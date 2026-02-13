@@ -125,6 +125,7 @@
 
 pub mod error;
 pub mod http;
+pub mod sync;
 pub mod types;
 
 // =============================================================================
@@ -142,6 +143,9 @@ pub use types::{
     ChangelistEntry, Node, NodeType, ParseChangelistError, ParseNodeTypeError, ParseStateError,
     PullDelta, PushDelta, StateResponse,
 };
+
+// Sync engine
+pub use sync::{RemoteDelta, RemoteState, SyncEngine, SyncStats};
 
 // =============================================================================
 // Constants
@@ -186,5 +190,8 @@ mod tests {
         let _ = NodeType::Change;
         let _ = PushDelta::new();
         let _ = PullDelta::new();
+        let _ = RemoteState::empty();
+        let _ = RemoteDelta::in_sync();
+        let _ = SyncStats::default();
     }
 }

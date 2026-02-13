@@ -260,8 +260,15 @@ impl ChangelistEntry {
     }
 
     /// Convert this entry to a Node.
+    ///
+    /// Respects the `tagged` field: tagged entries become `Node::tag`,
+    /// regular entries become `Node::change`.
     pub fn to_node(&self) -> Node {
-        Node::change(&self.hash, &self.merkle)
+        if self.tagged {
+            Node::tag(&self.hash, &self.merkle)
+        } else {
+            Node::change(&self.hash, &self.merkle)
+        }
     }
 }
 
