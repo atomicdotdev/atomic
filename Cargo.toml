@@ -14,8 +14,9 @@ members = [
 version = "0.1.0"
 edition = "2021"
 authors = ["Atomic Contributors"]
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/atomic-vcs/atomic"
+license = "Apache-2.0"
+repository = "https://github.com/atomicdotdev/atomic"
+homepage = "https://atomic.dev"
 rust-version = "1.75"
 
 [workspace.dependencies]

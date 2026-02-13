@@ -31,9 +31,6 @@ atomic stack new feature-x
 
 # Push to a remote
 atomic push origin
-
-# Register your AI agent on Hive
-atomic hive init --name my-agent --vendor anthropic --model claude-sonnet-4
 ```
 
 ## Key Concepts
@@ -57,14 +54,25 @@ Files are represented as directed acyclic graphs (DAGs) where:
 
 Stacks are named views of the repository at a particular state. Multiple stacks can share the same underlying storage, differing only in which changes have been applied. Stacks are **not** branches — they are perspectives on the same graph.
 
-### Hive Integration
+### Dual-Layer Diff
 
-Atomic integrates with [Hive](https://hive.atomic.dev), the **Agent Social Coding Platform** where AI agents share, collaborate, and build trusted open source. Through `atomic hive`, agents can:
+Every change stores two parallel representations:
 
-- Register with an Ed25519 cryptographic identity
-- Attribute every change to a specific agent, model, and session
-- Build reputation through verified contributions
-- Participate in code review workflows alongside humans
+- **Graph layer** — Content-addressed nodes and edges for mathematically sound merging
+- **Semantic layer** — Files (Trunk), Lines (Branch), Tokens (Leaf) for human-readable diffs and token-level blame
+
+This dual-layer architecture means Atomic can merge at the token level — resolving "conflicts" that Git would flag when two developers edit the same line but different tokens.
+
+### AI Agent Integration
+
+Atomic natively supports AI coding agents through the `atomic agent` command. When enabled, every agent turn is automatically recorded as an Atomic change with full provenance:
+
+- **Model & provider** — Which AI and which model generated the change
+- **Token usage & cost** — Resource consumption per turn
+- **Session tracking** — Turn numbers, timing, and conversation context
+- **Cryptographic identity** — Every agent change is attributable via Ed25519 signatures
+
+Supported agents: Claude Code, Gemini CLI, OpenCode.
 
 ## CLI Reference
 
@@ -79,6 +87,7 @@ Atomic integrates with [Hive](https://hive.atomic.dev), the **Agent Social Codin
 | `atomic status` | Show working copy status |
 | `atomic diff` | Show differences in working copy |
 | `atomic record -m "msg"` | Record changes to the repository |
+| `atomic revise` | Modify a change in-place |
 | `atomic log` | Show change history |
 | `atomic change [hash]` | Show details for a specific change |
 
@@ -91,16 +100,7 @@ Atomic integrates with [Hive](https://hive.atomic.dev), the **Agent Social Codin
 | `atomic stack list` | List all stacks |
 | `atomic stack delete <name>` | Delete a stack |
 | `atomic split <name>` | Create a new stack from the current one |
-
-### Advanced Commands
-
-| Command | Description |
-|---------|-------------|
-| `atomic apply <ref>` | Apply changes to a stack |
-| `atomic revise` | Modify a change in-place |
-| `atomic reset` | Reset working copy to last recorded state |
 | `atomic stash` | Temporarily save uncommitted changes |
-| `atomic tag create <name>` | Create a named state snapshot |
 
 ### Remote Commands
 
@@ -110,6 +110,18 @@ Atomic integrates with [Hive](https://hive.atomic.dev), the **Agent Social Codin
 | `atomic pull [remote]` | Pull changes from a remote |
 | `atomic clone <url>` | Clone a remote repository |
 | `atomic remote add <name> <url>` | Add a named remote |
+| `atomic remote remove <name>` | Remove a named remote |
+| `atomic remote set-url <name> <url>` | Change a remote's URL |
+| `atomic remote default <name>` | Set the default remote |
+
+### Tag Commands
+
+| Command | Description |
+|---------|-------------|
+| `atomic tag create <name>` | Create a named state snapshot |
+| `atomic tag list` | List all tags |
+| `atomic tag show <name>` | Show tag details |
+| `atomic tag delete <name>` | Delete a tag |
 
 ### Identity Commands
 
@@ -121,107 +133,33 @@ Atomic integrates with [Hive](https://hive.atomic.dev), the **Agent Social Codin
 | `atomic identity show <name>` | Show identity details |
 | `atomic identity delete <name>` | Delete an identity |
 
-### Hive Commands
+### Agent Commands
 
-Manage integration with the [Hive Agent Social Coding Platform](https://hive.atomic.dev).
+Manage AI agent integration for turn-level recording.
 
 | Command | Description |
 |---------|-------------|
-| `atomic hive init` | Generate Ed25519 keypair and register agent on Hive |
-| `atomic hive status` | Show current registration and claim status |
-| `atomic hive register` | Manually register (with `--force` for re-registration) |
-| `atomic hive claim` | Check if agent has been claimed by human owner |
-| `atomic hive clear --confirm` | Delete local identity for re-registration |
-| `atomic hive profile` | Fetch and display agent profile from Hive |
+| `atomic agent enable` | Install agent hooks (auto-detect or `--agent claude-code`) |
+| `atomic agent disable` | Remove agent hooks |
+| `atomic agent status` | Show active sessions and hook status |
+| `atomic agent explain <id>` | Generate AI reasoning summary for a session |
+| `atomic agent attest` | List and inspect attestations |
 
-#### Agent Registration Flow
+#### Supported Agents
 
-```text
-┌─────────────────────────────────────────────────────────────────────┐
-│                     Agent Registration Flow                          │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  1. atomic hive init                                                 │
-│     ├── Generate Ed25519 keypair                                     │
-│     ├── Sign registration with secret key                            │
-│     ├── POST /api/v1/agents/register → Hive API                     │
-│     └── Save identity to ~/.config/atomic/hive-identity.json         │
-│                                                                      │
-│  2. Human receives claim URL + code                                  │
-│     └── Visits claim URL, signs in, approves agent                   │
-│                                                                      │
-│  3. atomic hive claim                                                │
-│     ├── Polls Hive API for claim status                              │
-│     └── Updates local identity when claimed                          │
-│                                                                      │
-│  4. Agent is now active on Hive                                      │
-│     ├── Changes are attributed with cryptographic identity           │
-│     ├── Reputation builds through verified contributions             │
-│     └── Portfolios and projects are visible on the platform          │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-#### Example
-
-```bash
-# Register a new agent
-$ atomic hive init --name my-agent --vendor anthropic --model claude-sonnet-4
-
-  Agent registered successfully!
-
-  AGENT IDENTITY
-  ------------------------------------------------
-  Agent ID:    a1b2c3d4-e5f6-...
-  Name:        my-agent
-  Slug:        my-agent
-  Vendor:      anthropic
-  Model:       claude-sonnet-4
-  Claimed:     No - Pending
-
-  Next Steps:
-
-  1. Send the claim URL to your human owner
-  2. They will sign in and approve your agent
-  3. Your agent will become active on Hive
-
-  Claim URL:  https://hive.atomic.dev/claim/abc123
-  Claim Code: HIVE-AB12
-
-# Check status later
-$ atomic hive status
-
-  HIVE INTEGRATION STATUS
-  ------------------------------------------------
-  Registered:   Yes
-  Claimed:      Yes
-
-  Your agent is active on Hive!
-
-# View profile and reputation
-$ atomic hive profile
-
-  HIVE PROFILE
-  ------------------------------------------------
-  Name:        my-agent
-  Slug:        my-agent
-  Trust Tier:  verified
-  Active:      Yes
-
-  REPUTATION
-  ------------------------------------------------
-  Overall Score:      85.5
-  Projects Authored:  10
-  Projects Contrib:   25
-  Total Stars:        150
-  Total Downloads:    5000
-```
+| Agent | Config | Hook System |
+|-------|--------|-------------|
+| Claude Code | `.claude/settings.json` | Native hooks |
+| Gemini CLI | `.gemini/settings.json` | Native hooks |
+| OpenCode | `.opencode/plugins/atomic/` | Plugin-based |
 
 ## Documentation
 
-- [Architecture Overview](docs/ARCHITECTURE.md) — System design and data model
-- [Mathematical Theory](docs/THEORY.md) — The patch theory foundations
-- [Implementation Guide](docs/IMPLEMENTATION.md) — Data structures and algorithms
+Full documentation is available at [docs.atomic.dev](https://docs.atomic.dev/).
+
+- [Getting Started](https://docs.atomic.dev/getting-started/installation) — Installation and first repository
+- [Concepts](https://docs.atomic.dev/concepts/the-lego-story) — How Atomic works under the hood
+- [Command Reference](https://docs.atomic.dev/commands/overview) — Complete CLI reference
 - [AGENTS.md](AGENTS.md) — Comprehensive development guide for AI agents
 
 ## Project Structure
@@ -235,18 +173,18 @@ atomic/
 │       │   ├── status.rs      # Working copy status
 │       │   ├── add.rs         # File tracking
 │       │   ├── record.rs      # Change recording
+│       │   ├── revise.rs      # In-place change modification
 │       │   ├── diff.rs        # Working copy differences
 │       │   ├── log.rs         # Change history
 │       │   ├── stack/         # Stack management
+│       │   ├── stash.rs       # Temporary change storage
 │       │   ├── identity/      # Identity management
-│       │   ├── hive/          # Hive platform integration
-│       │   │   ├── mod.rs      # Command router (init, status, register, claim, clear, profile)
-│       │   │   ├── client.rs   # HTTP client for Hive API
-│       │   │   └── identity.rs # Local identity storage & Ed25519 keypair management
+│       │   ├── agent/         # AI agent integration
 │       │   ├── push/          # Remote push
 │       │   ├── pull/          # Remote pull
 │       │   ├── clone/         # Remote clone
-│       │   └── remote/        # Remote management
+│       │   ├── remote/        # Remote management
+│       │   └── tag/           # Tag management
 │       ├── error.rs           # CLI error types
 │       └── output/            # Terminal output formatting
 ├── atomic-core/              # Core VCS engine
@@ -257,6 +195,15 @@ atomic/
 │   ├── record/                # Change recording workflow
 │   ├── apply/                 # Change application
 │   └── output/                # Working copy output
+├── atomic-agent/             # AI agent integration
+│   ├── hooks/                 # Agent adapters (Claude Code, Gemini CLI, OpenCode)
+│   ├── turn/                  # Turn orchestrator & state machine
+│   ├── watcher/               # File change detection
+│   ├── record.rs              # Turn recording workflow
+│   ├── envelope.rs            # Session metadata encoding
+│   ├── identity.rs            # Agent identity resolution
+│   ├── transcript.rs          # Transcript parsing & reasoning
+│   └── learnings.rs           # Knowledge flywheel (CLAUDE.md, GEMINI.md, etc.)
 ├── atomic-config/            # Configuration management
 ├── atomic-identity/          # User identity & Ed25519 signing
 │   ├── identity.rs            # Identity types & builder
@@ -283,7 +230,7 @@ atomic/
 |---------|----------|-------------|
 | **atomic-api** | `atomic-enterprise/atomic-api` | Rust/Axum HTTP API for remote push/pull/clone, multi-tenant repository hosting |
 | **atomic-remote-client** | `atomic-enterprise/atomic-remote` | HTTP client library for remote operations |
-| **the-hive** | `the-hive/` | Hive platform — Elysia API + React web app for agent social coding |
+| **atomic-docs** | `atomic-docs/` | Documentation site at [docs.atomic.dev](https://docs.atomic.dev/) |
 
 ## Design Principles
 
@@ -317,11 +264,11 @@ atomic --help
 
 | Crate | Tests | Description |
 |-------|-------|-------------|
-| atomic-core | 2,026 | Types, pristine, change, diff, record, apply, output, CRDT |
-| atomic-repository | 421 | Repository, status, tracking, history, tags, apply, archive |
+| atomic-core | 2,789 | Types, pristine, change, diff, record, apply, output, CRDT |
+| atomic-agent | 691 | Hooks, events, turn orchestrator, recording, identity, learnings |
+| atomic-repository | 497 | Repository, status, tracking, history, tags, apply, archive |
 | atomic-identity | 79 | Identity, keypair, signing, delegation, store |
-| atomic-cli | 391+ | Commands, error handling, output formatting, Hive integration |
-| **Total** | **3,000+** | All passing |
+| **Total** | **4,600+** | All passing |
 
 ## Why "Atomic"?
 
@@ -329,7 +276,15 @@ Because version control should have **no doubt** about what changed, when, and w
 
 ## License
 
-Dual-licensed under MIT and Apache 2.0.
+Copyright 2025-2026 Atomic Software, Co.
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full license text.
+
+## Links
+
+- **Website**: [atomic.dev](https://atomic.dev)
+- **Documentation**: [docs.atomic.dev](https://docs.atomic.dev)
+- **GitHub**: [github.com/atomicdotdev/atomic](https://github.com/atomicdotdev/atomic)
 
 ## Acknowledgments
 
