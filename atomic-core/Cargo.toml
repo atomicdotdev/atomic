@@ -1,0 +1,49 @@
+[package]
+name = "atomic-core"
+description = "Core VCS engine for Atomic - graph-based version control"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+
+# Hashing
+blake3.workspace = true
+xxhash-rust.workspace = true
+
+# Compression
+zstd.workspace = true
+
+# Database
+redb.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Utilities
+thiserror.workspace = true
+anyhow.workspace = true
+bitflags.workspace = true
+data-encoding.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+
+# Diff algorithms
+similar.workspace = true
+
+[dev-dependencies]
+quickcheck.workspace = true
+quickcheck_macros.workspace = true
+tempfile.workspace = true
+
+[features]
+default = []
+# Enable additional debug assertions
+debug-checks = []

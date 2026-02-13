@@ -1,0 +1,243 @@
+name: Release
+
+on:
+  push:
+    branches: [releases]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: atomic
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Run the full test suite before building release artifacts
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action/setup@v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-test-
+
+      - name: Run tests
+        run: cargo test --workspace
+
+  # ---------------------------------------------------------------------------
+  # Extract version from Cargo.toml for tagging and release naming
+  # ---------------------------------------------------------------------------
+  version:
+    name: Extract Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Detected version: ${VERSION}"
+
+  # ---------------------------------------------------------------------------
+  # Build release binaries for each target platform
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.target }})
+    needs: [test, version]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Linux x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: atomic-x86_64-unknown-linux-gnu.tar.gz
+
+          # Linux aarch64 (cross-compiled)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: atomic-aarch64-unknown-linux-gnu.tar.gz
+            cross: true
+
+          # macOS x86_64 (Intel)
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: atomic-x86_64-apple-darwin.tar.gz
+
+          # macOS aarch64 (Apple Silicon)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: atomic-aarch64-apple-darwin.tar.gz
+
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: atomic-x86_64-pc-windows-msvc.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action/setup@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (for cross-compilation)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-release-
+
+      - name: Build release binary
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }} -p atomic-cli
+
+      - name: Build release binary (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }} -p atomic-cli
+
+      # Package: Unix (tar.gz)
+      - name: Package binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} staging/
+          cp README.md LICENSE staging/ 2>/dev/null || true
+          cd staging
+          tar czf ../${{ matrix.artifact }} *
+
+      # Package: Windows (zip)
+      - name: Package binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging
+          Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" staging/
+          Copy-Item README.md, LICENSE staging/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path staging/* -DestinationPath ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Create GitHub Release with all platform binaries
+  # ---------------------------------------------------------------------------
+  release:
+    name: Create Release
+    needs: [build, version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          find . -name "*.tar.gz" -o -name "*.zip" | while read f; do
+            sha256sum "$f" >> ../checksums-sha256.txt
+          done
+          cd ..
+          cat checksums-sha256.txt
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: Atomic ${{ needs.version.outputs.tag }}
+          draft: false
+          prerelease: ${{ contains(needs.version.outputs.version, '-') }}
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            Download the binary for your platform below, extract it, and add it to your `PATH`.
+
+            ### macOS (Apple Silicon)
+            ```bash
+            curl -L https://github.com/atomicdotdev/atomic/releases/download/${{ needs.version.outputs.tag }}/atomic-aarch64-apple-darwin.tar.gz | tar xz
+            sudo mv atomic /usr/local/bin/
+            ```
+
+            ### macOS (Intel)
+            ```bash
+            curl -L https://github.com/atomicdotdev/atomic/releases/download/${{ needs.version.outputs.tag }}/atomic-x86_64-apple-darwin.tar.gz | tar xz
+            sudo mv atomic /usr/local/bin/
+            ```
+
+            ### Linux (x86_64)
+            ```bash
+            curl -L https://github.com/atomicdotdev/atomic/releases/download/${{ needs.version.outputs.tag }}/atomic-x86_64-unknown-linux-gnu.tar.gz | tar xz
+            sudo mv atomic /usr/local/bin/
+            ```
+
+            ### Linux (aarch64)
+            ```bash
+            curl -L https://github.com/atomicdotdev/atomic/releases/download/${{ needs.version.outputs.tag }}/atomic-aarch64-unknown-linux-gnu.tar.gz | tar xz
+            sudo mv atomic /usr/local/bin/
+            ```
+
+            ### Windows (x86_64)
+            Download `atomic-x86_64-pc-windows-msvc.zip`, extract, and add to your `PATH`.
+
+            ### Verify
+            ```bash
+            atomic --version
+            ```
+
+            ---
+
+            See [checksums-sha256.txt](https://github.com/atomicdotdev/atomic/releases/download/${{ needs.version.outputs.tag }}/checksums-sha256.txt) for SHA-256 checksums of all artifacts.
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+            checksums-sha256.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

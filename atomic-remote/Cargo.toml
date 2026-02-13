@@ -1,0 +1,42 @@
+[package]
+name = "atomic-remote"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Remote protocol client for Atomic VCS"
+readme = "README.md"
+keywords = ["vcs", "version-control", "distributed", "remote", "protocol"]
+categories = ["development-tools"]
+
+[dependencies]
+# HTTP client
+reqwest = { workspace = true, features = ["json", "gzip", "deflate", "stream"] }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Utilities
+url = { workspace = true }
+bytes = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = { workspace = true }
+env_logger = { workspace = true }
+
+[features]
+default = []
+# Enable for integration tests against a running atomic-api server
+integration-tests = []

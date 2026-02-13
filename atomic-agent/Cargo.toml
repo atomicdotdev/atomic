@@ -1,0 +1,54 @@
+[package]
+name = "atomic-agent"
+description = "AI agent integration for Atomic VCS — turn-level recording with Watchman file watching"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Internal crates
+atomic-core = { workspace = true }
+atomic-repository = { workspace = true }
+atomic-identity = { workspace = true }
+
+# Watchman file watching
+watchman_client = "0.9"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+
+# Compression (for transcript storage in unhashed section)
+zstd = { workspace = true }
+
+# Hashing
+blake3 = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Async runtime (watchman_client is async)
+tokio = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+log = { workspace = true }
+
+# Filesystem traversal (fallback watcher when Watchman unavailable)
+walkdir = { workspace = true }
+ignore = { workspace = true }
+
+# Home directory resolution (for ~/.atomic/identities/)
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serial_test = { workspace = true }
+tokio = { version = "1.36", features = ["full", "test-util"] }

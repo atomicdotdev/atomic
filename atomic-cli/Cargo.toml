@@ -1,0 +1,67 @@
+[package]
+name = "atomic-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "A mathematically sound distributed version control system"
+readme = "README.md"
+keywords = ["vcs", "version-control", "distributed", "patch-theory"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "atomic"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+atomic-agent = { workspace = true }
+atomic-core = { workspace = true }
+atomic-config = { workspace = true }
+atomic-identity = { workspace = true }
+atomic-remote = { workspace = true }
+atomic-repository = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+indicatif = { workspace = true }
+dialoguer = { workspace = true }
+console = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+log = { workspace = true }
+env_logger = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# HTTP client (for Hive API)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Home/config directory resolution
+dirs = "5"
+
+# Base32/Base64 encoding
+data-encoding = "2.6"
+
+# Open URLs in default browser (for device auth flow)
+open = "5"
+
+# Utilities
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serial_test = { workspace = true }

@@ -1,0 +1,97 @@
+[workspace]
+resolver = "2"
+members = [
+    "atomic-agent",
+    "atomic-cli",
+    "atomic-core",
+    "atomic-config",
+    "atomic-identity",
+    "atomic-remote",
+    "atomic-repository",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Atomic Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/atomic-vcs/atomic"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Core
+atomic-agent = { path = "atomic-agent" }
+atomic-core = { path = "atomic-core" }
+atomic-config = { path = "atomic-config" }
+atomic-identity = { path = "atomic-identity" }
+atomic-remote = { path = "atomic-remote" }
+atomic-repository = { path = "atomic-repository" }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+toml = "0.8"
+
+# Hashing & Crypto
+blake3 = "1.5"
+ed25519-dalek = { version = "2.1", features = ["serde"] }
+rand = "0.8"
+
+# Compression
+zstd = "0.13"
+
+# Database
+redb = "2.1"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+indicatif = "0.17"
+dialoguer = "0.11"
+console = "0.15"
+
+# Async
+tokio = { version = "1.36", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+bytes = "1.5"
+
+# URL parsing
+url = "2.5"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Utilities
+thiserror = "1.0"
+anyhow = "1.0"
+bitflags = { version = "2.4", features = ["serde"] }
+data-encoding = "2.5"
+dirs = "5.0"
+walkdir = "2.5"
+ignore = "0.4"
+tempfile = "3.10"
+parking_lot = "0.12"
+log = "0.4"
+env_logger = "0.11"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Diff algorithms
+similar = "2.4"
+
+# Testing
+quickcheck = "1.0"
+quickcheck_macros = "1.0"
+serial_test = "3.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+# Faster incremental builds
+debug = 1
+
+[profile.test]
+# Enable debug info in tests
+debug = 2
