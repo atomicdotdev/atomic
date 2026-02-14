@@ -4808,6 +4808,58 @@ default = "{}"
         self.get_file_content_with_filter(&txn, &normalized, change_filter)
     }
 
+    /// Get the recorded content for a tracked file on a specific stack.
+    ///
+    /// Like `get_file_content`, but reads from the specified stack instead
+    /// of the current stack. This is a **read-only** operation — it does
+    /// NOT call `set_current_stack` or write anything to disk.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the file (relative to repository root)
+    /// * `stack_name` - The stack to read from
+    ///
+    /// # Returns
+    ///
+    /// The file content as bytes, or `None` if the file is not tracked
+    /// on the specified stack.
+    pub fn get_file_content_on_stack<P: AsRef<Path>>(
+        &self,
+        path: P,
+        stack_name: &str,
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        let path = path.as_ref();
+        let normalized = normalize_path(path);
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Get the specified stack (read-only — no set_current_stack)
+        let stack = txn
+            .get_stack(stack_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::StackNotFound {
+                name: stack_name.to_string(),
+            })?;
+
+        // Collect all change NodeIds in the specified stack
+        let mut change_filter: HashSet<NodeId> = HashSet::new();
+        let iter = txn
+            .iter_changes(&stack, 0)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        for result in iter {
+            let (_seq, node_id, _merkle) =
+                result.map_err(|e| RepositoryError::Database(e.to_string()))?;
+            change_filter.insert(node_id);
+        }
+
+        // Use the filtered retrieval method
+        self.get_file_content_with_filter(&txn, &normalized, change_filter)
+    }
+
     /// Get the recorded content for a tracked file with options.
     ///
     /// Like `get_file_content`, but allows specifying retrieval options
