@@ -91,9 +91,7 @@ use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
 use crate::hooks::AgentHook;
 
-// =============================================================================
 // Constants
-// =============================================================================
 
 /// The directory name for Gemini CLI configuration.
 const GEMINI_DIR: &str = ".gemini";
@@ -108,9 +106,7 @@ const ATOMIC_HOOK_PREFIX: &str = "atomic agent hooks gemini-cli";
 #[allow(dead_code)]
 const METADATA_DENY_RULE: &str = ".atomic/metadata/**";
 
-// =============================================================================
 // Gemini CLI JSON Input Types
-// =============================================================================
 
 /// Base input fields present in every Gemini CLI hook callback.
 ///
@@ -223,9 +219,7 @@ struct AfterToolInput {
     tool_response: Option<serde_json::Value>,
 }
 
-// =============================================================================
 // Gemini CLI Settings File Types
-// =============================================================================
 
 /// A single hook entry within a matcher group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,9 +280,7 @@ struct GeminiHooks {
     other: HashMap<String, serde_json::Value>,
 }
 
-// =============================================================================
 // GeminiCliHook
-// =============================================================================
 
 /// Gemini CLI hook adapter for Atomic Agent.
 ///
@@ -498,9 +490,7 @@ impl GeminiCliHook {
         }
     }
 
-    // =========================================================================
     // Global install/uninstall (same pattern as Claude Code)
-    // =========================================================================
 
     /// Install hooks globally to `~/.gemini/settings.json`.
     pub fn install_global(&self, force: bool) -> AgentResult<usize> {
@@ -533,9 +523,7 @@ impl GeminiCliHook {
     }
 }
 
-// =============================================================================
 // AgentHook Implementation
-// =============================================================================
 
 impl AgentHook for GeminiCliHook {
     fn name(&self) -> &str {
@@ -754,9 +742,7 @@ impl AgentHook for GeminiCliHook {
     }
 }
 
-// =============================================================================
 // Hook Verb Mapping
-// =============================================================================
 
 /// Map Gemini CLI hook verbs to Atomic HookTypes.
 ///
@@ -774,9 +760,7 @@ pub fn verb_to_hook_type(verb: &str) -> Option<HookType> {
     }
 }
 
-// =============================================================================
 // Helper Functions
-// =============================================================================
 
 /// Check if a specific hook command already exists in a matcher list.
 fn hook_command_exists(matchers: &[GeminiHookMatcher], matcher_str: &str, command: &str) -> bool {
@@ -844,9 +828,7 @@ fn remove_atomic_hooks(matchers: &mut Vec<GeminiHookMatcher>) {
     matchers.retain(|m| !m.hooks.is_empty());
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -856,9 +838,7 @@ mod tests {
         GeminiCliHook::new()
     }
 
-    // =========================================================================
     // Identity tests
-    // =========================================================================
 
     #[test]
     fn test_name() {
@@ -897,9 +877,7 @@ mod tests {
         assert!(verbs.contains(&"after-tool"));
     }
 
-    // =========================================================================
     // Verb mapping tests
-    // =========================================================================
 
     #[test]
     fn test_verb_to_hook_type() {
@@ -915,9 +893,7 @@ mod tests {
         assert_eq!(verb_to_hook_type("unknown"), None);
     }
 
-    // =========================================================================
     // Parse event tests
-    // =========================================================================
 
     #[test]
     fn test_parse_session_start() {
@@ -1002,9 +978,7 @@ mod tests {
         assert_eq!(event.session_id, "unknown");
     }
 
-    // =========================================================================
     // Detection tests
-    // =========================================================================
 
     #[test]
     fn test_detect_presence_with_gemini_dir() {
@@ -1022,9 +996,7 @@ mod tests {
         assert!(!hook.detect_presence(dir.path()));
     }
 
-    // =========================================================================
     // Install / uninstall tests
-    // =========================================================================
 
     #[test]
     fn test_install_creates_settings_file() {
@@ -1172,9 +1144,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // =========================================================================
     // Helper function tests
-    // =========================================================================
 
     #[test]
     fn test_is_atomic_hook() {
@@ -1354,9 +1324,7 @@ mod tests {
         assert!(!has_any_atomic_hook(&matchers));
     }
 
-    // =========================================================================
     // Settings serialization roundtrip
-    // =========================================================================
 
     #[test]
     fn test_settings_roundtrip() {

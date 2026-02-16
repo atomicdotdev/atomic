@@ -13,9 +13,7 @@ use atomic_core::types::{
     ChangePosition, EdgeFlags, GraphNode, Inode, NodeId, Position, SerializedGraphEdge, L64,
 };
 
-// ============================================================================
 // Helper Functions
-// ============================================================================
 
 /// Helper to create a test span.
 fn make_vertex(change: u64, start: u64, end: u64) -> GraphNode<NodeId> {
@@ -37,9 +35,7 @@ fn make_edge(flag: EdgeFlags, change: u64, pos: u64, intro: u64) -> SerializedGr
     SerializedGraphEdge::new(flag, dest, NodeId::new(intro))
 }
 
-// ============================================================================
 // InodeVertex Type Tests
-// ============================================================================
 
 /// Composite key for the inode-scoped graph index.
 /// This combines an Inode with a Span for the secondary B-tree.
@@ -177,9 +173,7 @@ fn test_inode_vertex_bytes_ordering_preserved() {
     assert!(bytes2 < bytes3, "Lower inode should have lower bytes");
 }
 
-// ============================================================================
 // Edge Tests (relevant to graph operations)
-// ============================================================================
 
 #[test]
 fn test_edge_creation() {
@@ -231,9 +225,7 @@ fn test_edge_roundtrip() {
     assert_eq!(serialized.introduced_by(), original.introduced_by());
 }
 
-// ============================================================================
 // Span Key Encoding Tests
-// ============================================================================
 
 /// Encode a Span as 24 bytes for use as a redb key.
 fn vertex_to_bytes(v: &GraphNode<NodeId>) -> [u8; 24] {
@@ -294,9 +286,7 @@ fn test_root_vertex() {
     assert_eq!(bytes, [0u8; 24]);
 }
 
-// ============================================================================
 // Two-Level B-Tree Conceptual Tests
-// ============================================================================
 
 /// These tests verify the conceptual properties that make the optimization work.
 /// Actual redb integration tests will be in pristine module.
@@ -353,9 +343,7 @@ fn test_inode_isolation() {
     assert!(!(iv_b >= min_a && iv_b <= max_a)); // file_b NOT in file_a's range
 }
 
-// ============================================================================
 // Migration Stats (for populating inode_graph from existing graph)
-// ============================================================================
 
 #[derive(Debug, Default, Clone)]
 pub struct MigrationStats {
@@ -407,9 +395,7 @@ fn test_migration_stats() {
     assert_eq!(stats1.errors, 1);
 }
 
-// ============================================================================
 // Migration Config
-// ============================================================================
 
 #[derive(Debug, Clone)]
 pub struct MigrationConfig {
@@ -463,9 +449,7 @@ fn test_migration_config_defaults() {
     assert!(!strict.continue_on_error);
 }
 
-// ============================================================================
 // Populate Inode Request
-// ============================================================================
 
 #[derive(Debug, Clone)]
 pub struct PopulateInodeRequest {
@@ -505,9 +489,7 @@ fn test_populate_inode_request() {
     assert_eq!(req.start_position, Some(pos));
 }
 
-// ============================================================================
 // Integration-style test: verify ordering with many entries
-// ============================================================================
 
 #[test]
 fn test_inode_vertex_btree_ordering_property() {

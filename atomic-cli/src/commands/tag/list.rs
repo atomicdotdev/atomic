@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The `tag list` command for listing all tags.
 //!
 //! This module implements the `atomic tag list` command, which shows all
@@ -48,9 +47,7 @@ use crate::output::{emphasis, hint};
 #[cfg(test)]
 use std::path::PathBuf;
 
-// =============================================================================
 // List Command
-// =============================================================================
 
 /// List all tags.
 ///
@@ -87,34 +84,6 @@ pub struct List {
 }
 
 impl List {
-    /// Create a new `List` command.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set whether to show verbose output.
-    pub fn with_verbose(mut self, verbose: bool) -> Self {
-        self.verbose = verbose;
-        self
-    }
-
-    /// Set the stack filter.
-    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
-        self.stack = Some(stack.into());
-        self
-    }
-
-    /// Set the pattern filter.
-    pub fn with_pattern(mut self, pattern: impl Into<String>) -> Self {
-        self.pattern = Some(pattern.into());
-        self
-    }
-
-    /// Set whether to show only annotated tags.
-    pub fn with_annotated_only(mut self, annotated_only: bool) -> Self {
-        self.annotated_only = annotated_only;
-        self
-    }
 }
 
 impl Command for List {
@@ -188,9 +157,7 @@ impl Command for List {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

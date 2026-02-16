@@ -77,9 +77,7 @@ use crate::types::{Base32, GraphNode, Hash, Inode, NodeId};
 use std::io::Write;
 use std::time::SystemTime;
 
-// ============================================================================
 // FILE METADATA
-// ============================================================================
 
 /// File permission and type metadata.
 ///
@@ -186,9 +184,7 @@ impl FileMetadata {
     }
 }
 
-// ============================================================================
 // WORKING COPY READ TRAIT
-// ============================================================================
 
 /// Read-only operations on the working copy.
 ///
@@ -304,9 +300,7 @@ pub trait WorkingCopyRead {
     fn walk_files(&self, _prefix: &str) -> Result<Vec<String>, Self::Error>;
 }
 
-// ============================================================================
 // WORKING COPY TRAIT
-// ============================================================================
 
 /// Full read-write operations on the working copy.
 ///
@@ -402,9 +396,7 @@ pub trait WorkingCopy: WorkingCopyRead {
     fn write_file(&self, path: &str, inode: Inode) -> Result<Self::Writer, Self::Error>;
 }
 
-// ============================================================================
 // VERTEX BUFFER TRAIT
-// ============================================================================
 
 /// Conflict marker constants.
 pub mod markers {
@@ -540,9 +532,7 @@ pub trait VertexBuffer {
     }
 }
 
-// ============================================================================
 // SINK IMPLEMENTATION (DISCARDS OUTPUT)
-// ============================================================================
 
 /// A working copy implementation that discards all output.
 ///
@@ -620,9 +610,7 @@ impl WorkingCopy for Sink {
     }
 }
 
-// ============================================================================
 // BASIC VERTEX BUFFER WRITER
-// ============================================================================
 
 /// A basic `VertexBuffer` implementation that writes to any `Write` type.
 ///
@@ -718,9 +706,7 @@ impl<W: Write> VertexBuffer for Writer<W> {
     }
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

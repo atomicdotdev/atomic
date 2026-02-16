@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Remote repository management commands.
 //!
 //! This module provides commands for managing remote repository configurations,
@@ -40,9 +39,7 @@ use crate::output::{print_hint, print_success};
 
 use atomic_repository::Repository;
 
-// =============================================================================
 // Remote Command
-// =============================================================================
 
 /// Manage remote repositories.
 ///
@@ -85,9 +82,7 @@ pub enum RemoteSubcommand {
     Default(RemoteDefault),
 }
 
-// =============================================================================
 // Subcommand Structs
-// =============================================================================
 
 /// Add a new remote.
 #[derive(Debug, Clone, Parser)]
@@ -145,9 +140,7 @@ pub struct RemoteDefault {
     pub name: String,
 }
 
-// =============================================================================
 // Implementation
-// =============================================================================
 
 impl Remote {
     /// Create a new Remote command (for testing).
@@ -156,18 +149,6 @@ impl Remote {
             command: None,
             verbose: false,
         }
-    }
-
-    /// Set verbose mode.
-    pub fn with_verbose(mut self, verbose: bool) -> Self {
-        self.verbose = verbose;
-        self
-    }
-
-    /// Set the subcommand.
-    pub fn with_command(mut self, command: RemoteSubcommand) -> Self {
-        self.command = Some(command);
-        self
     }
 
     /// List all configured remotes.
@@ -313,9 +294,7 @@ impl Command for Remote {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

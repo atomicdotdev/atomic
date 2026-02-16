@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The main Push command implementation.
 //!
 //! This module contains the `Push` struct and its `Command` implementation,
@@ -28,9 +27,7 @@ use super::helpers::{
 };
 use super::types::PushChange;
 
-// =============================================================================
 // Constants
-// =============================================================================
 
 /// Default remote name when none is specified.
 pub const DEFAULT_REMOTE: &str = "origin";
@@ -38,9 +35,7 @@ pub const DEFAULT_REMOTE: &str = "origin";
 /// Default request timeout in seconds.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
-// =============================================================================
 // Push Command
-// =============================================================================
 
 /// Push changes to a remote repository.
 ///
@@ -151,86 +146,6 @@ impl Push {
             insecure: false,
             timeout: DEFAULT_TIMEOUT_SECS,
         }
-    }
-
-    /// Set the remote name or URL.
-    ///
-    /// # Arguments
-    ///
-    /// * `remote` - Remote name (e.g., "origin") or full URL
-    pub fn with_remote(mut self, remote: impl Into<String>) -> Self {
-        self.remote = remote.into();
-        self
-    }
-
-    /// Set the target stack on the remote.
-    ///
-    /// # Arguments
-    ///
-    /// * `stack` - Stack name on the remote
-    pub fn with_to_stack(mut self, stack: impl Into<String>) -> Self {
-        self.to_stack = Some(stack.into());
-        self
-    }
-
-    /// Set the source stack to push from.
-    ///
-    /// # Arguments
-    ///
-    /// * `stack` - Local stack name
-    pub fn with_from_stack(mut self, stack: impl Into<String>) -> Self {
-        self.from_stack = Some(stack.into());
-        self
-    }
-
-    /// Enable or disable dry run mode.
-    ///
-    /// # Arguments
-    ///
-    /// * `dry_run` - Whether to enable dry run
-    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
-        self.dry_run = dry_run;
-        self
-    }
-
-    /// Enable or disable force push.
-    ///
-    /// # Arguments
-    ///
-    /// * `force` - Whether to force push
-    pub fn with_force(mut self, force: bool) -> Self {
-        self.force = force;
-        self
-    }
-
-    /// Enable or disable pushing all changes.
-    ///
-    /// # Arguments
-    ///
-    /// * `all` - Whether to push all changes
-    pub fn with_all(mut self, all: bool) -> Self {
-        self.all = all;
-        self
-    }
-
-    /// Enable or disable TLS certificate verification skipping.
-    ///
-    /// # Arguments
-    ///
-    /// * `insecure` - Whether to skip verification
-    pub fn with_insecure(mut self, insecure: bool) -> Self {
-        self.insecure = insecure;
-        self
-    }
-
-    /// Set the request timeout.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Timeout in seconds
-    pub fn with_timeout(mut self, timeout: u64) -> Self {
-        self.timeout = timeout;
-        self
     }
 
     /// Resolve the remote URL.
@@ -679,17 +594,13 @@ impl Command for Push {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // Push Command Construction Tests
-    // =========================================================================
 
     #[test]
     fn test_push_new() {
@@ -807,9 +718,7 @@ mod tests {
         assert!(debug_str.contains("origin"));
     }
 
-    // =========================================================================
     // Remote Channel Tests
-    // =========================================================================
 
     #[test]
     fn test_get_remote_stack_explicit() {
@@ -823,9 +732,7 @@ mod tests {
         assert_eq!(push.get_remote_stack("dev"), "dev");
     }
 
-    // =========================================================================
     // Remote Config Tests
-    // =========================================================================
 
     #[test]
     fn test_build_remote_config_default() {
@@ -852,9 +759,7 @@ mod tests {
         assert!(config.danger_accept_invalid_certs);
     }
 
-    // =========================================================================
     // Constants Tests
-    // =========================================================================
 
     #[test]
     fn test_default_remote() {

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The `tag delete` command for deleting a tag.
 //!
 //! This module implements the `atomic tag delete` command, which removes
@@ -36,9 +35,7 @@ use crate::output::{print_success, emphasis, hint};
 #[cfg(test)]
 use std::path::PathBuf;
 
-// =============================================================================
 // Delete Command
-// =============================================================================
 
 /// Delete a tag.
 ///
@@ -53,12 +50,6 @@ pub struct Delete {
 }
 
 impl Delete {
-    /// Create a new `Delete` command with the given tag name.
-    pub fn with_name(name: impl Into<String>) -> Self {
-        Self {
-            name: Some(name.into()),
-        }
-    }
 }
 
 impl Command for Delete {
@@ -92,9 +83,7 @@ impl Command for Delete {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

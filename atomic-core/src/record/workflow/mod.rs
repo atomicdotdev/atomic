@@ -72,8 +72,8 @@
 //!
 //! // Configure the workflow
 //! let options = WorkflowOptions::new()
-//!     .algorithm(Algorithm::Patience)
-//!     .prefix("src/");
+//!     .with_algorithm(Algorithm::Patience)
+//!     .with_prefix("src/");
 //!
 //! // Collect tracked files
 //! let tracked = collect_tracked_files(&txn, options.prefix())?;
@@ -162,9 +162,7 @@ pub use retrieve::{
     RetrieveResult,
 };
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -173,7 +171,7 @@ mod tests {
     #[test]
     fn test_module_exports_options() {
         let opts = WorkflowOptions::new();
-        assert!(opts.get_check_mtime());
+        assert!(opts.check_mtime());
     }
 
     #[test]
@@ -206,18 +204,18 @@ mod tests {
 
         // This test demonstrates the intended workflow
         let options = WorkflowOptions::new()
-            .algorithm(Algorithm::Patience)
-            .check_mtime(false);
+            .with_algorithm(Algorithm::Patience)
+            .with_check_mtime(false);
 
         // Verify options are configured
-        assert_eq!(options.get_algorithm(), Algorithm::Patience);
-        assert!(!options.get_check_mtime());
+        assert_eq!(options.algorithm(), Algorithm::Patience);
+        assert!(!options.check_mtime());
 
         // Compare some content
         let old = b"line1\nline2\n";
         let new = b"line1\nmodified\n";
 
-        let result = compare_content(old, new, options.get_algorithm());
+        let result = compare_content(old, new, options.algorithm());
         assert!(result.has_changes());
         assert!(!result.is_binary);
     }

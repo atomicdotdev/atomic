@@ -61,9 +61,7 @@ use super::options::ApplyOptions;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-// =============================================================================
 // ApplyStats
-// =============================================================================
 
 /// Statistics about CRDT apply operations.
 ///
@@ -120,9 +118,7 @@ impl ApplyStats {
         Self::default()
     }
 
-    // =========================================================================
     // Trunk Operation Recording
-    // =========================================================================
 
     /// Records a trunk creation.
     #[inline]
@@ -148,9 +144,7 @@ impl ApplyStats {
         self.trunks_undeleted += 1;
     }
 
-    // =========================================================================
     // Branch Operation Recording
-    // =========================================================================
 
     /// Records a branch insertion.
     #[inline]
@@ -170,9 +164,7 @@ impl ApplyStats {
         self.branches_restored += 1;
     }
 
-    // =========================================================================
     // Leaf Operation Recording
-    // =========================================================================
 
     /// Records a leaf insertion.
     #[inline]
@@ -198,9 +190,7 @@ impl ApplyStats {
         self.leaves_restored += 1;
     }
 
-    // =========================================================================
     // Other Recording
-    // =========================================================================
 
     /// Records content bytes processed.
     #[inline]
@@ -220,9 +210,7 @@ impl ApplyStats {
         self.operations_skipped += 1;
     }
 
-    // =========================================================================
     // Accessors
-    // =========================================================================
 
     /// Returns the number of trunks created.
     #[inline]
@@ -308,9 +296,7 @@ impl ApplyStats {
         self.operations_skipped
     }
 
-    // =========================================================================
     // Aggregate Accessors
-    // =========================================================================
 
     /// Returns the total number of trunk operations.
     #[inline]
@@ -348,9 +334,7 @@ impl ApplyStats {
         self.conflicts_detected > 0
     }
 
-    // =========================================================================
     // Merging
-    // =========================================================================
 
     /// Merges another stats instance into this one.
     ///
@@ -390,9 +374,7 @@ impl fmt::Display for ApplyStats {
     }
 }
 
-// =============================================================================
 // ApplyContext
-// =============================================================================
 
 /// Mutable context maintained during CRDT apply operations.
 ///
@@ -461,9 +443,7 @@ impl ApplyContext {
         Self::new(ApplyOptions::default())
     }
 
-    // =========================================================================
     // Accessors
-    // =========================================================================
 
     /// Returns a reference to the options.
     #[inline]
@@ -501,9 +481,7 @@ impl ApplyContext {
         self.failure_reason.as_deref()
     }
 
-    // =========================================================================
     // Conflict Management
-    // =========================================================================
 
     /// Adds a conflict to the context.
     ///
@@ -530,9 +508,7 @@ impl ApplyContext {
         self.conflicts.len()
     }
 
-    // =========================================================================
     // Failure Management
-    // =========================================================================
 
     /// Marks the apply as failed with a reason.
     pub fn mark_failed(&mut self, reason: impl Into<String>) {
@@ -540,9 +516,7 @@ impl ApplyContext {
         self.failure_reason = Some(reason.into());
     }
 
-    // =========================================================================
     // Stat Recording Convenience Methods
-    // =========================================================================
 
     /// Records a trunk creation.
     #[inline]
@@ -622,9 +596,7 @@ impl ApplyContext {
         self.stats.add_skipped();
     }
 
-    // =========================================================================
     // Validation Helpers
-    // =========================================================================
 
     /// Returns `true` if the operation limit has been exceeded.
     #[inline]
@@ -642,9 +614,7 @@ impl ApplyContext {
         !self.failed && !self.exceeds_operation_limit()
     }
 
-    // =========================================================================
     // Finalization
-    // =========================================================================
 
     /// Consumes the context and returns the final outcome.
     ///
@@ -669,9 +639,7 @@ impl ApplyContext {
     }
 }
 
-// =============================================================================
 // ApplyOutcome
-// =============================================================================
 
 /// The result of applying CRDT operations.
 ///
@@ -794,17 +762,13 @@ impl fmt::Display for ApplyOutcome {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // ApplyStats Tests
-    // =========================================================================
 
     #[test]
     fn test_stats_new() {
@@ -960,9 +924,7 @@ mod tests {
         assert_eq!(stats, restored);
     }
 
-    // =========================================================================
     // ApplyContext Tests
-    // =========================================================================
 
     #[test]
     fn test_context_new() {
@@ -1122,9 +1084,7 @@ mod tests {
         assert_eq!(context.stats().trunks_created(), 1);
     }
 
-    // =========================================================================
     // ApplyOutcome Tests
-    // =========================================================================
 
     #[test]
     fn test_outcome_success() {

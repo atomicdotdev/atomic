@@ -81,9 +81,7 @@ const PLUGIN_ENTRY: &str = "index.ts";
 /// Command prefix used to identify Atomic hooks in the plugin file.
 const ATOMIC_HOOK_PREFIX: &str = "atomic agent hooks opencode";
 
-// =============================================================================
 // OpenCode JSON Input Types
-// =============================================================================
 
 /// JSON input for session-start hook.
 ///
@@ -254,9 +252,7 @@ struct AfterToolInput {
     timestamp: Option<String>,
 }
 
-// =============================================================================
 // OpenCodeHook
-// =============================================================================
 
 /// OpenCode agent hook adapter.
 ///
@@ -655,9 +651,7 @@ impl AgentHook for OpenCodeHook {
     }
 }
 
-// =============================================================================
 // Helper: generate short pseudo-UUID for fallback session IDs
-// =============================================================================
 
 /// Generate a short hex string for fallback session IDs.
 ///
@@ -675,9 +669,7 @@ fn uuid_short() -> String {
     format!("{:08x}", (now & 0xFFFF_FFFF) as u32)
 }
 
-// =============================================================================
 // OpenCode hook verb → HookType mapping (registered in event.rs)
-// =============================================================================
 
 /// Convert an OpenCode-specific verb to a [`HookType`].
 ///
@@ -703,9 +695,7 @@ pub fn verb_to_hook_type(verb: &str) -> Option<HookType> {
     }
 }
 
-// =============================================================================
 // Embedded Plugin Template
-// =============================================================================
 
 /// The TypeScript plugin source that gets installed into `.opencode/plugins/`.
 ///
@@ -850,9 +840,7 @@ export const AtomicHooksPlugin = async ({ project, client, $, directory, worktre
 }
 "#;
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -864,9 +852,7 @@ mod tests {
         OpenCodeHook::new()
     }
 
-    // =========================================================================
     // Basic trait method tests
-    // =========================================================================
 
     #[test]
     fn test_name() {
@@ -919,9 +905,7 @@ mod tests {
         assert!(debug.contains("OpenCodeHook"));
     }
 
-    // =========================================================================
     // parse_event tests: session-start
-    // =========================================================================
 
     #[test]
     fn test_parse_session_start() {
@@ -943,9 +927,7 @@ mod tests {
         assert_eq!(raw["model"], "claude-sonnet-4");
     }
 
-    // =========================================================================
     // parse_event tests: session-end
-    // =========================================================================
 
     #[test]
     fn test_parse_session_end() {
@@ -956,9 +938,7 @@ mod tests {
         assert_eq!(event.event_type, HookType::SessionEnd);
     }
 
-    // =========================================================================
     // parse_event tests: user-prompt (TurnStart)
-    // =========================================================================
 
     #[test]
     fn test_parse_user_prompt() {
@@ -992,9 +972,7 @@ mod tests {
         assert_eq!(raw["provider"], "openai");
     }
 
-    // =========================================================================
     // parse_event tests: stop (TurnEnd)
-    // =========================================================================
 
     #[test]
     fn test_parse_stop() {
@@ -1014,9 +992,7 @@ mod tests {
         assert_eq!(raw["error"], true);
     }
 
-    // =========================================================================
     // parse_event tests: before-tool (PreToolUse)
-    // =========================================================================
 
     #[test]
     fn test_parse_before_tool() {
@@ -1043,9 +1019,7 @@ mod tests {
         assert!(event.tool_use_id.is_none());
     }
 
-    // =========================================================================
     // parse_event tests: after-tool (PostToolUse)
-    // =========================================================================
 
     #[test]
     fn test_parse_after_tool() {
@@ -1065,9 +1039,7 @@ mod tests {
         assert_eq!(event.tool_use_id.as_deref(), Some("call-99"));
     }
 
-    // =========================================================================
     // parse_event tests: error cases
-    // =========================================================================
 
     #[test]
     fn test_parse_event_empty_input() {
@@ -1112,9 +1084,7 @@ mod tests {
         assert_eq!(event.session_id, "s1");
     }
 
-    // =========================================================================
     // verb_to_hook_type tests
-    // =========================================================================
 
     #[test]
     fn test_verb_to_hook_type() {
@@ -1130,9 +1100,7 @@ mod tests {
         assert_eq!(verb_to_hook_type("unknown"), None);
     }
 
-    // =========================================================================
     // Installation tests
-    // =========================================================================
 
     #[test]
     fn test_detect_presence_with_opencode_dir() {
@@ -1277,9 +1245,7 @@ mod tests {
         assert!(hook.is_installed(tmp.path()));
     }
 
-    // =========================================================================
     // uuid_short tests
-    // =========================================================================
 
     #[test]
     fn test_uuid_short_format() {

@@ -74,9 +74,7 @@ use std::fmt;
 
 use super::semantic::{LineChange, SemanticDiff, SemanticLine, TokenChange};
 
-// =============================================================================
 // Conversion Configuration
-// =============================================================================
 
 /// Configuration for semantic diff to CRDT conversion.
 #[derive(Debug, Clone)]
@@ -145,9 +143,7 @@ impl ConversionConfig {
     }
 }
 
-// =============================================================================
 // Conversion Statistics
-// =============================================================================
 
 /// Statistics from a semantic-to-CRDT conversion.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -208,9 +204,7 @@ impl fmt::Display for ConversionStats {
     }
 }
 
-// =============================================================================
 // Conversion Error
-// =============================================================================
 
 /// Errors that can occur during semantic-to-CRDT conversion.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -231,9 +225,7 @@ pub enum ConversionError {
 /// Result type for conversion operations.
 pub type ConversionResult<T> = Result<T, ConversionError>;
 
-// =============================================================================
 // ID Allocator
-// =============================================================================
 
 /// Allocates unique IDs for CRDT operations.
 #[derive(Debug, Clone)]
@@ -273,9 +265,7 @@ impl IdAllocator {
     }
 }
 
-// =============================================================================
 // Semantic to CRDT Converter
-// =============================================================================
 
 /// Converts SemanticDiff results to CRDT operations.
 ///
@@ -567,9 +557,7 @@ impl SemanticToCrdt {
     }
 }
 
-// =============================================================================
 // Convenience Functions
-// =============================================================================
 
 /// Convert a SemanticDiff to FileOps with default configuration.
 ///
@@ -608,9 +596,7 @@ pub fn convert_diff_to_file_ops_with_config<'a>(
     Ok((ops, converter.stats().clone()))
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -625,9 +611,7 @@ mod tests {
         TrunkId::new(test_change_id(), 0)
     }
 
-    // =========================================================================
     // ConversionConfig tests
-    // =========================================================================
 
     #[test]
     fn test_conversion_config_default() {
@@ -652,9 +636,7 @@ mod tests {
         assert!(config.encoding.is_none());
     }
 
-    // =========================================================================
     // ConversionStats tests
-    // =========================================================================
 
     #[test]
     fn test_conversion_stats_default() {
@@ -696,9 +678,7 @@ mod tests {
         assert!(display.contains("10 token ops"));
     }
 
-    // =========================================================================
     // SemanticToCrdt tests
-    // =========================================================================
 
     #[test]
     fn test_convert_added_line() {
@@ -809,9 +789,7 @@ mod tests {
         assert!(!converter.stats().has_operations());
     }
 
-    // =========================================================================
     // Convenience function tests
-    // =========================================================================
 
     #[test]
     fn test_convert_diff_to_file_ops() {
@@ -847,9 +825,7 @@ mod tests {
         assert!(stats.has_operations());
     }
 
-    // =========================================================================
     // Integration tests
-    // =========================================================================
 
     #[test]
     fn test_multiline_conversion() {

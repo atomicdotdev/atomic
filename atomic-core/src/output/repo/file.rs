@@ -101,9 +101,7 @@ use super::conflict::{FileConflict, FileConflictType};
 use super::content::output_graph_content;
 use super::error::OutputError;
 
-// ============================================================================
 // FILE OUTPUT OPTIONS
-// ============================================================================
 
 /// Options for single file output.
 ///
@@ -249,9 +247,7 @@ impl Default for FileOutputOptions {
     }
 }
 
-// ============================================================================
 // FILE OUTPUT RESULT
-// ============================================================================
 
 /// Result of outputting a single file.
 ///
@@ -435,9 +431,7 @@ impl FileOutputResult {
     }
 }
 
-// ============================================================================
 // FILE OUTPUT ERROR
-// ============================================================================
 
 /// Error type for file output operations.
 ///
@@ -510,9 +504,7 @@ impl<WE> From<OutputError> for FileOutputError<WE> {
     }
 }
 
-// ============================================================================
 // OUTPUT FILE FUNCTION
-// ============================================================================
 
 /// Output a single file from the repository graph to the working copy.
 ///
@@ -927,17 +919,13 @@ where
     Ok((content, conflicts))
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ========================================================================
     // FileOutputOptions Tests
-    // ========================================================================
 
     #[test]
     fn test_options_new() {
@@ -1056,9 +1044,7 @@ mod tests {
         assert_eq!(retrieve.max_vertices, Some(500));
     }
 
-    // ========================================================================
     // FileOutputResult Tests
-    // ========================================================================
 
     #[test]
     fn test_result_new() {
@@ -1222,9 +1208,7 @@ mod tests {
         assert_ne!(result1, result2);
     }
 
-    // ========================================================================
     // FileOutputError Tests
-    // ========================================================================
 
     #[test]
     fn test_error_display_graph() {

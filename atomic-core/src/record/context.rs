@@ -84,9 +84,7 @@ use crate::pristine::{GraphTxnT, StackState, StackTxnT, TreeTxnT};
 use super::builder::RecordBuilder;
 use super::detect::DetectOptions;
 
-// ============================================================================
 // DETECT CONTEXT
-// ============================================================================
 
 /// Context for change detection operations.
 ///
@@ -112,7 +110,7 @@ use super::detect::DetectOptions;
 ///
 /// // Detect changes under a prefix
 /// let result = ctx.detect_changes(
-///     DetectOptions::new().prefix("src/")
+///     DetectOptions::new().with_prefix("src/")
 /// )?;
 /// ```
 #[derive(Debug)]
@@ -203,8 +201,8 @@ where
     /// let ctx = DetectContext::new(&txn, &working_copy, &changes)
     ///     .with_options(
     ///         DetectOptions::new()
-    ///             .algorithm(Algorithm::Patience)
-    ///             .check_mtime(false)
+    ///             .with_algorithm(Algorithm::Patience)
+    ///             .with_check_mtime(false)
     ///     );
     /// ```
     pub fn with_options(mut self, options: DetectOptions) -> Self {
@@ -302,9 +300,7 @@ where
     }
 }
 
-// ============================================================================
 // RECORD CONTEXT
-// ============================================================================
 
 /// Context for recording changes.
 ///
@@ -426,7 +422,7 @@ where
     ///
     /// ```rust,ignore
     /// let ctx = RecordContext::new(&txn, &stack, &working_copy, &changes)
-    ///     .with_options(DetectOptions::new().check_mtime(false));
+    ///     .with_options(DetectOptions::new().with_check_mtime(false));
     /// ```
     pub fn with_options(mut self, options: DetectOptions) -> Self {
         self.detect = self.detect.with_options(options);
@@ -565,9 +561,7 @@ where
     }
 }
 
-// ============================================================================
 // RECORD ITEM - Internal tracking structure
-// ============================================================================
 
 /// Internal item for tracking files during recording.
 ///
@@ -685,9 +679,7 @@ impl Default for RecordItem {
     }
 }
 
-// ============================================================================
 // FILE STATE - Pristine file state for comparison
-// ============================================================================
 
 /// Represents the pristine state of a file for comparison.
 ///
@@ -770,9 +762,7 @@ impl PristineFileState {
     }
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -786,9 +776,7 @@ mod tests {
         SerializedGraphEdge,
     };
 
-    // ========================================================================
     // Mock Transaction for Testing
-    // ========================================================================
 
     /// Mock transaction for testing contexts.
     #[derive(Debug, Default)]
@@ -934,9 +922,7 @@ mod tests {
         }
     }
 
-    // ========================================================================
     // DetectContext Tests
-    // ========================================================================
 
     #[test]
     fn test_detect_context_new() {
@@ -972,9 +958,9 @@ mod tests {
         let change_store = MemoryChangeStore::new();
 
         let options = DetectOptions::new()
-            .algorithm(Algorithm::Patience)
-            .check_mtime(false)
-            .prefix("src/");
+            .with_algorithm(Algorithm::Patience)
+            .with_check_mtime(false)
+            .with_prefix("src/");
 
         let ctx = DetectContext::new(&txn, &working_copy, &change_store).with_options(options);
 
@@ -990,7 +976,7 @@ mod tests {
         let change_store = MemoryChangeStore::new();
 
         let ctx = DetectContext::new(&txn, &working_copy, &change_store)
-            .with_options(DetectOptions::new().prefix("test/"));
+            .with_options(DetectOptions::new().with_prefix("test/"));
 
         let cloned = ctx.clone();
 
@@ -998,9 +984,7 @@ mod tests {
         assert_eq!(cloned.algorithm(), ctx.algorithm());
     }
 
-    // ========================================================================
     // RecordContext Tests
-    // ========================================================================
 
     #[test]
     fn test_record_context_new() {
@@ -1039,7 +1023,7 @@ mod tests {
         let stack = StackState::default();
 
         let ctx = RecordContext::new(&txn, &stack, &working_copy, &change_store)
-            .with_options(DetectOptions::new().algorithm(Algorithm::Patience));
+            .with_options(DetectOptions::new().with_algorithm(Algorithm::Patience));
 
         assert_eq!(ctx.options().algorithm, Algorithm::Patience);
     }
@@ -1086,9 +1070,7 @@ mod tests {
         assert!(ctx.builder().force_rediff);
     }
 
-    // ========================================================================
     // RecordItem Tests
-    // ========================================================================
 
     #[test]
     fn test_record_item_new() {
@@ -1189,9 +1171,7 @@ mod tests {
         assert!(debug.contains("RecordItem"));
     }
 
-    // ========================================================================
     // PristineFileState Tests
-    // ========================================================================
 
     #[test]
     fn test_pristine_file_state_new() {

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Types for the clone command.
 //!
 //! This module defines the data structures used throughout the clone operation,
@@ -21,13 +20,9 @@
 //! 3. **Self-documenting**: Rich documentation with examples
 //! 4. **Type-safe**: Leverage Rust's type system to prevent invalid states
 
-use std::path::PathBuf;
 
-use atomic_core::types::Merkle;
 
-// =============================================================================
 // CloneProgress
-// =============================================================================
 
 /// Tracks the progress of an ongoing clone operation.
 ///
@@ -74,29 +69,17 @@ pub enum ClonePhase {
     #[default]
     NotStarted,
 
-    /// Connecting to the remote server.
-    Connecting,
-
-    /// Querying remote state and changelist.
-    QueryingRemote,
-
     /// Downloading changes from the remote.
     Downloading,
 
     /// Applying downloaded changes to the local stack.
     Applying,
 
-    /// Downloading tag files.
-    DownloadingTags,
-
     /// Configuring the remote in repository settings.
     ConfiguringRemote,
 
     /// Clone operation completed successfully.
     Complete,
-
-    /// Clone operation failed.
-    Failed,
 }
 
 impl CloneProgress {
@@ -127,25 +110,6 @@ impl CloneProgress {
             tags_downloaded: 0,
             phase: ClonePhase::NotStarted,
         }
-    }
-
-    /// Set the current phase.
-    ///
-    /// # Arguments
-    ///
-    /// * `phase` - The new phase to set
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::types::{CloneProgress, ClonePhase};
-    ///
-    /// let progress = CloneProgress::new(10).with_phase(ClonePhase::Downloading);
-    /// assert_eq!(progress.phase, ClonePhase::Downloading);
-    /// ```
-    pub fn with_phase(mut self, phase: ClonePhase) -> Self {
-        self.phase = phase;
-        self
     }
 
     /// Record a successfully downloaded change.
@@ -181,82 +145,6 @@ impl CloneProgress {
     pub fn record_applied(&mut self) {
         self.applied += 1;
     }
-
-    /// Record a successfully downloaded tag.
-    ///
-    /// Increments the tags counter.
-    pub fn record_tag_downloaded(&mut self) {
-        self.tags_downloaded += 1;
-    }
-
-    /// Check if all changes have been downloaded.
-    ///
-    /// # Returns
-    ///
-    /// `true` if downloaded equals total_changes.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::types::CloneProgress;
-    ///
-    /// let mut progress = CloneProgress::new(2);
-    /// assert!(!progress.downloads_complete());
-    ///
-    /// progress.record_downloaded();
-    /// progress.record_downloaded();
-    /// assert!(progress.downloads_complete());
-    /// ```
-    pub fn downloads_complete(&self) -> bool {
-        self.downloaded >= self.total_changes
-    }
-
-    /// Check if all changes have been applied.
-    ///
-    /// # Returns
-    ///
-    /// `true` if applied equals total_changes.
-    pub fn applies_complete(&self) -> bool {
-        self.applied >= self.total_changes
-    }
-
-    /// Check if the clone operation is complete.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the phase is `Complete`.
-    pub fn is_complete(&self) -> bool {
-        self.phase == ClonePhase::Complete
-    }
-
-    /// Get the download progress as a percentage (0-100).
-    ///
-    /// # Returns
-    ///
-    /// The percentage of changes downloaded, or 0 if total_changes is 0.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::types::CloneProgress;
-    ///
-    /// let mut progress = CloneProgress::new(4);
-    /// assert_eq!(progress.download_percent(), 0);
-    ///
-    /// progress.record_downloaded();
-    /// assert_eq!(progress.download_percent(), 25);
-    ///
-    /// progress.record_downloaded();
-    /// progress.record_downloaded();
-    /// progress.record_downloaded();
-    /// assert_eq!(progress.download_percent(), 100);
-    /// ```
-    pub fn download_percent(&self) -> u8 {
-        if self.total_changes == 0 {
-            return 0;
-        }
-        ((self.downloaded * 100) / self.total_changes) as u8
-    }
 }
 
 impl Default for CloneProgress {
@@ -265,9 +153,7 @@ impl Default for CloneProgress {
     }
 }
 
-// =============================================================================
 // CloneStats
-// =============================================================================
 
 /// Statistics about a clone operation.
 ///
@@ -357,76 +243,6 @@ impl CloneStats {
         Self::default()
     }
 
-    /// Get total number of items downloaded (changes + tags).
-    ///
-    /// # Returns
-    ///
-    /// The sum of downloaded changes and tags.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::types::CloneStats;
-    ///
-    /// let mut stats = CloneStats::new();
-    /// stats.changes_downloaded = 10;
-    /// stats.tags_downloaded = 3;
-    ///
-    /// assert_eq!(stats.total_downloaded(), 13);
-    /// ```
-    pub fn total_downloaded(&self) -> usize {
-        self.changes_downloaded + self.tags_downloaded
-    }
-
-    /// Check if any items were downloaded.
-    ///
-    /// # Returns
-    ///
-    /// `true` if at least one change or tag was downloaded.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::types::CloneStats;
-    ///
-    /// let mut stats = CloneStats::new();
-    /// assert!(!stats.has_downloads());
-    ///
-    /// stats.changes_downloaded = 1;
-    /// assert!(stats.has_downloads());
-    /// ```
-    pub fn has_downloads(&self) -> bool {
-        self.total_downloaded() > 0
-    }
-
-    /// Check if nothing happened (no downloads, no skips, no failures).
-    ///
-    /// This indicates that the remote was empty.
-    ///
-    /// # Returns
-    ///
-    /// `true` if all counters are zero.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::types::CloneStats;
-    ///
-    /// let stats = CloneStats::new();
-    /// assert!(stats.is_noop());
-    ///
-    /// let mut stats2 = CloneStats::new();
-    /// stats2.changes_downloaded = 1;
-    /// assert!(!stats2.is_noop());
-    /// ```
-    pub fn is_noop(&self) -> bool {
-        self.changes_downloaded == 0
-            && self.tags_downloaded == 0
-            && self.changes_skipped == 0
-            && self.changes_failed == 0
-            && self.changes_applied == 0
-    }
-
     /// Check if any downloads failed.
     ///
     /// # Returns
@@ -494,46 +310,6 @@ impl CloneStats {
         self.bytes_transferred += bytes;
     }
 
-    /// Record a successfully downloaded tag.
-    ///
-    /// Increments the tag counter and adds the bytes to the transfer total.
-    ///
-    /// # Arguments
-    ///
-    /// * `bytes` - The size of the downloaded tag file in bytes
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::types::CloneStats;
-    ///
-    /// let mut stats = CloneStats::new();
-    /// stats.record_tag_downloaded(512);
-    ///
-    /// assert_eq!(stats.tags_downloaded, 1);
-    /// assert_eq!(stats.bytes_transferred, 512);
-    /// ```
-    pub fn record_tag_downloaded(&mut self, bytes: u64) {
-        self.tags_downloaded += 1;
-        self.bytes_transferred += bytes;
-    }
-
-    /// Record a skipped change (already exists locally).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::types::CloneStats;
-    ///
-    /// let mut stats = CloneStats::new();
-    /// stats.record_skipped();
-    ///
-    /// assert_eq!(stats.changes_skipped, 1);
-    /// ```
-    pub fn record_skipped(&mut self) {
-        self.changes_skipped += 1;
-    }
-
     /// Record a failed download.
     ///
     /// # Example
@@ -570,285 +346,15 @@ impl CloneStats {
     }
 }
 
-// =============================================================================
 // CloneOutcome
-// =============================================================================
 
-/// The outcome of a clone operation.
-///
-/// Contains statistics about what was downloaded and applied, along with
-/// metadata about the operation itself (was it a dry run? any warnings?).
-///
-/// # Example
-///
-/// ```rust
-/// use atomic::commands::clone::types::{CloneOutcome, CloneStats};
-/// use atomic_core::types::Merkle;
-/// use std::path::PathBuf;
-///
-/// let stats = CloneStats::new();
-/// let outcome = CloneOutcome::new(stats, PathBuf::from("/tmp/repo"))
-///     .with_remote_state(Merkle::ZERO);
-///
-/// assert!(outcome.is_success());
-/// assert!(!outcome.download_only);
-/// ```
-#[derive(Debug, Clone, Default)]
-pub struct CloneOutcome {
-    /// Statistics about the clone operation.
-    pub stats: CloneStats,
-
-    /// The path where the repository was cloned.
-    pub target_path: PathBuf,
-
-    /// The remote's Merkle state after the clone.
-    ///
-    /// This is useful for displaying the final state or for verification.
-    pub remote_state: Option<Merkle>,
-
-    /// The local Merkle state after the clone.
-    ///
-    /// Should match the remote state after a successful clone.
-    pub local_state: Option<Merkle>,
-
-    /// The stack that was cloned.
-    pub stack: String,
-
-    /// The remote URL that was cloned from.
-    pub remote_url: String,
-
-    /// Whether only downloads were performed (no apply).
-    pub download_only: bool,
-
-    /// Warning messages generated during the operation.
-    ///
-    /// Warnings don't prevent the operation from completing, but inform
-    /// the user about potential issues.
-    pub warnings: Vec<String>,
-}
-
-impl CloneOutcome {
-    /// Create a new clone outcome with the given statistics and target path.
-    ///
-    /// # Arguments
-    ///
-    /// * `stats` - The statistics from the clone operation
-    /// * `target_path` - The path where the repository was cloned
-    ///
-    /// # Returns
-    ///
-    /// A new `CloneOutcome` instance.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::types::{CloneOutcome, CloneStats};
-    /// use std::path::PathBuf;
-    ///
-    /// let mut stats = CloneStats::new();
-    /// stats.changes_downloaded = 5;
-    ///
-    /// let outcome = CloneOutcome::new(stats, PathBuf::from("/tmp/repo"));
-    /// assert_eq!(outcome.stats.changes_downloaded, 5);
-    /// ```
-    pub fn new(stats: CloneStats, target_path: PathBuf) -> Self {
-        Self {
-            stats,
-            target_path,
-            remote_state: None,
-            local_state: None,
-            stack: String::new(),
-            remote_url: String::new(),
-            download_only: false,
-            warnings: Vec::new(),
-        }
-    }
-
-    /// Create a download-only outcome with the given statistics.
-    ///
-    /// A download-only outcome indicates that changes were downloaded
-    /// but not applied to any local stack.
-    ///
-    /// # Arguments
-    ///
-    /// * `stats` - The download statistics
-    /// * `target_path` - The path where the repository was cloned
-    ///
-    /// # Returns
-    ///
-    /// A new `CloneOutcome` with `download_only = true`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::types::{CloneOutcome, CloneStats};
-    /// use std::path::PathBuf;
-    ///
-    /// let outcome = CloneOutcome::download_only(CloneStats::new(), PathBuf::from("/tmp/repo"));
-    /// assert!(outcome.download_only);
-    /// ```
-    pub fn download_only(stats: CloneStats, target_path: PathBuf) -> Self {
-        Self {
-            stats,
-            target_path,
-            download_only: true,
-            ..Default::default()
-        }
-    }
-
-    /// Set the remote state.
-    ///
-    /// # Arguments
-    ///
-    /// * `state` - The remote's current Merkle state
-    ///
-    /// # Returns
-    ///
-    /// Self with the remote state set, enabling method chaining.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::types::{CloneOutcome, CloneStats};
-    /// use atomic_core::types::Merkle;
-    /// use std::path::PathBuf;
-    ///
-    /// let outcome = CloneOutcome::new(CloneStats::new(), PathBuf::from("/tmp/repo"))
-    ///     .with_remote_state(Merkle::ZERO);
-    ///
-    /// assert!(outcome.remote_state.is_some());
-    /// ```
-    pub fn with_remote_state(mut self, state: Merkle) -> Self {
-        self.remote_state = Some(state);
-        self
-    }
-
-    /// Set the local state.
-    ///
-    /// # Arguments
-    ///
-    /// * `state` - The local Merkle state after clone
-    ///
-    /// # Returns
-    ///
-    /// Self with the local state set, enabling method chaining.
-    pub fn with_local_state(mut self, state: Merkle) -> Self {
-        self.local_state = Some(state);
-        self
-    }
-
-    /// Set the stack name.
-    ///
-    /// # Arguments
-    ///
-    /// * `stack` - The name of the cloned stack
-    ///
-    /// # Returns
-    ///
-    /// Self with the stack set, enabling method chaining.
-    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
-        self.stack = stack.into();
-        self
-    }
-
-    /// Set the remote URL.
-    ///
-    /// # Arguments
-    ///
-    /// * `url` - The URL that was cloned from
-    ///
-    /// # Returns
-    ///
-    /// Self with the remote URL set, enabling method chaining.
-    pub fn with_remote_url(mut self, url: impl Into<String>) -> Self {
-        self.remote_url = url.into();
-        self
-    }
-
-    /// Add a warning message.
-    ///
-    /// Warnings inform the user about potential issues but don't
-    /// prevent the operation from completing.
-    ///
-    /// # Arguments
-    ///
-    /// * `warning` - The warning message
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::types::{CloneOutcome, CloneStats};
-    /// use std::path::PathBuf;
-    ///
-    /// let mut outcome = CloneOutcome::new(CloneStats::new(), PathBuf::from("/tmp/repo"));
-    /// outcome.add_warning("Some files could not be written");
-    ///
-    /// assert!(outcome.has_warnings());
-    /// assert_eq!(outcome.warnings.len(), 1);
-    /// ```
-    pub fn add_warning(&mut self, warning: impl Into<String>) {
-        self.warnings.push(warning.into());
-    }
-
-    /// Check if the operation was successful.
-    ///
-    /// An operation is considered successful if there were no failures.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the operation completed without failures.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::types::{CloneOutcome, CloneStats};
-    /// use std::path::PathBuf;
-    ///
-    /// let outcome = CloneOutcome::new(CloneStats::new(), PathBuf::from("/tmp/repo"));
-    /// assert!(outcome.is_success());
-    ///
-    /// let mut stats = CloneStats::new();
-    /// stats.changes_failed = 1;
-    /// let outcome = CloneOutcome::new(stats, PathBuf::from("/tmp/repo"));
-    /// assert!(!outcome.is_success());
-    /// ```
-    pub fn is_success(&self) -> bool {
-        !self.stats.has_failures()
-    }
-
-    /// Check if there are any warnings.
-    ///
-    /// # Returns
-    ///
-    /// `true` if at least one warning was recorded.
-    pub fn has_warnings(&self) -> bool {
-        !self.warnings.is_empty()
-    }
-
-    /// Check if states match (remote and local are synchronized).
-    ///
-    /// # Returns
-    ///
-    /// `true` if both states are present and equal, `false` otherwise.
-    pub fn states_match(&self) -> bool {
-        match (&self.remote_state, &self.local_state) {
-            (Some(remote), Some(local)) => remote == local,
-            _ => false,
-        }
-    }
-}
-
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // ClonePhase Tests
-    // =========================================================================
 
     /// Test ClonePhase default value.
     #[test]
@@ -872,9 +378,7 @@ mod tests {
         assert_eq!(phase, cloned);
     }
 
-    // =========================================================================
     // CloneProgress Tests
-    // =========================================================================
 
     /// Test creating a CloneProgress with total changes.
     #[test]
@@ -1010,9 +514,7 @@ mod tests {
         assert_eq!(original, cloned);
     }
 
-    // =========================================================================
     // CloneStats Tests
-    // =========================================================================
 
     /// Test creating empty statistics.
     #[test]
@@ -1175,9 +677,7 @@ mod tests {
         assert_eq!(original, cloned);
     }
 
-    // =========================================================================
     // CloneOutcome Tests
-    // =========================================================================
 
     /// Test creating a new outcome.
     #[test]

@@ -35,9 +35,7 @@ use std::path::Path;
 use std::time::Duration;
 use url::Url;
 
-// =============================================================================
 // Constants
-// =============================================================================
 
 /// User-Agent header sent with all requests.
 ///
@@ -58,9 +56,7 @@ const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Accepted content encodings for compression.
 const ACCEPT_ENCODING_VALUE: &str = "zstd, gzip, deflate";
 
-// =============================================================================
 // HttpRemoteConfig
-// =============================================================================
 
 /// Configuration options for an HTTP remote connection.
 #[derive(Debug, Clone)]
@@ -123,9 +119,7 @@ impl HttpRemoteConfig {
     }
 }
 
-// =============================================================================
 // HttpRemote
-// =============================================================================
 
 /// HTTP client for communicating with remote Atomic repositories.
 ///
@@ -794,9 +788,7 @@ impl HttpRemote {
         }
     }
 
-    // =========================================================================
     // Streaming V3 Protocol Methods
-    // =========================================================================
 
     /// Upload a change file by reading directly from disk.
     ///
@@ -1094,9 +1086,7 @@ impl HttpRemote {
     }
 }
 
-// =============================================================================
 // Helper Functions
-// =============================================================================
 
 /// Infer the repository name from a URL.
 ///
@@ -1151,9 +1141,7 @@ fn parse_changelist(text: &str) -> RemoteResult<Vec<ChangelistEntry>> {
     Ok(entries)
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

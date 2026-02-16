@@ -64,9 +64,7 @@ use super::context::ApplyContext;
 use super::error::{storage_err, ApplyError, ApplyResult};
 use super::traits::MutCrdtTxnT;
 
-// =============================================================================
 // Public API
-// =============================================================================
 
 /// Applies a LeafOp to the pristine database.
 ///
@@ -124,9 +122,7 @@ pub fn apply_leaf_op<T: MutCrdtTxnT>(
     }
 }
 
-// =============================================================================
 // Insert Operation
-// =============================================================================
 
 /// Applies an Insert operation to create a new token.
 ///
@@ -193,9 +189,7 @@ fn apply_insert<T: MutCrdtTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Delete Operation
-// =============================================================================
 
 /// Applies a Delete operation to mark a token as deleted.
 ///
@@ -242,9 +236,7 @@ fn apply_delete<T: MutCrdtTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Replace Operation
-// =============================================================================
 
 /// Applies a Replace operation to change a token's content.
 ///
@@ -294,9 +286,7 @@ fn apply_replace<T: MutCrdtTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Restore Operation
-// =============================================================================
 
 /// Applies a Restore operation to restore a deleted token.
 ///
@@ -341,9 +331,7 @@ fn apply_restore<T: MutCrdtTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Validation Helpers
-// =============================================================================
 
 /// Validates that a leaf exists and is in the expected state.
 ///
@@ -415,9 +403,7 @@ pub fn validate_leaf_parent<T: MutCrdtTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -427,9 +413,7 @@ mod tests {
     use crate::types::{Inode, NodeId};
     use std::collections::HashMap;
 
-    // =========================================================================
     // Mock Transaction
-    // =========================================================================
 
     #[derive(Default)]
     struct MockTxn {
@@ -599,9 +583,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // Helper Functions
-    // =========================================================================
 
     fn create_test_branch(txn: &mut MockTxn, change_id: u64, branch_idx: u32) -> BranchId {
         let trunk_id = TrunkId::new(NodeId::new(change_id), 0);
@@ -611,9 +593,7 @@ mod tests {
         branch_id
     }
 
-    // =========================================================================
     // Insert Tests
-    // =========================================================================
 
     #[test]
     fn test_apply_insert() {
@@ -727,9 +707,7 @@ mod tests {
         assert!(result.unwrap_err().is_not_found());
     }
 
-    // =========================================================================
     // Delete Tests
-    // =========================================================================
 
     #[test]
     fn test_apply_delete() {
@@ -793,9 +771,7 @@ mod tests {
         assert!(result.unwrap_err().is_invalid_state());
     }
 
-    // =========================================================================
     // Replace Tests
-    // =========================================================================
 
     #[test]
     fn test_apply_replace() {
@@ -871,9 +847,7 @@ mod tests {
         assert!(result.unwrap_err().is_invalid_state());
     }
 
-    // =========================================================================
     // Restore Tests
-    // =========================================================================
 
     #[test]
     fn test_apply_restore() {
@@ -939,9 +913,7 @@ mod tests {
         assert!(result.unwrap_err().is_not_found());
     }
 
-    // =========================================================================
     // Validation Helper Tests
-    // =========================================================================
 
     #[test]
     fn test_validate_leaf_state() {

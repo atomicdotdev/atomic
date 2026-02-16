@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Types for the push command.
 //!
 //! This module defines the data structures used throughout the push operation,
@@ -6,9 +5,7 @@
 
 use atomic_core::types::{Hash, Merkle};
 
-// =============================================================================
 // PushChange
-// =============================================================================
 
 /// A change to be pushed to the remote.
 ///
@@ -138,11 +135,6 @@ impl PushChange {
         self
     }
 
-    /// Check if this change has a message.
-    pub fn has_message(&self) -> bool {
-        self.message.is_some()
-    }
-
     /// Get the message or a default placeholder.
     pub fn message_or_default(&self) -> &str {
         self.message.as_deref().unwrap_or("(no message)")
@@ -178,229 +170,17 @@ impl PushChange {
     }
 }
 
-// =============================================================================
 // PushStats
-// =============================================================================
 
-/// Statistics about a push operation.
-///
-/// Tracks metrics about what was pushed, useful for reporting and testing.
-///
-/// # Example
-///
-/// ```rust
-/// use atomic::commands::push::types::PushStats;
-///
-/// let mut stats = PushStats::new();
-/// assert_eq!(stats.changes_uploaded, 0);
-/// assert_eq!(stats.total_uploaded(), 0);
-///
-/// stats.changes_uploaded = 5;
-/// stats.tags_uploaded = 2;
-/// assert_eq!(stats.total_uploaded(), 7);
-/// assert!(stats.has_uploads());
-/// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PushStats {
-    /// Number of changes successfully uploaded.
-    pub changes_uploaded: usize,
-
-    /// Number of tags successfully uploaded.
-    pub tags_uploaded: usize,
-
-    /// Total bytes transferred to the remote.
-    pub bytes_transferred: u64,
-
-    /// Number of changes skipped (already on remote).
-    pub changes_skipped: usize,
-
-    /// Number of changes that failed to upload.
-    pub changes_failed: usize,
-}
-
-impl PushStats {
-    /// Create new empty statistics.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::push::types::PushStats;
-    ///
-    /// let stats = PushStats::new();
-    /// assert_eq!(stats.changes_uploaded, 0);
-    /// assert_eq!(stats.bytes_transferred, 0);
-    /// ```
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Get the total number of items uploaded (changes + tags).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::push::types::PushStats;
-    ///
-    /// let mut stats = PushStats::new();
-    /// stats.changes_uploaded = 3;
-    /// stats.tags_uploaded = 1;
-    /// assert_eq!(stats.total_uploaded(), 4);
-    /// ```
-    pub fn total_uploaded(&self) -> usize {
-        self.changes_uploaded + self.tags_uploaded
-    }
-
-    /// Check if anything was uploaded.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::push::types::PushStats;
-    ///
-    /// let stats = PushStats::new();
-    /// assert!(!stats.has_uploads());
-    /// ```
-    pub fn has_uploads(&self) -> bool {
-        self.total_uploaded() > 0
-    }
-
-    /// Check if the operation was a no-op (nothing to push).
-    ///
-    /// Returns true if nothing was uploaded but some changes were skipped,
-    /// indicating the remote was already up to date.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::push::types::PushStats;
-    ///
-    /// let mut stats = PushStats::new();
-    /// stats.changes_skipped = 5;
-    /// assert!(stats.is_noop());
-    /// ```
-    pub fn is_noop(&self) -> bool {
-        self.total_uploaded() == 0 && self.changes_skipped > 0
-    }
-
-    /// Check if there were any failures.
-    pub fn has_failures(&self) -> bool {
-        self.changes_failed > 0
-    }
-
-    /// Record a successful change upload.
-    ///
-    /// # Arguments
-    ///
-    /// * `bytes` - Number of bytes transferred for this change
-    pub fn record_change_uploaded(&mut self, bytes: u64) {
-        self.changes_uploaded += 1;
-        self.bytes_transferred += bytes;
-    }
-
-    /// Record a successful tag upload.
-    ///
-    /// # Arguments
-    ///
-    /// * `bytes` - Number of bytes transferred for this tag
-    pub fn record_tag_uploaded(&mut self, bytes: u64) {
-        self.tags_uploaded += 1;
-        self.bytes_transferred += bytes;
-    }
-
-    /// Record a skipped change.
-    pub fn record_skipped(&mut self) {
-        self.changes_skipped += 1;
-    }
-
-    /// Record a failed change.
-    pub fn record_failed(&mut self) {
-        self.changes_failed += 1;
-    }
-}
-
-// =============================================================================
 // PushOutcome
-// =============================================================================
 
-/// The outcome of a push operation.
-///
-/// Contains both the statistics and any relevant state information
-/// about the completed push.
-#[derive(Debug, Clone)]
-pub struct PushOutcome {
-    /// Statistics about the push operation.
-    pub stats: PushStats,
-
-    /// The final Merkle state on the remote after pushing.
-    pub remote_state: Option<Merkle>,
-
-    /// Whether the push was a dry run (no actual changes made).
-    pub dry_run: bool,
-
-    /// Any warning messages generated during the push.
-    pub warnings: Vec<String>,
-}
-
-impl PushOutcome {
-    /// Create a new push outcome.
-    pub fn new(stats: PushStats) -> Self {
-        Self {
-            stats,
-            remote_state: None,
-            dry_run: false,
-            warnings: Vec::new(),
-        }
-    }
-
-    /// Create a dry run outcome.
-    pub fn dry_run(stats: PushStats) -> Self {
-        Self {
-            stats,
-            remote_state: None,
-            dry_run: true,
-            warnings: Vec::new(),
-        }
-    }
-
-    /// Set the remote state.
-    pub fn with_remote_state(mut self, state: Merkle) -> Self {
-        self.remote_state = Some(state);
-        self
-    }
-
-    /// Add a warning message.
-    pub fn add_warning(&mut self, message: impl Into<String>) {
-        self.warnings.push(message.into());
-    }
-
-    /// Check if the push was successful (no failures).
-    pub fn is_success(&self) -> bool {
-        !self.stats.has_failures()
-    }
-
-    /// Check if there are any warnings.
-    pub fn has_warnings(&self) -> bool {
-        !self.warnings.is_empty()
-    }
-}
-
-impl Default for PushOutcome {
-    fn default() -> Self {
-        Self::new(PushStats::new())
-    }
-}
-
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // PushChange Tests
-    // =========================================================================
 
     #[test]
     fn test_push_change_new() {
@@ -488,9 +268,7 @@ mod tests {
         assert!(debug_str.contains("sequence: 0"));
     }
 
-    // =========================================================================
     // PushStats Tests
-    // =========================================================================
 
     #[test]
     fn test_push_stats_new() {
@@ -612,9 +390,7 @@ mod tests {
         assert_eq!(stats, cloned);
     }
 
-    // =========================================================================
     // PushOutcome Tests
-    // =========================================================================
 
     #[test]
     fn test_push_outcome_new() {

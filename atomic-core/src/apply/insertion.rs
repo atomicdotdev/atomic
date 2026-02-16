@@ -52,9 +52,7 @@ use super::error::LocalApplyError;
 use super::position::{resolve_context_vertex, resolve_inode, resolve_position};
 use super::workspace::Workspace;
 
-// =============================================================================
 // Insertion Application
-// =============================================================================
 
 /// Apply a Insertion atom to the graph.
 ///
@@ -178,9 +176,7 @@ pub fn apply_new_vertex<T: MutTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Edge Operations
-// =============================================================================
 
 /// Add an edge and its reverse to the graph.
 ///
@@ -247,9 +243,7 @@ pub fn add_edge_with_reverse<T: MutTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Conflict Detection
-// =============================================================================
 
 /// Check if a context span was deleted by an unknown change.
 ///
@@ -309,18 +303,14 @@ fn check_deleted_context<T: GraphTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::ChangePosition;
 
-    // =========================================================================
     // Test Helpers
-    // =========================================================================
 
     fn make_position(change: Option<Hash>, pos: u64) -> Position<Option<Hash>> {
         Position {
@@ -344,9 +334,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // Insertion Structure Tests
-    // =========================================================================
 
     #[test]
     fn test_new_vertex_creation() {
@@ -414,9 +402,7 @@ mod tests {
         assert!(insertion.flag.contains(EdgeFlags::BLOCK));
     }
 
-    // =========================================================================
     // GraphNode Creation Tests
-    // =========================================================================
 
     #[test]
     fn test_internal_vertex_creation() {
@@ -460,9 +446,7 @@ mod tests {
         assert!(!node.is_root());
     }
 
-    // =========================================================================
     // Edge Flag Tests
-    // =========================================================================
 
     #[test]
     fn test_edge_flags_block() {
@@ -519,9 +503,7 @@ mod tests {
         assert!(down_flag.contains(EdgeFlags::BLOCK));
     }
 
-    // =========================================================================
     // SerializedGraphEdge Tests
-    // =========================================================================
 
     #[test]
     fn test_serialized_edge_creation() {
@@ -554,9 +536,7 @@ mod tests {
         assert!(reverse.flag().contains(EdgeFlags::PARENT));
     }
 
-    // =========================================================================
     // Workspace Context Tests
-    // =========================================================================
 
     #[test]
     fn test_workspace_context_tracking() {
@@ -612,9 +592,7 @@ mod tests {
         assert!(workspace.is_rooted(&pos));
     }
 
-    // =========================================================================
     // Error Case Tests
-    // =========================================================================
 
     #[test]
     fn test_cyclic_dependency_error() {

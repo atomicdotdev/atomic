@@ -44,9 +44,7 @@ use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_info, print_section, print_warning};
 
-// =============================================================================
 // Command Definition
-// =============================================================================
 
 /// Show the current default identity.
 ///
@@ -185,9 +183,7 @@ impl WhoAmI {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

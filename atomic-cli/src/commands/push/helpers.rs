@@ -37,9 +37,7 @@ use crate::output::{info, stack as style_stack};
 
 use super::types::PushChange;
 
-// =============================================================================
 // Delta Calculation
-// =============================================================================
 
 /// Calculate which changes need to be pushed to the remote.
 ///
@@ -151,9 +149,7 @@ pub fn has_diverged(local_entries: &[HistoryEntry], remote_entries: &[Changelist
         .any(|e| !local_hashes.contains(&e.hash))
 }
 
-// =============================================================================
 // Change Data Loading
-// =============================================================================
 
 /// Load and serialize change data from the repository.
 ///
@@ -190,46 +186,7 @@ pub fn load_change_data(repo: &Repository, hash: &Hash) -> CliResult<Bytes> {
     Ok(Bytes::from(buffer))
 }
 
-/// Get the on-disk path of a change file for direct file-based push.
-///
-/// This returns the path to the `.change` file in the repository's change
-/// store, enabling `HttpRemote::upload_change_file()` to stream bytes
-/// directly from disk without the load → deserialize → re-serialize
-/// roundtrip.
-///
-/// # Arguments
-///
-/// * `repo` - The repository containing the change.
-/// * `hash` - The hash of the change.
-///
-/// # Returns
-///
-/// The path to the `.change` file on disk.
-///
-/// # Errors
-///
-/// Returns `CliError::ChangeNotFound` if the file doesn't exist.
-pub fn change_file_path(repo: &Repository, hash: &Hash) -> CliResult<std::path::PathBuf> {
-    let base32 = hash.to_base32();
-    let prefix = &base32[..2.min(base32.len())];
-    let filename = format!("{}.change", base32);
-    let path = repo
-        .root()
-        .join(".atomic")
-        .join("changes")
-        .join(prefix)
-        .join(filename);
-
-    if path.exists() {
-        Ok(path)
-    } else {
-        Err(CliError::ChangeNotFound { hash: base32 })
-    }
-}
-
-// =============================================================================
 // Delta Transfer Protocol
-// =============================================================================
 
 /// Size threshold (in bytes) for delta transfer negotiation.
 ///
@@ -280,17 +237,6 @@ impl PushTransferResult {
             bytes_saved: 0,
             chunks_reused: 0,
             chunks_total: 0,
-        }
-    }
-
-    /// Create a result for a delta transfer.
-    pub fn delta(bytes_sent: u64, bytes_saved: u64, chunks_reused: u32, chunks_total: u32) -> Self {
-        Self {
-            used_delta: true,
-            bytes_sent,
-            bytes_saved,
-            chunks_reused,
-            chunks_total,
         }
     }
 
@@ -413,9 +359,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-// =============================================================================
 // Error Conversion
-// =============================================================================
 
 /// Convert a remote error to a CLI error.
 ///
@@ -479,9 +423,7 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
     }
 }
 
-// =============================================================================
 // Display Helpers
-// =============================================================================
 
 /// Display the state comparison between local and remote.
 ///
@@ -562,17 +504,13 @@ pub fn format_count(count: usize, singular: &str) -> String {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // Delta Calculation Tests
-    // =========================================================================
 
     #[test]
     fn test_has_diverged_empty_remote() {
@@ -630,9 +568,7 @@ mod tests {
         assert!(!has_diverged(&local_entries, &remote_entries));
     }
 
-    // =========================================================================
     // Error Conversion Tests
-    // =========================================================================
 
     #[test]
     fn test_convert_connection_failed() {
@@ -702,9 +638,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // Format Count Tests
-    // =========================================================================
 
     #[test]
     fn test_format_count_zero() {
@@ -730,9 +664,7 @@ mod tests {
         assert_eq!(format_count(3, "warning"), "3 warnings");
     }
 
-    // =========================================================================
     // Display Helper Tests
-    // =========================================================================
 
     #[test]
     fn test_format_local_state_empty() {
@@ -759,9 +691,7 @@ mod tests {
         assert_eq!(format_remote_state(&state, &entries), "(empty)");
     }
 
-    // =========================================================================
     // Test Helpers
-    // =========================================================================
 
     /// Create a test history entry with a deterministic hash.
     /// The hash is created from the hash_str so that when compared with

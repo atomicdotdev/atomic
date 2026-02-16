@@ -110,9 +110,7 @@ use std::pin::Pin;
 use crate::error::AgentResult;
 use crate::event::TurnChanges;
 
-// =============================================================================
 // WatcherConfig
-// =============================================================================
 
 /// Configuration for creating a [`FileWatcher`].
 ///
@@ -182,9 +180,7 @@ impl WatcherConfig {
     }
 }
 
-// =============================================================================
 // FileWatcher Trait
-// =============================================================================
 
 /// Trait for detecting file changes during agent turns.
 ///
@@ -273,9 +269,7 @@ pub trait FileWatcher: Send + Sync {
     fn is_active(&self) -> bool;
 }
 
-// =============================================================================
 // Factory Function
-// =============================================================================
 
 /// Create a [`FileWatcher`] using the best available backend.
 ///
@@ -314,17 +308,13 @@ pub async fn create_watcher(config: WatcherConfig) -> AgentResult<Box<dyn FileWa
     Ok(Box::new(fallback::FallbackWatcher::new(config)))
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // WatcherConfig tests
-    // =========================================================================
 
     #[test]
     fn test_config_new() {
@@ -391,9 +381,7 @@ mod tests {
         assert!(debug.contains(".atomic"));
     }
 
-    // =========================================================================
     // FileWatcher trait tests (object safety)
-    // =========================================================================
 
     #[test]
     fn test_file_watcher_is_object_safe() {
@@ -402,9 +390,7 @@ mod tests {
         fn _accept_boxed(_watcher: Box<dyn FileWatcher>) {}
     }
 
-    // =========================================================================
     // create_watcher tests
-    // =========================================================================
 
     #[tokio::test]
     async fn test_create_watcher_returns_fallback() {

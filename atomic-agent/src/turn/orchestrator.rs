@@ -67,9 +67,7 @@ use crate::turn::phase::{self, Action, Event, Phase, TransitionContext};
 use crate::turn::session::{AgentSession, SessionStore};
 use crate::watcher::{self, FileWatcher, WatcherConfig};
 
-// =============================================================================
 // DispatchResult
-// =============================================================================
 
 /// The result of dispatching an event through the orchestrator.
 ///
@@ -150,9 +148,7 @@ impl std::fmt::Display for DispatchResult {
     }
 }
 
-// =============================================================================
 // TurnOrchestrator
-// =============================================================================
 
 /// Central coordinator for agent turn lifecycle.
 ///
@@ -257,9 +253,7 @@ impl TurnOrchestrator {
         &self.session_store
     }
 
-    // =========================================================================
     // Main dispatch
-    // =========================================================================
 
     /// Dispatch a turn event through the orchestrator.
     ///
@@ -289,9 +283,7 @@ impl TurnOrchestrator {
         }
     }
 
-    // =========================================================================
     // Event handlers
-    // =========================================================================
 
     /// Handle a SessionStart event.
     ///
@@ -368,7 +360,6 @@ impl TurnOrchestrator {
             }
         }
 
-        // =====================================================================
         // Fork the agent stack from the current stack.
         //
         // This ensures the agent inherits all existing changes (e.g.,
@@ -380,7 +371,6 @@ impl TurnOrchestrator {
         // Best-effort: if the repo can't be opened or the stack already
         // exists (resumed session), we log and continue — recording will
         // still work, it just won't have the parent's history.
-        // =====================================================================
         if session.parent_stack.is_none() {
             match atomic_repository::Repository::open(&self.repo_root) {
                 Ok(mut repo) => {
@@ -653,7 +643,6 @@ impl TurnOrchestrator {
             if session.turn_count == 1 { "" } else { "s" },
         );
 
-        // =====================================================================
         // Create an attestation for this session's changes.
         //
         // The attestation is a graph-level audit node that captures which
@@ -661,7 +650,6 @@ impl TurnOrchestrator {
         // data are left at zero — they're not available from the hook
         // payload. They can be enriched later when `claude --resume` data
         // is available.
-        // =====================================================================
         if session.turn_count > 0 {
             self.create_session_attestation(&session);
         }
@@ -704,9 +692,7 @@ impl TurnOrchestrator {
         Ok(DispatchResult::new(session_id, session.phase))
     }
 
-    // =========================================================================
     // Helpers
-    // =========================================================================
 
     /// Load an existing session or create a new one.
     ///
@@ -810,7 +796,6 @@ impl TurnOrchestrator {
         let all_change_hashes: Vec<atomic_core::types::Hash> =
             history.iter().map(|e| e.hash).collect();
 
-        // =====================================================================
         // Handle resumed sessions: find existing attestations and determine
         // which changes are new (not yet covered by any attestation).
         //
@@ -818,7 +803,6 @@ impl TurnOrchestrator {
         // On a resumed session, only the changes added since the last
         // attestation need to be covered. The new attestation chains to
         // the most recent existing one via `previous_attestation`.
-        // =====================================================================
         let mut already_covered: HashSet<atomic_core::types::Hash> = HashSet::new();
         let mut previous_attestation: Option<atomic_core::types::Hash> = None;
         let mut latest_attest_timestamp: i64 = 0;
@@ -953,9 +937,7 @@ impl std::fmt::Debug for TurnOrchestrator {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -993,9 +975,7 @@ mod tests {
         TurnEvent::new(session_id, HookType::SessionEnd)
     }
 
-    // =========================================================================
     // DispatchResult tests
-    // =========================================================================
 
     #[test]
     fn test_dispatch_result_new() {
@@ -1036,9 +1016,7 @@ mod tests {
         assert!(s.contains("test warning"));
     }
 
-    // =========================================================================
     // SessionStart tests
-    // =========================================================================
 
     #[tokio::test]
     async fn test_session_start_creates_session() {
@@ -1090,9 +1068,7 @@ mod tests {
         assert_eq!(session.turn_count, 3); // preserved
     }
 
-    // =========================================================================
     // TurnStart tests
-    // =========================================================================
 
     #[tokio::test]
     async fn test_turn_start_transitions_to_active() {
@@ -1137,9 +1113,7 @@ mod tests {
         assert!(session.is_some());
     }
 
-    // =========================================================================
     // TurnEnd tests
-    // =========================================================================
 
     #[tokio::test]
     async fn test_turn_end_with_no_changes() {
@@ -1196,9 +1170,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // SessionEnd tests
-    // =========================================================================
 
     #[tokio::test]
     async fn test_session_end_transitions_to_ended() {
@@ -1251,9 +1223,7 @@ mod tests {
         assert!(!orch.watcher.is_active());
     }
 
-    // =========================================================================
     // ToolUse tests
-    // =========================================================================
 
     #[tokio::test]
     async fn test_tool_use_event_handled() {
@@ -1285,9 +1255,7 @@ mod tests {
         assert_eq!(result.new_phase, Phase::Idle);
     }
 
-    // =========================================================================
     // Full lifecycle integration test
-    // =========================================================================
 
     #[tokio::test]
     async fn test_full_lifecycle_multi_turn() {
@@ -1367,9 +1335,7 @@ mod tests {
         assert_eq!(session.first_prompt.as_deref(), Some("First attempt"));
     }
 
-    // =========================================================================
     // Debug trait
-    // =========================================================================
 
     #[test]
     fn test_orchestrator_debug() {

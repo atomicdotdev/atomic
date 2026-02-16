@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Types for the pull command.
 //!
 //! This module defines the data structures used throughout the pull operation,
@@ -23,9 +22,7 @@
 
 use atomic_core::types::{Hash, Merkle};
 
-// =============================================================================
 // PullChange
-// =============================================================================
 
 /// A change to be downloaded from the remote.
 ///
@@ -158,57 +155,6 @@ impl PullChange {
         self
     }
 
-    /// Set the change message.
-    ///
-    /// The message is typically the first line of the change description,
-    /// used for display purposes when showing what changes will be pulled.
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - The change message (typically the first line)
-    ///
-    /// # Returns
-    ///
-    /// Self with the message set, enabling method chaining.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::PullChange;
-    /// use atomic_core::types::{Hash, Merkle};
-    ///
-    /// let change = PullChange::new(Hash::of(b"x"), 0, Merkle::ZERO)
-    ///     .with_message("Fix authentication bug");
-    ///
-    /// assert_eq!(change.message.as_deref(), Some("Fix authentication bug"));
-    /// ```
-    pub fn with_message(mut self, message: impl Into<String>) -> Self {
-        self.message = Some(message.into());
-        self
-    }
-
-    /// Check if this change has a message.
-    ///
-    /// # Returns
-    ///
-    /// `true` if a message has been set, `false` otherwise.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::PullChange;
-    /// use atomic_core::types::{Hash, Merkle};
-    ///
-    /// let without_msg = PullChange::new(Hash::of(b"x"), 0, Merkle::ZERO);
-    /// let with_msg = without_msg.clone().with_message("Test");
-    ///
-    /// assert!(!without_msg.has_message());
-    /// assert!(with_msg.has_message());
-    /// ```
-    pub fn has_message(&self) -> bool {
-        self.message.is_some()
-    }
-
     /// Get the message or a default placeholder.
     ///
     /// Returns the change message if one is set, or "(no message)" as a
@@ -233,35 +179,9 @@ impl PullChange {
     pub fn message_or_default(&self) -> &str {
         self.message.as_deref().unwrap_or("(no message)")
     }
-
-    /// Check if this change is tagged.
-    ///
-    /// Convenience method that's more readable than accessing the field directly.
-    ///
-    /// # Returns
-    ///
-    /// `true` if this change has an associated tag.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::PullChange;
-    /// use atomic_core::types::{Hash, Merkle};
-    ///
-    /// let change = PullChange::new(Hash::of(b"x"), 0, Merkle::ZERO);
-    /// assert!(!change.is_tagged());
-    ///
-    /// let tagged = change.with_tagged(true);
-    /// assert!(tagged.is_tagged());
-    /// ```
-    pub fn is_tagged(&self) -> bool {
-        self.tagged
-    }
 }
 
-// =============================================================================
 // PullStats
-// =============================================================================
 
 /// Statistics about a pull operation.
 ///
@@ -351,77 +271,6 @@ impl PullStats {
         Self::default()
     }
 
-    /// Get total number of items downloaded (changes + tags).
-    ///
-    /// # Returns
-    ///
-    /// The sum of downloaded changes and tags.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::PullStats;
-    ///
-    /// let mut stats = PullStats::new();
-    /// stats.changes_downloaded = 10;
-    /// stats.tags_downloaded = 3;
-    ///
-    /// assert_eq!(stats.total_downloaded(), 13);
-    /// ```
-    pub fn total_downloaded(&self) -> usize {
-        self.changes_downloaded + self.tags_downloaded
-    }
-
-    /// Check if any items were downloaded.
-    ///
-    /// # Returns
-    ///
-    /// `true` if at least one change or tag was downloaded.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::PullStats;
-    ///
-    /// let mut stats = PullStats::new();
-    /// assert!(!stats.has_downloads());
-    ///
-    /// stats.changes_downloaded = 1;
-    /// assert!(stats.has_downloads());
-    /// ```
-    pub fn has_downloads(&self) -> bool {
-        self.total_downloaded() > 0
-    }
-
-    /// Check if nothing happened (no downloads, no skips, no failures).
-    ///
-    /// This indicates that the local repository was already up to date
-    /// with the remote.
-    ///
-    /// # Returns
-    ///
-    /// `true` if all counters are zero.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::PullStats;
-    ///
-    /// let stats = PullStats::new();
-    /// assert!(stats.is_noop());
-    ///
-    /// let mut stats2 = PullStats::new();
-    /// stats2.changes_skipped = 1;
-    /// assert!(!stats2.is_noop());
-    /// ```
-    pub fn is_noop(&self) -> bool {
-        self.changes_downloaded == 0
-            && self.tags_downloaded == 0
-            && self.changes_skipped == 0
-            && self.changes_failed == 0
-            && self.changes_applied == 0
-    }
-
     /// Check if any downloads failed.
     ///
     /// # Returns
@@ -489,46 +338,6 @@ impl PullStats {
         self.bytes_transferred += bytes;
     }
 
-    /// Record a successfully downloaded tag.
-    ///
-    /// Increments the tag counter and adds the bytes to the transfer total.
-    ///
-    /// # Arguments
-    ///
-    /// * `bytes` - The size of the downloaded tag file in bytes
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::PullStats;
-    ///
-    /// let mut stats = PullStats::new();
-    /// stats.record_tag_downloaded(512);
-    ///
-    /// assert_eq!(stats.tags_downloaded, 1);
-    /// assert_eq!(stats.bytes_transferred, 512);
-    /// ```
-    pub fn record_tag_downloaded(&mut self, bytes: u64) {
-        self.tags_downloaded += 1;
-        self.bytes_transferred += bytes;
-    }
-
-    /// Record a skipped change (already exists locally).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::PullStats;
-    ///
-    /// let mut stats = PullStats::new();
-    /// stats.record_skipped();
-    ///
-    /// assert_eq!(stats.changes_skipped, 1);
-    /// ```
-    pub fn record_skipped(&mut self) {
-        self.changes_skipped += 1;
-    }
-
     /// Record a failed download.
     ///
     /// # Example
@@ -563,375 +372,17 @@ impl PullStats {
     pub fn record_applied(&mut self) {
         self.changes_applied += 1;
     }
-
-    /// Merge statistics from another PullStats instance.
-    ///
-    /// Useful when combining stats from parallel download operations.
-    ///
-    /// # Arguments
-    ///
-    /// * `other` - The other stats to merge into this one
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::PullStats;
-    ///
-    /// let mut stats1 = PullStats::new();
-    /// stats1.changes_downloaded = 5;
-    /// stats1.bytes_transferred = 1000;
-    ///
-    /// let mut stats2 = PullStats::new();
-    /// stats2.changes_downloaded = 3;
-    /// stats2.bytes_transferred = 500;
-    ///
-    /// stats1.merge(&stats2);
-    ///
-    /// assert_eq!(stats1.changes_downloaded, 8);
-    /// assert_eq!(stats1.bytes_transferred, 1500);
-    /// ```
-    pub fn merge(&mut self, other: &PullStats) {
-        self.changes_downloaded += other.changes_downloaded;
-        self.tags_downloaded += other.tags_downloaded;
-        self.bytes_transferred += other.bytes_transferred;
-        self.changes_skipped += other.changes_skipped;
-        self.changes_failed += other.changes_failed;
-        self.changes_applied += other.changes_applied;
-    }
 }
 
-// =============================================================================
 // PullOutcome
-// =============================================================================
 
-/// The outcome of a pull operation.
-///
-/// Contains statistics about what was downloaded and applied, along with
-/// metadata about the operation itself (was it a dry run? any warnings?).
-///
-/// # Example
-///
-/// ```rust
-/// use atomic::commands::pull::types::{PullOutcome, PullStats};
-/// use atomic_core::types::Merkle;
-///
-/// let stats = PullStats::new();
-/// let outcome = PullOutcome::new(stats)
-///     .with_remote_state(Merkle::ZERO);
-///
-/// assert!(outcome.is_success());
-/// assert!(!outcome.dry_run);
-/// ```
-#[derive(Debug, Clone, Default)]
-pub struct PullOutcome {
-    /// Statistics about the pull operation.
-    pub stats: PullStats,
-
-    /// The remote's Merkle state after the pull.
-    ///
-    /// This is useful for displaying the final state or for verification.
-    pub remote_state: Option<Merkle>,
-
-    /// The local Merkle state after the pull.
-    ///
-    /// Should match the remote state after a successful pull with no
-    /// local-only changes.
-    pub local_state: Option<Merkle>,
-
-    /// Whether this was a dry run (no actual changes made).
-    pub dry_run: bool,
-
-    /// Whether only downloads were performed (no apply).
-    pub download_only: bool,
-
-    /// Warning messages generated during the operation.
-    ///
-    /// Warnings don't prevent the operation from completing, but inform
-    /// the user about potential issues (like local-only changes).
-    pub warnings: Vec<String>,
-
-    /// Hashes of local-only changes detected during the pull.
-    ///
-    /// These are changes that exist locally but not on the remote,
-    /// which may indicate diverged history.
-    pub local_only_changes: Vec<String>,
-}
-
-impl PullOutcome {
-    /// Create a new pull outcome with the given statistics.
-    ///
-    /// # Arguments
-    ///
-    /// * `stats` - The statistics from the pull operation
-    ///
-    /// # Returns
-    ///
-    /// A new `PullOutcome` instance.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::{PullOutcome, PullStats};
-    ///
-    /// let mut stats = PullStats::new();
-    /// stats.changes_downloaded = 5;
-    ///
-    /// let outcome = PullOutcome::new(stats);
-    /// assert_eq!(outcome.stats.changes_downloaded, 5);
-    /// ```
-    pub fn new(stats: PullStats) -> Self {
-        Self {
-            stats,
-            remote_state: None,
-            local_state: None,
-            dry_run: false,
-            download_only: false,
-            warnings: Vec::new(),
-            local_only_changes: Vec::new(),
-        }
-    }
-
-    /// Create a dry-run outcome with the given statistics.
-    ///
-    /// A dry-run outcome represents what would have been pulled,
-    /// without actually performing any operations.
-    ///
-    /// # Arguments
-    ///
-    /// * `stats` - The estimated statistics
-    ///
-    /// # Returns
-    ///
-    /// A new `PullOutcome` with `dry_run = true`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::{PullOutcome, PullStats};
-    ///
-    /// let outcome = PullOutcome::dry_run(PullStats::new());
-    /// assert!(outcome.dry_run);
-    /// ```
-    pub fn dry_run(stats: PullStats) -> Self {
-        Self {
-            stats,
-            dry_run: true,
-            ..Default::default()
-        }
-    }
-
-    /// Create a download-only outcome with the given statistics.
-    ///
-    /// A download-only outcome indicates that changes were downloaded
-    /// but not applied to the local stack.
-    ///
-    /// # Arguments
-    ///
-    /// * `stats` - The download statistics
-    ///
-    /// # Returns
-    ///
-    /// A new `PullOutcome` with `download_only = true`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::{PullOutcome, PullStats};
-    ///
-    /// let outcome = PullOutcome::download_only(PullStats::new());
-    /// assert!(outcome.download_only);
-    /// ```
-    pub fn download_only(stats: PullStats) -> Self {
-        Self {
-            stats,
-            download_only: true,
-            ..Default::default()
-        }
-    }
-
-    /// Set the remote state.
-    ///
-    /// # Arguments
-    ///
-    /// * `state` - The remote's current Merkle state
-    ///
-    /// # Returns
-    ///
-    /// Self with the remote state set, enabling method chaining.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::{PullOutcome, PullStats};
-    /// use atomic_core::types::Merkle;
-    ///
-    /// let outcome = PullOutcome::new(PullStats::new())
-    ///     .with_remote_state(Merkle::ZERO);
-    ///
-    /// assert!(outcome.remote_state.is_some());
-    /// ```
-    pub fn with_remote_state(mut self, state: Merkle) -> Self {
-        self.remote_state = Some(state);
-        self
-    }
-
-    /// Set the local state.
-    ///
-    /// # Arguments
-    ///
-    /// * `state` - The local Merkle state after pull
-    ///
-    /// # Returns
-    ///
-    /// Self with the local state set, enabling method chaining.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::{PullOutcome, PullStats};
-    /// use atomic_core::types::Merkle;
-    ///
-    /// let outcome = PullOutcome::new(PullStats::new())
-    ///     .with_local_state(Merkle::ZERO);
-    ///
-    /// assert!(outcome.local_state.is_some());
-    /// ```
-    pub fn with_local_state(mut self, state: Merkle) -> Self {
-        self.local_state = Some(state);
-        self
-    }
-
-    /// Add a warning message.
-    ///
-    /// Warnings inform the user about potential issues but don't
-    /// prevent the operation from completing.
-    ///
-    /// # Arguments
-    ///
-    /// * `warning` - The warning message
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::{PullOutcome, PullStats};
-    ///
-    /// let mut outcome = PullOutcome::new(PullStats::new());
-    /// outcome.add_warning("Local changes detected");
-    ///
-    /// assert!(outcome.has_warnings());
-    /// assert_eq!(outcome.warnings.len(), 1);
-    /// ```
-    pub fn add_warning(&mut self, warning: impl Into<String>) {
-        self.warnings.push(warning.into());
-    }
-
-    /// Add a local-only change hash.
-    ///
-    /// Local-only changes are changes that exist locally but not on
-    /// the remote, indicating potential history divergence.
-    ///
-    /// # Arguments
-    ///
-    /// * `hash` - The base32-encoded hash of the local-only change
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::{PullOutcome, PullStats};
-    ///
-    /// let mut outcome = PullOutcome::new(PullStats::new());
-    /// outcome.add_local_only_change("ABC123...");
-    ///
-    /// assert!(outcome.has_local_only_changes());
-    /// ```
-    pub fn add_local_only_change(&mut self, hash: impl Into<String>) {
-        self.local_only_changes.push(hash.into());
-    }
-
-    /// Check if the operation was successful.
-    ///
-    /// An operation is considered successful if there were no failures.
-    /// A dry-run or download-only operation is always successful if it
-    /// completes without errors.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the operation completed without failures.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::{PullOutcome, PullStats};
-    ///
-    /// let outcome = PullOutcome::new(PullStats::new());
-    /// assert!(outcome.is_success());
-    ///
-    /// let mut stats = PullStats::new();
-    /// stats.changes_failed = 1;
-    /// let outcome = PullOutcome::new(stats);
-    /// assert!(!outcome.is_success());
-    /// ```
-    pub fn is_success(&self) -> bool {
-        !self.stats.has_failures()
-    }
-
-    /// Check if there are any warnings.
-    ///
-    /// # Returns
-    ///
-    /// `true` if at least one warning was recorded.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::{PullOutcome, PullStats};
-    ///
-    /// let outcome = PullOutcome::new(PullStats::new());
-    /// assert!(!outcome.has_warnings());
-    /// ```
-    pub fn has_warnings(&self) -> bool {
-        !self.warnings.is_empty()
-    }
-
-    /// Check if there are local-only changes (potential divergence).
-    ///
-    /// # Returns
-    ///
-    /// `true` if local-only changes were detected.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::types::{PullOutcome, PullStats};
-    ///
-    /// let outcome = PullOutcome::new(PullStats::new());
-    /// assert!(!outcome.has_local_only_changes());
-    /// ```
-    pub fn has_local_only_changes(&self) -> bool {
-        !self.local_only_changes.is_empty()
-    }
-
-    /// Get the number of local-only changes.
-    ///
-    /// # Returns
-    ///
-    /// The count of local-only changes detected.
-    pub fn local_only_count(&self) -> usize {
-        self.local_only_changes.len()
-    }
-}
-
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // PullChange Tests
-    // =========================================================================
 
     /// Test creating a PullChange with minimal information.
     #[test]
@@ -1028,9 +479,7 @@ mod tests {
         assert!(debug_str.contains("sequence: 0"));
     }
 
-    // =========================================================================
     // PullStats Tests
-    // =========================================================================
 
     /// Test creating empty statistics.
     #[test]
@@ -1222,9 +671,7 @@ mod tests {
         assert_eq!(original, cloned);
     }
 
-    // =========================================================================
     // PullOutcome Tests
-    // =========================================================================
 
     /// Test creating a new outcome.
     #[test]

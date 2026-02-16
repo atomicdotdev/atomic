@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The `reset` command for restoring working copy to pristine state.
 //!
 //! This module implements the `atomic reset` command, which restores the working
@@ -69,9 +68,7 @@ use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success, print_warning};
 
-// =============================================================================
 // Reset Command
-// =============================================================================
 
 /// Reset the working copy to the last recorded state.
 ///
@@ -129,46 +126,6 @@ impl Reset {
             dry_run: false,
             force: false,
         }
-    }
-
-    /// Set the files to reset.
-    pub fn with_files(mut self, files: Vec<String>) -> Self {
-        self.files = files;
-        self
-    }
-
-    /// Set the target stack.
-    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
-        self.stack = Some(stack.into());
-        self
-    }
-
-    /// Set dry-run mode.
-    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
-        self.dry_run = dry_run;
-        self
-    }
-
-    /// Set force mode.
-    pub fn with_force(mut self, force: bool) -> Self {
-        self.force = force;
-        self
-    }
-
-    /// Check if reset targets specific files or entire working copy.
-    fn is_partial_reset(&self) -> bool {
-        !self.files.is_empty()
-    }
-
-    /// Normalize a path relative to repository root.
-    fn normalize_path(&self, repo_root: &Path, path: &str) -> String {
-        let p = Path::new(path);
-        if p.is_absolute() {
-            if let Ok(rel) = p.strip_prefix(repo_root) {
-                return rel.to_string_lossy().to_string();
-            }
-        }
-        path.to_string()
     }
 
     /// Check if a path matches any of the specified file filters.
@@ -266,17 +223,6 @@ impl Reset {
                 Ok(false)
             }
         }
-    }
-
-    /// Delete a file that was added but should be removed on reset.
-    fn delete_untracked_file(&self, repo_root: &Path, path: &Path) -> CliResult<()> {
-        let full_path = repo_root.join(path);
-        if full_path.exists() {
-            std::fs::remove_file(&full_path).map_err(|e| {
-                CliError::Internal(anyhow::anyhow!("Failed to delete file: {}", e))
-            })?;
-        }
-        Ok(())
     }
 
     /// Switch to a different stack.
@@ -444,17 +390,13 @@ fn format_count(count: usize, word: &str) -> String {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // Builder Tests
-    // =========================================================================
 
     #[test]
     fn test_reset_new() {
@@ -514,9 +456,7 @@ mod tests {
         assert!(cmd.force);
     }
 
-    // =========================================================================
     // Partial Reset Tests
-    // =========================================================================
 
     #[test]
     fn test_is_partial_reset_empty() {
@@ -530,9 +470,7 @@ mod tests {
         assert!(cmd.is_partial_reset());
     }
 
-    // =========================================================================
     // Filter Tests
-    // =========================================================================
 
     #[test]
     fn test_matches_filter_empty() {
@@ -571,9 +509,7 @@ mod tests {
         assert!(!cmd.matches_filter("Cargo.toml"));
     }
 
-    // =========================================================================
     // Normalize Path Tests
-    // =========================================================================
 
     #[test]
     fn test_normalize_relative_path() {
@@ -600,9 +536,7 @@ mod tests {
         assert_eq!(result, "/other/path/file.rs");
     }
 
-    // =========================================================================
     // Format Tests
-    // =========================================================================
 
     #[test]
     fn test_format_count_singular() {
@@ -619,9 +553,7 @@ mod tests {
         assert_eq!(format_count(0, "file"), "0 files");
     }
 
-    // =========================================================================
     // Clone Tests
-    // =========================================================================
 
     #[test]
     fn test_reset_clone() {

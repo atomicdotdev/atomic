@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The `tag show` command for displaying tag details.
 //!
 //! This module implements the `atomic tag show` command, which displays
@@ -44,9 +43,7 @@ use crate::output::{emphasis, hint};
 #[cfg(test)]
 use std::path::PathBuf;
 
-// =============================================================================
 // Show Command
-// =============================================================================
 
 /// Show details for a specific tag.
 ///
@@ -61,12 +58,6 @@ pub struct Show {
 }
 
 impl Show {
-    /// Create a new `Show` command with the given tag name.
-    pub fn with_name(name: impl Into<String>) -> Self {
-        Self {
-            name: Some(name.into()),
-        }
-    }
 }
 
 impl Command for Show {
@@ -139,9 +130,7 @@ impl Command for Show {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

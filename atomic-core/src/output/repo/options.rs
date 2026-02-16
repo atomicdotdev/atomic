@@ -23,7 +23,7 @@
 //!
 //! // Or use the builder pattern
 //! let opts = OutputOptions::new()
-//!     .prefix("src/")
+//!     .with_prefix("src/")
 //!     .output_name_conflicts(true)
 //!     .if_modified_since(Some(SystemTime::now()))
 //!     .max_vertices(100_000)
@@ -38,9 +38,7 @@
 
 use std::time::SystemTime;
 
-// ============================================================================
 // OUTPUT OPTIONS
-// ============================================================================
 
 /// Configuration options for repository output operations.
 ///
@@ -64,7 +62,7 @@ use std::time::SystemTime;
 /// use atomic_core::output::repo::OutputOptions;
 ///
 /// let opts = OutputOptions::new()
-///     .prefix("src/lib/")
+///     .with_prefix("src/lib/")
 ///     .include_deleted(false)
 ///     .max_vertices(50_000);
 ///
@@ -155,7 +153,7 @@ impl OutputOptions {
     /// use atomic_core::output::repo::OutputOptions;
     ///
     /// let opts = OutputOptions::new()
-    ///     .prefix("src/")
+    ///     .with_prefix("src/")
     ///     .salt(123);
     /// ```
     #[must_use]
@@ -220,11 +218,11 @@ impl OutputOptions {
     /// ```rust
     /// use atomic_core::output::repo::OutputOptions;
     ///
-    /// let opts = OutputOptions::new().prefix("src/utils/");
+    /// let opts = OutputOptions::new().with_prefix("src/utils/");
     /// assert_eq!(opts.prefix, "src/utils/");
     /// ```
     #[must_use]
-    pub fn prefix(mut self, prefix: &str) -> Self {
+    pub fn with_prefix(mut self, prefix: &str) -> Self {
         self.prefix = prefix.to_string();
         self
     }
@@ -321,7 +319,7 @@ impl OutputOptions {
     /// ```rust
     /// use atomic_core::output::repo::OutputOptions;
     ///
-    /// let opts = OutputOptions::new().prefix("src/");
+    /// let opts = OutputOptions::new().with_prefix("src/");
     ///
     /// assert!(opts.matches_prefix("src/main.rs"));
     /// assert!(opts.matches_prefix("src/lib/utils.rs"));
@@ -372,9 +370,7 @@ impl OutputOptions {
     }
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -436,13 +432,13 @@ mod tests {
 
     #[test]
     fn test_builder_prefix() {
-        let opts = OutputOptions::new().prefix("src/");
+        let opts = OutputOptions::new().with_prefix("src/");
         assert_eq!(opts.prefix, "src/");
 
-        let opts = OutputOptions::new().prefix("");
+        let opts = OutputOptions::new().with_prefix("");
         assert!(opts.prefix.is_empty());
 
-        let opts = OutputOptions::new().prefix("deeply/nested/path/");
+        let opts = OutputOptions::new().with_prefix("deeply/nested/path/");
         assert_eq!(opts.prefix, "deeply/nested/path/");
     }
 
@@ -488,7 +484,7 @@ mod tests {
     fn test_builder_chaining() {
         let now = SystemTime::now();
         let opts = OutputOptions::new()
-            .prefix("src/")
+            .with_prefix("src/")
             .output_name_conflicts(false)
             .if_modified_since(Some(now))
             .include_deleted(true)
@@ -519,7 +515,7 @@ mod tests {
 
     #[test]
     fn test_matches_prefix_with_prefix() {
-        let opts = OutputOptions::new().prefix("src/");
+        let opts = OutputOptions::new().with_prefix("src/");
 
         assert!(opts.matches_prefix("src/"));
         assert!(opts.matches_prefix("src/main.rs"));
@@ -532,7 +528,7 @@ mod tests {
 
     #[test]
     fn test_matches_prefix_exact_match() {
-        let opts = OutputOptions::new().prefix("src/main.rs");
+        let opts = OutputOptions::new().with_prefix("src/main.rs");
 
         assert!(opts.matches_prefix("src/main.rs"));
         // Note: "src/main.rs.bak" DOES match because it starts with "src/main.rs"
@@ -577,7 +573,7 @@ mod tests {
     #[test]
     fn test_clone() {
         let opts = OutputOptions::new()
-            .prefix("src/")
+            .with_prefix("src/")
             .salt(42);
 
         let cloned = opts.clone();
@@ -588,7 +584,7 @@ mod tests {
 
     #[test]
     fn test_debug() {
-        let opts = OutputOptions::new().prefix("test/");
+        let opts = OutputOptions::new().with_prefix("test/");
         let debug_str = format!("{:?}", opts);
 
         assert!(debug_str.contains("OutputOptions"));

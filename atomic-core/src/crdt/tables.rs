@@ -102,9 +102,7 @@ use super::trunk::TrunkState;
 use crate::diff::token::TokenKind;
 use crate::types::{Inode, NodeId};
 
-// =============================================================================
 // Table Definitions
-// =============================================================================
 
 /// Trunk (file) storage: TrunkId → SerializedTrunk
 ///
@@ -190,9 +188,7 @@ pub const PATH_TRUNK: TableDefinition<&str, &[u8; 12]> = TableDefinition::new("c
 pub const BRANCH_VERTEX: TableDefinition<&[u8; 12], &[u8; 24]> =
     TableDefinition::new("crdt_branch_vertex");
 
-// =============================================================================
 // ID Encoding/Decoding (12 bytes each)
-// =============================================================================
 
 /// Encode a TrunkId as 12 bytes for storage.
 ///
@@ -297,9 +293,7 @@ pub fn decode_leaf_id(bytes: &[u8; 12]) -> LeafId {
     LeafId::new(change_id, leaf_idx)
 }
 
-// =============================================================================
 // Span Position Encoding/Decoding (24 bytes)
-// =============================================================================
 
 use crate::types::{ChangePosition, GraphNode};
 
@@ -332,9 +326,7 @@ pub fn decode_vertex_position(bytes: &[u8; 24]) -> GraphNode<NodeId> {
     GraphNode { change, start, end }
 }
 
-// =============================================================================
 // State Encoding/Decoding (1 byte each)
-// =============================================================================
 
 /// State byte constants for TrunkState.
 pub mod trunk_state {
@@ -421,9 +413,7 @@ pub fn decode_leaf_state(byte: u8) -> LeafState {
     }
 }
 
-// =============================================================================
 // TokenKind Encoding/Decoding (1 byte)
-// =============================================================================
 
 /// TokenKind byte constants.
 pub mod token_kind {
@@ -472,9 +462,7 @@ pub fn decode_token_kind(byte: u8) -> TokenKind {
     }
 }
 
-// =============================================================================
 // Branch Value Encoding/Decoding (24 bytes)
-// =============================================================================
 
 /// Serialized branch data stored in BRANCHES table.
 ///
@@ -544,9 +532,7 @@ pub fn decode_branch_value(bytes: &[u8; 24]) -> SerializedBranch {
     }
 }
 
-// =============================================================================
 // Leaf Value Encoding/Decoding (22 bytes)
-// =============================================================================
 
 /// Serialized leaf data stored in LEAVES table.
 ///
@@ -643,9 +629,7 @@ pub fn decode_leaf_value(bytes: &[u8; 22]) -> SerializedLeaf {
     }
 }
 
-// =============================================================================
 // Trunk Value Encoding/Decoding (Variable Length)
-// =============================================================================
 
 /// Serialized trunk data stored in TRUNKS table.
 ///
@@ -761,9 +745,7 @@ pub fn decode_trunk_value(bytes: &[u8]) -> Option<SerializedTrunk> {
     })
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

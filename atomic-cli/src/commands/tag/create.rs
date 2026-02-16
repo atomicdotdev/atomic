@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The `tag create` command for creating a new tag.
 //!
 //! This module implements the `atomic tag create` command, which creates a new
@@ -46,9 +45,7 @@ use crate::output::{print_success, emphasis};
 #[cfg(test)]
 use std::path::PathBuf;
 
-// =============================================================================
 // Author Parsing
-// =============================================================================
 
 /// Parse an author string in the format "Name <email>" or just "Name".
 ///
@@ -77,9 +74,7 @@ fn parse_author(s: &str) -> (String, Option<String>) {
     (s.to_string(), None)
 }
 
-// =============================================================================
 // Create Command
-// =============================================================================
 
 /// Create a new tag.
 ///
@@ -122,37 +117,6 @@ pub struct Create {
 }
 
 impl Create {
-    /// Create a new `Create` command with the given tag name.
-    pub fn with_name(name: impl Into<String>) -> Self {
-        Self {
-            name: Some(name.into()),
-            ..Default::default()
-        }
-    }
-
-    /// Set the message for an annotated tag.
-    pub fn with_message(mut self, message: impl Into<String>) -> Self {
-        self.message = Some(message.into());
-        self
-    }
-
-    /// Set the author for an annotated tag.
-    pub fn with_author(mut self, author: impl Into<String>) -> Self {
-        self.author = Some(author.into());
-        self
-    }
-
-    /// Set the stack to tag.
-    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
-        self.stack = Some(stack.into());
-        self
-    }
-
-    /// Enable force mode to overwrite existing tags.
-    pub fn with_force(mut self, force: bool) -> Self {
-        self.force = force;
-        self
-    }
 }
 
 impl Command for Create {
@@ -222,9 +186,7 @@ impl Command for Create {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

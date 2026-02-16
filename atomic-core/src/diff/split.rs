@@ -287,8 +287,7 @@ pub(crate) fn split_lines(content: &[u8]) -> Vec<Line<'_>> {
 mod tests {
     use super::*;
 
-    // ==================== Separator Tests ====================
-
+    // Separator Tests
     #[test]
     fn test_separator_default() {
         assert_eq!(Separator::default(), Separator::Newline);
@@ -368,8 +367,7 @@ mod tests {
         assert_eq!(sep.find_in(b"a|b|c"), None);
     }
 
-    // ==================== LineSplit Tests ====================
-
+    // LineSplit Tests
     #[test]
     fn test_linesplit_simple() {
         let content = b"a\nb\nc\n";
@@ -514,8 +512,7 @@ mod tests {
         assert_eq!(split.size_hint(), (0, Some(0)));
     }
 
-    // ==================== split_lines Tests ====================
-
+    // split_lines Tests
     #[test]
     fn test_split_lines() {
         let lines = split_lines(b"hello\nworld\n");
@@ -538,8 +535,7 @@ mod tests {
         assert!(lines[2].is_last());
     }
 
-    // ==================== Edge Cases ====================
-
+    // Edge Cases
     #[test]
     fn test_mixed_line_endings() {
         // When using newline separator, \r\n appears as \r at end of line

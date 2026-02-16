@@ -128,9 +128,7 @@ use std::fmt;
 use super::line_ops::{LineChange, LineChangeKind};
 use super::tokenize::{ContentTokenizer, TokenizeOptions};
 
-// ============================================================================
 // BUILD ERROR
-// ============================================================================
 
 /// Errors that can occur during CRDT change building.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,9 +191,7 @@ impl std::error::Error for CrdtBuildError {}
 /// Result type for build operations.
 pub type CrdtBuildResult<T> = Result<T, CrdtBuildError>;
 
-// ============================================================================
 // BUILD STATS
-// ============================================================================
 
 /// Statistics about the CRDT change building process.
 ///
@@ -302,9 +298,7 @@ impl fmt::Display for CrdtBuildStats {
     }
 }
 
-// ============================================================================
 // TOKEN OPS
-// ============================================================================
 
 /// Operations for tokens within a line.
 ///
@@ -342,9 +336,7 @@ impl TokenOps {
     }
 }
 
-// ============================================================================
 // LINE OPS
-// ============================================================================
 
 /// Operations for a single line.
 ///
@@ -475,9 +467,7 @@ impl LineOps {
     }
 }
 
-// ============================================================================
 // FILE OPS
-// ============================================================================
 
 /// Operations for a single file.
 ///
@@ -624,9 +614,7 @@ impl FileOps {
     }
 }
 
-// ============================================================================
 // CRDT CHANGE RESULT
-// ============================================================================
 
 /// The result of building CRDT operations for a change.
 ///
@@ -710,9 +698,7 @@ impl Default for CrdtChangeResult {
     }
 }
 
-// ============================================================================
 // CRDT CHANGE BUILDER
-// ============================================================================
 
 /// Builder for accumulating CRDT operations during change recording.
 ///
@@ -1138,9 +1124,7 @@ impl CrdtChangeBuilder {
     }
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

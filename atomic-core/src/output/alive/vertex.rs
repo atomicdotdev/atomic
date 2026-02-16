@@ -62,9 +62,7 @@
 use crate::types::{GraphNode, NodeId, SerializedGraphEdge};
 use bitflags::bitflags;
 
-// ============================================================================
 // VERTEX ID
-// ============================================================================
 
 /// Index into the alive graph's span array.
 ///
@@ -118,9 +116,7 @@ impl std::fmt::Display for VertexId {
     }
 }
 
-// ============================================================================
 // VERTEX FLAGS
-// ============================================================================
 
 bitflags! {
     /// Flags describing the state of an alive span during traversal.
@@ -201,9 +197,7 @@ impl std::fmt::Display for VertexFlags {
     }
 }
 
-// ============================================================================
 // ALIVE VERTEX
-// ============================================================================
 
 /// A span in the alive graph with traversal metadata.
 ///
@@ -431,9 +425,7 @@ impl Default for AliveVertex {
     }
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

@@ -103,9 +103,7 @@ use atomic_core::types::{Base32, Hash, Merkle, NodeId};
 use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
-// ============================================================================
 // Error Types
-// ============================================================================
 
 /// Result type for apply operations.
 pub type ApplyResult<T> = Result<T, ApplyError>;
@@ -200,9 +198,7 @@ fn format_hashes(hashes: &[Hash]) -> String {
         .join(", ")
 }
 
-// ============================================================================
 // ApplyOptions
-// ============================================================================
 
 /// Options for controlling change application.
 #[derive(Debug, Clone)]
@@ -294,9 +290,7 @@ impl ApplyOptions {
     }
 }
 
-// ============================================================================
 // ApplyStats
-// ============================================================================
 
 /// Statistics from a change application operation.
 #[derive(Debug, Clone, Default)]
@@ -349,9 +343,7 @@ impl ApplyStats {
     }
 }
 
-// ============================================================================
 // ApplyOutcome
-// ============================================================================
 
 /// The result of applying a change.
 #[derive(Debug, Clone)]
@@ -381,9 +373,7 @@ impl ApplyOutcome {
     }
 }
 
-// ============================================================================
 // Core Application Functions
-// ============================================================================
 
 /// Check what dependencies are missing for a change.
 ///
@@ -690,9 +680,7 @@ pub fn collect_all_dependencies<T: GraphTxnT>(
     Ok(needed)
 }
 
-// ============================================================================
 // Cross-Stack Apply Operations
-// ============================================================================
 
 /// Options for applying changes between stacks.
 ///
@@ -1019,17 +1007,13 @@ pub fn order_changes_by_deps(changes: &HashMap<Hash, Change>) -> ApplyResult<Vec
     compute_apply_order(changes)
 }
 
-// ============================================================================
 // Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ========================================================================
     // ApplyOptions Tests
-    // ========================================================================
 
     #[test]
     fn test_apply_options_default() {
@@ -1064,9 +1048,7 @@ mod tests {
         assert_eq!(opts.max_depth, 50);
     }
 
-    // ========================================================================
     // ApplyStats Tests
-    // ========================================================================
 
     #[test]
     fn test_apply_stats_new() {
@@ -1113,9 +1095,7 @@ mod tests {
         assert_eq!(stats1.conflicts_detected, 1);
     }
 
-    // ========================================================================
     // ApplyOutcome Tests
-    // ========================================================================
 
     #[test]
     fn test_apply_outcome_new() {
@@ -1128,9 +1108,7 @@ mod tests {
         assert!(!outcome.has_conflicts);
     }
 
-    // ========================================================================
     // Error Tests
-    // ========================================================================
 
     #[test]
     fn test_apply_error_display() {
@@ -1167,9 +1145,7 @@ mod tests {
         assert!(matches!(apply_err, ApplyError::MissingDependencies { .. }));
     }
 
-    // ========================================================================
     // Compute Apply Order Tests
-    // ========================================================================
 
     #[test]
     fn test_compute_apply_order_empty() {
@@ -1200,9 +1176,7 @@ mod tests {
         assert!(!formatted.is_empty());
     }
 
-    // ========================================================================
     // CrossStackApplyOptions Tests
-    // ========================================================================
 
     #[test]
     fn test_cross_stack_options_new() {
@@ -1242,9 +1216,7 @@ mod tests {
         assert!(opts.dry_run);
     }
 
-    // ========================================================================
     // CrossStackApplyOutcome Tests
-    // ========================================================================
 
     #[test]
     fn test_cross_stack_outcome_new() {

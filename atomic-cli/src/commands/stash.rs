@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The `stash` command for temporarily saving uncommitted changes.
 //!
 //! This module implements the `atomic stash` command, which saves uncommitted
@@ -86,9 +85,7 @@ use crate::commands::{find_repository_root, format_timestamp_relative, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_blank, print_hint, print_success, print_warning, stack as style_stack};
 
-// =============================================================================
 // Constants
-// =============================================================================
 
 /// Prefix for stash stack names.
 const STASH_PREFIX: &str = "stash/";
@@ -96,9 +93,7 @@ const STASH_PREFIX: &str = "stash/";
 /// Default message for stashes without a custom message.
 const DEFAULT_STASH_MESSAGE: &str = "WIP";
 
-// =============================================================================
 // Stash Command
-// =============================================================================
 
 /// Temporarily save uncommitted changes.
 ///
@@ -198,9 +193,7 @@ pub enum StashSubcommand {
     },
 }
 
-// =============================================================================
 // Stash Entry
-// =============================================================================
 
 /// Information about a stash entry.
 #[derive(Debug, Clone)]
@@ -222,21 +215,9 @@ impl StashEntry {
     pub fn reference(&self) -> String {
         format!("stash@{{{}}}", self.index)
     }
-
-    /// Format for display in list.
-    pub fn display(&self) -> String {
-        format!(
-            "{}: On {}: {}",
-            self.reference(),
-            self.source_stack,
-            self.message
-        )
-    }
 }
 
-// =============================================================================
 // Implementation
-// =============================================================================
 
 impl Stash {
     /// Create a new Stash command with default settings.
@@ -247,41 +228,6 @@ impl Stash {
             include_untracked: false,
             keep: false,
         }
-    }
-
-    /// Set the message for the stash.
-    pub fn with_message(mut self, message: impl Into<String>) -> Self {
-        self.message = Some(message.into());
-        self
-    }
-
-    /// Set whether to include untracked files.
-    pub fn with_include_untracked(mut self, include: bool) -> Self {
-        self.include_untracked = include;
-        self
-    }
-
-    /// Set whether to keep changes after stashing.
-    pub fn with_keep(mut self, keep: bool) -> Self {
-        self.keep = keep;
-        self
-    }
-
-    /// Generate a unique stash stack name.
-    fn generate_stash_name(&self, repo: &Repository) -> CliResult<String> {
-        let timestamp = Utc::now().timestamp_millis();
-        let base_name = format!("{}auto_{}", STASH_PREFIX, timestamp);
-
-        // Ensure uniqueness (shouldn't be needed with millisecond timestamp, but safe)
-        let mut name = base_name.clone();
-        let mut counter = 0;
-
-        while repo.stack_exists(&name).map_err(CliError::Repository)? {
-            counter += 1;
-            name = format!("{}_{}", base_name, counter);
-        }
-
-        Ok(name)
     }
 
     /// List all stash stacks, sorted by creation time (newest first).
@@ -438,7 +384,7 @@ impl Stash {
 
         // Build record options
         let options = RecordOptions::new()
-            .all(include_untracked || self.include_untracked)
+            .with_all(include_untracked || self.include_untracked)
             .apply_after_record(true)
             .save_to_store(true);
 
@@ -679,17 +625,13 @@ impl Command for Stash {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // Builder Tests
-    // =========================================================================
 
     #[test]
     fn test_stash_new() {
@@ -737,9 +679,7 @@ mod tests {
         assert!(cmd.keep);
     }
 
-    // =========================================================================
     // StashEntry Tests
-    // =========================================================================
 
     #[test]
     fn test_stash_entry_reference() {
@@ -783,9 +723,7 @@ mod tests {
         assert!(display.contains("Work in progress"));
     }
 
-    // =========================================================================
     // Constants Tests
-    // =========================================================================
 
     #[test]
     fn test_stash_prefix() {
@@ -797,9 +735,7 @@ mod tests {
         assert_eq!(DEFAULT_STASH_MESSAGE, "WIP");
     }
 
-    // =========================================================================
     // Clone Tests
-    // =========================================================================
 
     #[test]
     fn test_stash_clone() {
@@ -814,9 +750,7 @@ mod tests {
         assert_eq!(cloned.keep, cmd.keep);
     }
 
-    // =========================================================================
     // Subcommand Tests
-    // =========================================================================
 
     #[test]
     fn test_subcommand_push() {

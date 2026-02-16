@@ -60,9 +60,7 @@ use atomic_agent::hooks::AgentRegistry;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 
-// =============================================================================
 // Hooks Command
-// =============================================================================
 
 /// Internal hook handlers (called by agent hooks, not by users).
 ///
@@ -203,9 +201,7 @@ impl Command for Hooks {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

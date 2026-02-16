@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Helper functions for the pull command.
 //!
 //! This module provides utility functions used by the pull command, including:
@@ -35,9 +34,7 @@ use crate::output::{hint, info, stack as style_stack};
 
 use super::types::PullChange;
 
-// =============================================================================
 // Delta Calculation
-// =============================================================================
 
 /// Calculate which changes need to be pulled from the remote.
 ///
@@ -169,9 +166,7 @@ pub fn find_local_only_changes(
         .collect()
 }
 
-// =============================================================================
 // Change Data Operations
-// =============================================================================
 
 /// Save a downloaded change to the repository's change store.
 ///
@@ -221,23 +216,7 @@ pub fn save_downloaded_change(repo: &Repository, hash: &Hash, data: Bytes) -> Cl
     Ok(())
 }
 
-/// Check if a change already exists in the local repository.
-///
-/// # Arguments
-///
-/// * `repo` - The repository to check
-/// * `hash` - The hash of the change to look for
-///
-/// # Returns
-///
-/// `true` if the change exists locally, `false` otherwise.
-pub fn change_exists_locally(repo: &Repository, hash: &Hash) -> bool {
-    repo.has_change(hash)
-}
-
-// =============================================================================
 // Error Conversion
-// =============================================================================
 
 /// Convert a remote error to a CLI error.
 ///
@@ -318,9 +297,7 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
     }
 }
 
-// =============================================================================
 // Display Helpers
-// =============================================================================
 
 /// Display a comparison of local and remote state.
 ///
@@ -429,9 +406,7 @@ fn format_remote_state(state: &StateResponse, entries: &[ChangelistEntry]) -> St
     }
 }
 
-// =============================================================================
 // Formatting Utilities
-// =============================================================================
 
 /// Format a count with proper pluralization.
 ///
@@ -494,18 +469,14 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use atomic_core::types::NodeId;
 
-    // =========================================================================
     // Delta Calculation Tests
-    // =========================================================================
 
     /// Create a test history entry for testing.
     fn create_test_history_entry(hash_bytes: &[u8], sequence: u64) -> HistoryEntry {
@@ -621,9 +592,7 @@ mod tests {
         assert!(!delta[1].tagged);
     }
 
-    // =========================================================================
     // Local-Only Change Detection Tests
-    // =========================================================================
 
     /// Test detecting local-only changes when there are none.
     #[test]
@@ -678,9 +647,7 @@ mod tests {
         assert!(local_only.contains(&Hash::of(b"local2").to_base32()));
     }
 
-    // =========================================================================
     // Error Conversion Tests
-    // =========================================================================
 
     /// Test converting connection failed error.
     #[test]
@@ -789,9 +756,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // Formatting Tests
-    // =========================================================================
 
     /// Test format_count with zero.
     #[test]
@@ -849,9 +814,7 @@ mod tests {
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
     }
 
-    // =========================================================================
     // State Display Tests
-    // =========================================================================
 
     /// Test format_local_state with empty entries.
     #[test]

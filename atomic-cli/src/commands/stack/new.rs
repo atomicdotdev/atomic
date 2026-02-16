@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The `stack new` command for creating a new stack.
 //!
 //! This module implements the `atomic stack new` command, which creates a new
@@ -51,9 +50,7 @@ use crate::output::{print_hint, print_success, stack as style_stack};
 #[cfg(test)]
 use std::path::PathBuf;
 
-// =============================================================================
 // Constants
-// =============================================================================
 
 /// Maximum length for a stack name.
 const MAX_STACK_NAME_LENGTH: usize = 255;
@@ -61,9 +58,7 @@ const MAX_STACK_NAME_LENGTH: usize = 255;
 /// Characters not allowed in stack names.
 const INVALID_CHARS: &[char] = &['/', '\\', '\0', ':', '*', '?', '"', '<', '>', '|', ' '];
 
-// =============================================================================
 // Stack Name Validation
-// =============================================================================
 
 /// Validate a stack name.
 ///
@@ -123,9 +118,7 @@ fn validate_stack_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-// =============================================================================
 // New Command
-// =============================================================================
 
 /// Create a new stack.
 ///
@@ -171,33 +164,6 @@ pub struct New {
 }
 
 impl New {
-    /// Create a new `New` command with the given stack name.
-    pub fn with_name(name: impl Into<String>) -> Self {
-        Self {
-            name: Some(name.into()),
-            from: None,
-            empty: false,
-            switch: false,
-        }
-    }
-
-    /// Set the source stack to fork from.
-    pub fn with_from(mut self, from: impl Into<String>) -> Self {
-        self.from = Some(from.into());
-        self
-    }
-
-    /// Set whether to create an empty stack with no history.
-    pub fn with_empty(mut self, empty: bool) -> Self {
-        self.empty = empty;
-        self
-    }
-
-    /// Set whether to switch to the new stack.
-    pub fn with_switch(mut self, switch: bool) -> Self {
-        self.switch = switch;
-        self
-    }
 }
 
 impl Command for New {
@@ -290,9 +256,7 @@ impl Command for New {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

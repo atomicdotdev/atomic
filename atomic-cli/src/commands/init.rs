@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The `init` command for initializing a new Atomic repository.
 //!
 //! This module implements the `atomic init` command, which creates a new
@@ -58,16 +57,12 @@ use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_next_steps, print_success};
 
-// =============================================================================
 // Constants
-// =============================================================================
 
 /// Default stack name for new repositories.
 pub const DEFAULT_STACK_NAME: &str = "dev";
 
-// =============================================================================
 // Project Kind Templates
-// =============================================================================
 
 /// Get the .atomicignore content for a given project kind.
 ///
@@ -263,9 +258,7 @@ pub fn supported_kinds() -> &'static [&'static str] {
     ]
 }
 
-// =============================================================================
 // Init Command
-// =============================================================================
 
 /// Initialize a new Atomic repository.
 ///
@@ -322,54 +315,6 @@ impl Init {
             stack: DEFAULT_STACK_NAME.to_string(),
             kind: None,
         }
-    }
-
-    /// Create a new Init command for a specific path.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - The path to initialize
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let init = Init::at_path("/home/user/new-project");
-    /// init.run()?;
-    /// ```
-    pub fn at_path<P: Into<PathBuf>>(path: P) -> Self {
-        Self {
-            path: path.into(),
-            stack: DEFAULT_STACK_NAME.to_string(),
-            kind: None,
-        }
-    }
-
-    /// Set the initial stack name.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The stack name
-    ///
-    /// # Returns
-    ///
-    /// Self for method chaining.
-    pub fn with_stack<S: Into<String>>(mut self, name: S) -> Self {
-        self.stack = name.into();
-        self
-    }
-
-    /// Set the project kind.
-    ///
-    /// # Arguments
-    ///
-    /// * `kind` - The project kind
-    ///
-    /// # Returns
-    ///
-    /// Self for method chaining.
-    pub fn with_kind<S: Into<String>>(mut self, kind: S) -> Self {
-        self.kind = Some(kind.into());
-        self
     }
 
     /// Resolve the target path to an absolute path.
@@ -555,9 +500,7 @@ impl Command for Init {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

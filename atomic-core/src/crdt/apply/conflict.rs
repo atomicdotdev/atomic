@@ -38,9 +38,7 @@ use crate::crdt::{BranchId, LeafId, TrunkId};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-// =============================================================================
 // ConflictKind
-// =============================================================================
 
 /// The kind of CRDT conflict detected.
 ///
@@ -159,9 +157,7 @@ impl fmt::Display for ConflictKind {
     }
 }
 
-// =============================================================================
 // ConflictEntity
-// =============================================================================
 
 /// The entity involved in a conflict.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,9 +190,7 @@ impl fmt::Display for ConflictEntity {
     }
 }
 
-// =============================================================================
 // CrdtConflict
-// =============================================================================
 
 /// A conflict detected during CRDT operation application.
 ///
@@ -315,9 +309,7 @@ impl CrdtConflict {
         }
     }
 
-    // =========================================================================
     // Accessors
-    // =========================================================================
 
     /// Returns the conflict kind.
     #[inline]
@@ -355,9 +347,7 @@ impl CrdtConflict {
         self.resolution.as_deref()
     }
 
-    // =========================================================================
     // Convenience Methods
-    // =========================================================================
 
     /// Returns `true` if this conflict can be automatically resolved.
     #[inline]
@@ -371,9 +361,7 @@ impl CrdtConflict {
         self.kind.requires_user_action()
     }
 
-    // =========================================================================
     // Mutation Methods
-    // =========================================================================
 
     /// Marks this conflict as resolved with optional notes.
     pub fn mark_resolved(&mut self, resolution: Option<String>) {
@@ -398,9 +386,7 @@ impl fmt::Display for CrdtConflict {
     }
 }
 
-// =============================================================================
 // CrdtConflictBuilder
-// =============================================================================
 
 /// Builder for constructing [`CrdtConflict`] instances.
 ///
@@ -495,9 +481,7 @@ impl CrdtConflictBuilder {
     }
 }
 
-// =============================================================================
 // CrdtConflictTracker
-// =============================================================================
 
 /// Tracks conflicts during CRDT apply operations.
 ///
@@ -613,9 +597,7 @@ impl CrdtConflictTracker {
         self.conflicts.clear();
     }
 
-    // =========================================================================
     // Filtering Methods
-    // =========================================================================
 
     /// Returns conflicts of the specified kind.
     pub fn by_kind(&self, kind: ConflictKind) -> impl Iterator<Item = &CrdtConflict> {
@@ -652,9 +634,7 @@ impl CrdtConflictTracker {
         self.conflicts.iter().filter(|c| !c.is_resolved()).count()
     }
 
-    // =========================================================================
     // Merge
-    // =========================================================================
 
     /// Merges another tracker's conflicts into this one.
     pub fn merge(&mut self, other: CrdtConflictTracker) {
@@ -699,18 +679,14 @@ impl FromIterator<CrdtConflict> for CrdtConflictTracker {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::NodeId;
 
-    // =========================================================================
     // ConflictKind Tests
-    // =========================================================================
 
     #[test]
     fn test_conflict_kind_auto_resolvable() {
@@ -764,9 +740,7 @@ mod tests {
         assert_eq!(kind, restored);
     }
 
-    // =========================================================================
     // ConflictEntity Tests
-    // =========================================================================
 
     #[test]
     fn test_conflict_entity_trunk() {
@@ -815,9 +789,7 @@ mod tests {
         assert_eq!(entity, restored);
     }
 
-    // =========================================================================
     // CrdtConflict Tests
-    // =========================================================================
 
     #[test]
     fn test_conflict_new() {
@@ -962,9 +934,7 @@ mod tests {
         assert_eq!(conflict.description(), restored.description());
     }
 
-    // =========================================================================
     // CrdtConflictTracker Tests
-    // =========================================================================
 
     #[test]
     fn test_tracker_new() {

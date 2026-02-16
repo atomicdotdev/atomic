@@ -91,9 +91,7 @@ use crate::identity::build_agent_author;
 use crate::transcript;
 use crate::turn::session::AgentSession;
 
-// =============================================================================
 // TurnRecordOptions
-// =============================================================================
 
 /// Options for recording an agent turn as an Atomic change.
 ///
@@ -128,9 +126,7 @@ pub struct TurnRecordOptions<'a> {
     pub prompt: Option<String>,
 }
 
-// =============================================================================
 // TurnRecordOutcome
-// =============================================================================
 
 /// The result of recording a turn as an Atomic change.
 #[derive(Debug)]
@@ -194,9 +190,7 @@ impl std::fmt::Display for TurnRecordOutcome {
     }
 }
 
-// =============================================================================
 // Change Header Construction
-// =============================================================================
 
 /// Build a `ChangeHeader` for an agent turn.
 ///
@@ -570,9 +564,7 @@ fn truncate_prompt(prompt: &str, max_len: usize) -> String {
     }
 }
 
-// =============================================================================
 // Provenance Construction
-// =============================================================================
 
 /// Build a `Provenance` entry for an agent turn.
 ///
@@ -634,9 +626,7 @@ fn vendor_from_agent_name(agent_name: &str) -> AIVendor {
     }
 }
 
-// =============================================================================
 // SessionEnvelope Construction
-// =============================================================================
 
 /// Build a `SessionEnvelope` for embedding in `HashedChange.metadata`.
 fn build_turn_envelope(
@@ -682,9 +672,7 @@ fn build_turn_envelope(
     builder.build()
 }
 
-// =============================================================================
 // record_turn (the main entry point)
-// =============================================================================
 
 /// Record an agent turn as an Atomic change.
 ///
@@ -737,9 +725,7 @@ pub fn record_turn(
     repo_root: &Path,
     options: &TurnRecordOptions<'_>,
 ) -> AgentResult<TurnRecordOutcome> {
-    // =========================================================================
     // Step 1: Open the repository
-    // =========================================================================
     let repo =
         atomic_repository::Repository::open(repo_root).map_err(|e| AgentError::RecordFailed {
             session_id: options.session.session_id.clone(),
@@ -747,9 +733,7 @@ pub fn record_turn(
             reason: format!("Failed to open repository: {}", e),
         })?;
 
-    // =========================================================================
     // Step 2: Status — find out what the agent changed
-    // =========================================================================
     let status = repo
         .status(atomic_repository::status::StatusOptions::default())
         .map_err(|e| AgentError::RecordFailed {
@@ -766,9 +750,7 @@ pub fn record_turn(
         });
     }
 
-    // =========================================================================
     // Step 3: Add — track any new files the agent created
-    // =========================================================================
     // Agents create new files all the time (new modules, tests, configs).
     // These show up as "untracked" in status. We add them before recording
     // so they're included in the change.
@@ -800,9 +782,7 @@ pub fn record_turn(
         }
     }
 
-    // =========================================================================
     // Step 4: Build SessionEnvelope + Record the Atomic change
-    // =========================================================================
     // Build the header AFTER status so the message can describe actual changes
     // instead of parroting slash commands like "/init".
     let header = build_turn_header(options, &status, &untracked_paths);
@@ -833,7 +813,7 @@ pub fn record_turn(
     // This means session structure (turn number, timing, files, agent name)
     // is tamper-evident and commutes via patch theory.
     let record_options = atomic_repository::record::RecordOptions::new()
-        .all(true)
+        .with_all(true)
         .stack(options.session.stack_name.clone())
         .apply_after_record(true)
         .save_to_store(true)
@@ -857,9 +837,7 @@ pub fn record_turn(
         }
     };
 
-    // =========================================================================
     // Step 5: Collect results
-    // =========================================================================
     let recorded_files: Vec<String> = outcome
         .recorded_files()
         .iter()
@@ -867,9 +845,7 @@ pub fn record_turn(
         .collect();
     let file_count = recorded_files.len();
 
-    // =========================================================================
     // Step 6: Condense transcript + generate reasoning + attach to unhashed
-    // =========================================================================
     //
     // Read the agent's transcript file, condense it into structured entries,
     // optionally generate an AI reasoning summary, anchor code learnings to
@@ -916,9 +892,7 @@ pub fn record_turn(
     })
 }
 
-// =============================================================================
 // Step 6 Helper: Build Unhashed Turn Data
-// =============================================================================
 
 /// Build the unhashed turn data (transcript + reasoning) from the agent's
 /// transcript file and the recorded change's FileOps.
@@ -992,9 +966,7 @@ fn build_unhashed_turn_data(
     Some(data)
 }
 
-// =============================================================================
 // Ignore Patterns for Untracked Files
-// =============================================================================
 
 /// Directories and patterns that should never be auto-added by agent recording.
 ///
@@ -1055,9 +1027,7 @@ fn should_ignore_untracked(path: &str) -> bool {
     false
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -1088,9 +1058,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // truncate_prompt tests
-    // =========================================================================
 
     #[test]
     fn test_truncate_prompt_short() {
@@ -1124,9 +1092,7 @@ mod tests {
         assert!(result.chars().count() <= 20);
     }
 
-    // =========================================================================
     // build_turn_message tests
-    // =========================================================================
 
     fn empty_status() -> RepositoryStatus {
         RepositoryStatus::new("main".to_string(), None)
@@ -1136,9 +1102,7 @@ mod tests {
         vec![]
     }
 
-    // =========================================================================
     // is_meaningful_prompt tests
-    // =========================================================================
 
     #[test]
     fn test_slash_command_not_meaningful() {
@@ -1170,9 +1134,7 @@ mod tests {
         assert!(is_meaningful_prompt("refactor error handling"));
     }
 
-    // =========================================================================
     // format_file_group tests
-    // =========================================================================
 
     #[test]
     fn test_format_file_group_single() {
@@ -1215,13 +1177,9 @@ mod tests {
         assert_eq!(format_file_group("Add", &[]), "");
     }
 
-    // =========================================================================
     // build_turn_message tests
-    // =========================================================================
 
-    // =========================================================================
     // build_turn_message priority tests
-    // =========================================================================
 
     #[test]
     fn test_message_prompt_beats_file_summary() {
@@ -1267,9 +1225,7 @@ mod tests {
         assert_eq!(msg, "Add CLAUDE.md");
     }
 
-    // =========================================================================
     // extract_first_sentence / extract_first_sentence_from_paragraph tests
-    // =========================================================================
 
     #[test]
     fn test_extract_first_sentence_simple() {
@@ -1394,9 +1350,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // summarize_from_transcript tests
-    // =========================================================================
 
     #[test]
     fn test_summarize_from_transcript_missing_file() {
@@ -1485,9 +1439,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // build_turn_message tests (integration with transcript)
-    // =========================================================================
 
     #[test]
     fn test_message_transcript_used_when_prompt_and_files_unavailable() {
@@ -1583,9 +1535,7 @@ mod tests {
         assert!(msg.ends_with("..."));
     }
 
-    // =========================================================================
     // build_file_change_summary tests
-    // =========================================================================
 
     #[test]
     fn test_summary_untracked_only() {
@@ -1606,9 +1556,7 @@ mod tests {
         assert_eq!(summary, "");
     }
 
-    // =========================================================================
     // build_turn_header tests
-    // =========================================================================
 
     #[test]
     fn test_header_has_message() {
@@ -1640,9 +1588,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // vendor_from_agent_name tests
-    // =========================================================================
 
     #[test]
     fn test_vendor_from_agent_name_claude() {
@@ -1667,9 +1613,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // build_turn_provenance tests
-    // =========================================================================
 
     #[test]
     fn test_provenance_vendor_and_model() {
@@ -1792,9 +1736,7 @@ mod tests {
         assert!(prov.timestamp.is_some());
     }
 
-    // =========================================================================
     // build_turn_envelope tests
-    // =========================================================================
 
     #[test]
     fn test_envelope_session_id() {
@@ -1926,9 +1868,7 @@ mod tests {
         assert_eq!(decoded.turn_number, 3);
     }
 
-    // =========================================================================
     // record_turn tests (error cases — success requires a real repository)
-    // =========================================================================
 
     #[test]
     fn test_record_turn_nonexistent_repo_fails() {
@@ -1956,9 +1896,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // TurnRecordOutcome display
-    // =========================================================================
 
     #[test]
     fn test_outcome_display() {
@@ -2006,9 +1944,7 @@ mod tests {
         assert_eq!(outcome.recorded_file_list(), &["src/main.rs", "src/lib.rs"]);
     }
 
-    // =========================================================================
     // should_ignore_untracked tests
-    // =========================================================================
 
     #[test]
     fn test_ignore_node_modules() {

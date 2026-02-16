@@ -129,17 +129,13 @@
 //! changes affecting specific paths are downloaded. This is useful for large
 //! repositories where only a subset of files are needed.
 
-// =============================================================================
 // Submodules
-// =============================================================================
 
 mod command;
 mod helpers;
 pub mod types;
 
-// =============================================================================
 // Re-exports
-// =============================================================================
 
 // Main command struct
 pub use command::Clone;
@@ -148,9 +144,7 @@ pub use command::Clone;
 
 // Helper functions that might be useful externally
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

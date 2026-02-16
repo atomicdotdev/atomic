@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Command module for the Atomic CLI.
 //!
 //! This module provides the infrastructure for implementing CLI commands,
@@ -65,9 +64,7 @@ use chrono::{DateTime, Local, Utc};
 
 use crate::error::{CliError, CliResult};
 
-// =============================================================================
 // Command Submodules
-// =============================================================================
 
 // Phase 2: Core Local Commands
 pub mod add;
@@ -127,9 +124,7 @@ pub use stash::Stash;
 pub use status::Status;
 pub use tag::Tag;
 
-// =============================================================================
 // Command Trait
-// =============================================================================
 
 /// Trait that all CLI commands must implement.
 ///
@@ -182,9 +177,7 @@ pub trait Command {
     fn run(&self) -> CliResult<()>;
 }
 
-// =============================================================================
 // Repository Discovery
-// =============================================================================
 
 /// The name of the Atomic directory.
 pub const DOT_DIR: &str = ".atomic";
@@ -326,9 +319,7 @@ pub fn require_repository(path: Option<&Path>) -> CliResult<Repository> {
     open_repository(path)
 }
 
-// =============================================================================
 // Formatting Utilities
-// =============================================================================
 
 /// Default number of characters to show for truncated hashes.
 pub const DEFAULT_HASH_LENGTH: usize = 12;
@@ -473,69 +464,7 @@ pub fn format_timestamp_relative(timestamp: &DateTime<Utc>) -> String {
     }
 }
 
-/// Format a file size for display.
-///
-/// Converts bytes to a human-readable format with appropriate units.
-///
-/// # Arguments
-///
-/// * `bytes` - The size in bytes
-///
-/// # Returns
-///
-/// A human-readable size string.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// println!("{}", format_size(1024));       // "1.0 KiB"
-/// println!("{}", format_size(1048576));    // "1.0 MiB"
-/// ```
-pub fn format_size(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    const GIB: u64 = MIB * 1024;
-
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
-/// Format a count with appropriate singular/plural form.
-///
-/// # Arguments
-///
-/// * `count` - The count
-/// * `singular` - The singular form (e.g., "file")
-/// * `plural` - The plural form (e.g., "files")
-///
-/// # Returns
-///
-/// A formatted string like "1 file" or "5 files".
-///
-/// # Example
-///
-/// ```rust,ignore
-/// println!("{}", format_count(1, "file", "files"));  // "1 file"
-/// println!("{}", format_count(5, "file", "files"));  // "5 files"
-/// ```
-pub fn format_count(count: usize, singular: &str, plural: &str) -> String {
-    if count == 1 {
-        format!("{} {}", count, singular)
-    } else {
-        format!("{} {}", count, plural)
-    }
-}
-
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

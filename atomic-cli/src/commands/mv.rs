@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The `move` command for moving/renaming tracked files.
 //!
 //! This module implements the `atomic move` (alias `mv`) command, which moves
@@ -60,9 +59,7 @@ use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success, print_warning};
 
-// =============================================================================
 // Move Command
-// =============================================================================
 
 /// Move or rename tracked files.
 ///
@@ -111,27 +108,6 @@ pub struct Move {
 }
 
 impl Move {
-    /// Create a new Move command.
-    pub fn new(source: impl Into<String>, destination: impl Into<String>) -> Self {
-        Self {
-            source: source.into(),
-            destination: destination.into(),
-            dry_run: false,
-            force: false,
-        }
-    }
-
-    /// Set dry-run mode.
-    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
-        self.dry_run = dry_run;
-        self
-    }
-
-    /// Set force mode.
-    pub fn with_force(mut self, force: bool) -> Self {
-        self.force = force;
-        self
-    }
 
     /// Normalize a path relative to the repository root.
     fn normalize_path(&self, repo_root: &Path, path: &str) -> CliResult<String> {
@@ -281,17 +257,13 @@ impl Command for Move {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // Builder Tests
-    // =========================================================================
 
     #[test]
     fn test_move_new() {
@@ -335,9 +307,7 @@ mod tests {
         assert!(cmd.force);
     }
 
-    // =========================================================================
     // Path Resolution Tests
-    // =========================================================================
 
     #[test]
     fn test_resolve_destination_rename() {
@@ -381,9 +351,7 @@ mod tests {
         assert_eq!(result, "nonexistent/new.rs");
     }
 
-    // =========================================================================
     // Clone Tests
-    // =========================================================================
 
     #[test]
     fn test_move_clone() {
@@ -398,9 +366,7 @@ mod tests {
         assert_eq!(cloned.force, cmd.force);
     }
 
-    // =========================================================================
     // Normalize Path Tests
-    // =========================================================================
 
     #[test]
     fn test_normalize_relative_path() {

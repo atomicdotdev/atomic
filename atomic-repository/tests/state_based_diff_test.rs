@@ -70,9 +70,7 @@ fn record_change(repo: &Repository, message: &str) -> Hash {
     outcome.hash().clone()
 }
 
-// ============================================================================
 // StateBeforeChange Tests
-// ============================================================================
 
 #[test]
 fn test_state_before_change_struct() {
@@ -98,9 +96,7 @@ fn test_state_before_change_first() {
     assert_eq!(state.parent_max_sequence_exclusive(), 0);
 }
 
-// ============================================================================
 // Basic Workflow Tests
-// ============================================================================
 
 #[test]
 fn test_get_files_in_change_empty() {
@@ -118,9 +114,7 @@ fn test_get_files_in_change_empty() {
     assert!(files.is_empty());
 }
 
-// ============================================================================
 // Integration Tests - Repository Workflow
-// ============================================================================
 
 #[test]
 fn test_file_addition_state_retrieval() {
@@ -367,9 +361,7 @@ fn test_untracked_file() {
     assert!(after.unwrap().is_none());
 }
 
-// ============================================================================
 // Edge Case Tests
-// ============================================================================
 
 /// Empty files don't have content to record, so record() returns NothingToRecord.
 /// This test verifies that attempting to record an empty file fails as expected.
@@ -465,9 +457,7 @@ fn test_unicode_content() {
     );
 }
 
-// ============================================================================
 // Code Review Workflow Simulation
-// ============================================================================
 
 /// This test simulates the full code review workflow:
 /// 1. Developer creates initial code
@@ -541,9 +531,7 @@ fn main() {
     assert!(!diff_result.is_unchanged(), "Diff should show changes");
 }
 
-// ============================================================================
 // Append Operation Tests
-// ============================================================================
 
 /// Test appending content to an existing file.
 ///

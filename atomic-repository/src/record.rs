@@ -80,9 +80,7 @@ use thiserror::Error;
 use crate::status::{FileStatus, FileStatusEntry};
 use crate::RepositoryError;
 
-// ============================================================================
 // ERROR TYPES
-// ============================================================================
 
 /// Result type for record operations.
 pub type RecordResult<T> = Result<T, RecordError>;
@@ -163,9 +161,7 @@ pub enum RecordError {
     },
 }
 
-// ============================================================================
 // OPTIONS
-// ============================================================================
 
 /// Options for recording changes.
 ///
@@ -178,12 +174,12 @@ pub enum RecordError {
 /// use atomic_core::diff::Algorithm;
 ///
 /// let options = RecordOptions::new()
-///     .algorithm(Algorithm::Patience)
-///     .all(true)
+///     .with_algorithm(Algorithm::Patience)
+///     .with_all(true)
 ///     .message("Fix bug in parser");
 ///
-/// assert_eq!(options.get_algorithm(), Algorithm::Patience);
-/// assert!(options.get_all());
+/// assert_eq!(options.algorithm(), Algorithm::Patience);
+/// assert!(options.all());
 /// ```
 #[derive(Debug, Clone)]
 pub struct RecordOptions {
@@ -255,7 +251,7 @@ impl RecordOptions {
     /// use atomic_repository::record::RecordOptions;
     ///
     /// let options = RecordOptions::new();
-    /// assert!(!options.get_all());
+    /// assert!(!options.all());
     /// assert!(options.get_apply_after_record());
     /// ```
     #[must_use]
@@ -305,7 +301,7 @@ impl RecordOptions {
     ///
     /// * `all` - Whether to record all changes
     #[must_use]
-    pub fn all(mut self, all: bool) -> Self {
+    pub fn with_all(mut self, all: bool) -> Self {
         self.all = all;
         self
     }
@@ -316,7 +312,7 @@ impl RecordOptions {
     ///
     /// * `algorithm` - The algorithm to use (Myers or Patience)
     #[must_use]
-    pub fn algorithm(mut self, algorithm: Algorithm) -> Self {
+    pub fn with_algorithm(mut self, algorithm: Algorithm) -> Self {
         self.algorithm = algorithm;
         self
     }
@@ -327,7 +323,7 @@ impl RecordOptions {
     ///
     /// * `encoding` - The default encoding
     #[must_use]
-    pub fn default_encoding(mut self, encoding: Encoding) -> Self {
+    pub fn with_default_encoding(mut self, encoding: Encoding) -> Self {
         self.default_encoding = encoding;
         self
     }
@@ -340,7 +336,7 @@ impl RecordOptions {
     ///
     /// * `size` - Maximum size in bytes
     #[must_use]
-    pub fn max_file_size(mut self, size: u64) -> Self {
+    pub fn with_max_file_size(mut self, size: u64) -> Self {
         self.max_file_size = size;
         self
     }
@@ -351,7 +347,7 @@ impl RecordOptions {
     ///
     /// * `skip` - Whether to skip binary files
     #[must_use]
-    pub fn skip_binary(mut self, skip: bool) -> Self {
+    pub fn with_skip_binary(mut self, skip: bool) -> Self {
         self.skip_binary = skip;
         self
     }
@@ -515,31 +511,31 @@ impl RecordOptions {
 
     /// Get whether to record all changes.
     #[must_use]
-    pub fn get_all(&self) -> bool {
+    pub fn all(&self) -> bool {
         self.all
     }
 
     /// Get the diff algorithm.
     #[must_use]
-    pub fn get_algorithm(&self) -> Algorithm {
+    pub fn algorithm(&self) -> Algorithm {
         self.algorithm
     }
 
     /// Get the default encoding.
     #[must_use]
-    pub fn get_default_encoding(&self) -> Encoding {
+    pub fn default_encoding(&self) -> Encoding {
         self.default_encoding
     }
 
     /// Get the maximum file size.
     #[must_use]
-    pub fn get_max_file_size(&self) -> u64 {
+    pub fn max_file_size(&self) -> u64 {
         self.max_file_size
     }
 
     /// Get whether to skip binary files.
     #[must_use]
-    pub fn get_skip_binary(&self) -> bool {
+    pub fn skip_binary(&self) -> bool {
         self.skip_binary
     }
 
@@ -629,8 +625,8 @@ impl RecordOptions {
             .include_empty_files(self.record_empty_files)
             .globalize_options(
                 GlobalizeOptions::new()
-                    .include_empty_files(self.record_empty_files)
-                    .default_encoding(self.default_encoding),
+                    .with_include_empty_files(self.record_empty_files)
+                    .with_default_encoding(self.default_encoding),
             )
             .provenance(self.provenance.clone())
             .metadata_bytes(self.metadata_bytes.clone())
@@ -658,9 +654,7 @@ impl Default for RecordOptions {
     }
 }
 
-// ============================================================================
 // STATISTICS
-// ============================================================================
 
 /// Statistics about the recording process.
 ///
@@ -698,9 +692,7 @@ pub struct RecordStats {
     /// Number of errors.
     pub errors: usize,
 
-    // ========================================================================
     // CRDT Token-Level Statistics (for fine-grained diff tracking)
-    // ========================================================================
     /// Number of lines added (CRDT BranchOp::Insert).
     pub lines_added: usize,
 
@@ -800,9 +792,7 @@ impl fmt::Display for RecordStats {
     }
 }
 
-// ============================================================================
 // RESULT
-// ============================================================================
 
 /// Result of recording changes.
 #[derive(Debug)]
@@ -1013,9 +1003,7 @@ impl fmt::Display for RecordOutcome {
     }
 }
 
-// ============================================================================
 // HELPER FUNCTIONS
-// ============================================================================
 
 /// Build a ChangeHeader from options and explicit header.
 ///
@@ -1052,30 +1040,26 @@ pub fn filter_files<'a>(
         .collect()
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ========================================================================
     // RecordOptions Tests
-    // ========================================================================
 
     #[test]
     fn test_options_new_returns_defaults() {
         let opts = RecordOptions::new();
         assert!(opts.get_paths().is_empty());
-        assert!(!opts.get_all());
-        assert_eq!(opts.get_algorithm(), Algorithm::Myers);
-        assert_eq!(opts.get_default_encoding(), Encoding::Utf8);
+        assert!(!opts.all());
+        assert_eq!(opts.algorithm(), Algorithm::Myers);
+        assert_eq!(opts.default_encoding(), Encoding::Utf8);
         assert_eq!(
-            opts.get_max_file_size(),
+            opts.max_file_size(),
             RecordOptions::DEFAULT_MAX_FILE_SIZE
         );
-        assert!(!opts.get_skip_binary());
+        assert!(!opts.skip_binary());
         assert!(!opts.get_record_empty_files());
         assert_eq!(
             opts.get_context_lines(),
@@ -1091,7 +1075,7 @@ mod tests {
     fn test_options_default() {
         let opts = RecordOptions::default();
         assert!(opts.get_paths().is_empty());
-        assert!(!opts.get_all());
+        assert!(!opts.all());
     }
 
     #[test]
@@ -1111,32 +1095,32 @@ mod tests {
 
     #[test]
     fn test_options_all() {
-        let opts = RecordOptions::new().all(true);
-        assert!(opts.get_all());
+        let opts = RecordOptions::new().with_all(true);
+        assert!(opts.all());
     }
 
     #[test]
     fn test_options_algorithm() {
-        let opts = RecordOptions::new().algorithm(Algorithm::Patience);
-        assert_eq!(opts.get_algorithm(), Algorithm::Patience);
+        let opts = RecordOptions::new().with_algorithm(Algorithm::Patience);
+        assert_eq!(opts.algorithm(), Algorithm::Patience);
     }
 
     #[test]
     fn test_options_default_encoding() {
-        let opts = RecordOptions::new().default_encoding(Encoding::Binary);
-        assert_eq!(opts.get_default_encoding(), Encoding::Binary);
+        let opts = RecordOptions::new().with_default_encoding(Encoding::Binary);
+        assert_eq!(opts.default_encoding(), Encoding::Binary);
     }
 
     #[test]
     fn test_options_max_file_size() {
-        let opts = RecordOptions::new().max_file_size(1024);
-        assert_eq!(opts.get_max_file_size(), 1024);
+        let opts = RecordOptions::new().with_max_file_size(1024);
+        assert_eq!(opts.max_file_size(), 1024);
     }
 
     #[test]
     fn test_options_skip_binary() {
-        let opts = RecordOptions::new().skip_binary(true);
-        assert!(opts.get_skip_binary());
+        let opts = RecordOptions::new().with_skip_binary(true);
+        assert!(opts.skip_binary());
     }
 
     #[test]
@@ -1179,24 +1163,24 @@ mod tests {
     fn test_options_builder_chain() {
         let opts = RecordOptions::new()
             .paths(vec!["src/"])
-            .all(false)
-            .algorithm(Algorithm::Patience)
-            .max_file_size(1024 * 1024)
-            .skip_binary(true)
+            .with_all(false)
+            .with_algorithm(Algorithm::Patience)
+            .with_max_file_size(1024 * 1024)
+            .with_skip_binary(true)
             .message("Test change")
             .stack("feature");
 
         assert_eq!(opts.get_paths().len(), 1);
-        assert!(!opts.get_all());
-        assert_eq!(opts.get_algorithm(), Algorithm::Patience);
-        assert!(opts.get_skip_binary());
+        assert!(!opts.all());
+        assert_eq!(opts.algorithm(), Algorithm::Patience);
+        assert!(opts.skip_binary());
         assert_eq!(opts.get_message(), Some("Test change"));
         assert_eq!(opts.get_stack(), Some("feature"));
     }
 
     #[test]
     fn test_options_should_include_all() {
-        let opts = RecordOptions::new().all(true);
+        let opts = RecordOptions::new().with_all(true);
         assert!(opts.should_include("any/path/file.rs"));
     }
 
@@ -1235,9 +1219,7 @@ mod tests {
         assert!(debug.contains("RecordOptions"));
     }
 
-    // ========================================================================
     // RecordError Tests
-    // ========================================================================
 
     #[test]
     fn test_error_nothing_to_record() {
@@ -1276,9 +1258,7 @@ mod tests {
         assert!(msg.contains("100000000"));
     }
 
-    // ========================================================================
     // RecordStats Tests
-    // ========================================================================
 
     #[test]
     fn test_stats_new() {
@@ -1390,9 +1370,7 @@ mod tests {
         assert!(stats2.has_crdt_stats());
     }
 
-    // ========================================================================
     // RecordOutcome Tests
-    // ========================================================================
 
     #[test]
     fn test_outcome_new() {
@@ -1491,9 +1469,7 @@ mod tests {
         assert_eq!(taken.message(), "Take me");
     }
 
-    // ========================================================================
     // Helper Function Tests
-    // ========================================================================
 
     #[test]
     fn test_build_header_with_options_message() {
@@ -1533,9 +1509,7 @@ mod tests {
         assert_eq!(filtered.len(), 2);
     }
 
-    // ========================================================================
     // Provenance Tests
-    // ========================================================================
 
     #[test]
     fn test_options_provenance_default() {
@@ -1596,12 +1570,12 @@ mod tests {
 
         let opts = RecordOptions::new()
             .message("AI-assisted change")
-            .all(true)
+            .with_all(true)
             .add_provenance(prov);
 
         assert!(opts.has_provenance());
         assert_eq!(opts.get_message(), Some("AI-assisted change"));
-        assert!(opts.get_all());
+        assert!(opts.all());
     }
 
     #[test]

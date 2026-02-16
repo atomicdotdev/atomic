@@ -381,8 +381,7 @@ mod tests {
         strs.iter().map(|s| Line::new(s.as_bytes())).collect()
     }
 
-    // ==================== Basic Tests ====================
-
+    // Basic Tests
     #[test]
     fn test_empty_sequences() {
         let result = diff(&[], &[]);
@@ -455,8 +454,7 @@ mod tests {
         assert_eq!(result.insertions(), 1);
     }
 
-    // ==================== Unique Match Tests ====================
-
+    // Unique Match Tests
     #[test]
     fn test_find_unique_matches_simple() {
         let old = lines(&["a\n", "b\n", "c\n"]);
@@ -507,8 +505,7 @@ mod tests {
         assert!(matches.is_empty());
     }
 
-    // ==================== LIS Tests ====================
-
+    // LIS Tests
     #[test]
     fn test_lis_simple() {
         let matches = vec![
@@ -599,8 +596,7 @@ mod tests {
         assert_eq!(lis.len(), 1);
     }
 
-    // ==================== Integration Tests ====================
-
+    // Integration Tests
     #[test]
     fn test_patience_vs_myers_structural() {
         // A case where patience should produce better results

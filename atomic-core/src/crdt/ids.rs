@@ -29,9 +29,7 @@ use crate::types::NodeId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-// =============================================================================
 // TrunkId - File Level Identifier
-// =============================================================================
 
 /// Unique identifier for a file (trunk) in the CRDT graph.
 ///
@@ -114,9 +112,7 @@ impl fmt::Display for TrunkId {
     }
 }
 
-// =============================================================================
 // BranchId - Line Level Identifier
-// =============================================================================
 
 /// Unique identifier for a line (branch) in the CRDT graph.
 ///
@@ -198,9 +194,7 @@ impl fmt::Display for BranchId {
     }
 }
 
-// =============================================================================
 // LeafId - Token Level Identifier
-// =============================================================================
 
 /// Unique identifier for a token (leaf) in the CRDT graph.
 ///
@@ -282,9 +276,7 @@ impl fmt::Display for LeafId {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

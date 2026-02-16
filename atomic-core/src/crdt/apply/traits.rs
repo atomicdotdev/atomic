@@ -72,9 +72,7 @@ use crate::pristine::PristineError;
 use crate::types::Inode;
 use std::ops::Range;
 
-// =============================================================================
 // MutCrdtTxnT Trait
-// =============================================================================
 
 /// Transaction trait for CRDT apply operations.
 ///
@@ -102,9 +100,7 @@ pub trait MutCrdtTxnT {
     /// The error type for CRDT operations.
     type Error: Into<PristineError>;
 
-    // =========================================================================
     // Trunk (File) Operations
-    // =========================================================================
 
     /// Stores a trunk in the TRUNKS table.
     ///
@@ -190,9 +186,7 @@ pub trait MutCrdtTxnT {
     /// * `inode` - The inode to look up
     fn get_trunk_by_inode(&self, inode: Inode) -> Result<Option<TrunkId>, Self::Error>;
 
-    // =========================================================================
     // Branch (Line) Operations
-    // =========================================================================
 
     /// Stores a branch in the BRANCHES table.
     ///
@@ -262,9 +256,7 @@ pub trait MutCrdtTxnT {
     /// * `trunk_id` - The trunk to count branches for
     fn count_branches(&self, trunk_id: TrunkId) -> Result<usize, Self::Error>;
 
-    // =========================================================================
     // Leaf (Token) Operations
-    // =========================================================================
 
     /// Stores a leaf in the LEAVES table.
     ///
@@ -343,9 +335,7 @@ pub trait MutCrdtTxnT {
     /// * `branch_id` - The branch to count leaves for
     fn count_leaves(&self, branch_id: BranchId) -> Result<usize, Self::Error>;
 
-    // =========================================================================
     // Utility Operations
-    // =========================================================================
 
     /// Allocates a new unique inode.
     ///
@@ -353,9 +343,7 @@ pub trait MutCrdtTxnT {
     fn alloc_inode(&mut self) -> Result<Inode, Self::Error>;
 }
 
-// =============================================================================
 // Extension Methods
-// =============================================================================
 
 /// Extension trait providing higher-level CRDT operations.
 ///
@@ -458,9 +446,7 @@ pub trait MutCrdtTxnExt: MutCrdtTxnT {
 // Blanket implementation for all MutCrdtTxnT implementors
 impl<T: MutCrdtTxnT> MutCrdtTxnExt for T {}
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -468,9 +454,7 @@ mod tests {
     use crate::types::NodeId;
     use std::collections::HashMap;
 
-    // =========================================================================
     // Mock Transaction for Testing
-    // =========================================================================
 
     /// A mock transaction implementation for testing.
     #[derive(Default)]
@@ -649,9 +633,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // Trunk Tests
-    // =========================================================================
 
     #[test]
     fn test_put_and_get_trunk() {
@@ -729,9 +711,7 @@ mod tests {
         assert_eq!(txn.get_trunk_by_path("new.rs").unwrap(), Some(id));
     }
 
-    // =========================================================================
     // Branch Tests
-    // =========================================================================
 
     #[test]
     fn test_put_and_get_branch() {
@@ -773,9 +753,7 @@ mod tests {
         assert_eq!(txn.count_branches(trunk_id).unwrap(), 1);
     }
 
-    // =========================================================================
     // Leaf Tests
-    // =========================================================================
 
     #[test]
     fn test_put_and_get_leaf() {
@@ -819,9 +797,7 @@ mod tests {
         assert_eq!(retrieved.content_range(), 10..20);
     }
 
-    // =========================================================================
     // Extension Methods Tests
-    // =========================================================================
 
     #[test]
     fn test_create_trunk() {

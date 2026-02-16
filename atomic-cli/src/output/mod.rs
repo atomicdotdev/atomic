@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Output formatting utilities for the Atomic CLI.
 //!
 //! This module provides a comprehensive set of utilities for consistent,
@@ -68,11 +67,7 @@ pub use progress::{
 };
 
 
-use std::io::{self, Write};
-
-// =============================================================================
 // Convenience Print Functions
-// =============================================================================
 
 /// Print a success message to stdout.
 ///
@@ -164,9 +159,7 @@ pub fn print_hint(message: &str) {
     println!("{}", hint(message));
 }
 
-// =============================================================================
 // Structured Output Helpers
-// =============================================================================
 
 /// Print a section header.
 ///
@@ -185,33 +178,12 @@ pub fn print_section(title: &str) {
     println!("{}", emphasis(title));
 }
 
-/// Print an indented item.
-///
-/// Use this for list items within a section.
-///
-/// # Arguments
-///
-/// * `item` - The item text
-///
-/// # Example
-///
-/// ```rust,ignore
-/// print_section("Modified files:");
-/// print_item("src/main.rs");
-/// print_item("src/lib.rs");
-/// ```
-pub fn print_item(item: &str) {
-    println!("  {}", item);
-}
-
 /// Print a blank line for visual separation.
 pub fn print_blank() {
     println!();
 }
 
-// =============================================================================
 // Next Steps Helper
-// =============================================================================
 
 /// Print a "next steps" section to guide users.
 ///
@@ -258,56 +230,9 @@ pub fn print_next_steps(steps: &[(&str, &str)]) {
     }
 }
 
-// =============================================================================
 // Confirmation Prompt
-// =============================================================================
 
-/// Ask the user for confirmation.
-///
-/// Returns `true` if the user confirms, `false` otherwise.
-/// If stdin is not a TTY, returns the default value.
-///
-/// # Arguments
-///
-/// * `prompt` - The question to ask
-/// * `default` - The default answer if user just presses Enter
-///
-/// # Returns
-///
-/// `true` if confirmed, `false` otherwise.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// if confirm("Delete this file?", false) {
-///     delete_file();
-/// }
-/// ```
-pub fn confirm(prompt: &str, default: bool) -> bool {
-    let suffix = if default { " [Y/n] " } else { " [y/N] " };
-
-    print!("{}{}", prompt, suffix);
-    if io::stdout().flush().is_err() {
-        return default;
-    }
-
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() {
-        return default;
-    }
-
-    let input = input.trim().to_lowercase();
-    match input.as_str() {
-        "y" | "yes" => true,
-        "n" | "no" => false,
-        "" => default,
-        _ => default,
-    }
-}
-
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

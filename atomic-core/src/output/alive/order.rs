@@ -73,9 +73,7 @@
 use super::graph::AliveGraph;
 use super::vertex::VertexId;
 
-// ============================================================================
 // SCC IDENTIFIER
-// ============================================================================
 
 /// Identifier for a Strongly Connected Component.
 ///
@@ -116,9 +114,7 @@ impl std::fmt::Display for SccId {
     }
 }
 
-// ============================================================================
 // PATH ELEMENT (FOR CONFLICT TREE)
-// ============================================================================
 
 /// An element in the conflict tree path.
 ///
@@ -174,9 +170,7 @@ impl PathElement {
     }
 }
 
-// ============================================================================
 // CONFLICT PATH
-// ============================================================================
 
 /// A path through the conflict tree.
 ///
@@ -223,9 +217,7 @@ impl ConflictPath {
     }
 }
 
-// ============================================================================
 // CONFLICT TREE
-// ============================================================================
 
 /// The root of the conflict tree.
 ///
@@ -284,9 +276,7 @@ fn count_conflicts_in_path(path: &ConflictPath) -> usize {
     count
 }
 
-// ============================================================================
 // ORDER RESULT
-// ============================================================================
 
 /// Result of computing the output order.
 #[derive(Debug)]
@@ -334,9 +324,7 @@ impl OrderResult {
     }
 }
 
-// ============================================================================
 // TARJAN'S ALGORITHM
-// ============================================================================
 
 /// Compute the output order using Tarjan's SCC algorithm.
 ///
@@ -502,9 +490,7 @@ fn build_conflict_tree(graph: &AliveGraph, result: &mut OrderResult) {
     result.conflict_tree = ConflictTree::from_path(path);
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The `add` command for tracking files in the repository.
 //!
 //! This module implements the `atomic add` command, which adds files and
@@ -101,9 +100,7 @@ use crate::output::{
     added, hint, info, print_blank, print_hint, print_success, print_warning, warning,
 };
 
-// =============================================================================
 // Add Command
-// =============================================================================
 
 /// Add files to be tracked by the repository.
 ///
@@ -205,115 +202,6 @@ impl Add {
             no_recursive: false,
             directory: false,
         }
-    }
-
-    /// Add files to track.
-    ///
-    /// # Arguments
-    ///
-    /// * `files` - List of file paths to add
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let add = Add::new().with_files(vec!["src/main.rs", "src/lib.rs"]);
-    /// ```
-    pub fn with_files<I, S>(mut self, files: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.files = files.into_iter().map(|s| s.into()).collect();
-        self
-    }
-
-    /// Set the --all flag.
-    ///
-    /// # Arguments
-    ///
-    /// * `all` - Whether to add all untracked files
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let add = Add::new().with_all(true);
-    /// ```
-    pub fn with_all(mut self, all: bool) -> Self {
-        self.all = all;
-        self
-    }
-
-    /// Set the --dry-run flag.
-    ///
-    /// # Arguments
-    ///
-    /// * `dry_run` - Whether to perform a dry run
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let add = Add::new()
-    ///     .with_files(vec!["src/"])
-    ///     .with_dry_run(true);
-    /// ```
-    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
-        self.dry_run = dry_run;
-        self
-    }
-
-    /// Set the --force flag.
-    ///
-    /// # Arguments
-    ///
-    /// * `force` - Whether to force add ignored files
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let add = Add::new()
-    ///     .with_files(vec![".gitignore"])
-    ///     .with_force(true);
-    /// ```
-    pub fn with_force(mut self, force: bool) -> Self {
-        self.force = force;
-        self
-    }
-
-    /// Set the --recursive flag.
-    ///
-    /// # Arguments
-    ///
-    /// * `recursive` - Whether to recursively add directory contents
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let add = Add::new()
-    ///     .with_files(vec!["src/"])
-    ///     .with_recursive(false);
-    /// ```
-    pub fn with_recursive(mut self, recursive: bool) -> Self {
-        self.recursive = recursive;
-        self.no_recursive = !recursive;
-        self
-    }
-
-    /// Set the --directory flag.
-    ///
-    /// # Arguments
-    ///
-    /// * `directory` - Whether to track paths as explicit directories
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let add = Add::new()
-    ///     .with_files(vec!["src/empty_module/"])
-    ///     .with_directory(true);
-    /// ```
-    pub fn with_directory(mut self, directory: bool) -> Self {
-        self.directory = directory;
-        self
     }
 
     /// Convert command options to TrackingOptions.
@@ -573,9 +461,7 @@ impl Command for Add {
     }
 }
 
-// =============================================================================
 // Helper Types
-// =============================================================================
 
 /// Aggregate statistics from multiple add operations.
 #[derive(Debug, Clone, Default)]
@@ -610,9 +496,7 @@ impl AggregateStats {
     }
 }
 
-// =============================================================================
 // Helper Functions
-// =============================================================================
 
 /// Format a count with singular/plural noun.
 fn format_count(count: usize, singular: &str, plural: &str) -> String {
@@ -623,9 +507,7 @@ fn format_count(count: usize, singular: &str, plural: &str) -> String {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -633,9 +515,7 @@ mod tests {
     use serial_test::serial;
     use std::path::PathBuf;
 
-    // =========================================================================
     // Add Command Construction Tests
-    // =========================================================================
 
     #[test]
     fn test_add_new() {
@@ -719,9 +599,7 @@ mod tests {
         assert!(add.recursive);
     }
 
-    // =========================================================================
     // TrackingOptions Conversion Tests
-    // =========================================================================
 
     #[test]
     fn test_get_tracking_options_default() {
@@ -754,9 +632,7 @@ mod tests {
         assert!(!options.recursive);
     }
 
-    // =========================================================================
     // AggregateStats Tests
-    // =========================================================================
 
     #[test]
     fn test_aggregate_stats_new() {
@@ -801,9 +677,7 @@ mod tests {
         assert_eq!(stats.total_added(), 0);
     }
 
-    // =========================================================================
     // Format Count Tests
-    // =========================================================================
 
     #[test]
     fn test_format_count_singular() {
@@ -826,9 +700,7 @@ mod tests {
         assert_eq!(format_count(3, "directory", "directories"), "3 directories");
     }
 
-    // =========================================================================
     // Integration Tests (require temp directories)
-    // =========================================================================
 
     /// Guard that restores the current directory when dropped.
     struct DirGuard {
@@ -1178,9 +1050,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // =========================================================================
     // Edge Case Tests
-    // =========================================================================
 
     #[test]
     fn test_add_empty_files_list() {

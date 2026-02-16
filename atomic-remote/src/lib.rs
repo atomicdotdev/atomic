@@ -119,9 +119,7 @@
 //!
 //! - `integration-tests` - Enable integration tests that require a running `atomic-api` server
 
-// =============================================================================
 // Modules
-// =============================================================================
 
 pub mod error;
 pub mod http;
@@ -129,9 +127,7 @@ pub mod streaming;
 pub mod sync;
 pub mod types;
 
-// =============================================================================
 // Re-exports
-// =============================================================================
 
 // Error types
 pub use error::{RemoteError, RemoteResult};
@@ -154,9 +150,7 @@ pub use streaming::{
     StreamingPullOptions, StreamingPushOptions, TransferProgress, TransferStats,
 };
 
-// =============================================================================
 // Constants
-// =============================================================================
 
 /// The current protocol version.
 ///
@@ -166,9 +160,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// The crate version, used in User-Agent headers.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

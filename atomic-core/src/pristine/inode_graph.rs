@@ -99,9 +99,7 @@ use crate::types::{
 
 use redb::ReadableMultimapTable;
 
-// ============================================================================
 // INODE VERTEX COMPOSITE KEY
-// ============================================================================
 
 /// A composite key combining file identity (Inode) with graph span.
 ///
@@ -228,9 +226,7 @@ impl std::fmt::Display for InodeVertex {
     }
 }
 
-// ============================================================================
 // INODE ADJACENCY STATE
-// ============================================================================
 
 /// State for inode-scoped adjacency iteration.
 ///
@@ -296,9 +292,7 @@ impl InodeAdjState {
     }
 }
 
-// ============================================================================
 // INODE GRAPH STATISTICS
-// ============================================================================
 
 /// Statistics collected during inode-scoped graph operations.
 ///
@@ -355,9 +349,7 @@ impl std::fmt::Display for InodeGraphStats {
     }
 }
 
-// ============================================================================
 // INODE GRAPH OPS TRAIT
-// ============================================================================
 
 /// Trait for inode-scoped graph operations.
 ///
@@ -550,9 +542,7 @@ pub trait InodeGraphOps {
     }
 }
 
-// ============================================================================
 // INODE EDGE ITERATOR
-// ============================================================================
 
 /// Iterator over edges within an inode scope.
 ///
@@ -595,9 +585,7 @@ impl<'a, T: InodeGraphOps> Iterator for InodeEdgeIter<'a, T> {
     }
 }
 
-// ============================================================================
 // CONVERSION TRAITS
-// ============================================================================
 
 /// Trait for converting to an InodeVertex.
 pub trait IntoInodeVertex {
@@ -619,9 +607,7 @@ impl IntoInodeVertex for Position<NodeId> {
     }
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -887,9 +873,7 @@ mod tests {
     }
 }
 
-// ============================================================================
 // EDGE DESERIALIZATION (local copy to avoid module visibility issues)
-// ============================================================================
 
 /// Deserialize bytes to a SerializedGraphEdge
 #[inline]
@@ -905,9 +889,7 @@ fn deserialize_edge(bytes: &[u8; 24]) -> SerializedGraphEdge {
     SerializedGraphEdge::new(flag, dest, NodeId::new(introduced_by))
 }
 
-// ============================================================================
 // InodeGraphOps Implementation for ReadTxn
-// ============================================================================
 
 impl InodeGraphOps for ReadTxn {
     type InodeError = PristineError;
@@ -1039,9 +1021,7 @@ impl InodeGraphOps for ReadTxn {
     }
 }
 
-// ============================================================================
 // InodeGraphOps Implementation for WriteTxn
-// ============================================================================
 
 impl<'a> InodeGraphOps for WriteTxn<'a> {
     type InodeError = PristineError;
@@ -1173,9 +1153,7 @@ impl<'a> InodeGraphOps for WriteTxn<'a> {
     }
 }
 
-// ============================================================================
 // ADDITIONAL INTEGRATION TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod integration_tests {

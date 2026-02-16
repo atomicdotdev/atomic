@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The `stack delete` command for deleting a stack.
 //!
 //! This module implements the `atomic stack delete` command, which removes
@@ -49,9 +48,7 @@ use crate::output::{print_success, stack as style_stack, warning};
 #[cfg(test)]
 use std::path::PathBuf;
 
-// =============================================================================
 // Delete Command
-// =============================================================================
 
 /// Delete a stack.
 ///
@@ -79,19 +76,6 @@ pub struct Delete {
 }
 
 impl Delete {
-    /// Create a new `Delete` command with the given stack name.
-    pub fn with_name(name: impl Into<String>) -> Self {
-        Self {
-            name: Some(name.into()),
-            force: false,
-        }
-    }
-
-    /// Set whether to force deletion.
-    pub fn with_force(mut self, force: bool) -> Self {
-        self.force = force;
-        self
-    }
 }
 
 impl Command for Delete {
@@ -160,9 +144,7 @@ impl Command for Delete {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

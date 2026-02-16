@@ -74,9 +74,7 @@
 use crate::types::{Hash, NodeId, Position, GraphNode};
 use std::collections::HashSet;
 
-// =============================================================================
 // Zombie Conflicts
-// =============================================================================
 
 /// A zombie conflict represents deleted content with live connections.
 ///
@@ -157,9 +155,7 @@ impl ZombieConflict {
     }
 }
 
-// =============================================================================
 // Missing Context Conflicts
-// =============================================================================
 
 /// A missing context conflict represents a reference to non-existent context.
 ///
@@ -213,9 +209,7 @@ impl MissingContextConflict {
     }
 }
 
-// =============================================================================
 // Order Conflicts
-// =============================================================================
 
 /// An order conflict represents ambiguous insertion order.
 ///
@@ -264,9 +258,7 @@ impl OrderConflict {
     }
 }
 
-// =============================================================================
 // Conflict Tracker
-// =============================================================================
 
 /// Tracks all conflicts detected during change application.
 ///
@@ -311,9 +303,7 @@ impl ConflictTracker {
         self.involved_changes.clear();
     }
 
-    // =========================================================================
     // Zombie Conflicts
-    // =========================================================================
 
     /// Add a zombie conflict.
     pub fn add_zombie(&mut self, zombie: ZombieConflict) {
@@ -346,9 +336,7 @@ impl ConflictTracker {
         !self.zombies.is_empty()
     }
 
-    // =========================================================================
     // Missing Context Conflicts
-    // =========================================================================
 
     /// Add a missing context conflict.
     pub fn add_missing_context(&mut self, conflict: MissingContextConflict) {
@@ -371,9 +359,7 @@ impl ConflictTracker {
         !self.missing_contexts.is_empty()
     }
 
-    // =========================================================================
     // Order Conflicts
-    // =========================================================================
 
     /// Add an order conflict.
     pub fn add_order_conflict(&mut self, conflict: OrderConflict) {
@@ -398,9 +384,7 @@ impl ConflictTracker {
         !self.order_conflicts.is_empty()
     }
 
-    // =========================================================================
     // Aggregate Queries
-    // =========================================================================
 
     /// Check if there are any conflicts of any type.
     pub fn has_conflicts(&self) -> bool {
@@ -428,9 +412,7 @@ impl ConflictTracker {
     }
 }
 
-// =============================================================================
 // Conflict Summary
-// =============================================================================
 
 /// Summary statistics for conflicts.
 #[derive(Debug, Clone, Default)]
@@ -467,18 +449,14 @@ impl ConflictSummary {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::ChangePosition;
 
-    // =========================================================================
     // Test Helpers
-    // =========================================================================
 
     fn make_vertex(change: u64, start: u64, end: u64) -> GraphNode<NodeId> {
         GraphNode {
@@ -495,9 +473,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // Zombie Conflict Tests
-    // =========================================================================
 
     #[test]
     fn test_zombie_conflict_new() {
@@ -568,9 +544,7 @@ mod tests {
         assert!(!zombie2.is_resolved());
     }
 
-    // =========================================================================
     // Missing Context Tests
-    // =========================================================================
 
     #[test]
     fn test_missing_context_new() {
@@ -612,9 +586,7 @@ mod tests {
         assert_eq!(conflict.expected_change, Some(expected));
     }
 
-    // =========================================================================
     // Order Conflict Tests
-    // =========================================================================
 
     #[test]
     fn test_order_conflict_new() {
@@ -654,9 +626,7 @@ mod tests {
         assert_eq!(conflict.conflict_count(), 1);
     }
 
-    // =========================================================================
     // Conflict Tracker Tests
-    // =========================================================================
 
     #[test]
     fn test_conflict_tracker_new() {
@@ -761,9 +731,7 @@ mod tests {
         assert!(tracker.is_empty());
     }
 
-    // =========================================================================
     // Conflict Summary Tests
-    // =========================================================================
 
     #[test]
     fn test_conflict_summary_from_tracker() {

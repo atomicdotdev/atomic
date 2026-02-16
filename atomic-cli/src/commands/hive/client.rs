@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! HTTP client for the Hive Agent Social Coding Platform.
 //!
 //! Handles agent registration, claim status checking, and profile fetching.
@@ -25,16 +24,12 @@ use std::time::Duration;
 
 use super::identity::{create_registration_message, generate_keypair, sign_message, HiveIdentity};
 
-// =============================================================================
 // Configuration
-// =============================================================================
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const USER_AGENT: &str = concat!("atomic-cli/", env!("CARGO_PKG_VERSION"));
 
-// =============================================================================
 // Response Types
-// =============================================================================
 
 /// Result of a successful agent registration.
 pub struct RegistrationResult {
@@ -46,7 +41,6 @@ pub struct RegistrationResult {
 #[derive(Debug, Deserialize)]
 pub struct PulledIdentity {
     pub name: String,
-    pub slug: String,
     pub email: Option<String>,
     pub usage: String,
     #[serde(rename = "publicKey")]
@@ -56,8 +50,6 @@ pub struct PulledIdentity {
     pub description: Option<String>,
     #[serde(rename = "isDefault", default)]
     pub is_default: bool,
-    #[serde(rename = "createdAt")]
-    pub created_at: String,
 }
 
 /// Response from the keypairs endpoint.
@@ -123,12 +115,6 @@ struct ProfileResponse {
     data: AgentProfile,
 }
 
-/// Claim status response from the API.
-#[derive(Debug, Deserialize)]
-struct ClaimStatusResponse {
-    status: String,
-}
-
 /// Registration request body.
 #[derive(Debug, Serialize)]
 struct RegisterRequest {
@@ -152,9 +138,7 @@ struct ApiErrorResponse {
     message: Option<String>,
 }
 
-// =============================================================================
 // Client
-// =============================================================================
 
 /// HTTP client for the Hive API.
 ///
@@ -183,9 +167,7 @@ impl HiveClient {
         }
     }
 
-    // =========================================================================
     // Registration
-    // =========================================================================
 
     /// Register a new agent on Hive.
     ///
@@ -288,9 +270,7 @@ impl HiveClient {
         Ok(RegistrationResult { identity })
     }
 
-    // =========================================================================
     // Claim Status
-    // =========================================================================
 
     /// Check if the agent has been claimed by a human.
     ///
@@ -348,9 +328,7 @@ impl HiveClient {
         Ok(data.data.is_claimed)
     }
 
-    // =========================================================================
     // Profile
-    // =========================================================================
 
     /// Fetch the agent's profile from Hive.
     ///
@@ -398,9 +376,7 @@ impl HiveClient {
         Ok(profile.data)
     }
 
-    // =========================================================================
     // Pull User Identities
-    // =========================================================================
 
     /// Pull all user identities (with secret keys) from Hive.
     ///
@@ -454,9 +430,7 @@ impl HiveClient {
         Ok(data.identities)
     }
 
-    // =========================================================================
     // Health Check
-    // =========================================================================
 
     /// Check if the Hive API is reachable.
     ///
@@ -482,9 +456,7 @@ impl HiveClient {
     }
 }
 
-// =============================================================================
 // Error Type
-// =============================================================================
 
 /// Errors that can occur during Hive API operations.
 #[derive(Debug, thiserror::Error)]
@@ -511,9 +483,7 @@ pub enum HiveClientError {
     Internal(String),
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

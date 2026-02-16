@@ -102,9 +102,7 @@ use std::io::{self, Read, Write};
 
 use crate::types::Hash;
 
-// =============================================================================
 // Constants
-// =============================================================================
 
 /// Magic bytes identifying an attestation file: "ATST"
 const MAGIC: &[u8; 4] = b"ATST";
@@ -115,9 +113,7 @@ const SCHEMA_VERSION: u8 = 1;
 /// File extension for attestation files.
 pub const ATTESTATION_EXTENSION: &str = "attest";
 
-// =============================================================================
 // Attestation
-// =============================================================================
 
 /// A graph-level audit node capturing metadata about a set of changes.
 ///
@@ -331,9 +327,7 @@ impl fmt::Display for Attestation {
     }
 }
 
-// =============================================================================
 // AttestAgent
-// =============================================================================
 
 /// Identity of the agent that produced the covered changes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,9 +361,7 @@ impl fmt::Display for AttestAgent {
     }
 }
 
-// =============================================================================
 // CodeChangeStats
-// =============================================================================
 
 /// Code change statistics covered by the attestation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -406,9 +398,7 @@ impl fmt::Display for CodeChangeStats {
     }
 }
 
-// =============================================================================
 // ModelUsage
-// =============================================================================
 
 /// Token usage and cost for a single model within the attestation.
 ///
@@ -519,9 +509,7 @@ impl fmt::Display for ModelUsage {
     }
 }
 
-// =============================================================================
 // AttestationBuilder
-// =============================================================================
 
 /// Builder for constructing `Attestation` instances.
 pub struct AttestationBuilder {
@@ -648,9 +636,7 @@ impl AttestationBuilder {
     }
 }
 
-// =============================================================================
 // Error Type
-// =============================================================================
 
 /// Errors that can occur during attestation operations.
 #[derive(Debug, thiserror::Error)]
@@ -676,9 +662,7 @@ pub enum AttestationError {
     Io(#[from] io::Error),
 }
 
-// =============================================================================
 // Formatting Helpers
-// =============================================================================
 
 /// Format a token count with K/M suffixes.
 fn format_tokens(tokens: u64) -> String {
@@ -718,9 +702,7 @@ fn format_duration_ms(ms: u64) -> String {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

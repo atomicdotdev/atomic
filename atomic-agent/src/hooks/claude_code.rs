@@ -78,9 +78,7 @@ use crate::event::{HookType, TurnEvent};
 
 use super::AgentHook;
 
-// =============================================================================
 // Constants
-// =============================================================================
 
 /// The directory where Claude Code stores per-project settings.
 const CLAUDE_DIR: &str = ".claude";
@@ -94,9 +92,7 @@ const ATOMIC_HOOK_PREFIX: &str = "atomic agent hooks claude-code";
 /// Permission deny rule to prevent Claude from reading Atomic metadata.
 const METADATA_DENY_RULE: &str = "Read(./.atomic/metadata/**)";
 
-// =============================================================================
 // Claude Code JSON Input Types
-// =============================================================================
 
 /// JSON input for session-end and stop hooks.
 #[derive(Debug, Deserialize)]
@@ -171,9 +167,7 @@ struct PostToolInput {
     tool_response: Option<serde_json::Value>,
 }
 
-// =============================================================================
 // Claude Code Settings File Types
-// =============================================================================
 
 /// A single hook entry within a matcher group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,9 +216,7 @@ struct ClaudeHooks {
     post_tool_use: Vec<ClaudeHookMatcher>,
 }
 
-// =============================================================================
 // ClaudeCodeHook
-// =============================================================================
 
 /// Claude Code agent hook adapter.
 ///
@@ -789,9 +781,7 @@ impl AgentHook for ClaudeCodeHook {
     }
 }
 
-// =============================================================================
 // Hook Manipulation Helpers
-// =============================================================================
 
 /// Check if a specific command exists in a matcher list.
 fn hook_command_exists(matchers: &[ClaudeHookMatcher], matcher_name: &str, command: &str) -> bool {
@@ -918,9 +908,7 @@ fn remove_deny_rule(raw: &mut serde_json::Map<String, serde_json::Value>) {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -930,9 +918,7 @@ mod tests {
         ClaudeCodeHook::new()
     }
 
-    // =========================================================================
     // Trait basics
-    // =========================================================================
 
     #[test]
     fn test_name() {
@@ -986,9 +972,7 @@ mod tests {
         assert!(debug.contains("ClaudeCodeHook"));
     }
 
-    // =========================================================================
     // parse_event — empty input
-    // =========================================================================
 
     #[test]
     fn test_parse_event_empty_input() {
@@ -1015,9 +999,7 @@ mod tests {
         ));
     }
 
-    // =========================================================================
     // parse_event — SessionStart / SessionEnd / TurnEnd (SessionInfoInput)
-    // =========================================================================
 
     #[test]
     fn test_parse_session_start() {
@@ -1078,9 +1060,7 @@ mod tests {
         assert_eq!(event.session_id, "s1");
     }
 
-    // =========================================================================
     // parse_event — TurnStart (UserPromptInput)
-    // =========================================================================
 
     #[test]
     fn test_parse_turn_start_with_prompt() {
@@ -1118,9 +1098,7 @@ mod tests {
         assert_eq!(event.prompt, Some("".to_string()));
     }
 
-    // =========================================================================
     // parse_event — PreToolUse
-    // =========================================================================
 
     #[test]
     fn test_parse_pre_tool_use() {
@@ -1150,9 +1128,7 @@ mod tests {
         assert!(event.tool_use_id.is_none());
     }
 
-    // =========================================================================
     // parse_event — PostToolUse
-    // =========================================================================
 
     #[test]
     fn test_parse_post_tool_use() {
@@ -1187,9 +1163,7 @@ mod tests {
         assert_eq!(event.tool_name, Some("TodoWrite".to_string()));
     }
 
-    // =========================================================================
     // Hook manipulation helpers
-    // =========================================================================
 
     #[test]
     fn test_is_atomic_hook() {
@@ -1391,9 +1365,7 @@ mod tests {
         assert!(matchers.is_empty());
     }
 
-    // =========================================================================
     // Deny rule helpers
-    // =========================================================================
 
     #[test]
     fn test_ensure_deny_rule_adds_when_missing() {
@@ -1503,9 +1475,7 @@ mod tests {
         assert!(perms.get("allow").is_some()); // allow preserved
     }
 
-    // =========================================================================
     // Install / Uninstall (filesystem tests)
-    // =========================================================================
 
     #[test]
     fn test_install_creates_settings_file() {
@@ -1640,9 +1610,7 @@ mod tests {
         assert!(hook.uninstall(dir.path()).is_ok());
     }
 
-    // =========================================================================
     // is_installed
-    // =========================================================================
 
     #[test]
     fn test_is_installed_true() {
@@ -1674,9 +1642,7 @@ mod tests {
         assert!(!hook.is_installed(dir.path()));
     }
 
-    // =========================================================================
     // detect_presence
-    // =========================================================================
 
     #[test]
     fn test_detect_presence_true() {
@@ -1702,9 +1668,7 @@ mod tests {
         assert!(!hook.detect_presence(dir.path()));
     }
 
-    // =========================================================================
     // Full roundtrip: install → is_installed → uninstall → !is_installed
-    // =========================================================================
 
     #[test]
     fn test_full_roundtrip() {

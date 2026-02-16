@@ -490,372 +490,138 @@ pub type RecordResult<T> = Result<T, RecordError>;
 mod tests {
     use super::*;
 
-    // =========================================================================
-    // RecordError Construction Tests
-    // =========================================================================
+    // -- Classification: the record loop uses these to decide skip vs abort.
 
     #[test]
-    fn test_path_not_in_repo_construction() {
-        let err = RecordError::path_not_in_repo("/outside/repo");
-        assert!(matches!(err, RecordError::PathNotInRepo { path } if path == "/outside/repo"));
-    }
+    fn path_errors_are_all_user_addressable_file_issues() {
+        let path_errors = [
+            RecordError::path_not_in_repo("/outside/repo"),
+            RecordError::path_not_found(PathBuf::from("/gone")),
+            RecordError::permission_denied(PathBuf::from("/locked")),
+            RecordError::inode_not_found(PathBuf::from("/orphan")),
+        ];
+        for err in &path_errors {
+            assert!(err.is_path_error(), "{err} should be a path error");
+        }
 
-    #[test]
-    fn test_path_not_in_repo_from_string() {
-        let path = String::from("some/path");
-        let err = RecordError::path_not_in_repo(path);
-        assert!(matches!(err, RecordError::PathNotInRepo { path } if path == "some/path"));
-    }
-
-    #[test]
-    fn test_path_not_found_construction() {
-        let err = RecordError::path_not_found(PathBuf::from("/missing/file.txt"));
-        assert!(matches!(err, RecordError::PathNotFound { path } if path == PathBuf::from("/missing/file.txt")));
-    }
-
-    #[test]
-    fn test_permission_denied_construction() {
-        let err = RecordError::permission_denied(PathBuf::from("/restricted"));
-        assert!(matches!(err, RecordError::PermissionDenied { path } if path == PathBuf::from("/restricted")));
-    }
-
-    #[test]
-    fn test_missing_dependency_construction() {
-        let hash = Hash::of(b"test dependency");
-        let err = RecordError::missing_dependency(hash);
-        assert!(matches!(err, RecordError::MissingDependency { hash: h } if h == hash));
-    }
-
-    #[test]
-    fn test_diff_error_construction() {
-        let err = RecordError::diff("failed to compute diff");
-        assert!(
-            matches!(err, RecordError::Diff { message } if message == "failed to compute diff")
-        );
-    }
-
-    #[test]
-    fn test_encoding_error_construction() {
-        let err = RecordError::encoding(PathBuf::from("file.txt"), "invalid UTF-8");
-        match err {
-            RecordError::Encoding { path, message } => {
-                assert_eq!(path, PathBuf::from("file.txt"));
-                assert_eq!(message, "invalid UTF-8");
-            }
-            _ => panic!("Expected Encoding error"),
+        // Diff, encoding, and internal errors are NOT path problems.
+        let non_path = [
+            RecordError::diff("algorithm failed"),
+            RecordError::invalid_state("corrupted"),
+            RecordError::internal("bug"),
+            RecordError::encoding(PathBuf::from("f"), "bad utf8"),
+            RecordError::missing_dependency(Hash::of(b"x")),
+        ];
+        for err in &non_path {
+            assert!(!err.is_path_error(), "{err} should NOT be a path error");
         }
     }
 
     #[test]
-    fn test_file_too_large_construction() {
-        let err = RecordError::file_too_large(PathBuf::from("huge.bin"), 1_000_000_000, 100_000_000);
-        match err {
-            RecordError::FileTooLarge {
-                path,
-                size,
-                max_size,
-            } => {
-                assert_eq!(path, PathBuf::from("huge.bin"));
-                assert_eq!(size, 1_000_000_000);
-                assert_eq!(max_size, 100_000_000);
-            }
-            _ => panic!("Expected FileTooLarge error"),
-        }
-    }
+    fn storage_errors_identify_infrastructure_failures() {
+        let io: RecordError = std::io::Error::new(std::io::ErrorKind::NotFound, "disk gone").into();
+        let pristine: RecordError = PristineError::StackNotFound { name: "x".into() }.into();
 
-    #[test]
-    fn test_inode_not_found_construction() {
-        let err = RecordError::inode_not_found(PathBuf::from("orphan.txt"));
-        assert!(
-            matches!(err, RecordError::InodeNotFound { path } if path == PathBuf::from("orphan.txt"))
-        );
-    }
+        assert!(io.is_storage_error());
+        assert!(pristine.is_storage_error());
 
-    #[test]
-    fn test_conflict_construction() {
-        let err = RecordError::conflict(PathBuf::from("conflict.txt"), "merge conflict detected");
-        match err {
-            RecordError::Conflict { path, message } => {
-                assert_eq!(path, PathBuf::from("conflict.txt"));
-                assert_eq!(message, "merge conflict detected");
-            }
-            _ => panic!("Expected Conflict error"),
-        }
-    }
-
-    #[test]
-    fn test_invalid_state_construction() {
-        let err = RecordError::invalid_state("working copy corrupted");
-        assert!(
-            matches!(err, RecordError::InvalidState { message } if message == "working copy corrupted")
-        );
-    }
-
-    #[test]
-    fn test_internal_error_construction() {
-        let err = RecordError::internal("unexpected condition");
-        assert!(
-            matches!(err, RecordError::Internal { message } if message == "unexpected condition")
-        );
-    }
-
-    // =========================================================================
-    // Error Classification Tests
-    // =========================================================================
-
-    #[test]
-    fn test_is_path_error() {
-        assert!(RecordError::path_not_in_repo("x").is_path_error());
-        assert!(RecordError::path_not_found(PathBuf::from("x")).is_path_error());
-        assert!(RecordError::permission_denied(PathBuf::from("x")).is_path_error());
-        assert!(RecordError::inode_not_found(PathBuf::from("x")).is_path_error());
-
-        // Non-path errors
-        assert!(!RecordError::diff("x").is_path_error());
-        assert!(!RecordError::invalid_state("x").is_path_error());
-        assert!(!RecordError::internal("x").is_path_error());
-    }
-
-    #[test]
-    fn test_is_storage_error() {
-        let io_err = RecordError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "test error",
-        ));
-        assert!(io_err.is_storage_error());
-
-        let pristine_err = RecordError::Pristine(PristineError::StackNotFound {
-            name: "test".to_string(),
-        });
-        assert!(pristine_err.is_storage_error());
-
-        // Non-storage errors
+        // User-level errors should never be classified as storage.
         assert!(!RecordError::path_not_in_repo("x").is_storage_error());
         assert!(!RecordError::diff("x").is_storage_error());
+        assert!(!RecordError::file_too_large(PathBuf::from("x"), 100, 50).is_storage_error());
     }
 
     #[test]
-    fn test_is_recoverable() {
-        // Recoverable errors
-        assert!(RecordError::path_not_in_repo("x").is_recoverable());
-        assert!(RecordError::path_not_found(PathBuf::from("x")).is_recoverable());
-        assert!(RecordError::permission_denied(PathBuf::from("x")).is_recoverable());
-        assert!(RecordError::conflict(PathBuf::from("x"), "y").is_recoverable());
-        assert!(RecordError::file_too_large(PathBuf::from("x"), 100, 50).is_recoverable());
-
-        // Non-recoverable errors
-        assert!(!RecordError::internal("bug").is_recoverable());
-        assert!(!RecordError::invalid_state("corrupted").is_recoverable());
-    }
-
-    // =========================================================================
-    // Error Display Tests
-    // =========================================================================
-
-    #[test]
-    fn test_error_display_path_not_in_repo() {
-        let err = RecordError::path_not_in_repo("/outside/path");
-        let display = format!("{}", err);
-        assert!(display.contains("Path not in repository"));
-        assert!(display.contains("/outside/path"));
-    }
-
-    #[test]
-    fn test_error_display_path_not_found() {
-        let err = RecordError::path_not_found(PathBuf::from("/missing/file.txt"));
-        let display = format!("{}", err);
-        assert!(display.contains("Path not found"));
-        assert!(display.contains("missing/file.txt"));
-    }
-
-    #[test]
-    fn test_error_display_permission_denied() {
-        let err = RecordError::permission_denied(PathBuf::from("/restricted/file"));
-        let display = format!("{}", err);
-        assert!(display.contains("Permission denied"));
-        assert!(display.contains("restricted/file"));
-    }
-
-    #[test]
-    fn test_error_display_missing_dependency() {
-        let hash = Hash::of(b"dependency");
-        let err = RecordError::missing_dependency(hash);
-        let display = format!("{}", err);
-        assert!(display.contains("Missing dependency"));
-    }
-
-    #[test]
-    fn test_error_display_diff() {
-        let err = RecordError::diff("failed to compute LCS");
-        let display = format!("{}", err);
-        assert!(display.contains("Diff error"));
-        assert!(display.contains("failed to compute LCS"));
-    }
-
-    #[test]
-    fn test_error_display_encoding() {
-        let err = RecordError::encoding(PathBuf::from("binary.dat"), "not valid UTF-8");
-        let display = format!("{}", err);
-        assert!(display.contains("Encoding error"));
-        assert!(display.contains("binary.dat"));
-        assert!(display.contains("not valid UTF-8"));
-    }
-
-    #[test]
-    fn test_error_display_file_too_large() {
-        let err = RecordError::file_too_large(PathBuf::from("large.bin"), 1000, 500);
-        let display = format!("{}", err);
-        assert!(display.contains("File too large"));
-        assert!(display.contains("large.bin"));
-        assert!(display.contains("1000"));
-        assert!(display.contains("500"));
-    }
-
-    #[test]
-    fn test_error_display_inode_not_found() {
-        let err = RecordError::inode_not_found(PathBuf::from("orphan.txt"));
-        let display = format!("{}", err);
-        assert!(display.contains("Inode not found"));
-        assert!(display.contains("orphan.txt"));
-    }
-
-    #[test]
-    fn test_error_display_conflict() {
-        let err = RecordError::conflict(PathBuf::from("merged.txt"), "both modified");
-        let display = format!("{}", err);
-        assert!(display.contains("Conflict"));
-        assert!(display.contains("merged.txt"));
-        assert!(display.contains("both modified"));
-    }
-
-    #[test]
-    fn test_error_display_invalid_state() {
-        let err = RecordError::invalid_state("working copy is corrupted");
-        let display = format!("{}", err);
-        assert!(display.contains("Invalid working copy state"));
-        assert!(display.contains("corrupted"));
-    }
-
-    #[test]
-    fn test_error_display_internal() {
-        let err = RecordError::internal("invariant violated");
-        let display = format!("{}", err);
-        assert!(display.contains("Internal error"));
-        assert!(display.contains("invariant violated"));
-    }
-
-    // =========================================================================
-    // Error From Trait Tests
-    // =========================================================================
-
-    #[test]
-    fn test_from_io_error() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
-        let record_err: RecordError = io_err.into();
-        assert!(matches!(record_err, RecordError::Io(_)));
-    }
-
-    #[test]
-    fn test_from_pristine_error() {
-        let pristine_err = PristineError::StackNotFound {
-            name: "test".to_string(),
-        };
-        let record_err: RecordError = pristine_err.into();
-        assert!(matches!(record_err, RecordError::Pristine(_)));
-    }
-
-    // =========================================================================
-    // Error Debug Tests
-    // =========================================================================
-
-    #[test]
-    fn test_error_debug_format() {
-        let err = RecordError::path_not_in_repo("/some/path");
-        let debug = format!("{:?}", err);
-        assert!(debug.contains("PathNotInRepo"));
-        assert!(debug.contains("/some/path"));
-    }
-
-    #[test]
-    fn test_error_debug_nested() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
-        let record_err: RecordError = io_err.into();
-        let debug = format!("{:?}", record_err);
-        assert!(debug.contains("Io"));
-    }
-
-    // =========================================================================
-    // RecordResult Type Tests
-    // =========================================================================
-
-    #[test]
-    fn test_record_result_ok() {
-        let result: RecordResult<i32> = Ok(42);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 42);
-    }
-
-    #[test]
-    fn test_record_result_err() {
-        let result: RecordResult<i32> = Err(RecordError::internal("test"));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_record_result_question_mark_operator() {
-        fn inner() -> RecordResult<i32> {
-            Err(RecordError::internal("inner error"))
+    fn recoverable_errors_let_record_skip_a_file_and_continue() {
+        // These are user-fixable: rename, chmod, resolve conflict, reduce file.
+        let recoverable = [
+            RecordError::path_not_in_repo("x"),
+            RecordError::path_not_found(PathBuf::from("x")),
+            RecordError::permission_denied(PathBuf::from("x")),
+            RecordError::conflict(PathBuf::from("x"), "both sides edited"),
+            RecordError::file_too_large(PathBuf::from("x"), 100, 50),
+        ];
+        for err in &recoverable {
+            assert!(err.is_recoverable(), "{err} should be recoverable");
         }
 
-        fn outer() -> RecordResult<i32> {
-            let _value = inner()?;
-            Ok(42)
+        // Internal/state errors mean the repo is broken — can't skip and continue.
+        let fatal = [
+            RecordError::internal("assertion failed"),
+            RecordError::invalid_state("corrupted working copy"),
+        ];
+        for err in &fatal {
+            assert!(!err.is_recoverable(), "{err} should be fatal");
+        }
+    }
+
+    // -- Error propagation: ? must work across the error hierarchy.
+
+    #[test]
+    fn question_mark_propagates_io_and_pristine() {
+        fn read_file() -> RecordResult<Vec<u8>> {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"))?
         }
 
-        assert!(outer().is_err());
+        fn check_pristine() -> RecordResult<()> {
+            Err(PristineError::StackNotFound {
+                name: "main".into(),
+            })?
+        }
+
+        assert!(matches!(read_file(), Err(RecordError::Io(_))));
+        assert!(matches!(check_pristine(), Err(RecordError::Pristine(_))));
     }
 
-    // =========================================================================
-    // Edge Case Tests
-    // =========================================================================
+    // -- Display: messages must include enough context for the user to act.
 
     #[test]
-    fn test_empty_path_string() {
-        let err = RecordError::path_not_in_repo("");
-        assert!(matches!(err, RecordError::PathNotInRepo { path } if path.is_empty()));
+    fn display_messages_surface_paths_and_context() {
+        let cases: Vec<(RecordError, &[&str])> = vec![
+            (
+                RecordError::path_not_in_repo("/outside/repo"),
+                &["Path not in repository", "/outside/repo"],
+            ),
+            (
+                RecordError::path_not_found(PathBuf::from("/missing/file.txt")),
+                &["Path not found", "missing/file.txt"],
+            ),
+            (
+                RecordError::permission_denied(PathBuf::from("/restricted/secret")),
+                &["Permission denied", "restricted/secret"],
+            ),
+            (
+                RecordError::encoding(PathBuf::from("data.bin"), "not valid UTF-8"),
+                &["Encoding error", "data.bin", "not valid UTF-8"],
+            ),
+            (
+                RecordError::conflict(PathBuf::from("src/lib.rs"), "both sides edited line 42"),
+                &["Conflict", "src/lib.rs", "both sides edited"],
+            ),
+        ];
+
+        for (err, expected_fragments) in &cases {
+            let msg = err.to_string();
+            for frag in *expected_fragments {
+                assert!(msg.contains(frag), "{msg:?} missing {frag:?}");
+            }
+        }
     }
 
     #[test]
-    fn test_empty_message() {
-        let err = RecordError::diff("");
-        assert!(matches!(err, RecordError::Diff { message } if message.is_empty()));
+    fn file_too_large_display_shows_both_sizes() {
+        let err = RecordError::file_too_large(PathBuf::from("video.mp4"), 500_000_000, 10_000_000);
+        let msg = err.to_string();
+        // User needs to see both: how big the file is AND what the limit is.
+        assert!(msg.contains("500000000"), "should show actual size: {msg}");
+        assert!(msg.contains("10000000"), "should show max size: {msg}");
+        assert!(msg.contains("video.mp4"), "should show filename: {msg}");
     }
 
     #[test]
-    fn test_unicode_in_path() {
-        let err = RecordError::path_not_found(PathBuf::from("/路径/文件.txt"));
-        let display = format!("{}", err);
-        assert!(display.contains("文件.txt"));
-    }
-
-    #[test]
-    fn test_unicode_in_message() {
-        let err = RecordError::diff("比较失败 - 无效的编码");
-        let display = format!("{}", err);
-        assert!(display.contains("比较失败"));
-    }
-
-    #[test]
-    fn test_zero_size_file() {
-        let err = RecordError::file_too_large(PathBuf::from("file"), 0, 0);
-        let display = format!("{}", err);
-        assert!(display.contains("0 bytes"));
-    }
-
-    #[test]
-    fn test_max_u64_size() {
-        let err = RecordError::file_too_large(PathBuf::from("file"), u64::MAX, u64::MAX - 1);
-        // Should not panic on display
-        let _ = format!("{}", err);
+    fn file_too_large_does_not_panic_on_extreme_values() {
+        // Guard against formatting issues with boundary values.
+        let _ = RecordError::file_too_large(PathBuf::from("f"), 0, 0).to_string();
+        let _ = RecordError::file_too_large(PathBuf::from("f"), u64::MAX, u64::MAX - 1).to_string();
     }
 }

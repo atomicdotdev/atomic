@@ -24,17 +24,15 @@
 //!
 //! // Customize via builder pattern
 //! let opts = WorkflowOptions::new()
-//!     .algorithm(Algorithm::Patience)
-//!     .check_mtime(false)
-//!     .prefix("src/")
-//!     .max_file_size(10 * 1024 * 1024);  // 10MB
+//!     .with_algorithm(Algorithm::Patience)
+//!     .with_check_mtime(false)
+//!     .with_prefix("src/")
+//!     .with_max_file_size(10 * 1024 * 1024);  // 10MB
 //! ```
 
 use crate::diff::Algorithm;
 
-// ============================================================================
 // WORKFLOW OPTIONS
-// ============================================================================
 
 /// Configuration options for change detection and recording workflows.
 ///
@@ -61,11 +59,11 @@ use crate::diff::Algorithm;
 /// use atomic_core::record::workflow::WorkflowOptions;
 ///
 /// let opts = WorkflowOptions::new()
-///     .prefix("src/lib/")
-///     .check_mtime(false);
+///     .with_prefix("src/lib/")
+///     .with_check_mtime(false);
 ///
-/// assert_eq!(opts.get_prefix(), "src/lib/");
-/// assert!(!opts.get_check_mtime());
+/// assert_eq!(opts.prefix(), "src/lib/");
+/// assert!(!opts.check_mtime());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowOptions {
@@ -125,7 +123,7 @@ impl WorkflowOptions {
     /// use atomic_core::record::workflow::WorkflowOptions;
     ///
     /// let opts = WorkflowOptions::new();
-    /// assert!(opts.get_check_mtime());
+    /// assert!(opts.check_mtime());
     /// ```
     pub fn new() -> Self {
         Self::default()
@@ -143,10 +141,10 @@ impl WorkflowOptions {
     /// use atomic_core::record::workflow::WorkflowOptions;
     /// use atomic_core::diff::Algorithm;
     ///
-    /// let opts = WorkflowOptions::new().algorithm(Algorithm::Patience);
-    /// assert_eq!(opts.get_algorithm(), Algorithm::Patience);
+    /// let opts = WorkflowOptions::new().with_algorithm(Algorithm::Patience);
+    /// assert_eq!(opts.algorithm(), Algorithm::Patience);
     /// ```
-    pub fn algorithm(mut self, algorithm: Algorithm) -> Self {
+    pub fn with_algorithm(mut self, algorithm: Algorithm) -> Self {
         self.algorithm = algorithm;
         self
     }
@@ -156,7 +154,7 @@ impl WorkflowOptions {
     /// # Arguments
     ///
     /// * `check` - Whether to check mtime before comparing content
-    pub fn check_mtime(mut self, check: bool) -> Self {
+    pub fn with_check_mtime(mut self, check: bool) -> Self {
         self.check_mtime = check;
         self
     }
@@ -166,7 +164,7 @@ impl WorkflowOptions {
     /// # Arguments
     ///
     /// * `detect` - Whether to detect file moves
-    pub fn detect_moves(mut self, detect: bool) -> Self {
+    pub fn with_detect_moves(mut self, detect: bool) -> Self {
         self.detect_moves = detect;
         self
     }
@@ -176,7 +174,7 @@ impl WorkflowOptions {
     /// # Arguments
     ///
     /// * `detect` - Whether to track encoding changes
-    pub fn detect_encoding(mut self, detect: bool) -> Self {
+    pub fn with_detect_encoding(mut self, detect: bool) -> Self {
         self.detect_encoding = detect;
         self
     }
@@ -186,7 +184,7 @@ impl WorkflowOptions {
     /// # Arguments
     ///
     /// * `detect` - Whether to track permission changes
-    pub fn detect_permissions(mut self, detect: bool) -> Self {
+    pub fn with_detect_permissions(mut self, detect: bool) -> Self {
         self.detect_permissions = detect;
         self
     }
@@ -204,11 +202,11 @@ impl WorkflowOptions {
     /// ```rust
     /// use atomic_core::record::workflow::WorkflowOptions;
     ///
-    /// let opts = WorkflowOptions::new().prefix("src/");
+    /// let opts = WorkflowOptions::new().with_prefix("src/");
     /// assert!(opts.matches_prefix("src/main.rs"));
     /// assert!(!opts.matches_prefix("tests/test.rs"));
     /// ```
-    pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = prefix.into();
         self
     }
@@ -220,7 +218,7 @@ impl WorkflowOptions {
     /// # Arguments
     ///
     /// * `size` - Maximum size in bytes, or `None` for no limit
-    pub fn max_file_size(mut self, size: impl Into<Option<u64>>) -> Self {
+    pub fn with_max_file_size(mut self, size: impl Into<Option<u64>>) -> Self {
         self.max_file_size = size.into();
         self
     }
@@ -230,7 +228,7 @@ impl WorkflowOptions {
     /// # Arguments
     ///
     /// * `force` - Whether to bypass optimizations
-    pub fn force_rediff(mut self, force: bool) -> Self {
+    pub fn with_force_rediff(mut self, force: bool) -> Self {
         self.force_rediff = force;
         self
     }
@@ -240,63 +238,59 @@ impl WorkflowOptions {
     /// # Arguments
     ///
     /// * `ignore` - Whether to skip missing files without error
-    pub fn ignore_missing(mut self, ignore: bool) -> Self {
+    pub fn with_ignore_missing(mut self, ignore: bool) -> Self {
         self.ignore_missing = ignore;
         self
     }
 
-    // ========================================================================
     // Getters
-    // ========================================================================
 
     /// Get the diff algorithm.
-    pub fn get_algorithm(&self) -> Algorithm {
+    pub fn algorithm(&self) -> Algorithm {
         self.algorithm
     }
 
     /// Check if mtime optimization is enabled.
-    pub fn get_check_mtime(&self) -> bool {
+    pub fn check_mtime(&self) -> bool {
         self.check_mtime
     }
 
     /// Check if move detection is enabled.
-    pub fn get_detect_moves(&self) -> bool {
+    pub fn detect_moves(&self) -> bool {
         self.detect_moves
     }
 
     /// Check if encoding change detection is enabled.
-    pub fn get_detect_encoding(&self) -> bool {
+    pub fn detect_encoding(&self) -> bool {
         self.detect_encoding
     }
 
     /// Check if permission change detection is enabled.
-    pub fn get_detect_permissions(&self) -> bool {
+    pub fn detect_permissions(&self) -> bool {
         self.detect_permissions
     }
 
     /// Get the path prefix filter.
-    pub fn get_prefix(&self) -> &str {
+    pub fn prefix(&self) -> &str {
         &self.prefix
     }
 
     /// Get the maximum file size for diffing.
-    pub fn get_max_file_size(&self) -> Option<u64> {
+    pub fn max_file_size(&self) -> Option<u64> {
         self.max_file_size
     }
 
     /// Check if force rediff is enabled.
-    pub fn get_force_rediff(&self) -> bool {
+    pub fn force_rediff(&self) -> bool {
         self.force_rediff
     }
 
     /// Check if missing files should be ignored.
-    pub fn get_ignore_missing(&self) -> bool {
+    pub fn ignore_missing(&self) -> bool {
         self.ignore_missing
     }
 
-    // ========================================================================
     // Helper Methods
-    // ========================================================================
 
     /// Check if a path matches the prefix filter.
     ///
@@ -313,7 +307,7 @@ impl WorkflowOptions {
     /// ```rust
     /// use atomic_core::record::workflow::WorkflowOptions;
     ///
-    /// let opts = WorkflowOptions::new().prefix("src/");
+    /// let opts = WorkflowOptions::new().with_prefix("src/");
     ///
     /// assert!(opts.matches_prefix("src/main.rs"));
     /// assert!(opts.matches_prefix("src/lib/mod.rs"));
@@ -384,17 +378,13 @@ impl Default for WorkflowOptions {
     }
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ========================================================================
     // Construction Tests
-    // ========================================================================
 
     #[test]
     fn test_new_returns_default() {
@@ -408,110 +398,106 @@ mod tests {
     fn test_default_values() {
         let opts = WorkflowOptions::default();
 
-        assert_eq!(opts.get_algorithm(), Algorithm::Myers);
-        assert!(opts.get_check_mtime());
-        assert!(opts.get_detect_moves());
-        assert!(opts.get_detect_encoding());
-        assert!(opts.get_detect_permissions());
-        assert!(opts.get_prefix().is_empty());
-        assert_eq!(opts.get_max_file_size(), Some(WorkflowOptions::DEFAULT_MAX_FILE_SIZE));
-        assert!(!opts.get_force_rediff());
-        assert!(!opts.get_ignore_missing());
+        assert_eq!(opts.algorithm(), Algorithm::Myers);
+        assert!(opts.check_mtime());
+        assert!(opts.detect_moves());
+        assert!(opts.detect_encoding());
+        assert!(opts.detect_permissions());
+        assert!(opts.prefix().is_empty());
+        assert_eq!(opts.with_max_file_size(), Some(WorkflowOptions::DEFAULT_MAX_FILE_SIZE));
+        assert!(!opts.force_rediff());
+        assert!(!opts.ignore_missing());
     }
 
-    // ========================================================================
     // Builder Tests
-    // ========================================================================
 
     #[test]
     fn test_algorithm_builder() {
-        let opts = WorkflowOptions::new().algorithm(Algorithm::Patience);
-        assert_eq!(opts.get_algorithm(), Algorithm::Patience);
+        let opts = WorkflowOptions::new().with_algorithm(Algorithm::Patience);
+        assert_eq!(opts.algorithm(), Algorithm::Patience);
     }
 
     #[test]
     fn test_check_mtime_builder() {
-        let opts = WorkflowOptions::new().check_mtime(false);
-        assert!(!opts.get_check_mtime());
+        let opts = WorkflowOptions::new().with_check_mtime(false);
+        assert!(!opts.check_mtime());
     }
 
     #[test]
     fn test_detect_moves_builder() {
-        let opts = WorkflowOptions::new().detect_moves(false);
-        assert!(!opts.get_detect_moves());
+        let opts = WorkflowOptions::new().with_detect_moves(false);
+        assert!(!opts.detect_moves());
     }
 
     #[test]
     fn test_detect_encoding_builder() {
-        let opts = WorkflowOptions::new().detect_encoding(false);
-        assert!(!opts.get_detect_encoding());
+        let opts = WorkflowOptions::new().with_detect_encoding(false);
+        assert!(!opts.detect_encoding());
     }
 
     #[test]
     fn test_detect_permissions_builder() {
-        let opts = WorkflowOptions::new().detect_permissions(false);
-        assert!(!opts.get_detect_permissions());
+        let opts = WorkflowOptions::new().with_detect_permissions(false);
+        assert!(!opts.detect_permissions());
     }
 
     #[test]
     fn test_prefix_builder_str() {
-        let opts = WorkflowOptions::new().prefix("src/");
-        assert_eq!(opts.get_prefix(), "src/");
+        let opts = WorkflowOptions::new().with_prefix("src/");
+        assert_eq!(opts.prefix(), "src/");
     }
 
     #[test]
     fn test_prefix_builder_string() {
         let opts = WorkflowOptions::new().prefix(String::from("tests/"));
-        assert_eq!(opts.get_prefix(), "tests/");
+        assert_eq!(opts.prefix(), "tests/");
     }
 
     #[test]
     fn test_max_file_size_builder_some() {
-        let opts = WorkflowOptions::new().max_file_size(1024u64);
-        assert_eq!(opts.get_max_file_size(), Some(1024));
+        let opts = WorkflowOptions::new().with_max_file_size(1024u64);
+        assert_eq!(opts.with_max_file_size(), Some(1024));
     }
 
     #[test]
     fn test_max_file_size_builder_none() {
-        let opts = WorkflowOptions::new().max_file_size(None);
-        assert_eq!(opts.get_max_file_size(), None);
+        let opts = WorkflowOptions::new().with_max_file_size(None);
+        assert_eq!(opts.with_max_file_size(), None);
     }
 
     #[test]
     fn test_force_rediff_builder() {
-        let opts = WorkflowOptions::new().force_rediff(true);
-        assert!(opts.get_force_rediff());
+        let opts = WorkflowOptions::new().with_force_rediff(true);
+        assert!(opts.force_rediff());
     }
 
     #[test]
     fn test_ignore_missing_builder() {
-        let opts = WorkflowOptions::new().ignore_missing(true);
-        assert!(opts.get_ignore_missing());
+        let opts = WorkflowOptions::new().with_ignore_missing(true);
+        assert!(opts.ignore_missing());
     }
 
     #[test]
     fn test_builder_chaining() {
         let opts = WorkflowOptions::new()
-            .algorithm(Algorithm::Patience)
-            .check_mtime(false)
-            .detect_moves(false)
-            .prefix("src/")
-            .max_file_size(1024u64)
-            .force_rediff(true)
-            .ignore_missing(true);
+            .with_algorithm(Algorithm::Patience)
+            .with_check_mtime(false)
+            .with_detect_moves(false)
+            .with_prefix("src/")
+            .with_max_file_size(1024u64)
+            .with_force_rediff(true)
+            .with_ignore_missing(true);
 
-        assert_eq!(opts.get_algorithm(), Algorithm::Patience);
-        assert!(!opts.get_check_mtime());
-        assert!(!opts.get_detect_moves());
-        assert_eq!(opts.get_prefix(), "src/");
-        assert_eq!(opts.get_max_file_size(), Some(1024));
-        assert!(opts.get_force_rediff());
-        assert!(opts.get_ignore_missing());
+        assert_eq!(opts.algorithm(), Algorithm::Patience);
+        assert!(!opts.check_mtime());
+        assert!(!opts.detect_moves());
+        assert_eq!(opts.prefix(), "src/");
+        assert_eq!(opts.with_max_file_size(), Some(1024));
+        assert!(opts.force_rediff());
+        assert!(opts.ignore_missing());
     }
 
-    // ========================================================================
     // Helper Method Tests
-    // ========================================================================
 
     #[test]
     fn test_matches_prefix_empty() {
@@ -524,7 +510,7 @@ mod tests {
 
     #[test]
     fn test_matches_prefix_with_prefix() {
-        let opts = WorkflowOptions::new().prefix("src/");
+        let opts = WorkflowOptions::new().with_prefix("src/");
 
         assert!(opts.matches_prefix("src/main.rs"));
         assert!(opts.matches_prefix("src/lib/mod.rs"));
@@ -536,7 +522,7 @@ mod tests {
 
     #[test]
     fn test_matches_prefix_exact() {
-        let opts = WorkflowOptions::new().prefix("src/main.rs");
+        let opts = WorkflowOptions::new().with_prefix("src/main.rs");
 
         assert!(opts.matches_prefix("src/main.rs"));
         assert!(!opts.matches_prefix("src/lib.rs"));
@@ -544,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_exceeds_max_size_with_limit() {
-        let opts = WorkflowOptions::new().max_file_size(1024u64);
+        let opts = WorkflowOptions::new().with_max_file_size(1024u64);
 
         assert!(!opts.exceeds_max_size(1024));
         assert!(!opts.exceeds_max_size(100));
@@ -554,7 +540,7 @@ mod tests {
 
     #[test]
     fn test_exceeds_max_size_no_limit() {
-        let opts = WorkflowOptions::new().max_file_size(None);
+        let opts = WorkflowOptions::new().with_max_file_size(None);
 
         assert!(!opts.exceeds_max_size(0));
         assert!(!opts.exceeds_max_size(u64::MAX));
@@ -573,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_should_diff_force_rediff() {
-        let opts = WorkflowOptions::new().force_rediff(true);
+        let opts = WorkflowOptions::new().with_force_rediff(true);
 
         // Even if mtime unchanged, should diff
         assert!(opts.should_diff(true));
@@ -582,27 +568,25 @@ mod tests {
 
     #[test]
     fn test_should_diff_mtime_disabled() {
-        let opts = WorkflowOptions::new().check_mtime(false);
+        let opts = WorkflowOptions::new().with_check_mtime(false);
 
         // mtime checking disabled - always diff
         assert!(opts.should_diff(true));
         assert!(opts.should_diff(false));
     }
 
-    // ========================================================================
     // Clone and Debug Tests
-    // ========================================================================
 
     #[test]
     fn test_clone() {
         let opts = WorkflowOptions::new()
-            .prefix("test/")
-            .algorithm(Algorithm::Patience);
+            .with_prefix("test/")
+            .with_algorithm(Algorithm::Patience);
 
         let cloned = opts.clone();
 
-        assert_eq!(cloned.get_prefix(), "test/");
-        assert_eq!(cloned.get_algorithm(), Algorithm::Patience);
+        assert_eq!(cloned.prefix(), "test/");
+        assert_eq!(cloned.algorithm(), Algorithm::Patience);
     }
 
     #[test]
@@ -616,9 +600,9 @@ mod tests {
 
     #[test]
     fn test_eq() {
-        let opts1 = WorkflowOptions::new().prefix("src/");
-        let opts2 = WorkflowOptions::new().prefix("src/");
-        let opts3 = WorkflowOptions::new().prefix("tests/");
+        let opts1 = WorkflowOptions::new().with_prefix("src/");
+        let opts2 = WorkflowOptions::new().with_prefix("src/");
+        let opts3 = WorkflowOptions::new().with_prefix("tests/");
 
         assert_eq!(opts1, opts2);
         assert_ne!(opts1, opts3);

@@ -58,9 +58,7 @@ use super::error::{storage_err, ApplyError, ApplyResult};
 use super::leaf::apply_leaf_op;
 use super::traits::MutCrdtTxnT;
 
-// =============================================================================
 // Public API
-// =============================================================================
 
 /// Applies a BranchOp to the pristine database.
 ///
@@ -137,9 +135,7 @@ pub fn apply_branch_op_only<T: MutCrdtTxnT>(
     }
 }
 
-// =============================================================================
 // Insert Operation
-// =============================================================================
 
 /// Applies an Insert operation to create a new line.
 ///
@@ -236,9 +232,7 @@ fn apply_insert_only<T: MutCrdtTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Delete Operation
-// =============================================================================
 
 /// Applies a Delete operation to mark a line as deleted.
 ///
@@ -285,9 +279,7 @@ fn apply_delete<T: MutCrdtTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Restore Operation
-// =============================================================================
 
 /// Applies a Restore operation to restore a deleted line.
 ///
@@ -331,9 +323,7 @@ fn apply_restore<T: MutCrdtTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Validation Helpers
-// =============================================================================
 
 /// Validates that a branch exists and is in the expected state.
 ///
@@ -407,9 +397,7 @@ pub fn validate_branch_parent<T: MutCrdtTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -420,9 +408,7 @@ mod tests {
     use crate::types::{Inode, NodeId};
     use std::collections::HashMap;
 
-    // =========================================================================
     // Mock Transaction
-    // =========================================================================
 
     #[derive(Default)]
     struct MockTxn {
@@ -616,9 +602,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // Helper Functions
-    // =========================================================================
 
     fn create_test_trunk(txn: &mut MockTxn, node_id: u64) -> TrunkId {
         let trunk_id = TrunkId::new(NodeId::new(node_id), 0);
@@ -632,9 +616,7 @@ mod tests {
         trunk_id
     }
 
-    // =========================================================================
     // Insert Tests
-    // =========================================================================
 
     #[test]
     fn test_apply_insert() {
@@ -773,9 +755,7 @@ mod tests {
         assert_eq!(context.stats().leaves_inserted(), 2);
     }
 
-    // =========================================================================
     // Delete Tests
-    // =========================================================================
 
     #[test]
     fn test_apply_delete() {
@@ -846,9 +826,7 @@ mod tests {
         assert!(result.unwrap_err().is_invalid_state());
     }
 
-    // =========================================================================
     // Restore Tests
-    // =========================================================================
 
     #[test]
     fn test_apply_restore() {
@@ -930,9 +908,7 @@ mod tests {
         assert!(result.unwrap_err().is_not_found());
     }
 
-    // =========================================================================
     // Validation Helper Tests
-    // =========================================================================
 
     #[test]
     fn test_validate_branch_state() {

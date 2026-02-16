@@ -35,9 +35,7 @@ use std::path::Path;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use thiserror::Error;
 
-// ============================================================================
 // Error Types
-// ============================================================================
 
 /// Result type for ignore operations.
 pub type IgnoreResult<T> = Result<T, IgnoreError>;
@@ -59,9 +57,7 @@ pub enum IgnoreError {
     Io(#[from] std::io::Error),
 }
 
-// ============================================================================
 // IgnoreRules
-// ============================================================================
 
 /// Ignore rules loaded from various sources.
 ///
@@ -305,9 +301,7 @@ impl Default for IgnoreRules {
     }
 }
 
-// ============================================================================
 // Helper Functions
-// ============================================================================
 
 /// Load global ignore rules from ~/.config/atomic/ignore
 fn load_global_ignore() -> Option<Gitignore> {
@@ -382,9 +376,7 @@ pub fn local_ignore_path(repo_root: &Path) -> std::path::PathBuf {
     repo_root.join(".atomicignore")
 }
 
-// ============================================================================
 // Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Revise command - modify a change in-place
 //!
 //! The `revise` command allows modifying a previously recorded change without
@@ -89,9 +88,7 @@ use crate::commands::{find_repository_root, format_hash, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success, print_warning};
 
-// =============================================================================
 // Reference Parsing
-// =============================================================================
 
 /// A parsed change reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,9 +168,7 @@ impl ChangeRef {
     }
 }
 
-// =============================================================================
 // Revise Command
-// =============================================================================
 
 /// Revise a change in-place.
 ///
@@ -261,36 +256,6 @@ impl Revise {
             all: false,
             files: Vec::new(),
         }
-    }
-
-    /// Set the reference to revise.
-    pub fn with_reference(mut self, reference: impl Into<String>) -> Self {
-        self.reference = reference.into();
-        self
-    }
-
-    /// Set the message for the revised change.
-    pub fn with_message(mut self, message: impl Into<String>) -> Self {
-        self.message = Some(message.into());
-        self
-    }
-
-    /// Set reword mode (only change message).
-    pub fn with_reword(mut self, reword: bool) -> Self {
-        self.reword = reword;
-        self
-    }
-
-    /// Set no-edit mode.
-    pub fn with_no_edit(mut self, no_edit: bool) -> Self {
-        self.no_edit = no_edit;
-        self
-    }
-
-    /// Set dry-run mode.
-    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
-        self.dry_run = dry_run;
-        self
     }
 
     /// Parse the reference string into a ChangeRef.
@@ -793,17 +758,13 @@ impl Command for Revise {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // ChangeRef Tests
-    // =========================================================================
 
     #[test]
     fn test_change_ref_parse_empty() {
@@ -903,9 +864,7 @@ mod tests {
         assert_eq!(ChangeRef::default(), ChangeRef::Last);
     }
 
-    // =========================================================================
     // Revise Builder Tests
-    // =========================================================================
 
     #[test]
     fn test_revise_new() {
@@ -975,9 +934,7 @@ mod tests {
         assert_eq!(revise.parse_reference(), ChangeRef::Relative(3));
     }
 
-    // =========================================================================
     // Author Parsing Tests
-    // =========================================================================
 
     #[test]
     fn test_parse_author_none() {
@@ -1012,9 +969,7 @@ mod tests {
         assert_eq!(email, Some("alice@example.com".to_string()));
     }
 
-    // =========================================================================
     // Message Tests
-    // =========================================================================
 
     #[test]
     fn test_get_message_explicit() {

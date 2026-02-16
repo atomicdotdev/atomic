@@ -90,9 +90,7 @@ use std::fmt;
 
 use super::tokenize::{ContentTokenizer, TokenizeOptions};
 
-// ============================================================================
 // CONVERSION OPTIONS
-// ============================================================================
 
 /// Options controlling graph_op to CRDT conversion.
 ///
@@ -219,9 +217,7 @@ impl Default for ConversionOptions {
     }
 }
 
-// ============================================================================
 // CONVERT ERROR
-// ============================================================================
 
 /// Errors that can occur during graph_op conversion.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,9 +286,7 @@ impl std::error::Error for ConvertError {}
 /// Result type for conversion operations.
 pub type ConvertResult<T> = Result<T, ConvertError>;
 
-// ============================================================================
 // CONVERSION STATS
-// ============================================================================
 
 /// Statistics about the conversion process.
 ///
@@ -371,9 +365,7 @@ impl fmt::Display for ConversionStats {
     }
 }
 
-// ============================================================================
 // CONVERTED OPS
-// ============================================================================
 
 /// The result of converting hunks to CRDT operations.
 ///
@@ -515,9 +507,7 @@ impl Default for ConvertedOps {
     }
 }
 
-// ============================================================================
 // HUNK CONVERTER
-// ============================================================================
 
 /// Converts hunks to CRDT operations.
 ///
@@ -907,9 +897,7 @@ impl HunkConverter {
     }
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

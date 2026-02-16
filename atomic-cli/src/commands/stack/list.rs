@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The `stack list` command for listing all stacks.
 //!
 //! This module implements the `atomic stack list` command, which shows all
@@ -43,9 +42,7 @@ use crate::output::{hint, stack as style_stack};
 #[cfg(test)]
 use std::path::PathBuf;
 
-// =============================================================================
 // List Command
-// =============================================================================
 
 /// List all stacks.
 ///
@@ -63,16 +60,6 @@ pub struct List {
 }
 
 impl List {
-    /// Create a new `List` command.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set whether to show verbose output.
-    pub fn with_verbose(mut self, verbose: bool) -> Self {
-        self.verbose = verbose;
-        self
-    }
 }
 
 impl Command for List {
@@ -137,9 +124,7 @@ impl Command for List {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

@@ -46,9 +46,7 @@ use crate::error::{AgentError, AgentResult};
 use crate::event::TurnChanges;
 use crate::watcher::{FileWatcher, WatcherConfig};
 
-// =============================================================================
 // FileSnapshot
-// =============================================================================
 
 /// A point-in-time snapshot of the filesystem: path → (mtime, size).
 ///
@@ -164,9 +162,7 @@ fn diff_snapshots(before: &FileSnapshot, after: &FileSnapshot) -> TurnChanges {
         .with_deleted(deleted)
 }
 
-// =============================================================================
 // FallbackWatcher
-// =============================================================================
 
 /// File watcher using filesystem snapshots (no Watchman required).
 ///
@@ -267,9 +263,7 @@ impl FileWatcher for FallbackWatcher {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -281,9 +275,7 @@ mod tests {
         WatcherConfig::new(dir.path())
     }
 
-    // =========================================================================
     // Snapshot tests
-    // =========================================================================
 
     #[test]
     fn test_take_snapshot_empty_dir() {
@@ -366,9 +358,7 @@ mod tests {
         assert!(entry.mtime > SystemTime::UNIX_EPOCH);
     }
 
-    // =========================================================================
     // Diff tests
-    // =========================================================================
 
     #[test]
     fn test_diff_no_changes() {
@@ -573,9 +563,7 @@ mod tests {
         assert!(changes.is_empty());
     }
 
-    // =========================================================================
     // FallbackWatcher lifecycle tests
-    // =========================================================================
 
     #[tokio::test]
     async fn test_watcher_not_active_initially() {
@@ -641,9 +629,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // =========================================================================
     // FallbackWatcher change detection tests
-    // =========================================================================
 
     #[tokio::test]
     async fn test_watcher_no_changes() {
@@ -858,9 +844,7 @@ mod tests {
         assert_eq!(changes.file_count(), 1);
     }
 
-    // =========================================================================
     // FileWatcher trait object test
-    // =========================================================================
 
     #[tokio::test]
     async fn test_watcher_as_trait_object() {

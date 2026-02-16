@@ -38,9 +38,7 @@ pub type AgentResult<T> = Result<T, AgentError>;
 /// Errors that can occur during agent operations.
 #[derive(Debug, Error)]
 pub enum AgentError {
-    // =========================================================================
     // Watchman / File Watcher Errors
-    // =========================================================================
     /// Watchman daemon is not running or not installed.
     ///
     /// This is a soft error — the system falls back to the polling-based
@@ -69,9 +67,7 @@ pub enum AgentError {
         path: PathBuf,
     },
 
-    // =========================================================================
     // Hook Parsing Errors
-    // =========================================================================
     /// Failed to parse JSON input from an agent hook callback.
     #[error("Failed to parse hook input for {agent} ({hook_type}): {reason}")]
     HookParseFailed {
@@ -103,9 +99,7 @@ pub enum AgentError {
         field: String,
     },
 
-    // =========================================================================
     // Agent Configuration Errors
-    // =========================================================================
     /// Unknown agent name — not registered in the `AgentRegistry`.
     #[error("Unknown agent: '{name}' (available agents: {available})")]
     AgentNotFound {
@@ -140,9 +134,7 @@ pub enum AgentError {
         path: PathBuf,
     },
 
-    // =========================================================================
     // Session Errors
-    // =========================================================================
     /// No active session found for the given session ID.
     #[error("Session not found: '{session_id}'")]
     SessionNotFound {
@@ -186,9 +178,7 @@ pub enum AgentError {
         new_session: String,
     },
 
-    // =========================================================================
     // Turn State Machine Errors
-    // =========================================================================
     /// `end_turn` was called without a preceding `begin_turn`.
     #[error("No active turn — end_turn called without begin_turn for session '{session_id}'")]
     TurnNotActive {
@@ -215,9 +205,7 @@ pub enum AgentError {
         operation: String,
     },
 
-    // =========================================================================
     // Recording Errors
-    // =========================================================================
     /// Failed to record a turn as an Atomic change.
     #[error("Failed to record turn {turn_number} for session '{session_id}': {reason}")]
     RecordFailed {
@@ -252,9 +240,7 @@ pub enum AgentError {
         reason: String,
     },
 
-    // =========================================================================
     // Identity Errors
-    // =========================================================================
     /// Failed to create or retrieve an agent identity.
     #[error("Agent identity error for '{agent}': {reason}")]
     IdentityError {
@@ -271,9 +257,7 @@ pub enum AgentError {
         reason: String,
     },
 
-    // =========================================================================
     // Transcript Errors
-    // =========================================================================
     /// Failed to read or parse a transcript file.
     #[error("Failed to read transcript at {path}: {reason}")]
     TranscriptReadFailed {
@@ -290,9 +274,7 @@ pub enum AgentError {
         reason: String,
     },
 
-    // =========================================================================
     // Generic Wrappers
-    // =========================================================================
     /// An IO error occurred.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -407,9 +389,7 @@ impl AgentError {
     }
 }
 
-// =============================================================================
 // Conversions from external error types
-// =============================================================================
 
 impl From<walkdir::Error> for AgentError {
     fn from(err: walkdir::Error) -> Self {
@@ -420,9 +400,7 @@ impl From<walkdir::Error> for AgentError {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -525,9 +503,7 @@ mod tests {
         assert!(msg.contains("schema version 99"));
     }
 
-    // =========================================================================
     // Classification tests
-    // =========================================================================
 
     #[test]
     fn test_is_recoverable() {
@@ -597,9 +573,7 @@ mod tests {
         assert!(!AgentError::WatchmanNotRunning.is_state_violation());
     }
 
-    // =========================================================================
     // Suggestion tests
-    // =========================================================================
 
     #[test]
     fn test_suggestion_watchman() {
@@ -630,9 +604,7 @@ mod tests {
         assert!(err.suggestion().is_none());
     }
 
-    // =========================================================================
     // Exit code tests
-    // =========================================================================
 
     #[test]
     fn test_exit_code_user_errors() {
@@ -688,9 +660,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // Conversion tests
-    // =========================================================================
 
     #[test]
     fn test_from_io_error() {

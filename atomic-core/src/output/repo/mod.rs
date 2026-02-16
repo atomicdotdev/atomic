@@ -60,7 +60,7 @@
 //!
 //! // Configure output options
 //! let options = OutputOptions::new()
-//!     .prefix("src/")
+//!     .with_prefix("src/")
 //!     .output_name_conflicts(true);
 //!
 //! // Create a conflict-aware writer

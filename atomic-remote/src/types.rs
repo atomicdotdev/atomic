@@ -8,9 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-// =============================================================================
 // NodeType
-// =============================================================================
 
 /// The type of a node in the Atomic DAG.
 ///
@@ -83,9 +81,7 @@ impl fmt::Display for ParseNodeTypeError {
 
 impl std::error::Error for ParseNodeTypeError {}
 
-// =============================================================================
 // Node
-// =============================================================================
 
 /// A node in the Atomic DAG, representing either a change or a tag.
 ///
@@ -139,9 +135,7 @@ impl fmt::Display for Node {
     }
 }
 
-// =============================================================================
 // ChangelistEntry
-// =============================================================================
 
 /// An entry in a channel's changelist.
 ///
@@ -301,9 +295,7 @@ impl fmt::Display for ParseChangelistError {
 
 impl std::error::Error for ParseChangelistError {}
 
-// =============================================================================
 // StateResponse
-// =============================================================================
 
 /// Response from a state query.
 ///
@@ -466,9 +458,7 @@ impl fmt::Display for ParseStateError {
 
 impl std::error::Error for ParseStateError {}
 
-// =============================================================================
 // PushDelta
-// =============================================================================
 
 /// The set of changes to push to a remote.
 ///
@@ -512,9 +502,7 @@ impl PushDelta {
     }
 }
 
-// =============================================================================
 // PullDelta
-// =============================================================================
 
 /// The set of changes to pull from a remote.
 ///
@@ -553,9 +541,7 @@ impl PullDelta {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

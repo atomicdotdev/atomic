@@ -89,9 +89,7 @@ use crate::types::{
 
 use super::error::PristineError;
 
-// =============================================================================
 // GraphTxnT - Base Graph Operations
-// =============================================================================
 
 /// Read-only graph operations
 ///
@@ -322,9 +320,7 @@ pub trait GraphTxnT {
     fn get_rev_deps(&self, dep_id: NodeId) -> Result<Vec<NodeId>, PristineError>;
 }
 
-// =============================================================================
 // StackState - Stack Metadata
-// =============================================================================
 
 /// Stack state information
 ///
@@ -440,9 +436,7 @@ impl StackState {
     }
 }
 
-// =============================================================================
 // StackTxnT - Stack Operations
-// =============================================================================
 
 /// Stack operations
 ///
@@ -590,9 +584,7 @@ pub trait StackTxnT: GraphTxnT {
     >;
 }
 
-// =============================================================================
 // TreeTxnT - File Tree Operations
-// =============================================================================
 
 /// File tree operations
 ///
@@ -825,9 +817,7 @@ pub trait TreeTxnT: GraphTxnT {
     fn get_file_mtime(&self, path: &str) -> Result<Option<(i64, u32, u64)>, PristineError>;
 }
 
-// =============================================================================
 // MutTxnT - Mutable Operations
-// =============================================================================
 
 /// Mutable graph operations
 ///
@@ -885,9 +875,7 @@ pub trait TreeTxnT: GraphTxnT {
 /// }
 /// ```
 pub trait MutTxnT: StackTxnT + TreeTxnT {
-    // =========================================================================
     // Change Registration
-    // =========================================================================
 
     /// Register a new internal ID for an external hash
     ///
@@ -971,9 +959,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// ```
     fn register_attestation(&mut self, hash: &Hash) -> Result<NodeId, PristineError>;
 
-    // =========================================================================
     // Graph Modification
-    // =========================================================================
 
     /// Add an edge to the graph
     ///
@@ -1060,9 +1046,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
         edge: SerializedGraphEdge,
     ) -> Result<bool, PristineError>;
 
-    // =========================================================================
     // Stack Operations
-    // =========================================================================
 
     /// Open or create a stack
     ///
@@ -1250,9 +1234,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// ```
     fn del_stack(&mut self, stack: &StackState) -> Result<(), PristineError>;
 
-    // =========================================================================
     // Tree Operations
-    // =========================================================================
 
     /// Add a file to the tree
     ///
@@ -1316,9 +1298,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// * `pos` - The root position in the graph
     fn put_inode(&mut self, inode: Inode, pos: Position<NodeId>) -> Result<(), PristineError>;
 
-    // =========================================================================
     // Directory Operations
-    // =========================================================================
 
     /// Mark an inode as a directory.
     ///
@@ -1379,9 +1359,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// The position that was mapped, if any.
     fn del_inode(&mut self, inode: Inode) -> Result<Option<Position<NodeId>>, PristineError>;
 
-    // =========================================================================
     // Dependency Operations
-    // =========================================================================
 
     /// Add a dependency relationship
     ///
@@ -1407,9 +1385,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// A vector of NodeIds this change depends on.
     fn get_deps(&self, change_id: NodeId) -> Result<Vec<NodeId>, PristineError>;
 
-    // =========================================================================
     // Allocation
-    // =========================================================================
 
     /// Allocate a new inode
     ///
@@ -1425,9 +1401,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// transactions (though only one write transaction can be active).
     fn alloc_inode(&mut self) -> Result<Inode, PristineError>;
 
-    // =========================================================================
     // CRDT Table Operations
-    // =========================================================================
 
     /// Store a trunk (file) entry in the CRDT tables.
     ///
@@ -1562,9 +1536,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// Store inode→position mapping for CRDT compatibility.
     fn put_inodes(&mut self, inode: u64, pos: &Position<NodeId>) -> Result<(), PristineError>;
 
-    // =========================================================================
     // Transaction Control
-    // =========================================================================
 
     /// Commit the transaction
     ///
@@ -1601,9 +1573,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     fn abort(self) -> Result<(), PristineError>;
 }
 
-// =============================================================================
 // VertexExt - Convenience Trait
-// =============================================================================
 
 /// Extension trait for convenient span creation
 ///
@@ -1641,9 +1611,7 @@ impl VertexExt for GraphNode<NodeId> {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

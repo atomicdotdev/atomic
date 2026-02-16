@@ -117,18 +117,14 @@ use thiserror::Error;
 use crate::ignore::IgnoreRules;
 use crate::status::is_always_ignored;
 
-// ============================================================================
 // Constants
-// ============================================================================
 
 /// Maximum depth for recursive directory traversal.
 ///
 /// This prevents infinite loops from symlink cycles and limits memory usage.
 const MAX_RECURSION_DEPTH: usize = 100;
 
-// ============================================================================
 // Error Types
-// ============================================================================
 
 /// Result type for tracking operations.
 pub type TrackingResult<T> = Result<T, TrackingError>;
@@ -219,9 +215,7 @@ pub enum TrackingError {
     },
 }
 
-// ============================================================================
 // TrackingStats
-// ============================================================================
 
 /// Statistics from a tracking operation.
 ///
@@ -279,9 +273,7 @@ impl TrackingStats {
     }
 }
 
-// ============================================================================
 // TrackingOptions
-// ============================================================================
 
 /// Options for controlling tracking operations.
 #[derive(Debug, Clone)]
@@ -365,9 +357,7 @@ impl TrackingOptions {
     }
 }
 
-// ============================================================================
 // TrackedFile
-// ============================================================================
 
 /// Information about a tracked file.
 #[derive(Debug, Clone)]
@@ -393,9 +383,7 @@ impl TrackedFile {
     }
 }
 
-// ============================================================================
 // Helper Functions
-// ============================================================================
 
 /// Normalize a path for storage.
 /// Normalize a path for storage in the repository.
@@ -629,9 +617,7 @@ pub fn collect_files_for_tracking_with_rules(
     Ok(files)
 }
 
-// ============================================================================
 // Core Tracking Functions
-// ============================================================================
 
 /// Add a single file to tracking.
 ///
@@ -1073,17 +1059,13 @@ pub fn tracked_under_prefix<T: TreeTxnT>(
     Ok(results)
 }
 
-// ============================================================================
 // Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ========================================================================
     // Path Normalization Tests
-    // ========================================================================
 
     #[test]
     fn test_normalize_path_basic() {
@@ -1168,9 +1150,7 @@ mod tests {
         );
     }
 
-    // ========================================================================
     // Should Ignore Tests
-    // ========================================================================
 
     #[test]
     fn test_should_ignore_internal_dirs() {
@@ -1287,9 +1267,7 @@ mod tests {
         assert!(should_ignore(Path::new("src/.hidden"), false));
     }
 
-    // ========================================================================
     // TrackingStats Tests
-    // ========================================================================
 
     #[test]
     fn test_tracking_stats_new() {
@@ -1323,9 +1301,7 @@ mod tests {
         assert_eq!(stats.skipped_paths[0].1, "already tracked");
     }
 
-    // ========================================================================
     // TrackingOptions Tests
-    // ========================================================================
 
     #[test]
     fn test_tracking_options_default() {
@@ -1366,9 +1342,7 @@ mod tests {
         assert!(!opts.include_hidden);
     }
 
-    // ========================================================================
     // TrackedFile Tests
-    // ========================================================================
 
     #[test]
     fn test_tracked_file_new() {
@@ -1387,9 +1361,7 @@ mod tests {
         assert!(dir.is_directory);
     }
 
-    // ========================================================================
     // Error Tests
-    // ========================================================================
 
     #[test]
     fn test_tracking_error_display() {
@@ -1419,9 +1391,7 @@ mod tests {
         assert!(err.to_string().contains("already exists"));
     }
 
-    // ========================================================================
     // Collect Files Tests
-    // ========================================================================
 
     #[test]
     fn test_collect_files_single_file() {
@@ -1545,9 +1515,7 @@ mod tests {
         assert!(hidden_result.is_empty());
     }
 
-    // ========================================================================
     // Integration Tests with Pristine
-    // ========================================================================
 
     #[test]
     fn test_add_and_check_tracked() {

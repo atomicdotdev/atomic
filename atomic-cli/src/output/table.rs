@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Table formatting utilities for structured CLI output.
 //!
 //! This module provides a simple, flexible table formatting system for
@@ -36,9 +35,7 @@
 
 use std::fmt;
 
-// =============================================================================
 // Alignment
-// =============================================================================
 
 /// Column alignment options for table cells.
 ///
@@ -55,7 +52,7 @@ pub enum Alignment {
     /// Align content to the right.
     ///
     /// Extra space is added to the left of the content.
-    /// Useful for numeric columns.
+    #[allow(dead_code)] // used in apply() match arm
     Right,
 
     /// Center content.
@@ -101,9 +98,7 @@ impl Alignment {
     }
 }
 
-// =============================================================================
 // Column Configuration
-// =============================================================================
 
 /// Configuration for a table column.
 ///
@@ -169,27 +164,9 @@ impl Column {
         self.min_width = width;
         self
     }
-
-    /// Set the maximum width for this column.
-    ///
-    /// Content exceeding this width will be truncated.
-    ///
-    /// # Arguments
-    ///
-    /// * `width` - The maximum width in characters
-    ///
-    /// # Returns
-    ///
-    /// Self for method chaining.
-    pub fn max_width(mut self, width: usize) -> Self {
-        self.max_width = width;
-        self
-    }
 }
 
-// =============================================================================
 // Row
-// =============================================================================
 
 /// A single row in the table.
 ///
@@ -201,11 +178,6 @@ pub struct Row {
 }
 
 impl Row {
-    /// Create a new empty row.
-    pub fn new() -> Self {
-        Self { cells: Vec::new() }
-    }
-
     /// Create a row from a vector of values.
     ///
     /// # Arguments
@@ -224,30 +196,6 @@ impl Row {
             cells: cells.into_iter().map(|s| s.into()).collect(),
         }
     }
-
-    /// Add a cell to this row.
-    ///
-    /// # Arguments
-    ///
-    /// * `value` - The cell value to add
-    ///
-    /// # Returns
-    ///
-    /// Self for method chaining.
-    pub fn add_cell<S: Into<String>>(mut self, value: S) -> Self {
-        self.cells.push(value.into());
-        self
-    }
-
-    /// Get the number of cells in this row.
-    pub fn len(&self) -> usize {
-        self.cells.len()
-    }
-
-    /// Check if this row is empty.
-    pub fn is_empty(&self) -> bool {
-        self.cells.is_empty()
-    }
 }
 
 impl<I, S> From<I> for Row
@@ -260,9 +208,7 @@ where
     }
 }
 
-// =============================================================================
 // Table
-// =============================================================================
 
 /// A formatted table for CLI output.
 ///
@@ -293,7 +239,8 @@ pub struct Table {
     /// Column separator string
     column_separator: String,
 
-    /// Whether to use colors
+    /// Whether to use colors in output
+    #[allow(dead_code)] // set in constructor
     use_colors: bool,
 }
 
@@ -311,33 +258,6 @@ impl Table {
             column_separator: "  ".to_string(),
             use_colors: true,
         }
-    }
-
-    /// Set the table header.
-    ///
-    /// This creates columns with the given headers using default alignment.
-    ///
-    /// # Arguments
-    ///
-    /// * `headers` - The header values
-    ///
-    /// # Returns
-    ///
-    /// Self for method chaining.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let mut table = Table::new();
-    /// table.set_header(vec!["Stack", "State", "Changes"]);
-    /// ```
-    pub fn set_header<I, S>(&mut self, headers: I) -> &mut Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.columns = headers.into_iter().map(|h| Column::new(h)).collect();
-        self
     }
 
     /// Set the columns with full configuration.
@@ -388,77 +308,6 @@ impl Table {
     {
         self.rows.push(Row::from_vec(row));
         self
-    }
-
-    /// Add a pre-constructed row to the table.
-    ///
-    /// # Arguments
-    ///
-    /// * `row` - The row to add
-    ///
-    /// # Returns
-    ///
-    /// Self for method chaining.
-    pub fn add_row_obj(&mut self, row: Row) -> &mut Self {
-        self.rows.push(row);
-        self
-    }
-
-    /// Set whether to show the header separator line.
-    ///
-    /// # Arguments
-    ///
-    /// * `show` - Whether to show the separator
-    ///
-    /// # Returns
-    ///
-    /// Self for method chaining.
-    pub fn show_header_separator(&mut self, show: bool) -> &mut Self {
-        self.show_header_separator = show;
-        self
-    }
-
-    /// Set the column separator string.
-    ///
-    /// # Arguments
-    ///
-    /// * `separator` - The separator string (default is two spaces)
-    ///
-    /// # Returns
-    ///
-    /// Self for method chaining.
-    pub fn column_separator<S: Into<String>>(&mut self, separator: S) -> &mut Self {
-        self.column_separator = separator.into();
-        self
-    }
-
-    /// Set whether to use colors.
-    ///
-    /// # Arguments
-    ///
-    /// * `use_colors` - Whether to use colors
-    ///
-    /// # Returns
-    ///
-    /// Self for method chaining.
-    pub fn use_colors(&mut self, use_colors: bool) -> &mut Self {
-        self.use_colors = use_colors;
-        self
-    }
-
-    /// Get the number of rows (excluding header).
-    pub fn row_count(&self) -> usize {
-        self.rows.len()
-    }
-
-    /// Get the number of columns.
-    pub fn column_count(&self) -> usize {
-        self.columns.len()
-    }
-
-    /// Check if the table is empty (no rows).
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
     }
 
     /// Calculate the width for each column.
@@ -588,159 +437,9 @@ impl fmt::Display for Table {
     }
 }
 
-// =============================================================================
 // Simple Table Builder
-// =============================================================================
 
-/// A builder for quickly creating simple key-value tables.
-///
-/// This is useful for displaying configuration, status, or other
-/// name-value pairs.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let table = KeyValueTable::new()
-///     .add("Stack", "main")
-///     .add("State", "ABC123...")
-///     .add("Changes", "42");
-/// println!("{}", table);
-/// ```
-///
-/// Output:
-/// ```text
-/// Stack:    main
-/// State:    ABC123...
-/// Changes:  42
-/// ```
-#[derive(Debug, Clone, Default)]
-pub struct KeyValueTable {
-    /// The key-value pairs
-    pairs: Vec<(String, String)>,
-
-    /// Separator between key and value
-    separator: String,
-
-    /// Whether to align values
-    align_values: bool,
-}
-
-impl KeyValueTable {
-    /// Create a new key-value table.
-    pub fn new() -> Self {
-        Self {
-            pairs: Vec::new(),
-            separator: ":  ".to_string(),
-            align_values: true,
-        }
-    }
-
-    /// Add a key-value pair.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The key (label)
-    /// * `value` - The value
-    ///
-    /// # Returns
-    ///
-    /// Self for method chaining.
-    pub fn add<K: Into<String>, V: Into<String>>(mut self, key: K, value: V) -> Self {
-        self.pairs.push((key.into(), value.into()));
-        self
-    }
-
-    /// Set the separator between keys and values.
-    ///
-    /// # Arguments
-    ///
-    /// * `separator` - The separator string
-    ///
-    /// # Returns
-    ///
-    /// Self for method chaining.
-    pub fn separator<S: Into<String>>(mut self, separator: S) -> Self {
-        self.separator = separator.into();
-        self
-    }
-
-    /// Set whether to align values.
-    ///
-    /// When enabled, all values start at the same column.
-    ///
-    /// # Arguments
-    ///
-    /// * `align` - Whether to align values
-    ///
-    /// # Returns
-    ///
-    /// Self for method chaining.
-    pub fn align_values(mut self, align: bool) -> Self {
-        self.align_values = align;
-        self
-    }
-
-    /// Get the number of pairs in this table.
-    pub fn len(&self) -> usize {
-        self.pairs.len()
-    }
-
-    /// Check if this table is empty.
-    pub fn is_empty(&self) -> bool {
-        self.pairs.is_empty()
-    }
-
-    /// Render the table to a string.
-    fn render(&self) -> String {
-        if self.pairs.is_empty() {
-            return String::new();
-        }
-
-        let max_key_width = if self.align_values {
-            self.pairs
-                .iter()
-                .map(|(k, _)| console::measure_text_width(k))
-                .max()
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
-        let mut output = String::new();
-        for (key, value) in &self.pairs {
-            if self.align_values {
-                let key_width = console::measure_text_width(key);
-                let padding = max_key_width - key_width;
-                output.push_str(&format!(
-                    "{}{}{}{}\n",
-                    key,
-                    " ".repeat(padding),
-                    self.separator,
-                    value
-                ));
-            } else {
-                output.push_str(&format!("{}{}{}\n", key, self.separator, value));
-            }
-        }
-
-        // Remove trailing newline
-        if output.ends_with('\n') {
-            output.pop();
-        }
-
-        output
-    }
-}
-
-impl fmt::Display for KeyValueTable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.render())
-    }
-}
-
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -958,18 +657,14 @@ mod tests {
 
     #[test]
     fn test_kv_table_add() {
-        let table = KeyValueTable::new()
-            .add("Name", "Alice")
-            .add("Age", "30");
+        let table = KeyValueTable::new().add("Name", "Alice").add("Age", "30");
 
         assert_eq!(table.len(), 2);
     }
 
     #[test]
     fn test_kv_table_render() {
-        let table = KeyValueTable::new()
-            .add("Name", "Alice")
-            .add("Age", "30");
+        let table = KeyValueTable::new().add("Name", "Alice").add("Age", "30");
 
         let output = table.to_string();
         assert!(output.contains("Name"));
@@ -980,9 +675,7 @@ mod tests {
 
     #[test]
     fn test_kv_table_custom_separator() {
-        let table = KeyValueTable::new()
-            .separator(" = ")
-            .add("x", "1");
+        let table = KeyValueTable::new().separator(" = ").add("x", "1");
 
         let output = table.to_string();
         assert!(output.contains("x = 1"));

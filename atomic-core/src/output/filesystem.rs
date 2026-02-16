@@ -109,9 +109,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-// ============================================================================
 // CONSTANTS
-// ============================================================================
 
 /// The name of the Atomic metadata directory, which is always ignored.
 pub const DOT_DIR: &str = ".atomic";
@@ -128,9 +126,7 @@ pub const DEFAULT_DIR_MODE: u32 = 0o755;
 #[cfg(unix)]
 pub const DEFAULT_EXEC_MODE: u32 = 0o755;
 
-// ============================================================================
 // FILESYSTEM WORKING COPY
-// ============================================================================
 
 /// A filesystem-backed working copy.
 ///
@@ -408,9 +404,7 @@ impl FileSystem {
     }
 }
 
-// ============================================================================
 // WORKING COPY READ IMPLEMENTATION
-// ============================================================================
 
 impl WorkingCopyRead for FileSystem {
     type Error = io::Error;
@@ -506,9 +500,7 @@ impl WorkingCopyRead for FileSystem {
     }
 }
 
-// ============================================================================
 // WORKING COPY WRITE IMPLEMENTATION
-// ============================================================================
 
 /// A buffered file writer returned by [`FileSystem::write_file`].
 ///
@@ -723,9 +715,7 @@ impl WorkingCopy for FileSystem {
     }
 }
 
-// ============================================================================
 // HELPER FUNCTIONS
-// ============================================================================
 
 /// Normalize a path by resolving `.` and `..` components.
 ///
@@ -785,9 +775,7 @@ fn set_permissions(path: &Path, permissions: u16) -> io::Result<()> {
     fs::set_permissions(path, perms)
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

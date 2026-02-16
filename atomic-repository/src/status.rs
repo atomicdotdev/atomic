@@ -87,16 +87,12 @@ use thiserror::Error;
 
 use crate::ignore::IgnoreRules;
 
-// ============================================================================
 // Constants
-// ============================================================================
 
 /// Patterns that are always ignored (internal directories)
 const ALWAYS_IGNORED: &[&str] = &[".atomic", ".git"];
 
-// ============================================================================
 // Error Types
-// ============================================================================
 
 /// Result type for status operations.
 pub type StatusResult<T> = Result<T, StatusError>;
@@ -130,9 +126,7 @@ pub enum StatusError {
     WalkDir(#[from] walkdir::Error),
 }
 
-// ============================================================================
 // FileStatus Enum
-// ============================================================================
 
 /// The status of a file in the repository.
 ///
@@ -259,9 +253,7 @@ impl std::fmt::Display for FileStatus {
     }
 }
 
-// ============================================================================
 // FileStatusEntry
-// ============================================================================
 
 /// Information about a single file's status.
 ///
@@ -388,9 +380,7 @@ impl FileStatusEntry {
     }
 }
 
-// ============================================================================
 // RepositoryStatus
-// ============================================================================
 
 /// Complete status of a repository.
 ///
@@ -490,9 +480,7 @@ impl RepositoryStatus {
         self.entries.iter().any(|e| e.status.is_untracked())
     }
 
-    // ========================================================================
     // Filtered Iterators
-    // ========================================================================
 
     /// Iterate over modified files.
     pub fn modified(&self) -> impl Iterator<Item = &FileStatusEntry> {
@@ -576,9 +564,7 @@ impl RepositoryStatus {
         self.dirty().count()
     }
 
-    // ========================================================================
     // Path Collections
-    // ========================================================================
 
     /// Get all paths with a specific status.
     pub fn paths_with_status(&self, status: FileStatus) -> Vec<&Path> {
@@ -605,9 +591,7 @@ impl Default for RepositoryStatus {
     }
 }
 
-// ============================================================================
 // StatusOptions
-// ============================================================================
 
 /// Options for controlling status computation.
 ///
@@ -701,9 +685,7 @@ impl StatusOptions {
     }
 }
 
-// ============================================================================
 // Helper Functions
-// ============================================================================
 
 /// Check if a path should be ignored (always-ignored patterns).
 ///
@@ -828,17 +810,13 @@ pub fn collect_working_copy_files_with_rules(
     Ok(files)
 }
 
-// ============================================================================
 // Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ========================================================================
     // FileStatus Tests
-    // ========================================================================
 
     #[test]
     fn test_file_status_is_dirty() {
@@ -899,9 +877,7 @@ mod tests {
         assert_eq!(format!("{}", FileStatus::Untracked), "untracked");
     }
 
-    // ========================================================================
     // FileStatusEntry Tests
-    // ========================================================================
 
     #[test]
     fn test_file_status_entry_new() {
@@ -956,9 +932,7 @@ mod tests {
         assert_eq!(entry.details(), Some("Some details"));
     }
 
-    // ========================================================================
     // RepositoryStatus Tests
-    // ========================================================================
 
     #[test]
     fn test_repository_status_new() {
@@ -1158,9 +1132,7 @@ mod tests {
         assert_eq!(tracked.len(), 2);
     }
 
-    // ========================================================================
     // StatusOptions Tests
-    // ========================================================================
 
     #[test]
     fn test_status_options_default() {
@@ -1207,9 +1179,7 @@ mod tests {
         assert_eq!(opts.path_filters.len(), 1);
     }
 
-    // ========================================================================
     // Helper Function Tests
-    // ========================================================================
 
     #[test]
     fn test_is_always_ignored() {
@@ -1286,9 +1256,7 @@ mod tests {
         assert!(!files.contains(&PathBuf::from("README.md")));
     }
 
-    // ========================================================================
     // StatusError Tests
-    // ========================================================================
 
     #[test]
     fn test_status_error_display() {

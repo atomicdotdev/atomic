@@ -22,34 +22,49 @@ atomic/
 │   ├── types/            # Fundamental data types
 │   └── pristine/         # Storage layer (redb)
 ├── atomic-config/        # Configuration management
-├── atomic-identity/      # User identity & Ed25519 signing ✅ Phase 11 Complete
+├── atomic-identity/      # User identity & Ed25519 signing
 └── atomic-repository/    # High-level repository operations
 ```
 
 ### Related Projects
 
-- **atomic-remote-client** (`atomic-enterprise/atomic-remote`) - Clean-room HTTP client for remote operations (Phase 9.4.1 ✅)
+- **atomic-remote-client** (`atomic-enterprise/atomic-remote`) - Clean-room HTTP client for remote operations
 - **atomic-api** (`atomic-enterprise/atomic-api`) - Server-side HTTP API for remote operations
-- **atomic** (original) - Reference implementation (protocol behavior only, no code copied)
 
 ## Core Concepts
 
 ### 1. Repository Graph
 
-Files are represented as directed acyclic graphs (DAGs):
+Files are represented as directed acyclic graphs (DAGs). Nodes are opaque
+byte ranges (hunks); edges define the ordering between them. The semantic
+layer (CRDT) interprets the bytes as human-readable text.
 
 ```
-┌─────────┐     ┌─────────┐     ┌─────────┐
-│ Vertex  │────▶│ Vertex  │────▶│ Vertex  │
-│ "Hello" │     │ " "     │     │ "World" │
-└─────────┘     └─────────┘     └─────────┘
-     │               │               │
-     └───────────────┴───────────────┘
-              Content of file
+  Graph layer (storage):
+
+  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+  │ Hunk [0:5]   │────▶│ Hunk [5:6]   │────▶│ Hunk [0:5]   │
+  │ (5 bytes)    │     │ (1 byte)     │     │ (5 bytes)    │
+  └──────────────┘     └──────────────┘     └──────────────┘
+    change 1             change 1             change 2
+
+  Semantic layer (interpretation):
+
+  The CRDT reads the hunks and translates them for display:
+  [0:5] → "Hello"    [5:6] → " "    [0:5] → "World"
 ```
 
-- **Vertices**: Contiguous chunks of content within a change
-- **Edges**: Ordered relationships between vertices (with flags)
+- **Inodes** (`Inode`): A stable identifier for a file. Survives renames.
+  The `TREE` table maps `path → Inode` and `INODES` maps `Inode → Position`
+  (the root node of that file's graph). The Inode *is* the file.
+- **Nodes / Vertices** (`GraphNode`): Each node holds a chunk of content (a
+  byte range within a change). The codebase uses "node" and "vertex"
+  interchangeably — `GraphNode` is the struct name, "vertex" is the graph
+  theory term used in traversal code (`AliveVertex`, `find_block`, etc.).
+  To read a file, walk the graph and concatenate node content in edge order.
+- **Edges** (`SerializedGraphEdge`): Define ordering between nodes. An edge
+  from A to B means "A's content comes before B's." Edges carry flags
+  (`BLOCK`, `FOLDER`, `PARENT`, `DELETED`) that indicate structure and state.
 
 ### 2. Changes (Patches)
 
@@ -643,33 +658,25 @@ The `INODE_GRAPH` secondary index enables **O(n) file traversal** where n is pro
 
 ### Documentation Standards
 
-Every public item should have:
+- Document **public** items that aren't self-explanatory from the type signature
+- Skip docs on trivial getters, obvious fields, and internal helpers
+- Use `# Examples` on public APIs that have non-obvious usage
+- Use `# Errors` only when the failure modes aren't clear from the return type
+- Avoid restating the function name or field name in the doc comment
+
+### Getter Convention
+
+Follow Rust naming conventions for accessors:
 
 ```rust
-/// Brief one-line description.
-///
-/// Longer explanation of what this does, why it exists,
-/// and how it fits into the larger system.
-///
-/// # Arguments
-///
-/// * `param` - What this parameter is for
-///
-/// # Returns
-///
-/// What the return value means.
-///
-/// # Errors
-///
-/// When and why this can fail.
-///
-/// # Examples
-///
-/// ```
-/// let result = function(arg)?;
-/// assert!(result.is_valid());
-/// ```
-pub fn function(param: Type) -> Result<Output, Error> { ... }
+// Good: getter matches field name
+pub fn algorithm(&self) -> Algorithm { self.algorithm }
+
+// Good: builder uses with_ prefix
+pub fn with_algorithm(mut self, alg: Algorithm) -> Self { ... }
+
+// Bad: Java-style get_ prefix
+pub fn get_algorithm(&self) -> Algorithm { self.algorithm }
 ```
 
 ### Record Style
@@ -681,550 +688,41 @@ Use conventional records:
 - `docs:` Documentation updates
 - `test:` Test additions/changes
 
-## Implementation Roadmap
+## Roadmap
 
+### Identity Management (complete)
 
+The `atomic-identity` crate provides Ed25519-based identity management with
+multiple identities per user, agent delegation, and cryptographic signing.
+Identities are stored under `~/.atomic/identities/` and integrate with
+change headers via `identity.to_author()`.
 
-#### Phase 9.3: Stack Commands
-- [ ] **Stack Command Router** (`atomic/src/commands/stack/mod.rs`)
-  - [ ] Subcommand routing
-- [ ] **`stack new`** (`atomic/src/commands/stack/new.rs`)
-  - [ ] CLI arguments: `name`, `--from`, `--switch`
-- [ ] **`stack switch`** (`atomic/src/commands/stack/switch.rs`)
-  - [ ] CLI arguments: `name`
-- [ ] **`stack delete`** (`atomic/src/commands/stack/delete.rs`)
-  - [ ] CLI arguments: `name`, `--force`
-- [ ] **`stack list`** (`atomic/src/commands/stack/list.rs`)
-  - [ ] CLI arguments: `--verbose`
+Key types: `Identity`, `IdentityId`, `KeyPair`, `Delegation`, `DelegationScope`,
+`Signature`, `Signer`, `IdentityStore`.
 
+### Semantic Layer (in progress)
 
-##### Phase 9.4.7: Remote Management Command 🔄 Planned
-- [ ] **`remote` Command** (`atomic/atomic-cli/src/commands/remote.rs`)
-  - [ ] `remote` (no args) - List all remotes with URLs
-  - [ ] `remote add <name> <url>` - Add new remote
-  - [ ] `remote remove <name>` - Remove a remote
-  - [ ] `remote set-url <name> <url>` - Update remote URL
-  - [ ] `remote default <name>` - Set default remote for push/pull
+The semantic layer translates raw graph operations (byte positions) into
+human-readable line/token operations for code review, blame, and diffs.
 
-- [ ] **Remote Configuration in `atomic-repository`**
-  - [ ] `RemoteConfig` struct in repository config
-  - [ ] Serialization to `.atomic/config.toml`
-  - [ ] Methods: `add_remote()`, `remove_remote()`, `get_remote()`, `list_remotes()`
+**Status**: FileOps generation and CRDT table population work. Remaining:
+verify content retrieval consistency and wire up token-level diff display.
 
-##### Phase 9.4.8: Testing Strategy
+Relevant code: `atomic-core/src/change/ops.rs`, `atomic-core/src/apply/crdt.rs`,
+`atomic-core/src/record/workflow/crdt/`.
 
-- [ ] **Unit Tests in `atomic-remote`**
-  - [ ] URL parsing and normalization
-  - [ ] Changelist parsing (with/without trailing dot)
-  - [ ] State response parsing
-  - [ ] Error type conversions
-  - [ ] Content encoding/decoding
+### Stack Workflow Commands (planned)
 
-- [ ] **Integration Tests in `atomic-cli`**
-  - [ ] Push to `LocalRemote` (mock)
-  - [ ] Pull from `LocalRemote` (mock)
-  - [ ] Clone from `LocalRemote` (mock)
-  - [ ] Round-trip: init → record → push → clone → record → push → pull
+Advanced stack manipulation: `unrecord`, `reinsert`, `revise`, cross-stack `apply`,
+per-stack `tag`. These build on the existing `Repository::unrecord()` and
+`Repository::reinsert_change()` methods.
 
-- [ ] **End-to-End Tests** (requires running `atomic-api`)
-  - [ ] Push to HTTP API
-  - [ ] Pull from HTTP API
-  - [ ] Clone from HTTP API
-  - [ ] Error handling (auth, not found, conflicts)
+Key design: a change reference syntax (`@`, `@~1`, `@~N`, `stack@`) for
+addressing changes within stacks. See the Phase 13 section of the CRDT
+Semantic Layer design doc for the full spec.
 
-##### Phase 9.4.9: Documentation
-- [ ] `atomic-remote` crate README with usage examples
-- [ ] Remote configuration format in atomic docs
-- [ ] Troubleshooting guide for common errors
-- [ ] API setup guide for local development
 
-##### Architecture Diagram
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    Clean-Room Remote Implementation                          │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │                           atomic-cli                                   │  │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │  │
-│  │  │    push     │  │    pull     │  │    clone    │  │   remote    │  │  │
-│  │  │   command   │  │   command   │  │   command   │  │   command   │  │  │
-│  │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  │  │
-│  │         │                │                │                │         │  │
-│  │         └────────────────┴────────────────┴────────────────┘         │  │
-│  │                                   │                                   │  │
-│  │                                   ▼                                   │  │
-│  │  ┌─────────────────────────────────────────────────────────────────┐ │  │
-│  │  │                    atomic-repository                             │ │  │
-│  │  │  Repository, ChangeStore, Pristine, Status, History, etc.       │ │  │
-│  │  └─────────────────────────────────────────────────────────────────┘ │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                   │                                         │
-│                                   │ uses                                    │
-│                                   ▼                                         │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │                       atomic-enterprise                                │  │
-│  │  ┌─────────────────────────────────────────────────────────────────┐ │  │
-│  │  │                     atomic-remote (NEW)                          │ │  │
-│  │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐ │ │  │
-│  │  │  │ RemoteRepo  │  │ HttpRemote  │  │ LocalRemote (testing)   │ │ │  │
-│  │  │  │   trait     │  │   struct    │  │       struct            │ │ │  │
-│  │  │  └─────────────┘  └──────┬──────┘  └─────────────────────────┘ │ │  │
-│  │  └──────────────────────────┼────────────────────────────────────┘ │  │
-│  │                             │ HTTP                                  │  │
-│  │                             ▼                                       │  │
-│  │  ┌─────────────────────────────────────────────────────────────────┐ │  │
-│  │  │                       atomic-api                                 │ │  │
-│  │  │  POST ?apply={hash}     GET ?change={hash}                      │ │  │
-│  │  │  POST ?tagup={state}    GET ?tag={state}                        │ │  │
-│  │  │  GET ?changelist=...    GET ?state=...                          │ │  │
-│  │  └─────────────────────────────────────────────────────────────────┘ │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-Key Points:
-1. atomic-remote is a NEW crate in atomic-enterprise (clean-room implementation)
-2. atomic-cli commands use atomic-remote via Cargo dependency
-3. No code from original atomic/atomic-remote is used
-4. Protocol derived from atomic-api server implementation
-5. User-Agent: atomic-{version} enables CLI detection in API
-```
-
-### Phase 11: Identity Management ✅ Complete
-
-The `atomic-identity` crate provides comprehensive identity management for Atomic VCS,
-supporting multiple identities, agent delegation, and cryptographic signing.
-
-#### Phase 11.1: Core Identity Types ✅ Complete
-- [x] **Identity struct** (`identity.rs`) - 26 tests
-  - [x] `IdentityId` - Unique identifier derived from public key (Blake3 hash)
-  - [x] `Identity` - Complete identity with name, email, keys, type, usage
-  - [x] `IdentityType` enum (User, Agent, Delegated)
-  - [x] `IdentityMetadata` - Creation time, expiry, description
-  - [x] `IdentityBuilder` - Fluent builder pattern for identity construction
-  - [x] `Author` struct for change header integration
-
-- [x] **Usage Contexts** (`usage.rs`) - 16 tests
-  - [x] `IdentityUsage` enum (Personal, Work, Community, Bot, Custom)
-  - [x] Helper methods: `is_personal()`, `is_work()`, `is_community()`, `is_bot()`
-  - [x] Parsing from strings with `IdentityUsage::parse()`
-  - [x] Serialization/deserialization support
-
-#### Phase 11.2: Cryptographic Operations ✅ Complete
-- [x] **Key Pair Management** (`keypair.rs`) - 7 tests
-  - [x] `PublicKey` - Ed25519 public key with base32 encoding
-  - [x] `SecretKey` - Ed25519 secret key (not Clone/Serialize for security)
-  - [x] `KeyPair` - Combined public/secret key for signing
-  - [x] Signature verification via `PublicKey::verify()`
-
-- [x] **Signing Module** (`signing.rs`) - 18 tests
-  - [x] `Signature` - Ed25519 signature with base32 encoding
-  - [x] `Signer` - Creates signatures from secret keys
-  - [x] `SignedData` - Data with attached signature
-  - [x] `SignatureInfo` - Rich signature metadata (signer, timestamp, reason)
-  - [x] `SignatureSet` - Multi-party signing support
-  - [x] `VerificationResult` - Detailed verification outcomes
-
-#### Phase 11.3: Delegation Support ✅ Complete
-- [x] **Delegation Module** (`delegation.rs`) - 15 tests
-  - [x] `DelegationPermission` enum (Read, Record, Push, Pull, ManageStacks, ManageTags, Admin, Full)
-  - [x] `DelegationScope` - Permissions + repository/stack patterns
-  - [x] `DelegationScopeBuilder` - Fluent builder for scopes
-  - [x] `Delegation` - Certificate authorizing agent to act on behalf of user
-  - [x] `DelegationId` - Unique delegation identifier
-  - [x] Permission checking with `Delegation::allows()`
-  - [x] Expiry and revocation support
-
-#### Phase 11.4: Identity Storage ✅ Complete
-- [x] **Identity Store** (`store.rs`) - 12 tests
-  - [x] `IdentityStore` - Persistent storage for identities
-  - [x] `StoreConfig` - Default identity and per-usage defaults
-  - [x] `LoadOptions` - Options for loading (public-only, with secret, with password)
-  - [x] `IdentityFilter` - Filter identities by usage, type, name
-  - [x] Save/load identities with optional encrypted secret keys
-  - [x] Default identity management (global and per-usage)
-  - [x] List/filter/delete operations
-
-#### Identity Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        Identity Management Architecture                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                         Identity Types                               │   │
-│  │                                                                      │   │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐  │   │
-│  │  │     User     │  │    Agent     │  │       Delegated          │  │   │
-│  │  │  (Human)     │  │  (AI/Bot)    │  │  (Agent on behalf of)    │  │   │
-│  │  └──────────────┘  └──────────────┘  └──────────────────────────┘  │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                         Usage Contexts                               │   │
-│  │                                                                      │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌───────────┐  ┌─────┐  ┌──────────┐ │   │
-│  │  │ Personal │  │   Work   │  │ Community │  │ Bot │  │  Custom  │ │   │
-│  │  └──────────┘  └──────────┘  └───────────┘  └─────┘  └──────────┘ │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                         Delegation Model                             │   │
-│  │                                                                      │   │
-│  │  User Identity ──delegates to──▶ Agent Identity                     │   │
-│  │        │                              │                              │   │
-│  │        │ signs                        │ operates within              │   │
-│  │        ▼                              ▼                              │   │
-│  │  Delegation Certificate ◀──defines── DelegationScope                │   │
-│  │  (expiry, revocation)                 (permissions, patterns)        │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                         Storage Layout                               │   │
-│  │                                                                      │   │
-│  │  ~/.atomic/identities/                                              │   │
-│  │  ├── config.toml              # Store config (defaults)             │   │
-│  │  ├── alice-personal-ABCD1234/                                       │   │
-│  │  │   ├── identity.toml        # Identity metadata                   │   │
-│  │  │   └── secret.key           # Encrypted secret key                │   │
-│  │  └── ci-bot-EFGH5678/                                               │   │
-│  │      └── identity.toml        # Agent identity (no secret key)      │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-#### Integration with Change Headers
-
-Identities integrate with atomic-core's `Author` type for change attribution:
-
-```rust
-use atomic_identity::{Identity, IdentityUsage};
-
-// Create identity
-let identity = Identity::builder("alice")
-    .email("alice@example.com")
-    .usage(IdentityUsage::Work)
-    .build()?;
-
-// Convert to Author for change headers
-let author = identity.to_author();
-// author.name = "alice"
-// author.email = Some("alice@example.com")
-// author.identity = Some("<base32 public key>")
-```
-
-#### Test Coverage (79 tests)
-- identity.rs: 26 tests (IdentityId, Identity, IdentityBuilder, IdentityMetadata)
-- usage.rs: 16 tests (IdentityUsage enum and methods)
-- keypair.rs: 7 tests (PublicKey, SecretKey, KeyPair)
-- signing.rs: 18 tests (Signature, Signer, SignedData, SignatureInfo, SignatureSet)
-- delegation.rs: 15 tests (DelegationPermission, DelegationScope, Delegation)
-- store.rs: 12 tests (IdentityStore, StoreConfig, LoadOptions, IdentityFilter)
-- lib.rs: 6 tests (integration tests)
-- Doc tests: 8 passing
-
-### Phase 12: Semantic Layer 🔄 In Progress
-
-Implement the **required** semantic layer (`TrunkOp`, `BranchOp`, `LeafOp`) that
-makes the graph understandable for code review and developer workflows.
-
-#### Design Philosophy
-
-**Graph = Storage. CRDT = Understanding. Both are required.**
-
-| Layer | Purpose | Types |
-|-------|---------|-------|
-| **Graph (Storage)** | Persistence, content-addressing, merging | `Hunk`, `Atom`, `NewVertex`, `EdgeMap`, `Vertex`, `Edge` |
-| **Semantic (Interpretation)** | Lines, tokens, human-readable diffs | `TrunkOp`, `BranchOp`, `LeafOp`, `FileOps` |
-
-The graph alone cannot support modern code review:
-- "Bytes 1024-1089 changed" is useless for review
-- "Position 9 in change X" means nothing to developers
-- Byte-level blame doesn't answer "who wrote this function?"
-
-Semantic operations are **required** to provide:
-- Line-level diffs ("line 42 was modified")
-- Token-level diffs (`--word-diff` shows "changed `foo` to `bar`")
-- Fine-grained blame (which change introduced each token)
-- Semantic conflict resolution
-
-#### Phase 12.1: Semantic Operations Module ✅ Complete
-- [x] **Create Semantic Operations Module** (`atomic-core/src/change/ops.rs`) - 19 tests
-  - [x] `FileOps` struct (trunk-level operations)
-  - [x] `LineOps` struct (branch-level operations)
-  - [x] `FileOpsStats` for change statistics
-  - [x] Serialization/deserialization with bincode and JSON
-
-- [x] **Add `file_ops` field to `HashedChange`** (`atomic-core/src/change/change.rs`)
-  - [x] Add `file_ops: Vec<FileOps>` field alongside `hunks`
-  - [x] Keep `hunks: Vec<Hunk<H>>` as the **primary** graph operations
-  - [x] `file_ops` is optional semantic metadata for enhanced features
-
-#### Phase 12.2: Record Workflow - Generate Both Formats ✅ Complete
-- [x] **Dual-Format Recording** (`atomic-core/src/record/workflow/`)
-  - [x] Generate Hunks for graph storage (primary)
-  - [x] Generate FileOps for semantic overlay (optional)
-  - [x] `RecordedFile` has both `hunks` and `file_ops` fields
-  - [x] `from_file_ops()` constructor for CRDT-enhanced recording
-  - [x] Statistics track both hunk count and line/token counts
-
-- [x] **Update `atomic-repository` Recording** (`atomic-repository/src/`)
-  - [x] Record changes with both Hunks (graph) and FileOps (CRDT)
-  - [x] Both formats are generated together during recording
-  - [x] Apply populates both graph tables and CRDT tables
-
-#### Phase 12.3: CRDT Apply for Semantic Tables 🔄 In Progress
-- [x] **Semantic Apply Module** (`atomic-core/src/apply/crdt.rs`) - 35 tests
-  - [x] `apply_file_ops()` populates CRDT tables (TRUNKS, BRANCHES, LEAVES)
-  - [x] Also populates GRAPH table for output system compatibility
-  - [x] `CrdtApplyStats` tracks apply statistics
-  - [x] Trunk/Branch/Leaf operations implemented
-
-- [ ] **Remaining Work**
-  - [ ] Debug content retrieval mismatch in integration tests
-  - [ ] Verify CRDT tables correctly index into graph content
-  - [ ] Ensure semantic layer and graph layer are consistent
-
-**Current Status**: Semantic tables are populated. Need to verify the semantic layer
-correctly interprets the graph content for display.
-
-#### Phase 12.4: Semantic Display Features
-- [ ] **Token-Level Diff Display** (`atomic/src/commands/diff.rs`)
-  - [ ] Use `FileOps` from stored changes for all diffs
-  - [ ] Display line numbers and token changes (not byte ranges)
-  - [ ] `--word-diff` shows token additions/deletions/replacements
-
-- [ ] **Fine-Grained Blame**
-  - [ ] Use Semantic Leaf IDs for token-level blame
-  - [ ] Answer "who wrote this specific token?"
-  - [ ] Support line-level and token-level granularity
-
-#### Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Change Storage Architecture                          │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  HashedChange                                                               │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  hunks: Vec<Hunk>           ← PRIMARY: Graph operations              │   │
-│  │  file_ops: Vec<FileOps>     ← OVERLAY: Semantic metadata (optional)  │   │
-│  │  contents: Vec<u8>          ← Content blob (shared by both)          │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  Apply Flow:                                                                │
-│  ┌──────────────┐                                                          │
-│  │ apply_hunk() │ ──▶ GRAPH table (vertices, edges) ──▶ Output system     │
-│  └──────────────┘                                                          │
-│  ┌───────────────────┐                                                     │
-│  │ apply_file_ops()  │ ──▶ Semantic tables ( index) ──▶ Diff, Blame        │
-│  └───────────────────┘                                                     │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-#### Benefits of Two-Layer Architecture
-- **Separation of concerns**: Graph handles storage, CRDT handles semantics
-- **Efficient storage**: Graph stores bytes compactly
-- **Human-readable display**: CRDT provides lines and tokens
-- **Modern code review**: Developers see meaningful diffs, not byte offsets
-- **Competitive with Git/GitHub**: Line-level and word-level operations
-
-### Phase 13: Stack Workflow Commands 🔄 Planned
-
-Advanced stack manipulation commands for flexible change management workflows.
-
-#### Design Philosophy
-
-**Changes are immutable but repositionable. Stacks are views of the same graph.**
-
-| Command | Level | Purpose |
-|---------|-------|---------|
-| `unrecord` | Low-level | Remove change from stack (preserves change data) |
-| `reinsert` | Low-level | Put change back into stack at position |
-| `revise` | High-level | Modify change in-place (unrecord + re-record + re-apply) |
-| `apply` | Cross-stack | Apply changes from another stack |
-| `tag` | Metadata | Named state snapshots per-stack |
-
-#### Phase 13.1: Change Reference System
-- [ ] **Reference Parsing** (`atomic-core/src/reference.rs`)
-  - [ ] `@` = current/last change in stack
-  - [ ] `@~1` = previous change (parent)
-  - [ ] `@~N` = N changes back
-  - [ ] `@{hash-prefix}` = specific change by hash
-  - [ ] `stack@` = last change in named stack
-  - [ ] `stack@~1` = previous change in named stack
-
-- [ ] **Reference Resolution** (`atomic-repository/src/reference.rs`)
-  - [ ] `resolve_ref()` → `(StackName, ChangeId, Hash)`
-  - [ ] Validate reference exists
-  - [ ] Handle ambiguous hash prefixes
-
-#### Phase 13.2: Low-Level Primitives
-- [ ] **`unrecord` Command** (`atomic/atomic-cli/src/commands/unrecord.rs`)
-  - [ ] CLI: `atomic unrecord <ref>` (default: `@`)
-  - [ ] CLI: `atomic unrecord @~1` (previous change)
-  - [ ] CLI: `atomic unrecord --to @~3` (unrecord last 3)
-  - [ ] Options: `--dry-run`, `--force`
-  - [ ] Output: Shows unrecorded change hash for reinsertion
-  - [ ] Working copy left with unrecorded changes applied
-
-- [ ] **`reinsert` Command** (`atomic/atomic-cli/src/commands/reinsert.rs`)
-  - [ ] CLI: `atomic reinsert <hash>`
-  - [ ] CLI: `atomic reinsert <hash> --at @~2`
-  - [ ] Options: `--at <position>`, `--dry-run`
-  - [ ] Validates dependencies are satisfied
-
-- [ ] **Repository Methods** (`atomic-repository/src/unrecord.rs`)
-  - [ ] `Repository::unrecord()` - Remove change from stack
-  - [ ] `Repository::reinsert()` - Add change back to stack
-  - [ ] `Repository::can_unrecord()` - Check if safe to unrecord
-  - [ ] Dependency tracking for safe operations
-
-#### Phase 13.3: High-Level Revise Command
-- [ ] **`revise` Command** (`atomic/atomic-cli/src/commands/revise.rs`)
-  - [ ] CLI: `atomic revise` (revise last change)
-  - [ ] CLI: `atomic revise @~1` (revise previous change)
-  - [ ] CLI: `atomic revise @~1 -m "New message"` (with new message)
-  - [ ] CLI: `atomic revise @~1 --reword` (only change message)
-  - [ ] Options: `-m/--message`, `--reword`, `--no-edit`
-
-- [ ] **Revise Workflow** (`atomic-repository/src/revise.rs`)
-  ```
-  revise(@~1):
-  1. Unrecord @ (save as pending_1)
-  2. Unrecord @~1 (this is the target)
-  3. Working copy now has target's changes
-  4. User edits files (or just message with --reword)
-  5. Record new change (replaces target)
-  6. Re-apply pending_1
-  ```
-  - [ ] `ReviseOptions` - target ref, message, reword-only
-  - [ ] `ReviseOutcome` - new change hash, re-applied changes
-  - [ ] Handle conflicts during re-apply
-
-#### Phase 13.4: Cross-Stack Operations
-- [ ] **`apply` Command** (`atomic/atomic-cli/src/commands/apply.rs`)
-  - [ ] CLI: `atomic apply feature@` (apply last from feature)
-  - [ ] CLI: `atomic apply feature@~1..feature@` (range)
-  - [ ] CLI: `atomic apply --from feature --to main:v1.0` (up to tag)
-  - [ ] CLI: `atomic apply --cherry-pick <hash1> <hash2>` (specific changes)
-  - [ ] Options: `--dry-run`, `--no-deps`
-
-- [ ] **Cross-Stack Apply** (`atomic-repository/src/cross_apply.rs`)
-  - [ ] `CrossApplyOptions` - source stack, target stack, range/selection
-  - [ ] `CrossApplyOutcome` - applied changes, conflicts
-  - [ ] Automatic dependency resolution
-  - [ ] Conflict handling strategies
-
-#### Phase 13.5: Per-Stack Tags
-- [ ] **Tag Storage** (`.atomic/tags/{stack}/{name}.tag`)
-  - [ ] Allows same tag name in different stacks
-  - [ ] Lightweight tags (just state hash)
-  - [ ] Annotated tags (message, author, timestamp)
-
-- [ ] **`tag` Command** (`atomic/atomic-cli/src/commands/tag.rs`)
-  - [ ] CLI: `atomic tag v1.0` (tag current state)
-  - [ ] CLI: `atomic tag v1.0 -m "Release 1.0"` (annotated)
-  - [ ] CLI: `atomic tag --list` (list tags in current stack)
-  - [ ] CLI: `atomic tag --list --all` (all stacks)
-  - [ ] CLI: `atomic tag --delete v1.0`
-  - [ ] CLI: `atomic tag --stack feature v1.0` (tag other stack)
-
-- [ ] **Tag Methods** (`atomic-repository/src/tags.rs`)
-  - [ ] `Repository::create_tag()` - Create tag for stack state
-  - [ ] `Repository::get_tag()` - Resolve tag to state
-  - [ ] `Repository::list_tags()` - List tags with filters
-  - [ ] `Repository::delete_tag()` - Remove tag
-
-#### Phase 13.6: Log with References
-- [ ] **Enhanced `log` Command** (`atomic/atomic-cli/src/commands/log.rs`)
-  - [ ] Show `@`, `@~1`, `@~2` references in output
-  - [ ] Show tags inline with changes
-  - [ ] CLI: `atomic log --oneline` (compact)
-  - [ ] CLI: `atomic log --graph` (ASCII graph)
-  - [ ] CLI: `atomic log feature` (other stack's log)
-
-#### Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      Stack Workflow Architecture                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  Reference System                                                           │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  @          → Current change (HEAD equivalent)                       │   │
-│  │  @~1        → Previous change                                        │   │
-│  │  @~N        → N changes back                                         │   │
-│  │  feature@   → Last change in 'feature' stack                         │   │
-│  │  main:v1.0  → Tag 'v1.0' in 'main' stack                            │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  Command Hierarchy                                                          │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                                                                      │   │
-│  │  High-Level (Workflows)           Low-Level (Primitives)            │   │
-│  │  ┌──────────────────────┐        ┌──────────────────────┐          │   │
-│  │  │  revise              │        │  unrecord            │          │   │
-│  │  │  (modify in-place)   │───────▶│  (remove from stack) │          │   │
-│  │  └──────────────────────┘        └──────────────────────┘          │   │
-│  │                                           │                         │   │
-│  │                                           ▼                         │   │
-│  │                                  ┌──────────────────────┐          │   │
-│  │                                  │  reinsert            │          │   │
-│  │                                  │  (add back to stack) │          │   │
-│  │                                  └──────────────────────┘          │   │
-│  │                                                                      │   │
-│  │  Cross-Stack                      Metadata                          │   │
-│  │  ┌──────────────────────┐        ┌──────────────────────┐          │   │
-│  │  │  apply               │        │  tag                 │          │   │
-│  │  │  (changes between    │        │  (named state        │          │   │
-│  │  │   stacks)            │        │   snapshots)         │          │   │
-│  │  └──────────────────────┘        └──────────────────────┘          │   │
-│  │                                                                      │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  Revise Workflow Example                                                    │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                                                                      │   │
-│  │  Before:  [A] ← [B] ← [C] ← @                                       │   │
-│  │                   ↑                                                  │   │
-│  │              want to revise                                          │   │
-│  │                                                                      │   │
-│  │  Step 1: unrecord @ (C saved as pending)                            │   │
-│  │           [A] ← [B] ← @                                              │   │
-│  │                                                                      │   │
-│  │  Step 2: unrecord @ (B is now target)                               │   │
-│  │           [A] ← @    working copy has B's changes                   │   │
-│  │                                                                      │   │
-│  │  Step 3: user edits, record as B'                                   │   │
-│  │           [A] ← [B'] ← @                                            │   │
-│  │                                                                      │   │
-│  │  Step 4: re-apply pending (C)                                       │   │
-│  │           [A] ← [B'] ← [C] ← @                                      │   │
-│  │                                                                      │   │
-│  │  After:   B has been revised to B', C re-applied on top             │   │
-│  │                                                                      │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-#### Key Differences from Git
-
-| Aspect | Git | Atomic |
-|--------|-----|--------|
-| Amend/Revise | Only HEAD, rewrites history | Any change, preserves graph |
-| Rebase | Complex, rewrites commits | Natural via unrecord/reinsert |
-| Cherry-pick | Copies commit | Applies same change (shared graph) |
-| Tags | Global namespace | Per-stack namespacing |
-| References | SHA + branch pointers | `@~N` syntax + stack context |
 
 ## Testing Strategy
 
@@ -1271,92 +769,20 @@ fn hash_roundtrip(data: Vec<u8>) -> bool {
 }
 ```
 
-### Current Test Coverage
+### Testing
 
-- **CLI tests**: 365+ in atomic crate (error, output, commands)
-  - Error: 87 tests (error types, classification, suggestions, exit codes)
-  - Colors: 46 tests (ColorMode, status colors, file colors, StatusChar)
-  - Progress: 31 tests (spinners, progress bars, multi-progress, finish states)
-  - Table: 46 tests (Alignment, Column, Table, KeyValueTable, truncation)
-  - Commands/mod: 20 tests (repository discovery, hash formatting, timestamps)
-  - Init command: 42 tests (creation, validation, ignore templates, integration)
-  - Status command: 58 tests (StatusOutputConfig, status_code, status_description, format tests, integration)
-  - Add command: 45 tests (builder pattern, TrackingOptions conversion, AggregateStats, format_count, integration)
-  - Record command: 45 tests (builder pattern, algorithm parsing, author parsing, options, integration)
-- **Unit tests**: 92 in pristine module (core transactions)
-- **CRDT tests**: 133 in crdt module (hierarchical Trunk → Branch → Leaf model)
-  - ids.rs: 21 tests (TrunkId, BranchId, LeafId creation, ordering, serialization)
-  - trunk.rs: 22 tests (Trunk, TrunkState, TrunkOp)
-  - branch.rs: 24 tests (Branch, BranchState, BranchOp)
-  - leaf.rs: 24 tests (Leaf, LeafState, LeafOp)
-  - tables.rs: 37 tests (ID/value encoding, state encoding, roundtrips, ordering)
-  - mod.rs: 5 tests (hierarchy integration, CRDT semantics)
-- **Inode graph tests**: 27 in inode_graph module (dual B-tree traversal)
-- **Change tests**: 263 in change module (including provenance, credit, and ChangeStore trait)
-  - ChangeStore: 33 tests (trait, MemoryChangeStore, content retrieval, thread safety)
-- **Diff tests**: 292 in diff module (algorithm, line, ops, split, myers, patience, token, word, inline)
-  - Token: 68 tests (tokenization, operators, strings, numbers, comments)
-  - Word: 40 tests (word-level diff operations, merging, configuration)
-  - Inline: 37 tests (span handling, rendering, gap filling)
-- **Record tests**: 433 in record module (error, item types, builder, detect, context, workflow)
-  - detect.rs: 59 tests (DetectOptions, FileChange, FileChangeKind, DetectResult, content comparison)
-  - context.rs: 32 tests (DetectContext, RecordContext, RecordItem, PristineFileState)
-  - workflow/ module: 272 tests (modular workflow implementation)
-    - options.rs: 30 tests (WorkflowOptions builder pattern, prefix matching, size limits)
-    - collect.rs: 33 tests (TrackedFile, WorkingFile, CollectionResult, file collection, walk_files)
-    - compare.rs: 27 tests (CompareResult, encoding detection, content comparison, diffing)
-    - hunk.rs: 56 tests (HunkBuildOptions, PendingChange, BuiltHunk, HunkBuilder)
-    - detect.rs: 46 tests (DetectionOptions, DetectedFile, DetectionKind, DetectionResult)
-    - record.rs: 60 tests (RecordingOptions, RecordingStats, RecordedFile, RecordingResult, CRDT integration)
-- **Apply tests**: 247 in apply module (error, workspace, change, position, vertex, edge, conflict)
-- **Output tests**: 630 in output module (error, traits, memory, filesystem, alive graph, ordering, repo)
-  - FileSystem: 64 tests (read, write, directory ops, permissions, path traversal safety)
-  - Repo module: 268 tests (options, outcome, conflicts, error handling, writer, content, file, repository, tree)
-    - options.rs: 17 tests (builder pattern, prefix matching, time filtering)
-    - outcome.rs: 31 tests (file/directory recording, merge, summary display)
-    - conflict.rs: 28 tests (FileConflict, FileConflictType, builder methods)
-    - error.rs: 20 tests (error types, conversions, source chain)
-    - writer.rs: 21 tests (ConflictWriter, marker output, line tracking)
-    - content.rs: 8 tests (ContentChunk, graph content output)
-    - file.rs: 46 tests (FileOutputOptions, FileOutputResult, FileOutputError, output functions)
-    - repository.rs: 53 tests (RepositoryOutputOptions, RepositoryOutputResult, OutputItem, errors)
-    - tree.rs: 44 tests (TreeCollectOptions, TreeItem, TreeCollectResult, hierarchy building)
-- **Repository tests**: 421 in atomic-repository (changestore, repository, status, tracking, apply, history, tags, unrecord, archive, content retrieval, ignore)
-  - Apply: 19 tests (options, stats, outcome, error handling, dependency ordering, Repository methods, apply_recorded)
-  - Ignore: 36 tests (IgnoreRules, pattern matching, whitelist, glob patterns, real-world patterns)
-  - Tracking: 2 new tests (should_ignore_with_rules, collect_files_with_ignore_rules)
-  - Repository: 6 new tests (ignore_rules, is_ignored, status_respects_atomicignore, include_ignored, add_respects_atomicignore)
-- **Globalize tests**: 34 in globalize module (options, errors, caching, position resolution, vertex/edge creation, FileAdd handling)
-- **Assembly tests**: 33 in assembly module (options, errors, context, stats, change creation, dependency collection)
-  - Changestore: 39 tests (save/load, iteration, caching, error handling)
-  - Repository: 63 tests (init, open, stacks, change storage, status, tracking, tags, archive integration)
-  - Status: 29 tests (FileStatus, FileStatusEntry, RepositoryStatus, StatusOptions, helpers)
-  - Tracking: 30 tests (add, remove, move, list, path normalization, ignore patterns)
+Run the full test suite with:
 
-  - History: 36 tests (HistoryEntry, HistoryOptions, HistorySummary, PathHistoryEntry, errors)
-  - Tags: 34 tests (Tag, TagOptions, TagFilter, file operations, validation)
-  - Unrecord: 27 tests (options, outcome, stats, dependency info, errors)
-  - Archive: 31 tests (format, options, entry, manifest, outcome, directory archive)
-  - Error: 8 tests (error types, detection methods)
-- **Integration tests**: 18 in inode_graph_test
-- **Type tests**: 87 in types_test
-- **Remote client tests**: 61 in atomic-remote-client (atomic-enterprise)
-  - error.rs: 15 tests (error variants, classification, suggestions)
-  - types.rs: 37 tests (Node, NodeType, ChangelistEntry, StateResponse, PushDelta, PullDelta)
-  - http.rs: 14 tests (HttpRemote, HttpRemoteConfig, URL parsing, changelist parsing)
-- **Identity tests**: 79 in atomic-identity
-  - identity.rs: 26 tests (IdentityId, Identity, IdentityBuilder, IdentityMetadata, Author)
-  - usage.rs: 16 tests (IdentityUsage enum, parsing, serialization)
-  - keypair.rs: 7 tests (PublicKey, SecretKey, KeyPair, signing)
-  - signing.rs: 18 tests (Signature, Signer, SignedData, SignatureInfo, SignatureSet)
-  - delegation.rs: 15 tests (DelegationPermission, DelegationScope, Delegation)
-  - store.rs: 12 tests (IdentityStore, StoreConfig, LoadOptions, IdentityFilter)
-  - lib.rs: 6 tests (integration tests)
-- **Total**: 2,526+ library tests passing (2,026 atomic-core + 421 atomic-repository + 79 atomic-identity)
-- **CLI tests**: 365 tests passing (307 with --test-threads=1)
-- **Remote client**: 61 unit tests + 5 doc tests (atomic-enterprise/atomic-remote-client)
-- **Doctests**: 206 passing
-- **Grand Total**: 3,014+ passing tests
+```bash
+cargo test                        # all crates
+cargo test -p atomic-core         # core engine
+cargo test -p atomic-repository   # repository operations
+cargo test -p atomic-identity     # identity management
+```
+
+Tests are colocated with the code they exercise (inline `#[cfg(test)]` modules)
+and integration tests live under each crate's `tests/` directory. Doctests on
+public APIs serve as both documentation and regression tests.
 
 ## Performance Considerations
 
@@ -1371,168 +797,56 @@ fn hash_roundtrip(data: Vec<u8>) -> bool {
 ```
 atomic-core/
 ├── src/
-│   ├── lib.rs              # Crate root, re-exports
-│   ├── types/              # Core data types
-│   │   ├── mod.rs          # Type exports
-│   │   ├── hash.rs         # Hash, Merkle, Hasher
-│   │   ├── node_id.rs      # L64, NodeId, ChangePosition, Inode
-│   │   ├── vertex.rs       # Vertex<H>
-│   │   ├── position.rs     # Position<H>
-│   │   └── edge.rs         # EdgeFlags, Edge, SerializedEdge
-│   ├── diff/               # Diff algorithms
-│   │   ├── mod.rs          # Module documentation & main diff() entry point
-│   │   ├── algorithm.rs    # Algorithm enum (Myers, Patience)
-│   │   ├── line.rs         # Line struct with FNV-1a hashing
-│   │   ├── ops.rs          # DiffOp, DiffResult, Replacement
-│   │   ├── split.rs        # LineSplit iterator, Separator
-│   │   ├── myers.rs        # LCS-based diff implementation
-│   │   ├── patience.rs     # LIS-based diff with unique anchors
-│   │   ├── token.rs        # Token/word representation for word-level diff
-│   │   ├── word.rs         # Word-level diff algorithm (CRDT-style)
-│   │   └── inline.rs       # Inline diff display for code reviews
-│   ├── crdt/               # Hierarchical CRDT graph model
-│   │   ├── mod.rs          # Module exports, overview documentation
-│   │   ├── ids.rs          # TrunkId, BranchId, LeafId (globally unique IDs)
-│   │   ├── trunk.rs        # Trunk (file), TrunkState, TrunkOp
-│   │   ├── branch.rs       # Branch (line), BranchState, BranchOp
-│   │   ├── leaf.rs         # Leaf (token), LeafState, LeafOp
-│   │   └── tables.rs       # Pristine table definitions & encoding helpers
-│   ├── pristine/           # Storage layer
-│   │   ├── mod.rs          # Module documentation & exports
-│   │   ├── error.rs        # PristineError, PristineResult
-│   │   ├── inode_graph.rs  # InodeGraphOps trait & dual B-tree optimization
-│   │   ├── tables.rs       # Table definitions, key encoding
-│   │   ├── traits.rs       # GraphTxnT, StackTxnT, TreeTxnT, MutTxnT
-│   │   └── txn/            # Transaction implementations
-│   │       ├── mod.rs      # Submodule exports
-│   │       ├── helpers.rs  # Serialization, AdjIterator
-│   │       ├── pristine.rs # Pristine database handle
-│   │       ├── read.rs     # ReadTxn implementation (+ InodeGraphOps)
-│   │       └── write.rs    # WriteTxn implementation (+ InodeGraphOps)
-│   ├── change/             # Change representation
-│   │   ├── mod.rs          # Module documentation & exports
-│   │   ├── atom.rs         # Atom, NewVertex, EdgeMap, NewEdge
-│   │   ├── change.rs       # Change, HashedChange, Offsets
-│   │   ├── credit.rs       # AI-aware blame (Credit, CreditType, FileCredits)
-│   │   ├── encoding.rs     # Encoding detection (UTF-8, Binary, etc.)
-│   │   ├── header.rs       # ChangeHeader, Author, builder pattern
-│   │   ├── hunk.rs         # Hunk enum (FileAdd, FileDel, Edit, etc.)
-│   │   ├── local.rs        # Local, LocalByte (display context)
-│   │   ├── provenance.rs   # AI provenance (vendor, model, tokens, cost)
-│   │   └── store.rs        # ChangeStore trait, MemoryChangeStore
-│   ├── record/             # Recording changes from working copy
-│   │   ├── mod.rs          # Module documentation & exports
-│   │   ├── error.rs        # RecordError, RecordResult
-│   │   ├── item.rs         # InodeUpdate, FileMetadata, RecordItem
-│   │   ├── builder.rs      # RecordBuilder, Recorded, RecordStats
-│   │   ├── detect.rs       # Change detection (DetectOptions, FileChange, compare_content)
-│   │   ├── context.rs      # DetectContext, RecordContext, PristineFileState
-│   │   └── workflow/       # Modular workflow implementation
-│   │       ├── mod.rs      # Module exports and documentation
-│   │       ├── options.rs  # WorkflowOptions configuration with builder pattern
-│   │       ├── collect.rs  # TrackedFile, WorkingFile, CollectionResult, file collection
-│   │       ├── compare.rs  # CompareResult, encoding detection, content comparison
-│   │       ├── hunk.rs     # HunkBuilder, BuiltHunk, PendingChange
-│   │       ├── detect.rs   # DetectionOptions, DetectedFile, DetectionKind, DetectionResult
-│   │       ├── record.rs   # RecordingOptions, RecordedFile, RecordingResult
-│   │       ├── retrieve.rs # Content retrieval from pristine graph
-│   │       ├── globalize.rs # GlobalizeContext, position resolution, vertex/edge creation
-│   │       ├── assembly.rs  # AssemblyContext, change assembly, dependency collection
-│   │       └── crdt/        # CRDT operation generation (Phase 10.3)
-│   │           ├── mod.rs      # Module exports, integration documentation
-│   │           ├── tokenize.rs # ContentTokenizer, TokenizedLine, TokenizedToken
-│   │           ├── line_ops.rs # LineAnalyzer, LineChange, AnalysisOptions
-│   │           ├── convert.rs  # HunkConverter, ConvertedOps, ConversionOptions
-│   │           └── builder.rs  # CrdtChangeBuilder, FileOps, LineOps, TokenOps
-│   ├── apply/              # Applying changes to the graph
-│   │   ├── mod.rs          # Module documentation & exports
-│   │   ├── error.rs        # ApplyError, LocalApplyError, results
-│   │   ├── workspace.rs    # Workspace, PendingEdge, MissingContext, Zombie
-│   │   ├── change.rs       # verify_dependencies, compute_new_state, validate_can_apply
-│   │   ├── position.rs     # resolve_position, resolve_vertex, resolve_inode
-│   │   ├── vertex.rs       # apply_new_vertex, add_edge_with_reverse
-│   │   ├── edge.rs         # apply_edge_map, find_source_vertex, find_target_vertex
-│   │   └── conflict.rs     # ConflictTracker, ZombieConflict, OrderConflict
-│   └── output/             # Working copy output
-│       ├── mod.rs          # Module documentation, Conflict, OutputItem, OutputStats
-│       ├── error.rs        # OutputError, ContentError, TreeError, ConflictType
-│       ├── filesystem.rs   # FileSystem real filesystem implementation
-│       ├── memory.rs       # Memory working copy implementation for testing
-│       ├── traits.rs       # WorkingCopyRead, WorkingCopy, VertexBuffer, FileMetadata
-│       ├── repo/           # Repository output (modular structure)
-│       │   ├── mod.rs      # Module exports and documentation
-│       │   ├── options.rs  # OutputOptions configuration with builder pattern
-│       │   ├── outcome.rs  # OutputOutcome, FileWritten for result tracking
-│       │   ├── conflict.rs # FileConflict, FileConflictType
-│       │   ├── error.rs    # OutputError, OutputResult
-│       │   ├── writer.rs   # ConflictWriter for conflict marker output
-│       │   ├── content.rs  # Graph content output, ContentChunk
-│       │   ├── file.rs     # Single file output (output_file, FileOutputOptions)
-│       │   ├── repository.rs # Full repository output (output_repository, OutputItem)
-│       │   └── tree.rs     # Tree traversal (collect_tree, TreeItem, TreeCollectOptions)
-│       └── alive/          # Alive graph traversal
-│           ├── mod.rs      # Module exports, RedundantEdge
-│           ├── vertex.rs   # AliveVertex, VertexId, VertexFlags
-│           ├── graph.rs    # AliveGraph, GraphStats
-│           ├── retrieve.rs # retrieve_graph, RetrieveOptions, RetrieveResult
-│           └── order.rs    # Tarjan SCC, ConflictTree, ConflictPath, PathElement
-└── tests/
-    ├── types_test.rs       # Comprehensive type tests
-    └── inode_graph_test.rs # Graph indexing tests
-
-atomic-identity/
-├── src/
-│   ├── lib.rs              # Crate root, re-exports all public types
-│   ├── error.rs            # IdentityError enum
-│   ├── identity.rs         # Identity, IdentityId, IdentityType, IdentityMetadata, Author
-│   ├── keypair.rs          # PublicKey, SecretKey, KeyPair (Ed25519)
-│   ├── usage.rs            # IdentityUsage (Personal, Work, Community, Bot, Custom)
-│   ├── delegation.rs       # Delegation, DelegationScope, DelegationPermission
-│   ├── signing.rs          # Signature, Signer, SignedData, SignatureInfo, SignatureSet
-│   └── store.rs            # IdentityStore, StoreConfig, LoadOptions, IdentityFilter
-└── Cargo.toml              # Identity crate dependencies
+│   ├── lib.rs
+│   ├── types/              # L64, NodeId, Hash, Merkle, Vertex, Edge, etc.
+│   ├── diff/               # Myers + Patience diff algorithms
+│   │   ├── token/          # Token-level diff (word diff for code review)
+│   │   ├── semantic/       # Line + token semantic diff
+│   │   └── ...
+│   ├── crdt/               # Trunk → Branch → Leaf semantic model
+│   ├── pristine/           # redb storage layer
+│   │   └── txn/
+│   │       ├── read.rs
+│   │       └── write/      # Split by trait: graph, stack, tree, mutate
+│   ├── change/             # Change representation, headers, provenance
+│   ├── record/
+│   │   └── workflow/
+│   │       ├── globalize/  # Position resolution, vertex creation, pipeline
+│   │       ├── crdt/       # CRDT operation generation
+│   │       └── ...
+│   ├── apply/              # Graph application, conflict detection
+│   └── output/             # Working copy output, alive graph traversal
+│       ├── repo/
+│       └── alive/
 
 atomic-repository/
 ├── src/
-│   ├── lib.rs              # Crate root, re-exports all modules
-│   ├── apply.rs            # Apply changes to graph (ApplyOptions, ApplyOutcome, ApplyStats)
-│   ├── archive.rs          # Export repository state (ArchiveFormat, ArchiveOptions, Archive trait)
-│   ├── changestore.rs      # Filesystem-backed change storage with LRU caching
-│   ├── error.rs            # RepositoryError and result types
-│   ├── history.rs          # History querying (log, reverse_log, HistoryEntry, HistoryOptions)
-│   ├── ignore.rs           # .atomicignore pattern matching (IgnoreRules, gitignore syntax)
-│   ├── repository.rs       # Main Repository struct and operations
-│   ├── status.rs           # Working copy status (FileStatus, RepositoryStatus, StatusOptions)
-│   ├── tags.rs             # Named state snapshots (Tag, TagOptions, TagFilter, TagSort)
-│   ├── tracking.rs         # File tracking (add, remove, move, TrackingOptions)
-│   └── unrecord.rs         # Undo applied changes (UnrecordOptions, UnrecordOutcome, UnrecordStats)
-└── tests/
-    └── (integration tests)
+│   ├── repository/         # Split by domain:
+│   │   ├── mod.rs          # Struct, init, open, path helpers
+│   │   ├── stacks.rs       # Stack CRUD
+│   │   ├── changes.rs      # Change save/load/delete
+│   │   ├── record.rs       # Record workflow
+│   │   ├── apply.rs        # Apply changes
+│   │   ├── status.rs       # Working copy status
+│   │   ├── tracking.rs     # File tracking
+│   │   ├── history.rs      # Log, unrecord, reinsert
+│   │   ├── tags.rs         # Tag CRUD
+│   │   ├── archive.rs      # Export
+│   │   ├── content.rs      # File content retrieval
+│   │   └── remotes.rs      # Remote configuration
+│   └── ...
 
-atomic/                       # CLI application
+atomic-cli/
 ├── src/
-│   ├── main.rs              # CLI entry point, argument parsing, command dispatch
-│   ├── error.rs             # CLI-specific error types (CliError, CliResult)
-│   ├── commands/            # Command implementations
-│   │   ├── mod.rs           # Command trait, shared utilities, re-exports
-│   │   ├── init.rs          # Repository initialization command
-│   │   ├── status.rs        # Working copy status command (58 tests)
-│   │   ├── add.rs           # File tracking command (45 tests)
-│   │   ├── record.rs        # Change recording command (planned)
-│   │   ├── log.rs           # History viewing command (planned)
-│   │   ├── diff.rs          # Working copy differences command (planned)
-│   │   └── stack/           # Stack management subcommands (planned)
-│   │       ├── mod.rs       # Stack command routing
-│   │       ├── new.rs       # Create stack
-│   │       ├── switch.rs    # Switch stack
-│   │       ├── delete.rs    # Delete stack
-│   │       └── list.rs      # List stacks
-│   └── output/              # Output formatting utilities
-│       ├── mod.rs           # Re-exports, convenience functions (print_success, etc.)
-│       ├── colors.rs        # Terminal color utilities (ColorMode, status colors)
-│       ├── progress.rs      # Progress bar helpers (spinners, progress bars)
-│       └── table.rs         # Table formatting (Table, KeyValueTable, Alignment)
-└── Cargo.toml               # CLI dependencies
+│   ├── main.rs
+│   ├── commands/
+│   │   ├── diff/           # types, command, output
+│   │   ├── log/            # types, command
+│   │   ├── change/         # types, command
+│   │   ├── record/         # builder, provenance, format, command
+│   │   ├── push/, pull/, clone/, stack/, tag/, ...
+│   │   └── ...
+│   └── output/             # colors, progress, table
 ```
 
 ## Getting Started

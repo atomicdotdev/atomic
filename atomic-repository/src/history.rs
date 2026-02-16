@@ -68,9 +68,7 @@ use atomic_core::types::{Base32, Hash, Inode, Merkle, NodeId};
 use std::fmt;
 use thiserror::Error;
 
-// ============================================================================
 // Error Types
-// ============================================================================
 
 /// Result type for history operations.
 pub type HistoryResult<T> = Result<T, HistoryError>;
@@ -117,9 +115,7 @@ pub enum HistoryError {
     Io(#[from] std::io::Error),
 }
 
-// ============================================================================
 // History Entry
-// ============================================================================
 
 /// A single entry in the history log.
 ///
@@ -262,9 +258,7 @@ impl fmt::Display for HistoryEntry {
     }
 }
 
-// ============================================================================
 // History Options
-// ============================================================================
 
 /// Options for controlling history queries.
 ///
@@ -374,9 +368,7 @@ impl HistoryOptions {
     }
 }
 
-// ============================================================================
 // History Summary
-// ============================================================================
 
 /// Summary statistics about a stack's history.
 ///
@@ -448,9 +440,7 @@ impl fmt::Display for HistorySummary {
     }
 }
 
-// ============================================================================
 // Path History Entry
-// ============================================================================
 
 /// A history entry for a specific path.
 ///
@@ -534,9 +524,7 @@ impl fmt::Display for PathModificationType {
     }
 }
 
-// ============================================================================
 // History Iterator
-// ============================================================================
 
 /// An iterator over history entries.
 ///
@@ -624,9 +612,7 @@ impl<'a, T: StackTxnT> Iterator for HistoryIter<'a, T> {
     }
 }
 
-// ============================================================================
 // Log Functions
-// ============================================================================
 
 /// Get forward history log from a stack.
 ///
@@ -864,9 +850,7 @@ pub fn is_change_in_history<T: StackTxnT>(
     find_change_sequence(txn, stack, hash).map(|seq| seq.is_some())
 }
 
-// ============================================================================
 // STATE-BASED CONTENT RETRIEVAL
-// ============================================================================
 
 /// Information about the state before a change was applied.
 ///
@@ -1204,17 +1188,13 @@ pub fn get_files_in_change(change: &Change) -> Vec<String> {
     files.into_iter().collect()
 }
 
-// ============================================================================
 // Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ========================================================================
     // StateBeforeChange Tests
-    // ========================================================================
 
     #[test]
     fn test_state_before_change_new() {
@@ -1319,15 +1299,11 @@ mod tests {
         assert!(debug.contains("parent_sequence"));
     }
 
-    // ========================================================================
     // Existing Tests (below this line)
-    // ========================================================================
 
     use super::*;
 
-    // ========================================================================
     // HistoryEntry Tests
-    // ========================================================================
 
     #[test]
     fn test_history_entry_new() {
@@ -1428,9 +1404,7 @@ mod tests {
         assert_eq!(entry1, entry2);
     }
 
-    // ========================================================================
     // HistoryOptions Tests
-    // ========================================================================
 
     #[test]
     fn test_history_options_default() {
@@ -1474,9 +1448,7 @@ mod tests {
         assert!(options.load_headers);
     }
 
-    // ========================================================================
     // HistorySummary Tests
-    // ========================================================================
 
     #[test]
     fn test_history_summary_new() {
@@ -1531,9 +1503,7 @@ mod tests {
         assert!(display.contains("3 tagged"));
     }
 
-    // ========================================================================
     // PathHistoryEntry Tests
-    // ========================================================================
 
     #[test]
     fn test_path_history_entry_new() {
@@ -1569,9 +1539,7 @@ mod tests {
         assert_eq!(*path_entry.hash(), hash);
     }
 
-    // ========================================================================
     // PathModificationType Tests
-    // ========================================================================
 
     #[test]
     fn test_path_modification_type_display() {
@@ -1588,9 +1556,7 @@ mod tests {
         assert_ne!(PathModificationType::Created, PathModificationType::Modified);
     }
 
-    // ========================================================================
     // HistoryError Tests
-    // ========================================================================
 
     #[test]
     fn test_history_error_stack_not_found() {

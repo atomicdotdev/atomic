@@ -21,9 +21,7 @@ use atomic_core::record::workflow::crdt::{
 };
 use atomic_core::types::{Inode, NodeId};
 
-// ============================================================================
 // Mock Transaction Implementation
-// ============================================================================
 
 /// A mock CRDT transaction for testing the apply workflow.
 #[derive(Debug, Default)]
@@ -263,9 +261,7 @@ impl MutCrdtTxnT for MockCrdtTxn {
     }
 }
 
-// ============================================================================
 // Integration Tests
-// ============================================================================
 
 /// Test that we can build CRDT operations for a new file and apply them.
 #[test]

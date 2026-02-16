@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The `remove` command for untracking files in the repository.
 //!
 //! This module implements the `atomic remove` command, which removes files and
@@ -65,9 +64,7 @@ use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success, print_warning};
 
-// =============================================================================
 // Remove Command
-// =============================================================================
 
 /// Remove files from tracking.
 ///
@@ -144,31 +141,6 @@ impl Remove {
             dry_run: false,
             force: false,
         }
-    }
-
-    /// Set whether to keep files on disk.
-    pub fn with_keep(mut self, keep: bool) -> Self {
-        self.keep = keep;
-        self
-    }
-
-    /// Set whether to recursively remove directories.
-    pub fn with_recursive(mut self, recursive: bool) -> Self {
-        self.recursive = recursive;
-        self.no_recursive = !recursive;
-        self
-    }
-
-    /// Set dry-run mode.
-    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
-        self.dry_run = dry_run;
-        self
-    }
-
-    /// Set force mode.
-    pub fn with_force(mut self, force: bool) -> Self {
-        self.force = force;
-        self
     }
 
     /// Convert to TrackingOptions.
@@ -320,17 +292,13 @@ fn format_count(count: usize, word: &str) -> String {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // Builder Tests
-    // =========================================================================
 
     #[test]
     fn test_remove_new() {
@@ -387,9 +355,7 @@ mod tests {
         assert!(cmd.force);
     }
 
-    // =========================================================================
     // Options Conversion Tests
-    // =========================================================================
 
     #[test]
     fn test_to_tracking_options_default() {
@@ -406,9 +372,7 @@ mod tests {
         let _ = options;
     }
 
-    // =========================================================================
     // Format Tests
-    // =========================================================================
 
     #[test]
     fn test_format_action_remove() {
@@ -437,9 +401,7 @@ mod tests {
         assert_eq!(format_count(0, "file"), "0 files");
     }
 
-    // =========================================================================
     // Multiple Paths Tests
-    // =========================================================================
 
     #[test]
     fn test_remove_multiple_paths() {

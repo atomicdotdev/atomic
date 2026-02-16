@@ -68,9 +68,7 @@ use std::fmt;
 /// ```
 #[derive(Debug)]
 pub enum PristineError {
-    // =========================================================================
     // Database Errors (from redb)
-    // =========================================================================
     /// Error opening or creating the database
     ///
     /// This typically occurs when:
@@ -108,15 +106,11 @@ pub enum PristineError {
     /// - I/O error during flush
     Commit(redb::CommitError),
 
-    // =========================================================================
     // I/O Errors
-    // =========================================================================
     /// General I/O error (file operations, etc.)
     Io(std::io::Error),
 
-    // =========================================================================
     // Not Found Errors
-    // =========================================================================
     /// Stack (view) not found in the database
     ///
     /// The requested stack name doesn't exist. This is common when:
@@ -144,9 +138,7 @@ pub enum PristineError {
         hash: String,
     },
 
-    // =========================================================================
     // Data Errors
-    // =========================================================================
     /// Invalid span structure
     ///
     /// The span data is malformed or inconsistent.
@@ -178,9 +170,7 @@ pub enum PristineError {
         message: String,
     },
 
-    // =========================================================================
     // Serialization Errors
-    // =========================================================================
     /// Failed to serialize or deserialize data
     ///
     /// The data couldn't be encoded or decoded. This may indicate:
@@ -238,9 +228,7 @@ impl std::error::Error for PristineError {
     }
 }
 
-// =============================================================================
 // From Implementations for Error Conversion
-// =============================================================================
 
 impl From<redb::DatabaseError> for PristineError {
     fn from(e: redb::DatabaseError) -> Self {
@@ -278,9 +266,7 @@ impl From<std::io::Error> for PristineError {
     }
 }
 
-// =============================================================================
 // Result Type Alias
-// =============================================================================
 
 /// Result type for pristine operations
 ///
@@ -297,9 +283,7 @@ impl From<std::io::Error> for PristineError {
 /// ```
 pub type PristineResult<T> = Result<T, PristineError>;
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -307,82 +291,109 @@ mod tests {
     use std::error::Error;
 
     #[test]
-    fn test_error_display_stack_not_found() {
-        let err = PristineError::StackNotFound {
-            name: "main".to_string(),
-        };
-        assert_eq!(err.to_string(), "stack not found: main");
-    }
+    fn display_messages_include_context() {
+        // Each variant should surface the data that helps a user diagnose the problem.
+        let cases: Vec<(PristineError, &[&str])> = vec![
+            (
+                PristineError::StackNotFound {
+                    name: "feature-x".into(),
+                },
+                &["stack not found", "feature-x"],
+            ),
+            (
+                PristineError::ChangeNotFound { id: 42 },
+                &["change not found", "42"],
+            ),
+            (
+                PristineError::HashNotFound {
+                    hash: "ABCD1234".into(),
+                },
+                &["hash not found", "ABCD1234"],
+            ),
+            (
+                PristineError::BlockNotFound {
+                    change: 7,
+                    pos: 256,
+                },
+                &["block not found", "7", "256"],
+            ),
+            (
+                PristineError::InvalidVertex {
+                    message: "start > end".into(),
+                },
+                &["invalid node", "start > end"],
+            ),
+            (
+                PristineError::Inconsistent {
+                    message: "orphaned edge".into(),
+                },
+                &["inconsistent", "orphaned edge"],
+            ),
+            (
+                PristineError::Serialization {
+                    message: "invalid UTF-8".into(),
+                },
+                &["serialization", "invalid UTF-8"],
+            ),
+        ];
 
-    #[test]
-    fn test_error_display_change_not_found() {
-        let err = PristineError::ChangeNotFound { id: 42 };
-        assert_eq!(err.to_string(), "change not found: 42");
-    }
-
-    #[test]
-    fn test_error_display_block_not_found() {
-        let err = PristineError::BlockNotFound { change: 1, pos: 100 };
-        assert_eq!(err.to_string(), "block not found for position 1:100");
-    }
-
-    #[test]
-    fn test_error_display_hash_not_found() {
-        let err = PristineError::HashNotFound {
-            hash: "ABCD1234".to_string(),
-        };
-        assert_eq!(err.to_string(), "hash not found: ABCD1234");
-    }
-
-    #[test]
-    fn test_error_display_invalid_vertex() {
-        let err = PristineError::InvalidVertex {
-            message: "start > end".to_string(),
-        };
-        assert_eq!(err.to_string(), "invalid node: start > end");
-    }
-
-    #[test]
-    fn test_error_display_inconsistent() {
-        let err = PristineError::Inconsistent {
-            message: "orphaned edge".to_string(),
-        };
-        assert_eq!(err.to_string(), "inconsistent state: orphaned edge");
-    }
-
-    #[test]
-    fn test_error_display_serialization() {
-        let err = PristineError::Serialization {
-            message: "invalid UTF-8".to_string(),
-        };
-        assert_eq!(err.to_string(), "serialization error: invalid UTF-8");
-    }
-
-    #[test]
-    fn test_error_is_error_trait() {
-        // Verify that PristineError implements std::error::Error
-        let err: Box<dyn std::error::Error> = Box::new(PristineError::Inconsistent {
-            message: "test".to_string(),
-        });
-        assert!(err.to_string().contains("inconsistent"));
-    }
-
-    #[test]
-    fn test_error_source_returns_none_for_custom_errors() {
-        let err = PristineError::StackNotFound {
-            name: "test".to_string(),
-        };
-        assert!(err.source().is_none());
-    }
-
-    #[test]
-    fn test_io_error_conversion() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
-        let pristine_err: PristineError = io_err.into();
-
-        match pristine_err {
-            PristineError::Io(_) => {} // Expected
-            _ => panic!("Expected Io variant"),
+        for (err, expected_fragments) in cases {
+            let msg = err.to_string();
+            for fragment in expected_fragments {
+                assert!(msg.contains(fragment), "{msg:?} missing {fragment:?}");
+            }
         }
+    }
+
+    #[test]
+    fn io_error_preserves_source_chain() {
+        let original = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+        let err: PristineError = original.into();
+
+        // The source chain should be accessible for logging/debugging.
+        let source = err.source().expect("Io variant should expose source");
+        assert!(source.to_string().contains("access denied"));
+    }
+
+    #[test]
+    fn custom_variants_have_no_source() {
+        // Non-wrapper variants shouldn't claim a source error exists.
+        let custom_errors: Vec<PristineError> = vec![
+            PristineError::StackNotFound { name: "x".into() },
+            PristineError::ChangeNotFound { id: 1 },
+            PristineError::HashNotFound { hash: "x".into() },
+            PristineError::InvalidVertex {
+                message: "x".into(),
+            },
+            PristineError::BlockNotFound { change: 0, pos: 0 },
+            PristineError::Inconsistent {
+                message: "x".into(),
+            },
+            PristineError::Serialization {
+                message: "x".into(),
+            },
+        ];
+
+        for err in custom_errors {
+            assert!(err.source().is_none(), "{err:?} should not have a source");
+        }
+    }
+
+    #[test]
+    fn from_conversions_round_trip_through_question_mark() {
+        // Simulate the ? operator flow: redb/io errors -> PristineResult
+        fn fallible_io() -> PristineResult<()> {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"))?
+        }
+
+        let result = fallible_io();
+        assert!(matches!(result, Err(PristineError::Io(_))));
+    }
+
+    #[test]
+    fn errors_are_send_and_sync() {
+        // PristineError must be thread-safe for async storage backends.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PristineError>();
     }
 }

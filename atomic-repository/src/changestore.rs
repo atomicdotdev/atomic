@@ -72,9 +72,7 @@ use atomic_core::change::{Change, ChangeError, ChangeHeader};
 use atomic_core::types::{Base32, GraphNode, Hash, NodeId};
 use thiserror::Error;
 
-// ============================================================================
 // Constants
-// ============================================================================
 
 /// Default LRU cache capacity for changes.
 ///
@@ -94,9 +92,7 @@ pub const CHANGE_EXTENSION: &str = "change";
 /// which provides good distribution without excessive directory overhead.
 const HASH_PREFIX_LEN: usize = 2;
 
-// ============================================================================
 // Error Types
-// ============================================================================
 
 /// Result type for change store operations.
 pub type ChangeStoreResult<T> = Result<T, ChangeStoreError>;
@@ -199,9 +195,7 @@ impl ChangeStoreError {
     }
 }
 
-// ============================================================================
 // LRU Cache Implementation
-// ============================================================================
 
 /// A simple LRU (Least Recently Used) cache for changes.
 ///
@@ -315,9 +309,7 @@ impl<K: Eq + std::hash::Hash + Clone, V> LruCache<K, V> {
     }
 }
 
-// ============================================================================
 // ChangeStore
-// ============================================================================
 
 /// A filesystem-backed store for changes.
 ///
@@ -725,9 +717,7 @@ impl ChangeStore {
         self.cache.read().map(|c| c.len()).unwrap_or(0)
     }
 
-    // ========================================================================
     // Attestation Storage
-    // ========================================================================
 
     /// Get the filesystem path for an attestation with the given hash.
     ///
@@ -865,9 +855,7 @@ impl ChangeStore {
     }
 }
 
-// ============================================================================
 // Attestation Iterator
-// ============================================================================
 
 /// Iterator over attestation hashes in the changes directory.
 ///
@@ -956,9 +944,7 @@ impl<'a> Iterator for AttestationIterator<'a> {
     }
 }
 
-// ============================================================================
 // ChangeStore Trait Implementation
-// ============================================================================
 
 /// Implementation of the `atomic_core::change::ChangeStore` trait.
 ///
@@ -1081,9 +1067,7 @@ impl ChangeStoreTrait for ChangeStore {
     }
 }
 
-// ============================================================================
 // Change Iterator
-// ============================================================================
 
 /// Iterator over changes stored in the filesystem.
 ///
@@ -1173,9 +1157,7 @@ impl Iterator for ChangeIterator {
     }
 }
 
-// ============================================================================
 // Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -1183,9 +1165,7 @@ mod tests {
     use atomic_core::change::{Author, Change, ChangeHeader};
     use tempfile::TempDir;
 
-    // ========================================================================
     // Test Helpers
-    // ========================================================================
 
     /// Create a temporary directory for testing.
     fn create_temp_dir() -> TempDir {
@@ -1221,9 +1201,7 @@ mod tests {
         Change::new(header, Vec::new(), content.to_vec(), Vec::new())
     }
 
-    // ========================================================================
     // LRU Cache Tests
-    // ========================================================================
 
     #[test]
     fn test_lru_cache_basic_operations() {
@@ -1295,9 +1273,7 @@ mod tests {
         assert_eq!(cache.get(&1), Some(&"ONE".to_string()));
     }
 
-    // ========================================================================
     // ChangeStore Path Tests
-    // ========================================================================
 
     #[test]
     fn test_change_path_format() {
@@ -1341,9 +1317,7 @@ mod tests {
         assert_ne!(path1, path2);
     }
 
-    // ========================================================================
     // ChangeStore Save/Load Tests
-    // ========================================================================
 
     #[test]
     fn test_save_change() {
@@ -1447,9 +1421,7 @@ mod tests {
         assert!(store.has_change(&hash));
     }
 
-    // ========================================================================
     // ChangeStore Delete Tests
-    // ========================================================================
 
     #[test]
     fn test_delete_change() {
@@ -1504,9 +1476,7 @@ mod tests {
         assert!(result.unwrap_err().is_not_found());
     }
 
-    // ========================================================================
     // ChangeStore Iteration Tests
-    // ========================================================================
 
     #[test]
     fn test_iter_changes_empty() {
@@ -1558,9 +1528,7 @@ mod tests {
         assert_eq!(store.count_changes().unwrap(), 3);
     }
 
-    // ========================================================================
     // Cache Behavior Tests
-    // ========================================================================
 
     #[test]
     fn test_cache_hit() {
@@ -1609,9 +1577,7 @@ mod tests {
         }
     }
 
-    // ========================================================================
     // Error Condition Tests
-    // ========================================================================
 
     #[test]
     fn test_error_is_not_found() {
@@ -1653,9 +1619,7 @@ mod tests {
         assert!(err.to_string().contains("COMPUTED"));
     }
 
-    // ========================================================================
     // From Root Tests
-    // ========================================================================
 
     #[test]
     fn test_from_root() {
@@ -1671,9 +1635,7 @@ mod tests {
         assert!(expected_dir.exists());
     }
 
-    // ========================================================================
     // Multiple Changes with Same Prefix Tests
-    // ========================================================================
 
     #[test]
     fn test_multiple_changes_same_directory() {
@@ -1703,9 +1665,7 @@ mod tests {
         assert_eq!(store.count_changes().unwrap(), 20);
     }
 
-    // ========================================================================
     // Content Preservation Tests
-    // ========================================================================
 
     #[test]
     fn test_large_content_preservation() {

@@ -53,9 +53,7 @@ use std::collections::HashSet;
 
 use super::super::error::{RecordError, RecordResult};
 
-// ============================================================================
 // RETRIEVE OPTIONS
-// ============================================================================
 
 /// Options for content retrieval.
 ///
@@ -118,9 +116,7 @@ impl Default for RetrieveContentOptions {
     }
 }
 
-// ============================================================================
 // RETRIEVE RESULT
-// ============================================================================
 
 /// Result of content retrieval.
 ///
@@ -182,9 +178,7 @@ impl RetrieveResult {
     }
 }
 
-// ============================================================================
 // RETRIEVE FUNCTIONS
-// ============================================================================
 
 /// Retrieve content from the pristine graph.
 ///
@@ -309,9 +303,7 @@ where
     }
 }
 
-// ============================================================================
 // STATE-BASED CONTENT RETRIEVAL
-// ============================================================================
 
 /// Retrieve content with a change filter for state-based retrieval.
 ///
@@ -458,9 +450,7 @@ where
     retrieve_content_with_filter(txn, changes, position, options)
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -469,9 +459,7 @@ mod tests {
     use crate::pristine::PristineError;
     use crate::types::{ChangePosition, EdgeFlags, GraphNode, Hash, SerializedGraphEdge};
 
-    // ========================================================================
     // Mock Transaction
-    // ========================================================================
 
     /// Mock transaction for testing.
     #[derive(Debug, Default)]
@@ -569,9 +557,7 @@ mod tests {
         }
     }
 
-    // ========================================================================
     // RetrieveContentOptions Tests
-    // ========================================================================
 
     #[test]
     fn test_options_new() {
@@ -621,9 +607,7 @@ mod tests {
         assert_eq!(cloned.max_vertices, Some(100));
     }
 
-    // ========================================================================
     // RetrieveResult Tests
-    // ========================================================================
 
     #[test]
     fn test_result_empty() {
@@ -674,9 +658,7 @@ mod tests {
         assert_eq!(cloned.has_conflicts, result.has_conflicts);
     }
 
-    // ========================================================================
     // Retrieve Content Tests
-    // ========================================================================
 
     #[test]
     fn test_retrieve_content_root_position() {
@@ -712,9 +694,7 @@ mod tests {
         assert_eq!(result.vertices_processed, 0);
     }
 
-    // ========================================================================
     // Has Content Tests
-    // ========================================================================
 
     #[test]
     fn test_has_content_root() {

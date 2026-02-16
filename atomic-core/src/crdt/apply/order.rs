@@ -44,9 +44,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt;
 
-// =============================================================================
 // InsertPosition
-// =============================================================================
 
 /// The resolved position for an insertion operation.
 ///
@@ -100,9 +98,7 @@ impl fmt::Display for InsertPosition {
     }
 }
 
-// =============================================================================
 // CrdtOrdering Trait
-// =============================================================================
 
 /// Trait for CRDT elements that can be ordered.
 ///
@@ -126,9 +122,7 @@ pub trait CrdtOrdering: Ord + Clone {
     }
 }
 
-// =============================================================================
 // Insertion Position Resolution
-// =============================================================================
 
 /// Finds the insertion position for a new element among concurrent insertions.
 ///
@@ -205,9 +199,7 @@ pub fn find_leaf_insert_position(new_id: &LeafId, concurrent: &[LeafId]) -> Inse
     find_insert_position(new_id, concurrent)
 }
 
-// =============================================================================
 // OrderingEntry
-// =============================================================================
 
 /// An entry in an ordering sequence with its insertion reference.
 ///
@@ -260,9 +252,7 @@ impl<Id: Clone + Eq + Ord> PartialOrd for OrderingEntry<Id> {
     }
 }
 
-// =============================================================================
 // OrderingSequence
-// =============================================================================
 
 /// A sequence of elements with CRDT ordering.
 ///
@@ -468,18 +458,14 @@ impl<Id: Clone + Eq + Ord> OrderingSequence<Id> {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::NodeId;
 
-    // =========================================================================
     // InsertPosition Tests
-    // =========================================================================
 
     #[test]
     fn test_insert_position_to_index() {
@@ -510,9 +496,7 @@ mod tests {
         assert!(InsertPosition::End.to_string().contains("end"));
     }
 
-    // =========================================================================
     // find_insert_position Tests
-    // =========================================================================
 
     #[test]
     fn test_find_position_empty() {
@@ -565,9 +549,7 @@ mod tests {
         assert_eq!(pos, InsertPosition::After(0));
     }
 
-    // =========================================================================
     // OrderingEntry Tests
-    // =========================================================================
 
     #[test]
     fn test_ordering_entry_new() {
@@ -611,9 +593,7 @@ mod tests {
         assert_eq!(entry, restored);
     }
 
-    // =========================================================================
     // OrderingSequence Tests
-    // =========================================================================
 
     #[test]
     fn test_sequence_new() {

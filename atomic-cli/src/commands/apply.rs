@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Apply command implementation.
 //!
 //! The `apply` command applies changes to stacks, supporting:
@@ -16,9 +15,7 @@ use crate::commands::{format_hash, require_repository};
 use crate::error::{CliError, CliResult};
 use crate::output;
 
-// =============================================================================
 // Apply Command
-// =============================================================================
 
 /// Apply changes to a stack.
 ///
@@ -163,9 +160,7 @@ pub struct PreviewArgs {
     up_to_tag: Option<String>,
 }
 
-// =============================================================================
 // Command Implementation
-// =============================================================================
 
 impl crate::commands::Command for Apply {
     fn run(&self) -> CliResult<()> {
@@ -191,9 +186,7 @@ impl crate::commands::Command for Apply {
     }
 }
 
-// =============================================================================
 // Subcommand Implementations
-// =============================================================================
 
 /// Apply a single change by hash.
 fn run_single_apply(repo: &Repository, change_str: &str, args: &Apply) -> CliResult<()> {
@@ -436,9 +429,7 @@ fn run_preview(repo: &Repository, args: &PreviewArgs) -> CliResult<()> {
     Ok(())
 }
 
-// =============================================================================
 // Helper Functions
-// =============================================================================
 
 /// Parse a change hash from a string (full or abbreviated).
 fn parse_change_hash(repo: &Repository, hash_str: &str) -> CliResult<Hash> {
@@ -532,9 +523,7 @@ fn print_cross_stack_outcome(outcome: &CrossStackApplyOutcome, dry_run: bool) {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

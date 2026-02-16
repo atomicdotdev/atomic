@@ -45,9 +45,7 @@ use crate::pristine::PristineError;
 use std::error::Error;
 use std::fmt;
 
-// =============================================================================
 // Helper Functions
-// =============================================================================
 
 /// Converts a MutCrdtTxnT error to an ApplyError with context.
 ///
@@ -70,18 +68,14 @@ pub fn storage_err<E: Into<PristineError>>(err: E, context: &str) -> ApplyError 
     }
 }
 
-// =============================================================================
 // ApplyResult Type Alias
-// =============================================================================
 
 /// Result type for CRDT apply operations.
 ///
 /// This is the standard result type returned by all apply functions.
 pub type ApplyResult<T> = Result<T, ApplyError>;
 
-// =============================================================================
 // ApplyError
-// =============================================================================
 
 /// Errors that can occur when applying CRDT operations.
 ///
@@ -100,9 +94,7 @@ pub type ApplyResult<T> = Result<T, ApplyError>;
 /// - [`is_recoverable()`](ApplyError::is_recoverable) - Can retry or continue
 #[derive(Debug)]
 pub enum ApplyError {
-    // =========================================================================
     // Not Found Errors
-    // =========================================================================
     /// Referenced trunk (file) does not exist.
     ///
     /// This occurs when an operation references a TrunkId that hasn't been
@@ -139,9 +131,7 @@ pub enum ApplyError {
         path: String,
     },
 
-    // =========================================================================
     // Already Exists Errors
-    // =========================================================================
     /// Trunk with this ID already exists.
     ///
     /// This occurs when attempting to create a trunk with an ID that's
@@ -180,9 +170,7 @@ pub enum ApplyError {
         existing_trunk: TrunkId,
     },
 
-    // =========================================================================
     // Invalid State Errors
-    // =========================================================================
     /// Trunk is in an invalid state for the requested operation.
     ///
     /// For example, trying to delete an already-deleted trunk, or
@@ -220,9 +208,7 @@ pub enum ApplyError {
         operation: String,
     },
 
-    // =========================================================================
     // Ordering Errors
-    // =========================================================================
     /// Failed to find a valid insertion position.
     ///
     /// This occurs when the CRDT ordering algorithm cannot determine
@@ -252,9 +238,7 @@ pub enum ApplyError {
         description: String,
     },
 
-    // =========================================================================
     // Content Errors
-    // =========================================================================
     /// Content range is out of bounds.
     ///
     /// The specified content range doesn't fit within the content blob.
@@ -273,9 +257,7 @@ pub enum ApplyError {
         description: String,
     },
 
-    // =========================================================================
     // Storage Errors
-    // =========================================================================
     /// Database operation failed.
     ///
     /// This wraps errors from the underlying pristine storage layer.
@@ -286,9 +268,7 @@ pub enum ApplyError {
         context: String,
     },
 
-    // =========================================================================
     // Internal Errors
-    // =========================================================================
     /// An internal invariant was violated.
     ///
     /// This indicates a bug in the apply code and should be reported.
@@ -299,9 +279,7 @@ pub enum ApplyError {
 }
 
 impl ApplyError {
-    // =========================================================================
     // Constructors
-    // =========================================================================
 
     /// Creates a `TrunkNotFound` error.
     #[inline]
@@ -459,9 +437,7 @@ impl ApplyError {
         }
     }
 
-    // =========================================================================
     // Classification Methods
-    // =========================================================================
 
     /// Returns `true` if this is a "not found" error.
     #[inline]
@@ -541,9 +517,7 @@ impl ApplyError {
         self.is_not_found() || self.is_already_exists() || self.is_invalid_state()
     }
 
-    // =========================================================================
     // User Guidance
-    // =========================================================================
 
     /// Returns a user-friendly suggestion for resolving this error.
     pub fn suggestion(&self) -> &'static str {
@@ -788,18 +762,14 @@ impl From<PristineError> for ApplyError {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::NodeId;
 
-    // =========================================================================
     // Constructor Tests
-    // =========================================================================
 
     #[test]
     fn test_trunk_not_found() {
@@ -940,9 +910,7 @@ mod tests {
         assert!(err.to_string().contains("unexpected state"));
     }
 
-    // =========================================================================
     // Classification Tests
-    // =========================================================================
 
     #[test]
     fn test_is_recoverable() {
@@ -984,9 +952,7 @@ mod tests {
         assert_eq!(true_count, 1, "Error should match exactly one category");
     }
 
-    // =========================================================================
     // Suggestion Tests
-    // =========================================================================
 
     #[test]
     fn test_suggestions_not_empty() {
@@ -1029,9 +995,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // Exit Code Tests
-    // =========================================================================
 
     #[test]
     fn test_exit_codes() {
@@ -1059,9 +1023,7 @@ mod tests {
         assert_eq!(ApplyError::internal("bug").exit_code(), 70);
     }
 
-    // =========================================================================
     // Display and Debug Tests
-    // =========================================================================
 
     #[test]
     fn test_display_format() {
@@ -1084,9 +1046,7 @@ mod tests {
         assert!(debug.contains("TrunkNotFound"));
     }
 
-    // =========================================================================
     // Error Trait Tests
-    // =========================================================================
 
     #[test]
     fn test_error_source() {
@@ -1115,9 +1075,7 @@ mod tests {
         assert!(err.to_string().contains("unknown operation"));
     }
 
-    // =========================================================================
     // ApplyResult Tests
-    // =========================================================================
 
     #[test]
     fn test_apply_result_ok() {

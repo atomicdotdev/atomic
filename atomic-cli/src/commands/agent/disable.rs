@@ -25,9 +25,7 @@ use crate::commands::{find_repository_root, Command};
 use crate::error::CliResult;
 use crate::output::{print_error, print_success, print_warning};
 
-// =============================================================================
 // Disable Command
-// =============================================================================
 
 /// Remove agent hooks from the repository.
 ///
@@ -248,9 +246,7 @@ impl Disable {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

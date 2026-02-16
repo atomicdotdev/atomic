@@ -11,9 +11,7 @@ use crate::types::{
 use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::traits::StackState;
 
-// =============================================================================
 // Edge Serialization
-// =============================================================================
 
 /// Serialize a SerializedGraphEdge to bytes (24 bytes)
 ///
@@ -47,9 +45,7 @@ pub fn deserialize_edge(bytes: &[u8; 24]) -> SerializedGraphEdge {
     SerializedGraphEdge::new(flag, dest, NodeId::new(introduced_by))
 }
 
-// =============================================================================
 // Stack State Serialization
-// =============================================================================
 
 /// Serialize a StackState to bytes
 ///
@@ -113,9 +109,7 @@ pub fn deserialize_stack_state(bytes: &[u8]) -> PristineResult<StackState> {
     })
 }
 
-// =============================================================================
 // Adjacency Iterator
-// =============================================================================
 
 /// Iterator over adjacent edges
 ///
@@ -161,9 +155,7 @@ impl Iterator for AdjIterator {
 
 impl ExactSizeIterator for AdjIterator {}
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

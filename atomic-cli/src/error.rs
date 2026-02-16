@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! CLI-specific error types for the Atomic command-line interface.
 //!
 //! This module provides error types that wrap underlying library errors
@@ -56,9 +55,7 @@ pub type CliResult<T> = Result<T, CliError>;
 /// - **Internal errors**: Unexpected failures (bugs)
 #[derive(Debug, Error)]
 pub enum CliError {
-    // =========================================================================
     // Repository Errors
-    // =========================================================================
     /// No Atomic repository found in the current directory or any parent.
     ///
     /// This error occurs when a command that requires a repository is run
@@ -102,16 +99,7 @@ pub enum CliError {
         reason: String,
     },
 
-    // =========================================================================
     // Stack Errors
-    // =========================================================================
-    /// No stack is currently checked out.
-    ///
-    /// This can happen if the repository is in an inconsistent state
-    /// or if the current stack file is missing/corrupted.
-    #[error("No stack is currently checked out")]
-    NoCurrentStack,
-
     /// The specified stack doesn't exist.
     ///
     /// This occurs when trying to switch to, delete, or otherwise
@@ -142,9 +130,7 @@ pub enum CliError {
         name: String,
     },
 
-    // =========================================================================
     // File Errors
-    // =========================================================================
     /// The specified file doesn't exist.
     ///
     /// This occurs when trying to add, diff, or otherwise operate
@@ -194,9 +180,7 @@ pub enum CliError {
         path: PathBuf,
     },
 
-    // =========================================================================
     // Change Errors
-    // =========================================================================
     /// There are no changes to record.
     ///
     /// This occurs when running `atomic record` with no modified files.
@@ -236,13 +220,6 @@ pub enum CliError {
         dependency: String,
     },
 
-    /// The change has already been applied to the current stack.
-    #[error("Change already applied: {hash}")]
-    ChangeAlreadyApplied {
-        /// The hash of the already-applied change
-        hash: String,
-    },
-
     /// A conflict occurred during the operation.
     ///
     /// This can occur when applying changes that conflict with
@@ -253,9 +230,7 @@ pub enum CliError {
         description: String,
     },
 
-    // =========================================================================
     // Identity Errors
-    // =========================================================================
     /// The specified identity doesn't exist.
     ///
     /// This occurs when trying to use, show, or delete an identity
@@ -270,16 +245,7 @@ pub enum CliError {
     #[error("Identity already exists: '{0}'")]
     IdentityAlreadyExists(String),
 
-    /// No default identity is set.
-    ///
-    /// This occurs when an operation requires an identity but no
-    /// default has been configured.
-    #[error("No default identity set")]
-    NoDefaultIdentity,
-
-    // =========================================================================
     // Remote Errors
-    // =========================================================================
     /// Failed to connect to or communicate with the remote.
     ///
     /// This can occur due to network issues, authentication failures,
@@ -306,9 +272,7 @@ pub enum CliError {
         remote: String,
     },
 
-    // =========================================================================
     // User Input Errors
-    // =========================================================================
     /// The user cancelled the operation.
     #[error("Operation cancelled by user")]
     Cancelled,
@@ -320,9 +284,7 @@ pub enum CliError {
         message: String,
     },
 
-    // =========================================================================
     // Internal Errors
-    // =========================================================================
     /// An unexpected internal error occurred.
     ///
     /// This indicates a bug in Atomic. If you encounter this error,
@@ -344,26 +306,7 @@ pub enum CliError {
 }
 
 impl CliError {
-    // =========================================================================
     // Constructor Helpers
-    // =========================================================================
-
-    /// Create a `RepositoryNotFound` error for the given path.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - The path where the search for a repository started
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let err = CliError::repository_not_found("/home/user/project");
-    /// ```
-    pub fn repository_not_found<P: Into<PathBuf>>(path: P) -> Self {
-        Self::RepositoryNotFound {
-            searched_path: path.into(),
-        }
-    }
 
     /// Create a `RepositoryExists` error for the given path.
     ///
@@ -387,159 +330,9 @@ impl CliError {
         }
     }
 
-    /// Create a `StackNotFound` error for the given stack name.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the stack that wasn't found
-    pub fn stack_not_found<S: Into<String>>(name: S) -> Self {
-        Self::StackNotFound { name: name.into() }
-    }
-
-    /// Create a `FileNotFound` error for the given path.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - The path to the missing file
-    pub fn file_not_found<P: Into<PathBuf>>(path: P) -> Self {
-        Self::FileNotFound { path: path.into() }
-    }
-
-    /// Create a `ChangeNotFound` error for the given hash.
-    ///
-    /// # Arguments
-    ///
-    /// * `hash` - The hash (or partial hash) of the missing change
-    pub fn change_not_found<S: Into<String>>(hash: S) -> Self {
-        Self::ChangeNotFound { hash: hash.into() }
-    }
-
-    /// Create a `RemoteError` with the given message.
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - Description of what went wrong
-    /// * `url` - Optional URL of the remote
-    pub fn remote_error<S: Into<String>>(message: S, url: Option<String>) -> Self {
-        Self::RemoteError {
-            message: message.into(),
-            url,
-        }
-    }
-
-    /// Create an `IdentityNotFound` error for the given name.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the identity that wasn't found
-    pub fn identity_not_found<S: Into<String>>(name: S) -> Self {
-        Self::IdentityNotFound(name.into())
-    }
-
-    /// Create an `IdentityAlreadyExists` error for the given name.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the identity that already exists
-    pub fn identity_already_exists<S: Into<String>>(name: S) -> Self {
-        Self::IdentityAlreadyExists(name.into())
-    }
-
-    // =========================================================================
     // Error Classification
-    // =========================================================================
 
-    /// Check if this error indicates the repository doesn't exist.
-    ///
-    /// # Returns
-    ///
-    /// `true` if this is a `RepositoryNotFound` error
-    pub fn is_not_found(&self) -> bool {
-        matches!(self, Self::RepositoryNotFound { .. })
-    }
-
-    /// Check if this error is related to stack operations.
-    ///
-    /// # Returns
-    ///
-    /// `true` if this error involves stack operations
-    pub fn is_stack_error(&self) -> bool {
-        matches!(
-            self,
-            Self::NoCurrentStack
-                | Self::StackNotFound { .. }
-                | Self::StackAlreadyExists { .. }
-                | Self::CannotDeleteCurrentStack { .. }
-        )
-    }
-
-    /// Check if this error is related to file operations.
-    ///
-    /// # Returns
-    ///
-    /// `true` if this error involves file operations
-    pub fn is_file_error(&self) -> bool {
-        matches!(
-            self,
-            Self::FileNotFound { .. }
-                | Self::FileNotTracked { .. }
-                | Self::FileAlreadyTracked { .. }
-                | Self::PathOutsideRepository { .. }
-        )
-    }
-
-    /// Check if this error is related to remote operations.
-    ///
-    /// # Returns
-    ///
-    /// `true` if this error involves remote operations
-    pub fn is_remote_error(&self) -> bool {
-        matches!(
-            self,
-            Self::RemoteError { .. }
-                | Self::RemoteNotFound { .. }
-                | Self::AuthenticationFailed { .. }
-        )
-    }
-
-    /// Check if this error can potentially be resolved by user action.
-    ///
-    /// Some errors (like `NothingToRecord` or `FileNotTracked`) can be
-    /// resolved by the user taking specific actions. This method helps
-    /// identify such errors for providing more helpful guidance.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the user can potentially resolve this error
-    pub fn is_user_fixable(&self) -> bool {
-        matches!(
-            self,
-            Self::RepositoryNotFound { .. }
-                | Self::FileNotTracked { .. }
-                | Self::NothingToRecord
-                | Self::StackNotFound { .. }
-                | Self::MissingDependency { .. }
-                | Self::Conflict { .. }
-                | Self::RemoteNotFound { .. }
-                | Self::AuthenticationFailed { .. }
-        )
-    }
-
-    /// Check if this error is an internal/unexpected error.
-    ///
-    /// Internal errors typically indicate bugs in Atomic and should
-    /// be reported.
-    ///
-    /// # Returns
-    ///
-    /// `true` if this is an internal/unexpected error
-    pub fn is_internal(&self) -> bool {
-        matches!(self, Self::Internal(_))
-    }
-
-    // =========================================================================
     // User Guidance
-    // =========================================================================
 
     /// Get a suggestion for how to resolve this error.
     ///
@@ -566,9 +359,6 @@ impl CliError {
             }
             Self::RepositoryExists { .. } => {
                 Some("The directory is already an Atomic repository. Use 'atomic status' to see its state.")
-            }
-            Self::NoCurrentStack => {
-                Some("Run 'atomic stack list' to see available stacks, then 'atomic stack switch <name>' to select one.")
             }
             Self::StackNotFound { .. } => {
                 Some("Run 'atomic stack list' to see available stacks, or 'atomic stack new <name>' to create a new one.")
@@ -615,9 +405,6 @@ impl CliError {
             Self::IdentityAlreadyExists(_) => {
                 Some("Choose a different name, or use 'atomic identity show <name>' to view the existing identity.")
             }
-            Self::NoDefaultIdentity => {
-                Some("Run 'atomic identity default <name>' to set a default identity.")
-            }
             Self::Cancelled => None,
             Self::InvalidArgument { .. } => {
                 Some("Run 'atomic <command> --help' for usage information.")
@@ -649,8 +436,7 @@ impl CliError {
             Self::NothingToRecord
             | Self::Cancelled
             | Self::FileAlreadyTracked { .. }
-            | Self::StackAlreadyExists { .. }
-            | Self::ChangeAlreadyApplied { .. } => 1,
+            | Self::StackAlreadyExists { .. } => 1,
 
             // Command-line usage errors
             Self::InvalidArgument { .. } => 2,
@@ -660,7 +446,6 @@ impl CliError {
             | Self::RepositoryExists { .. }
             | Self::InvalidPath { .. }
             | Self::InvalidRepository { .. }
-            | Self::NoCurrentStack
             | Self::StackNotFound { .. }
             | Self::CannotDeleteCurrentStack { .. }
             | Self::FileNotFound { .. }
@@ -672,8 +457,7 @@ impl CliError {
             | Self::MissingDependency { .. }
             | Self::Conflict { .. }
             | Self::IdentityNotFound(_)
-            | Self::IdentityAlreadyExists(_)
-            | Self::NoDefaultIdentity => 3,
+            | Self::IdentityAlreadyExists(_) => 3,
 
             // Remote/network errors
             Self::RemoteError { .. }
@@ -692,9 +476,7 @@ impl CliError {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -791,7 +573,6 @@ mod tests {
 
     #[test]
     fn test_is_stack_error() {
-        assert!(CliError::NoCurrentStack.is_stack_error());
         assert!(CliError::stack_not_found("main").is_stack_error());
         assert!(CliError::StackAlreadyExists { name: "dev".into() }.is_stack_error());
         assert!(CliError::CannotDeleteCurrentStack { name: "dev".into() }.is_stack_error());
@@ -1118,7 +899,6 @@ mod tests {
             CliError::InvalidRepository {
                 reason: "corrupted".into(),
             },
-            CliError::NoCurrentStack,
             CliError::stack_not_found("main"),
             CliError::StackAlreadyExists { name: "dev".into() },
             CliError::CannotDeleteCurrentStack { name: "dev".into() },
@@ -1139,7 +919,6 @@ mod tests {
                 change: "A".into(),
                 dependency: "B".into(),
             },
-            CliError::ChangeAlreadyApplied { hash: "ABC".into() },
             CliError::Conflict {
                 description: "conflict".into(),
             },

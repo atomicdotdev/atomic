@@ -39,9 +39,7 @@ use super::context::ApplyContext;
 use super::error::{storage_err, ApplyError, ApplyResult};
 use super::traits::MutCrdtTxnT;
 
-// =============================================================================
 // Public API
-// =============================================================================
 
 /// Applies a TrunkOp to the pristine database.
 ///
@@ -85,9 +83,7 @@ pub fn apply_trunk_op<T: MutCrdtTxnT>(
     }
 }
 
-// =============================================================================
 // Create Operation
-// =============================================================================
 
 /// Applies a Create operation to create a new file.
 ///
@@ -143,9 +139,7 @@ fn apply_create<T: MutCrdtTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Delete Operation
-// =============================================================================
 
 /// Applies a Delete operation to mark a file as deleted.
 ///
@@ -192,9 +186,7 @@ fn apply_delete<T: MutCrdtTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Move Operation
-// =============================================================================
 
 /// Applies a Move operation to rename or relocate a file.
 ///
@@ -249,9 +241,7 @@ fn apply_move<T: MutCrdtTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Undelete Operation
-// =============================================================================
 
 /// Applies an Undelete operation to restore a deleted file.
 ///
@@ -295,9 +285,7 @@ fn apply_undelete<T: MutCrdtTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Validation Helpers
-// =============================================================================
 
 /// Validates that a trunk exists and is in the expected state.
 ///
@@ -366,9 +354,7 @@ pub fn validate_path_available<T: MutCrdtTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -377,9 +363,7 @@ mod tests {
     use crate::types::NodeId;
     use std::collections::HashMap;
 
-    // =========================================================================
     // Mock Transaction
-    // =========================================================================
 
     #[derive(Default)]
     struct MockTxn {
@@ -540,9 +524,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // Create Tests
-    // =========================================================================
 
     #[test]
     fn test_apply_create() {
@@ -636,9 +618,7 @@ mod tests {
         assert!(result.unwrap_err().is_already_exists());
     }
 
-    // =========================================================================
     // Delete Tests
-    // =========================================================================
 
     #[test]
     fn test_apply_delete() {
@@ -697,9 +677,7 @@ mod tests {
         assert!(result.unwrap_err().is_invalid_state());
     }
 
-    // =========================================================================
     // Move Tests
-    // =========================================================================
 
     #[test]
     fn test_apply_move() {
@@ -810,9 +788,7 @@ mod tests {
         assert_eq!(context.stats().trunks_moved(), 0);
     }
 
-    // =========================================================================
     // Undelete Tests
-    // =========================================================================
 
     #[test]
     fn test_apply_undelete() {
@@ -873,9 +849,7 @@ mod tests {
         assert!(result.unwrap_err().is_not_found());
     }
 
-    // =========================================================================
     // Validation Helper Tests
-    // =========================================================================
 
     #[test]
     fn test_validate_trunk_state() {

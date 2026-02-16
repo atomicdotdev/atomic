@@ -33,9 +33,7 @@ use crate::types::{GraphNode, Hash, Inode, NodeId, Position};
 
 use super::error::LocalApplyError;
 
-// =============================================================================
 // Position Resolution
-// =============================================================================
 
 /// Convert an external position (with Hash) to an internal position (with NodeId).
 ///
@@ -294,18 +292,14 @@ pub fn resolve_context_vertex<T: GraphTxnT>(
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::ChangePosition;
 
-    // =========================================================================
     // Test Helpers
-    // =========================================================================
 
     fn make_external_position(hash: Option<Hash>, pos: u64) -> Position<Option<Hash>> {
         Position {
@@ -322,9 +316,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // Position Helper Tests
-    // =========================================================================
 
     #[test]
     fn test_make_external_position_with_hash() {
@@ -362,9 +354,7 @@ mod tests {
         assert_eq!(node.end, ChangePosition::new(50));
     }
 
-    // =========================================================================
     // Position Equality Tests
-    // =========================================================================
 
     #[test]
     fn test_external_position_equality() {
@@ -388,9 +378,7 @@ mod tests {
         assert_ne!(v1, v3);
     }
 
-    // =========================================================================
     // Internal Position Tests
-    // =========================================================================
 
     #[test]
     fn test_internal_position_from_self_reference() {
@@ -415,9 +403,7 @@ mod tests {
         assert_eq!(node.end, ChangePosition::new(20));
     }
 
-    // =========================================================================
     // ROOT Position Tests
-    // =========================================================================
 
     #[test]
     fn test_root_node_id() {
@@ -438,9 +424,7 @@ mod tests {
         assert!(!node.is_root());
     }
 
-    // =========================================================================
     // Hash Resolution Tests (Structure Only)
-    // =========================================================================
 
     #[test]
     fn test_hash_creates_unique_positions() {
@@ -467,9 +451,7 @@ mod tests {
         assert_ne!(pos1.pos, pos2.pos);
     }
 
-    // =========================================================================
     // Span Range Tests
-    // =========================================================================
 
     #[test]
     fn test_vertex_range_validation() {
@@ -500,9 +482,7 @@ mod tests {
         assert_eq!(len - start, 15);
     }
 
-    // =========================================================================
     // Context Direction Tests
-    // =========================================================================
 
     #[test]
     fn test_up_context_structure() {
@@ -526,9 +506,7 @@ mod tests {
         assert_eq!(down_ctx.pos, ChangePosition::new(0));
     }
 
-    // =========================================================================
     // Error Case Tests (Structure Only)
-    // =========================================================================
 
     #[test]
     fn test_dependency_missing_error_structure() {

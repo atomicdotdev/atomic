@@ -98,9 +98,9 @@
 //! use atomic_core::diff::Algorithm;
 //!
 //! let options = WorkflowOptions::new()
-//!     .algorithm(Algorithm::Patience)
-//!     .check_mtime(true)
-//!     .prefix("src/");
+//!     .with_algorithm(Algorithm::Patience)
+//!     .with_check_mtime(true)
+//!     .with_prefix("src/");
 //! ```
 //!
 //! ## Step 3: Collect and Compare
@@ -172,8 +172,8 @@
 //!
 //! // Configure workflow
 //! let options = WorkflowOptions::new()
-//!     .algorithm(Algorithm::Myers)
-//!     .check_mtime(true);
+//!     .with_algorithm(Algorithm::Myers)
+//!     .with_check_mtime(true);
 //!
 //! // Collect tracked files
 //! let tracked = collect_tracked_files(&txn, "")?;
@@ -194,9 +194,7 @@
 //! [`RecordBuilder`]: crate::record::RecordBuilder
 //! [`RecordError`]: crate::record::RecordError
 
-// =============================================================================
 // SUBMODULES
-// =============================================================================
 
 mod builder;
 mod context;
@@ -205,9 +203,7 @@ mod error;
 mod item;
 pub mod workflow;
 
-// =============================================================================
 // RE-EXPORTS
-// =============================================================================
 
 // Builder types
 pub use builder::{RecordBuilder, RecordStats, Recorded};
@@ -227,9 +223,7 @@ pub use error::{RecordError, RecordResult};
 // Item types
 pub use item::{FileMetadata, InodeUpdate, RecordItem};
 
-// =============================================================================
 // CONVENIENCE RE-EXPORTS FROM WORKFLOW
-// =============================================================================
 
 /// Workflow configuration options.
 ///

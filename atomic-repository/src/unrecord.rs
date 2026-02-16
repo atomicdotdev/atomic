@@ -76,9 +76,7 @@ use std::collections::HashSet;
 use std::fmt;
 use thiserror::Error;
 
-// ============================================================================
 // Error Types
-// ============================================================================
 
 /// Result type for unrecord operations.
 pub type UnrecordResult<T> = Result<T, UnrecordError>;
@@ -141,9 +139,7 @@ pub enum UnrecordError {
     Io(#[from] std::io::Error),
 }
 
-// ============================================================================
 // Unrecord Options
-// ============================================================================
 
 /// Options for unrecord operations.
 ///
@@ -242,9 +238,7 @@ impl UnrecordOptions {
     }
 }
 
-// ============================================================================
 // Unrecord Result
-// ============================================================================
 
 /// Result of an unrecord operation.
 ///
@@ -326,9 +320,7 @@ impl fmt::Display for UnrecordOutcome {
     }
 }
 
-// ============================================================================
 // Unrecord Statistics
-// ============================================================================
 
 /// Statistics about an unrecord operation.
 #[derive(Debug, Clone, Default)]
@@ -370,9 +362,7 @@ impl UnrecordStats {
     }
 }
 
-// ============================================================================
 // Dependency Information
-// ============================================================================
 
 /// Information about a change's dependencies for unrecord purposes.
 #[derive(Debug, Clone)]
@@ -426,9 +416,7 @@ impl UnrecordDependencyInfo {
     }
 }
 
-// ============================================================================
 // Core Functions
-// ============================================================================
 
 /// Check if a change can be unrecorded from a stack.
 ///
@@ -722,17 +710,13 @@ pub fn get_last_change<T: StackTxnT>(_txn: &T, stack: &StackState) -> UnrecordRe
     Ok(Some(hash))
 }
 
-// ============================================================================
 // Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ========================================================================
     // UnrecordOptions Tests
-    // ========================================================================
 
     #[test]
     fn test_unrecord_options_default() {
@@ -776,9 +760,7 @@ mod tests {
         assert!(!options.cascade);
     }
 
-    // ========================================================================
     // UnrecordOutcome Tests
-    // ========================================================================
 
     #[test]
     fn test_unrecord_outcome_new() {
@@ -837,9 +819,7 @@ mod tests {
         assert!(display.contains("[DRY RUN]"));
     }
 
-    // ========================================================================
     // UnrecordStats Tests
-    // ========================================================================
 
     #[test]
     fn test_unrecord_stats_default() {
@@ -879,9 +859,7 @@ mod tests {
         assert_eq!(stats1.vertices_removed, 15);
     }
 
-    // ========================================================================
     // UnrecordDependencyInfo Tests
-    // ========================================================================
 
     #[test]
     fn test_dependency_info_new() {
@@ -920,9 +898,7 @@ mod tests {
         assert!(info.block_reason.is_some());
     }
 
-    // ========================================================================
     // UnrecordError Tests
-    // ========================================================================
 
     #[test]
     fn test_unrecord_error_change_not_found() {

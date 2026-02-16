@@ -56,9 +56,7 @@ use clap::Subcommand;
 use crate::commands::Command;
 use crate::error::CliResult;
 
-// =============================================================================
 // Identity Command Router
-// =============================================================================
 
 /// Identity management commands.
 ///
@@ -195,9 +193,7 @@ impl Command for Identity {
     }
 }
 
-// =============================================================================
 // Default Subcommand
-// =============================================================================
 
 /// Set the default identity.
 #[derive(Debug, clap::Args)]
@@ -272,9 +268,7 @@ impl Command for Default {
     }
 }
 
-// =============================================================================
 // Helper Functions
-// =============================================================================
 
 /// Format an identity type for display.
 pub fn format_identity_type(identity_type: &atomic_identity::IdentityType) -> &'static str {

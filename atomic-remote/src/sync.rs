@@ -81,9 +81,7 @@ use crate::error::RemoteResult;
 use crate::http::HttpRemote;
 use crate::types::{ChangelistEntry, Node, PullDelta, PushDelta, StateResponse};
 
-// =============================================================================
 // Remote State Cache
-// =============================================================================
 
 /// A cached entry representing one position in the remote's history.
 ///
@@ -266,9 +264,7 @@ impl fmt::Display for RemoteState {
     }
 }
 
-// =============================================================================
 // Remote Delta
-// =============================================================================
 
 /// The difference between our cached view of a remote and its actual state.
 ///
@@ -410,9 +406,7 @@ impl fmt::Display for RemoteDelta {
     }
 }
 
-// =============================================================================
 // Sync Engine
-// =============================================================================
 
 /// Statistics from a sync operation.
 #[derive(Debug, Clone, Default)]
@@ -470,9 +464,7 @@ impl<'a> SyncEngine<'a> {
         &self.stats
     }
 
-    // =========================================================================
     // Dichotomy Algorithm — O(log n) divergence detection
-    // =========================================================================
 
     /// Find the divergence point between our cached view and the remote's
     /// actual state using binary search on Merkle states.
@@ -602,9 +594,7 @@ impl<'a> SyncEngine<'a> {
         Ok(lo)
     }
 
-    // =========================================================================
     // Delta Computation
-    // =========================================================================
 
     /// Compute the full `RemoteDelta` for a given stack.
     ///
@@ -738,9 +728,7 @@ impl<'a> SyncEngine<'a> {
         })
     }
 
-    // =========================================================================
     // Convenience: Pull and Push
-    // =========================================================================
 
     /// Compute a pull delta for a given stack.
     ///
@@ -775,17 +763,13 @@ impl<'a> SyncEngine<'a> {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // RemoteState tests
-    // =========================================================================
 
     #[test]
     fn test_remote_state_empty() {
@@ -951,9 +935,7 @@ mod tests {
         assert!(display.contains("1 entries"));
     }
 
-    // =========================================================================
     // RemoteDelta tests
-    // =========================================================================
 
     #[test]
     fn test_remote_delta_in_sync() {
@@ -1045,9 +1027,7 @@ mod tests {
         assert!(display.contains("download=1"));
     }
 
-    // =========================================================================
     // SyncStats tests
-    // =========================================================================
 
     #[test]
     fn test_sync_stats_default() {
@@ -1084,9 +1064,7 @@ mod tests {
         assert!(display.contains("10 entries"));
     }
 
-    // =========================================================================
     // Node helper tests (verifying Hash/Eq for HashSet usage)
-    // =========================================================================
 
     #[test]
     fn test_node_equality_in_hashset() {

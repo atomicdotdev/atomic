@@ -70,9 +70,7 @@ use crate::output::traits::VertexBuffer;
 use crate::types::{Base32, GraphNode, Hash, NodeId, Position};
 use std::io::Write;
 
-// ============================================================================
 // CONFLICT MARKERS
-// ============================================================================
 
 /// Conflict marker strings.
 pub mod markers {
@@ -86,9 +84,7 @@ pub mod markers {
     pub const END: &str = "<<<<<<<";
 }
 
-// ============================================================================
 // CONFLICT WRITER
-// ============================================================================
 
 /// A writer that tracks and outputs conflict markers.
 ///
@@ -356,9 +352,7 @@ fn count_digits(n: u32) -> u32 {
     count
 }
 
-// ============================================================================
 // WRITE TRAIT IMPLEMENTATION
-// ============================================================================
 
 impl<W: Write> Write for ConflictWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -374,9 +368,7 @@ impl<W: Write> Write for ConflictWriter<W> {
     }
 }
 
-// ============================================================================
 // VERTEX BUFFER IMPLEMENTATION
-// ============================================================================
 
 impl<W: Write> VertexBuffer for ConflictWriter<W> {
     fn output_line<E, F>(&mut self, node: GraphNode<NodeId>, get_contents: F) -> Result<(), E>
@@ -477,9 +469,7 @@ impl<W: Write> VertexBuffer for ConflictWriter<W> {
     }
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

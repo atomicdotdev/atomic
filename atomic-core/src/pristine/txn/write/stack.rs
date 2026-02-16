@@ -1,0 +1,86 @@
+use super::*;
+
+// StackTxnT Implementation
+
+impl<'a> StackTxnT for WriteTxn<'a> {
+    fn get_stack(&self, name: &str) -> PristineResult<Option<StackState>> {
+        let table = self.txn.open_table(STACKS)?;
+        let result = table.get(name)?;
+        match result {
+            Some(value) => {
+                let bytes = value.value();
+                let state = deserialize_stack_state(bytes)?;
+                Ok(Some(state))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn list_stacks(&self) -> PristineResult<Vec<String>> {
+        let table = self.txn.open_table(STACKS)?;
+        let mut names = Vec::new();
+        for result in table.iter()? {
+            if let Ok((k, _)) = result {
+                names.push(k.value().to_string());
+            }
+        }
+        Ok(names)
+    }
+
+    fn get_change_seq(&self, stack: &StackState, change_id: NodeId) -> PristineResult<Option<u64>> {
+        let table = self.txn.open_table(REV_STACK_CHANGES)?;
+        let key = encode_stack_seq(stack.id, change_id.get());
+        let result = table.get(&key)?;
+        match result {
+            Some(value) => Ok(Some(value.value())),
+            None => Ok(None),
+        }
+    }
+
+    fn get_change_at_seq(&self, stack: &StackState, seq: u64) -> PristineResult<Option<NodeId>> {
+        let table = self.txn.open_table(STACK_CHANGES)?;
+        let key = encode_stack_seq(stack.id, seq);
+        let result = table.get(&key)?;
+        match result {
+            Some(value) => Ok(Some(NodeId::new(value.value()))),
+            None => Ok(None),
+        }
+    }
+
+    fn iter_changes(
+        &self,
+        stack: &StackState,
+        from_seq: u64,
+    ) -> PristineResult<Box<dyn Iterator<Item = Result<(u64, NodeId, Merkle), PristineError>> + '_>>
+    {
+        let changes_table = self.txn.open_table(STACK_CHANGES)?;
+        let tags_table = self.txn.open_table(TAGS)?;
+
+        let stack_id = stack.id;
+        let start_key = encode_stack_seq(stack_id, from_seq);
+        let end_key = encode_stack_seq(stack_id + 1, 0);
+
+        let mut results = Vec::new();
+        for result in changes_table.range::<&[u8; 16]>(&start_key..&end_key)? {
+            match result {
+                Ok((key, value)) => {
+                    let (_, seq) = decode_stack_seq(key.value());
+                    let change_id = NodeId::new(value.value());
+
+                    let tag_key = encode_stack_seq(stack_id, seq);
+                    let merkle = match tags_table.get(&tag_key) {
+                        Ok(Some(m)) => Merkle::from_bytes(*m.value()),
+                        _ => Merkle::ZERO,
+                    };
+
+                    results.push(Ok((seq, change_id, merkle)));
+                }
+                Err(e) => {
+                    results.push(Err(PristineError::Storage(e)));
+                }
+            }
+        }
+
+        Ok(Box::new(results.into_iter()))
+    }
+}

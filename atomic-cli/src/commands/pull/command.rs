@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The main Pull command implementation.
 //!
 //! This module contains the `Pull` struct and its `Command` implementation,
@@ -50,9 +49,7 @@ use super::helpers::{
 };
 use super::types::{PullChange, PullStats};
 
-// =============================================================================
 // Constants
-// =============================================================================
 
 /// Default remote name when none is specified.
 ///
@@ -65,9 +62,7 @@ pub const DEFAULT_REMOTE: &str = "origin";
 /// and failing quickly on unresponsive servers.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
-// =============================================================================
 // Pull Command
-// =============================================================================
 
 /// Pull changes from a remote repository.
 ///
@@ -185,161 +180,7 @@ impl Pull {
         }
     }
 
-    /// Set the remote name or URL.
-    ///
-    /// # Arguments
-    ///
-    /// * `remote` - The remote name or URL to pull from
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::Pull;
-    ///
-    /// let pull = Pull::new().with_remote("upstream");
-    /// assert_eq!(pull.remote, "upstream");
-    /// ```
-    pub fn with_remote(mut self, remote: impl Into<String>) -> Self {
-        self.remote = remote.into();
-        self
-    }
-
-    /// Set the local stack to pull into.
-    ///
-    /// # Arguments
-    ///
-    /// * `stack` - The name of the local stack
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::Pull;
-    ///
-    /// let pull = Pull::new().with_to_stack("feature");
-    /// assert_eq!(pull.to_stack, Some("feature".to_string()));
-    /// ```
-    pub fn with_to_stack(mut self, stack: impl Into<String>) -> Self {
-        self.to_stack = Some(stack.into());
-        self
-    }
-
-    /// Set the remote stack to pull from.
-    ///
-    /// # Arguments
-    ///
-    /// * `stack` - The name of the remote stack
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::Pull;
-    ///
-    /// let pull = Pull::new().with_from_stack("main");
-    /// assert_eq!(pull.from_stack, Some("main".to_string()));
-    /// ```
-    pub fn with_from_stack(mut self, stack: impl Into<String>) -> Self {
-        self.from_stack = Some(stack.into());
-        self
-    }
-
-    /// Enable or disable dry run mode.
-    ///
-    /// # Arguments
-    ///
-    /// * `dry_run` - Whether to enable dry run mode
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::Pull;
-    ///
-    /// let pull = Pull::new().with_dry_run(true);
-    /// assert!(pull.dry_run);
-    /// ```
-    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
-        self.dry_run = dry_run;
-        self
-    }
-
-    /// Enable or disable pulling all changes.
-    ///
-    /// # Arguments
-    ///
-    /// * `all` - Whether to pull all changes
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::Pull;
-    ///
-    /// let pull = Pull::new().with_all(true);
-    /// assert!(pull.all);
-    /// ```
-    pub fn with_all(mut self, all: bool) -> Self {
-        self.all = all;
-        self
-    }
-
-    /// Enable or disable TLS certificate verification bypass.
-    ///
-    /// # Arguments
-    ///
-    /// * `insecure` - Whether to skip certificate verification
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::Pull;
-    ///
-    /// let pull = Pull::new().with_insecure(true);
-    /// assert!(pull.insecure);
-    /// ```
-    pub fn with_insecure(mut self, insecure: bool) -> Self {
-        self.insecure = insecure;
-        self
-    }
-
-    /// Set the request timeout in seconds.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - The timeout in seconds
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::Pull;
-    ///
-    /// let pull = Pull::new().with_timeout(60);
-    /// assert_eq!(pull.timeout, 60);
-    /// ```
-    pub fn with_timeout(mut self, timeout: u64) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    /// Enable or disable download-only mode.
-    ///
-    /// # Arguments
-    ///
-    /// * `download_only` - Whether to only download without applying
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::pull::Pull;
-    ///
-    /// let pull = Pull::new().with_download_only(true);
-    /// assert!(pull.download_only);
-    /// ```
-    pub fn with_download_only(mut self, download_only: bool) -> Self {
-        self.download_only = download_only;
-        self
-    }
-
-    // =========================================================================
     // Internal Helper Methods
-    // =========================================================================
 
     /// Resolve the remote URL from the remote name or return as-is if it's a URL.
     ///
@@ -708,17 +549,13 @@ impl Command for Pull {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // Constructor and Builder Tests
-    // =========================================================================
 
     /// Test creating a new Pull with defaults.
     #[test]
@@ -851,9 +688,7 @@ mod tests {
         assert!(debug_str.contains("Pull"));
     }
 
-    // =========================================================================
     // Internal Method Tests
-    // =========================================================================
 
     /// Test get_remote_stack with explicit stack.
     #[test]
@@ -896,9 +731,7 @@ mod tests {
         assert!(std::mem::size_of_val(&config) > 0);
     }
 
-    // =========================================================================
     // Constant Tests
-    // =========================================================================
 
     /// Test that DEFAULT_REMOTE is "origin".
     #[test]

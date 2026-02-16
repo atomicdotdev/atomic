@@ -35,9 +35,7 @@ use crate::commands::{find_repository_root, Command};
 use crate::error::CliResult;
 use crate::output::{print_error, print_success, print_warning};
 
-// =============================================================================
 // Enable Command
-// =============================================================================
 
 /// Install agent hooks for turn-level recording.
 #[derive(Debug, Args)]
@@ -332,9 +330,7 @@ impl Enable {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

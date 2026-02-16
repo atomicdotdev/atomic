@@ -50,9 +50,7 @@ use commands::{
 };
 use output::{print_error, print_hint};
 
-// =============================================================================
 // CLI Argument Definitions
-// =============================================================================
 
 /// Atomic - A mathematically sound distributed version control system.
 ///
@@ -477,9 +475,7 @@ enum Commands {
     Tag(Tag),
 }
 
-// =============================================================================
 // Main Entry Point
-// =============================================================================
 
 fn main() {
     // Initialize logging

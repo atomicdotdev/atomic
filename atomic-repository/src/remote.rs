@@ -43,9 +43,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-// =============================================================================
 // Error Types
-// =============================================================================
 
 /// Errors that can occur during remote configuration operations.
 #[derive(Debug)]
@@ -129,9 +127,7 @@ impl std::error::Error for RemoteError {
 /// Result type for remote operations.
 pub type RemoteResult<T> = Result<T, RemoteError>;
 
-// =============================================================================
 // RemoteEntry
-// =============================================================================
 
 /// A single remote repository entry.
 ///
@@ -228,9 +224,7 @@ impl fmt::Display for RemoteEntry {
     }
 }
 
-// =============================================================================
 // RemoteConfig
-// =============================================================================
 
 /// Configuration for all remotes in a repository.
 ///
@@ -638,9 +632,7 @@ impl RemoteConfig {
     }
 }
 
-// =============================================================================
 // Helper Functions
-// =============================================================================
 
 /// Validate a remote name.
 ///
@@ -686,18 +678,14 @@ fn validate_remote_name(name: &str) -> RemoteResult<()> {
     Ok(())
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    // =========================================================================
     // RemoteEntry Tests
-    // =========================================================================
 
     #[test]
     fn test_remote_entry_new() {
@@ -764,9 +752,7 @@ default = true"#;
         assert!(!entry.default); // default is false when not specified
     }
 
-    // =========================================================================
     // RemoteConfig Tests
-    // =========================================================================
 
     #[test]
     fn test_remote_config_new() {
@@ -1004,9 +990,7 @@ default = true"#;
         assert_eq!(names.len(), 2);
     }
 
-    // =========================================================================
     // File I/O Tests
-    // =========================================================================
 
     #[test]
     fn test_remote_config_load_nonexistent() {
@@ -1089,9 +1073,7 @@ key = "value"
         assert!(!content.contains("[remotes]"));
     }
 
-    // =========================================================================
     // Validation Tests
-    // =========================================================================
 
     #[test]
     fn test_validate_remote_name_valid() {
@@ -1113,9 +1095,7 @@ key = "value"
         assert!(validate_remote_name("origin@test").is_err());
     }
 
-    // =========================================================================
     // Error Display Tests
-    // =========================================================================
 
     #[test]
     fn test_remote_error_display() {

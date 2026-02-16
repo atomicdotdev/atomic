@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The `split` command for creating a new stack from an existing one.
 //!
 //! This module implements the `atomic split` command, which creates a new
@@ -48,9 +47,7 @@ use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success, stack as style_stack};
 
-// =============================================================================
 // Constants
-// =============================================================================
 
 /// Maximum length for a stack name.
 const MAX_STACK_NAME_LENGTH: usize = 255;
@@ -58,9 +55,7 @@ const MAX_STACK_NAME_LENGTH: usize = 255;
 /// Characters not allowed in stack names.
 const INVALID_CHARS: &[char] = &['/', '\\', '\0', ':', '*', '?', '"', '<', '>', '|', ' '];
 
-// =============================================================================
 // Stack Name Validation
-// =============================================================================
 
 /// Validate a stack name.
 fn validate_stack_name(name: &str) -> Result<(), String> {
@@ -101,9 +96,7 @@ fn validate_stack_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-// =============================================================================
 // Split Command
-// =============================================================================
 
 /// Split a stack (create a new stack from an existing one).
 ///
@@ -136,26 +129,6 @@ pub struct Split {
 }
 
 impl Split {
-    /// Create a new Split command with the given stack name.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            source: None,
-            switch: false,
-        }
-    }
-
-    /// Set the source stack to split from.
-    pub fn with_source(mut self, source: impl Into<String>) -> Self {
-        self.source = Some(source.into());
-        self
-    }
-
-    /// Set whether to switch to the new stack.
-    pub fn with_switch(mut self, switch: bool) -> Self {
-        self.switch = switch;
-        self
-    }
 }
 
 impl Default for Split {
@@ -248,17 +221,13 @@ impl Command for Split {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // Builder Tests
-    // =========================================================================
 
     #[test]
     fn test_split_new() {
@@ -300,9 +269,7 @@ mod tests {
         assert!(cmd.switch);
     }
 
-    // =========================================================================
     // Validation Tests
-    // =========================================================================
 
     #[test]
     fn test_validate_stack_name_valid() {
@@ -339,9 +306,7 @@ mod tests {
         assert!(validate_stack_name("name.").is_err());
     }
 
-    // =========================================================================
     // Clone Tests
-    // =========================================================================
 
     #[test]
     fn test_split_clone() {

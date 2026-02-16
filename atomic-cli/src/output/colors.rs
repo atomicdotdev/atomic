@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Terminal color utilities for consistent CLI output theming.
 //!
 //! This module provides a centralized color scheme for the Atomic CLI,
@@ -39,138 +38,11 @@
 
 use console::{style, StyledObject};
 
-// =============================================================================
 // Color Mode
-// =============================================================================
 
-/// Controls whether colors should be used in output.
-///
-/// This enum allows explicit control over color output, which is useful
-/// for implementing `--color` flags or respecting environment variables.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ColorMode {
-    /// Automatically detect whether to use colors.
-    ///
-    /// Colors will be used if:
-    /// - Output is to a TTY
-    /// - `NO_COLOR` environment variable is not set
-    /// - `TERM` is not "dumb"
-    #[default]
-    Auto,
-
-    /// Always use colors, even if output is not a TTY.
-    Always,
-
-    /// Never use colors, even if output is a TTY.
-    Never,
-}
-
-impl ColorMode {
-    /// Check if colors should be used given this mode.
-    ///
-    /// # Returns
-    ///
-    /// `true` if colors should be used, `false` otherwise.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let mode = ColorMode::Auto;
-    /// if mode.should_colorize() {
-    ///     println!("{}", colors::success("Colored output!"));
-    /// } else {
-    ///     println!("Plain output");
-    /// }
-    /// ```
-    pub fn should_colorize(&self) -> bool {
-        match self {
-            ColorMode::Always => true,
-            ColorMode::Never => false,
-            ColorMode::Auto => should_colorize(),
-        }
-    }
-}
-
-impl std::str::FromStr for ColorMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "auto" => Ok(ColorMode::Auto),
-            "always" | "yes" | "true" | "1" => Ok(ColorMode::Always),
-            "never" | "no" | "false" | "0" => Ok(ColorMode::Never),
-            _ => Err(format!(
-                "Invalid color mode '{}'. Use 'auto', 'always', or 'never'.",
-                s
-            )),
-        }
-    }
-}
-
-impl std::fmt::Display for ColorMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ColorMode::Auto => write!(f, "auto"),
-            ColorMode::Always => write!(f, "always"),
-            ColorMode::Never => write!(f, "never"),
-        }
-    }
-}
-
-// =============================================================================
 // Color Detection
-// =============================================================================
 
-/// Check if the terminal supports colors and colors should be used.
-///
-/// This function checks:
-/// 1. The `NO_COLOR` environment variable (if set, returns false)
-/// 2. The `CLICOLOR_FORCE` environment variable (if set to non-zero, returns true)
-/// 3. Whether stdout is a TTY
-/// 4. The `TERM` environment variable (returns false if "dumb")
-///
-/// # Returns
-///
-/// `true` if colors should be used, `false` otherwise.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// if colors::should_colorize() {
-///     println!("{}", colors::success("Colorful!"));
-/// }
-/// ```
-pub fn should_colorize() -> bool {
-    // Check NO_COLOR first (https://no-color.org/)
-    if std::env::var("NO_COLOR").is_ok() {
-        return false;
-    }
-
-    // Check CLICOLOR_FORCE
-    if let Ok(val) = std::env::var("CLICOLOR_FORCE") {
-        if val != "0" {
-            return true;
-        }
-    }
-
-    // Check if we're outputting to a terminal
-    if !console::Term::stdout().is_term() {
-        return false;
-    }
-
-    // Check for dumb terminal
-    if let Ok(term) = std::env::var("TERM") {
-        if term == "dumb" {
-            return false;
-        }
-    }
-
-    true
-}
-
-// =============================================================================
 // Status Colors
-// =============================================================================
 
 /// Format a success message in green.
 ///
@@ -278,9 +150,7 @@ pub fn hint<D: std::fmt::Display>(text: D) -> StyledObject<D> {
     style(text).dim()
 }
 
-// =============================================================================
 // File Status Colors
-// =============================================================================
 
 /// Format added content in green.
 ///
@@ -366,30 +236,7 @@ pub fn untracked<D: std::fmt::Display>(text: D) -> StyledObject<D> {
     style(text).red()
 }
 
-/// Format renamed/moved content in blue.
-///
-/// Use this for files that have been renamed or moved.
-///
-/// # Arguments
-///
-/// * `text` - The text to format
-///
-/// # Returns
-///
-/// A styled object that displays in blue when printed.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// println!("{}", colors::renamed("old.rs -> new.rs"));
-/// ```
-pub fn renamed<D: std::fmt::Display>(text: D) -> StyledObject<D> {
-    style(text).blue()
-}
-
-// =============================================================================
 // Reference Colors
-// =============================================================================
 
 /// Format a file path in bold.
 ///
@@ -496,9 +343,7 @@ pub fn author<D: std::fmt::Display>(text: D) -> StyledObject<D> {
     style(text)
 }
 
-// =============================================================================
 // Semantic Colors
-// =============================================================================
 
 /// Format emphasized text in bold.
 ///
@@ -542,98 +387,9 @@ pub fn command<D: std::fmt::Display>(text: D) -> StyledObject<D> {
     style(text).cyan().bold()
 }
 
-/// Format a conflict marker in red and bold.
-///
-/// Use this for conflict-related output.
-///
-/// # Arguments
-///
-/// * `text` - The conflict text to format
-///
-/// # Returns
-///
-/// A styled object that displays in red and bold when printed.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// println!("{}", colors::conflict("CONFLICT in src/main.rs"));
-/// ```
-pub fn conflict<D: std::fmt::Display>(text: D) -> StyledObject<D> {
-    style(text).red().bold()
-}
-
-// =============================================================================
 // File Status Prefix
-// =============================================================================
 
-/// A file status indicator character with its appropriate color.
-///
-/// This struct represents the single-character status indicators
-/// used in short-form status output (like `M`, `A`, `D`, `?`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatusChar {
-    /// Added file (A)
-    Added,
-    /// Modified file (M)
-    Modified,
-    /// Deleted file (D)
-    Deleted,
-    /// Renamed/moved file (R)
-    Renamed,
-    /// Untracked file (?)
-    Untracked,
-    /// Conflicted file (C)
-    Conflict,
-    /// Clean/unchanged (space)
-    Clean,
-}
-
-impl StatusChar {
-    /// Get the character representation of this status.
-    ///
-    /// # Returns
-    ///
-    /// A single character representing this status.
-    pub fn char(&self) -> char {
-        match self {
-            StatusChar::Added => 'A',
-            StatusChar::Modified => 'M',
-            StatusChar::Deleted => 'D',
-            StatusChar::Renamed => 'R',
-            StatusChar::Untracked => '?',
-            StatusChar::Conflict => 'C',
-            StatusChar::Clean => ' ',
-        }
-    }
-
-    /// Format this status character with appropriate colors.
-    ///
-    /// # Returns
-    ///
-    /// A styled string containing the status character.
-    pub fn styled(&self) -> StyledObject<char> {
-        match self {
-            StatusChar::Added => added(self.char()),
-            StatusChar::Modified => modified(self.char()),
-            StatusChar::Deleted => deleted(self.char()),
-            StatusChar::Renamed => renamed(self.char()),
-            StatusChar::Untracked => untracked(self.char()),
-            StatusChar::Conflict => conflict(self.char()),
-            StatusChar::Clean => style(' '),
-        }
-    }
-}
-
-impl std::fmt::Display for StatusChar {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.styled())
-    }
-}
-
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

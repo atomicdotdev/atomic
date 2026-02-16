@@ -81,9 +81,7 @@ use crate::diff::{diff, Algorithm, DiffOp, Line};
 use crate::output::FileMetadata;
 use crate::types::{Inode, NodeId, Position};
 
-// ============================================================================
 // DETECT OPTIONS
-// ============================================================================
 
 /// Options for change detection.
 ///
@@ -100,11 +98,11 @@ use crate::types::{Inode, NodeId, Position};
 ///
 /// // With custom diff algorithm
 /// let opts = DetectOptions::new()
-///     .algorithm(Algorithm::Patience);
+///     .with_algorithm(Algorithm::Patience);
 ///
 /// // Skip mtime optimization (always compare content)
 /// let opts = DetectOptions::new()
-///     .check_mtime(false);
+///     .with_check_mtime(false);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectOptions {
@@ -181,10 +179,10 @@ impl DetectOptions {
     /// use atomic_core::record::DetectOptions;
     /// use atomic_core::diff::Algorithm;
     ///
-    /// let opts = DetectOptions::new().algorithm(Algorithm::Patience);
+    /// let opts = DetectOptions::new().with_algorithm(Algorithm::Patience);
     /// assert_eq!(opts.algorithm, Algorithm::Patience);
     /// ```
-    pub fn algorithm(mut self, algorithm: Algorithm) -> Self {
+    pub fn with_algorithm(mut self, algorithm: Algorithm) -> Self {
         self.algorithm = algorithm;
         self
     }
@@ -194,7 +192,7 @@ impl DetectOptions {
     /// # Arguments
     ///
     /// * `check` - Whether to check mtime before comparing content
-    pub fn check_mtime(mut self, check: bool) -> Self {
+    pub fn with_check_mtime(mut self, check: bool) -> Self {
         self.check_mtime = check;
         self
     }
@@ -204,7 +202,7 @@ impl DetectOptions {
     /// # Arguments
     ///
     /// * `detect` - Whether to detect file moves
-    pub fn detect_moves(mut self, detect: bool) -> Self {
+    pub fn with_detect_moves(mut self, detect: bool) -> Self {
         self.detect_moves = detect;
         self
     }
@@ -234,7 +232,7 @@ impl DetectOptions {
     /// # Arguments
     ///
     /// * `prefix` - Path prefix to filter files
-    pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = prefix.into();
         self
     }
@@ -254,7 +252,7 @@ impl DetectOptions {
     /// # Arguments
     ///
     /// * `force` - Whether to force re-diffing
-    pub fn force_rediff(mut self, force: bool) -> Self {
+    pub fn with_force_rediff(mut self, force: bool) -> Self {
         self.force_rediff = force;
         self
     }
@@ -284,9 +282,7 @@ impl Default for DetectOptions {
     }
 }
 
-// ============================================================================
 // FILE CHANGE KIND
-// ============================================================================
 
 /// The kind of change detected for a file.
 ///
@@ -393,9 +389,7 @@ impl FileChangeKind {
     }
 }
 
-// ============================================================================
 // FILE CHANGE
-// ============================================================================
 
 /// A detected change to a file.
 ///
@@ -577,9 +571,7 @@ impl FileChange {
     }
 }
 
-// ============================================================================
 // DETECT RESULT
-// ============================================================================
 
 /// Result of change detection.
 ///
@@ -696,9 +688,7 @@ impl DetectResult {
     }
 }
 
-// ============================================================================
 // CONTENT COMPARISON
-// ============================================================================
 
 /// Compare two byte slices and produce diff operations.
 ///
@@ -788,17 +778,13 @@ pub fn is_binary_content(content: &[u8]) -> bool {
     false
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ========================================================================
     // DetectOptions Tests
-    // ========================================================================
 
     #[test]
     fn test_options_new() {
@@ -824,21 +810,21 @@ mod tests {
 
     #[test]
     fn test_options_algorithm() {
-        let opts = DetectOptions::new().algorithm(Algorithm::Patience);
+        let opts = DetectOptions::new().with_algorithm(Algorithm::Patience);
 
         assert_eq!(opts.algorithm, Algorithm::Patience);
     }
 
     #[test]
     fn test_options_check_mtime() {
-        let opts = DetectOptions::new().check_mtime(false);
+        let opts = DetectOptions::new().with_check_mtime(false);
 
         assert!(!opts.check_mtime);
     }
 
     #[test]
     fn test_options_detect_moves() {
-        let opts = DetectOptions::new().detect_moves(false);
+        let opts = DetectOptions::new().with_detect_moves(false);
 
         assert!(!opts.detect_moves);
     }
@@ -859,7 +845,7 @@ mod tests {
 
     #[test]
     fn test_options_prefix() {
-        let opts = DetectOptions::new().prefix("src/");
+        let opts = DetectOptions::new().with_prefix("src/");
 
         assert_eq!(opts.prefix, "src/");
     }
@@ -873,7 +859,7 @@ mod tests {
 
     #[test]
     fn test_options_force_rediff() {
-        let opts = DetectOptions::new().force_rediff(true);
+        let opts = DetectOptions::new().with_force_rediff(true);
 
         assert!(opts.force_rediff);
     }
@@ -881,11 +867,11 @@ mod tests {
     #[test]
     fn test_options_chaining() {
         let opts = DetectOptions::new()
-            .algorithm(Algorithm::Patience)
-            .check_mtime(false)
-            .detect_moves(false)
-            .prefix("test/")
-            .force_rediff(true);
+            .with_algorithm(Algorithm::Patience)
+            .with_check_mtime(false)
+            .with_detect_moves(false)
+            .with_prefix("test/")
+            .with_force_rediff(true);
 
         assert_eq!(opts.algorithm, Algorithm::Patience);
         assert!(!opts.check_mtime);
@@ -905,7 +891,7 @@ mod tests {
 
     #[test]
     fn test_options_matches_prefix_with_prefix() {
-        let opts = DetectOptions::new().prefix("src/");
+        let opts = DetectOptions::new().with_prefix("src/");
 
         assert!(opts.matches_prefix("src/main.rs"));
         assert!(opts.matches_prefix("src/lib/mod.rs"));
@@ -914,7 +900,7 @@ mod tests {
 
     #[test]
     fn test_options_clone() {
-        let opts = DetectOptions::new().prefix("test/");
+        let opts = DetectOptions::new().with_prefix("test/");
         let cloned = opts.clone();
 
         assert_eq!(opts, cloned);
@@ -928,9 +914,7 @@ mod tests {
         assert!(debug.contains("DetectOptions"));
     }
 
-    // ========================================================================
     // FileChangeKind Tests
-    // ========================================================================
 
     #[test]
     fn test_change_kind_added() {
@@ -1013,9 +997,7 @@ mod tests {
         assert!(kind.diff_ops().is_none());
     }
 
-    // ========================================================================
     // FileChange Tests
-    // ========================================================================
 
     #[test]
     fn test_file_change_added() {
@@ -1122,9 +1104,7 @@ mod tests {
         assert!(debug.contains("test.rs"));
     }
 
-    // ========================================================================
     // DetectResult Tests
-    // ========================================================================
 
     #[test]
     fn test_result_new() {
@@ -1284,9 +1264,7 @@ mod tests {
         assert!(debug.contains("DetectResult"));
     }
 
-    // ========================================================================
     // Content Comparison Tests
-    // ========================================================================
 
     #[test]
     fn test_compare_content_identical() {
@@ -1352,9 +1330,7 @@ mod tests {
         assert!(!ops.is_empty());
     }
 
-    // ========================================================================
     // Encoding Detection Tests
-    // ========================================================================
 
     #[test]
     fn test_detect_encoding_utf8() {
@@ -1388,9 +1364,7 @@ mod tests {
         assert_eq!(encoding, Encoding::Utf8);
     }
 
-    // ========================================================================
     // Binary Detection Tests
-    // ========================================================================
 
     #[test]
     fn test_is_binary_null_bytes() {

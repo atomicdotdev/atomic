@@ -80,9 +80,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::Range;
 
-// ============================================================================
 // TOKENIZE OPTIONS
-// ============================================================================
 
 /// Options controlling tokenization behavior.
 ///
@@ -236,9 +234,7 @@ impl Default for TokenizeOptions {
     }
 }
 
-// ============================================================================
 // TOKENIZE ERROR
-// ============================================================================
 
 /// Errors that can occur during tokenization.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,9 +294,7 @@ impl fmt::Display for TokenizeError {
 
 impl std::error::Error for TokenizeError {}
 
-// ============================================================================
 // TOKENIZED TOKEN
-// ============================================================================
 
 /// A single token with its metadata.
 ///
@@ -401,9 +395,7 @@ impl fmt::Display for TokenizedToken {
     }
 }
 
-// ============================================================================
 // TOKENIZED LINE
-// ============================================================================
 
 /// A tokenized line with its tokens and metadata.
 ///
@@ -568,9 +560,7 @@ impl fmt::Display for TokenizedLine {
     }
 }
 
-// ============================================================================
 // TOKEN STATS
-// ============================================================================
 
 /// Statistics about tokenization results.
 ///
@@ -679,9 +669,7 @@ impl fmt::Display for TokenStats {
     }
 }
 
-// ============================================================================
 // CONTENT TOKENIZER
-// ============================================================================
 
 /// Main tokenizer for converting content bytes into tokenized lines.
 ///
@@ -903,9 +891,7 @@ impl<'a> ContentTokenizer<'a> {
     }
 }
 
-// ============================================================================
 // LINE ITERATOR
-// ============================================================================
 
 /// Iterator over tokenized lines.
 ///
@@ -981,9 +967,7 @@ impl<'a> LineIterator<'a> {
     }
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

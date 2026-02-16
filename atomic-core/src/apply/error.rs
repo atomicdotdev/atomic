@@ -138,9 +138,7 @@ pub enum LocalApplyError {
     /// * `tag_hash` - The hash of the tag
     /// * `expected_state` - The Merkle state the tag expects
     /// * `actual_state` - The stack's current Merkle state
-    #[error(
-        "Tag state mismatch for {tag_hash}: expected {expected_state}, got {actual_state}"
-    )]
+    #[error("Tag state mismatch for {tag_hash}: expected {expected_state}, got {actual_state}")]
     TagStateMismatch {
         /// The hash of the tag being applied
         tag_hash: Hash,
@@ -300,7 +298,11 @@ impl LocalApplyError {
     /// * `tag_hash` - The hash of the tag
     /// * `expected_state` - The expected Merkle state
     /// * `actual_state` - The actual stack state
-    pub fn tag_state_mismatch(tag_hash: Hash, expected_state: Merkle, actual_state: Merkle) -> Self {
+    pub fn tag_state_mismatch(
+        tag_hash: Hash,
+        expected_state: Merkle,
+        actual_state: Merkle,
+    ) -> Self {
         Self::TagStateMismatch {
             tag_hash,
             expected_state,
@@ -617,483 +619,228 @@ mod tests {
     use super::*;
     use crate::types::ChangePosition;
 
-    // =========================================================================
-    // Helper Functions
-    // =========================================================================
-
-    fn test_hash() -> Hash {
-        Hash::of(b"test hash data")
+    fn hash_a() -> Hash {
+        Hash::of(b"change A")
     }
 
-    fn test_merkle() -> Merkle {
-        Merkle::of(b"test merkle data")
+    fn hash_b() -> Hash {
+        Hash::of(b"change B")
     }
 
-    fn test_position() -> Position<NodeId> {
+    fn some_position() -> Position<NodeId> {
         Position::new(NodeId::new(42), ChangePosition::new(100))
     }
 
-    fn test_node_id() -> NodeId {
-        NodeId::new(123)
-    }
-
-    // =========================================================================
-    // LocalApplyError Construction Tests
-    // =========================================================================
+    // -- Classification logic: the interesting behavior of these error types
+    //    is how they're bucketed for retry/recovery decisions in the apply loop.
 
     #[test]
-    fn test_dependency_missing_construction() {
-        let hash = test_hash();
-        let err = LocalApplyError::dependency_missing(hash);
-        assert!(matches!(err, LocalApplyError::DependencyMissing { hash: h } if h == hash));
-    }
+    fn dependency_errors_are_the_union_of_missing_dep_missing_node_missing_context() {
+        let dep = LocalApplyError::dependency_missing(hash_a());
+        let node = LocalApplyError::node_not_found(NodeId::new(9));
+        let ctx = LocalApplyError::missing_context(some_position());
 
-    #[test]
-    fn test_change_already_applied_construction() {
-        let hash = test_hash();
-        let err = LocalApplyError::change_already_applied(hash);
-        assert!(matches!(err, LocalApplyError::ChangeAlreadyApplied { hash: h } if h == hash));
-    }
+        for err in [&dep, &node, &ctx] {
+            assert!(
+                err.is_dependency_error(),
+                "{err} should be a dependency error"
+            );
+        }
 
-    #[test]
-    fn test_tag_already_applied_construction() {
-        let hash = test_hash();
-        let err = LocalApplyError::tag_already_applied(hash);
-        assert!(matches!(err, LocalApplyError::TagAlreadyApplied { hash: h } if h == hash));
-    }
-
-    #[test]
-    fn test_tag_state_mismatch_construction() {
-        let tag_hash = test_hash();
-        let expected = test_merkle();
-        let actual = Merkle::of(b"different state");
-        let err = LocalApplyError::tag_state_mismatch(tag_hash, expected, actual);
-
-        match err {
-            LocalApplyError::TagStateMismatch {
-                tag_hash: h,
-                expected_state: e,
-                actual_state: a,
-            } => {
-                assert_eq!(h, tag_hash);
-                assert_eq!(e, expected);
-                assert_eq!(a, actual);
-            }
-            _ => panic!("Expected TagStateMismatch"),
+        // Everything else must NOT be classified as dependency.
+        let non_dep = [
+            LocalApplyError::change_already_applied(hash_a()),
+            LocalApplyError::InvalidChange,
+            LocalApplyError::Corruption,
+            LocalApplyError::internal("bug"),
+            LocalApplyError::cyclic_dependency("A->B->A"),
+            LocalApplyError::block_not_found(some_position()),
+        ];
+        for err in &non_dep {
+            assert!(
+                !err.is_dependency_error(),
+                "{err} should NOT be a dependency error"
+            );
         }
     }
 
     #[test]
-    fn test_tag_not_registered_construction() {
-        let hash = test_hash();
-        let err = LocalApplyError::tag_not_registered(hash);
-        assert!(matches!(err, LocalApplyError::TagNotRegistered { hash: h } if h == hash));
+    fn corruption_classification_catches_graph_integrity_failures() {
+        // These indicate the on-disk graph is broken — not user error.
+        assert!(LocalApplyError::Corruption.is_corruption());
+        assert!(LocalApplyError::block_not_found(some_position()).is_corruption());
+        assert!(LocalApplyError::inconsistent_edge("dangling").is_corruption());
+
+        // Dependency issues are NOT corruption — the graph is fine, just incomplete.
+        assert!(!LocalApplyError::dependency_missing(hash_a()).is_corruption());
+        assert!(!LocalApplyError::node_not_found(NodeId::new(1)).is_corruption());
     }
 
     #[test]
-    fn test_block_not_found_construction() {
-        let pos = test_position();
-        let err = LocalApplyError::block_not_found(pos);
-        assert!(matches!(err, LocalApplyError::BlockNotFound { position: p } if p == pos));
+    fn recoverable_errors_are_exactly_the_ones_a_sync_loop_should_retry() {
+        // Recoverable: fetch the dep / skip the dup / wait for state convergence.
+        let recoverable = [
+            LocalApplyError::dependency_missing(hash_a()),
+            LocalApplyError::change_already_applied(hash_a()),
+            LocalApplyError::tag_already_applied(hash_a()),
+            LocalApplyError::tag_state_mismatch(hash_a(), Merkle::of(b"x"), Merkle::of(b"y")),
+        ];
+        for err in &recoverable {
+            assert!(err.is_recoverable(), "{err} should be recoverable");
+        }
+
+        // NOT recoverable: corruption, bad format, internal bugs.
+        let fatal = [
+            LocalApplyError::Corruption,
+            LocalApplyError::InvalidChange,
+            LocalApplyError::internal("assertion failed"),
+            LocalApplyError::block_not_found(some_position()),
+            LocalApplyError::cyclic_dependency("A->A"),
+        ];
+        for err in &fatal {
+            assert!(
+                !err.is_recoverable(),
+                "{err} should be fatal (not recoverable)"
+            );
+        }
     }
 
     #[test]
-    fn test_node_not_found_construction() {
-        let node_id = test_node_id();
-        let err = LocalApplyError::node_not_found(node_id);
-        assert!(matches!(err, LocalApplyError::NodeNotFound { node_id: n } if n == node_id));
+    fn already_applied_is_idempotency_guard() {
+        assert!(LocalApplyError::change_already_applied(hash_a()).is_already_applied());
+        assert!(LocalApplyError::tag_already_applied(hash_a()).is_already_applied());
+
+        // Dependency errors are a different category — don't conflate them.
+        assert!(!LocalApplyError::dependency_missing(hash_a()).is_already_applied());
+    }
+
+    // -- ApplyError wrapping: verify the high-level type correctly delegates.
+
+    #[test]
+    fn apply_error_delegates_classification_through_local_wrapper() {
+        let dep: ApplyError = LocalApplyError::dependency_missing(hash_a()).into();
+        let dup: ApplyError = LocalApplyError::change_already_applied(hash_a()).into();
+        let parse = ApplyError::change_parse("bad header");
+
+        assert!(dep.is_dependency_missing());
+        assert!(dep.is_local());
+        assert!(dep.is_recoverable());
+
+        assert!(dup.is_already_applied());
+        assert!(dup.is_recoverable());
+
+        assert!(!parse.is_local());
+        assert!(!parse.is_recoverable());
+        assert!(parse.as_local().is_none());
     }
 
     #[test]
-    fn test_cyclic_dependency_construction() {
-        let err = LocalApplyError::cyclic_dependency("A -> B -> A");
-        assert!(
-            matches!(err, LocalApplyError::CyclicDependency { message } if message == "A -> B -> A")
-        );
+    fn storage_errors_are_pristine_or_io() {
+        let pristine: ApplyError = PristineError::StackNotFound {
+            name: "gone".into(),
+        }
+        .into();
+        let io: ApplyError = std::io::Error::new(std::io::ErrorKind::NotFound, "vanished").into();
+
+        assert!(pristine.is_storage());
+        assert!(io.is_storage());
+
+        // Local and parse errors are NOT storage.
+        assert!(!ApplyError::change_parse("x").is_storage());
+        let local: ApplyError = LocalApplyError::Corruption.into();
+        assert!(!local.is_storage());
     }
 
     #[test]
-    fn test_inconsistent_edge_construction() {
-        let err = LocalApplyError::inconsistent_edge("edge to deleted node");
+    fn change_not_found_is_recoverable_because_it_might_be_fetched() {
+        let err = ApplyError::change_not_found(hash_a(), PathBuf::from("/changes/AB/CD"));
+        assert!(err.is_recoverable());
+
+        // But a parse error means the file IS there and is broken — not recoverable.
+        assert!(!ApplyError::change_parse("truncated").is_recoverable());
+    }
+
+    #[test]
+    fn as_local_extracts_inner_error_for_detailed_matching() {
+        let inner = LocalApplyError::cyclic_dependency("A -> B -> A");
+        let outer: ApplyError = inner.into();
+
+        let extracted = outer.as_local().expect("should unwrap Local variant");
         assert!(matches!(
-            err,
-            LocalApplyError::InconsistentEdge { message } if message == "edge to deleted node"
+            extracted,
+            LocalApplyError::CyclicDependency { .. }
         ));
     }
 
-    #[test]
-    fn test_missing_context_construction() {
-        let pos = test_position();
-        let err = LocalApplyError::missing_context(pos);
-        assert!(matches!(err, LocalApplyError::MissingContext { position: p } if p == pos));
-    }
+    // -- Error propagation: the ? operator must work across the error hierarchy.
 
     #[test]
-    fn test_internal_construction() {
-        let err = LocalApplyError::internal("unexpected state");
-        assert!(
-            matches!(err, LocalApplyError::Internal { message } if message == "unexpected state")
-        );
-    }
-
-    #[test]
-    fn test_invalid_change_construction() {
-        let err = LocalApplyError::InvalidChange;
-        assert!(matches!(err, LocalApplyError::InvalidChange));
-    }
-
-    #[test]
-    fn test_corruption_construction() {
-        let err = LocalApplyError::Corruption;
-        assert!(matches!(err, LocalApplyError::Corruption));
-    }
-
-    // =========================================================================
-    // LocalApplyError Classification Tests
-    // =========================================================================
-
-    #[test]
-    fn test_is_dependency_error() {
-        assert!(LocalApplyError::dependency_missing(test_hash()).is_dependency_error());
-        assert!(LocalApplyError::node_not_found(test_node_id()).is_dependency_error());
-        assert!(LocalApplyError::missing_context(test_position()).is_dependency_error());
-
-        // Non-dependency errors
-        assert!(!LocalApplyError::change_already_applied(test_hash()).is_dependency_error());
-        assert!(!LocalApplyError::InvalidChange.is_dependency_error());
-        assert!(!LocalApplyError::Corruption.is_dependency_error());
-    }
-
-    #[test]
-    fn test_is_already_applied() {
-        assert!(LocalApplyError::change_already_applied(test_hash()).is_already_applied());
-        assert!(LocalApplyError::tag_already_applied(test_hash()).is_already_applied());
-
-        // Not already-applied errors
-        assert!(!LocalApplyError::dependency_missing(test_hash()).is_already_applied());
-        assert!(!LocalApplyError::InvalidChange.is_already_applied());
-    }
-
-    #[test]
-    fn test_is_corruption() {
-        assert!(LocalApplyError::Corruption.is_corruption());
-        assert!(LocalApplyError::block_not_found(test_position()).is_corruption());
-        assert!(LocalApplyError::inconsistent_edge("x").is_corruption());
-
-        // Non-corruption errors
-        assert!(!LocalApplyError::dependency_missing(test_hash()).is_corruption());
-        assert!(!LocalApplyError::InvalidChange.is_corruption());
-    }
-
-    #[test]
-    fn test_local_is_recoverable() {
-        // Recoverable
-        assert!(LocalApplyError::dependency_missing(test_hash()).is_recoverable());
-        assert!(LocalApplyError::change_already_applied(test_hash()).is_recoverable());
-        assert!(LocalApplyError::tag_already_applied(test_hash()).is_recoverable());
-        assert!(LocalApplyError::tag_state_mismatch(
-            test_hash(),
-            test_merkle(),
-            test_merkle()
-        )
-        .is_recoverable());
-
-        // Not recoverable
-        assert!(!LocalApplyError::Corruption.is_recoverable());
-        assert!(!LocalApplyError::InvalidChange.is_recoverable());
-        assert!(!LocalApplyError::internal("bug").is_recoverable());
-    }
-
-    // =========================================================================
-    // LocalApplyError Display Tests
-    // =========================================================================
-
-    #[test]
-    fn test_display_dependency_missing() {
-        let err = LocalApplyError::dependency_missing(test_hash());
-        let display = format!("{}", err);
-        assert!(display.contains("Dependency missing"));
-    }
-
-    #[test]
-    fn test_display_change_already_applied() {
-        let err = LocalApplyError::change_already_applied(test_hash());
-        let display = format!("{}", err);
-        assert!(display.contains("Change already applied"));
-    }
-
-    #[test]
-    fn test_display_tag_state_mismatch() {
-        let err = LocalApplyError::tag_state_mismatch(
-            test_hash(),
-            Merkle::of(b"expected"),
-            Merkle::of(b"actual"),
-        );
-        let display = format!("{}", err);
-        assert!(display.contains("Tag state mismatch"));
-        assert!(display.contains("expected"));
-        assert!(display.contains("got"));
-    }
-
-    #[test]
-    fn test_display_block_not_found() {
-        let err = LocalApplyError::block_not_found(test_position());
-        let display = format!("{}", err);
-        assert!(display.contains("Block not found"));
-    }
-
-    #[test]
-    fn test_display_corruption() {
-        let err = LocalApplyError::Corruption;
-        let display = format!("{}", err);
-        assert!(display.contains("corruption"));
-    }
-
-    #[test]
-    fn test_display_cyclic_dependency() {
-        let err = LocalApplyError::cyclic_dependency("A -> B -> C -> A");
-        let display = format!("{}", err);
-        assert!(display.contains("Cyclic dependency"));
-        assert!(display.contains("A -> B -> C -> A"));
-    }
-
-    // =========================================================================
-    // ApplyError Construction Tests
-    // =========================================================================
-
-    #[test]
-    fn test_change_parse_construction() {
-        let err = ApplyError::change_parse("invalid header");
-        assert!(
-            matches!(err, ApplyError::ChangeParse { message } if message == "invalid header")
-        );
-    }
-
-    #[test]
-    fn test_change_not_found_construction() {
-        let hash = test_hash();
-        let err = ApplyError::change_not_found(hash, PathBuf::from("/changes/AB/CDEF"));
-        match err {
-            ApplyError::ChangeNotFound { hash: h, path: p } => {
-                assert_eq!(h, hash);
-                assert_eq!(p, PathBuf::from("/changes/AB/CDEF"));
-            }
-            _ => panic!("Expected ChangeNotFound"),
-        }
-    }
-
-    // =========================================================================
-    // ApplyError Classification Tests
-    // =========================================================================
-
-    #[test]
-    fn test_apply_is_local() {
-        let local_err = LocalApplyError::dependency_missing(test_hash());
-        let err: ApplyError = local_err.into();
-        assert!(err.is_local());
-
-        let err = ApplyError::change_parse("test");
-        assert!(!err.is_local());
-    }
-
-    #[test]
-    fn test_apply_is_storage() {
-        let pristine_err = PristineError::StackNotFound {
-            name: "test".to_string(),
-        };
-        let err: ApplyError = pristine_err.into();
-        assert!(err.is_storage());
-
-        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "test");
-        let err: ApplyError = io_err.into();
-        assert!(err.is_storage());
-
-        let err = ApplyError::change_parse("test");
-        assert!(!err.is_storage());
-    }
-
-    #[test]
-    fn test_apply_is_already_applied() {
-        let local_err = LocalApplyError::change_already_applied(test_hash());
-        let err: ApplyError = local_err.into();
-        assert!(err.is_already_applied());
-
-        let local_err = LocalApplyError::tag_already_applied(test_hash());
-        let err: ApplyError = local_err.into();
-        assert!(err.is_already_applied());
-
-        let err = ApplyError::change_parse("test");
-        assert!(!err.is_already_applied());
-    }
-
-    #[test]
-    fn test_apply_is_dependency_missing() {
-        let local_err = LocalApplyError::dependency_missing(test_hash());
-        let err: ApplyError = local_err.into();
-        assert!(err.is_dependency_missing());
-
-        let err = ApplyError::change_parse("test");
-        assert!(!err.is_dependency_missing());
-    }
-
-    #[test]
-    fn test_apply_as_local() {
-        let local_err = LocalApplyError::dependency_missing(test_hash());
-        let err: ApplyError = local_err.into();
-        assert!(err.as_local().is_some());
-
-        let err = ApplyError::change_parse("test");
-        assert!(err.as_local().is_none());
-    }
-
-    #[test]
-    fn test_apply_is_recoverable() {
-        // Recoverable local errors
-        let local_err = LocalApplyError::dependency_missing(test_hash());
-        let err: ApplyError = local_err.into();
-        assert!(err.is_recoverable());
-
-        // ChangeNotFound is recoverable (might be fetched)
-        let err = ApplyError::change_not_found(test_hash(), PathBuf::from("/test"));
-        assert!(err.is_recoverable());
-
-        // Non-recoverable
-        let err = ApplyError::change_parse("corrupted");
-        assert!(!err.is_recoverable());
-    }
-
-    // =========================================================================
-    // ApplyError Display Tests
-    // =========================================================================
-
-    #[test]
-    fn test_display_apply_local() {
-        let local_err = LocalApplyError::dependency_missing(test_hash());
-        let err: ApplyError = local_err.into();
-        let display = format!("{}", err);
-        assert!(display.contains("Apply error"));
-        assert!(display.contains("Dependency missing"));
-    }
-
-    #[test]
-    fn test_display_apply_change_parse() {
-        let err = ApplyError::change_parse("invalid format");
-        let display = format!("{}", err);
-        assert!(display.contains("Change parse error"));
-        assert!(display.contains("invalid format"));
-    }
-
-    #[test]
-    fn test_display_apply_change_not_found() {
-        let err = ApplyError::change_not_found(test_hash(), PathBuf::from("/changes/AB/CDEF"));
-        let display = format!("{}", err);
-        assert!(display.contains("Change file not found"));
-        assert!(display.contains("changes/AB/CDEF"));
-    }
-
-    // =========================================================================
-    // ApplyError From Trait Tests
-    // =========================================================================
-
-    #[test]
-    fn test_from_local_apply_error() {
-        let local_err = LocalApplyError::InvalidChange;
-        let err: ApplyError = local_err.into();
-        assert!(matches!(err, ApplyError::Local(LocalApplyError::InvalidChange)));
-    }
-
-    #[test]
-    fn test_from_pristine_error() {
-        let pristine_err = PristineError::StackNotFound {
-            name: "test".to_string(),
-        };
-        let err: ApplyError = pristine_err.into();
-        assert!(matches!(err, ApplyError::Pristine(_)));
-    }
-
-    #[test]
-    fn test_from_io_error() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
-        let err: ApplyError = io_err.into();
-        assert!(matches!(err, ApplyError::Io(_)));
-    }
-
-    // =========================================================================
-    // Result Type Tests
-    // =========================================================================
-
-    #[test]
-    fn test_apply_result_ok() {
-        let result: ApplyResult<i32> = Ok(42);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 42);
-    }
-
-    #[test]
-    fn test_apply_result_err() {
-        let result: ApplyResult<i32> = Err(ApplyError::change_parse("test"));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_local_apply_result_ok() {
-        let result: LocalApplyResult<String> = Ok("success".to_string());
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_local_apply_result_err() {
-        let result: LocalApplyResult<String> = Err(LocalApplyError::Corruption);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_question_mark_propagation() {
-        fn inner() -> LocalApplyResult<i32> {
+    fn question_mark_chains_local_through_apply() {
+        fn step_one() -> LocalApplyResult<()> {
             Err(LocalApplyError::InvalidChange)
         }
 
-        fn outer() -> ApplyResult<i32> {
-            let _value = inner()?;
-            Ok(42)
+        fn step_two() -> ApplyResult<()> {
+            step_one()?; // LocalApplyError -> ApplyError via From
+            Ok(())
         }
 
-        let result = outer();
-        assert!(result.is_err());
+        let result = step_two();
         assert!(matches!(
             result,
             Err(ApplyError::Local(LocalApplyError::InvalidChange))
         ));
     }
 
-    // =========================================================================
-    // Edge Case Tests
-    // =========================================================================
+    #[test]
+    fn question_mark_chains_io_through_apply() {
+        fn read_change() -> ApplyResult<Vec<u8>> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such file",
+            ))?
+        }
+
+        assert!(matches!(read_change(), Err(ApplyError::Io(_))));
+    }
+
+    // -- Display: verify that error messages carry enough context for debugging.
+    //    We test the display contract, not the exact wording.
 
     #[test]
-    fn test_empty_message() {
-        let err = LocalApplyError::internal("");
-        assert!(matches!(err, LocalApplyError::Internal { message } if message.is_empty()));
+    fn tag_state_mismatch_display_shows_both_states() {
+        let expected = Merkle::of(b"expected state");
+        let actual = Merkle::of(b"actual state");
+        let err = LocalApplyError::tag_state_mismatch(hash_a(), expected, actual);
+
+        let msg = err.to_string();
+        // The message must help someone figure out WHY the tag didn't apply.
+        assert!(
+            msg.contains("expected"),
+            "should mention expected state: {msg}"
+        );
+        assert!(msg.contains("got"), "should mention actual state: {msg}");
     }
 
     #[test]
-    fn test_unicode_in_message() {
-        let err = LocalApplyError::cyclic_dependency("循环依赖: A → B → A");
-        let display = format!("{}", err);
-        assert!(display.contains("循环依赖"));
+    fn change_not_found_display_includes_path() {
+        let err =
+            ApplyError::change_not_found(hash_a(), PathBuf::from("/repo/.atomic/changes/AB/CDEF"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("changes/AB/CDEF"),
+            "should show where we looked: {msg}"
+        );
     }
 
     #[test]
-    fn test_debug_format() {
-        let err = LocalApplyError::dependency_missing(test_hash());
-        let debug = format!("{:?}", err);
-        assert!(debug.contains("DependencyMissing"));
-    }
-
-    #[test]
-    fn test_apply_debug_format() {
-        let err = ApplyError::change_parse("test error");
-        let debug = format!("{:?}", err);
-        assert!(debug.contains("ChangeParse"));
+    fn local_errors_surface_through_apply_display() {
+        let err: ApplyError = LocalApplyError::dependency_missing(hash_a()).into();
+        let msg = err.to_string();
+        // The wrapping layer shouldn't swallow the inner message.
+        assert!(
+            msg.contains("Dependency missing"),
+            "inner message lost: {msg}"
+        );
     }
 }

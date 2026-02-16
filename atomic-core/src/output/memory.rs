@@ -91,9 +91,7 @@ use std::io::{self, Cursor, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
-// ============================================================================
 // ERROR TYPE
-// ============================================================================
 
 /// Error type for memory working copy operations.
 ///
@@ -153,9 +151,7 @@ impl std::fmt::Display for MemoryError {
 
 impl std::error::Error for MemoryError {}
 
-// ============================================================================
 // MEMORY FILE ENTRY
-// ============================================================================
 
 /// An in-memory file or directory entry.
 #[derive(Debug, Clone)]
@@ -192,9 +188,7 @@ impl MemoryFile {
     }
 }
 
-// ============================================================================
 // MEMORY WRITER
-// ============================================================================
 
 /// A writer that captures content and writes it to the memory working copy
 /// when dropped or explicitly flushed.
@@ -238,9 +232,7 @@ impl Drop for MemoryWriter {
     }
 }
 
-// ============================================================================
 // MEMORY WORKING COPY
-// ============================================================================
 
 /// An in-memory working copy implementation.
 ///
@@ -506,9 +498,7 @@ impl std::fmt::Debug for Memory {
     }
 }
 
-// ============================================================================
 // TRAIT IMPLEMENTATIONS
-// ============================================================================
 
 impl WorkingCopyRead for Memory {
     type Error = MemoryError;
@@ -696,9 +686,7 @@ impl WorkingCopy for Memory {
     }
 }
 
-// ============================================================================
 // HELPER FUNCTIONS
-// ============================================================================
 
 /// Get the parent path of a file path.
 ///
@@ -711,9 +699,7 @@ fn path_parent(path: &str) -> Option<String> {
     }
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

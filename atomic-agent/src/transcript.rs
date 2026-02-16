@@ -92,9 +92,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AgentError, AgentResult};
 
-// =============================================================================
 // Condensed Transcript
-// =============================================================================
 
 /// The type of a transcript entry.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -211,9 +209,7 @@ impl fmt::Display for CondensedEntry {
     }
 }
 
-// =============================================================================
 // Transcript Parsing (Claude Code JSONL)
-// =============================================================================
 
 /// Tools that should show only minimal detail (path/URL, not content).
 const MINIMAL_DETAIL_TOOLS: &[&str] = &["Read", "Skill", "WebFetch"];
@@ -374,9 +370,7 @@ pub fn aggregate_tool_usage(entries: &[CondensedEntry]) -> Vec<ToolUseSummary> {
     result
 }
 
-// =============================================================================
 // Claude Code JSONL Types (internal)
-// =============================================================================
 
 /// A single line in a Claude Code JSONL transcript.
 #[derive(Debug, Deserialize)]
@@ -484,9 +478,7 @@ fn extract_tool_detail(tool_name: &str, input: &serde_json::Value) -> Option<Str
         .or(parsed.pattern)
 }
 
-// =============================================================================
 // AI-Generated Reasoning Summary
-// =============================================================================
 
 /// AI-generated reasoning summary for a turn.
 ///
@@ -727,9 +719,7 @@ impl fmt::Display for CodeLearning {
     }
 }
 
-// =============================================================================
 // Graph Anchor (invisible to users)
-// =============================================================================
 
 /// CRDT graph references that keep a learning anchored to specific code.
 ///
@@ -841,9 +831,7 @@ pub fn anchor_to_graph(learnings: &mut [CodeLearning], file_ops: &[atomic_core::
     }
 }
 
-// =============================================================================
 // Reasoning Generator Trait + Claude CLI Implementation
-// =============================================================================
 
 /// The summarization prompt template.
 ///
@@ -1242,9 +1230,7 @@ pub fn try_generate_reasoning(condensed_text: &str, files: &[String]) -> Option<
     }
 }
 
-// =============================================================================
 // Mock Generator (for testing)
-// =============================================================================
 
 /// A mock reasoning generator for testing.
 ///
@@ -1282,9 +1268,7 @@ impl ReasoningGenerator for MockGenerator {
     }
 }
 
-// =============================================================================
 // CRDT Anchor Helpers
-// =============================================================================
 
 /// Extract the (change_id, leaf_idx) tuple from a LeafOp, if it references an existing leaf.
 ///
@@ -1295,9 +1279,7 @@ fn leaf_op_id(op: &atomic_core::crdt::LeafOp) -> Option<(u64, u32)> {
         .map(|lid| (lid.change_id().get(), lid.leaf_idx()))
 }
 
-// =============================================================================
 // Tool Usage Summary
-// =============================================================================
 
 /// Aggregated tool usage for a turn.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1334,9 +1316,7 @@ impl fmt::Display for ToolUseSummary {
     }
 }
 
-// =============================================================================
 // Unhashed Turn Data
-// =============================================================================
 
 /// The top-level unhashed data for an agent turn.
 ///
@@ -1441,9 +1421,7 @@ impl UnhashedTurnData {
     }
 }
 
-// =============================================================================
 // Attach / Extract / Strip operations on Change.unhashed
-// =============================================================================
 
 /// The JSON key used to store agent turn data in `change.unhashed`.
 pub const UNHASHED_KEY: &str = "agent_turn";
@@ -1546,17 +1524,13 @@ pub fn is_redacted(change: &atomic_core::change::Change) -> bool {
         .unwrap_or(false)
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // CondensedEntry
-    // =========================================================================
 
     #[test]
     fn test_entry_user() {
@@ -1625,9 +1599,7 @@ mod tests {
         assert_eq!(entries, parsed);
     }
 
-    // =========================================================================
     // Transcript parsing (Claude Code JSONL)
-    // =========================================================================
 
     #[test]
     fn test_condense_empty() {
@@ -1714,9 +1686,7 @@ mod tests {
         assert!(entries.is_empty());
     }
 
-    // =========================================================================
     // format_condensed
-    // =========================================================================
 
     #[test]
     fn test_format_condensed_empty() {
@@ -1744,9 +1714,7 @@ mod tests {
         assert!(text.contains("- src/main.rs"));
     }
 
-    // =========================================================================
     // extract_prompts
-    // =========================================================================
 
     #[test]
     fn test_extract_prompts() {
@@ -1767,9 +1735,7 @@ mod tests {
         assert!(prompts.is_empty());
     }
 
-    // =========================================================================
     // aggregate_tool_usage
-    // =========================================================================
 
     #[test]
     fn test_aggregate_tool_usage() {
@@ -1814,9 +1780,7 @@ mod tests {
         assert_eq!(tools[1].tool_name, "Zzz");
     }
 
-    // =========================================================================
     // TurnReasoning
-    // =========================================================================
 
     #[test]
     fn test_reasoning_empty() {
@@ -1889,9 +1853,7 @@ mod tests {
         assert_eq!(r, parsed);
     }
 
-    // =========================================================================
     // CodeLearning
-    // =========================================================================
 
     #[test]
     fn test_code_learning_minimal() {
@@ -1980,9 +1942,7 @@ mod tests {
         assert!(!parsed.is_anchored());
     }
 
-    // =========================================================================
     // GraphAnchor
-    // =========================================================================
 
     #[test]
     fn test_anchor_empty() {
@@ -2010,9 +1970,7 @@ mod tests {
         assert!(a.is_populated());
     }
 
-    // =========================================================================
     // ToolUseSummary
-    // =========================================================================
 
     #[test]
     fn test_tool_summary_display() {
@@ -2026,9 +1984,7 @@ mod tests {
         assert_eq!(s.to_string(), "Bash (×1)");
     }
 
-    // =========================================================================
     // UnhashedTurnData
-    // =========================================================================
 
     #[test]
     fn test_unhashed_new() {
@@ -2085,9 +2041,7 @@ mod tests {
         assert_eq!(data, parsed);
     }
 
-    // =========================================================================
     // Attach / Extract / Strip
-    // =========================================================================
 
     fn make_empty_change() -> atomic_core::change::Change {
         atomic_core::change::Change::empty(atomic_core::change::ChangeHeader::default())
@@ -2174,9 +2128,7 @@ mod tests {
         assert_eq!(hash_before, hash_after_strip);
     }
 
-    // =========================================================================
     // Learnings
-    // =========================================================================
 
     #[test]
     fn test_learnings_empty() {
@@ -2196,9 +2148,7 @@ mod tests {
         assert!(!l.is_empty());
     }
 
-    // =========================================================================
     // EntryType
-    // =========================================================================
 
     #[test]
     fn test_entry_type_display() {
@@ -2215,9 +2165,7 @@ mod tests {
         assert_eq!(parsed, EntryType::User);
     }
 
-    // =========================================================================
     // strip_markdown_code_blocks
-    // =========================================================================
 
     #[test]
     fn test_strip_no_blocks() {
@@ -2252,9 +2200,7 @@ mod tests {
         assert!(result.contains("intent"));
     }
 
-    // =========================================================================
     // truncate_for_error
-    // =========================================================================
 
     #[test]
     fn test_truncate_short() {
@@ -2275,9 +2221,7 @@ mod tests {
         assert_eq!(truncate_for_error(&s, 50), s);
     }
 
-    // =========================================================================
     // ClaudeCliGenerator construction
-    // =========================================================================
 
     #[test]
     fn test_generator_default() {
@@ -2333,9 +2277,7 @@ mod tests {
         assert!(debug.contains("ClaudeCliGenerator"));
     }
 
-    // =========================================================================
     // MockGenerator
-    // =========================================================================
 
     #[test]
     fn test_mock_generator_success() {
@@ -2360,9 +2302,7 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("LLM unavailable"));
     }
 
-    // =========================================================================
     // ReasoningGenerator trait object safety
-    // =========================================================================
 
     #[test]
     fn test_generator_is_object_safe() {
@@ -2378,9 +2318,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // =========================================================================
     // try_generate_reasoning (non-fatal wrapper)
-    // =========================================================================
 
     #[test]
     fn test_try_generate_no_claude() {
@@ -2389,9 +2327,7 @@ mod tests {
         assert!(!gen.is_available());
     }
 
-    // =========================================================================
     // SUMMARIZATION_PROMPT
-    // =========================================================================
 
     #[test]
     fn test_prompt_has_required_fields() {
@@ -2418,9 +2354,7 @@ mod tests {
         assert!(SUMMARIZATION_PROMPT.contains("</transcript>"));
     }
 
-    // =========================================================================
     // End-to-end: parse prompt response (simulated)
-    // =========================================================================
 
     #[test]
     fn test_parse_claude_response_format() {

@@ -65,9 +65,7 @@ use crate::crdt::{
 use crate::pristine::{MutTxnT, PristineResult};
 use crate::types::{GraphNode, NodeId};
 
-// =============================================================================
 // Statistics
-// =============================================================================
 
 /// Statistics from applying FileOps to CRDT tables.
 #[derive(Debug, Clone, Default)]
@@ -121,9 +119,7 @@ impl ApplyFileOpsStats {
     }
 }
 
-// =============================================================================
 // Apply Functions
-// =============================================================================
 
 /// Apply all FileOps from a change to the CRDT tables.
 ///
@@ -351,9 +347,7 @@ fn encoding_to_u8(encoding: Option<&Encoding>) -> u8 {
     }
 }
 
-// =============================================================================
 // Low-Level Table Operations
-// =============================================================================
 
 /// Store a trunk in the CRDT tables.
 fn put_trunk<T: MutTxnT>(
@@ -524,9 +518,7 @@ fn update_leaf_content<T: MutTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

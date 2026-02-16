@@ -31,9 +31,7 @@ impl ReadTxn {
     }
 }
 
-// =============================================================================
 // GraphTxnT Implementation
-// =============================================================================
 
 impl GraphTxnT for ReadTxn {
     type Adj = AdjIterator;
@@ -233,9 +231,7 @@ impl GraphTxnT for ReadTxn {
     }
 }
 
-// =============================================================================
 // StackTxnT Implementation
-// =============================================================================
 
 impl StackTxnT for ReadTxn {
     fn get_stack(&self, name: &str) -> PristineResult<Option<StackState>> {
@@ -321,9 +317,7 @@ impl StackTxnT for ReadTxn {
     }
 }
 
-// =============================================================================
 // TreeTxnT Implementation
-// =============================================================================
 
 impl TreeTxnT for ReadTxn {
     fn get_inode(&self, path: &str) -> PristineResult<Option<Inode>> {

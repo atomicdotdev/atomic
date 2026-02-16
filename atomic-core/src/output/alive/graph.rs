@@ -65,9 +65,7 @@ use super::vertex::{AliveVertex, VertexFlags, VertexId};
 #[allow(unused_imports)]
 use crate::types::{GraphNode, NodeId, SerializedGraphEdge};
 
-// ============================================================================
 // ALIVE GRAPH
-// ============================================================================
 
 /// A graph of alive vertices for file content output.
 ///
@@ -419,9 +417,7 @@ impl std::ops::IndexMut<VertexId> for AliveGraph {
     }
 }
 
-// ============================================================================
 // GRAPH STATISTICS
-// ============================================================================
 
 /// Statistics about an alive graph.
 ///
@@ -479,9 +475,7 @@ impl std::fmt::Display for GraphStats {
     }
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

@@ -309,7 +309,7 @@ impl AssemblyOptions {
     #[must_use]
     pub fn include_empty_files(mut self, include: bool) -> Self {
         self.include_empty_files = include;
-        self.globalize_options = self.globalize_options.include_empty_files(include);
+        self.globalize_options = self.globalize_options.with_include_empty_files(include);
         self
     }
 

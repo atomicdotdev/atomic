@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The `status` command for showing the working copy state.
 //!
 //! This module implements the `atomic status` command, which displays
@@ -105,7 +104,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use atomic_core::types::Base32;
-use atomic_repository::status::{FileStatus, RepositoryStatus, StatusOptions};
+use atomic_repository::status::{RepositoryStatus, StatusOptions};
 use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command, DEFAULT_HASH_LENGTH};
@@ -115,64 +114,9 @@ use crate::output::{
     print_hint, print_section, stack as style_stack, untracked as style_untracked, warning,
 };
 
-// =============================================================================
 // Status Output Configuration
-// =============================================================================
 
-/// Configuration for status output formatting.
-///
-/// This struct controls how status information is displayed to the user,
-/// including format selection and filtering options.
-#[derive(Debug, Clone)]
-pub struct StatusOutputConfig {
-    /// Use short (porcelain) format instead of long format.
-    pub short: bool,
-
-    /// Hide untracked files from output.
-    pub no_untracked: bool,
-
-    /// Filter to a specific path prefix.
-    pub path_filter: Option<String>,
-}
-
-impl Default for StatusOutputConfig {
-    fn default() -> Self {
-        Self {
-            short: false,
-            no_untracked: false,
-            path_filter: None,
-        }
-    }
-}
-
-impl StatusOutputConfig {
-    /// Create a new configuration with default settings.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Enable short format output.
-    pub fn short(mut self) -> Self {
-        self.short = true;
-        self
-    }
-
-    /// Disable untracked file display.
-    pub fn hide_untracked(mut self) -> Self {
-        self.no_untracked = true;
-        self
-    }
-
-    /// Filter to a specific path.
-    pub fn filter_path(mut self, path: impl Into<String>) -> Self {
-        self.path_filter = Some(path.into());
-        self
-    }
-}
-
-// =============================================================================
 // Status Command
-// =============================================================================
 
 /// Show the status of the working copy.
 ///
@@ -250,24 +194,6 @@ impl Status {
             no_untracked: false,
             debug_ignore: false,
         }
-    }
-
-    /// Set the path filter.
-    pub fn with_path(mut self, path: impl Into<String>) -> Self {
-        self.path = Some(path.into());
-        self
-    }
-
-    /// Enable short format output.
-    pub fn with_short(mut self, short: bool) -> Self {
-        self.short = short;
-        self
-    }
-
-    /// Set whether to hide untracked files.
-    pub fn with_no_untracked(mut self, no_untracked: bool) -> Self {
-        self.no_untracked = no_untracked;
-        self
     }
 
     /// Get status options based on command settings.
@@ -547,84 +473,9 @@ impl Command for Status {
     }
 }
 
-// =============================================================================
 // Helper Functions
-// =============================================================================
 
-/// Get the status code character for a file status.
-///
-/// Returns the single-character code used in short format output.
-///
-/// # Arguments
-///
-/// * `status` - The file status to get the code for
-///
-/// # Returns
-///
-/// A single character representing the status.
-pub fn status_code(status: FileStatus) -> char {
-    match status {
-        FileStatus::Clean => ' ',
-        FileStatus::Modified => 'M',
-        FileStatus::Deleted => 'D',
-        FileStatus::Untracked => '?',
-        FileStatus::Added => 'A',
-        FileStatus::Conflicted => 'C',
-        FileStatus::TypeChanged => 'T',
-        FileStatus::PermissionsChanged => 'P',
-    }
-}
-
-/// Get the display name for a file status.
-///
-/// Returns a human-readable description of the status for long format output.
-///
-/// # Arguments
-///
-/// * `status` - The file status to describe
-///
-/// # Returns
-///
-/// A string describing the status.
-pub fn status_description(status: FileStatus) -> &'static str {
-    match status {
-        FileStatus::Clean => "clean",
-        FileStatus::Modified => "modified",
-        FileStatus::Deleted => "deleted",
-        FileStatus::Untracked => "untracked",
-        FileStatus::Added => "new file",
-        FileStatus::Conflicted => "conflict",
-        FileStatus::TypeChanged => "type changed",
-        FileStatus::PermissionsChanged => "permissions",
-    }
-}
-
-/// Check if status indicates a file needs to be recorded.
-///
-/// Returns `true` if the status represents a change that should be
-/// included in the next record operation.
-///
-/// # Arguments
-///
-/// * `status` - The file status to check
-///
-/// # Returns
-///
-/// `true` if the file has recordable changes.
-pub fn is_recordable(status: FileStatus) -> bool {
-    matches!(
-        status,
-        FileStatus::Modified
-            | FileStatus::Deleted
-            | FileStatus::Added
-            | FileStatus::TypeChanged
-            | FileStatus::PermissionsChanged
-    )
-}
-
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -633,9 +484,7 @@ mod tests {
     use atomic_repository::status::FileStatusEntry;
     use std::path::PathBuf;
 
-    // =========================================================================
     // Status Command Construction Tests
-    // =========================================================================
 
     #[test]
     fn test_status_new() {
@@ -683,9 +532,7 @@ mod tests {
         assert!(status.no_untracked);
     }
 
-    // =========================================================================
     // StatusOutputConfig Tests
-    // =========================================================================
 
     #[test]
     fn test_output_config_new() {
@@ -733,9 +580,7 @@ mod tests {
         assert_eq!(config.path_filter, Some("tests/".to_string()));
     }
 
-    // =========================================================================
     // Status Options Conversion Tests
-    // =========================================================================
 
     #[test]
     fn test_get_status_options_default() {
@@ -758,9 +603,7 @@ mod tests {
         // Options include path filter
     }
 
-    // =========================================================================
     // Status Code Tests
-    // =========================================================================
 
     #[test]
     fn test_status_code_clean() {
@@ -802,9 +645,7 @@ mod tests {
         assert_eq!(status_code(FileStatus::PermissionsChanged), 'P');
     }
 
-    // =========================================================================
     // Status Description Tests
-    // =========================================================================
 
     #[test]
     fn test_status_description_clean() {
@@ -846,9 +687,7 @@ mod tests {
         assert_eq!(status_description(FileStatus::PermissionsChanged), "permissions");
     }
 
-    // =========================================================================
     // Is Recordable Tests
-    // =========================================================================
 
     #[test]
     fn test_is_recordable_modified() {
@@ -891,9 +730,7 @@ mod tests {
         assert!(!is_recordable(FileStatus::Conflicted));
     }
 
-    // =========================================================================
     // Repository Status Format Tests
-    // =========================================================================
 
     #[test]
     fn test_repository_status_empty() {
@@ -929,9 +766,7 @@ mod tests {
         assert!(!status.is_clean());
     }
 
-    // =========================================================================
     // Print Format Tests (Output verification)
-    // =========================================================================
 
     #[test]
     fn test_short_format_no_panic_empty() {
@@ -989,9 +824,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // =========================================================================
     // Integration Tests (require temp directories)
-    // =========================================================================
 
     // Note: Integration tests that change the current directory are prone to
     // interfering with each other when run in parallel. We use a guard pattern
@@ -1184,9 +1017,7 @@ mod tests {
         assert!(result.is_ok(), "Status with multiple files failed: {:?}", result.err());
     }
 
-    // =========================================================================
     // Edge Case Tests
-    // =========================================================================
 
     #[test]
     fn test_status_code_all_variants() {

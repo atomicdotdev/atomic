@@ -33,9 +33,7 @@ use crate::pristine::PristineError;
 use crate::types::Inode;
 use std::fmt;
 
-// ============================================================================
 // OUTPUT ERROR
-// ============================================================================
 
 /// Errors that can occur during repository output operations.
 ///
@@ -337,9 +335,7 @@ impl From<PristineError> for OutputError {
     }
 }
 
-// ============================================================================
 // RESULT TYPE ALIAS
-// ============================================================================
 
 /// Result type for output operations.
 ///
@@ -360,9 +356,7 @@ impl From<PristineError> for OutputError {
 /// ```
 pub type OutputResult<T> = Result<T, OutputError>;
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

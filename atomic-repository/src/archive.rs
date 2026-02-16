@@ -72,9 +72,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-// ============================================================================
 // Error Types
-// ============================================================================
 
 /// Result type for archive operations.
 pub type ArchiveResult<T> = Result<T, ArchiveError>;
@@ -148,9 +146,7 @@ pub enum ArchiveError {
     Format(String),
 }
 
-// ============================================================================
 // Archive Format
-// ============================================================================
 
 /// Supported archive formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -219,9 +215,7 @@ impl fmt::Display for ArchiveFormat {
     }
 }
 
-// ============================================================================
 // Archive Options
-// ============================================================================
 
 /// Options for archive creation.
 ///
@@ -230,7 +224,7 @@ impl fmt::Display for ArchiveFormat {
 /// ```rust,ignore
 /// let options = ArchiveOptions::default()
 ///     .format(ArchiveFormat::TarGz)
-///     .prefix("myproject-1.0/")
+///     .with_prefix("myproject-1.0/")
 ///     .exclude(&["*.log", "tmp/"]);
 /// ```
 #[derive(Debug, Clone)]
@@ -328,7 +322,7 @@ impl ArchiveOptions {
     }
 
     /// Set a prefix for all paths.
-    pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = Some(prefix.into());
         self
     }
@@ -409,9 +403,7 @@ impl ArchiveOptions {
     }
 }
 
-// ============================================================================
 // Archive Manifest
-// ============================================================================
 
 /// An entry in the archive manifest.
 #[derive(Debug, Clone)]
@@ -558,9 +550,7 @@ impl fmt::Display for ArchiveManifest {
     }
 }
 
-// ============================================================================
 // Archive Outcome
-// ============================================================================
 
 /// Result of an archive operation.
 #[derive(Debug, Clone)]
@@ -656,9 +646,7 @@ impl fmt::Display for ArchiveOutcome {
     }
 }
 
-// ============================================================================
 // Archive Trait
-// ============================================================================
 
 /// Trait for archive implementations.
 ///
@@ -690,9 +678,7 @@ pub trait Archive {
     fn finish(self) -> Result<(), Self::Error>;
 }
 
-// ============================================================================
 // Directory Archive
-// ============================================================================
 
 /// A simple directory-based "archive" that writes files directly.
 pub struct DirectoryArchive {
@@ -781,9 +767,7 @@ impl Archive for DirectoryArchive {
     }
 }
 
-// ============================================================================
 // Helper Functions
-// ============================================================================
 
 /// Simple glob pattern matching.
 ///
@@ -850,18 +834,14 @@ pub fn get_archive_path(base: &Path, prefix: Option<&str>) -> PathBuf {
     }
 }
 
-// ============================================================================
 // Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    // ========================================================================
     // ArchiveFormat Tests
-    // ========================================================================
 
     #[test]
     fn test_archive_format_extension() {
@@ -917,9 +897,7 @@ mod tests {
         assert_eq!(format!("{}", ArchiveFormat::Directory), "directory");
     }
 
-    // ========================================================================
     // ArchiveOptions Tests
-    // ========================================================================
 
     #[test]
     fn test_archive_options_default() {
@@ -940,7 +918,7 @@ mod tests {
         let options = ArchiveOptions::new()
             .format(ArchiveFormat::Tar)
             .state(state)
-            .prefix("project-1.0/")
+            .with_prefix("project-1.0/")
             .include(&["src/*", "Cargo.toml"])
             .exclude(&["*.log", "target/"])
             .overwrite(true)
@@ -992,9 +970,7 @@ mod tests {
         assert!(!options.should_include("tmp/cache"));
     }
 
-    // ========================================================================
     // ArchiveEntry Tests
-    // ========================================================================
 
     #[test]
     fn test_archive_entry_file() {
@@ -1036,9 +1012,7 @@ mod tests {
         assert!(dir_display.contains("src/"));
     }
 
-    // ========================================================================
     // ArchiveManifest Tests
-    // ========================================================================
 
     #[test]
     fn test_archive_manifest_new() {
@@ -1100,9 +1074,7 @@ mod tests {
         assert!(display.contains("1024 bytes"));
     }
 
-    // ========================================================================
     // ArchiveOutcome Tests
-    // ========================================================================
 
     #[test]
     fn test_archive_outcome_new() {
@@ -1174,9 +1146,7 @@ mod tests {
         assert!(display.contains("1 files"));
     }
 
-    // ========================================================================
     // DirectoryArchive Tests
-    // ========================================================================
 
     #[test]
     fn test_directory_archive_create() {
@@ -1227,9 +1197,7 @@ mod tests {
         assert!(archive_dir.join("src/lib").is_dir());
     }
 
-    // ========================================================================
     // Helper Function Tests
-    // ========================================================================
 
     #[test]
     fn test_matches_glob_exact() {
@@ -1303,9 +1271,7 @@ mod tests {
         );
     }
 
-    // ========================================================================
     // ArchiveError Tests
-    // ========================================================================
 
     #[test]
     fn test_archive_error_display() {

@@ -60,9 +60,7 @@ use crate::output::{print_hint, print_success, print_warning};
 use self::client::HiveClient;
 use self::identity::{HiveIdentity, HiveIdentityStore};
 
-// =============================================================================
 // Hive Command Router
-// =============================================================================
 
 /// Manage Hive Agent Social Platform integration.
 ///
@@ -191,9 +189,7 @@ impl Command for Hive {
     }
 }
 
-// =============================================================================
 // Constants
-// =============================================================================
 
 const DEFAULT_API_URL: &str = "https://hive.atomic.dev/api/v1";
 const LOCAL_API_URL: &str = "http://localhost:3001/api/v1";
@@ -209,9 +205,7 @@ const VALID_VENDORS: &[&str] = &[
     "open-source",
 ];
 
-// =============================================================================
 // Init Subcommand
-// =============================================================================
 
 /// Initialize Hive integration and register agent.
 #[derive(Debug, clap::Args)]
@@ -352,9 +346,7 @@ impl Init {
     }
 }
 
-// =============================================================================
 // Status Subcommand
-// =============================================================================
 
 /// Show current Hive registration status.
 #[derive(Debug, clap::Args)]
@@ -409,9 +401,7 @@ impl Status {
     }
 }
 
-// =============================================================================
 // Register Subcommand
-// =============================================================================
 
 /// Manually register agent on Hive.
 #[derive(Debug, clap::Args)]
@@ -526,9 +516,7 @@ impl Register {
     }
 }
 
-// =============================================================================
 // Claim Subcommand
-// =============================================================================
 
 /// Check if agent has been claimed.
 #[derive(Debug, clap::Args)]
@@ -598,9 +586,7 @@ impl Claim {
     }
 }
 
-// =============================================================================
 // Clear Subcommand
-// =============================================================================
 
 /// Clear local identity for re-registration.
 #[derive(Debug, clap::Args)]
@@ -638,9 +624,7 @@ impl Clear {
     }
 }
 
-// =============================================================================
 // Profile Subcommand
-// =============================================================================
 
 /// Show agent profile from Hive.
 #[derive(Debug, clap::Args)]
@@ -711,9 +695,7 @@ impl Profile {
     }
 }
 
-// =============================================================================
 // Helpers
-// =============================================================================
 
 fn print_identity_box(identity: &HiveIdentity) {
     println!("  AGENT IDENTITY");
@@ -738,9 +720,7 @@ fn print_identity_box(identity: &HiveIdentity) {
     );
 }
 
-// =============================================================================
 // PullIdentities Subcommand
-// =============================================================================
 
 /// Local web URL for device auth (the-hive web app)
 const LOCAL_WEB_URL: &str = "http://localhost:3000";
@@ -1076,9 +1056,7 @@ impl PullIdentities {
     }
 }
 
-// =============================================================================
 // Helpers
-// =============================================================================
 
 fn validate_vendor(vendor: &str) -> CliResult<()> {
     if VALID_VENDORS.contains(&vendor) {

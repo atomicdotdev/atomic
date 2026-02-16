@@ -12,9 +12,7 @@
 
 use redb::{MultimapTableDefinition, TableDefinition};
 
-// =============================================================================
 // ID Mapping Tables
-// =============================================================================
 
 /// Maps NodeId (u64) → Hash ([u8; 32])
 ///
@@ -42,9 +40,7 @@ pub mod node_type {
     pub const ATTESTATION: u8 = 2;
 }
 
-// =============================================================================
 // Graph Tables
-// =============================================================================
 
 /// Main graph table: GraphNode → [GraphEdge] (multimap)
 ///
@@ -65,9 +61,7 @@ pub const GRAPH: MultimapTableDefinition<&[u8; 24], &[u8; 24]> =
 pub const INODE_GRAPH: MultimapTableDefinition<&[u8; 32], &[u8; 24]> =
     MultimapTableDefinition::new("inode_graph");
 
-// =============================================================================
 // Stack Tables
-// =============================================================================
 
 /// Stack metadata
 ///
@@ -96,9 +90,7 @@ pub const STACK_CHANGES: TableDefinition<&[u8; 16], u64> = TableDefinition::new(
 pub const REV_STACK_CHANGES: TableDefinition<&[u8; 16], u64> =
     TableDefinition::new("rev_stack_changes");
 
-// =============================================================================
 // File Tree Tables
-// =============================================================================
 
 /// File tree: path → inode
 ///
@@ -214,9 +206,7 @@ pub mod directory_flags {
     }
 }
 
-// =============================================================================
 // Dependency Tables
-// =============================================================================
 
 /// Dependencies: change_id → [dep_id] (multimap)
 ///
@@ -234,9 +224,7 @@ pub const DEPS: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new
 /// Tracks which changes depend on a given change (reverse of DEPS).
 pub const REV_DEPS: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new("rev_deps");
 
-// =============================================================================
 // State Tables
-// =============================================================================
 
 /// Stack states: (stack_id, merkle) → sequence
 ///
@@ -254,9 +242,7 @@ pub const STATES: TableDefinition<&[u8; 40], u64> = TableDefinition::new("states
 /// Stores tagged states (named snapshots) for stacks.
 pub const TAGS: TableDefinition<&[u8; 16], &[u8; 32]> = TableDefinition::new("tags");
 
-// =============================================================================
 // File Mtime Cache Table
-// =============================================================================
 //
 // Stores the last-recorded filesystem modification time for each tracked file.
 // During `status()`, if a file's current mtime matches the cached value, we
@@ -318,9 +304,7 @@ pub fn decode_file_mtime(value: &[u8; 20]) -> (i64, u32, u64) {
     (mtime_secs, mtime_nanos, file_size)
 }
 
-// =============================================================================
 // V3 Change Storage Tables
-// =============================================================================
 //
 // These tables store change data directly in redb, eliminating .change files
 // as the primary storage format. The V3 section-based format maps naturally
@@ -435,9 +419,7 @@ pub const CHANGE_CHUNKS: TableDefinition<&[u8; 36], &[u8; 32]> =
 pub const CHANGE_UNHASHED: TableDefinition<&[u8; 32], &[u8]> =
     TableDefinition::new("change_unhashed");
 
-// =============================================================================
 // V3 Change Storage Key Encoding
-// =============================================================================
 
 /// Encode a change-hash + file-index as 36 bytes for CHANGE_GRAPH / CHANGE_SEMANTIC / CHANGE_CHUNKS keys.
 ///
@@ -461,9 +443,7 @@ pub fn decode_change_file_key(key: &[u8; 36]) -> ([u8; 32], u32) {
     (change_hash, file_index)
 }
 
-// =============================================================================
 // Key Encoding Helpers
-// =============================================================================
 
 /// Encode a span as 24 bytes for use as a graph key
 #[inline]
@@ -647,9 +627,7 @@ mod tests {
         assert!(v1 < v2, "inode 1 should sort before inode 2");
     }
 
-    // =========================================================================
     // Directory Flag Tests
-    // =========================================================================
 
     #[test]
     fn test_directory_flags_explicit() {

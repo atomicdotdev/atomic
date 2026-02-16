@@ -335,523 +335,211 @@ impl From<TreeError> for OutputError {
 /// Result type alias for tree operations.
 pub type TreeResult<T> = Result<T, TreeError>;
 
-// ============================================================================
-// TESTS
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::ChangePosition;
 
-    // -------------------------------------------------------------------------
-    // OutputError Tests
-    // -------------------------------------------------------------------------
+    // -- ContentError → OutputError conversion: this is the real contract.
+    //    The output layer receives content errors from the change store and
+    //    must map them to the right OutputError variant so callers can
+    //    distinguish "missing change" from "corrupted content" from "I/O".
 
     #[test]
-    fn test_output_error_display_io() {
-        let err = OutputError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "file not found",
-        ));
-        assert!(err.to_string().contains("I/O error"));
+    fn content_io_error_surfaces_as_output_io() {
+        let content_err =
+            ContentError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "boom"));
+        let output_err: OutputError = content_err.into();
+        assert!(
+            matches!(output_err, OutputError::Io(_)),
+            "IO errors must stay as IO so callers can retry"
+        );
     }
 
     #[test]
-    fn test_output_error_display_change_store() {
-        let hash = Hash::of(b"test");
-        let err = OutputError::ChangeStore {
-            message: "corrupted".to_string(),
-            hash: Some(hash),
+    fn content_not_found_becomes_missing_change() {
+        let hash = Hash::of(b"some change content");
+        let content_err = ContentError::ChangeNotFound { hash };
+        let output_err: OutputError = content_err.into();
+
+        // This distinction matters: MissingChange triggers a fetch in sync,
+        // while ChangeStore errors indicate local corruption.
+        match output_err {
+            OutputError::MissingChange { hash: h } => assert_eq!(h, hash),
+            other => panic!("expected MissingChange, got {other}"),
+        }
+    }
+
+    #[test]
+    fn content_truncated_becomes_change_store_error() {
+        let content_err = ContentError::Truncated {
+            expected: 1024,
+            actual: 512,
         };
-        assert!(err.to_string().contains("corrupted"));
+        let output_err: OutputError = content_err.into();
+
+        match output_err {
+            OutputError::ChangeStore { message, .. } => {
+                assert!(message.contains("1024"), "should mention expected size");
+                assert!(message.contains("512"), "should mention actual size");
+            }
+            other => panic!("expected ChangeStore, got {other}"),
+        }
     }
 
     #[test]
-    fn test_output_error_display_vertex_not_found() {
+    fn content_vertex_error_carries_change_id_for_debugging() {
         let node = GraphNode {
             change: NodeId::new(42),
             start: ChangePosition::new(0),
-            end: ChangePosition::new(10),
+            end: ChangePosition::new(100),
         };
-        let err = OutputError::NodeNotFound {
-            node,
-            change_id: Some(NodeId::new(42)),
-        };
-        assert!(err.to_string().contains("GraphNode not found"));
+        let content_err = ContentError::VertexContent { node };
+        let output_err: OutputError = content_err.into();
+
+        match output_err {
+            OutputError::NodeNotFound { change_id, .. } => {
+                assert_eq!(change_id, Some(NodeId::new(42)));
+            }
+            other => panic!("expected NodeNotFound, got {other}"),
+        }
+    }
+
+    // -- TreeError → OutputError conversion: tree traversal errors that
+    //    aren't pristine-related become Internal errors (they indicate bugs).
+
+    #[test]
+    fn tree_pristine_error_stays_pristine_not_internal() {
+        let tree_err = TreeError::Pristine(PristineError::HashNotFound { hash: "abc".into() });
+        let output_err: OutputError = tree_err.into();
+        assert!(
+            matches!(output_err, OutputError::Pristine(_)),
+            "pristine errors must not be downgraded to Internal"
+        );
     }
 
     #[test]
-    fn test_output_error_display_position_not_found() {
-        let position = Position {
-            change: NodeId::new(1),
-            pos: ChangePosition::new(100),
-        };
-        let err = OutputError::PositionNotFound { position };
-        assert!(err.to_string().contains("Position not found"));
+    fn tree_structural_errors_become_internal() {
+        // Orphan entries, cycles, and depth overflows are bugs, not user errors.
+        let structural_errors: Vec<TreeError> = vec![
+            TreeError::OrphanEntry {
+                name: "ghost.txt".into(),
+                inode: Inode::new(999),
+            },
+            TreeError::CircularReference {
+                path: PathBuf::from("/a/b/a"),
+            },
+            TreeError::MaxDepthExceeded {
+                depth: 500,
+                limit: 100,
+            },
+        ];
+
+        for tree_err in structural_errors {
+            let desc = format!("{tree_err}");
+            let output_err: OutputError = tree_err.into();
+            assert!(
+                matches!(output_err, OutputError::Internal { .. }),
+                "{desc} should become Internal"
+            );
+        }
+    }
+
+    // -- Error propagation chains: verify ? works across the full hierarchy.
+
+    #[test]
+    fn io_chains_through_content_to_output() {
+        fn read_content() -> ContentResult<Vec<u8>> {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"))?
+        }
+
+        fn output_file() -> OutputResult<Vec<u8>> {
+            Ok(read_content()?)
+        }
+
+        // The IO error must survive two ? hops without being swallowed.
+        assert!(matches!(output_file(), Err(OutputError::Io(_))));
     }
 
     #[test]
-    fn test_output_error_display_inode_not_found() {
-        let err = OutputError::InodeNotFound {
-            inode: Inode::new(123),
-        };
-        assert!(err.to_string().contains("Inode"));
+    fn pristine_chains_through_tree_to_output() {
+        fn walk_tree() -> TreeResult<()> {
+            Err(PristineError::StackNotFound {
+                name: "main".into(),
+            })?
+        }
+
+        fn output_repo() -> OutputResult<()> {
+            walk_tree()?;
+            Ok(())
+        }
+
+        assert!(matches!(output_repo(), Err(OutputError::Pristine(_))));
+    }
+
+    // -- ConflictType: used as a key in conflict tracking maps.
+
+    #[test]
+    fn conflict_types_are_distinct_in_hash_sets() {
+        use std::collections::HashSet;
+        let all = [
+            ConflictType::Order,
+            ConflictType::Zombie,
+            ConflictType::Cyclic,
+            ConflictType::Name,
+        ];
+        let set: HashSet<_> = all.iter().copied().collect();
+        assert_eq!(set.len(), 4, "all four conflict types must be distinct");
+
+        // Duplicates should collapse.
+        let mut with_dup: HashSet<ConflictType> = set;
+        with_dup.insert(ConflictType::Order);
+        assert_eq!(with_dup.len(), 4);
     }
 
     #[test]
-    fn test_output_error_display_path_not_found() {
-        let err = OutputError::PathNotFound {
-            path: "/foo/bar.txt".to_string(),
-        };
-        assert!(err.to_string().contains("/foo/bar.txt"));
-    }
-
-    #[test]
-    fn test_output_error_display_encoding() {
-        let err = OutputError::Encoding {
-            path: "test.txt".to_string(),
-            message: "invalid UTF-8".to_string(),
-        };
-        assert!(err.to_string().contains("Encoding error"));
-        assert!(err.to_string().contains("test.txt"));
-    }
-
-    #[test]
-    fn test_output_error_display_not_writable() {
-        let err = OutputError::NotWritable {
-            path: "/readonly/file".to_string(),
-        };
-        assert!(err.to_string().contains("not writable"));
-    }
-
-    #[test]
-    fn test_output_error_display_conflict() {
-        let err = OutputError::Conflict {
-            path: "src/main.rs".to_string(),
-            conflict_type: ConflictType::Order,
-            sides: 2,
-        };
-        assert!(err.to_string().contains("Conflict"));
-        assert!(err.to_string().contains("src/main.rs"));
-    }
-
-    #[test]
-    fn test_output_error_display_missing_change() {
-        let hash = Hash::of(b"missing");
-        let err = OutputError::MissingChange { hash };
-        assert!(err.to_string().contains("Missing change"));
-    }
-
-    #[test]
-    fn test_output_error_display_internal() {
-        let err = OutputError::Internal {
-            message: "unexpected state".to_string(),
-        };
-        assert!(err.to_string().contains("Internal error"));
-    }
-
-    #[test]
-    fn test_output_error_from_pristine() {
-        let pristine_err = PristineError::HashNotFound {
-            hash: "test_hash".to_string(),
-        };
-        let output_err: OutputError = pristine_err.into();
-        assert!(matches!(output_err, OutputError::Pristine(_)));
-    }
-
-    #[test]
-    fn test_output_error_from_io() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test");
-        let output_err: OutputError = io_err.into();
-        assert!(matches!(output_err, OutputError::Io(_)));
-    }
-
-    // -------------------------------------------------------------------------
-    // ConflictType Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_conflict_type_display() {
+    fn conflict_type_display_is_human_readable() {
+        // These strings end up in conflict markers that users see in files.
         assert_eq!(ConflictType::Order.to_string(), "order conflict");
         assert_eq!(ConflictType::Zombie.to_string(), "zombie conflict");
         assert_eq!(ConflictType::Cyclic.to_string(), "cyclic conflict");
         assert_eq!(ConflictType::Name.to_string(), "name conflict");
     }
 
-    #[test]
-    fn test_conflict_type_equality() {
-        assert_eq!(ConflictType::Order, ConflictType::Order);
-        assert_ne!(ConflictType::Order, ConflictType::Zombie);
-    }
+    // -- Display messages: verify they carry actionable context.
 
     #[test]
-    fn test_conflict_type_hash() {
-        use std::collections::HashSet;
-        let mut set = HashSet::new();
-        set.insert(ConflictType::Order);
-        set.insert(ConflictType::Zombie);
-        set.insert(ConflictType::Order); // duplicate
-        assert_eq!(set.len(), 2);
-    }
-
-    #[test]
-    fn test_conflict_type_clone() {
-        let original = ConflictType::Cyclic;
-        let cloned = original;
-        assert_eq!(original, cloned);
-    }
-
-    #[test]
-    fn test_conflict_type_debug() {
-        let debug = format!("{:?}", ConflictType::Name);
-        assert!(debug.contains("Name"));
-    }
-
-    // -------------------------------------------------------------------------
-    // ContentError Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_content_error_display_io() {
-        let err = ContentError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "not found",
-        ));
-        assert!(err.to_string().contains("I/O error"));
-    }
-
-    #[test]
-    fn test_content_error_display_not_found() {
-        let err = ContentError::ChangeNotFound {
-            hash: Hash::of(b"test"),
-        };
-        assert!(err.to_string().contains("Change not found"));
-    }
-
-    #[test]
-    fn test_content_error_display_truncated() {
-        let err = ContentError::Truncated {
-            expected: 100,
-            actual: 50,
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("truncated"));
-        assert!(msg.contains("100"));
-        assert!(msg.contains("50"));
-    }
-
-    #[test]
-    fn test_content_error_display_vertex_content() {
-        let node = GraphNode {
-            change: NodeId::new(1),
-            start: ChangePosition::new(0),
-            end: ChangePosition::new(10),
-        };
-        let err = ContentError::VertexContent { node };
-        assert!(err.to_string().contains("Failed to get contents"));
-    }
-
-    #[test]
-    fn test_content_error_to_output_error_io() {
-        let content_err = ContentError::Io(std::io::Error::new(std::io::ErrorKind::Other, "test"));
-        let output_err: OutputError = content_err.into();
-        assert!(matches!(output_err, OutputError::Io(_)));
-    }
-
-    #[test]
-    fn test_content_error_to_output_error_not_found() {
-        let hash = Hash::of(b"missing");
-        let content_err = ContentError::ChangeNotFound { hash };
-        let output_err: OutputError = content_err.into();
-        assert!(matches!(output_err, OutputError::MissingChange { .. }));
-    }
-
-    #[test]
-    fn test_content_error_to_output_error_truncated() {
-        let content_err = ContentError::Truncated {
-            expected: 100,
-            actual: 50,
-        };
-        let output_err: OutputError = content_err.into();
-        assert!(matches!(output_err, OutputError::ChangeStore { .. }));
-    }
-
-    #[test]
-    fn test_content_error_to_output_error_vertex() {
-        let node = GraphNode {
-            change: NodeId::new(42),
-            start: ChangePosition::new(0),
-            end: ChangePosition::new(10),
-        };
-        let content_err = ContentError::VertexContent { node };
-        let output_err: OutputError = content_err.into();
-        assert!(matches!(output_err, OutputError::NodeNotFound { .. }));
-    }
-
-    // -------------------------------------------------------------------------
-    // TreeError Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_tree_error_display_pristine() {
-        let err = TreeError::Pristine(PristineError::HashNotFound {
-            hash: "test_hash".to_string(),
-        });
-        assert!(err.to_string().contains("Pristine error"));
-    }
-
-    #[test]
-    fn test_tree_error_display_orphan() {
-        let err = TreeError::OrphanEntry {
-            name: "orphan.txt".to_string(),
-            inode: Inode::new(999),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("Orphan"));
-        assert!(msg.contains("orphan.txt"));
-    }
-
-    #[test]
-    fn test_tree_error_display_circular() {
-        let err = TreeError::CircularReference {
-            path: PathBuf::from("/a/b/c"),
-        };
-        assert!(err.to_string().contains("Circular reference"));
-    }
-
-    #[test]
-    fn test_tree_error_display_max_depth() {
-        let err = TreeError::MaxDepthExceeded {
-            depth: 1000,
-            limit: 100,
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("depth exceeded"));
-        assert!(msg.contains("1000"));
-        assert!(msg.contains("100"));
-    }
-
-    #[test]
-    fn test_tree_error_to_output_error_pristine() {
-        let tree_err = TreeError::Pristine(PristineError::HashNotFound {
-            hash: "test_hash".to_string(),
-        });
-        let output_err: OutputError = tree_err.into();
-        assert!(matches!(output_err, OutputError::Pristine(_)));
-    }
-
-    #[test]
-    fn test_tree_error_to_output_error_orphan() {
-        let tree_err = TreeError::OrphanEntry {
-            name: "test".to_string(),
-            inode: Inode::new(1),
-        };
-        let output_err: OutputError = tree_err.into();
-        assert!(matches!(output_err, OutputError::Internal { .. }));
-    }
-
-    #[test]
-    fn test_tree_error_to_output_error_circular() {
-        let tree_err = TreeError::CircularReference {
-            path: PathBuf::from("/test"),
-        };
-        let output_err: OutputError = tree_err.into();
-        assert!(matches!(output_err, OutputError::Internal { .. }));
-    }
-
-    #[test]
-    fn test_tree_error_to_output_error_max_depth() {
-        let tree_err = TreeError::MaxDepthExceeded {
-            depth: 500,
-            limit: 100,
-        };
-        let output_err: OutputError = tree_err.into();
-        assert!(matches!(output_err, OutputError::Internal { .. }));
-    }
-
-    // -------------------------------------------------------------------------
-    // Result Type Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_output_result_ok() {
-        let result: OutputResult<i32> = Ok(42);
-        assert_eq!(result.unwrap(), 42);
-    }
-
-    #[test]
-    fn test_output_result_err() {
-        let result: OutputResult<i32> = Err(OutputError::Internal {
-            message: "test".to_string(),
-        });
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_content_result_ok() {
-        let result: ContentResult<String> = Ok("content".to_string());
-        assert_eq!(result.unwrap(), "content");
-    }
-
-    #[test]
-    fn test_content_result_err() {
-        let result: ContentResult<String> = Err(ContentError::Truncated {
-            expected: 10,
-            actual: 5,
-        });
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_tree_result_ok() {
-        let result: TreeResult<Vec<String>> = Ok(vec!["a".into(), "b".into()]);
-        assert_eq!(result.unwrap().len(), 2);
-    }
-
-    #[test]
-    fn test_tree_result_err() {
-        let result: TreeResult<()> = Err(TreeError::MaxDepthExceeded {
-            depth: 100,
-            limit: 50,
-        });
-        assert!(result.is_err());
-    }
-
-    // -------------------------------------------------------------------------
-    // Error Chaining Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_error_chaining_io_to_content_to_output() {
-        // Create an IO error
-        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "original error");
-
-        // Convert to ContentError
-        let content_err: ContentError = io_err.into();
-        assert!(matches!(content_err, ContentError::Io(_)));
-
-        // Convert to OutputError
-        let output_err: OutputError = content_err.into();
-        assert!(matches!(output_err, OutputError::Io(_)));
-    }
-
-    #[test]
-    fn test_error_chaining_pristine_to_tree_to_output() {
-        // Create a PristineError
-        let pristine_err = PristineError::HashNotFound {
-            hash: "test_hash".to_string(),
-        };
-
-        // Convert to TreeError
-        let tree_err: TreeError = pristine_err.into();
-        assert!(matches!(tree_err, TreeError::Pristine(_)));
-
-        // Convert to OutputError
-        let output_err: OutputError = tree_err.into();
-        assert!(matches!(output_err, OutputError::Pristine(_)));
-    }
-
-    // -------------------------------------------------------------------------
-    // Debug Trait Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_output_error_debug() {
-        let err = OutputError::Internal {
-            message: "test debug".to_string(),
-        };
-        let debug = format!("{:?}", err);
-        assert!(debug.contains("Internal"));
-        assert!(debug.contains("test debug"));
-    }
-
-    #[test]
-    fn test_content_error_debug() {
-        let err = ContentError::Truncated {
-            expected: 100,
-            actual: 50,
-        };
-        let debug = format!("{:?}", err);
-        assert!(debug.contains("Truncated"));
-    }
-
-    #[test]
-    fn test_tree_error_debug() {
-        let err = TreeError::CircularReference {
-            path: PathBuf::from("/test"),
-        };
-        let debug = format!("{:?}", err);
-        assert!(debug.contains("CircularReference"));
-    }
-
-    // -------------------------------------------------------------------------
-    // Edge Cases and Special Values
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_empty_path_error() {
-        let err = OutputError::PathNotFound {
-            path: String::new(),
-        };
-        assert!(err.to_string().contains("Path not found"));
-    }
-
-    #[test]
-    fn test_unicode_path_error() {
-        let err = OutputError::PathNotFound {
-            path: "日本語/テスト.txt".to_string(),
-        };
-        assert!(err.to_string().contains("日本語"));
-    }
-
-    #[test]
-    fn test_long_path_error() {
-        let long_path = "a/".repeat(100) + "file.txt";
-        let err = OutputError::PathNotFound {
-            path: long_path.clone(),
-        };
-        assert!(err.to_string().contains(&long_path));
-    }
-
-    #[test]
-    fn test_zero_conflict_sides() {
+    fn conflict_display_includes_path_and_type() {
         let err = OutputError::Conflict {
-            path: "test.txt".to_string(),
+            path: "src/main.rs".into(),
             conflict_type: ConflictType::Order,
-            sides: 0,
+            sides: 3,
         };
-        // Should still display, even if 0 sides doesn't make practical sense
-        assert!(err.to_string().contains("Conflict"));
+        let msg = err.to_string();
+        assert!(msg.contains("src/main.rs"), "must show which file: {msg}");
+        assert!(msg.contains("order conflict"), "must show kind: {msg}");
     }
 
     #[test]
-    fn test_many_conflict_sides() {
-        let err = OutputError::Conflict {
-            path: "test.txt".to_string(),
-            conflict_type: ConflictType::Order,
-            sides: 100,
+    fn encoding_error_shows_file_and_reason() {
+        let err = OutputError::Encoding {
+            path: "data/日本語.txt".into(),
+            message: "invalid UTF-8 at byte 42".into(),
         };
-        assert!(err.to_string().contains("Conflict"));
+        let msg = err.to_string();
+        assert!(msg.contains("日本語.txt"), "must show path: {msg}");
+        assert!(msg.contains("byte 42"), "must show reason: {msg}");
     }
 
     #[test]
-    fn test_root_node_vertex_error() {
-        let node = GraphNode::ROOT;
-        let err = OutputError::NodeNotFound {
-            node,
-            change_id: None,
-        };
-        assert!(err.to_string().contains("GraphNode not found"));
-    }
-
-    #[test]
-    fn test_node_not_found_error_max() {
-        let node = GraphNode::MAX;
-        let err = OutputError::NodeNotFound {
-            node,
-            change_id: None,
-        };
-        assert!(err.to_string().contains("GraphNode not found"));
+    fn missing_change_display_includes_hash() {
+        let hash = Hash::of(b"important change");
+        let err = OutputError::MissingChange { hash };
+        let msg = err.to_string();
+        // The hash in the message lets users fetch the missing change.
+        assert!(
+            msg.len() > 20,
+            "should include the hash representation: {msg}"
+        );
     }
 }

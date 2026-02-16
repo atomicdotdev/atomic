@@ -48,9 +48,7 @@ use std::path::{Path, PathBuf};
 
 use atomic_core::change::Author;
 
-// =============================================================================
 // AgentAuthorOptions
-// =============================================================================
 
 /// Options for resolving an agent author identity.
 #[derive(Debug, Clone)]
@@ -70,9 +68,7 @@ pub struct AgentAuthorOptions<'a> {
     pub identity_dir: Option<PathBuf>,
 }
 
-// =============================================================================
 // Author Resolution
-// =============================================================================
 
 /// Resolve the agent author for a turn change.
 ///
@@ -139,9 +135,7 @@ fn fallback_agent_author(options: &AgentAuthorOptions<'_>) -> Author {
     Author::new(options.agent_display_name, None::<String>)
 }
 
-// =============================================================================
 // Session Short ID
-// =============================================================================
 
 /// Extract a short identifier from the session ID for the `+tag` suffix.
 ///
@@ -211,9 +205,7 @@ pub fn normalize_agent_name(agent_name: &str) -> String {
         .to_lowercase()
 }
 
-// =============================================================================
 // User Identity Loading
-// =============================================================================
 
 /// Minimal info extracted from the user's default identity.
 ///
@@ -379,9 +371,7 @@ fn extract_toml_string_value(line: &str) -> Option<String> {
     }
 }
 
-// =============================================================================
 // Integration with record_turn
-// =============================================================================
 
 /// Build an `Author` for an agent turn, using the session's identity info.
 ///
@@ -411,9 +401,7 @@ pub fn build_agent_author(agent_name: &str, agent_display_name: &str, session_id
     resolve_agent_author(&options)
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -421,9 +409,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    // =========================================================================
     // extract_session_short
-    // =========================================================================
 
     #[test]
     fn test_session_short_uuid() {
@@ -472,9 +458,7 @@ mod tests {
         assert_eq!(extract_session_short("----"), "0000");
     }
 
-    // =========================================================================
     // normalize_agent_name
-    // =========================================================================
 
     #[test]
     fn test_normalize_claude_code() {
@@ -506,9 +490,7 @@ mod tests {
         assert_eq!(normalize_agent_name(""), "");
     }
 
-    // =========================================================================
     // derive_agent_author
-    // =========================================================================
 
     #[test]
     fn test_derive_with_email() {
@@ -573,9 +555,7 @@ mod tests {
         assert_eq!(author.email, Some("dev@example.com".to_string()));
     }
 
-    // =========================================================================
     // fallback_agent_author
-    // =========================================================================
 
     #[test]
     fn test_fallback_author() {
@@ -593,9 +573,7 @@ mod tests {
         assert!(author.identity.is_none());
     }
 
-    // =========================================================================
     // resolve_agent_author (integration)
-    // =========================================================================
 
     #[test]
     fn test_resolve_no_identity_dir() {
@@ -701,9 +679,7 @@ identity_type = "user"
         assert_eq!(author.identity, Some("PK_BOB".to_string()));
     }
 
-    // =========================================================================
     // build_agent_author (convenience function)
-    // =========================================================================
 
     #[test]
     fn test_build_agent_author_fallback() {
@@ -721,9 +697,7 @@ identity_type = "user"
         assert!(!author.name.is_empty());
     }
 
-    // =========================================================================
     // extract_toml_string_value
-    // =========================================================================
 
     #[test]
     fn test_extract_toml_string_simple() {
@@ -759,9 +733,7 @@ identity_type = "user"
         );
     }
 
-    // =========================================================================
     // extract_default_identity_from_config
-    // =========================================================================
 
     #[test]
     fn test_extract_default_identity() {
@@ -798,9 +770,7 @@ version = 1
         assert_eq!(extract_default_identity_from_config(config), None);
     }
 
-    // =========================================================================
     // Display format verification
-    // =========================================================================
 
     #[test]
     fn test_author_display_with_email() {

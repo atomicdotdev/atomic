@@ -250,36 +250,28 @@ impl Zombie {
 /// ```
 #[derive(Debug, Clone)]
 pub struct Workspace {
-    // =========================================================================
     // Context Tracking
-    // =========================================================================
     /// Up-context positions (predecessors for new vertices).
     predecessors: Vec<Position<NodeId>>,
 
     /// Down-context positions (successors for new vertices).
     successors: Vec<Position<NodeId>>,
 
-    // =========================================================================
     // Edge Operations
-    // =========================================================================
     /// Pending edges to be added to the graph.
     pending_edges: Vec<PendingEdge>,
 
     /// Edges that have been marked for deletion.
     deleted_edges: HashSet<(Position<NodeId>, Position<NodeId>)>,
 
-    // =========================================================================
     // Parent/Child Tracking
-    // =========================================================================
     /// Map from child to parent positions (for folder structure).
     parents: HashMap<Position<NodeId>, Position<NodeId>>,
 
     /// Map from parent to children (for folder iteration).
     children: HashMap<Position<NodeId>, Vec<Position<NodeId>>>,
 
-    // =========================================================================
     // Conflict Tracking
-    // =========================================================================
     /// Missing context vertices detected during application.
     missing_contexts: Vec<MissingContext>,
 
@@ -289,9 +281,7 @@ pub struct Workspace {
     /// Positions that have been verified as rooted (connected to graph root).
     rooted: HashSet<Position<NodeId>>,
 
-    // =========================================================================
     // Temporary Buffers
-    // =========================================================================
     /// Buffer for adjacency iteration results.
     adjacency_buffer: Vec<Position<NodeId>>,
 
@@ -411,9 +401,7 @@ impl Workspace {
             && self.zombies.is_empty()
     }
 
-    // =========================================================================
     // Context Management
-    // =========================================================================
 
     /// Add an up-context position (predecessor).
     ///
@@ -457,9 +445,7 @@ impl Workspace {
         self.successors.clear();
     }
 
-    // =========================================================================
     // Edge Management
-    // =========================================================================
 
     /// Add a pending edge to be created.
     pub fn add_pending_edge(
@@ -512,9 +498,7 @@ impl Workspace {
         std::mem::take(&mut self.pending_edges)
     }
 
-    // =========================================================================
     // Parent/Child Tracking
-    // =========================================================================
 
     /// Set the parent of a position.
     pub fn set_parent(&mut self, child: Position<NodeId>, parent: Position<NodeId>) {
@@ -532,9 +516,7 @@ impl Workspace {
         self.children.get(parent).map(|v| v.as_slice())
     }
 
-    // =========================================================================
     // Conflict Tracking
-    // =========================================================================
 
     /// Record a missing context.
     pub fn add_missing_context(&mut self, ctx: MissingContext) {
@@ -587,9 +569,7 @@ impl Workspace {
         self.has_missing_contexts() || self.has_zombies()
     }
 
-    // =========================================================================
     // Rooted Tracking
-    // =========================================================================
 
     /// Mark a position as verified rooted.
     pub fn mark_rooted(&mut self, pos: Position<NodeId>) {
@@ -601,9 +581,7 @@ impl Workspace {
         self.rooted.contains(pos)
     }
 
-    // =========================================================================
     // Temporary Buffers
-    // =========================================================================
 
     /// Get a mutable reference to the adjacency buffer.
     ///
@@ -629,9 +607,7 @@ impl Workspace {
         &mut self.visited
     }
 
-    // =========================================================================
     // Statistics
-    // =========================================================================
 
     /// Get statistics about the workspace state.
     pub fn stats(&self) -> WorkspaceStats {
@@ -705,9 +681,7 @@ impl WorkspaceStats {
 mod tests {
     use super::*;
 
-    // =========================================================================
     // PendingEdge Tests
-    // =========================================================================
 
     #[test]
     fn test_pending_edge_new() {
@@ -766,9 +740,7 @@ mod tests {
         assert!(!edge.is_parent());
     }
 
-    // =========================================================================
     // MissingContext Tests
-    // =========================================================================
 
     #[test]
     fn test_missing_context_up() {
@@ -798,9 +770,7 @@ mod tests {
         assert_eq!(ctx.during_change, Some(change));
     }
 
-    // =========================================================================
     // Zombie Tests
-    // =========================================================================
 
     #[test]
     fn test_zombie_new() {
@@ -829,9 +799,7 @@ mod tests {
         assert_eq!(zombie.inode, Some(inode));
     }
 
-    // =========================================================================
     // Workspace Basic Tests
-    // =========================================================================
 
     #[test]
     fn test_workspace_new() {
@@ -866,9 +834,7 @@ mod tests {
         assert!(workspace.is_empty());
     }
 
-    // =========================================================================
     // Context Tests
-    // =========================================================================
 
     #[test]
     fn test_workspace_up_context() {
@@ -907,9 +873,7 @@ mod tests {
         assert_eq!(workspace.down_context_count(), 0);
     }
 
-    // =========================================================================
     // Edge Tests
-    // =========================================================================
 
     #[test]
     fn test_workspace_pending_edges() {
@@ -964,9 +928,7 @@ mod tests {
         assert!(workspace.is_edge_deleted(&from, &to));
     }
 
-    // =========================================================================
     // Parent/Child Tests
-    // =========================================================================
 
     #[test]
     fn test_workspace_parent_child() {
@@ -996,9 +958,7 @@ mod tests {
         assert!(workspace.get_children(&pos).is_none());
     }
 
-    // =========================================================================
     // Conflict Tracking Tests
-    // =========================================================================
 
     #[test]
     fn test_workspace_missing_contexts() {
@@ -1052,9 +1012,7 @@ mod tests {
         assert!(workspace.has_conflicts());
     }
 
-    // =========================================================================
     // Rooted Tracking Tests
-    // =========================================================================
 
     #[test]
     fn test_workspace_rooted() {
@@ -1068,9 +1026,7 @@ mod tests {
         assert!(workspace.is_rooted(&pos));
     }
 
-    // =========================================================================
     // Temporary Buffer Tests
-    // =========================================================================
 
     #[test]
     fn test_workspace_buffers() {
@@ -1089,9 +1045,7 @@ mod tests {
         assert!(workspace.visited().contains(&Position::ROOT));
     }
 
-    // =========================================================================
     // Statistics Tests
-    // =========================================================================
 
     #[test]
     fn test_workspace_stats_empty() {

@@ -56,9 +56,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-// =============================================================================
 // Phase
-// =============================================================================
 
 /// The lifecycle phase of an agent session.
 ///
@@ -174,9 +172,7 @@ impl fmt::Display for Phase {
     }
 }
 
-// =============================================================================
 // Event
-// =============================================================================
 
 /// An event that triggers a state machine transition.
 ///
@@ -238,9 +234,7 @@ impl fmt::Display for Event {
     }
 }
 
-// =============================================================================
 // Action
-// =============================================================================
 
 /// An action that the orchestrator should execute after a transition.
 ///
@@ -326,9 +320,7 @@ impl fmt::Display for Action {
     }
 }
 
-// =============================================================================
 // TransitionContext
-// =============================================================================
 
 /// Read-only context for transitions that need to inspect session state.
 ///
@@ -359,9 +351,7 @@ impl TransitionContext {
     }
 }
 
-// =============================================================================
 // TransitionResult
-// =============================================================================
 
 /// The outcome of a state machine transition.
 ///
@@ -429,9 +419,7 @@ impl fmt::Display for TransitionResult {
     }
 }
 
-// =============================================================================
 // Transition Function
-// =============================================================================
 
 /// Compute the next phase and required actions given the current phase
 /// and an event.
@@ -601,9 +589,7 @@ fn transition_from_ended(event: Event, ctx: TransitionContext) -> TransitionResu
     }
 }
 
-// =============================================================================
 // Apply Common Actions
-// =============================================================================
 
 /// Trait for types that can have common actions applied to them.
 ///
@@ -669,9 +655,7 @@ pub fn apply_common_actions<S: SessionState>(
     remaining
 }
 
-// =============================================================================
 // All phases and events for exhaustive testing
-// =============================================================================
 
 /// All possible phases, for exhaustive testing.
 #[allow(dead_code)]
@@ -692,18 +676,14 @@ const ALL_EVENTS: [Event; 5] = [
     Event::SessionStop,
 ];
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
 
-    // =========================================================================
     // Phase tests
-    // =========================================================================
 
     #[test]
     fn test_phase_is_active() {
@@ -794,9 +774,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&Phase::Ended).unwrap(), "\"ended\"");
     }
 
-    // =========================================================================
     // Event tests
-    // =========================================================================
 
     #[test]
     fn test_event_as_str() {
@@ -816,9 +794,7 @@ mod tests {
         assert_eq!(Event::SessionStop.to_string(), "SessionStop");
     }
 
-    // =========================================================================
     // Action tests
-    // =========================================================================
 
     #[test]
     fn test_action_is_strategy_specific() {
@@ -841,9 +817,7 @@ mod tests {
         assert_eq!(Action::WarnStaleSession.to_string(), "warn_stale_session");
     }
 
-    // =========================================================================
     // TransitionResult tests
-    // =========================================================================
 
     #[test]
     fn test_result_noop() {
@@ -879,9 +853,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // Transition: from Idle
-    // =========================================================================
 
     #[test]
     fn test_idle_turn_start() {
@@ -929,9 +901,7 @@ mod tests {
         assert_eq!(r.actions, vec![Action::UpdateInteraction]);
     }
 
-    // =========================================================================
     // Transition: from Active
-    // =========================================================================
 
     #[test]
     fn test_active_turn_start_ctrl_c_recovery() {
@@ -984,9 +954,7 @@ mod tests {
         assert_eq!(r.actions, vec![Action::UpdateInteraction]);
     }
 
-    // =========================================================================
     // Transition: from ActiveRecorded
-    // =========================================================================
 
     #[test]
     fn test_active_recorded_turn_start_ctrl_c_recovery() {
@@ -1049,9 +1017,7 @@ mod tests {
         assert_eq!(r.actions, vec![Action::UpdateInteraction]);
     }
 
-    // =========================================================================
     // Transition: from Ended
-    // =========================================================================
 
     #[test]
     fn test_ended_turn_start_reenter() {
@@ -1116,9 +1082,7 @@ mod tests {
         assert!(r.is_noop());
     }
 
-    // =========================================================================
     // Full lifecycle integration tests
-    // =========================================================================
 
     #[test]
     fn test_full_lifecycle_single_turn() {
@@ -1222,9 +1186,7 @@ mod tests {
         assert!(r.requires_recording());
     }
 
-    // =========================================================================
     // Exhaustive transition table test
-    // =========================================================================
 
     #[test]
     fn test_all_transitions_produce_valid_phase() {
@@ -1277,9 +1239,7 @@ mod tests {
         assert_eq!(count, 40);
     }
 
-    // =========================================================================
     // Context tests
-    // =========================================================================
 
     #[test]
     fn test_context_default() {
@@ -1328,9 +1288,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // apply_common_actions tests
-    // =========================================================================
 
     /// Mock session state for testing apply_common_actions
     struct MockSession {
@@ -1443,9 +1401,7 @@ mod tests {
         assert!(!session.ended_at_cleared.get());
     }
 
-    // =========================================================================
     // Integration: transition + apply_common_actions
-    // =========================================================================
 
     #[test]
     fn test_transition_and_apply_turn_lifecycle() {

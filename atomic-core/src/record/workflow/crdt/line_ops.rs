@@ -84,9 +84,7 @@ use crate::diff::{diff_text, Algorithm, DiffOp};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-// ============================================================================
 // ANALYSIS OPTIONS
-// ============================================================================
 
 /// Options controlling line analysis behavior.
 ///
@@ -239,9 +237,7 @@ impl Default for AnalysisOptions {
     }
 }
 
-// ============================================================================
 // LINE CHANGE KIND
-// ============================================================================
 
 /// The type of change for a line.
 ///
@@ -348,9 +344,7 @@ impl fmt::Display for LineChangeKind {
     }
 }
 
-// ============================================================================
 // LINE CHANGE
-// ============================================================================
 
 /// A single line change in the analysis.
 ///
@@ -562,9 +556,7 @@ impl fmt::Display for LineChange {
     }
 }
 
-// ============================================================================
 // ANALYSIS STATS
-// ============================================================================
 
 /// Statistics about the line analysis.
 ///
@@ -661,9 +653,7 @@ impl fmt::Display for AnalysisStats {
     }
 }
 
-// ============================================================================
 // LINE ANALYSIS
-// ============================================================================
 
 /// The result of analyzing line differences.
 ///
@@ -789,16 +779,12 @@ impl LineAnalysis {
     }
 }
 
-// ============================================================================
 // ANALYSIS RESULT (FOR COMPATIBILITY WITH MOD.RS EXPORTS)
-// ============================================================================
 
 /// Alias for LineAnalysis for API compatibility.
 pub type AnalysisResult = LineAnalysis;
 
-// ============================================================================
 // LINE ANALYZER
-// ============================================================================
 
 /// Analyzes differences between old and new content at the line level.
 ///
@@ -978,9 +964,7 @@ impl<'a> LineAnalyzer<'a> {
     }
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

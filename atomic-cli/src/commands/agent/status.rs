@@ -23,9 +23,7 @@ use atomic_agent::turn::session::SessionStore;
 use crate::commands::{find_repository_root, Command};
 use crate::error::CliResult;
 
-// =============================================================================
 // AgentStatus Command
-// =============================================================================
 
 /// Show agent integration status.
 ///
@@ -55,9 +53,7 @@ impl Command for AgentStatus {
 
         let registry = AgentRegistry::with_defaults();
 
-        // =====================================================================
         // Installed agents
-        // =====================================================================
 
         println!("Agent Integration Status");
         println!("=======================");
@@ -108,9 +104,7 @@ impl Command for AgentStatus {
 
         println!();
 
-        // =====================================================================
         // Sessions
-        // =====================================================================
 
         let session_store = match SessionStore::for_repo(&repo_root) {
             Ok(store) => store,
@@ -245,9 +239,7 @@ impl Command for AgentStatus {
             println!();
         }
 
-        // =====================================================================
         // Summary
-        // =====================================================================
 
         let total_turns: u32 = sessions.iter().map(|s| s.turn_count).sum();
         let total_files: usize = sessions.iter().map(|s| s.files_touched.len()).sum();
@@ -267,9 +259,7 @@ impl Command for AgentStatus {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

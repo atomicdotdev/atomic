@@ -50,9 +50,7 @@ use super::error::LocalApplyError;
 use super::position::{resolve_inode, resolve_introduced_by, resolve_position};
 use super::workspace::Workspace;
 
-// =============================================================================
 // EdgeUpdate Application
-// =============================================================================
 
 /// Apply an EdgeUpdate atom to the graph.
 ///
@@ -158,9 +156,7 @@ fn apply_new_edge<T: MutTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Span Finding
-// =============================================================================
 
 /// Find the source span for an edge operation.
 ///
@@ -232,9 +228,7 @@ pub fn find_target_vertex<T: GraphTxnT>(
         .map_err(|_| LocalApplyError::BlockNotFound { position: pos })
 }
 
-// =============================================================================
 // Edge Operations
-// =============================================================================
 
 /// Add an edge and its reverse to the graph.
 ///
@@ -338,9 +332,7 @@ fn del_edge_with_reverse<T: MutTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Deletion Handling
-// =============================================================================
 
 /// Collect pseudo-edges for reconnection when deleting a span.
 ///
@@ -473,18 +465,14 @@ fn check_vertex_for_zombies<T: GraphTxnT>(
     Ok(())
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::ChangePosition;
 
-    // =========================================================================
     // Test Helpers
-    // =========================================================================
 
     fn make_position(change: Option<Hash>, pos: u64) -> Position<Option<Hash>> {
         Position {
@@ -516,9 +504,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // NewEdge Structure Tests
-    // =========================================================================
 
     #[test]
     fn test_new_edge_creation() {
@@ -579,9 +565,7 @@ mod tests {
         assert!(undel_edge.is_undeletion());
     }
 
-    // =========================================================================
     // EdgeUpdate Structure Tests
-    // =========================================================================
 
     #[test]
     fn test_edge_map_creation() {
@@ -626,9 +610,7 @@ mod tests {
         assert_eq!(edge_update.len(), 2);
     }
 
-    // =========================================================================
     // Span Finding Tests
-    // =========================================================================
 
     #[test]
     fn test_root_source_vertex() {
@@ -670,9 +652,7 @@ mod tests {
         assert!(adjusted.end < target.end);
     }
 
-    // =========================================================================
     // Edge Flag Transition Tests
-    // =========================================================================
 
     #[test]
     fn test_deletion_flag_transition() {
@@ -701,9 +681,7 @@ mod tests {
         assert!(flag.contains(EdgeFlags::DELETED));
     }
 
-    // =========================================================================
     // SerializedGraphEdge Tests
-    // =========================================================================
 
     #[test]
     fn test_serialized_edge_for_deletion() {
@@ -732,9 +710,7 @@ mod tests {
         assert!(reverse.flag().contains(EdgeFlags::DELETED));
     }
 
-    // =========================================================================
     // Workspace Tracking Tests
-    // =========================================================================
 
     #[test]
     fn test_workspace_parent_tracking() {
@@ -770,9 +746,7 @@ mod tests {
         assert!(workspace.is_rooted(&pos));
     }
 
-    // =========================================================================
     // Error Case Tests
-    // =========================================================================
 
     #[test]
     fn test_block_not_found_error() {
@@ -810,9 +784,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // Integration-style Tests (Structure Only)
-    // =========================================================================
 
     #[test]
     fn test_deletion_workflow_structure() {

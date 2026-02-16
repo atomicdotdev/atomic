@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The main Clone command implementation.
 //!
 //! This module contains the `Clone` struct and its `Command` implementation,
@@ -48,9 +47,7 @@ use super::helpers::{
 };
 use super::types::{ClonePhase, CloneProgress, CloneStats};
 
-// =============================================================================
 // Constants
-// =============================================================================
 
 /// Default stack to clone when none is specified.
 ///
@@ -63,9 +60,7 @@ pub const DEFAULT_STACK: &str = "dev";
 /// and failing quickly on unresponsive servers.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
-// =============================================================================
 // Clone Command
-// =============================================================================
 
 /// Clone a remote repository.
 ///
@@ -169,109 +164,7 @@ impl Clone {
         }
     }
 
-    /// Set the target path.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - The directory to clone into
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::Clone;
-    ///
-    /// let clone = Clone::new("https://example.com/repo".to_string())
-    ///     .with_path("my-project");
-    /// assert_eq!(clone.path, Some("my-project".to_string()));
-    /// ```
-    pub fn with_path(mut self, path: impl Into<String>) -> Self {
-        self.path = Some(path.into());
-        self
-    }
-
-    /// Set the stack to clone.
-    ///
-    /// # Arguments
-    ///
-    /// * `stack` - The stack name to clone
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::Clone;
-    ///
-    /// let clone = Clone::new("https://example.com/repo".to_string())
-    ///     .with_stack("dev");
-    /// assert_eq!(clone.stack, "dev");
-    /// ```
-    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
-        self.stack = stack.into();
-        self
-    }
-
-    /// Enable or disable TLS certificate verification bypass.
-    ///
-    /// # Arguments
-    ///
-    /// * `insecure` - Whether to skip certificate verification
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::Clone;
-    ///
-    /// let clone = Clone::new("https://example.com/repo".to_string())
-    ///     .with_insecure(true);
-    /// assert!(clone.insecure);
-    /// ```
-    pub fn with_insecure(mut self, insecure: bool) -> Self {
-        self.insecure = insecure;
-        self
-    }
-
-    /// Set the request timeout in seconds.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - The timeout in seconds
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::Clone;
-    ///
-    /// let clone = Clone::new("https://example.com/repo".to_string())
-    ///     .with_timeout(60);
-    /// assert_eq!(clone.timeout, 60);
-    /// ```
-    pub fn with_timeout(mut self, timeout: u64) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    /// Enable or disable download-only mode.
-    ///
-    /// # Arguments
-    ///
-    /// * `download_only` - Whether to only download without applying
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::Clone;
-    ///
-    /// let clone = Clone::new("https://example.com/repo".to_string())
-    ///     .with_download_only(true);
-    /// assert!(clone.download_only);
-    /// ```
-    pub fn with_download_only(mut self, download_only: bool) -> Self {
-        self.download_only = download_only;
-        self
-    }
-
-    // =========================================================================
     // Internal Helper Methods
-    // =========================================================================
 
     /// Build the HTTP remote configuration.
     ///
@@ -672,17 +565,13 @@ impl Command for Clone {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // =========================================================================
     // Constructor and Builder Tests
-    // =========================================================================
 
     /// Test creating a new Clone with URL.
     #[test]
@@ -782,9 +671,7 @@ mod tests {
         assert!(debug_str.contains("https://example.com/repo"));
     }
 
-    // =========================================================================
     // Internal Method Tests
-    // =========================================================================
 
     /// Test build_remote_config with default settings.
     #[test]
@@ -834,9 +721,7 @@ mod tests {
         assert_eq!(clone.get_display_name(), "repo");
     }
 
-    // =========================================================================
     // Constant Tests
-    // =========================================================================
 
     /// Test that DEFAULT_STACK is "dev" (atomic-api convention).
     #[test]
@@ -850,9 +735,7 @@ mod tests {
         assert_eq!(DEFAULT_TIMEOUT_SECS, 30);
     }
 
-    // =========================================================================
     // Command Validation Tests
-    // =========================================================================
 
     /// Test run with empty URL returns error.
     #[test]

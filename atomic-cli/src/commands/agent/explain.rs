@@ -51,9 +51,7 @@ use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{emphasis, hint, info, print_error, print_success, print_warning};
 
-// =============================================================================
 // Explain Command
-// =============================================================================
 
 /// Generate AI reasoning summaries for agent turns.
 ///
@@ -350,9 +348,7 @@ impl Command for Explain {
     }
 }
 
-// =============================================================================
 // Get Condensed Transcript Text
-// =============================================================================
 
 /// Get the condensed transcript text for a change.
 ///
@@ -422,9 +418,7 @@ fn get_condensed_text(
     Ok(String::new())
 }
 
-// =============================================================================
 // Display Reasoning
-// =============================================================================
 
 /// Print a reasoning summary in a readable format.
 fn print_reasoning(reasoning: &TurnReasoning) {
@@ -498,9 +492,7 @@ fn print_reasoning(reasoning: &TurnReasoning) {
     }
 }
 
-// =============================================================================
 // Save Reasoning Back to Change
-// =============================================================================
 
 /// Save reasoning back into the change's unhashed section.
 ///
@@ -538,9 +530,7 @@ fn save_reasoning_to_change(
     Ok(())
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

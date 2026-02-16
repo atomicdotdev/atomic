@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! The `stack switch` command for switching between stacks.
 //!
 //! This module implements the `atomic stack switch` command, which changes
@@ -48,9 +47,7 @@ use crate::output::{print_success, stack as style_stack};
 #[cfg(test)]
 use std::path::PathBuf;
 
-// =============================================================================
 // Switch Command
-// =============================================================================
 
 /// Switch to a different stack.
 ///
@@ -72,12 +69,6 @@ pub struct Switch {
 }
 
 impl Switch {
-    /// Create a new `Switch` command with the given stack name.
-    pub fn with_name(name: impl Into<String>) -> Self {
-        Self {
-            name: Some(name.into()),
-        }
-    }
 }
 
 impl Command for Switch {
@@ -134,9 +125,7 @@ impl Command for Switch {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

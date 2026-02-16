@@ -70,9 +70,7 @@ use crate::types::{EdgeFlags, GraphNode, NodeId, Position, SerializedGraphEdge};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-// ============================================================================
 // RETRIEVE OPTIONS
-// ============================================================================
 
 /// Options for graph retrieval.
 ///
@@ -385,9 +383,7 @@ impl PartialEq for RetrieveOptions {
 
 impl Eq for RetrieveOptions {}
 
-// ============================================================================
 // RETRIEVE RESULT
-// ============================================================================
 
 /// Result of a graph retrieval operation.
 #[derive(Debug)]
@@ -417,9 +413,7 @@ impl RetrieveResult {
     }
 }
 
-// ============================================================================
 // RETRIEVE FUNCTION
-// ============================================================================
 
 /// Retrieve the alive graph for a file starting from a position.
 ///
@@ -718,9 +712,7 @@ fn is_vertex_zombie<T: GraphTxnT>(
     Ok(false)
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -817,9 +809,7 @@ mod tests {
         assert!(debug.contains("include_deleted"));
     }
 
-    // ========================================================================
     // Change Filter Tests
-    // ========================================================================
 
     #[test]
     fn test_retrieve_options_with_change_filter() {

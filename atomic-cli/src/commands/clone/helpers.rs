@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Helper functions for the clone command.
 //!
 //! This module provides utility functions used by the clone command, including:
@@ -33,9 +32,7 @@ use atomic_repository::Repository;
 
 use crate::error::{CliError, CliResult};
 
-// =============================================================================
 // URL Parsing
-// =============================================================================
 
 /// Infer the repository name from a URL.
 ///
@@ -114,24 +111,7 @@ pub fn infer_repo_name(url: &str) -> Option<String> {
     None
 }
 
-/// Normalize a URL for consistent handling.
-///
-/// Ensures the URL is in a standard format for the clone operation.
-///
-/// # Arguments
-///
-/// * `url` - The URL to normalize
-///
-/// # Returns
-///
-/// The normalized URL string.
-pub fn normalize_url(url: &str) -> String {
-    url.trim_end_matches('/').to_string()
-}
-
-// =============================================================================
 // Path Validation
-// =============================================================================
 
 /// Validate that the target path is suitable for cloning.
 ///
@@ -222,9 +202,7 @@ pub fn resolve_target_path(url: &str, path: Option<String>) -> PathBuf {
     }
 }
 
-// =============================================================================
 // Cleanup Guard
-// =============================================================================
 
 /// A guard that cleans up a directory on drop if not disabled.
 ///
@@ -304,24 +282,6 @@ impl CleanupGuard {
     pub fn disable(mut self) {
         self.enabled = false;
     }
-
-    /// Check if cleanup is disabled.
-    ///
-    /// # Returns
-    ///
-    /// `true` if cleanup has been disabled.
-    pub fn is_disabled(&self) -> bool {
-        !self.enabled
-    }
-
-    /// Get the path being guarded.
-    ///
-    /// # Returns
-    ///
-    /// A reference to the guarded path.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 impl Drop for CleanupGuard {
@@ -333,31 +293,7 @@ impl Drop for CleanupGuard {
     }
 }
 
-/// Perform cleanup on error.
-///
-/// Removes the target directory if it exists.
-///
-/// # Arguments
-///
-/// * `path` - The path to clean up
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use atomic::commands::clone::helpers::cleanup_on_error;
-/// use std::path::Path;
-///
-/// cleanup_on_error(Path::new("/tmp/failed-clone"));
-/// ```
-pub fn cleanup_on_error(path: &Path) {
-    if path.exists() {
-        let _ = std::fs::remove_dir_all(path);
-    }
-}
-
-// =============================================================================
 // Change Operations
-// =============================================================================
 
 /// Save a downloaded change to the repository's change store.
 ///
@@ -407,23 +343,7 @@ pub fn save_downloaded_change(repo: &Repository, hash: &Hash, data: Bytes) -> Cl
     Ok(())
 }
 
-/// Check if a change already exists in the local repository.
-///
-/// # Arguments
-///
-/// * `repo` - The repository to check
-/// * `hash` - The hash of the change to look for
-///
-/// # Returns
-///
-/// `true` if the change exists locally, `false` otherwise.
-pub fn change_exists_locally(repo: &Repository, hash: &Hash) -> bool {
-    repo.has_change(hash)
-}
-
-// =============================================================================
 // Error Conversion
-// =============================================================================
 
 /// Convert a remote error to a CLI error.
 ///
@@ -504,9 +424,7 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
     }
 }
 
-// =============================================================================
 // Formatting Utilities
-// =============================================================================
 
 /// Format a count with proper pluralization.
 ///
@@ -570,18 +488,14 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    // =========================================================================
     // URL Parsing Tests
-    // =========================================================================
 
     /// Test inferring repo name from atomic-api URL pattern.
     #[test]
@@ -639,9 +553,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // Path Validation Tests
-    // =========================================================================
 
     /// Test validate_target_path with non-existent path.
     #[test]
@@ -688,9 +600,7 @@ mod tests {
         assert_eq!(path, PathBuf::from("repo"));
     }
 
-    // =========================================================================
     // CleanupGuard Tests
-    // =========================================================================
 
     /// Test CleanupGuard creation.
     #[test]
@@ -779,9 +689,7 @@ mod tests {
         cleanup_on_error(Path::new("/nonexistent/path/12345"));
     }
 
-    // =========================================================================
     // Error Conversion Tests
-    // =========================================================================
 
     /// Test converting connection failed error.
     #[test]
@@ -914,9 +822,7 @@ mod tests {
         assert!(matches!(cli_err, CliError::Conflict { .. }));
     }
 
-    // =========================================================================
     // Formatting Tests
-    // =========================================================================
 
     /// Test format_count with zero.
     #[test]

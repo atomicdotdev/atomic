@@ -68,9 +68,7 @@ use crate::types::{Base32, ChangePosition, Hash, NodeId, GraphNode};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-// ============================================================================
 // CHANGE STORE TRAIT
-// ============================================================================
 
 /// A trait for storing and retrieving changes.
 ///
@@ -242,9 +240,7 @@ pub trait ChangeStore: Send + Sync {
     }
 }
 
-// ============================================================================
 // MEMORY CHANGE STORE
-// ============================================================================
 
 /// Error type for the in-memory change store.
 #[derive(Debug, Clone)]
@@ -525,9 +521,7 @@ impl ChangeStore for MemoryChangeStore {
     }
 }
 
-// ============================================================================
 // TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

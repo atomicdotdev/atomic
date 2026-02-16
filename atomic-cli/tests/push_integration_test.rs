@@ -17,9 +17,7 @@ use atomic_remote::{ChangelistEntry, RemoteError, StateResponse};
 use atomic_repository::history::HistoryEntry;
 use std::collections::HashSet;
 
-// =============================================================================
 // Types Tests (replicated from push/types.rs for integration testing)
-// =============================================================================
 
 /// A change to be pushed to the remote (test version).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,9 +109,7 @@ impl PushStats {
     }
 }
 
-// =============================================================================
 // Helper Functions (replicated from push/helpers.rs)
-// =============================================================================
 
 /// Check if local and remote histories have diverged.
 fn has_diverged(local_entries: &[HistoryEntry], remote_entries: &[ChangelistEntry]) -> bool {
@@ -137,9 +133,7 @@ fn format_count(count: usize, singular: &str) -> String {
     }
 }
 
-// =============================================================================
 // Test Helpers
-// =============================================================================
 
 fn make_history_entry(sequence: u64, hash_seed: &str) -> HistoryEntry {
     HistoryEntry {
@@ -162,9 +156,7 @@ fn make_changelist_entry(sequence: u64, hash_seed: &str) -> ChangelistEntry {
     )
 }
 
-// =============================================================================
 // PushChange Tests
-// =============================================================================
 
 #[test]
 fn test_push_change_new() {
@@ -217,9 +209,7 @@ fn test_push_change_builder_chain() {
     assert_eq!(change.message.as_deref(), Some("Fix bug"));
 }
 
-// =============================================================================
 // PushStats Tests
-// =============================================================================
 
 #[test]
 fn test_push_stats_new() {
@@ -314,9 +304,7 @@ fn test_push_stats_record_failed() {
     assert!(stats.has_failures());
 }
 
-// =============================================================================
 // has_diverged Tests
-// =============================================================================
 
 #[test]
 fn test_has_diverged_with_empty_remote() {
@@ -383,9 +371,7 @@ fn test_has_diverged_with_empty_local() {
     assert!(has_diverged(&local, &remote));
 }
 
-// =============================================================================
 // format_count Tests
-// =============================================================================
 
 #[test]
 fn test_format_count_zero() {
@@ -411,9 +397,7 @@ fn test_format_count_different_words() {
     assert_eq!(format_count(3, "warning"), "3 warnings");
 }
 
-// =============================================================================
 // Remote Error Tests
-// =============================================================================
 
 #[test]
 fn test_remote_error_is_retryable() {
@@ -466,9 +450,7 @@ fn test_remote_error_suggestions() {
     assert!(timeout_err.suggestion().is_some());
 }
 
-// =============================================================================
 // StateResponse Tests
-// =============================================================================
 
 #[test]
 fn test_state_response_empty() {
@@ -490,9 +472,7 @@ fn test_state_response_with_state() {
     assert!(state.merkle().is_some());
 }
 
-// =============================================================================
 // ChangelistEntry Tests
-// =============================================================================
 
 #[test]
 fn test_changelist_entry_new() {

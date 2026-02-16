@@ -32,9 +32,7 @@ use crate::commands::{find_repository_root, format_hash, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::print_warning;
 
-// =============================================================================
 // Attest Command
-// =============================================================================
 
 /// List and inspect attestations in the repository.
 ///
@@ -406,9 +404,7 @@ impl Attest {
     }
 }
 
-// =============================================================================
 // Formatting Helpers
-// =============================================================================
 
 fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
@@ -438,9 +434,7 @@ fn format_count(n: usize, word: &str) -> String {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

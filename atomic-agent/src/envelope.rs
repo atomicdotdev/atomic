@@ -67,9 +67,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AgentError, AgentResult};
 
-// =============================================================================
 // Constants
-// =============================================================================
 
 /// Magic bytes identifying a SessionEnvelope in HashedChange.metadata.
 ///
@@ -84,9 +82,7 @@ const SCHEMA_VERSION: u8 = 1;
 #[allow(dead_code)]
 const MIN_ENCODED_SIZE: usize = 5;
 
-// =============================================================================
 // SessionEnvelope
-// =============================================================================
 
 /// Structured session/turn metadata embedded in `HashedChange.metadata`.
 ///
@@ -122,9 +118,7 @@ pub struct SessionEnvelope {
     /// Writers always use `SCHEMA_VERSION`.
     pub schema_version: u8,
 
-    // =========================================================================
     // Session identification
-    // =========================================================================
     /// Unique session identifier.
     ///
     /// Links all turns within the same session. Format is agent-specific
@@ -142,9 +136,7 @@ pub struct SessionEnvelope {
     #[serde(default)]
     pub agent_display_name: Option<String>,
 
-    // =========================================================================
     // Turn identification
-    // =========================================================================
     /// Sequential turn number within the session (1-indexed).
     ///
     /// Turn 1 is the first turn after the session starts. The server uses
@@ -159,9 +151,7 @@ pub struct SessionEnvelope {
     #[serde(default)]
     pub total_turns: Option<u32>,
 
-    // =========================================================================
     // Timing
-    // =========================================================================
     /// When the session started (Unix epoch seconds).
     pub session_started_at: i64,
 
@@ -177,9 +167,7 @@ pub struct SessionEnvelope {
     /// to avoid timezone/precision issues in the UI.
     pub turn_duration_ms: u64,
 
-    // =========================================================================
     // Prompt
-    // =========================================================================
     /// First ~200 characters of the user's prompt for UI previews.
     ///
     /// Truncated at word boundaries when possible. `None` if the agent
@@ -195,9 +183,7 @@ pub struct SessionEnvelope {
     #[serde(default)]
     pub prompt_hash: Option<[u8; 32]>,
 
-    // =========================================================================
     // Files
-    // =========================================================================
     /// Files modified in THIS turn.
     ///
     /// Paths are relative to the repository root. This is the same list
@@ -212,9 +198,7 @@ pub struct SessionEnvelope {
     #[serde(default)]
     pub files_in_session: u32,
 
-    // =========================================================================
     // Identity
-    // =========================================================================
     /// Reference to the identity delegation authorizing this agent.
     ///
     /// This is the delegation ID from `atomic-identity`, linking the change
@@ -405,9 +389,7 @@ impl std::fmt::Display for SessionEnvelope {
     }
 }
 
-// =============================================================================
 // SessionEnvelopeBuilder
-// =============================================================================
 
 /// Builder for constructing `SessionEnvelope` instances.
 ///
@@ -587,9 +569,7 @@ impl SessionEnvelopeBuilder {
     }
 }
 
-// =============================================================================
 // Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -618,9 +598,7 @@ mod tests {
         SessionEnvelope::builder("s1", "test-agent").build()
     }
 
-    // =========================================================================
     // Builder tests
-    // =========================================================================
 
     #[test]
     fn test_builder_required_fields() {
@@ -678,9 +656,7 @@ mod tests {
         assert_eq!(e.prompt_hash, Some(hash));
     }
 
-    // =========================================================================
     // Encode / Decode roundtrip
-    // =========================================================================
 
     #[test]
     fn test_encode_decode_roundtrip_full() {
@@ -737,9 +713,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // Decode error cases
-    // =========================================================================
 
     #[test]
     fn test_decode_too_short() {
@@ -811,9 +785,7 @@ mod tests {
         assert!(matches!(err, AgentError::EnvelopeCodecError { .. }));
     }
 
-    // =========================================================================
     // is_session_envelope
-    // =========================================================================
 
     #[test]
     fn test_is_session_envelope_valid() {
@@ -849,9 +821,7 @@ mod tests {
         assert!(!SessionEnvelope::is_session_envelope(&json));
     }
 
-    // =========================================================================
     // Helper methods
-    // =========================================================================
 
     #[test]
     fn test_turn_file_count() {
@@ -885,9 +855,7 @@ mod tests {
         assert!(!e.is_session_complete());
     }
 
-    // =========================================================================
     // Duration display
-    // =========================================================================
 
     #[test]
     fn test_duration_display_milliseconds() {
@@ -961,9 +929,7 @@ mod tests {
         assert_eq!(e.duration_display(), "10s");
     }
 
-    // =========================================================================
     // Display trait
-    // =========================================================================
 
     #[test]
     fn test_display_full() {
@@ -998,9 +964,7 @@ mod tests {
         assert!(s.len() < 200);
     }
 
-    // =========================================================================
     // Serde (JSON) roundtrip — for debugging/inspection
-    // =========================================================================
 
     #[test]
     fn test_json_roundtrip() {
@@ -1039,9 +1003,7 @@ mod tests {
         assert!(json.contains("agent_display_name"));
     }
 
-    // =========================================================================
     // Schema version
-    // =========================================================================
 
     #[test]
     fn test_schema_version_is_1() {
@@ -1089,9 +1051,7 @@ mod tests {
         assert_eq!(decoded.schema_version, 0);
     }
 
-    // =========================================================================
     // Edge cases
-    // =========================================================================
 
     #[test]
     fn test_empty_session_id() {
