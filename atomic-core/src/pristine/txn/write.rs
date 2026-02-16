@@ -477,6 +477,19 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
 
         Ok(Box::new(results.into_iter()))
     }
+
+    fn get_file_mtime(&self, path: &str) -> PristineResult<Option<(i64, u32, u64)>> {
+        let table = self.txn.open_table(FILE_MTIMES)?;
+        let guard = table.get(path)?;
+        match guard {
+            Some(value) => {
+                let bytes = value.value();
+                let (secs, nanos, size) = decode_file_mtime(bytes);
+                Ok(Some((secs, nanos, size)))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 // =============================================================================
@@ -1039,6 +1052,25 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         }
 
         Ok(inode)
+    }
+
+    fn put_file_mtime(
+        &mut self,
+        path: &str,
+        mtime_secs: i64,
+        mtime_nanos: u32,
+        file_size: u64,
+    ) -> Result<(), PristineError> {
+        let value = encode_file_mtime(mtime_secs, mtime_nanos, file_size);
+        let mut table = self.txn.open_table(FILE_MTIMES)?;
+        table.insert(path, &value)?;
+        Ok(())
+    }
+
+    fn del_file_mtime(&mut self, path: &str) -> Result<(), PristineError> {
+        let mut table = self.txn.open_table(FILE_MTIMES)?;
+        table.remove(path)?;
+        Ok(())
     }
 
     fn put_inode(&mut self, inode: Inode, pos: Position<NodeId>) -> PristineResult<()> {

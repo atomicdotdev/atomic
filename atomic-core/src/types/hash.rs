@@ -369,7 +369,10 @@ mod tests {
     fn test_hash_hex_invalid() {
         assert!(Hash::from_hex("").is_none());
         assert!(Hash::from_hex("abc").is_none());
-        assert!(Hash::from_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_none());
+        assert!(
+            Hash::from_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+                .is_none()
+        );
     }
 
     #[test]
@@ -453,12 +456,12 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_bincode_roundtrip() {
-        let original = Hash::of(b"bincode test");
-        let bytes = bincode::serialize(&original).unwrap();
-        let parsed: Hash = bincode::deserialize(&bytes).unwrap();
+    fn test_hash_postcard_roundtrip() {
+        let original = Hash::of(b"postcard test");
+        let bytes = postcard::to_allocvec(&original).unwrap();
+        let parsed: Hash = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(original, parsed);
-        // Binary format should be exactly 32 bytes (fixed array)
+        // Postcard fixed-size array should be exactly 32 bytes
         assert_eq!(bytes.len(), 32);
     }
 

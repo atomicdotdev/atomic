@@ -806,6 +806,23 @@ pub trait TreeTxnT: GraphTxnT {
         >,
         PristineError,
     >;
+
+    /// Get the cached file metadata (mtime + size) for a tracked file.
+    ///
+    /// Returns the filesystem metadata snapshot taken at the time the file
+    /// was last recorded or applied. During status, if the current `stat()`
+    /// values match, we skip the expensive graph content comparison.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - File path (relative to repository root)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some((mtime_secs, mtime_nanos, file_size)))` - Cached metadata
+    /// * `Ok(None)` - No cached metadata for this path
+    /// * `Err(_)` - Database error
+    fn get_file_mtime(&self, path: &str) -> Result<Option<(i64, u32, u64)>, PristineError>;
 }
 
 // =============================================================================
@@ -1259,6 +1276,35 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     ///
     /// The inode that was removed, if any.
     fn del_tree(&mut self, path: &str) -> Result<Option<Inode>, PristineError>;
+
+    /// Store file metadata (mtime + size) for fast status detection.
+    ///
+    /// Called after a file is recorded or applied. Stores the filesystem
+    /// metadata so that subsequent `status()` calls can skip the expensive
+    /// graph content comparison for unchanged files.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - File path (relative to repository root)
+    /// * `mtime_secs` - Modification time (seconds since epoch)
+    /// * `mtime_nanos` - Modification time (nanoseconds component)
+    /// * `file_size` - File size in bytes
+    fn put_file_mtime(
+        &mut self,
+        path: &str,
+        mtime_secs: i64,
+        mtime_nanos: u32,
+        file_size: u64,
+    ) -> Result<(), PristineError>;
+
+    /// Remove cached file metadata.
+    ///
+    /// Called when a file is deleted or untracked.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - File path to remove from the mtime cache
+    fn del_file_mtime(&mut self, path: &str) -> Result<(), PristineError>;
 
     /// Map an inode to a graph position
     ///

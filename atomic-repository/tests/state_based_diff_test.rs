@@ -105,31 +105,14 @@ fn test_state_before_change_first() {
 #[test]
 fn test_get_files_in_change_empty() {
     // Create a minimal change with no hunks
-    use atomic_core::change::{Change, HashedChange, Offsets};
+    use atomic_core::change::Change;
 
-    let header = ChangeHeader::builder()
-        .message("Empty change")
-        .author(Author::new("Test", None::<String>))
-        .build();
-
-    let hashed = HashedChange {
-        version: 1,
-        header,
-        dependencies: vec![],
-        extra_known: vec![],
-        metadata: vec![],
-        hunks: vec![],
-        file_ops: vec![],
-        contents_hash: Hash::NONE,
-        provenance: vec![],
-    };
-
-    let change = Change {
-        offsets: Offsets::default(),
-        hashed,
-        unhashed: None,
-        contents: vec![],
-    };
+    let change = Change::empty(
+        ChangeHeader::builder()
+            .message("Empty change")
+            .author(Author::new("Test", None::<String>))
+            .build(),
+    );
 
     let files = get_files_in_change(&change);
     assert!(files.is_empty());
@@ -185,7 +168,9 @@ fn test_file_modification_state_retrieval() {
     let _hash1 = record_change(&repo, "Add hello.txt");
 
     // Verify initial content is retrievable
-    let initial = repo.get_file_content("hello.txt").expect("Failed to get initial");
+    let initial = repo
+        .get_file_content("hello.txt")
+        .expect("Failed to get initial");
     assert!(initial.is_some(), "Initial content should exist");
 
     // Modify the file
@@ -193,7 +178,9 @@ fn test_file_modification_state_retrieval() {
     fs::write(&file_path, "Hello, Atomic!").expect("Failed to write modified file");
 
     // Check status before recording
-    let status = repo.status(StatusOptions::default()).expect("Failed to get status");
+    let status = repo
+        .status(StatusOptions::default())
+        .expect("Failed to get status");
     let modified: Vec<_> = status.modified().collect();
     assert_eq!(modified.len(), 1, "Should have 1 modified file");
 
@@ -201,7 +188,9 @@ fn test_file_modification_state_retrieval() {
     let hash2 = record_change(&repo, "Modify hello.txt");
 
     // Check content right after recording
-    let content_after_record = repo.get_file_content("hello.txt").expect("Failed to get content after record");
+    let content_after_record = repo
+        .get_file_content("hello.txt")
+        .expect("Failed to get content after record");
     assert_eq!(
         content_after_record.as_deref(),
         Some(b"Hello, Atomic!".as_slice()),
@@ -209,9 +198,15 @@ fn test_file_modification_state_retrieval() {
     );
 
     // Check final status
-    let final_status = repo.status(StatusOptions::default()).expect("Failed to get final status");
+    let final_status = repo
+        .status(StatusOptions::default())
+        .expect("Failed to get final status");
     let final_modified: Vec<_> = final_status.modified().collect();
-    assert_eq!(final_modified.len(), 0, "Should have no modified files after record");
+    assert_eq!(
+        final_modified.len(),
+        0,
+        "Should have no modified files after record"
+    );
 
     // Get content BEFORE the modification
     let before = repo
@@ -231,10 +226,7 @@ fn test_file_modification_state_retrieval() {
         .get_file_content_after_change("hello.txt", &hash2)
         .expect("Failed to get content after");
 
-    assert!(
-        after.is_some(),
-        "Content after modification should exist"
-    );
+    assert!(after.is_some(), "Content after modification should exist");
     let after_content = after.unwrap();
     assert_eq!(
         String::from_utf8_lossy(&after_content),
@@ -546,10 +538,7 @@ fn main() {
     use atomic_core::diff::{diff_text, Algorithm};
     let diff_result = diff_text(&before, &after, Algorithm::Myers);
 
-    assert!(
-        !diff_result.is_unchanged(),
-        "Diff should show changes"
-    );
+    assert!(!diff_result.is_unchanged(), "Diff should show changes");
 }
 
 // ============================================================================
@@ -577,11 +566,7 @@ fn test_file_append_state_retrieval() {
     let initial_bytes = initial_content.unwrap();
     let initial_str = String::from_utf8_lossy(&initial_bytes);
     println!("DEBUG: Initial content retrieved: {:?}", initial_str);
-    assert_eq!(
-        initial_str,
-        "Line 1\n",
-        "Initial content should match"
-    );
+    assert_eq!(initial_str, "Line 1\n", "Initial content should match");
 
     // Append content to the file
     let file_path = repo_path.join("append.txt");
@@ -589,7 +574,9 @@ fn test_file_append_state_retrieval() {
     println!("DEBUG: Wrote new content to file");
 
     // Check status - file should show as modified
-    let status = repo.status(StatusOptions::default()).expect("Failed to get status");
+    let status = repo
+        .status(StatusOptions::default())
+        .expect("Failed to get status");
     let modified_files: Vec<_> = status.modified().collect();
     println!("DEBUG: Modified files count: {}", modified_files.len());
     for f in &modified_files {
@@ -615,14 +602,18 @@ fn test_file_append_state_retrieval() {
         .get_file_content_before_change("append.txt", &hash2)
         .expect("Failed to get content before append");
 
-    println!("DEBUG: Content before result: {:?}", before.as_ref().map(|v| String::from_utf8_lossy(v).to_string()));
+    println!(
+        "DEBUG: Content before result: {:?}",
+        before
+            .as_ref()
+            .map(|v| String::from_utf8_lossy(v).to_string())
+    );
     assert!(before.is_some(), "Content before append should exist");
     let before_content = before.unwrap();
     let before_str = String::from_utf8_lossy(&before_content);
     println!("DEBUG: Content BEFORE append: {:?}", before_str);
     assert_eq!(
-        before_str,
-        "Line 1\n",
+        before_str, "Line 1\n",
         "Content before append should be original"
     );
 
@@ -638,13 +629,14 @@ fn test_file_append_state_retrieval() {
     println!("DEBUG: Expected: {:?}", "Line 1\nLine 2\n");
     println!("DEBUG: After content bytes: {:?}", after_content);
     assert_eq!(
-        after_str,
-        "Line 1\nLine 2\n",
+        after_str, "Line 1\nLine 2\n",
         "Content after append should include appended content"
     );
 
     // Verify final status is clean
-    let final_status = repo.status(StatusOptions::default()).expect("Failed to get final status");
+    let final_status = repo
+        .status(StatusOptions::default())
+        .expect("Failed to get final status");
     let final_modified: Vec<_> = final_status.modified().collect();
     assert!(
         final_modified.is_empty(),
@@ -684,7 +676,9 @@ fn test_file_prepend_state_retrieval() {
     );
 
     // Verify final status is clean
-    let final_status = repo.status(StatusOptions::default()).expect("Failed to get final status");
+    let final_status = repo
+        .status(StatusOptions::default())
+        .expect("Failed to get final status");
     let final_modified: Vec<_> = final_status.modified().collect();
     assert!(
         final_modified.is_empty(),
@@ -705,8 +699,13 @@ fn test_file_insert_middle_state_retrieval() {
     println!("DEBUG: Initial change hash: {}", hash1.to_base32());
 
     // Verify initial content
-    let initial = repo.get_file_content("middle.txt").expect("Failed to get initial");
-    println!("DEBUG: Initial content: {:?}", String::from_utf8_lossy(&initial.unwrap()));
+    let initial = repo
+        .get_file_content("middle.txt")
+        .expect("Failed to get initial");
+    println!(
+        "DEBUG: Initial content: {:?}",
+        String::from_utf8_lossy(&initial.unwrap())
+    );
 
     // Insert content in the middle
     let file_path = repo_path.join("middle.txt");
@@ -714,7 +713,9 @@ fn test_file_insert_middle_state_retrieval() {
     println!("DEBUG: Wrote new content with middle line inserted");
 
     // Check status before recording
-    let status = repo.status(StatusOptions::default()).expect("Failed to get status");
+    let status = repo
+        .status(StatusOptions::default())
+        .expect("Failed to get status");
     let modified: Vec<_> = status.modified().collect();
     println!("DEBUG: Modified files before record: {}", modified.len());
 
@@ -733,13 +734,14 @@ fn test_file_insert_middle_state_retrieval() {
     println!("DEBUG: Content AFTER insert: {:?}", after_str);
     println!("DEBUG: Expected: {:?}", "Line 1\nLine 2\nLine 3\n");
     assert_eq!(
-        after_str,
-        "Line 1\nLine 2\nLine 3\n",
+        after_str, "Line 1\nLine 2\nLine 3\n",
         "Content after insert should include inserted line"
     );
 
     // Verify final status is clean
-    let final_status = repo.status(StatusOptions::default()).expect("Failed to get final status");
+    let final_status = repo
+        .status(StatusOptions::default())
+        .expect("Failed to get final status");
     let final_modified: Vec<_> = final_status.modified().collect();
     assert!(
         final_modified.is_empty(),

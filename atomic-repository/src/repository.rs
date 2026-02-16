@@ -1196,6 +1196,36 @@ default = "{}"
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
+    /// Save a change using pre-serialized V3 bytes (hash-stable).
+    ///
+    /// This writes the exact V3 bytes to disk, ensuring the file hash matches
+    /// the hash registered in the pristine graph. Without this, re-serializing
+    /// the deserialized Change can produce a different hash (different hash table
+    /// ordering, different chunk boundaries, etc.), causing "change not found"
+    /// errors on push.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - The content hash (from the original serialization)
+    /// * `v3_bytes` - The exact V3 bytes to write to disk
+    /// * `_change` - The deserialized Change (unused, kept for API compatibility)
+    fn save_change_bytes(
+        &self,
+        hash: &Hash,
+        v3_bytes: &[u8],
+        _change: &Change,
+    ) -> Result<Hash, RepositoryError> {
+        // Write the exact V3 bytes to the file store (no re-serialization).
+        // This ensures the hash in the filename matches the hash in the pristine.
+        let change_path = self.change_store.change_path(hash);
+        if let Some(parent) = change_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&change_path, v3_bytes)?;
+
+        Ok(*hash)
+    }
+
     /// Load a change from the repository.
     ///
     /// If the change is in the cache, it's returned directly. Otherwise,
@@ -1836,19 +1866,88 @@ default = "{}"
                 }
 
                 if options.hash_contents {
-                    // Hash the current working copy file content
-                    match hash_file_contents(&abs_path) {
-                        Ok(current_hash) => {
-                            entry.set_current_hash(current_hash);
+                    // Fast path: check filesystem mtime + size against cached values.
+                    // If they match, the file hasn't been modified since the last record,
+                    // and we can skip the expensive graph content reconstruction entirely.
+                    // This reduces incremental status from O(files × graph_size) to O(files × stat).
+                    let mut mtime_matched = false;
 
-                            // If file has graph content, compare with recorded content
-                            if has_graph_content {
-                                // Retrieve the recorded content from the graph and hash it
-                                match self.get_file_content(path) {
-                                    Ok(Some(recorded_content)) => {
-                                        let recorded_hash = Hash::of(&recorded_content);
-                                        if current_hash != recorded_hash {
-                                            // Content differs - file is modified
+                    if has_graph_content {
+                        if let Ok(metadata) = std::fs::metadata(&abs_path) {
+                            use std::time::SystemTime;
+                            let current_mtime =
+                                metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                            let current_size = metadata.len();
+
+                            // Convert to (secs, nanos) for comparison
+                            let duration = current_mtime
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default();
+                            let current_secs = duration.as_secs() as i64;
+                            let current_nanos = duration.subsec_nanos();
+
+                            // Check the mtime cache
+                            let path_str = path.to_string_lossy();
+                            if let Ok(Some((cached_secs, cached_nanos, cached_size))) =
+                                txn.get_file_mtime(&path_str)
+                            {
+                                if current_secs == cached_secs
+                                    && current_nanos == cached_nanos
+                                    && current_size == cached_size
+                                {
+                                    // mtime + size match — file hasn't changed.
+                                    // Keep as Clean, skip the expensive content comparison.
+                                    mtime_matched = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if !mtime_matched {
+                        // Slow path: hash the working copy file and compare with graph content.
+                        match hash_file_contents(&abs_path) {
+                            Ok(current_hash) => {
+                                entry.set_current_hash(current_hash);
+
+                                // If file has graph content, compare with recorded content
+                                if has_graph_content {
+                                    // Retrieve the recorded content from the graph and hash it
+                                    match self.get_file_content(path) {
+                                        Ok(Some(recorded_content)) => {
+                                            let recorded_hash = Hash::of(&recorded_content);
+                                            if current_hash != recorded_hash {
+                                                // Content differs - file is modified
+                                                entry = FileStatusEntry::new(
+                                                    path.clone(),
+                                                    FileStatus::Modified,
+                                                );
+                                                if let Some(inode) = inode {
+                                                    entry.set_inode(inode);
+                                                }
+                                                entry.set_current_hash(current_hash);
+                                            }
+                                            // Otherwise keep as Clean
+                                        }
+                                        Ok(None) => {
+                                            // No recorded content - keep as Clean
+                                            debug_assert!(
+                                                !has_graph_content || {
+                                                    let is_empty_file = std::fs::metadata(&abs_path)
+                                                        .map(|m| m.len() == 0)
+                                                        .unwrap_or(false);
+                                                    if !is_empty_file {
+                                                        eprintln!(
+                                                            "WARNING: File '{}' has graph content but get_file_content returned None.",
+                                                            path.display()
+                                                        );
+                                                    }
+                                                    true
+                                                },
+                                                "Unexpected: has_graph_content=true but no content retrieved"
+                                            );
+                                        }
+                                        Err(_) => {
+                                            // Error retrieving content - assume modified to be safe
                                             entry = FileStatusEntry::new(
                                                 path.clone(),
                                                 FileStatus::Modified,
@@ -1857,65 +1956,24 @@ default = "{}"
                                                 entry.set_inode(inode);
                                             }
                                             entry.set_current_hash(current_hash);
+                                            entry.set_details(
+                                                "Unable to retrieve recorded content".to_string(),
+                                            );
                                         }
-                                        // Otherwise keep as Clean
-                                    }
-                                    Ok(None) => {
-                                        // No recorded content - file has graph structure but no content.
-                                        // This is valid for empty files or files with only inode vertices.
-                                        // Keep as Clean since the graph exists but has no content to compare.
-                                        //
-                                        // NOTE: If you're debugging a case where a file shows as Clean
-                                        // but should be Modified, check that the content is actually
-                                        // being stored in the graph during recording. The bug was likely
-                                        // in globalize_hunk using `content` instead of `full_content`
-                                        // for Replace hunks.
-                                        debug_assert!(
-                                            !has_graph_content || {
-                                                // If has_graph_content is true, this should only happen
-                                                // for empty files. Log for debugging if it's not empty.
-                                                let is_empty_file = std::fs::metadata(&abs_path)
-                                                    .map(|m| m.len() == 0)
-                                                    .unwrap_or(false);
-                                                if !is_empty_file {
-                                                    eprintln!(
-                                                        "WARNING: File '{}' has graph content but get_file_content returned None. \
-                                                         This may indicate a bug in content storage.",
-                                                        path.display()
-                                                    );
-                                                }
-                                                true // Don't fail the assertion, just warn
-                                            },
-                                            "Unexpected: has_graph_content=true but no content retrieved"
-                                        );
-                                    }
-                                    Err(_) => {
-                                        // Error retrieving content - assume modified to be safe
-                                        entry = FileStatusEntry::new(
-                                            path.clone(),
-                                            FileStatus::Modified,
-                                        );
-                                        if let Some(inode) = inode {
-                                            entry.set_inode(inode);
-                                        }
-                                        entry.set_current_hash(current_hash);
-                                        entry.set_details(
-                                            "Unable to retrieve recorded content".to_string(),
-                                        );
                                     }
                                 }
+                                // Files marked as Added stay as Added regardless of content
                             }
-                            // Files marked as Added stay as Added regardless of content
-                        }
-                        Err(_) => {
-                            // Can't read file - might be a permission issue
-                            // Mark as modified since we can't verify (unless it's newly added)
-                            if has_graph_content {
-                                entry = FileStatusEntry::new(path.clone(), FileStatus::Modified);
-                                if let Some(inode) = inode {
-                                    entry.set_inode(inode);
+                            Err(_) => {
+                                // Can't read file - might be a permission issue
+                                if has_graph_content {
+                                    entry =
+                                        FileStatusEntry::new(path.clone(), FileStatus::Modified);
+                                    if let Some(inode) = inode {
+                                        entry.set_inode(inode);
+                                    }
+                                    entry.set_details("Unable to read file contents".to_string());
                                 }
-                                entry.set_details("Unable to read file contents".to_string());
                             }
                         }
                     }
@@ -3058,21 +3116,23 @@ default = "{}"
         let change = assembly_result.into_change();
         stats.dependency_count = change.dependencies().len();
 
-        // Compute the hash
-        let _hasher = atomic_core::types::Hasher::new();
-        // Serialize to compute hash
-        let mut hash_buffer = Vec::new();
-        change
-            .serialize(&mut hash_buffer)
+        // Serialize to V3 format and compute content hash.
+        // We keep the raw V3 bytes so we can save them directly to disk
+        // without re-serializing (which would produce a different hash).
+        let mut v3_bytes = Vec::new();
+        let computed_hash = change
+            .serialize(&mut v3_bytes)
             .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
 
-        let _hash = Hash::of(&hash_buffer);
-
-        // Reload the change from the buffer (to get proper offsets)
-        let (final_change, computed_hash) = Change::deserialize(&mut hash_buffer.as_slice())
+        // Reload the change from the V3 buffer to get a clean deserialized form
+        let (final_change, verified_hash) = Change::deserialize(&mut v3_bytes.as_slice())
             .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+        debug_assert_eq!(computed_hash, verified_hash);
 
         let mut outcome = RecordOutcome::new(final_change, computed_hash, stats);
+        // Stash the original V3 bytes so save_change can write them directly
+        // instead of re-serializing (which may produce a different hash).
+        outcome.set_v3_bytes(v3_bytes);
 
         // Add recorded/skipped/deleted files to outcome
         for path in recorded_paths {
@@ -3088,10 +3148,19 @@ default = "{}"
             outcome.add_error(path, error);
         }
 
-        // Save to store if requested
+        // Save to store if requested.
+        // Use the original V3 bytes (not re-serialized) to ensure the hash
+        // on disk matches the hash registered in the pristine graph.
         if options.get_save_to_store() {
-            self.save_change(outcome.change())
-                .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+            if let Some(v3_bytes) = outcome.v3_bytes() {
+                // Fast path: write the exact V3 bytes that produced computed_hash
+                self.save_change_bytes(&computed_hash, v3_bytes, outcome.change())
+                    .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+            } else {
+                // Fallback: re-serialize (may produce different hash — legacy path)
+                self.save_change(outcome.change())
+                    .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+            }
             outcome.set_saved(true);
         }
 
@@ -3107,6 +3176,32 @@ default = "{}"
             match self.apply_recorded(&outcome, apply_opts) {
                 Ok(apply_outcome) => {
                     outcome.set_applied(apply_outcome.new_state);
+
+                    // Update mtime cache for all recorded/added files.
+                    // This snapshots the filesystem metadata AFTER the record,
+                    // so subsequent status() calls can skip unchanged files.
+                    if let Ok(mut mtime_txn) = self.pristine.write_txn() {
+                        for path_str in outcome.recorded_files() {
+                            // Strip directory markers like "dir/ (directory)"
+                            let clean_path =
+                                path_str.strip_suffix("/ (directory)").unwrap_or(path_str);
+                            let abs_path = self.root.join(clean_path);
+                            if let Ok(metadata) = std::fs::metadata(&abs_path) {
+                                use std::time::SystemTime;
+                                let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                                let duration = mtime
+                                    .duration_since(SystemTime::UNIX_EPOCH)
+                                    .unwrap_or_default();
+                                let _ = mtime_txn.put_file_mtime(
+                                    clean_path,
+                                    duration.as_secs() as i64,
+                                    duration.subsec_nanos(),
+                                    metadata.len(),
+                                );
+                            }
+                        }
+                        let _ = mtime_txn.commit();
+                    }
                 }
                 Err(e) => {
                     outcome.add_error("apply".to_string(), e.to_string());

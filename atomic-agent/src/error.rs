@@ -301,9 +301,9 @@ pub enum AgentError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// A bincode serialization/deserialization error occurred.
-    #[error("Bincode error: {0}")]
-    Bincode(#[from] bincode::Error),
+    /// A postcard serialization/deserialization error occurred.
+    #[error("Postcard error: {0}")]
+    Postcard(#[from] postcard::Error),
 
     /// An error from the underlying `atomic-repository` crate.
     #[error("Repository error: {0}")]

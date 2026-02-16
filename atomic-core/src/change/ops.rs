@@ -308,18 +308,14 @@ pub struct LineOps {
     /// The line number in the old file (for deletes/modifies).
     /// None for pure insertions.
     ///
-    /// Note: We use `#[serde(default)]` but NOT `skip_serializing_if` because
-    /// this type is serialized with bincode (in HashedChange), which requires
-    /// all fields to be present. JSON serialization still works correctly.
+    /// We use `#[serde(default)]` so that missing fields deserialize as `None`.
     #[serde(default)]
     old_line_num: Option<usize>,
 
     /// The line number in the new file (for inserts/modifies).
     /// None for pure deletions.
     ///
-    /// Note: We use `#[serde(default)]` but NOT `skip_serializing_if` because
-    /// this type is serialized with bincode (in HashedChange), which requires
-    /// all fields to be present. JSON serialization still works correctly.
+    /// We use `#[serde(default)]` so that missing fields deserialize as `None`.
     #[serde(default)]
     new_line_num: Option<usize>,
 
@@ -1129,12 +1125,12 @@ mod tests {
     }
 
     #[test]
-    fn test_file_ops_bincode_roundtrip() {
+    fn test_file_ops_postcard_roundtrip() {
         let mut ops = FileOps::create(test_trunk_id(), "binary.dat".to_string(), None);
         ops.add_line_op(LineOps::delete(test_branch_id(5), vec![]));
 
-        let bytes = bincode::serialize(&ops).unwrap();
-        let deserialized: FileOps = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_allocvec(&ops).unwrap();
+        let deserialized: FileOps = postcard::from_bytes(&bytes).unwrap();
 
         assert_eq!(ops, deserialized);
     }

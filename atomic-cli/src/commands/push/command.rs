@@ -24,7 +24,7 @@ use crate::output::{
 
 use super::helpers::{
     calculate_push_delta, convert_remote_error, display_state_comparison, format_count,
-    has_diverged, load_change_data,
+    has_diverged, upload_change_smart,
 };
 use super::types::PushChange;
 
@@ -510,23 +510,33 @@ impl Push {
 
         let progress = create_progress_bar(new_changes.len() as u64, "Pushing changes");
 
+        let mut _total_bytes_sent: u64 = 0;
+        let mut _total_bytes_saved: u64 = 0;
+        let mut _delta_count: usize = 0;
+
         for (i, change) in new_changes.iter().enumerate() {
-            let change_data = load_change_data(&repo, &change.hash)?;
+            let transfer = upload_change_smart(&remote, &repo, &change.hash, &remote_stack).await;
 
-            let result = remote
-                .upload_change(&change.hash.to_base32(), &remote_stack, change_data)
-                .await;
-
-            match result {
-                Ok(()) => {
+            match transfer {
+                Ok(result) => {
                     let msg = change.message_or_default();
+                    let transfer_info = if result.used_delta {
+                        _delta_count += 1;
+                        format!(" [{}]", result)
+                    } else {
+                        String::new()
+                    };
+                    _total_bytes_sent += result.bytes_sent;
+                    _total_bytes_saved += result.bytes_saved;
+
                     println!(
-                        "  {} {} ({}/{}) {}",
+                        "  {} {} ({}/{}) {}{}",
                         success("✓"),
                         style_hash(&format_hash(&change.hash, false)),
                         i + 1,
                         new_changes.len(),
-                        msg
+                        msg,
+                        transfer_info,
                     );
                 }
                 Err(e) => {
@@ -540,7 +550,7 @@ impl Push {
                         msg,
                         e
                     );
-                    return Err(convert_remote_error(e, &remote_url));
+                    return Err(e);
                 }
             }
 

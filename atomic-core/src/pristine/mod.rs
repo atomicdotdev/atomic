@@ -149,7 +149,7 @@
 
 mod error;
 mod inode_graph;
-mod tables;
+pub mod tables;
 mod traits;
 mod txn;
 
@@ -157,7 +157,7 @@ pub use error::{PristineError, PristineResult};
 pub use inode_graph::{
     InodeAdjState, InodeEdgeIter, InodeGraphOps, InodeGraphStats, InodeVertex, IntoInodeVertex,
 };
-pub use tables::*;
 pub use tables::directory_flags;
+pub use tables::*;
 pub use traits::{GraphTxnT, MutTxnT, StackState, StackTxnT, TreeTxnT, VertexExt};
 pub use txn::{AdjIterator, Pristine, ReadTxn, WriteTxn};

@@ -25,7 +25,7 @@
 //! The envelope is serialized as:
 //!
 //! ```text
-//! [magic: 4 bytes "ATSE"] [schema_version: 1 byte] [bincode payload]
+//! [magic: 4 bytes "ATSE"] [postcard payload]
 //! ```
 //!
 //! The 4-byte magic prefix allows `is_session_envelope()` to quickly check
@@ -80,7 +80,7 @@ const MAGIC: &[u8; 4] = b"ATSE";
 /// envelope format.
 const SCHEMA_VERSION: u8 = 1;
 
-/// Minimum valid encoded size: magic (4) + at least 1 byte of bincode payload.
+/// Minimum valid encoded size: magic (4) + at least 1 byte of postcard payload.
 #[allow(dead_code)]
 const MIN_ENCODED_SIZE: usize = 5;
 
@@ -90,7 +90,7 @@ const MIN_ENCODED_SIZE: usize = 5;
 
 /// Structured session/turn metadata embedded in `HashedChange.metadata`.
 ///
-/// This type is serialized (magic + version + bincode) into the hashed
+/// This type is serialized (magic + postcard) into the hashed
 /// metadata field of an Atomic change, making it part of the change's
 /// cryptographic identity.
 ///
@@ -240,14 +240,14 @@ impl SessionEnvelope {
 
     /// Encode the envelope for storage in `HashedChange.metadata`.
     ///
-    /// Format: `[MAGIC: 4 bytes][VERSION: 1 byte][bincode payload]`
+    /// Format: `[MAGIC: 4 bytes][postcard payload]`
     ///
     /// # Errors
     ///
-    /// Returns `AgentError::EnvelopeCodecError` if bincode serialization fails.
+    /// Returns `AgentError::EnvelopeCodecError` if postcard serialization fails.
     pub fn encode(&self) -> AgentResult<Vec<u8>> {
-        let payload = bincode::serialize(self).map_err(|e| AgentError::EnvelopeCodecError {
-            reason: format!("bincode serialize failed: {}", e),
+        let payload = postcard::to_allocvec(self).map_err(|e| AgentError::EnvelopeCodecError {
+            reason: format!("postcard serialize failed: {}", e),
         })?;
 
         let mut buf = Vec::with_capacity(MAGIC.len() + payload.len());
@@ -266,7 +266,7 @@ impl SessionEnvelope {
     /// - The data is too short
     /// - The magic prefix doesn't match
     /// - The schema version is unsupported
-    /// - Bincode deserialization fails
+    /// - Postcard deserialization fails
     pub fn decode(data: &[u8]) -> AgentResult<Self> {
         if data.len() < MAGIC.len() + 1 {
             return Err(AgentError::EnvelopeCodecError {
@@ -287,8 +287,8 @@ impl SessionEnvelope {
 
         // Deserialize payload (includes schema_version field)
         let envelope: Self =
-            bincode::deserialize(&data[4..]).map_err(|e| AgentError::EnvelopeCodecError {
-                reason: format!("bincode deserialize failed: {}", e),
+            postcard::from_bytes(&data[4..]).map_err(|e| AgentError::EnvelopeCodecError {
+                reason: format!("postcard deserialize failed: {}", e),
             })?;
 
         // Check version from the deserialized struct
@@ -806,7 +806,7 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
         bytes.push(SCHEMA_VERSION);
-        bytes.extend_from_slice(b"this is not valid bincode data at all");
+        bytes.extend_from_slice(b"this is not valid postcard data at all");
         let err = SessionEnvelope::decode(&bytes).unwrap_err();
         assert!(matches!(err, AgentError::EnvelopeCodecError { .. }));
     }
@@ -838,7 +838,7 @@ mod tests {
     #[test]
     fn test_is_session_envelope_other_metadata() {
         // Simulate other metadata stored in HashedChange.metadata
-        let other_metadata = bincode::serialize(&"some other data").unwrap();
+        let other_metadata = postcard::to_allocvec(&"some other data").unwrap();
         assert!(!SessionEnvelope::is_session_envelope(&other_metadata));
     }
 
@@ -1012,7 +1012,7 @@ mod tests {
 
     #[test]
     fn test_json_minimal_has_null_optionals() {
-        // With bincode-compatible serde (no skip_serializing_if),
+        // With serde (no skip_serializing_if),
         // None fields serialize as null in JSON and empty vecs as [].
         let e = make_minimal_envelope();
         let json = serde_json::to_string(&e).unwrap();
@@ -1020,7 +1020,7 @@ mod tests {
         assert!(json.contains("session_id"));
         assert!(json.contains("agent_name"));
         assert!(json.contains("turn_number"));
-        // Optional fields are present as null (bincode needs them)
+        // Optional fields are present as null
         assert!(json.contains("total_turns"));
         assert!(json.contains("delegation_id"));
     }
@@ -1063,7 +1063,7 @@ mod tests {
         let mut e = make_minimal_envelope();
         e.schema_version = 99;
         // Encode with the high version baked in
-        let payload = bincode::serialize(&e).unwrap();
+        let payload = postcard::to_allocvec(&e).unwrap();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&payload);
@@ -1081,7 +1081,7 @@ mod tests {
     fn test_version_0_accepted() {
         let mut e = make_minimal_envelope();
         e.schema_version = 0;
-        let payload = bincode::serialize(&e).unwrap();
+        let payload = postcard::to_allocvec(&e).unwrap();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&payload);

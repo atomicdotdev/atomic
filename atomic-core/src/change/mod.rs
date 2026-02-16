@@ -86,12 +86,14 @@
 //! - [`provenance`]: AI provenance tracking (vendor, model, tokens, cost)
 //! - [`credit`]: AI-aware line-level attribution (like git blame)
 //! - [`change`]: Complete change structure and serialization
+//! - [`format_v3`]: V3 change file format — streaming, compressed, postcard-serialized (Phase 1)
 
 mod atom;
 pub mod attestation;
 mod change;
 mod credit;
 mod encoding;
+pub mod format_v3;
 mod graph_op;
 mod header;
 mod local;
@@ -107,7 +109,7 @@ pub use attestation::{
     AttestAgent, Attestation, AttestationBuilder, AttestationError, CodeChangeStats, ModelUsage,
     ATTESTATION_EXTENSION,
 };
-pub use change::{Change, ChangeError, HashedChange, Offsets};
+pub use change::{Change, ChangeError, HashedChange};
 pub use credit::{Credit, CreditRange, CreditStats, CreditType, FileCredits, LineCredit};
 pub use encoding::Encoding;
 pub use header::{Author, ChangeHeader};
@@ -119,12 +121,6 @@ pub use provenance::{
     AITool, AIVendor, Cost, PromptContent, Provenance, SuggestionType, TokenUsage,
 };
 pub use store::{ChangeStore, MemoryChangeStore, MemoryStoreError};
-
-/// Current change format version.
-///
-/// This is incremented when the serialization format changes in a
-/// backward-incompatible way.
-pub const VERSION: u64 = 1;
 
 #[cfg(test)]
 mod tests {

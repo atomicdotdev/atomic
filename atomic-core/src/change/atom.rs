@@ -669,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn test_new_vertex_bincode_roundtrip() {
+    fn test_new_vertex_postcard_roundtrip() {
         let nv = Insertion {
             predecessors: vec![],
             successors: vec![],
@@ -679,8 +679,8 @@ mod tests {
             inode: test_hash_position(42),
         };
 
-        let bytes = bincode::serialize(&nv).unwrap();
-        let parsed: Insertion<Hash> = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_allocvec(&nv).unwrap();
+        let parsed: Insertion<Hash> = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(nv, parsed);
     }
 
@@ -910,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn test_new_edge_bincode_roundtrip() {
+    fn test_new_edge_postcard_roundtrip() {
         let edge = NewEdge {
             previous: EdgeFlags::FOLDER | EdgeFlags::PARENT,
             flag: EdgeFlags::FOLDER | EdgeFlags::PARENT | EdgeFlags::DELETED,
@@ -923,8 +923,8 @@ mod tests {
             introduced_by: Hash::of(b"intro"),
         };
 
-        let bytes = bincode::serialize(&edge).unwrap();
-        let parsed: NewEdge<Hash> = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_allocvec(&edge).unwrap();
+        let parsed: NewEdge<Hash> = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(edge, parsed);
     }
 
@@ -963,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn test_atom_bincode_roundtrip() {
+    fn test_atom_postcard_roundtrip() {
         let atoms: Vec<Atom<Hash>> = vec![
             Atom::Insertion(Insertion {
                 predecessors: vec![test_hash_position(0)],
@@ -990,8 +990,8 @@ mod tests {
         ];
 
         for atom in atoms {
-            let bytes = bincode::serialize(&atom).unwrap();
-            let parsed: Atom<Hash> = bincode::deserialize(&bytes).unwrap();
+            let bytes = postcard::to_allocvec(&atom).unwrap();
+            let parsed: Atom<Hash> = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(atom, parsed);
         }
     }
@@ -1036,8 +1036,8 @@ mod tests {
         assert_eq!(em.len(), 100);
 
         // Verify serialization still works
-        let bytes = bincode::serialize(&em).unwrap();
-        let parsed: EdgeUpdate<Hash> = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_allocvec(&em).unwrap();
+        let parsed: EdgeUpdate<Hash> = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(em, parsed);
     }
 

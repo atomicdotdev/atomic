@@ -836,6 +836,16 @@ pub struct RecordOutcome {
 
     /// Non-fatal errors that occurred.
     errors: Vec<(String, String)>,
+
+    /// The original serialized V3 bytes from the first serialize() call.
+    ///
+    /// Stored so that `save_change` can write the exact bytes to disk
+    /// instead of re-serializing (which may produce a different hash due
+    /// to different hash table ordering or chunk boundaries).
+    ///
+    /// This ensures the hash on disk matches the hash registered in the
+    /// pristine graph, preventing "change not found" errors on push.
+    v3_bytes: Option<Vec<u8>>,
 }
 
 impl RecordOutcome {
@@ -852,6 +862,7 @@ impl RecordOutcome {
             deleted_files: Vec::new(),
             skipped_files: Vec::new(),
             errors: Vec::new(),
+            v3_bytes: None,
         }
     }
 
@@ -963,6 +974,20 @@ impl RecordOutcome {
     }
 
     /// Add an error.
+    /// Store the original V3 serialized bytes for hash-stable saving.
+    ///
+    /// Called by `Repository::record()` after the first `serialize()` call.
+    /// These bytes are later written directly to disk by `save_change_bytes()`
+    /// to avoid the hash mismatch caused by re-serialization.
+    pub fn set_v3_bytes(&mut self, bytes: Vec<u8>) {
+        self.v3_bytes = Some(bytes);
+    }
+
+    /// Get the original V3 bytes, if stored.
+    pub fn v3_bytes(&self) -> Option<&[u8]> {
+        self.v3_bytes.as_deref()
+    }
+
     pub fn add_error(&mut self, path: String, error: String) {
         self.errors.push((path, error));
     }

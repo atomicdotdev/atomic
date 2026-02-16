@@ -51,8 +51,7 @@ pub use types::*;
 pub use change::{
     AITool, AIVendor, Atom, Author, Change, ChangeError, ChangeHeader, Cost, Credit, CreditRange,
     CreditStats, CreditType, EdgeUpdate, Encoding, FileCredits, GraphOp, HashedChange, Insertion,
-    LineCredit, Local, LocalByte, NewEdge, Offsets, PromptContent, Provenance, SuggestionType,
-    TokenUsage,
+    LineCredit, Local, LocalByte, NewEdge, PromptContent, Provenance, SuggestionType, TokenUsage,
 };
 
 // Re-export pristine types

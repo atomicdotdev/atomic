@@ -436,6 +436,17 @@ impl TreeTxnT for ReadTxn {
 
         Ok(Box::new(results.into_iter()))
     }
+
+    fn get_file_mtime(&self, path: &str) -> PristineResult<Option<(i64, u32, u64)>> {
+        let table = self.txn.open_table(FILE_MTIMES)?;
+        match table.get(path)? {
+            Some(value) => {
+                let (secs, nanos, size) = decode_file_mtime(value.value());
+                Ok(Some((secs, nanos, size)))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]

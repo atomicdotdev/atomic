@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bincode_roundtrip() {
+    fn test_postcard_roundtrip() {
         for encoding in [
             Encoding::Utf8,
             Encoding::Utf16Le,
@@ -546,8 +546,8 @@ mod tests {
             Encoding::Latin1,
             Encoding::Binary,
         ] {
-            let bytes = bincode::serialize(&encoding).unwrap();
-            let parsed: Encoding = bincode::deserialize(&bytes).unwrap();
+            let bytes = postcard::to_allocvec(&encoding).unwrap();
+            let parsed: Encoding = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(encoding, parsed);
         }
     }

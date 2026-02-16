@@ -107,12 +107,19 @@ pub mod unrecord;
 // Phase 9 additions
 pub mod remote;
 
+// Phase 4: Parallel recording pipeline
+pub mod parallel_record;
+
+// Phase 5: redb-native change storage
+pub mod redb_change_store;
+
+// Phase 6: Semantic regeneration (rebuild SEMANTIC from graph + content after thin pull)
+pub mod semantic_regen;
+
 // Re-export main types at crate root for convenience
 
 // Change store exports
-pub use changestore::{
-    ChangeStore, ChangeStoreError, ChangeStoreResult, DEFAULT_CACHE_CAPACITY,
-};
+pub use changestore::{ChangeStore, ChangeStoreError, ChangeStoreResult, DEFAULT_CACHE_CAPACITY};
 
 // Error exports
 pub use error::*;
@@ -139,8 +146,8 @@ pub use tracking::{
 pub use apply::{
     apply_change_to_graph, check_missing_dependencies, collect_all_dependencies,
     compute_apply_order, filter_missing_in_stack, get_changes_up_to_seq, get_missing_changes,
-    get_stack_changes, order_changes_by_deps, ApplyError, ApplyOptions, ApplyOutcome,
-    ApplyResult, ApplyStats, CrossStackApplyOptions, CrossStackApplyOutcome,
+    get_stack_changes, order_changes_by_deps, ApplyError, ApplyOptions, ApplyOutcome, ApplyResult,
+    ApplyStats, CrossStackApplyOptions, CrossStackApplyOutcome,
 };
 
 // History exports
@@ -183,6 +190,4 @@ pub use archive::{
 };
 
 // Ignore exports
-pub use ignore::{
-    global_ignore_path, local_ignore_path, IgnoreError, IgnoreResult, IgnoreRules,
-};
+pub use ignore::{global_ignore_path, local_ignore_path, IgnoreError, IgnoreResult, IgnoreRules};

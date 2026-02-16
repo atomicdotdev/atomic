@@ -76,7 +76,6 @@
 //! for single-threaded use. For parallel recording, create separate contexts
 //! for each thread with appropriate synchronization on shared state.
 
-
 use crate::change::ChangeStore;
 use crate::diff::Algorithm;
 use crate::output::WorkingCopyRead;
@@ -891,6 +890,10 @@ mod tests {
             PristineError,
         > {
             Ok(Box::new(std::iter::empty()))
+        }
+
+        fn get_file_mtime(&self, _path: &str) -> Result<Option<(i64, u32, u64)>, PristineError> {
+            Ok(None)
         }
     }
 

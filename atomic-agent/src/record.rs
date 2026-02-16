@@ -727,7 +727,7 @@ fn build_turn_envelope(
 ///         prompt: Hashed(<blake3>),
 ///         metadata: [("turn_number", "3"), ("agent_name", "claude-code")],
 ///     }],
-///     metadata: <SessionEnvelope bincode bytes>,  // ← tamper-evident session data
+///     metadata: <SessionEnvelope postcard bytes>,  // ← tamper-evident session data
 ///     hunks: [...],        // ← actual file diffs from repo.record()
 ///     file_ops: [...],     // ← CRDT semantic ops from repo.record()
 ///     contents: [...],     // ← file content from repo.record()

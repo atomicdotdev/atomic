@@ -29,8 +29,7 @@
 //!
 //! ```text
 //! [MAGIC: 4 bytes "ATST"]
-//! [VERSION: 1 byte]
-//! [bincode payload → Attestation]
+//! [postcard payload → Attestation]
 //! ```
 //!
 //! # Cross-Stack Queries
@@ -192,12 +191,12 @@ impl Attestation {
 
     /// Serialize the attestation to bytes.
     ///
-    /// Format: `[MAGIC: 4 bytes][VERSION: 1 byte][bincode payload]`
+    /// Format: `[MAGIC: 4 bytes][postcard payload]`
     ///
     /// The hash is computed over the entire serialized output.
     pub fn serialize(&self) -> Result<Vec<u8>, AttestationError> {
-        let payload = bincode::serialize(self).map_err(|e| AttestationError::Codec {
-            reason: format!("bincode serialize failed: {}", e),
+        let payload = postcard::to_allocvec(self).map_err(|e| AttestationError::Codec {
+            reason: format!("postcard serialize failed: {}", e),
         })?;
 
         let mut buf = Vec::with_capacity(MAGIC.len() + payload.len());
@@ -227,8 +226,8 @@ impl Attestation {
         }
 
         let attestation: Self =
-            bincode::deserialize(&data[4..]).map_err(|e| AttestationError::Codec {
-                reason: format!("bincode deserialize failed: {}", e),
+            postcard::from_bytes(&data[4..]).map_err(|e| AttestationError::Codec {
+                reason: format!("postcard deserialize failed: {}", e),
             })?;
 
         if attestation.version > SCHEMA_VERSION {
@@ -990,7 +989,7 @@ mod tests {
     #[test]
     fn test_deserialize_corrupted_payload() {
         let mut bytes = b"ATST".to_vec();
-        bytes.extend_from_slice(b"not valid bincode data at all");
+        bytes.extend_from_slice(b"not valid postcard data at all");
         let result = Attestation::deserialize(&bytes);
         assert!(result.is_err());
     }

@@ -12,7 +12,13 @@ rust-version.workspace = true
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
-bincode.workspace = true
+postcard.workspace = true
+
+# Parallel processing
+rayon.workspace = true
+
+# Content-defined chunking
+fastcdc.workspace = true
 
 # Hashing
 blake3.workspace = true

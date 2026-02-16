@@ -125,6 +125,7 @@
 
 pub mod error;
 pub mod http;
+pub mod streaming;
 pub mod sync;
 pub mod types;
 
@@ -146,6 +147,12 @@ pub use types::{
 
 // Sync engine
 pub use sync::{RemoteDelta, RemoteState, SyncEngine, SyncStats};
+
+// Streaming protocol
+pub use streaming::{
+    ChunkManifest, ChunkManifestEntry, ChunkNegotiation, Layer, LayerSelection,
+    StreamingPullOptions, StreamingPushOptions, TransferProgress, TransferStats,
+};
 
 // =============================================================================
 // Constants
@@ -193,5 +200,14 @@ mod tests {
         let _ = RemoteState::empty();
         let _ = RemoteDelta::in_sync();
         let _ = SyncStats::default();
+
+        // Streaming protocol types
+        let _ = LayerSelection::all();
+        let _ = LayerSelection::thin_pull();
+        let _ = ChunkManifest::empty();
+        let _ = ChunkManifestEntry::new(0, [0u8; 32], 0, 0);
+        let _ = StreamingPushOptions::default();
+        let _ = StreamingPullOptions::default();
+        let _ = TransferStats::default();
     }
 }

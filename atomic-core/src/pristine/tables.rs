@@ -255,6 +255,213 @@ pub const STATES: TableDefinition<&[u8; 40], u64> = TableDefinition::new("states
 pub const TAGS: TableDefinition<&[u8; 16], &[u8; 32]> = TableDefinition::new("tags");
 
 // =============================================================================
+// File Mtime Cache Table
+// =============================================================================
+//
+// Stores the last-recorded filesystem modification time for each tracked file.
+// During `status()`, if a file's current mtime matches the cached value, we
+// skip the expensive graph content reconstruction + comparison entirely.
+//
+// This is the same optimization Git uses (stat data in the index). For a
+// repository with 264 files, it reduces incremental `status()` from ~10s
+// (full graph traversal for every file) to ~50ms (stat-only for unchanged files).
+//
+// The cache is invalidated per-file whenever:
+//   - A change is recorded that modifies the file (mtime updated to post-record value)
+//   - A change is applied that modifies the file (mtime updated after output)
+//   - The user runs `atomic reset` (cache cleared)
+//
+// If the mtime check is inconclusive (e.g., mtime resolution is too coarse,
+// or the file was modified and reverted within the same second), we fall back
+// to the full content comparison. This means false negatives (showing Clean
+// when Modified) are impossible — we only skip the comparison when we're
+// confident the file hasn't changed.
+
+/// File mtime cache: path → (mtime_secs, mtime_nanos, file_size)
+///
+/// Key: file path (string, relative to repo root)
+/// Value: 20 bytes encoding (mtime_secs: i64, mtime_nanos: u32, file_size: u64)
+///
+/// Stores the filesystem metadata snapshot taken at the time the file was
+/// last recorded or applied. During status, if `stat()` returns the same
+/// values, we know the file hasn't changed and skip content comparison.
+///
+/// The combination of (mtime, size) catches virtually all modifications:
+/// - Content edits change mtime (and usually size)
+/// - Truncation changes size
+/// - `touch` changes mtime
+/// - The only false positive is modifying a file back to its original
+///   content within the same mtime granularity — we accept this as
+///   an extremely rare edge case that just causes one extra comparison
+pub const FILE_MTIMES: TableDefinition<&str, &[u8; 20]> = TableDefinition::new("file_mtimes");
+
+/// Encode file metadata for the FILE_MTIMES table.
+///
+/// Packs (mtime_secs, mtime_nanos, file_size) into 20 bytes.
+#[inline]
+pub fn encode_file_mtime(mtime_secs: i64, mtime_nanos: u32, file_size: u64) -> [u8; 20] {
+    let mut value = [0u8; 20];
+    value[0..8].copy_from_slice(&mtime_secs.to_le_bytes());
+    value[8..12].copy_from_slice(&mtime_nanos.to_le_bytes());
+    value[12..20].copy_from_slice(&file_size.to_le_bytes());
+    value
+}
+
+/// Decode file metadata from the FILE_MTIMES table.
+///
+/// Returns (mtime_secs, mtime_nanos, file_size).
+#[inline]
+pub fn decode_file_mtime(value: &[u8; 20]) -> (i64, u32, u64) {
+    let mtime_secs = i64::from_le_bytes(value[0..8].try_into().unwrap());
+    let mtime_nanos = u32::from_le_bytes(value[8..12].try_into().unwrap());
+    let file_size = u64::from_le_bytes(value[12..20].try_into().unwrap());
+    (mtime_secs, mtime_nanos, file_size)
+}
+
+// =============================================================================
+// V3 Change Storage Tables
+// =============================================================================
+//
+// These tables store change data directly in redb, eliminating .change files
+// as the primary storage format. The V3 section-based format maps naturally
+// to per-section redb values:
+//
+//   CHANGE_META:     Header + deps + provenance + hash table (one blob per change)
+//   CHANGE_GRAPH:    Per-file graph ops (one blob per file per change)
+//   CHANGE_SEMANTIC: Per-file semantic ops (one blob per file per change)
+//   CONTENT_CHUNKS:  Content-addressed chunks (shared across changes via hash)
+//   CHANGE_CHUNKS:   Maps a change to its ordered list of content chunk hashes
+//   CHANGE_UNHASHED: Unhashed metadata (AI transcripts, reasoning, etc.)
+//
+// Benefits over .change files:
+//   - No serialization overhead (values go in/out as compressed blobs)
+//   - Automatic caching (redb page cache handles hot changes)
+//   - Transactional (change storage participates in same ACID txn as graph apply)
+//   - Random access (read one file's graph ops without loading everything)
+//   - Layer-selective (code review reads CHANGE_SEMANTIC only, apply reads CHANGE_GRAPH only)
+
+/// Change metadata: hash → zstd(postcard(ChangeHeader + deps + provenance + hash_table))
+///
+/// Key: change content hash (blake3, 32 bytes)
+/// Value: compressed blob containing all metadata sections
+///
+/// This is the first thing read when loading a change. It contains:
+/// - ChangeHeader (message, authors, timestamp)
+/// - Dependency hash indices
+/// - Provenance entries (AI attribution)
+/// - The hash dedup table (for resolving HashIndex → full hash)
+///
+/// Metadata is always loaded regardless of which layers are requested,
+/// because it's small and universally needed.
+pub const CHANGE_META: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("change_meta");
+
+/// Per-file graph operations: (change_hash, file_index) → zstd(postcard(GraphSectionPayload))
+///
+/// Key: 36 bytes encoding (change_hash: [u8; 32], file_index: u32)
+/// Value: compressed blob containing CompactGraphOps for one file
+///
+/// Each modified file in a change gets one entry. The file_index preserves
+/// the ordering from the original change file. The value is a compressed
+/// `GraphSectionPayload` containing:
+/// - File path
+/// - Compact graph operations (using HashIndex instead of full hashes)
+/// - Content byte range
+///
+/// Layer-selective reads: `apply` reads only this table + CONTENT_CHUNKS.
+/// Code review skips this table entirely.
+pub const CHANGE_GRAPH: TableDefinition<&[u8; 36], &[u8]> = TableDefinition::new("change_graph");
+
+/// Per-file semantic operations: (change_hash, file_index) → zstd(postcard(SemanticSectionPayload))
+///
+/// Key: 36 bytes encoding (change_hash: [u8; 32], file_index: u32)
+/// Value: compressed blob containing FileOps (Trunk/Branch/Leaf) for one file
+///
+/// Each modified file can have one semantic entry containing the
+/// human-readable operations for diffs, blame, and code review.
+///
+/// Semantic sections are optional — a "thin pull" skips them entirely.
+/// They can be regenerated from graph + content at any time.
+///
+/// Layer-selective reads: code review reads only this table + CONTENT_CHUNKS.
+/// `apply` skips this table entirely.
+pub const CHANGE_SEMANTIC: TableDefinition<&[u8; 36], &[u8]> =
+    TableDefinition::new("change_semantic");
+
+/// Content-addressed chunks: chunk_blake3_hash → zstd(raw content bytes)
+///
+/// Key: blake3 hash of the **uncompressed** chunk data (32 bytes)
+/// Value: zstd-compressed chunk content
+///
+/// Chunks are keyed by CONTENT hash, not change hash. This enables:
+/// - **Cross-change deduplication**: identical content regions (renames, copies,
+///   reverts) are stored once regardless of how many changes reference them.
+/// - **Delta transfer**: during push/pull, only chunks the receiver doesn't
+///   have need to be transferred.
+/// - **Efficient storage**: a 1-line edit to a 10 MB file shares ~99% of
+///   chunks with the previous version.
+///
+/// Chunk sizes are determined by FastCDC content-defined chunking:
+/// - Minimum: 16 KB, Average: 64 KB, Maximum: 256 KB
+pub const CONTENT_CHUNKS: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("content_chunks");
+
+/// Change chunk manifest: (change_hash, chunk_index) → chunk_content_hash
+///
+/// Key: 36 bytes encoding (change_hash: [u8; 32], chunk_index: u32)
+/// Value: blake3 hash of the chunk content (reference into CONTENT_CHUNKS)
+///
+/// Maps a change to its ordered list of content chunks. To reconstruct
+/// the full content blob for a change:
+/// 1. Iterate CHANGE_CHUNKS for the change hash (ordered by chunk_index)
+/// 2. For each chunk_content_hash, look up CONTENT_CHUNKS to get the data
+/// 3. Decompress and concatenate in order
+///
+/// This indirection enables chunk sharing across changes — multiple changes
+/// can reference the same chunk by its content hash.
+pub const CHANGE_CHUNKS: TableDefinition<&[u8; 36], &[u8; 32]> =
+    TableDefinition::new("change_chunks");
+
+/// Unhashed metadata: change_hash → zstd(json(Value))
+///
+/// Key: change content hash (blake3, 32 bytes)
+/// Value: compressed JSON blob
+///
+/// Stores data that doesn't affect the change's identity:
+/// - AI transcripts and reasoning traces
+/// - Editor state and review comments
+/// - Session metadata
+///
+/// This data is explicitly excluded from the content hash.
+pub const CHANGE_UNHASHED: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("change_unhashed");
+
+// =============================================================================
+// V3 Change Storage Key Encoding
+// =============================================================================
+
+/// Encode a change-hash + file-index as 36 bytes for CHANGE_GRAPH / CHANGE_SEMANTIC / CHANGE_CHUNKS keys.
+///
+/// Layout: `[change_hash: 32 bytes][file_index: 4 bytes LE]`
+#[inline]
+pub fn encode_change_file_key(change_hash: &[u8; 32], file_index: u32) -> [u8; 36] {
+    let mut key = [0u8; 36];
+    key[0..32].copy_from_slice(change_hash);
+    key[32..36].copy_from_slice(&file_index.to_le_bytes());
+    key
+}
+
+/// Decode a change-hash + file-index from 36 bytes.
+///
+/// Returns `(change_hash, file_index)`.
+#[inline]
+pub fn decode_change_file_key(key: &[u8; 36]) -> ([u8; 32], u32) {
+    let mut change_hash = [0u8; 32];
+    change_hash.copy_from_slice(&key[0..32]);
+    let file_index = u32::from_le_bytes([key[32], key[33], key[34], key[35]]);
+    (change_hash, file_index)
+}
+
+// =============================================================================
 // Key Encoding Helpers
 // =============================================================================
 
