@@ -248,8 +248,12 @@ impl Repository {
 
                                 // If file has graph content, compare with recorded content
                                 if has_graph_content {
-                                    // Retrieve the recorded content from the graph and hash it
-                                    match self.get_file_content(path) {
+                                    // Retrieve the recorded content from the graph and hash it.
+                                    // Use get_file_content_via_overlay so that local workspaces
+                                    // see their parent chain's content via the overlay model.
+                                    match self
+                                        .get_file_content_via_overlay(path, &self.current_stack)
+                                    {
                                         Ok(Some(recorded_content)) => {
                                             let recorded_hash = Hash::of(&recorded_content);
                                             if current_hash != recorded_hash {
@@ -482,5 +486,4 @@ impl Repository {
         let status = self.status(StatusOptions::tracked_only())?;
         Ok(status.deleted().map(|e| e.path().to_path_buf()).collect())
     }
-
 }

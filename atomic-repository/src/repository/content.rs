@@ -1,6 +1,266 @@
 use super::*;
+use atomic_core::pristine::OverlayTxn;
 
 impl Repository {
+    /// Get the recorded content for a tracked file using the overlay model.
+    ///
+    /// This is the **two-tier-aware** content retrieval method. It creates an
+    /// `OverlayTxn` for the given stack so that graph traversal sees both the
+    /// stack's own `STACK_GRAPH` edges and the global `GRAPH`.
+    ///
+    /// For Shared stacks this is equivalent to `get_file_content_on_stack`.
+    /// For Local workspaces this is the only correct way to read content,
+    /// because their edges live in `STACK_GRAPH`, not `GRAPH`.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the file (relative to repository root)
+    /// * `stack_name` - The stack whose perspective to use
+    ///
+    /// # Returns
+    ///
+    /// The file content as bytes, or `None` if the file is not tracked or
+    /// has no recorded content from this stack's perspective.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Read file as seen by the "feature" local workspace
+    /// let content = repo.get_file_content_via_overlay("src/main.rs", "feature")?;
+    /// ```
+    pub fn get_file_content_via_overlay<P: AsRef<Path>>(
+        &self,
+        path: P,
+        stack_name: &str,
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        use atomic_core::output::alive::RetrieveOptions;
+        use atomic_core::record::workflow::retrieve::retrieve_content_with_filter;
+
+        let path = path.as_ref();
+        let normalized = normalize_path(path);
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let stack = txn
+            .get_stack(stack_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::StackNotFound {
+                name: stack_name.to_string(),
+            })?;
+
+        // Build the overlay for this stack's perspective
+        let overlay = OverlayTxn::from_stack(&txn, &stack)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Check if file is tracked (tree tables are global, overlay passes through)
+        if !is_tracked(&overlay, &normalized)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            return Ok(None);
+        }
+
+        // Get inode → position
+        let inode = match get_inode(&overlay, &normalized) {
+            Ok(Some(inode)) => inode,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(RepositoryError::Database(e.to_string())),
+        };
+
+        let position = match overlay.inner().inode_position(inode) {
+            Ok(Some(pos)) => pos,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(RepositoryError::Database(e.to_string())),
+        };
+
+        // Build a change filter for this stack's changes
+        let mut change_filter: HashSet<NodeId> = HashSet::new();
+        let iter = txn
+            .iter_changes(&stack, 0)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        for result in iter {
+            let (_seq, node_id, _merkle) =
+                result.map_err(|e| RepositoryError::Database(e.to_string()))?;
+            change_filter.insert(node_id);
+        }
+
+        // For local workspaces, also include changes from parent stacks in the
+        // overlay chain, since those changes' vertices should be visible too.
+        if stack.kind.is_local() {
+            let chain = txn
+                .resolve_overlay_chain(&stack)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            for &ancestor_id in &chain {
+                if ancestor_id == stack.id {
+                    continue; // already included above
+                }
+                if let Some(ancestor) = txn
+                    .get_stack_by_id(ancestor_id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                {
+                    let ancestor_iter = txn
+                        .iter_changes(&ancestor, 0)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    for result in ancestor_iter {
+                        let (_seq, node_id, _merkle) =
+                            result.map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        change_filter.insert(node_id);
+                    }
+                }
+            }
+
+            // Also include changes from all shared ancestor stacks (the global
+            // graph base). Walk the parent chain past the overlay to find the
+            // shared stack and include its changes.
+            let mut cursor = stack.parent;
+            loop {
+                match cursor {
+                    Some(pid) => {
+                        let parent = txn
+                            .get_stack_by_id(pid)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        match parent {
+                            Some(p) if p.kind.is_shared() => {
+                                // Include this shared stack's changes
+                                let p_iter = txn
+                                    .iter_changes(&p, 0)
+                                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                                for result in p_iter {
+                                    let (_seq, node_id, _merkle) = result
+                                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                                    change_filter.insert(node_id);
+                                }
+                                break;
+                            }
+                            Some(p) => cursor = p.parent,
+                            None => break,
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        let options = RetrieveOptions::new().with_change_filter(change_filter);
+
+        // Use the overlay for graph traversal so STACK_GRAPH edges are visible
+        let content = retrieve_content_with_filter(&overlay, &self.change_store, position, options)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if content.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(content))
+        }
+    }
+
+    /// Diff two stacks: returns (changes only in A, changes only in B, common changes).
+    ///
+    /// This is the change-level diff. For file-content diff, use
+    /// `get_file_content_via_overlay` for each stack and diff the results.
+    ///
+    /// # Arguments
+    ///
+    /// * `stack_a` - First stack name
+    /// * `stack_b` - Second stack name
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(only_in_a, only_in_b, in_both)` — each a `Vec<Hash>`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let (only_feature, only_dev, common) = repo.diff_stacks("feature", "dev")?;
+    /// println!("{} changes only in feature", only_feature.len());
+    /// println!("{} changes only in dev", only_dev.len());
+    /// println!("{} changes in common", common.len());
+    /// ```
+    pub fn diff_stacks(
+        &self,
+        stack_a: &str,
+        stack_b: &str,
+    ) -> Result<(Vec<Hash>, Vec<Hash>, Vec<Hash>), RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let a = txn
+            .get_stack(stack_a)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::StackNotFound {
+                name: stack_a.to_string(),
+            })?;
+
+        let b = txn
+            .get_stack(stack_b)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::StackNotFound {
+                name: stack_b.to_string(),
+            })?;
+
+        // Collect hashes from each stack
+        let a_changes: Vec<Hash> = {
+            let iter = txn
+                .iter_changes(&a, 0)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let mut hashes = Vec::new();
+            for result in iter {
+                let (_seq, node_id, _merkle) =
+                    result.map_err(|e| RepositoryError::Database(e.to_string()))?;
+                if let Some(hash) = txn
+                    .get_external(node_id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                {
+                    hashes.push(hash);
+                }
+            }
+            hashes
+        };
+
+        let b_changes: Vec<Hash> = {
+            let iter = txn
+                .iter_changes(&b, 0)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let mut hashes = Vec::new();
+            for result in iter {
+                let (_seq, node_id, _merkle) =
+                    result.map_err(|e| RepositoryError::Database(e.to_string()))?;
+                if let Some(hash) = txn
+                    .get_external(node_id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                {
+                    hashes.push(hash);
+                }
+            }
+            hashes
+        };
+
+        let a_set: HashSet<Hash> = a_changes.iter().copied().collect();
+        let b_set: HashSet<Hash> = b_changes.iter().copied().collect();
+
+        let only_a: Vec<Hash> = a_changes
+            .iter()
+            .filter(|h| !b_set.contains(h))
+            .copied()
+            .collect();
+        let only_b: Vec<Hash> = b_changes
+            .iter()
+            .filter(|h| !a_set.contains(h))
+            .copied()
+            .collect();
+        let common: Vec<Hash> = a_changes
+            .iter()
+            .filter(|h| b_set.contains(h))
+            .copied()
+            .collect();
+
+        Ok((only_a, only_b, common))
+    }
+
     /// This retrieves the file content from the repository graph as it was
     /// at the last recorded state. This is useful for computing diffs between
     /// the working copy and the recorded state.

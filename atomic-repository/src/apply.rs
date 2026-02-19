@@ -94,8 +94,8 @@
 
 use atomic_core::apply::{
     apply_edge_map, apply_file_ops, apply_new_vertex, compute_new_state, validate_can_apply,
-    verify_dependencies, ConflictSummary, ConflictTracker, LocalApplyError, MissingContextConflict,
-    Workspace, ZombieConflict,
+    verify_dependencies, ApplyTarget, ConflictSummary, ConflictTracker, LocalApplyError,
+    MissingContextConflict, Workspace, ZombieConflict,
 };
 use atomic_core::change::{Atom, AtomRef, Change, GraphOp};
 use atomic_core::pristine::{GraphTxnT, MutTxnT, StackState, StackTxnT};
@@ -503,10 +503,21 @@ pub fn apply_change_to_graph<T: MutTxnT + StackTxnT>(
     // Validate we can apply
     validate_can_apply(txn, &stack, change_id, change_hash, change)?;
 
+    // Determine where edges should be written based on the stack kind.
+    // Shared stacks → global GRAPH; Local workspaces → STACK_GRAPH[(stack_id, vertex)].
+    let apply_target = ApplyTarget::from_stack_kind(stack.kind, stack.id);
+
     // Only apply hunks if the change isn't already in the graph.
     // If it's already in the graph (e.g., applied via another stack), we just
     // need to add it to this stack's change log - the graph already has the data.
-    if !already_in_graph {
+    //
+    // NOTE: For Local workspaces, `already_in_graph` refers to the global GRAPH.
+    // An Local workspace always writes to its own STACK_GRAPH, so we still need
+    // to apply hunks even if the change exists in the global graph — the
+    // local workspace needs its own copy of the edges.
+    let should_apply_hunks = !already_in_graph || apply_target.is_local();
+
+    if should_apply_hunks {
         // Process each graph_op (graph layer)
         for graph_op in change.hunks() {
             apply_hunk(
@@ -518,6 +529,7 @@ pub fn apply_change_to_graph<T: MutTxnT + StackTxnT>(
                 change,
                 options,
                 &mut stats,
+                &apply_target,
             )?;
         }
 
@@ -566,27 +578,28 @@ fn apply_hunk<T: MutTxnT>(
     change: &Change,
     options: &ApplyOptions,
     stats: &mut ApplyStats,
+    apply_target: &ApplyTarget,
 ) -> ApplyResult<()> {
     // Process atoms in the graph_op
     for atom_ref in graph_op.atoms() {
         match atom_ref {
             AtomRef::Insertion(insertion) => {
-                apply_new_vertex(txn, workspace, change_id, insertion, change)?;
+                apply_new_vertex(txn, workspace, change_id, insertion, change, apply_target)?;
                 stats.atoms_processed += 1;
             }
             AtomRef::EdgeUpdate(edge_update) => {
-                apply_edge_map(txn, workspace, change_id, edge_update, change)?;
+                apply_edge_map(txn, workspace, change_id, edge_update, change, apply_target)?;
                 stats.atoms_processed += 1;
             }
             AtomRef::Atom(atom) => {
                 // Full atom - dispatch to appropriate handler
                 match atom {
                     Atom::Insertion(nv) => {
-                        apply_new_vertex(txn, workspace, change_id, nv, change)?;
+                        apply_new_vertex(txn, workspace, change_id, nv, change, apply_target)?;
                         stats.atoms_processed += 1;
                     }
                     Atom::EdgeUpdate(em) => {
-                        apply_edge_map(txn, workspace, change_id, em, change)?;
+                        apply_edge_map(txn, workspace, change_id, em, change, apply_target)?;
                         stats.atoms_processed += 1;
                     }
                 }

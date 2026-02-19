@@ -44,11 +44,12 @@
 
 use crate::change::{Change, EdgeUpdate, NewEdge};
 use crate::pristine::{GraphTxnT, MutTxnT};
-use crate::types::{EdgeFlags, Hash, Inode, NodeId, Position, SerializedGraphEdge, GraphNode};
+use crate::types::{EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge};
 
 use super::error::LocalApplyError;
 use super::position::{resolve_inode, resolve_introduced_by, resolve_position};
 use super::workspace::Workspace;
+use super::ApplyTarget;
 
 // EdgeUpdate Application
 
@@ -78,10 +79,19 @@ pub fn apply_edge_map<T: MutTxnT>(
     change_id: NodeId,
     edge_update: &EdgeUpdate<Option<Hash>>,
     change: &Change,
+    target: &ApplyTarget,
 ) -> Result<(), LocalApplyError> {
     // Process each edge in the map
     for edge in &edge_update.edges {
-        apply_new_edge(txn, workspace, change_id, &edge_update.inode, edge, change)?;
+        apply_new_edge(
+            txn,
+            workspace,
+            change_id,
+            &edge_update.inode,
+            edge,
+            change,
+            target,
+        )?;
     }
 
     Ok(())
@@ -106,6 +116,7 @@ fn apply_new_edge<T: MutTxnT>(
     inode: &Position<Option<Hash>>,
     edge: &NewEdge<Option<Hash>>,
     change: &Change,
+    apply_target: &ApplyTarget,
 ) -> Result<(), LocalApplyError> {
     // Resolve the introduced_by change
     let introduced_by = resolve_introduced_by(txn, &edge.introduced_by, change_id)?;
@@ -143,10 +154,26 @@ fn apply_new_edge<T: MutTxnT>(
     }
 
     // Remove the old edge (ignoring not-found errors)
-    del_edge_with_reverse(txn, resolved_inode, edge.previous, source, target, introduced_by)?;
+    del_edge_with_reverse(
+        txn,
+        resolved_inode,
+        edge.previous,
+        source,
+        target,
+        introduced_by,
+        apply_target,
+    )?;
 
     // Add the new edge
-    add_edge_with_reverse(txn, resolved_inode, edge.flag, source, target, change_id)?;
+    add_edge_with_reverse(
+        txn,
+        resolved_inode,
+        edge.flag,
+        source,
+        target,
+        change_id,
+        apply_target,
+    )?;
 
     // For deletions, check for zombie context
     if edge.flag.contains(EdgeFlags::DELETED) && !edge.flag.contains(EdgeFlags::FOLDER) {
@@ -249,38 +276,54 @@ fn add_edge_with_reverse<T: MutTxnT>(
     inode: Option<Inode>,
     flag: EdgeFlags,
     source: GraphNode<NodeId>,
-    target: GraphNode<NodeId>,
+    dest: GraphNode<NodeId>,
     introduced_by: NodeId,
+    apply_target: &ApplyTarget,
 ) -> Result<(), LocalApplyError> {
     // Create forward edge
-    let forward_edge = SerializedGraphEdge::new(flag, target.start_pos(), introduced_by);
+    let forward_edge = SerializedGraphEdge::new(flag, dest.start_pos(), introduced_by);
 
     // Create reverse edge (with PARENT flag)
     let reverse_flag = flag | EdgeFlags::PARENT;
     let reverse_edge = SerializedGraphEdge::new(reverse_flag, source.end_pos(), introduced_by);
 
-    // Add to main graph
-    txn.put_graph(source, forward_edge)
-        .map_err(|e| LocalApplyError::Internal {
-            message: format!("Failed to add forward edge: {}", e),
-        })?;
+    match apply_target {
+        ApplyTarget::Global => {
+            // Shared stack: write to global GRAPH + INODE_GRAPH
+            txn.put_graph(source, forward_edge)
+                .map_err(|e| LocalApplyError::Internal {
+                    message: format!("Failed to add forward edge: {}", e),
+                })?;
 
-    txn.put_graph(target, reverse_edge)
-        .map_err(|e| LocalApplyError::Internal {
-            message: format!("Failed to add reverse edge: {}", e),
-        })?;
+            txn.put_graph(dest, reverse_edge)
+                .map_err(|e| LocalApplyError::Internal {
+                    message: format!("Failed to add reverse edge: {}", e),
+                })?;
 
-    // Add to inode graph if we have an inode
-    if let Some(inode_val) = inode {
-        txn.put_inode_graph(inode_val, source, forward_edge)
-            .map_err(|e| LocalApplyError::Internal {
-                message: format!("Failed to add forward inode edge: {}", e),
-            })?;
+            if let Some(inode_val) = inode {
+                txn.put_inode_graph(inode_val, source, forward_edge)
+                    .map_err(|e| LocalApplyError::Internal {
+                        message: format!("Failed to add forward inode edge: {}", e),
+                    })?;
 
-        txn.put_inode_graph(inode_val, target, reverse_edge)
-            .map_err(|e| LocalApplyError::Internal {
-                message: format!("Failed to add reverse inode edge: {}", e),
-            })?;
+                txn.put_inode_graph(inode_val, dest, reverse_edge)
+                    .map_err(|e| LocalApplyError::Internal {
+                        message: format!("Failed to add reverse inode edge: {}", e),
+                    })?;
+            }
+        }
+        ApplyTarget::Local { stack_id } => {
+            // Local workspace: write to STACK_GRAPH[(stack_id, vertex)]
+            txn.put_stack_graph(*stack_id, source, forward_edge)
+                .map_err(|e| LocalApplyError::Internal {
+                    message: format!("Failed to add forward stack graph edge: {}", e),
+                })?;
+
+            txn.put_stack_graph(*stack_id, dest, reverse_edge)
+                .map_err(|e| LocalApplyError::Internal {
+                    message: format!("Failed to add reverse stack graph edge: {}", e),
+                })?;
+        }
     }
 
     Ok(())
@@ -309,24 +352,33 @@ fn del_edge_with_reverse<T: MutTxnT>(
     inode: Option<Inode>,
     flag: EdgeFlags,
     source: GraphNode<NodeId>,
-    target: GraphNode<NodeId>,
+    dest: GraphNode<NodeId>,
     introduced_by: NodeId,
+    apply_target: &ApplyTarget,
 ) -> Result<(), LocalApplyError> {
     // Create forward edge to delete
-    let forward_edge = SerializedGraphEdge::new(flag, target.start_pos(), introduced_by);
+    let forward_edge = SerializedGraphEdge::new(flag, dest.start_pos(), introduced_by);
 
     // Create reverse edge to delete
     let reverse_flag = flag | EdgeFlags::PARENT;
     let reverse_edge = SerializedGraphEdge::new(reverse_flag, source.end_pos(), introduced_by);
 
-    // Remove from main graph (ignore not-found errors)
-    let _ = txn.del_graph(source, forward_edge);
-    let _ = txn.del_graph(target, reverse_edge);
+    match apply_target {
+        ApplyTarget::Global => {
+            // Shared stack: remove from global GRAPH + INODE_GRAPH
+            let _ = txn.del_graph(source, forward_edge);
+            let _ = txn.del_graph(dest, reverse_edge);
 
-    // Remove from inode graph if we have an inode
-    if let Some(inode_val) = inode {
-        let _ = txn.del_inode_graph(inode_val, source, forward_edge);
-        let _ = txn.del_inode_graph(inode_val, target, reverse_edge);
+            if let Some(inode_val) = inode {
+                let _ = txn.del_inode_graph(inode_val, source, forward_edge);
+                let _ = txn.del_inode_graph(inode_val, dest, reverse_edge);
+            }
+        }
+        ApplyTarget::Local { stack_id } => {
+            // Local workspace: remove from STACK_GRAPH[(stack_id, vertex)]
+            let _ = txn.del_stack_graph(*stack_id, source, forward_edge);
+            let _ = txn.del_stack_graph(*stack_id, dest, reverse_edge);
+        }
     }
 
     Ok(())
@@ -436,11 +488,11 @@ fn check_vertex_for_zombies<T: GraphTxnT>(
     let min_flag = EdgeFlags::empty();
     let max_flag = EdgeFlags::all() - EdgeFlags::DELETED;
 
-    let edges = txn
-        .iter_adjacent(node, min_flag, max_flag)
-        .map_err(|e| LocalApplyError::Internal {
-            message: format!("Failed to iterate for zombies: {}", e),
-        })?;
+    let edges =
+        txn.iter_adjacent(node, min_flag, max_flag)
+            .map_err(|e| LocalApplyError::Internal {
+                message: format!("Failed to iterate for zombies: {}", e),
+            })?;
 
     for edge_result in edges {
         let adj_edge = edge_result.map_err(|e| LocalApplyError::Internal {

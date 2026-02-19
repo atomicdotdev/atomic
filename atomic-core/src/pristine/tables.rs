@@ -61,6 +61,25 @@ pub const GRAPH: MultimapTableDefinition<&[u8; 24], &[u8; 24]> =
 pub const INODE_GRAPH: MultimapTableDefinition<&[u8; 32], &[u8; 24]> =
     MultimapTableDefinition::new("inode_graph");
 
+/// Stack-scoped graph for local workspace edge storage
+///
+/// Key: 32 bytes encoding (stack_id: u64, change_id: u64, start: u64, end: u64)
+/// Value: 24 bytes encoding SerializedGraphEdge
+///
+/// This table stores edges for **Local** stacks only. Shared stacks write
+/// directly to the global `GRAPH` table. When an local workspace is deleted,
+/// all entries with its `stack_id` prefix are cascade-deleted, leaving zero
+/// orphaned edges in the graph.
+///
+/// An local workspace's effective view is the union of its own `STACK_GRAPH`
+/// entries, its parent's effective view (recursively up the ancestry chain),
+/// and the global `GRAPH` (reached when a Shared ancestor is encountered).
+///
+/// The key layout is identical to `INODE_GRAPH` — `(u64 discriminant, 24-byte vertex)` —
+/// so the same encode/decode pattern applies.
+pub const STACK_GRAPH: MultimapTableDefinition<&[u8; 32], &[u8; 24]> =
+    MultimapTableDefinition::new("stack_graph");
+
 // Stack Tables
 
 /// Stack metadata
@@ -467,12 +486,45 @@ pub fn decode_vertex(key: &[u8; 24]) -> (u64, u64, u64) {
 /// Encode an inode-span as 32 bytes for use as an inode_graph key
 #[inline]
 pub fn encode_inode_vertex(inode: u64, change_id: u64, start: u64, end: u64) -> [u8; 32] {
-    let mut key = [0u8; 32];
-    key[0..8].copy_from_slice(&inode.to_le_bytes());
-    key[8..16].copy_from_slice(&change_id.to_le_bytes());
-    key[16..24].copy_from_slice(&start.to_le_bytes());
-    key[24..32].copy_from_slice(&end.to_le_bytes());
-    key
+    let mut bytes = [0u8; 32];
+    bytes[0..8].copy_from_slice(&inode.to_le_bytes());
+    bytes[8..16].copy_from_slice(&change_id.to_le_bytes());
+    bytes[16..24].copy_from_slice(&start.to_le_bytes());
+    bytes[24..32].copy_from_slice(&end.to_le_bytes());
+    bytes
+}
+
+/// Encode a stack-scoped graph key: (stack_id, change_id, start, end) → 32 bytes
+///
+/// Layout is identical to `encode_inode_vertex` but the first u64 is a
+/// `stack_id` instead of an `inode`. This allows prefix scans on `stack_id`
+/// for cascade deletion when an local workspace is removed.
+pub fn encode_stack_graph_key(stack_id: u64, change_id: u64, start: u64, end: u64) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[0..8].copy_from_slice(&stack_id.to_le_bytes());
+    bytes[8..16].copy_from_slice(&change_id.to_le_bytes());
+    bytes[16..24].copy_from_slice(&start.to_le_bytes());
+    bytes[24..32].copy_from_slice(&end.to_le_bytes());
+    bytes
+}
+
+/// Decode a stack-scoped graph key: 32 bytes → (stack_id, change_id, start, end)
+pub fn decode_stack_graph_key(bytes: &[u8; 32]) -> (u64, u64, u64, u64) {
+    let stack_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let change_id = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let start = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    let end = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+    (stack_id, change_id, start, end)
+}
+
+/// Encode a stack-scoped graph prefix key for range scans.
+///
+/// Returns a 32-byte key with only the `stack_id` set and all other fields
+/// zeroed. Used as the start bound for prefix range scans on `STACK_GRAPH`.
+pub fn encode_stack_graph_prefix(stack_id: u64) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[0..8].copy_from_slice(&stack_id.to_le_bytes());
+    bytes
 }
 
 /// Decode an inode-span from 32 bytes
@@ -539,6 +591,7 @@ pub fn decode_stack_merkle(key: &[u8; 40]) -> (u64, [u8; 32]) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     #[test]
@@ -558,17 +611,69 @@ mod tests {
     #[test]
     fn test_inode_vertex_encoding_roundtrip() {
         let inode = 42u64;
-        let change_id = 12345u64;
-        let start = 100u64;
-        let end = 200u64;
+        let change_id = 100u64;
+        let start = 200u64;
+        let end = 300u64;
 
         let encoded = encode_inode_vertex(inode, change_id, start, end);
-        let (dec_inode, dec_change, dec_start, dec_end) = decode_inode_vertex(&encoded);
+        let (d_inode, d_change, d_start, d_end) = decode_inode_vertex(&encoded);
 
-        assert_eq!(dec_inode, inode);
-        assert_eq!(dec_change, change_id);
-        assert_eq!(dec_start, start);
-        assert_eq!(dec_end, end);
+        assert_eq!(d_inode, inode);
+        assert_eq!(d_change, change_id);
+        assert_eq!(d_start, start);
+        assert_eq!(d_end, end);
+    }
+
+    #[test]
+    fn test_stack_graph_key_encoding_roundtrip() {
+        let stack_id = 7u64;
+        let change_id = 100u64;
+        let start = 200u64;
+        let end = 300u64;
+
+        let encoded = encode_stack_graph_key(stack_id, change_id, start, end);
+        let (d_stack, d_change, d_start, d_end) = decode_stack_graph_key(&encoded);
+
+        assert_eq!(d_stack, stack_id);
+        assert_eq!(d_change, change_id);
+        assert_eq!(d_start, start);
+        assert_eq!(d_end, end);
+    }
+
+    #[test]
+    fn test_stack_graph_prefix_encoding() {
+        let prefix = encode_stack_graph_prefix(42);
+        let (stack_id, change_id, start, end) = decode_stack_graph_key(&prefix);
+
+        assert_eq!(stack_id, 42);
+        assert_eq!(change_id, 0);
+        assert_eq!(start, 0);
+        assert_eq!(end, 0);
+    }
+
+    #[test]
+    fn test_stack_graph_prefix_ordering() {
+        // Entries for stack 5 should sort before entries for stack 6
+        let key_5a = encode_stack_graph_key(5, 1, 0, 10);
+        let key_5b = encode_stack_graph_key(5, 2, 0, 20);
+        let key_6a = encode_stack_graph_key(6, 1, 0, 10);
+
+        assert!(key_5a < key_5b);
+        assert!(key_5b < key_6a);
+
+        // Prefix for stack 6 is strictly greater than all stack 5 entries
+        let prefix_6 = encode_stack_graph_prefix(6);
+        assert!(key_5b < prefix_6);
+    }
+
+    #[test]
+    fn test_stack_graph_key_matches_inode_vertex_layout() {
+        // The two encodings use the same layout, just different semantics
+        // for the first u64 (stack_id vs inode)
+        let stack_encoded = encode_stack_graph_key(42, 100, 200, 300);
+        let inode_encoded = encode_inode_vertex(42, 100, 200, 300);
+
+        assert_eq!(stack_encoded, inode_encoded);
     }
 
     #[test]

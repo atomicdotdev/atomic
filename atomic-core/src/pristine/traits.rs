@@ -359,6 +359,100 @@ pub trait GraphTxnT {
 /// assert_eq!(stack.change_count, 0);
 /// assert_eq!(stack.state, Merkle::ZERO);
 /// ```
+/// Controls the lifecycle and edge-storage strategy for a stack.
+///
+/// # Two-Tier Graph Model
+///
+/// Atomic uses a two-tier graph model where edges live in different storage
+/// locations depending on the stack kind:
+///
+/// - **Shared** stacks (dev, release, main) write edges to the global `GRAPH`
+///   table. These edges are visible to all stacks and persist permanently.
+/// - **Local** stacks (feature, bug, experiment) write edges to the
+///   per-stack `STACK_GRAPH` table. These edges are only visible through the
+///   overlay chain and are cascade-deleted when the stack is deleted.
+///
+/// # Overlay Chain
+///
+/// An local workspace's effective view is the union of its own `STACK_GRAPH`,
+/// its parent's effective view (recursively), down to the global `GRAPH`:
+///
+/// ```text
+/// feature-login view = STACK_GRAPH[feature-login]
+///                     ∪ STACK_GRAPH[service-auth]   (parent)
+///                     ∪ GRAPH                        (dev is Shared → stop)
+/// ```
+///
+/// # Example
+///
+/// ```
+/// use atomic_core::pristine::StackKind;
+///
+/// let kind = StackKind::Local;
+/// assert_eq!(kind as u8, 0);
+/// assert!(!kind.is_shared());
+/// assert!(kind.is_local());
+///
+/// let kind = StackKind::Shared;
+/// assert_eq!(kind as u8, 1);
+/// assert!(kind.is_shared());
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[repr(u8)]
+pub enum StackKind {
+    /// Ephemeral staging area (feature, bug, experiment).
+    ///
+    /// Edges are stored in `STACK_GRAPH[(stack_id, vertex)]`.
+    /// Can be deleted cleanly at any time via cascade.
+    Local = 0,
+
+    /// Permanent promoted history (dev, release, main).
+    ///
+    /// Edges are stored in the global `GRAPH[vertex]`.
+    /// Deletion is restricted; these stacks are the canonical record.
+    Shared = 1,
+}
+
+impl StackKind {
+    /// Check if this is a shared stack.
+    #[inline]
+    pub fn is_shared(self) -> bool {
+        self == Self::Shared
+    }
+
+    /// Check if this is an local workspace.
+    #[inline]
+    pub fn is_local(self) -> bool {
+        self == Self::Local
+    }
+
+    /// Convert from a raw u8 value.
+    ///
+    /// Returns `None` if the value is not a valid `StackKind`.
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Local),
+            1 => Some(Self::Shared),
+            _ => None,
+        }
+    }
+}
+
+impl Default for StackKind {
+    fn default() -> Self {
+        Self::Shared
+    }
+}
+
+impl std::fmt::Display for StackKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local => write!(f, "local"),
+            Self::Shared => write!(f, "shared"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackState {
     /// Stack ID (internal, repository-local)
@@ -384,6 +478,26 @@ pub struct StackState {
     /// This is the sequence number of the next change to be applied.
     /// If change_count is 5, changes 0-4 have been applied.
     pub change_count: u64,
+
+    /// Stack kind (Local or Shared)
+    ///
+    /// Controls where edges are stored when changes are applied:
+    /// - `Shared`: edges go to the global `GRAPH` table (permanent)
+    /// - `Local`: edges go to `STACK_GRAPH[(stack_id, vertex)]` (ephemeral)
+    pub kind: StackKind,
+
+    /// Parent stack ID
+    ///
+    /// The stack this one was branched from. Used to build the overlay chain
+    /// for graph traversal. Every stack except the root has a parent.
+    ///
+    /// - `None`: This is the root stack (e.g., "main"). Only one stack should
+    ///   have `parent = None` — the root of the hierarchy.
+    /// - `Some(id)`: The parent stack's internal ID. The parent can be either
+    ///   Shared or Local. For example, `feature-login` might have
+    ///   `parent = Some(service_auth_id)` which itself has
+    ///   `parent = Some(dev_id)`.
+    pub parent: Option<u64>,
 }
 
 impl Default for StackState {
@@ -393,14 +507,17 @@ impl Default for StackState {
             name: String::new(),
             state: Merkle::ZERO,
             change_count: 0,
+            kind: StackKind::Shared,
+            parent: None,
         }
     }
 }
 
 impl StackState {
-    /// Create a new stack state with the given name
+    /// Create a new shared stack state with the given name and no parent.
     ///
-    /// Initializes a new stack with zero changes and the zero Merkle state.
+    /// This is the default constructor for backward compatibility. New code
+    /// should prefer [`StackState::with_kind`] for explicit kind/parent.
     ///
     /// # Arguments
     ///
@@ -416,6 +533,8 @@ impl StackState {
     /// assert_eq!(stack.id, 1);
     /// assert_eq!(stack.name, "main");
     /// assert_eq!(stack.change_count, 0);
+    /// assert!(stack.kind.is_shared());
+    /// assert!(stack.parent.is_none());
     /// ```
     pub fn new(id: u64, name: String) -> Self {
         Self {
@@ -423,6 +542,43 @@ impl StackState {
             name,
             state: Merkle::ZERO,
             change_count: 0,
+            kind: StackKind::Shared,
+            parent: None,
+        }
+    }
+
+    /// Create a new stack with explicit kind and parent.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The internal stack identifier
+    /// * `name` - The human-readable stack name
+    /// * `kind` - Whether this stack is Local or Shared
+    /// * `parent` - The parent stack's ID (`None` for the root stack)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use atomic_core::pristine::{StackState, StackKind};
+    ///
+    /// // Create a shared "dev" stack parented on "main" (id=1)
+    /// let dev = StackState::with_kind(2, "dev".to_string(), StackKind::Shared, Some(1));
+    /// assert!(dev.kind.is_shared());
+    /// assert_eq!(dev.parent, Some(1));
+    ///
+    /// // Create a local "feature" stack parented on "dev" (id=2)
+    /// let feature = StackState::with_kind(3, "feature".to_string(), StackKind::Local, Some(2));
+    /// assert!(feature.kind.is_local());
+    /// assert_eq!(feature.parent, Some(2));
+    /// ```
+    pub fn with_kind(id: u64, name: String, kind: StackKind, parent: Option<u64>) -> Self {
+        Self {
+            id,
+            name,
+            state: Merkle::ZERO,
+            change_count: 0,
+            kind,
+            parent,
         }
     }
 
@@ -433,6 +589,12 @@ impl StackState {
     /// `true` if the stack has no changes applied.
     pub fn is_empty(&self) -> bool {
         self.change_count == 0
+    }
+
+    /// Check if this is the root stack (no parent).
+    #[inline]
+    pub fn is_root(&self) -> bool {
+        self.parent.is_none()
     }
 }
 
@@ -471,6 +633,154 @@ impl StackState {
 /// }
 /// ```
 pub trait StackTxnT: GraphTxnT {
+    /// Look up a stack by its internal ID.
+    ///
+    /// This is used to resolve parent references when walking the overlay
+    /// chain. Unlike [`get_stack`] which looks up by name, this looks up
+    /// by the internal numeric ID stored in `StackState::id`.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The internal stack identifier
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(state))` - The stack with this ID
+    /// * `Ok(None)` - No stack with this ID
+    /// * `Err(_)` - Database error
+    fn get_stack_by_id(&self, id: u64) -> Result<Option<StackState>, PristineError>;
+
+    /// Resolve the overlay chain for an local workspace.
+    ///
+    /// Walks the `parent` links from the given stack upward, collecting
+    /// the IDs of each **Local** ancestor. Stops when a **Shared**
+    /// ancestor (or the root) is reached, since Shared stacks read from
+    /// the global `GRAPH`.
+    ///
+    /// # Arguments
+    ///
+    /// * `stack` - The stack to resolve the chain for
+    ///
+    /// # Returns
+    ///
+    /// A vector of stack IDs representing the overlay chain, ordered from
+    /// the given stack (most specific) to the last Local ancestor.
+    /// The global `GRAPH` is implicitly the base and is not included.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // feature-login (Local, parent=service-auth)
+    /// // service-auth  (Local, parent=dev)
+    /// // dev           (Shared,   parent=main)
+    ///
+    /// let chain = txn.resolve_overlay_chain(&feature_login)?;
+    /// // chain = [feature_login.id, service_auth.id]
+    /// // GRAPH is the implicit base (dev is Shared → stop)
+    /// ```
+    fn resolve_overlay_chain(&self, stack: &StackState) -> Result<Vec<u64>, PristineError> {
+        let mut chain: Vec<u64> = Vec::new();
+
+        if stack.kind.is_shared() {
+            // Shared stacks read directly from GRAPH, no overlay needed
+            return Ok(chain);
+        }
+
+        chain.push(stack.id);
+
+        let mut cursor = stack.parent;
+        while let Some(parent_id) = cursor {
+            let parent = self.get_stack_by_id(parent_id)?;
+            match parent {
+                Some(p) if p.kind.is_local() => {
+                    chain.push(p.id);
+                    cursor = p.parent;
+                }
+                _ => break, // Shared ancestor or not found → GRAPH is the base
+            }
+        }
+
+        Ok(chain)
+    }
+
+    /// Iterate over edges in the stack-scoped graph for a given vertex.
+    ///
+    /// Returns edges from `STACK_GRAPH[(stack_id, vertex)]` that have flags
+    /// within the specified range. This is the per-stack equivalent of
+    /// [`GraphTxnT::iter_adjacent`] which reads from the global `GRAPH`.
+    ///
+    /// # Arguments
+    ///
+    /// * `stack_id` - The local workspace's internal ID
+    /// * `node` - The source vertex
+    /// * `min_flag` - Minimum edge flags (inclusive)
+    /// * `max_flag` - Maximum edge flags (inclusive)
+    ///
+    /// # Returns
+    ///
+    /// An iterator yielding edges that match the flag criteria.
+    fn iter_stack_graph_adjacent(
+        &self,
+        stack_id: u64,
+        node: GraphNode<NodeId>,
+        min_flag: EdgeFlags,
+        max_flag: EdgeFlags,
+    ) -> Result<
+        Box<dyn Iterator<Item = Result<SerializedGraphEdge, PristineError>> + '_>,
+        PristineError,
+    >;
+
+    /// Find all stacks that have the given stack as their parent.
+    ///
+    /// This is used during stack deletion to check for child stacks that
+    /// would be orphaned. A stack with children cannot be deleted without
+    /// first reparenting or deleting its children (unless `--force` is used).
+    ///
+    /// # Arguments
+    ///
+    /// * `parent_id` - The internal ID of the parent stack
+    ///
+    /// # Returns
+    ///
+    /// A vector of `StackState` for all stacks whose `parent == Some(parent_id)`.
+    fn get_children_stacks(&self, parent_id: u64) -> Result<Vec<StackState>, PristineError> {
+        // Default implementation: scan all stacks and filter by parent.
+        // Stack counts are typically small (<100), so this is fine.
+        let names = self.list_stacks()?;
+        let mut children = Vec::new();
+        for name in names {
+            if let Some(stack) = self.get_stack(&name)? {
+                if stack.parent == Some(parent_id) {
+                    children.push(stack);
+                }
+            }
+        }
+        Ok(children)
+    }
+
+    /// Collect all unique vertex `(start, end)` positions for a given change
+    /// within a stack's `STACK_GRAPH`.
+    ///
+    /// This performs a range scan on the `STACK_GRAPH` table to find all
+    /// vertices belonging to a specific change in a specific stack. It is
+    /// used by [`OverlayTxn`] to implement `find_block` and `find_block_end`
+    /// against the `STACK_GRAPH`.
+    ///
+    /// # Arguments
+    ///
+    /// * `stack_id` - The local workspace's internal ID
+    /// * `change_id` - The change whose vertices to collect
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(start, end)` pairs representing vertex byte ranges.
+    /// The pairs are deduplicated but not sorted in any guaranteed order.
+    fn iter_stack_graph_vertices_for_change(
+        &self,
+        stack_id: u64,
+        change_id: u64,
+    ) -> Result<Vec<(u64, u64)>, PristineError>;
+
     /// Get a stack by name
     ///
     /// Looks up a stack by its human-readable name.
@@ -1046,6 +1356,75 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
         edge: SerializedGraphEdge,
     ) -> Result<bool, PristineError>;
 
+    // Stack Graph Operations (Local Workspace Edge Storage)
+
+    /// Add an edge to the stack-scoped graph.
+    ///
+    /// This stores edges for **Local** stacks in the `STACK_GRAPH` table,
+    /// keyed by `(stack_id, vertex)`. These edges are only visible through
+    /// the overlay chain and are cascade-deleted when the stack is removed.
+    ///
+    /// # Arguments
+    ///
+    /// * `stack_id` - The local workspace's internal ID
+    /// * `node` - The source vertex
+    /// * `edge` - The edge to add
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` - The edge was newly inserted
+    /// * `Ok(false)` - The edge already existed
+    /// * `Err(_)` - Database error
+    fn put_stack_graph(
+        &mut self,
+        stack_id: u64,
+        node: GraphNode<NodeId>,
+        edge: SerializedGraphEdge,
+    ) -> Result<bool, PristineError>;
+
+    /// Remove an edge from the stack-scoped graph.
+    ///
+    /// # Arguments
+    ///
+    /// * `stack_id` - The local workspace's internal ID
+    /// * `node` - The source vertex
+    /// * `edge` - The edge to remove
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` - The edge was removed
+    /// * `Ok(false)` - The edge didn't exist
+    /// * `Err(_)` - Database error
+    fn del_stack_graph(
+        &mut self,
+        stack_id: u64,
+        node: GraphNode<NodeId>,
+        edge: SerializedGraphEdge,
+    ) -> Result<bool, PristineError>;
+
+    /// Cascade-delete all edges for an local workspace.
+    ///
+    /// Removes every entry in `STACK_GRAPH` whose key starts with `stack_id`.
+    /// This is called during `del_stack` for Local workspaces to ensure zero
+    /// orphaned edges remain in the graph.
+    ///
+    /// # Arguments
+    ///
+    /// * `stack_id` - The local workspace's internal ID
+    ///
+    /// # Returns
+    ///
+    /// The number of edges deleted.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Delete all pending edges for the feature stack
+    /// let count = txn.del_stack_graph_prefix(feature_stack.id)?;
+    /// println!("Removed {} orphaned edges", count);
+    /// ```
+    fn del_stack_graph_prefix(&mut self, stack_id: u64) -> Result<u64, PristineError>;
+
     // Stack Operations
 
     /// Open or create a stack
@@ -1068,6 +1447,64 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// println!("Stack has {} changes", stack.change_count);
     /// ```
     fn open_or_create_stack(&mut self, name: &str) -> Result<StackState, PristineError>;
+
+    /// Create a new stack with explicit kind and parent.
+    ///
+    /// If a stack with the given name already exists, returns an error.
+    /// Use [`open_or_create_stack`] for the backward-compatible "get or create"
+    /// behavior (which defaults to Shared, no parent).
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The stack name (must be unique)
+    /// * `kind` - Whether this stack is Local or Shared
+    /// * `parent` - The parent stack's ID (`None` only for the root stack)
+    ///
+    /// # Errors
+    ///
+    /// - `PristineError::StackAlreadyExists` if a stack with this name exists
+    /// - `PristineError::StackNotFound` if `parent` references a non-existent stack
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Create a shared "dev" stack parented on "main" (id=1)
+    /// let dev = txn.create_stack("dev", StackKind::Shared, Some(1))?;
+    ///
+    /// // Create a local "feature" stack parented on "dev"
+    /// let feature = txn.create_stack("feature", StackKind::Local, Some(dev.id))?;
+    /// ```
+    fn create_stack(
+        &mut self,
+        name: &str,
+        kind: StackKind,
+        parent: Option<u64>,
+    ) -> Result<StackState, PristineError>;
+
+    /// Look up a stack by its internal ID.
+    ///
+    /// This is used to resolve parent references when walking the overlay
+    /// chain. Unlike [`StackTxnT::get_stack`] which looks up by name, this
+    /// looks up by the internal numeric ID stored in `StackState::id`.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The internal stack identifier
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(state))` - The stack with this ID
+    /// * `Ok(None)` - No stack with this ID
+    /// * `Err(_)` - Database error
+    ///
+    /// # Note
+    ///
+    /// This method also exists on [`StackTxnT`] for read-only access.
+    /// The `MutTxnT` version delegates to the `StackTxnT` implementation.
+    fn get_stack_by_id(&self, id: u64) -> Result<Option<StackState>, PristineError> {
+        // Default implementation delegates to StackTxnT (which MutTxnT: StackTxnT)
+        StackTxnT::get_stack_by_id(self, id)
+    }
 
     /// Record a change in a stack
     ///
@@ -1203,32 +1640,41 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// ```
     fn update_stack(&mut self, stack: &StackState) -> Result<(), PristineError>;
 
-    /// Delete a stack from the database
+    /// Delete a stack from the database.
     ///
-    /// Removes the stack and all its associated data:
-    /// - Stack metadata from STACKS table
-    /// - Change log entries from STACK_CHANGES table
-    /// - Reverse change log entries from REV_STACK_CHANGES table
-    /// - State/sequence mappings from STATES table
-    /// - Tag entries from TAGS table
+    /// For **Local** stacks, this cascade-deletes all edges from
+    /// `STACK_GRAPH[(stack_id, *)]` and then removes all metadata:
+    /// - `STACK_GRAPH` edges (cascade prefix delete — zero orphans)
+    /// - Stack metadata from `STACKS` table
+    /// - Change log entries from `STACK_CHANGES` table
+    /// - Reverse change log entries from `REV_STACK_CHANGES` table
+    /// - State/sequence mappings from `STATES` table
+    /// - Tag entries from `TAGS` table
     ///
-    /// **Note**: This does not delete the changes themselves, only the stack's
-    /// view of them. Changes remain in the graph and may be referenced by
-    /// other stacks.
+    /// **Shared** stacks cannot be deleted because their edges live in the
+    /// global `GRAPH` table and are depended on by all stacks. Attempting
+    /// to delete a Shared stack returns `PristineError::CannotDeleteSharedStack`.
+    ///
+    /// A stack that has **child stacks** (other stacks with `parent == this.id`)
+    /// cannot be deleted — returns `PristineError::StackHasChildren`. Delete
+    /// or reparent children first.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The stack to delete
+    /// * `stack` - The stack to delete (must be Local, with no children)
     ///
     /// # Returns
     ///
-    /// * `Ok(())` - Stack was deleted successfully
+    /// * `Ok(())` - Stack and all its STACK_GRAPH edges were deleted
+    /// * `Err(CannotDeleteSharedStack)` - Stack is Shared
+    /// * `Err(StackHasChildren)` - Stack has child stacks
     /// * `Err(_)` - Database error
     ///
     /// # Example
     ///
     /// ```ignore
     /// let stack = txn.get_stack("feature-branch")?.unwrap();
+    /// // Only works for Local workspaces with no children
     /// txn.del_stack(&stack)?;
     /// txn.commit()?;
     /// ```
@@ -1614,6 +2060,7 @@ impl VertexExt for GraphNode<NodeId> {
 // Tests
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use super::*;
 
@@ -1621,29 +2068,77 @@ mod tests {
     fn test_stack_state_default() {
         let state = StackState::default();
         assert_eq!(state.id, 0);
-        assert!(state.name.is_empty());
+        assert_eq!(state.name, "");
         assert_eq!(state.state, Merkle::ZERO);
         assert_eq!(state.change_count, 0);
-        assert!(state.is_empty());
+        assert_eq!(state.kind, StackKind::Shared);
+        assert_eq!(state.parent, None);
     }
 
     #[test]
     fn test_stack_state_new() {
-        let state = StackState::new(42, "main".to_string());
+        let state = StackState::new(42, "test".to_string());
         assert_eq!(state.id, 42);
-        assert_eq!(state.name, "main");
+        assert_eq!(state.name, "test");
         assert_eq!(state.state, Merkle::ZERO);
         assert_eq!(state.change_count, 0);
+        assert_eq!(state.kind, StackKind::Shared);
+        assert_eq!(state.parent, None);
+    }
+
+    #[test]
+    fn test_stack_state_with_kind() {
+        let state = StackState::with_kind(3, "feature".to_string(), StackKind::Local, Some(2));
+        assert_eq!(state.id, 3);
+        assert_eq!(state.name, "feature");
+        assert_eq!(state.kind, StackKind::Local);
+        assert_eq!(state.parent, Some(2));
         assert!(state.is_empty());
+        assert!(!state.is_root());
     }
 
     #[test]
     fn test_stack_state_is_empty() {
         let mut state = StackState::new(1, "test".to_string());
         assert!(state.is_empty());
-
         state.change_count = 1;
         assert!(!state.is_empty());
+    }
+
+    #[test]
+    fn test_stack_state_is_root() {
+        let root = StackState::new(1, "main".to_string());
+        assert!(root.is_root());
+
+        let child = StackState::with_kind(2, "dev".to_string(), StackKind::Shared, Some(1));
+        assert!(!child.is_root());
+    }
+
+    #[test]
+    fn test_stack_kind_from_u8() {
+        assert_eq!(StackKind::from_u8(0), Some(StackKind::Local));
+        assert_eq!(StackKind::from_u8(1), Some(StackKind::Shared));
+        assert_eq!(StackKind::from_u8(2), None);
+        assert_eq!(StackKind::from_u8(255), None);
+    }
+
+    #[test]
+    fn test_stack_kind_display() {
+        assert_eq!(format!("{}", StackKind::Local), "local");
+        assert_eq!(format!("{}", StackKind::Shared), "shared");
+    }
+
+    #[test]
+    fn test_stack_kind_default() {
+        assert_eq!(StackKind::default(), StackKind::Shared);
+    }
+
+    #[test]
+    fn test_stack_kind_predicates() {
+        assert!(StackKind::Shared.is_shared());
+        assert!(!StackKind::Shared.is_local());
+        assert!(StackKind::Local.is_local());
+        assert!(!StackKind::Local.is_shared());
     }
 
     #[test]

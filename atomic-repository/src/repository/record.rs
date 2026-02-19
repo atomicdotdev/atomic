@@ -370,8 +370,12 @@ impl Repository {
                         (inode, position)
                     };
 
-                    // Step 2: Retrieve old content from the graph
-                    let old_content = match self.get_file_content(entry.path()) {
+                    // Step 2: Retrieve old content from the graph.
+                    // Use get_file_content_via_overlay so that local workspaces
+                    // see their parent chain's content via the overlay model.
+                    let old_content = match self
+                        .get_file_content_via_overlay(entry.path(), &self.current_stack)
+                    {
                         Ok(Some(content)) => content,
                         Ok(None) => {
                             // No recorded content found - treat as new file

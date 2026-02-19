@@ -59,19 +59,16 @@ pub struct List {
     pub verbose: bool,
 }
 
-impl List {
-}
+impl List {}
 
 impl Command for List {
     fn run(&self) -> CliResult<()> {
         // Find the repository
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(|e| match e {
-            atomic_repository::RepositoryError::NotFound { path } => {
-                CliError::RepositoryNotFound {
-                    searched_path: path.into(),
-                }
-            }
+            atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
+                searched_path: path.into(),
+            },
             other => CliError::Repository(other),
         })?;
 
@@ -80,7 +77,10 @@ impl Command for List {
         let current = repo.current_stack();
 
         if stacks.is_empty() {
-            println!("{}", hint("No stacks found. Use 'atomic stack new <name>' to create one."));
+            println!(
+                "{}",
+                hint("No stacks found. Use 'atomic stack new <name>' to create one.")
+            );
             return Ok(());
         }
 
@@ -99,14 +99,28 @@ impl Command for List {
                 // Get stack info for verbose output
                 match repo.get_stack_info(&stack) {
                     Ok(info) => {
-                        let change_word = if info.change_count == 1 { "change" } else { "changes" };
+                        let change_word = if info.change_count == 1 {
+                            "change"
+                        } else {
+                            "changes"
+                        };
+                        let kind_tag = match info.kind_label() {
+                            "local" => "[local]",
+                            _ => "[shared]",
+                        };
+                        let parent_info = match &info.parent_name {
+                            Some(p) => format!("  parent: {}", style_stack(p)),
+                            None => String::new(),
+                        };
                         println!(
-                            "{} {:<width$}  ({} {})  state: {}",
+                            "{} {:<width$}  {:<10}  ({} {})  state: {}{}",
                             marker,
                             style_stack(&stack),
+                            kind_tag,
                             info.change_count,
                             change_word,
                             info.state_short(),
+                            parent_info,
                             width = max_name_len
                         );
                     }

@@ -1,4 +1,16 @@
-//! The `stack new` command for creating a new stack.
+//! The `stack new` command for creating new stacks.
+//!
+//! # Two-Tier Stack Model
+//!
+//! Stacks can be **Shared** (default) or **Local**:
+//!
+//! - **Shared** stacks (dev, release, main) write edges to the global graph.
+//!   They are permanent and visible to all stacks.
+//! - **Local** stacks (feature, bug, experiment) write edges to a per-stack
+//!   graph. They can be deleted cleanly with zero orphaned edges.
+//!
+//! Use `--local` to create an local workspace. Use `--parent` to set the
+//! parent stack (defaults to the current stack).
 //!
 //! This module implements the `atomic stack new` command, which creates a new
 //! stack in the repository. Stacks in Atomic are views of the graph - they
@@ -161,9 +173,116 @@ pub struct New {
     /// a new stack. Use this flag to automatically switch to the new stack.
     #[arg(long, short = 's')]
     pub switch: bool,
+
+    /// Create an local workspace (ephemeral, deletable).
+    ///
+    /// Local workspaces write edges to a per-stack graph (`STACK_GRAPH`)
+    /// instead of the global graph. When deleted, all their edges are
+    /// cascade-removed with zero orphans.
+    ///
+    /// Without this flag, stacks are created as **shared** (permanent).
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Create a local feature stack parented on dev
+    /// atomic stack new feature-auth --local
+    ///
+    /// # Create an local workspace with an explicit parent
+    /// atomic stack new feature-login --local --parent service-auth
+    /// ```
+    #[arg(long, short = 'i')]
+    pub local: bool,
+
+    /// Parent stack for the new stack.
+    ///
+    /// Sets the parent in the stack hierarchy. The parent determines
+    /// the overlay chain for graph traversal: an local workspace sees
+    /// its own edges plus its parent's effective view (recursively).
+    ///
+    /// Defaults to the current stack. Use `--parent` to specify a
+    /// different parent explicitly.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Parent on a long-lived service stack
+    /// atomic stack new feature-login --local --parent service-auth
+    ///
+    /// # Parent on dev (the default if dev is current)
+    /// atomic stack new bugfix-123 --local --parent dev
+    /// ```
+    #[arg(long, value_name = "STACK")]
+    pub parent: Option<String>,
 }
 
 impl New {
+    /// Two-tier stack creation: --local and/or --parent
+    fn run_two_tier(&self, name: &str, repo: &mut Repository) -> CliResult<()> {
+        use atomic_core::pristine::{MutTxnT, StackKind, StackTxnT};
+
+        let kind = if self.local {
+            StackKind::Local
+        } else {
+            StackKind::Shared
+        };
+
+        // Resolve the parent stack name → ID
+        let parent_name = self
+            .parent
+            .clone()
+            .unwrap_or_else(|| repo.current_stack().to_string());
+
+        let mut txn = repo
+            .pristine()
+            .write_txn()
+            .map_err(|e| CliError::Internal(e.into()))?;
+
+        let parent_stack = txn
+            .get_stack(&parent_name)
+            .map_err(|e| CliError::Internal(e.into()))?
+            .ok_or_else(|| CliError::StackNotFound {
+                name: parent_name.clone(),
+            })?;
+
+        let parent_id = parent_stack.id;
+
+        // Create the stack with explicit kind and parent
+        let _stack = txn
+            .create_stack(name, kind, Some(parent_id))
+            .map_err(|e| CliError::Internal(e.into()))?;
+
+        txn.commit().map_err(|e| CliError::Internal(e.into()))?;
+
+        let kind_label = if kind.is_local() {
+            "local"
+        } else {
+            "shared"
+        };
+
+        print_success(&format!(
+            "Created {} stack: {} (parent: {})",
+            kind_label,
+            style_stack(name),
+            style_stack(&parent_name),
+        ));
+
+        self.maybe_switch(name, repo)
+    }
+
+    /// Optionally switch to the new stack and print hint.
+    fn maybe_switch(&self, name: &str, repo: &mut Repository) -> CliResult<()> {
+        if self.switch {
+            repo.set_current_stack(name).map_err(CliError::Repository)?;
+            print_success(&format!("Switched to stack: {}", style_stack(name)));
+        } else {
+            print_hint(&format!(
+                "Use 'atomic stack switch {}' to switch to the new stack",
+                name
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Command for New {
@@ -195,6 +314,12 @@ impl Command for New {
             });
         }
 
+        // If --local or --parent is specified, use the two-tier create path
+        if self.local || self.parent.is_some() {
+            return self.run_two_tier(name, &mut repo);
+        }
+
+        // Legacy path: --empty or --from (backward compatible)
         // Determine the source stack:
         // 1. If --empty is specified, create an orphan stack with no history
         // 2. If --from is specified, use that stack
@@ -241,18 +366,7 @@ impl Command for New {
             }
         }
 
-        // Optionally switch to the new stack
-        if self.switch {
-            repo.set_current_stack(name).map_err(CliError::Repository)?;
-            print_success(&format!("Switched to stack: {}", style_stack(name)));
-        } else {
-            print_hint(&format!(
-                "Use 'atomic stack switch {}' to switch to the new stack",
-                name
-            ));
-        }
-
-        Ok(())
+        self.maybe_switch(name, &mut repo)
     }
 }
 

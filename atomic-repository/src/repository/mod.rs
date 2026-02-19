@@ -45,7 +45,7 @@ use atomic_core::output::repo::{
     output_repository, RepositoryOutputOptions, RepositoryOutputResult,
 };
 use atomic_core::output::FileSystem;
-use atomic_core::pristine::{GraphTxnT, MutTxnT, Pristine, StackTxnT, TreeTxnT};
+use atomic_core::pristine::{GraphTxnT, MutTxnT, Pristine, StackKind, StackTxnT, TreeTxnT};
 use atomic_core::record::workflow::retrieve::{RetrieveContentOptions, RetrieveResult};
 use atomic_core::types::{Base32, Hash, Inode, Merkle, NodeId, Position};
 
@@ -95,6 +95,10 @@ pub struct StackInfo {
     pub state: Merkle,
     /// The number of changes applied to this stack
     pub change_count: u64,
+    /// Stack kind (Local or Shared)
+    pub kind: StackKind,
+    /// Parent stack name, if any
+    pub parent_name: Option<String>,
 }
 
 impl StackInfo {
@@ -116,6 +120,19 @@ impl StackInfo {
     /// Check if the stack is empty (has no changes).
     pub fn is_empty(&self) -> bool {
         self.change_count == 0
+    }
+
+    /// Get a human-readable label for the stack kind.
+    pub fn kind_label(&self) -> &str {
+        match self.kind {
+            StackKind::Shared => "shared",
+            StackKind::Local => "local",
+        }
+    }
+
+    /// Get the parent name for display, or "—" if root.
+    pub fn parent_display(&self) -> &str {
+        self.parent_name.as_deref().unwrap_or("—")
     }
 }
 
@@ -792,9 +809,34 @@ default = "{}"
                 name: name.to_string(),
             })?;
 
-        // Delete the stack
-        txn.del_stack(&stack)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        // Delete the stack.
+        //
+        // `del_stack` enforces:
+        // - Shared stacks cannot be deleted (returns CannotDeleteSharedStack)
+        // - Stacks with children cannot be deleted (returns StackHasChildren)
+        // - Local workspaces cascade-delete all STACK_GRAPH edges (zero orphans)
+        txn.del_stack(&stack).map_err(|e| match &e {
+            atomic_core::pristine::PristineError::CannotDeleteSharedStack { name } => {
+                RepositoryError::InvalidOperation {
+                    message: format!(
+                        "cannot delete shared stack '{}': shared stacks are permanent. \
+                         Use 'stack new' to create an local workspace instead.",
+                        name
+                    ),
+                }
+            }
+            atomic_core::pristine::PristineError::StackHasChildren { name, children } => {
+                RepositoryError::InvalidOperation {
+                    message: format!(
+                        "cannot delete stack '{}': has child stacks ({}). \
+                         Delete or reparent children first.",
+                        name,
+                        children.join(", ")
+                    ),
+                }
+            }
+            _ => RepositoryError::Database(e.to_string()),
+        })?;
 
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -827,10 +869,21 @@ default = "{}"
                 name: name.to_string(),
             })?;
 
+        // Resolve parent name if the stack has a parent
+        let parent_name = if let Some(parent_id) = stack.parent {
+            txn.get_stack_by_id(parent_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .map(|p| p.name)
+        } else {
+            None
+        };
+
         Ok(StackInfo {
             name: stack.name.clone(),
             state: stack.state,
             change_count: stack.change_count,
+            kind: stack.kind,
+            parent_name,
         })
     }
 

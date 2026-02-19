@@ -122,6 +122,49 @@ pub enum PristineError {
         name: String,
     },
 
+    /// A stack with this name already exists
+    ///
+    /// Returned by [`MutTxnT::create_stack`] when attempting to create a
+    /// stack whose name is already taken. Use [`MutTxnT::open_or_create_stack`]
+    /// if "get or create" semantics are desired.
+    StackAlreadyExists {
+        /// The name of the stack that already exists
+        name: String,
+    },
+
+    /// Cannot delete a shared stack
+    ///
+    /// Shared stacks (dev, release, main) write edges to the global `GRAPH`
+    /// table and are the canonical record of promoted history. Deleting them
+    /// would orphan edges in the global graph. Use `--force` with explicit
+    /// cleanup if this is intentional.
+    CannotDeleteSharedStack {
+        /// The name of the shared stack
+        name: String,
+    },
+
+    /// Cannot perform operation because the stack has child stacks
+    ///
+    /// An local workspace that other stacks reference as their parent cannot
+    /// be deleted without first reparenting or deleting its children.
+    StackHasChildren {
+        /// The name of the stack that has children
+        name: String,
+        /// Names of the child stacks
+        children: Vec<String>,
+    },
+
+    /// Parent stack cycle detected
+    ///
+    /// Setting the given parent would create a cycle in the stack ancestry
+    /// chain (e.g., A → B → C → A). The overlay chain must be acyclic.
+    StackCycleDetected {
+        /// The stack being created or reparented
+        name: String,
+        /// The parent that would create a cycle
+        parent_name: String,
+    },
+
     /// Change not found by its internal ID
     ///
     /// The NodeId doesn't correspond to any registered change.
@@ -198,6 +241,31 @@ impl fmt::Display for PristineError {
 
             // Not found errors
             Self::StackNotFound { name } => write!(f, "stack not found: {}", name),
+            Self::StackAlreadyExists { name } => {
+                write!(f, "stack already exists: {}", name)
+            }
+            Self::CannotDeleteSharedStack { name } => {
+                write!(
+                    f,
+                    "cannot delete shared stack '{}': shared stacks are permanent",
+                    name
+                )
+            }
+            Self::StackHasChildren { name, children } => {
+                write!(
+                    f,
+                    "cannot delete stack '{}': has child stacks: {}",
+                    name,
+                    children.join(", ")
+                )
+            }
+            Self::StackCycleDetected { name, parent_name } => {
+                write!(
+                    f,
+                    "cannot set parent of '{}' to '{}': would create a cycle",
+                    name, parent_name
+                )
+            }
             Self::ChangeNotFound { id } => write!(f, "change not found: {}", id),
             Self::HashNotFound { hash } => write!(f, "hash not found: {}", hash),
 
@@ -301,6 +369,35 @@ mod tests {
                 &["stack not found", "feature-x"],
             ),
             (
+                PristineError::StackAlreadyExists { name: "dev".into() },
+                &["stack already exists", "dev"],
+            ),
+            (
+                PristineError::CannotDeleteSharedStack {
+                    name: "main".into(),
+                },
+                &["cannot delete shared stack", "main"],
+            ),
+            (
+                PristineError::StackHasChildren {
+                    name: "service-auth".into(),
+                    children: vec!["feature-login".into(), "bug-fix".into()],
+                },
+                &[
+                    "cannot delete stack",
+                    "service-auth",
+                    "feature-login",
+                    "bug-fix",
+                ],
+            ),
+            (
+                PristineError::StackCycleDetected {
+                    name: "a".into(),
+                    parent_name: "b".into(),
+                },
+                &["cannot set parent", "a", "b", "cycle"],
+            ),
+            (
                 PristineError::ChangeNotFound { id: 42 },
                 &["change not found", "42"],
             ),
@@ -360,6 +457,16 @@ mod tests {
         // Non-wrapper variants shouldn't claim a source error exists.
         let custom_errors: Vec<PristineError> = vec![
             PristineError::StackNotFound { name: "x".into() },
+            PristineError::StackAlreadyExists { name: "x".into() },
+            PristineError::CannotDeleteSharedStack { name: "x".into() },
+            PristineError::StackHasChildren {
+                name: "x".into(),
+                children: vec!["y".into()],
+            },
+            PristineError::StackCycleDetected {
+                name: "a".into(),
+                parent_name: "b".into(),
+            },
             PristineError::ChangeNotFound { id: 1 },
             PristineError::HashNotFound { hash: "x".into() },
             PristineError::InvalidVertex {

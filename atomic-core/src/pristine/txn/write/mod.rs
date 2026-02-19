@@ -20,7 +20,7 @@ use crate::types::{
 
 use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
-use crate::pristine::traits::{GraphTxnT, MutTxnT, StackState, StackTxnT, TreeTxnT};
+use crate::pristine::traits::{GraphTxnT, MutTxnT, StackKind, StackState, StackTxnT, TreeTxnT};
 
 use super::helpers::{
     deserialize_edge, deserialize_stack_state, serialize_edge, serialize_stack_state, AdjIterator,
@@ -217,6 +217,72 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         Ok(removed)
     }
 
+    fn put_stack_graph(
+        &mut self,
+        stack_id: u64,
+        node: GraphNode<NodeId>,
+        edge: SerializedGraphEdge,
+    ) -> PristineResult<bool> {
+        let mut table = self.txn.open_multimap_table(STACK_GRAPH)?;
+        let key = encode_stack_graph_key(
+            stack_id,
+            node.change.get(),
+            node.start.get(),
+            node.end.get(),
+        );
+        let value = serialize_edge(&edge);
+        let inserted = table.insert(&key, &value)?;
+        Ok(inserted)
+    }
+
+    fn del_stack_graph(
+        &mut self,
+        stack_id: u64,
+        node: GraphNode<NodeId>,
+        edge: SerializedGraphEdge,
+    ) -> PristineResult<bool> {
+        let mut table = self.txn.open_multimap_table(STACK_GRAPH)?;
+        let key = encode_stack_graph_key(
+            stack_id,
+            node.change.get(),
+            node.start.get(),
+            node.end.get(),
+        );
+        let value = serialize_edge(&edge);
+        let removed = table.remove(&key, &value)?;
+        Ok(removed)
+    }
+
+    fn del_stack_graph_prefix(&mut self, stack_id: u64) -> PristineResult<u64> {
+        let mut table = self.txn.open_multimap_table(STACK_GRAPH)?;
+
+        let start_key = encode_stack_graph_prefix(stack_id);
+        let end_key = encode_stack_graph_prefix(stack_id + 1);
+
+        // Collect keys to delete (can't mutate while iterating)
+        let mut keys_to_delete: Vec<([u8; 32], Vec<[u8; 24]>)> = Vec::new();
+        for result in table.range::<&[u8; 32]>(&start_key..&end_key)? {
+            let (key, values) = result?;
+            let key_bytes: [u8; 32] = *key.value();
+            let mut edge_bytes = Vec::new();
+            for v in values {
+                let v = v?;
+                edge_bytes.push(*v.value());
+            }
+            keys_to_delete.push((key_bytes, edge_bytes));
+        }
+
+        let mut count = 0u64;
+        for (key, edges) in &keys_to_delete {
+            for edge in edges {
+                table.remove(key, edge)?;
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
     fn open_or_create_stack(&mut self, name: &str) -> PristineResult<StackState> {
         // Check if stack exists
         {
@@ -227,9 +293,77 @@ impl<'a> MutTxnT for WriteTxn<'a> {
             }
         }
 
-        // Create new stack
+        // Create new stack (defaults to Shared, no parent for backward compat)
         let id = self.next_stack_id.fetch_add(1, Ordering::SeqCst);
         let state = StackState::new(id, name.to_string());
+
+        // Save it
+        {
+            let mut table = self.txn.open_table(STACKS)?;
+            let bytes = serialize_stack_state(&state);
+            table.insert(name, bytes.as_slice())?;
+        }
+
+        Ok(state)
+    }
+
+    fn create_stack(
+        &mut self,
+        name: &str,
+        kind: StackKind,
+        parent: Option<u64>,
+    ) -> PristineResult<StackState> {
+        // Check if stack already exists
+        {
+            let table = self.txn.open_table(STACKS)?;
+            if table.get(name)?.is_some() {
+                return Err(PristineError::StackAlreadyExists {
+                    name: name.to_string(),
+                });
+            }
+        }
+
+        // Validate parent exists if specified, and detect cycles
+        if let Some(parent_id) = parent {
+            let parent_stack = StackTxnT::get_stack_by_id(self, parent_id)?.ok_or_else(|| {
+                PristineError::StackNotFound {
+                    name: format!("parent stack id={}", parent_id),
+                }
+            })?;
+
+            // Cycle detection: walk the parent chain from the proposed parent
+            // upward. If we ever encounter our own (not-yet-allocated) name,
+            // there's a cycle. Since the stack doesn't exist yet, we only need
+            // to check that the parent chain terminates without revisiting
+            // `parent_id` — which is guaranteed as long as the existing graph
+            // is acyclic and we're adding a leaf.
+            //
+            // However, we also guard against the degenerate case where someone
+            // passes parent == self (once IDs are known). Since we haven't
+            // allocated an ID yet, the only risk is the parent chain itself
+            // being cyclic (which would be a pre-existing bug). We do a bounded
+            // walk as a safety check.
+            let mut visited = std::collections::HashSet::new();
+            visited.insert(parent_id);
+            let mut cursor = parent_stack.parent;
+            while let Some(ancestor_id) = cursor {
+                if !visited.insert(ancestor_id) {
+                    // We've seen this ID before — cycle detected in existing chain
+                    return Err(PristineError::StackCycleDetected {
+                        name: name.to_string(),
+                        parent_name: parent_stack.name.clone(),
+                    });
+                }
+                match StackTxnT::get_stack_by_id(self, ancestor_id)? {
+                    Some(ancestor) => cursor = ancestor.parent,
+                    None => break, // Broken chain — parent doesn't exist (shouldn't happen)
+                }
+            }
+        }
+
+        // Allocate ID and create state
+        let id = self.next_stack_id.fetch_add(1, Ordering::SeqCst);
+        let state = StackState::with_kind(id, name.to_string(), kind, parent);
 
         // Save it
         {
@@ -530,6 +664,28 @@ impl<'a> MutTxnT for WriteTxn<'a> {
     }
 
     fn del_stack(&mut self, stack: &StackState) -> PristineResult<()> {
+        // Guard: Shared stacks cannot be deleted (they own global GRAPH edges).
+        if stack.kind.is_shared() {
+            return Err(PristineError::CannotDeleteSharedStack {
+                name: stack.name.clone(),
+            });
+        }
+
+        // Guard: Check for child stacks that reference this stack as parent.
+        // Deleting a parent would leave children with a dangling parent pointer.
+        let children = StackTxnT::get_children_stacks(self, stack.id)?;
+        if !children.is_empty() {
+            let child_names: Vec<String> = children.iter().map(|c| c.name.clone()).collect();
+            return Err(PristineError::StackHasChildren {
+                name: stack.name.clone(),
+                children: child_names,
+            });
+        }
+
+        // Cascade-delete all STACK_GRAPH edges for this local workspace.
+        // This is the key operation that ensures zero orphaned edges.
+        self.del_stack_graph_prefix(stack.id)?;
+
         // Remove from STACKS table
         {
             let mut table = self.txn.open_table(STACKS)?;
@@ -537,7 +693,6 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         }
 
         // Remove all change log entries for this stack
-        // We need to iterate through all sequences and remove them
         {
             let mut table = self.txn.open_table(STACK_CHANGES)?;
             for seq in 0..stack.change_count {
@@ -547,11 +702,8 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         }
 
         // Remove all reverse change log entries
-        // We need to read STACK_CHANGES first to know which change_ids to remove
         {
             let mut rev_table = self.txn.open_table(REV_STACK_CHANGES)?;
-            // Since we don't have the change_ids readily available, we iterate
-            // through the stack_changes we're about to delete
             let table = self.txn.open_table(STACK_CHANGES)?;
             for seq in 0..stack.change_count {
                 let key = encode_stack_seq(stack.id, seq);
@@ -563,11 +715,8 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         }
 
         // Remove all state/sequence mappings from STATES table
-        // We need to remove entries where the key starts with this stack's id
-        // The key format is (stack_id: u64, merkle: [u8; 32])
         {
             let mut table = self.txn.open_table(STATES)?;
-            // Get all the merkle states from TAGS and remove their STATES entries
             let tags_table = self.txn.open_table(TAGS)?;
             for seq in 0..stack.change_count {
                 let key = encode_stack_seq(stack.id, seq);

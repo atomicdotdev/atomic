@@ -194,10 +194,17 @@ mod tests {
 
     #[test]
     fn test_delete_stack() {
+        use atomic_core::pristine::{MutTxnT, StackKind, StackTxnT};
         let (_temp_dir, mut repo) = create_temp_repo();
 
-        // Create a stack
-        repo.create_stack("to-delete").unwrap();
+        // Create an local workspace (only local workspaces can be deleted)
+        {
+            let mut txn = repo.pristine.write_txn().unwrap();
+            let dev = txn.get_stack("dev").unwrap().unwrap();
+            txn.create_stack("to-delete", StackKind::Local, Some(dev.id))
+                .unwrap();
+            txn.commit().unwrap();
+        }
         assert!(repo.stack_exists("to-delete").unwrap());
 
         // Delete the stack
@@ -230,11 +237,19 @@ mod tests {
 
     #[test]
     fn test_delete_stack_preserves_others() {
+        use atomic_core::pristine::{MutTxnT, StackKind, StackTxnT};
         let (_temp_dir, mut repo) = create_temp_repo();
 
-        // Create two stacks
-        repo.create_stack("keep-me").unwrap();
-        repo.create_stack("delete-me").unwrap();
+        // Create two local workspaces (only local workspaces can be deleted)
+        {
+            let mut txn = repo.pristine.write_txn().unwrap();
+            let dev = txn.get_stack("dev").unwrap().unwrap();
+            txn.create_stack("keep-me", StackKind::Local, Some(dev.id))
+                .unwrap();
+            txn.create_stack("delete-me", StackKind::Local, Some(dev.id))
+                .unwrap();
+            txn.commit().unwrap();
+        }
 
         // Delete one
         repo.delete_stack("delete-me").unwrap();

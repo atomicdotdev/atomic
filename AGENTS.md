@@ -46,7 +46,7 @@ layer (CRDT) interprets the bytes as human-readable text.
   │ Hunk [0:5]   │────▶│ Hunk [5:6]   │────▶│ Hunk [0:5]   │
   │ (5 bytes)    │     │ (1 byte)     │     │ (5 bytes)    │
   └──────────────┘     └──────────────┘     └──────────────┘
-    change 1             change 1             change 2
+  Node (change 1)      Node (change 1)      Node (change 2)
 
   Semantic layer (interpretation):
 
@@ -78,26 +78,103 @@ let hash = Hash::of(change_content);
 let node_id = txn.register_change(&hash)?;
 ```
 
-### 3. Stacks (Not Branches!)
+### 3. Stacks (Two-Tier Graph Model)
 
-**Critical Concept**: Stacks are **views** of the graph, not forks.
+**Critical Concept**: Stacks use a **two-tier graph model** where edge storage
+depends on whether a stack is **Shared** or **Local**.
 
 | Aspect | Git Branches | Atomic Stacks |
 |--------|--------------|---------------|
 | Data Model | Pointer to commit | Ordered sequence of applied changes |
-| Storage | Duplicates history | Shares underlying graph |
-| "Merging" | 3-way merge | Apply missing changes |
+| Storage | Duplicates history | Two-tier: global GRAPH + per-stack STACK_GRAPH |
+| "Merging" | 3-way merge | Apply changes (with dependency closure) |
 | State | HEAD commit hash | Merkle hash of sequence |
+| Cleanup | Manual branch delete + GC | Cascade delete STACK_GRAPH (zero orphans) |
+
+#### Stack Kinds
 
 ```rust
-// Create a stack - it's just a view, not a fork
-let mut stack = txn.open_or_create_stack("feature")?;
+pub enum StackKind {
+    /// Edges stored in STACK_GRAPH[(stack_id, vertex)].
+    /// Cascade-deleted when the stack is removed. Zero orphans.
+    Local,  // feature, bug, service-auth, experiment
 
-// Apply a change to the stack
-txn.put_change(&mut stack, change_id, &hash)?;
+    /// Edges stored in the global GRAPH[vertex].
+    /// Permanent promoted history. Deletion is restricted.
+    Shared,    // dev, release, main
+}
+```
 
-// The stack's Merkle state uniquely identifies its sequence
-println!("State: {}", stack.state);
+#### Parent Chains and the Overlay Model
+
+Every stack has a parent (except the root). The parent relationship defines
+the **overlay chain** for graph traversal:
+
+```
+  main  (Shared, parent=None — the only true root)
+    │
+  release  (Shared, parent=main)
+    │
+  dev  (Shared, parent=release)
+    │
+    ├── service-auth  (Local, parent=dev)
+    │     ├── feature-login   (Local, parent=service-auth)
+    │     └── feature-logout  (Local, parent=service-auth)
+    │
+    └── service-payments  (Local, parent=dev)
+```
+
+An local workspace's **effective view** is the union of its own `STACK_GRAPH`,
+each isolated ancestor's `STACK_GRAPH`, and the global `GRAPH` (reached when
+a Shared ancestor is encountered):
+
+```
+feature-login view = STACK_GRAPH[feature-login]
+                   ∪ STACK_GRAPH[service-auth]   (parent, Local)
+                   ∪ GRAPH                        (dev is Shared → stop)
+```
+
+#### Creating Stacks
+
+```rust
+// Backward compatible: defaults to Shared, no parent
+let stack = txn.open_or_create_stack("main")?;
+
+// Explicit kind and parent
+let dev = txn.create_stack("dev", StackKind::Shared, Some(main.id))?;
+let feature = txn.create_stack("feature", StackKind::Local, Some(dev.id))?;
+
+// Stacked isolated on isolated
+let login = txn.create_stack("feature-login", StackKind::Local, Some(service_auth.id))?;
+```
+
+#### Apply = Change + Dependency Closure (Not Cherry-Pick)
+
+`apply` moves a change **and all of its transitive dependencies** to the
+target stack. A change cannot be applied without every change it depends on
+already present on the target. The system computes the missing dependency
+closure automatically — the user picks the change, and apply pulls in
+everything required for correctness.
+
+```rust
+// Apply a change from "feature" to "dev"
+// 1. Compute transitive deps of the change
+// 2. Filter out deps already on the target stack
+// 3. Apply missing deps in dependency order, then the change itself
+//
+// Local → Shared target: edges go to GRAPH
+// Local → Local target: edges go to target's STACK_GRAPH
+// Source stack is NOT modified
+```
+
+#### Deleting Stacks
+
+```rust
+// Local: cascade-delete STACK_GRAPH[stack_id] → zero orphans
+// Changes previously applied to a Shared stack survive in GRAPH
+txn.del_stack_graph_prefix(feature.id)?;
+
+// Shared: restricted (permanent history)
 ```
 
 ### 4. Merkle State
@@ -281,6 +358,32 @@ This simplifies the codebase while maintaining semantic clarity.
 └── working_copy_id        # Working copy state
 ```
 
+### Two-Tier Edge Storage
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Two-Tier Graph Architecture                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Global GRAPH (Shared stacks: dev, release, main)                       │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ Key: GraphNode (24 bytes)  → Value: [SerializedGraphEdge]      │    │
+│  │ Permanent. Visible to ALL stacks. Written by Shared stacks.    │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  Per-Stack STACK_GRAPH (Local workspaces: feature, bug, service-*)       │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ Key: (stack_id, GraphNode) (32 bytes) → Value: [Edge] (24 b)  │    │
+│  │ Ephemeral. Visible only through the overlay chain.             │    │
+│  │ Prefix scan on stack_id → O(n) cascade deletion.              │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  Effective view for Local workspace:                                      │
+│    STACK_GRAPH[this] ∪ STACK_GRAPH[parent] ∪ ... ∪ GRAPH               │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
 ## Pristine Storage Layer
 
 ### Overview
@@ -303,7 +406,7 @@ The pristine is the persistent storage layer using [redb](https://docs.rs/redb):
 │  │             │  │             │  │                         │  │
 │  │ EXTERNAL    │  │ GRAPH       │  │ STACKS                  │  │
 │  │ INTERNAL    │  │ INODE_GRAPH │  │ STACK_CHANGES           │  │
-│  │ NODE_TYPES  │  │             │  │ REV_STACK_CHANGES       │  │
+│  │ NODE_TYPES  │  │ STACK_GRAPH │  │ REV_STACK_CHANGES       │  │
 │  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
 │  │  File Tree  │  │Dependencies │  │         State           │  │
@@ -323,9 +426,10 @@ The pristine is the persistent storage layer using [redb](https://docs.rs/redb):
 | `EXTERNAL` | NodeId (u64) | Hash ([u8; 32]) | Internal → external ID |
 | `INTERNAL` | Hash ([u8; 32]) | NodeId (u64) | External → internal ID |
 | `NODE_TYPES` | NodeId (u64) | u8 | Node type (change=0, tag=1) |
-| `GRAPH` | GraphNode ([u8; 24]) | [GraphEdge] | Main graph (multimap) |
+| `GRAPH` | GraphNode ([u8; 24]) | [GraphEdge] | Main graph — Shared stack edges (multimap) |
 | `INODE_GRAPH` | (Inode, GraphNode) ([u8; 32]) | [GraphEdge] | File-scoped index |
-| `STACKS` | name (str) | StackState (var) | Stack metadata |
+| `STACK_GRAPH` | (stack_id, GraphNode) ([u8; 32]) | [GraphEdge] | Local workspace edges (multimap) |
+| `STACKS` | name (str) | StackState (var) | Stack metadata (kind, parent, merkle) |
 | `STACK_CHANGES` | (stack_id, seq) ([u8; 16]) | change_id (u64) | Change log |
 | `REV_STACK_CHANGES` | (stack_id, change_id) ([u8; 16]) | seq (u64) | Reverse log |
 | `TREE` | path (str) | inode (u64) | Path → inode |
@@ -346,7 +450,14 @@ let stack = txn.get_stack("main")?;
 
 // Read-write (exclusive)
 let mut txn = pristine.write_txn()?;
+
+// Backward-compatible: defaults to Shared, no parent
 let mut stack = txn.open_or_create_stack("feature")?;
+
+// Explicit kind and parent
+let dev = txn.create_stack("dev", StackKind::Shared, Some(main.id))?;
+let feature = txn.create_stack("feature", StackKind::Local, Some(dev.id))?;
+
 txn.put_change(&mut stack, change_id, &hash)?;
 txn.update_stack(&stack)?;
 txn.commit()?;  // or txn.abort()?
@@ -357,13 +468,18 @@ txn.commit()?;  // or txn.abort()?
 ```
                     MutTxnT
         (Full read-write access)
+        (put_stack_graph, del_stack_graph,
+         del_stack_graph_prefix, create_stack)
                      │
         ┌────────────┼────────────┐
         ▼            ▼            ▼
     StackTxnT    TreeTxnT    GraphTxnT
    (Stack ops)  (File ops)  (Graph queries)
-        │            │            │
-        └────────────┼────────────┘
+   (get_stack_by_id,          │
+    resolve_overlay_chain,    │
+    iter_stack_graph_adjacent)│
+        │            │        │
+        └────────────┼────────┘
                      │
                 GraphTxnT
               (Base trait)
@@ -710,6 +826,60 @@ verify content retrieval consistency and wire up token-level diff display.
 
 Relevant code: `atomic-core/src/change/ops.rs`, `atomic-core/src/apply/crdt.rs`,
 `atomic-core/src/record/workflow/crdt/`.
+
+### Two-Tier Stack Graph Model (Phase 1 complete, Phases 2-6 in progress)
+
+The two-tier graph model enables Local workspaces (feature, bug, service-*)
+to own their edges in `STACK_GRAPH` while Shared stacks (dev, release, main)
+write to the global `GRAPH`. Deleting an Local workspace cascade-deletes its
+edges with zero orphans.
+
+**Phase 1 (complete)**: Foundation types and storage schema.
+- `StackKind` enum (Local, Shared)
+- `parent: Option<u64>` field on `StackState`
+- `STACK_GRAPH` table with `(stack_id, vertex)` composite key
+- `create_stack(name, kind, parent)` for explicit stack creation
+- `put_stack_graph`, `del_stack_graph`, `del_stack_graph_prefix` on `MutTxnT`
+- `get_stack_by_id`, `resolve_overlay_chain`, `iter_stack_graph_adjacent` on `StackTxnT`
+- Backward-compatible serialization (v1 data reads as Shared, no parent)
+- 37 integration tests covering all new functionality
+
+**Phase 2 (planned)**: Apply path branching.
+- `add_edge_with_reverse` branches on `StackKind`: Local → `put_stack_graph`, Shared → `put_graph`
+- Thread `StackKind` through the apply pipeline
+
+**Phase 3 (planned)**: Graph traversal overlay.
+- `RetrieveOptions` gains `stack_chain: Vec<u64>` for overlay chain
+- `retrieve_graph` reads from STACK_GRAPH chain ∪ GRAPH with deduplication
+- `find_block` / `find_block_end` check STACK_GRAPH layers
+
+**Phase 4 (planned)**: Stack lifecycle.
+- `del_stack` cascade-deletes `STACK_GRAPH` prefix for Local workspaces
+- Parent cycle detection, child reparenting
+
+**Phase 5 (complete)**: Apply between stacks + cross-stack diff.
+- `apply_from_stack`, `cherry_pick`, `apply_change_rec` already work with the
+  two-tier model (Phase 2's `ApplyTarget` routes edges correctly per `StackKind`)
+- `get_file_content_via_overlay`: reads file content through `OverlayTxn` so
+  local workspaces see their `STACK_GRAPH` edges + global `GRAPH`
+- `diff_stacks(a, b)`: change-level diff (only_in_a, only_in_b, common)
+- `OverlayTxn` implements `TreeTxnT` + `StackTxnT` (pass-through to inner)
+  so it can be used anywhere `GraphTxnT + TreeTxnT` is required
+
+**Phase 6 (complete)**: CLI and UX.
+- `stack new --local --parent dev` creates local workspaces with explicit parent
+- `stack new` without flags preserves backward-compatible behavior (shared, fork from current)
+- `stack list --verbose` shows `[shared]`/`[isolated]` tags and parent name
+- `StackInfo` gains `kind: StackKind` and `parent_name: Option<String>` fields
+- `Repository::get_stack_info` resolves parent ID → name for display
+
+Relevant code: `atomic-core/src/pristine/traits.rs` (StackKind, StackState),
+`atomic-core/src/pristine/tables.rs` (STACK_GRAPH), `atomic-core/src/pristine/txn/`,
+`atomic-core/src/pristine/overlay.rs` (OverlayTxn), `atomic-core/src/apply/mod.rs`
+(ApplyTarget), `atomic-repository/src/repository/content.rs` (get_file_content_via_overlay,
+diff_stacks), `atomic-repository/src/repository/mod.rs` (StackInfo with kind/parent),
+`atomic-cli/src/commands/stack/new.rs` (--local, --parent flags),
+`atomic-cli/src/commands/stack/list.rs` (kind/parent in verbose output).
 
 ### Stack Workflow Commands (planned)
 

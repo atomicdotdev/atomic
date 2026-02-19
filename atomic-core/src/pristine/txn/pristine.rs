@@ -77,6 +77,7 @@ impl Pristine {
             // Graph tables
             write_txn.open_multimap_table(GRAPH)?;
             write_txn.open_multimap_table(INODE_GRAPH)?;
+            write_txn.open_multimap_table(STACK_GRAPH)?;
 
             // Stack tables
             write_txn.open_table(STACKS)?;

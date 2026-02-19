@@ -886,6 +886,31 @@ mod tests {
     }
 
     impl StackTxnT for MockTxn {
+        fn get_stack_by_id(&self, _id: u64) -> Result<Option<StackState>, PristineError> {
+            Ok(None)
+        }
+
+        fn iter_stack_graph_adjacent(
+            &self,
+            _stack_id: u64,
+            _node: GraphNode<NodeId>,
+            _min_flag: EdgeFlags,
+            _max_flag: EdgeFlags,
+        ) -> Result<
+            Box<dyn Iterator<Item = Result<SerializedGraphEdge, PristineError>> + '_>,
+            PristineError,
+        > {
+            Ok(Box::new(std::iter::empty()))
+        }
+
+        fn iter_stack_graph_vertices_for_change(
+            &self,
+            _stack_id: u64,
+            _change_id: u64,
+        ) -> Result<Vec<(u64, u64)>, PristineError> {
+            Ok(Vec::new())
+        }
+
         fn get_stack(&self, _name: &str) -> Result<Option<StackState>, PristineError> {
             Ok(None)
         }
