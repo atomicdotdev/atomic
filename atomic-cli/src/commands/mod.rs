@@ -464,11 +464,96 @@ pub fn format_timestamp_relative(timestamp: &DateTime<Utc>) -> String {
     }
 }
 
+/// Format a byte size in human-readable form.
+///
+/// Automatically selects the appropriate unit (bytes, KiB, MiB, GiB).
+///
+/// # Arguments
+///
+/// * `bytes` - The size in bytes
+///
+/// # Returns
+///
+/// A formatted string like "1.5 MiB" or "42 bytes".
+///
+/// # Example
+///
+/// ```rust,ignore
+/// assert_eq!(format_size(1024), "1.0 KiB");
+/// assert_eq!(format_size(42), "42 bytes");
+/// ```
+pub fn format_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Format a count with singular/plural label.
+///
+/// # Arguments
+///
+/// * `count` - The count
+/// * `singular` - The singular form of the noun
+/// * `plural` - The plural form of the noun
+///
+/// # Returns
+///
+/// A formatted string like "1 file" or "3 files".
+///
+/// # Example
+///
+/// ```rust,ignore
+/// assert_eq!(format_count(1, "file", "files"), "1 file");
+/// assert_eq!(format_count(3, "file", "files"), "3 files");
+/// ```
+pub fn format_count(count: u64, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {}", singular)
+    } else {
+        format!("{} {}", count, plural)
+    }
+}
+
+/// Format a count with auto-pluralization (appends 's').
+///
+/// Convenience wrapper around [`format_count`] for regular English nouns
+/// where the plural is just the singular + 's'.
+///
+/// # Arguments
+///
+/// * `count` - The count
+/// * `singular` - The singular form of the noun (plural = singular + "s")
+///
+/// # Example
+///
+/// ```rust,ignore
+/// assert_eq!(format_count_auto(1, "change"), "1 change");
+/// assert_eq!(format_count_auto(5, "change"), "5 changes");
+/// ```
+pub fn format_count_auto(count: usize, singular: &str) -> String {
+    if count == 1 {
+        format!("1 {}", singular)
+    } else {
+        format!("{} {}s", count, singular)
+    }
+}
+
 // Tests
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use tempfile::TempDir;
 
     // -------------------------------------------------------------------------

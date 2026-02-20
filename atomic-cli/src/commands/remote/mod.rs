@@ -151,6 +151,12 @@ impl Remote {
         }
     }
 
+    /// Builder: set the verbose flag.
+    pub fn with_verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
+    }
+
     /// List all configured remotes.
     fn list_remotes(&self) -> CliResult<()> {
         let repo_root = find_repository_root()?;

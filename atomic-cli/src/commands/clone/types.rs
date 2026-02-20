@@ -20,7 +20,9 @@
 //! 3. **Self-documenting**: Rich documentation with examples
 //! 4. **Type-safe**: Leverage Rust's type system to prevent invalid states
 
+use std::path::PathBuf;
 
+use atomic_core::types::{Hash, Merkle};
 
 // CloneProgress
 
@@ -130,20 +132,43 @@ impl CloneProgress {
     }
 
     /// Record a successfully applied change.
-    ///
-    /// Increments the applied counter.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use atomic::commands::clone::types::CloneProgress;
-    ///
-    /// let mut progress = CloneProgress::new(10);
-    /// progress.record_applied();
-    /// assert_eq!(progress.applied, 1);
-    /// ```
     pub fn record_applied(&mut self) {
         self.applied += 1;
+    }
+
+    /// Record a successfully downloaded tag.
+    pub fn record_tag_downloaded(&mut self) {
+        self.tags_downloaded += 1;
+    }
+
+    /// Builder: set the current phase.
+    pub fn with_phase(mut self, phase: ClonePhase) -> Self {
+        self.phase = phase;
+        self
+    }
+
+    /// Check if all downloads are complete.
+    pub fn downloads_complete(&self) -> bool {
+        self.total_changes > 0 && self.downloaded >= self.total_changes
+    }
+
+    /// Check if all applies are complete.
+    pub fn applies_complete(&self) -> bool {
+        self.total_changes > 0 && self.applied >= self.total_changes
+    }
+
+    /// Check if the clone operation is complete.
+    pub fn is_complete(&self) -> bool {
+        self.phase == ClonePhase::Complete
+    }
+
+    /// Get download progress as a percentage (0-100).
+    pub fn download_percent(&self) -> usize {
+        if self.total_changes == 0 {
+            0
+        } else {
+            (self.downloaded * 100) / self.total_changes
+        }
     }
 }
 
@@ -344,9 +369,160 @@ impl CloneStats {
     pub fn record_applied(&mut self) {
         self.changes_applied += 1;
     }
+
+    /// Get total number of items downloaded (changes + tags).
+    pub fn total_downloaded(&self) -> usize {
+        self.changes_downloaded + self.tags_downloaded
+    }
+
+    /// Check if any items were downloaded.
+    pub fn has_downloads(&self) -> bool {
+        self.total_downloaded() > 0
+    }
+
+    /// Check if the clone was a no-op (nothing downloaded, nothing applied, nothing skipped).
+    ///
+    /// Returns `false` if any work was done, including skipping changes
+    /// that already exist locally (since that means the remote had changes).
+    pub fn is_noop(&self) -> bool {
+        self.changes_downloaded == 0
+            && self.tags_downloaded == 0
+            && self.changes_applied == 0
+            && self.changes_failed == 0
+            && self.changes_skipped == 0
+    }
+
+    /// Record a successfully downloaded tag.
+    pub fn record_tag_downloaded(&mut self, bytes: u64) {
+        self.tags_downloaded += 1;
+        self.bytes_transferred += bytes;
+    }
+
+    /// Record a skipped change (already exists locally).
+    pub fn record_skipped(&mut self) {
+        self.changes_skipped += 1;
+    }
 }
 
 // CloneOutcome
+
+/// The result of a clone operation.
+///
+/// Contains the final statistics, state information, and any warnings
+/// that occurred during the clone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CloneOutcome {
+    /// Clone statistics.
+    pub stats: CloneStats,
+    /// The target path where the repository was cloned.
+    pub target_path: PathBuf,
+    /// Whether this was a download-only clone (no apply).
+    pub download_only: bool,
+    /// The remote Merkle state after cloning.
+    pub remote_state: Option<Merkle>,
+    /// The local Merkle state after cloning.
+    pub local_state: Option<Merkle>,
+    /// The stack name used for the clone.
+    pub stack: String,
+    /// The remote URL that was cloned.
+    pub remote_url: String,
+    /// Any warnings produced during the clone.
+    pub warnings: Vec<String>,
+}
+
+impl Default for CloneOutcome {
+    fn default() -> Self {
+        Self {
+            stats: CloneStats::default(),
+            target_path: PathBuf::new(),
+            download_only: false,
+            remote_state: None,
+            local_state: None,
+            stack: String::new(),
+            remote_url: String::new(),
+            warnings: Vec::new(),
+        }
+    }
+}
+
+impl CloneOutcome {
+    /// Create a new clone outcome with the given stats and target path.
+    pub fn new(stats: CloneStats, target_path: PathBuf) -> Self {
+        Self {
+            stats,
+            target_path,
+            download_only: false,
+            remote_state: None,
+            local_state: None,
+            stack: String::new(),
+            remote_url: String::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Create a download-only clone outcome.
+    pub fn download_only(stats: CloneStats, target_path: PathBuf) -> Self {
+        Self {
+            stats,
+            target_path,
+            download_only: true,
+            remote_state: None,
+            local_state: None,
+            stack: String::new(),
+            remote_url: String::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Builder: set the remote state.
+    pub fn with_remote_state(mut self, state: Merkle) -> Self {
+        self.remote_state = Some(state);
+        self
+    }
+
+    /// Builder: set the local state.
+    pub fn with_local_state(mut self, state: Merkle) -> Self {
+        self.local_state = Some(state);
+        self
+    }
+
+    /// Builder: set the stack name.
+    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
+        self.stack = stack.into();
+        self
+    }
+
+    /// Builder: set the remote URL.
+    pub fn with_remote_url(mut self, url: impl Into<String>) -> Self {
+        self.remote_url = url.into();
+        self
+    }
+
+    /// Add a warning message.
+    pub fn add_warning(&mut self, warning: impl Into<String>) {
+        self.warnings.push(warning.into());
+    }
+
+    /// Check if the clone was successful (no failures).
+    pub fn is_success(&self) -> bool {
+        !self.stats.has_failures()
+    }
+
+    /// Check if there are warnings.
+    pub fn has_warnings(&self) -> bool {
+        !self.warnings.is_empty()
+    }
+
+    /// Check if the local and remote states match.
+    ///
+    /// Returns `false` if either state is missing.
+    pub fn states_match(&self) -> bool {
+        match (&self.local_state, &self.remote_state) {
+            (Some(local), Some(remote)) => local == remote,
+            _ => false,
+        }
+    }
+}
 
 // Tests
 

@@ -141,6 +141,21 @@ impl ChangeIdentifier {
             ))
         }
     }
+
+    /// Check if this identifier is a hash (full or prefix).
+    pub fn is_hash(&self) -> bool {
+        matches!(self, Self::FullHash(_) | Self::HashPrefix(_))
+    }
+
+    /// Check if this identifier is a sequence number.
+    pub fn is_sequence(&self) -> bool {
+        matches!(self, Self::Sequence(_))
+    }
+
+    /// Check if this identifier is "latest" (no specific identifier).
+    pub fn is_latest(&self) -> bool {
+        matches!(self, Self::Latest)
+    }
 }
 
 // JSON Output Types

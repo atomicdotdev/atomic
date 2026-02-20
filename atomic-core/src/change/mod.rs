@@ -99,6 +99,7 @@ mod header;
 mod local;
 pub mod ops;
 mod provenance;
+pub mod provenance_graph;
 mod store;
 
 // Re-export all public types
@@ -113,6 +114,11 @@ pub use change::{Change, ChangeError, HashedChange};
 pub use credit::{Credit, CreditRange, CreditStats, CreditType, FileCredits, LineCredit};
 pub use encoding::Encoding;
 pub use header::{Author, ChangeHeader};
+pub use provenance_graph::{
+    ProvenanceEdge, ProvenanceEdgeKind, ProvenanceGraph, ProvenanceGraphBuilder,
+    ProvenanceGraphError, ProvenanceNode, ProvenanceNodeKind, ProvenanceStats,
+    PROVENANCE_GRAPH_EXTENSION,
+};
 
 pub use graph_op::{AtomRef, GraphOp, HunkAtomIter};
 pub use local::{Local, LocalByte};

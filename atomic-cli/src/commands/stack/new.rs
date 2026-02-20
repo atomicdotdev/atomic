@@ -217,6 +217,36 @@ pub struct New {
 }
 
 impl New {
+    /// Create a new New command with the given stack name.
+    pub fn with_name(name: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+            from: None,
+            empty: false,
+            switch: false,
+            local: false,
+            parent: None,
+        }
+    }
+
+    /// Builder: set the source stack to fork from.
+    pub fn with_from(mut self, from: impl Into<String>) -> Self {
+        self.from = Some(from.into());
+        self
+    }
+
+    /// Builder: set the empty flag.
+    pub fn with_empty(mut self, empty: bool) -> Self {
+        self.empty = empty;
+        self
+    }
+
+    /// Builder: set the switch flag.
+    pub fn with_switch(mut self, switch: bool) -> Self {
+        self.switch = switch;
+        self
+    }
+
     /// Two-tier stack creation: --local and/or --parent
     fn run_two_tier(&self, name: &str, repo: &mut Repository) -> CliResult<()> {
         use atomic_core::pristine::{MutTxnT, StackKind, StackTxnT};
@@ -254,11 +284,7 @@ impl New {
 
         txn.commit().map_err(|e| CliError::Internal(e.into()))?;
 
-        let kind_label = if kind.is_local() {
-            "local"
-        } else {
-            "shared"
-        };
+        let kind_label = if kind.is_local() { "local" } else { "shared" };
 
         print_success(&format!(
             "Created {} stack: {} (parent: {})",

@@ -1,6 +1,5 @@
 use super::*;
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,11 +153,15 @@ mod tests {
         let db_path = dir.path().join("pristine");
         let pristine = Pristine::open(&db_path).unwrap();
 
-        // Create a stack with some changes
+        // Create a shared parent and a local stack with some changes.
+        // del_stack only works on Local stacks (Shared stacks are permanent).
         {
             let mut txn = pristine.write_txn().unwrap();
 
-            let mut stack = txn.open_or_create_stack("to-delete").unwrap();
+            let parent = txn.open_or_create_stack("parent").unwrap();
+            let mut stack = txn
+                .create_stack("to-delete", StackKind::Local, Some(parent.id))
+                .unwrap();
             assert_eq!(stack.name, "to-delete");
 
             // Add some changes
@@ -208,12 +211,18 @@ mod tests {
         let db_path = dir.path().join("pristine");
         let pristine = Pristine::open(&db_path).unwrap();
 
-        // Create two stacks
+        // Create a shared parent and two local sibling stacks.
+        // del_stack only works on Local stacks.
         {
             let mut txn = pristine.write_txn().unwrap();
 
-            let mut stack1 = txn.open_or_create_stack("keep-me").unwrap();
-            let mut stack2 = txn.open_or_create_stack("delete-me").unwrap();
+            let parent = txn.open_or_create_stack("parent").unwrap();
+            let mut stack1 = txn
+                .create_stack("keep-me", StackKind::Local, Some(parent.id))
+                .unwrap();
+            let mut stack2 = txn
+                .create_stack("delete-me", StackKind::Local, Some(parent.id))
+                .unwrap();
 
             // Add changes to both
             let hash1 = Hash::of(b"change for keep");

@@ -164,6 +164,36 @@ impl Clone {
         }
     }
 
+    /// Builder: set the target path.
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    /// Builder: set the stack name.
+    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
+        self.stack = stack.into();
+        self
+    }
+
+    /// Builder: set the insecure flag.
+    pub fn with_insecure(mut self, insecure: bool) -> Self {
+        self.insecure = insecure;
+        self
+    }
+
+    /// Builder: set the timeout in seconds.
+    pub fn with_timeout(mut self, timeout: u64) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Builder: set the download-only flag.
+    pub fn with_download_only(mut self, download_only: bool) -> Self {
+        self.download_only = download_only;
+        self
+    }
+
     // Internal Helper Methods
 
     /// Build the HTTP remote configuration.

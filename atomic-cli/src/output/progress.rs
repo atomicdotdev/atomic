@@ -39,7 +39,7 @@
 
 use std::time::Duration;
 
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 // Style Constants
 
@@ -123,7 +123,97 @@ pub fn create_progress_bar(total: u64, message: &str) -> ProgressBar {
     pb
 }
 
+/// Create a progress bar for byte-based operations (downloads, transfers).
+///
+/// Similar to [`create_progress_bar`] but uses byte-friendly formatting
+/// (KB, MB, GB) instead of raw counts.
+///
+/// # Arguments
+///
+/// * `total_bytes` - The total number of bytes to process
+/// * `message` - The message to display with the progress bar
+///
+/// # Returns
+///
+/// A configured [`ProgressBar`] with byte-progress styling.
+pub fn create_byte_progress_bar(total_bytes: u64, message: &str) -> ProgressBar {
+    let pb = ProgressBar::new(total_bytes);
+    pb.set_style(byte_progress_style());
+    pb.set_message(message.to_string());
+    pb.enable_steady_tick(Duration::from_millis(PROGRESS_TICK_MS));
+    pb
+}
+
+/// Create a hidden (non-visual) progress bar for tracking without display.
+///
+/// Useful for operations where you want to track progress programmatically
+/// but don't want visual output (e.g., in non-interactive contexts).
+///
+/// # Arguments
+///
+/// * `total` - The total number of units to track
+///
+/// # Returns
+///
+/// A [`ProgressBar`] that tracks position but produces no output.
+pub fn create_hidden_progress(total: u64) -> ProgressBar {
+    let pb = ProgressBar::hidden();
+    pb.set_length(total);
+    pb
+}
+
 // Multi-Progress Support
+
+/// Create a multi-progress container for parallel progress bars.
+///
+/// A [`MultiProgress`] allows displaying multiple progress bars
+/// simultaneously, useful for parallel operations like downloading
+/// multiple files.
+pub fn create_multi_progress() -> MultiProgress {
+    MultiProgress::new()
+}
+
+/// Add a spinner to a multi-progress container.
+///
+/// # Arguments
+///
+/// * `mp` - The multi-progress container
+/// * `message` - The spinner message
+pub fn add_spinner(mp: &MultiProgress, message: &str) -> ProgressBar {
+    let pb = mp.add(ProgressBar::new_spinner());
+    pb.set_style(spinner_style());
+    pb.set_message(message.to_string());
+    pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
+    pb
+}
+
+/// Add a progress bar to a multi-progress container.
+///
+/// # Arguments
+///
+/// * `mp` - The multi-progress container
+/// * `total` - The total number of units
+/// * `message` - The progress bar message
+pub fn add_progress_bar(mp: &MultiProgress, total: u64, message: &str) -> ProgressBar {
+    let pb = mp.add(ProgressBar::new(total));
+    pb.set_style(progress_style());
+    pb.set_message(message.to_string());
+    pb.enable_steady_tick(Duration::from_millis(PROGRESS_TICK_MS));
+    pb
+}
+
+/// Suspend multi-progress rendering to run a closure.
+///
+/// This temporarily hides the progress bars so that other output
+/// (e.g., log messages, prompts) can be displayed cleanly.
+///
+/// # Arguments
+///
+/// * `mp` - The multi-progress container
+/// * `f` - The closure to run while progress is suspended
+pub fn suspend<R>(mp: &MultiProgress, f: impl FnOnce() -> R) -> R {
+    mp.suspend(f)
+}
 
 // Progress Bar Completion
 
@@ -146,6 +236,31 @@ pub fn create_progress_bar(total: u64, message: &str) -> ProgressBar {
 pub fn finish_success(pb: &ProgressBar, message: &str) {
     pb.set_style(success_style());
     pb.finish_with_message(message.to_string());
+}
+
+/// Finish a progress bar with a warning message.
+///
+/// This clears the progress bar and displays a warning message in yellow.
+///
+/// # Arguments
+///
+/// * `pb` - The progress bar to finish
+/// * `message` - The warning message to display
+pub fn finish_warning(pb: &ProgressBar, message: &str) {
+    pb.set_style(warning_style());
+    pb.finish_with_message(message.to_string());
+}
+
+/// Finish and completely clear a progress bar from the terminal.
+///
+/// Unlike `finish_success`/`finish_error`, this removes the progress bar
+/// entirely without leaving a message.
+///
+/// # Arguments
+///
+/// * `pb` - The progress bar to clear
+pub fn finish_and_clear(pb: &ProgressBar) {
+    pb.finish_and_clear();
 }
 
 /// Finish a progress bar with an error message.
@@ -211,7 +326,57 @@ fn error_style() -> ProgressStyle {
         .tick_chars("✗ ")
 }
 
+/// Get the byte-progress bar style.
+///
+/// Format: `⠋ [████████░░░░░░░░] 1.5 MB/3.0 MB Message (50%)`
+fn byte_progress_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{spinner:.cyan} [{bar:30.cyan/dim}] {bytes}/{total_bytes} {msg} ({percent}%)",
+    )
+    .expect("Invalid byte progress template")
+    .tick_chars(SPINNER_CHARS)
+    .progress_chars("█▓░")
+}
+
+/// Get the warning completion style.
+///
+/// Format: `⚠ Message` (in yellow)
+fn warning_style() -> ProgressStyle {
+    ProgressStyle::with_template("{prefix:.yellow} {msg:.yellow}")
+        .expect("Invalid warning template")
+        .tick_chars("⚠ ")
+}
+
 // Utility Functions
+
+/// Set the position of a progress bar.
+///
+/// # Arguments
+///
+/// * `pb` - The progress bar
+/// * `pos` - The new position
+pub fn set_position(pb: &ProgressBar, pos: u64) {
+    pb.set_position(pos);
+}
+
+/// Set the message of a progress bar.
+///
+/// # Arguments
+///
+/// * `pb` - The progress bar
+/// * `message` - The new message
+pub fn set_message(pb: &ProgressBar, message: &str) {
+    pb.set_message(message.to_string());
+}
+
+/// Check if a progress bar is finished.
+///
+/// # Arguments
+///
+/// * `pb` - The progress bar to check
+pub fn is_finished(pb: &ProgressBar) -> bool {
+    pb.is_finished()
+}
 
 // Tests
 

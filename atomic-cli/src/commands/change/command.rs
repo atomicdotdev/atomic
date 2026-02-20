@@ -93,8 +93,50 @@ impl ChangeCmd {
         }
     }
 
+    /// Builder: set the identifier.
+    pub fn with_identifier(mut self, id: impl Into<String>) -> Self {
+        self.identifier = Some(id.into());
+        self
+    }
+
+    /// Builder: set the stack.
+    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
+        self.stack = Some(stack.into());
+        self
+    }
+
+    /// Builder: set the output format.
+    pub fn with_format(mut self, format: ChangeFormat) -> Self {
+        self.format = format;
+        self
+    }
+
+    /// Builder: set show-deps flag.
+    pub fn with_show_deps(mut self, show_deps: bool) -> Self {
+        self.show_deps = show_deps;
+        self
+    }
+
+    /// Builder: set show-hunks flag.
+    pub fn with_show_hunks(mut self, show_hunks: bool) -> Self {
+        self.show_hunks = show_hunks;
+        self
+    }
+
+    /// Builder: set full-hash flag.
+    pub fn with_full_hash(mut self, full_hash: bool) -> Self {
+        self.full_hash = full_hash;
+        self
+    }
+
+    /// Builder: set show-provenance flag.
+    pub fn with_show_provenance(mut self, show_provenance: bool) -> Self {
+        self.show_provenance = show_provenance;
+        self
+    }
+
     /// Get the hash display length.
-    fn get_hash_length(&self) -> usize {
+    pub(crate) fn get_hash_length(&self) -> usize {
         if self.full_hash {
             52
         } else {
@@ -398,7 +440,12 @@ impl ChangeCmd {
     }
 
     /// Format the change for short output.
-    fn format_short(&self, change: &Change, hash: &Hash, sequence: Option<u64>) -> String {
+    pub(crate) fn format_short(
+        &self,
+        change: &Change,
+        hash: &Hash,
+        sequence: Option<u64>,
+    ) -> String {
         let hash_len = self.get_hash_length();
         let hash_str = format_hash_with_length(hash, hash_len);
 
@@ -503,7 +550,12 @@ impl ChangeCmd {
     }
 
     /// Format the change for JSON output.
-    fn format_json(&self, change: &Change, hash: &Hash, sequence: Option<u64>) -> String {
+    pub(crate) fn format_json(
+        &self,
+        change: &Change,
+        hash: &Hash,
+        sequence: Option<u64>,
+    ) -> String {
         let json_change = if self.show_provenance {
             JsonChange::from_change_with_provenance(change, hash, sequence)
         } else {
@@ -580,7 +632,7 @@ impl Command for ChangeCmd {
 // Helper Functions
 
 /// Truncate a string to a maximum length, adding ellipsis if needed.
-fn truncate_string(s: &str, max_len: usize) -> String {
+pub(crate) fn truncate_string(s: &str, max_len: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max_len {
         s.to_string()
@@ -593,7 +645,7 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 }
 
 /// Format an author for display.
-fn format_author(author: &Author) -> String {
+pub(crate) fn format_author(author: &Author) -> String {
     if let Some(ref email) = author.email {
         format!("{} <{}>", author.name, email)
     } else {
@@ -602,7 +654,7 @@ fn format_author(author: &Author) -> String {
 }
 
 /// Count unique paths affected by hunks.
-fn count_unique_paths<H>(hunks: &[GraphOp<H>]) -> usize {
+pub(crate) fn count_unique_paths<H>(hunks: &[GraphOp<H>]) -> usize {
     let mut paths = std::collections::HashSet::new();
     for graph_op in hunks {
         if let Some(path) = get_hunk_path(graph_op) {

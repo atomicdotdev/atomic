@@ -2,11 +2,11 @@ use super::*;
 
 impl Record {
     /// Format the outcome for display.
-    pub(super) fn format_outcome(&self, _repo: &Repository, outcome: &RecordOutcome) -> String {
+    pub(super) fn format_outcome(&self, repo: &Repository, outcome: &RecordOutcome) -> String {
         let mut output = String::new();
 
-        // Get stack name (use default for now until method is implemented)
-        let stack_name = "dev";
+        // Get the actual current stack name from the repository
+        let stack_name = repo.current_stack();
 
         // Get hash (shortened)
         let hash_short = &outcome.hash().to_base32()[..DEFAULT_HASH_LENGTH.min(8)];

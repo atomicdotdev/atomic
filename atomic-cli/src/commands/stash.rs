@@ -215,6 +215,25 @@ impl StashEntry {
     pub fn reference(&self) -> String {
         format!("stash@{{{}}}", self.index)
     }
+
+    /// Format the stash entry for display.
+    ///
+    /// Returns a human-readable string like:
+    /// `stash@{0}: On dev: Fix authentication bug`
+    pub fn display(&self) -> String {
+        format!(
+            "{}: On {}: {}",
+            self.reference(),
+            self.source_stack,
+            self.message
+        )
+    }
+}
+
+impl std::fmt::Display for StashEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display())
+    }
 }
 
 // Implementation
@@ -228,6 +247,37 @@ impl Stash {
             include_untracked: false,
             keep: false,
         }
+    }
+
+    /// Builder: set the message.
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+
+    /// Builder: set the include-untracked flag.
+    pub fn with_include_untracked(mut self, include: bool) -> Self {
+        self.include_untracked = include;
+        self
+    }
+
+    /// Builder: set the keep flag.
+    pub fn with_keep(mut self, keep: bool) -> Self {
+        self.keep = keep;
+        self
+    }
+
+    /// Builder: set the --all subcommand behavior (alias for include_untracked).
+    pub fn with_all(mut self, all: bool) -> Self {
+        self.include_untracked = all;
+        self
+    }
+
+    /// Builder: set the subcommand to apply with dependencies.
+    pub fn with_dependencies(mut self, _deps: bool) -> Self {
+        // Dependencies flag is handled at the subcommand level;
+        // this builder is provided for test convenience.
+        self
     }
 
     /// List all stash stacks, sorted by creation time (newest first).

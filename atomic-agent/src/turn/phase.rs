@@ -469,8 +469,15 @@ fn transition_from_idle(event: Event) -> TransitionResult {
             TransitionResult::with_actions(Phase::Active, vec![Action::UpdateInteraction])
         }
 
-        // Turn end while idle → no-op (no active turn to end)
-        Event::TurnEnd => TransitionResult::noop(Phase::Idle),
+        // Turn end while idle → still attempt to record.
+        // OpenCode's plugin fires session.idle (TurnEnd) without a preceding
+        // TurnStart when the bus event ordering doesn't guarantee it.
+        // Rather than silently dropping the turn, attempt a record — if
+        // the working copy is clean, record_turn returns EmptyTurn harmlessly.
+        Event::TurnEnd => TransitionResult::with_actions(
+            Phase::Idle,
+            vec![Action::RecordIfChanged, Action::UpdateInteraction],
+        ),
 
         // A change was recorded while idle (user manually recorded) → record
         Event::Recorded => TransitionResult::with_actions(

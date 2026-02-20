@@ -145,6 +145,26 @@ impl FileDiffStats {
     pub fn total_changes(&self) -> usize {
         self.insertions + self.deletions
     }
+
+    /// Check if this file has any changes.
+    pub fn has_changes(&self) -> bool {
+        self.insertions > 0 || self.deletions > 0
+    }
+
+    /// Check if this file was added.
+    pub fn is_added(&self) -> bool {
+        self.status == 'A'
+    }
+
+    /// Check if this file was deleted.
+    pub fn is_deleted(&self) -> bool {
+        self.status == 'D'
+    }
+
+    /// Check if this file was modified.
+    pub fn is_modified(&self) -> bool {
+        self.status == 'M'
+    }
 }
 
 // Aggregate Diff Statistics
@@ -195,6 +215,11 @@ impl DiffStats {
     /// Get total deletions across all files.
     pub fn total_deletions(&self) -> usize {
         self.total_deletions
+    }
+
+    /// Get total number of changed lines across all files.
+    pub fn total_changes(&self) -> usize {
+        self.total_insertions + self.total_deletions
     }
 
     /// Check if there are any changes.
@@ -276,7 +301,54 @@ impl Default for DiffOutputConfig {
     }
 }
 
-impl DiffOutputConfig {}
+impl DiffOutputConfig {
+    /// Create a new config with default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builder: set the number of context lines.
+    pub fn with_context(mut self, lines: usize) -> Self {
+        self.context_lines = lines;
+        self
+    }
+
+    /// Builder: set whether to use colored output.
+    pub fn with_color(mut self, color: bool) -> Self {
+        self.color = color;
+        self
+    }
+
+    /// Builder: set the output format.
+    pub fn with_format(mut self, format: DiffFormat) -> Self {
+        self.format = format;
+        self
+    }
+
+    /// Builder: set the stat graph width.
+    pub fn with_stat_width(mut self, width: usize) -> Self {
+        self.stat_width = width;
+        self
+    }
+
+    /// Builder: set whether to show line numbers.
+    pub fn with_line_numbers(mut self, show: bool) -> Self {
+        self.show_line_numbers = show;
+        self
+    }
+
+    /// Builder: set whether to show path prefixes.
+    pub fn with_path_prefix(mut self, show: bool) -> Self {
+        self.show_path_prefix = show;
+        self
+    }
+
+    /// Builder: set whether to enable word-level diff.
+    pub fn with_word_diff(mut self, word_diff: bool) -> Self {
+        self.word_diff = word_diff;
+        self
+    }
+}
 
 // Diff GraphOp
 
@@ -391,6 +463,31 @@ impl HunkLine {
         matches!(self.status, LineStatus::Added | LineStatus::Removed)
     }
 
+    /// Check if this line was added.
+    pub fn is_added(&self) -> bool {
+        matches!(self.status, LineStatus::Added)
+    }
+
+    /// Check if this line was removed/deleted.
+    pub fn is_removed(&self) -> bool {
+        matches!(self.status, LineStatus::Removed)
+    }
+
+    /// Alias for `is_removed` — used in some test contexts.
+    pub fn is_deleted(&self) -> bool {
+        self.is_removed()
+    }
+
+    /// Check if this line is context (unchanged).
+    pub fn is_context(&self) -> bool {
+        matches!(self.status, LineStatus::Unchanged)
+    }
+
+    /// Check if this line is modified (alias for is_change).
+    pub fn is_modified(&self) -> bool {
+        self.is_change()
+    }
+
     /// Get the prefix character for this line.
     pub fn prefix(&self) -> char {
         match self.status {
@@ -434,6 +531,19 @@ pub struct FileDiff {
 }
 
 impl FileDiff {
+    /// Check if this file diff has any changes.
+    pub fn has_changes(&self) -> bool {
+        !self.hunks.is_empty()
+            || self.stats.insertions > 0
+            || self.stats.deletions > 0
+            || self.is_binary
+    }
+
+    /// Get total number of changed lines (insertions + deletions).
+    pub fn total_changes(&self) -> usize {
+        self.stats.insertions + self.stats.deletions
+    }
+
     /// Create a new file diff.
     pub fn new(path: impl Into<String>, status: FileChangeStatus) -> Self {
         let path_str = path.into();

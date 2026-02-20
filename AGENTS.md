@@ -827,7 +827,7 @@ verify content retrieval consistency and wire up token-level diff display.
 Relevant code: `atomic-core/src/change/ops.rs`, `atomic-core/src/apply/crdt.rs`,
 `atomic-core/src/record/workflow/crdt/`.
 
-### Two-Tier Stack Graph Model (Phase 1 complete, Phases 2-6 in progress)
+### Two-Tier Stack Graph Model (Phases 1-6 complete)
 
 The two-tier graph model enables Local workspaces (feature, bug, service-*)
 to own their edges in `STACK_GRAPH` while Shared stacks (dev, release, main)
@@ -844,18 +844,55 @@ edges with zero orphans.
 - Backward-compatible serialization (v1 data reads as Shared, no parent)
 - 37 integration tests covering all new functionality
 
-**Phase 2 (planned)**: Apply path branching.
-- `add_edge_with_reverse` branches on `StackKind`: Local → `put_stack_graph`, Shared → `put_graph`
-- Thread `StackKind` through the apply pipeline
+**Phase 2 (complete)**: Apply path branching.
+- `ApplyTarget` enum routes edges: `Global` → `put_graph` + `put_inode_graph`,
+  `Local { stack_id }` → `put_stack_graph`
+- `ApplyTarget::from_stack_kind(kind, id)` canonical constructor
+- `add_edge_with_reverse` in both `edge.rs` and `insertion.rs` branches on `ApplyTarget`
+- `del_edge_with_reverse` branches on `ApplyTarget`
+- `apply_new_vertex` takes `&ApplyTarget` and threads it to edge operations
+- `apply_edge_map` takes `&ApplyTarget` and threads it through `apply_new_edge`
+- `apply_change_to_graph` constructs `ApplyTarget` from stack's `StackKind`
+- `should_apply_hunks` logic: local workspaces always apply hunks (even if
+  change exists in global GRAPH) because they need their own STACK_GRAPH edges
+- `output_working_copy` uses `OverlayTxn` so graph traversal sees
+  STACK_GRAPH chain ∪ GRAPH (files from other stacks are invisible)
+- `output_working_copy_prefix` also uses `OverlayTxn` + visible change filter
+- `OverlayTxn::collect_visible_changes(stack)` collects change NodeIds from
+  the full parent chain (current stack + all ancestors, both Local and Shared)
+- `get_file_content`, `get_file_content_on_stack` delegate to
+  `get_file_content_via_overlay` for consistent overlay-aware retrieval
+- `get_file_content_via_overlay` refactored to use `collect_visible_changes`
+  instead of manual parent-chain walking
 
-**Phase 3 (planned)**: Graph traversal overlay.
-- `RetrieveOptions` gains `stack_chain: Vec<u64>` for overlay chain
-- `retrieve_graph` reads from STACK_GRAPH chain ∪ GRAPH with deduplication
-- `find_block` / `find_block_end` check STACK_GRAPH layers
+**Phase 3 (complete)**: Graph traversal overlay.
+- `OverlayTxn` wraps any `GraphTxnT + StackTxnT` transaction
+- `iter_adjacent` unions STACK_GRAPH chain edges with GRAPH, deduplicating
+  by `SerializedGraphEdge` equality (24-byte comparison)
+- `find_block` checks each STACK_GRAPH layer before falling back to GRAPH
+- `find_block_end` checks each STACK_GRAPH layer before falling back to GRAPH
+- `has_vertex` checks STACK_GRAPH layers then GRAPH
+- `OverlayTxn::is_file_alive(pos)` checks whether an inode vertex has at
+  least one alive (non-PARENT, non-DELETED) forward edge through the overlay
+- `OverlayTxn::iter_tree` filters entries by graph aliveness when overlay is
+  active — files whose edges live only in a *different* stack's STACK_GRAPH
+  are excluded. When no overlay (shared stack), delegates directly.
+- `status` method uses `OverlayTxn` for `iter_tree`, `get_inode`,
+  `is_directory`, and `inode_position` calls, ensuring files from other
+  local stacks do not appear as tracked
+- TREE/INODES tables remain global (they are a superset index); the overlay
+  model determines file visibility at the graph level
 
-**Phase 4 (planned)**: Stack lifecycle.
+**Phase 4 (complete)**: Stack lifecycle.
 - `del_stack` cascade-deletes `STACK_GRAPH` prefix for Local workspaces
-- Parent cycle detection, child reparenting
+  (zero orphaned edges)
+- `del_stack` blocks deletion of Shared stacks (`CannotDeleteSharedStack`)
+- `del_stack` blocks deletion of stacks with children (`StackHasChildren`)
+- `del_stack` cleans up: STACK_CHANGES, REV_STACK_CHANGES, STATES, TAGS
+- Parent cycle detection in `create_stack`: walks proposed parent chain with
+  a visited set; returns `StackCycleDetected` if a cycle is found
+- Parent validation: `create_stack` returns `StackNotFound` if parent ID
+  references a non-existent stack
 
 **Phase 5 (complete)**: Apply between stacks + cross-stack diff.
 - `apply_from_stack`, `cherry_pick`, `apply_change_rec` already work with the
@@ -875,9 +912,15 @@ edges with zero orphans.
 
 Relevant code: `atomic-core/src/pristine/traits.rs` (StackKind, StackState),
 `atomic-core/src/pristine/tables.rs` (STACK_GRAPH), `atomic-core/src/pristine/txn/`,
-`atomic-core/src/pristine/overlay.rs` (OverlayTxn), `atomic-core/src/apply/mod.rs`
-(ApplyTarget), `atomic-repository/src/repository/content.rs` (get_file_content_via_overlay,
-diff_stacks), `atomic-repository/src/repository/mod.rs` (StackInfo with kind/parent),
+`atomic-core/src/pristine/overlay.rs` (OverlayTxn, collect_visible_changes, is_file_alive,
+iter_tree filtering), `atomic-core/src/apply/mod.rs` (ApplyTarget),
+`atomic-core/src/apply/edge.rs` (add_edge_with_reverse, del_edge_with_reverse),
+`atomic-core/src/apply/insertion.rs` (apply_new_vertex, add_edge_with_reverse),
+`atomic-repository/src/apply.rs` (apply_change_to_graph, apply_hunk),
+`atomic-repository/src/repository/content.rs` (get_file_content_via_overlay,
+diff_stacks), `atomic-repository/src/repository/mod.rs` (output_working_copy,
+output_working_copy_prefix, switch_stack, StackInfo with kind/parent),
+`atomic-repository/src/repository/status.rs` (overlay-aware status),
 `atomic-cli/src/commands/stack/new.rs` (--local, --parent flags),
 `atomic-cli/src/commands/stack/list.rs` (kind/parent in verbose output).
 

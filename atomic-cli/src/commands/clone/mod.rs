@@ -141,14 +141,28 @@ pub mod types;
 pub use command::Clone;
 
 // Types for external use
+pub use types::{CloneOutcome, ClonePhase, CloneProgress, CloneStats};
 
 // Helper functions that might be useful externally
+pub use helpers::{format_count as helpers_format_count, infer_repo_name, CleanupGuard};
+
+// Constants
+pub use command::{DEFAULT_STACK, DEFAULT_TIMEOUT_SECS};
 
 // Tests
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper: format a count with auto-pluralization (singular + "s").
+    fn format_count(count: usize, singular: &str) -> String {
+        if count == 1 {
+            format!("1 {}", singular)
+        } else {
+            format!("{} {}s", count, singular)
+        }
+    }
 
     /// Verify that the Clone struct is properly re-exported and constructible.
     #[test]

@@ -122,7 +122,8 @@ pub mod types;
 // Re-exports
 
 // Main command struct
-pub use command::Push;
+pub use command::{Push, DEFAULT_REMOTE, DEFAULT_TIMEOUT_SECS};
+pub use types::{PushChange, PushOutcome, PushStats};
 
 // Types for external use
 
@@ -133,6 +134,15 @@ pub use command::Push;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper: format a count with auto-pluralization (singular + "s").
+    fn format_count(count: usize, singular: &str) -> String {
+        if count == 1 {
+            format!("1 {}", singular)
+        } else {
+            format!("{} {}s", count, singular)
+        }
+    }
 
     #[test]
     fn test_push_reexported() {

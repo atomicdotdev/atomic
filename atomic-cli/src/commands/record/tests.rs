@@ -1,6 +1,5 @@
 use super::*;
 
-
 // Tests
 
 #[cfg(test)]
@@ -236,8 +235,8 @@ mod tests {
         let result = record.build_options();
         assert!(result.is_ok());
         let options = result.unwrap();
-        assert!(!options.get_all());
-        assert!(!options.get_skip_binary());
+        assert!(!options.all());
+        assert!(!options.skip_binary());
     }
 
     #[test]
@@ -246,7 +245,7 @@ mod tests {
         let result = record.build_options();
         assert!(result.is_ok());
         let options = result.unwrap();
-        assert!(options.get_all());
+        assert!(options.all());
     }
 
     #[test]
@@ -264,7 +263,7 @@ mod tests {
         let result = record.build_options();
         assert!(result.is_ok());
         let options = result.unwrap();
-        assert!(options.get_skip_binary());
+        assert!(options.skip_binary());
     }
 
     #[test]
@@ -273,7 +272,7 @@ mod tests {
         let result = record.build_options();
         assert!(result.is_ok());
         let options = result.unwrap();
-        assert_eq!(options.with_max_file_size(), 500);
+        assert_eq!(options.max_file_size(), 500);
     }
 
     #[test]

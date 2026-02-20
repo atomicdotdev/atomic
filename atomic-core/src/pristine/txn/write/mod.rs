@@ -157,6 +157,37 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         Ok(node_id)
     }
 
+    fn register_provenance(&mut self, hash: &Hash) -> PristineResult<NodeId> {
+        // Check if already registered
+        {
+            let table = self.txn.open_table(INTERNAL)?;
+            let result = table.get(hash.as_bytes())?;
+            if let Some(value) = result {
+                return Ok(NodeId::new(value.value()));
+            }
+        }
+
+        // Allocate a new ID
+        let id = self.next_node_id.fetch_add(1, Ordering::SeqCst);
+        let node_id = NodeId::new(id);
+
+        // Insert into both tables
+        {
+            let mut external = self.txn.open_table(EXTERNAL)?;
+            external.insert(id, hash.as_bytes())?;
+        }
+        {
+            let mut internal = self.txn.open_table(INTERNAL)?;
+            internal.insert(hash.as_bytes(), id)?;
+        }
+        {
+            let mut node_types = self.txn.open_table(NODE_TYPES)?;
+            node_types.insert(id, node_type::PROVENANCE)?;
+        }
+
+        Ok(node_id)
+    }
+
     fn put_graph(
         &mut self,
         node: GraphNode<NodeId>,

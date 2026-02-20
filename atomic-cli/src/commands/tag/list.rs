@@ -37,8 +37,8 @@
 
 use clap::Parser;
 
-use atomic_repository::{Repository, TagFilter};
 use atomic_core::types::Base32;
+use atomic_repository::{Repository, TagFilter};
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
@@ -84,6 +84,39 @@ pub struct List {
 }
 
 impl List {
+    /// Create a new List command with default settings.
+    pub fn new() -> Self {
+        Self {
+            verbose: false,
+            stack: None,
+            pattern: None,
+            annotated_only: false,
+        }
+    }
+
+    /// Builder: set the verbose flag.
+    pub fn with_verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
+    }
+
+    /// Builder: set the stack filter.
+    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
+        self.stack = Some(stack.into());
+        self
+    }
+
+    /// Builder: set the name pattern filter.
+    pub fn with_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.pattern = Some(pattern.into());
+        self
+    }
+
+    /// Builder: set the annotated-only filter.
+    pub fn with_annotated_only(mut self, annotated_only: bool) -> Self {
+        self.annotated_only = annotated_only;
+        self
+    }
 }
 
 impl Command for List {
@@ -91,11 +124,9 @@ impl Command for List {
         // Find the repository
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(|e| match e {
-            atomic_repository::RepositoryError::NotFound { path } => {
-                CliError::RepositoryNotFound {
-                    searched_path: path.into(),
-                }
-            }
+            atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
+                searched_path: path.into(),
+            },
             other => CliError::Repository(other),
         })?;
 
@@ -115,10 +146,15 @@ impl Command for List {
         }
 
         // Get tags
-        let tags = repo.list_tags_filtered(&filter).map_err(CliError::Repository)?;
+        let tags = repo
+            .list_tags_filtered(&filter)
+            .map_err(CliError::Repository)?;
 
         if tags.is_empty() {
-            println!("{}", hint("No tags found. Use 'atomic tag create <name>' to create one."));
+            println!(
+                "{}",
+                hint("No tags found. Use 'atomic tag create <name>' to create one.")
+            );
             return Ok(());
         }
 
@@ -319,7 +355,8 @@ mod tests {
         {
             let repo = Repository::init(repo_path).unwrap();
             repo.create_tag("v1.0.0", TagOptions::default()).unwrap();
-            repo.create_tag("v2.0.0", TagOptions::default().message("Annotated")).unwrap();
+            repo.create_tag("v2.0.0", TagOptions::default().message("Annotated"))
+                .unwrap();
         }
 
         // Change to the repo directory

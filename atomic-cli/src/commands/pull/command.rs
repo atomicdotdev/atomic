@@ -180,6 +180,54 @@ impl Pull {
         }
     }
 
+    /// Builder: set the remote name or URL.
+    pub fn with_remote(mut self, remote: impl Into<String>) -> Self {
+        self.remote = remote.into();
+        self
+    }
+
+    /// Builder: set the local stack to pull into.
+    pub fn with_to_stack(mut self, stack: impl Into<String>) -> Self {
+        self.to_stack = Some(stack.into());
+        self
+    }
+
+    /// Builder: set the remote stack to pull from.
+    pub fn with_from_stack(mut self, stack: impl Into<String>) -> Self {
+        self.from_stack = Some(stack.into());
+        self
+    }
+
+    /// Builder: set the dry-run flag.
+    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
+    /// Builder: set the --all flag.
+    pub fn with_all(mut self, all: bool) -> Self {
+        self.all = all;
+        self
+    }
+
+    /// Builder: set the insecure flag.
+    pub fn with_insecure(mut self, insecure: bool) -> Self {
+        self.insecure = insecure;
+        self
+    }
+
+    /// Builder: set the timeout in seconds.
+    pub fn with_timeout(mut self, timeout: u64) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Builder: set the download-only flag.
+    pub fn with_download_only(mut self, download_only: bool) -> Self {
+        self.download_only = download_only;
+        self
+    }
+
     // Internal Helper Methods
 
     /// Resolve the remote URL from the remote name or return as-is if it's a URL.

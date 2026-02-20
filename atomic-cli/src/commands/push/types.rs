@@ -140,6 +140,11 @@ impl PushChange {
         self.message.as_deref().unwrap_or("(no message)")
     }
 
+    /// Check if this change has a message.
+    pub fn has_message(&self) -> bool {
+        self.message.is_some()
+    }
+
     /// Mark this change as already existing in the remote graph.
     ///
     /// Changes that are already in the graph only need stack adoption,
@@ -172,7 +177,141 @@ impl PushChange {
 
 // PushStats
 
+/// Statistics about a push operation.
+///
+/// Tracks metrics about what was pushed, useful for reporting to the user
+/// and for testing assertions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PushStats {
+    /// Number of changes successfully uploaded.
+    pub changes_uploaded: usize,
+    /// Number of tags successfully uploaded.
+    pub tags_uploaded: usize,
+    /// Total bytes transferred to the remote.
+    pub bytes_transferred: u64,
+    /// Number of changes skipped (already exist on remote).
+    pub changes_skipped: usize,
+    /// Number of changes that failed to upload.
+    pub changes_failed: usize,
+}
+
+impl PushStats {
+    /// Create new empty statistics.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Get total number of items uploaded (changes + tags).
+    pub fn total_uploaded(&self) -> usize {
+        self.changes_uploaded + self.tags_uploaded
+    }
+
+    /// Check if any items were uploaded.
+    pub fn has_uploads(&self) -> bool {
+        self.total_uploaded() > 0
+    }
+
+    /// Check if the push was a no-op (everything was skipped or nothing happened).
+    ///
+    /// A push is a no-op if nothing was uploaded and nothing failed,
+    /// but something was skipped (meaning the remote already had everything).
+    /// If nothing was skipped either, it's not a no-op — it means there was
+    /// nothing to push at all.
+    pub fn is_noop(&self) -> bool {
+        self.changes_uploaded == 0
+            && self.tags_uploaded == 0
+            && self.changes_failed == 0
+            && self.changes_skipped > 0
+    }
+
+    /// Check if any uploads failed.
+    pub fn has_failures(&self) -> bool {
+        self.changes_failed > 0
+    }
+
+    /// Record a successfully uploaded change.
+    pub fn record_change_uploaded(&mut self, bytes: u64) {
+        self.changes_uploaded += 1;
+        self.bytes_transferred += bytes;
+    }
+
+    /// Record a successfully uploaded tag.
+    pub fn record_tag_uploaded(&mut self, bytes: u64) {
+        self.tags_uploaded += 1;
+        self.bytes_transferred += bytes;
+    }
+
+    /// Record a skipped change (already exists on remote).
+    pub fn record_skipped(&mut self) {
+        self.changes_skipped += 1;
+    }
+
+    /// Record a failed upload.
+    pub fn record_failed(&mut self) {
+        self.changes_failed += 1;
+    }
+}
+
 // PushOutcome
+
+/// The result of a push operation.
+///
+/// Contains the final statistics, state information, and any warnings
+/// that occurred during the push.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PushOutcome {
+    /// Push statistics.
+    pub stats: PushStats,
+    /// Whether this was a dry-run push (no changes uploaded).
+    pub dry_run: bool,
+    /// The remote Merkle state after pushing.
+    pub remote_state: Option<Hash>,
+    /// Any warnings produced during the push.
+    pub warnings: Vec<String>,
+}
+
+impl PushOutcome {
+    /// Create a new push outcome with the given stats.
+    pub fn new(stats: PushStats) -> Self {
+        Self {
+            stats,
+            dry_run: false,
+            remote_state: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Create a dry-run push outcome.
+    pub fn dry_run(stats: PushStats) -> Self {
+        Self {
+            stats,
+            dry_run: true,
+            remote_state: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Builder: set the remote state.
+    pub fn with_remote_state(mut self, state: Hash) -> Self {
+        self.remote_state = Some(state);
+        self
+    }
+
+    /// Add a warning message.
+    pub fn add_warning(&mut self, warning: impl Into<String>) {
+        self.warnings.push(warning.into());
+    }
+
+    /// Check if there are warnings.
+    pub fn has_warnings(&self) -> bool {
+        !self.warnings.is_empty()
+    }
+
+    /// Check if the push was successful (no failures).
+    pub fn is_success(&self) -> bool {
+        !self.stats.has_failures()
+    }
+}
 
 // Tests
 

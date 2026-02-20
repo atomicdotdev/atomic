@@ -79,8 +79,7 @@ use std::path::PathBuf;
 use atomic_core::change::{Change, ChangeHeader};
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::{
-    HistoryEntry, HistoryOptions, RecordOptions, Repository, StatusOptions,
-    UnrecordOptions,
+    HistoryEntry, HistoryOptions, RecordOptions, Repository, StatusOptions, UnrecordOptions,
 };
 use clap::Parser;
 
@@ -258,6 +257,36 @@ impl Revise {
         }
     }
 
+    /// Builder: set the reference.
+    pub fn with_reference(mut self, reference: impl Into<String>) -> Self {
+        self.reference = reference.into();
+        self
+    }
+
+    /// Builder: set the message.
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+
+    /// Builder: set the reword flag.
+    pub fn with_reword(mut self, reword: bool) -> Self {
+        self.reword = reword;
+        self
+    }
+
+    /// Builder: set the no-edit flag.
+    pub fn with_no_edit(mut self, no_edit: bool) -> Self {
+        self.no_edit = no_edit;
+        self
+    }
+
+    /// Builder: set the dry-run flag.
+    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
     /// Parse the reference string into a ChangeRef.
     fn parse_reference(&self) -> ChangeRef {
         ChangeRef::parse(&self.reference)
@@ -300,10 +329,7 @@ impl Revise {
             .into_iter()
             .find(|e| e.sequence == sequence)
             .ok_or_else(|| {
-                CliError::Internal(anyhow::anyhow!(
-                    "Change at sequence {} not found",
-                    sequence
-                ))
+                CliError::Internal(anyhow::anyhow!("Change at sequence {} not found", sequence))
             })?;
 
         Ok((sequence, entry))
@@ -440,7 +466,11 @@ impl Revise {
             .map_err(CliError::Repository)?;
         let changes_to_unrecord = stack_info.change_count - sequence;
 
-        println!("Would revise change {} (sequence #{})", format_hash(&entry.hash, false), sequence);
+        println!(
+            "Would revise change {} (sequence #{})",
+            format_hash(&entry.hash, false),
+            sequence
+        );
         println!();
 
         if changes_to_unrecord > 1 {
@@ -462,8 +492,17 @@ impl Revise {
             entries_to_show.sort_by(|a, b| b.sequence.cmp(&a.sequence));
 
             for e in entries_to_show {
-                let marker = if e.sequence == sequence { " (target)" } else { "" };
-                println!("  #{}: {}{}", e.sequence, format_hash(&e.hash, false), marker);
+                let marker = if e.sequence == sequence {
+                    " (target)"
+                } else {
+                    ""
+                };
+                println!(
+                    "  #{}: {}{}",
+                    e.sequence,
+                    format_hash(&e.hash, false),
+                    marker
+                );
             }
             println!();
             println!(
@@ -495,9 +534,9 @@ impl Revise {
             .map_err(CliError::Repository)?;
 
         // Load the original change to get its message
-        let original_change = repo.load_change(&entry.hash).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to load change: {}", e))
-        })?;
+        let original_change = repo
+            .load_change(&entry.hash)
+            .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load change: {}", e)))?;
 
         let original_message = original_change.hashed.header.message.clone();
 
@@ -581,7 +620,10 @@ impl Revise {
         // Record the revised change
         let outcome = repo.record(header, options).map_err(|e| {
             // If recording fails, we should try to restore the state
-            print_warning(&format!("Recording failed: {}. Attempting to restore...", e));
+            print_warning(&format!(
+                "Recording failed: {}. Attempting to restore...",
+                e
+            ));
 
             // Try to re-apply all the unrecorded changes
             for hash in pending_changes.iter().rev() {
@@ -601,10 +643,7 @@ impl Revise {
 
         // Step 4: Re-apply pending changes
         if !pending_changes.is_empty() {
-            print_hint(&format!(
-                "Re-applying {} changes...",
-                pending_changes.len()
-            ));
+            print_hint(&format!("Re-applying {} changes...", pending_changes.len()));
 
             for hash in &pending_changes {
                 repo.reinsert_change(hash, None).map_err(|e| {
@@ -663,16 +702,14 @@ impl Revise {
         })?;
 
         // Apply the new change to the stack (it replaces the unrecorded one)
-        repo.apply_change(&new_hash, Default::default()).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to apply reworded change: {}", e))
-        })?;
+        repo.apply_change(&new_hash, Default::default())
+            .map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to apply reworded change: {}", e))
+            })?;
 
         // Re-apply pending changes
         if !pending_changes.is_empty() {
-            print_hint(&format!(
-                "Re-applying {} changes...",
-                pending_changes.len()
-            ));
+            print_hint(&format!("Re-applying {} changes...", pending_changes.len()));
 
             for hash in pending_changes {
                 repo.reinsert_change(hash, None).map_err(|e| {
@@ -996,9 +1033,7 @@ mod tests {
     #[test]
     fn test_get_message_explicit_overrides_reword() {
         // Explicit message takes precedence
-        let revise = Revise::new()
-            .with_message("Explicit")
-            .with_reword(true);
+        let revise = Revise::new().with_message("Explicit").with_reword(true);
         let msg = revise.get_message("Original").unwrap();
         assert_eq!(msg, "Explicit");
     }

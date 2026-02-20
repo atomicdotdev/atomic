@@ -186,6 +186,26 @@ struct StopInput {
     #[serde(default)]
     error: Option<bool>,
 
+    /// Input/prompt tokens used in this turn
+    #[serde(default)]
+    input_tokens: Option<u64>,
+
+    /// Output/completion tokens generated in this turn
+    #[serde(default)]
+    output_tokens: Option<u64>,
+
+    /// Cache read tokens
+    #[serde(default)]
+    cache_read_tokens: Option<u64>,
+
+    /// Cache write tokens
+    #[serde(default)]
+    cache_write_tokens: Option<u64>,
+
+    /// Cost in USD for this turn
+    #[serde(default)]
+    cost_usd: Option<f64>,
+
     #[serde(default)]
     cwd: Option<String>,
 

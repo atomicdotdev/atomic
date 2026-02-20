@@ -108,6 +108,27 @@ pub struct Move {
 }
 
 impl Move {
+    /// Create a new Move command.
+    pub fn new<S1: Into<String>, S2: Into<String>>(source: S1, destination: S2) -> Self {
+        Self {
+            source: source.into(),
+            destination: destination.into(),
+            dry_run: false,
+            force: false,
+        }
+    }
+
+    /// Builder: set the dry-run flag.
+    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
+    /// Builder: set the force flag.
+    pub fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
+    }
 
     /// Normalize a path relative to the repository root.
     fn normalize_path(&self, repo_root: &Path, path: &str) -> CliResult<String> {

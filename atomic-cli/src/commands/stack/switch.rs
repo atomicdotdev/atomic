@@ -69,6 +69,12 @@ pub struct Switch {
 }
 
 impl Switch {
+    /// Create a new Switch command targeting the given stack.
+    pub fn with_name(name: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+        }
+    }
 }
 
 impl Command for Switch {

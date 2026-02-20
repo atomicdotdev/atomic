@@ -128,6 +128,57 @@ impl Reset {
         }
     }
 
+    /// Builder: set files to reset.
+    pub fn with_files<I, S>(mut self, files: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.files = files.into_iter().map(|s| s.into()).collect();
+        self
+    }
+
+    /// Builder: set the stack to reset to.
+    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
+        self.stack = Some(stack.into());
+        self
+    }
+
+    /// Builder: set the dry-run flag.
+    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
+    /// Builder: set the force flag.
+    pub fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
+    }
+
+    /// Check if this is a partial reset (specific files, not whole working copy).
+    pub fn is_partial_reset(&self) -> bool {
+        !self.files.is_empty()
+    }
+
+    /// Normalize a path relative to the repository root.
+    ///
+    /// If the path is absolute and under the repo root, strips the prefix.
+    /// Otherwise returns the path as-is.
+    pub fn normalize_path(&self, repo_root: &std::path::Path, path: &str) -> CliResult<String> {
+        let p = std::path::Path::new(path);
+        if p.is_absolute() {
+            match p.strip_prefix(repo_root) {
+                Ok(rel) => Ok(rel.to_string_lossy().to_string()),
+                Err(_) => Err(CliError::PathOutsideRepository {
+                    path: std::path::PathBuf::from(path),
+                }),
+            }
+        } else {
+            Ok(path.to_string())
+        }
+    }
+
     /// Check if a path matches any of the specified file filters.
     fn matches_filter(&self, path: &str) -> bool {
         if self.files.is_empty() {
@@ -173,9 +224,9 @@ impl Reset {
     /// Execute dry-run for a single file - output pristine content to stdout.
     fn dry_run_single_file(&self, repo: &Repository, path: &str) -> CliResult<()> {
         // Get file content from pristine
-        let content = repo
-            .get_file_content(Path::new(path))
-            .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to get file content: {}", e)))?;
+        let content = repo.get_file_content(Path::new(path)).map_err(|e| {
+            CliError::Internal(anyhow::anyhow!("Failed to get file content: {}", e))
+        })?;
 
         match content {
             Some(bytes) => {
@@ -195,9 +246,9 @@ impl Reset {
     /// Reset a single file to pristine state.
     fn reset_file(&self, repo: &Repository, repo_root: &Path, path: &Path) -> CliResult<bool> {
         // Get content from pristine
-        let content = repo
-            .get_file_content(path)
-            .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to get file content: {}", e)))?;
+        let content = repo.get_file_content(path).map_err(|e| {
+            CliError::Internal(anyhow::anyhow!("Failed to get file content: {}", e))
+        })?;
 
         let full_path = repo_root.join(path);
 
@@ -228,7 +279,10 @@ impl Reset {
     /// Switch to a different stack.
     fn switch_stack(&self, repo: &mut Repository, stack_name: &str) -> CliResult<()> {
         // Check stack exists
-        if !repo.stack_exists(stack_name).map_err(CliError::Repository)? {
+        if !repo
+            .stack_exists(stack_name)
+            .map_err(CliError::Repository)?
+        {
             return Err(CliError::StackNotFound {
                 name: stack_name.to_string(),
             });
@@ -515,7 +569,7 @@ mod tests {
     fn test_normalize_relative_path() {
         let cmd = Reset::new();
         let temp = tempfile::tempdir().unwrap();
-        let result = cmd.normalize_path(temp.path(), "src/file.rs");
+        let result = cmd.normalize_path(temp.path(), "src/file.rs").unwrap();
         assert_eq!(result, "src/file.rs");
     }
 
@@ -524,7 +578,9 @@ mod tests {
         let cmd = Reset::new();
         let temp = tempfile::tempdir().unwrap();
         let abs = temp.path().join("src/file.rs");
-        let result = cmd.normalize_path(temp.path(), abs.to_str().unwrap());
+        let result = cmd
+            .normalize_path(temp.path(), abs.to_str().unwrap())
+            .unwrap();
         assert_eq!(result, "src/file.rs");
     }
 
@@ -533,7 +589,7 @@ mod tests {
         let cmd = Reset::new();
         let temp = tempfile::tempdir().unwrap();
         let result = cmd.normalize_path(temp.path(), "/other/path/file.rs");
-        assert_eq!(result, "/other/path/file.rs");
+        assert!(result.is_err());
     }
 
     // Format Tests

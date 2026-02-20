@@ -1,0 +1,46 @@
+{
+  "name": "opencode-atomic-hooks",
+  "version": "1.0.0",
+  "description": "Atomic VCS provenance tracking plugin for OpenCode — turns every AI agent turn into a content-addressed change with full causal decision graphs",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target bun --format esm && bun x tsc --emitDeclarationOnly",
+    "dev": "bun build src/index.ts --outdir dist --target bun --format esm --watch",
+    "test": "bun test src/__tests__/",
+    "test:watch": "bun test --watch src/__tests__/",
+    "typecheck": "bun x tsc --noEmit",
+    "prepublishOnly": "bun run build"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=0.1.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest",
+    "@types/bun": "latest",
+    "typescript": "^5.7.0"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "atomic",
+    "atomic-vcs",
+    "provenance",
+    "ai-agent",
+    "version-control",
+    "code-attribution"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/atomicdotdev/atomic"
+  },
+  "homepage": "https://atomic.dev",
+  "author": "Atomic VCS Contributors"
+}

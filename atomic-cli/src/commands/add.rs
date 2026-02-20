@@ -204,6 +204,49 @@ impl Add {
         }
     }
 
+    /// Builder: set the files to add.
+    pub fn with_files<I, S>(mut self, files: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.files = files.into_iter().map(|s| s.into()).collect();
+        self
+    }
+
+    /// Builder: set the `--all` flag.
+    pub fn with_all(mut self, all: bool) -> Self {
+        self.all = all;
+        self
+    }
+
+    /// Builder: set the `--dry-run` flag.
+    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
+    /// Builder: set the `--force` flag.
+    pub fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
+    }
+
+    /// Builder: set the `--recursive` flag.
+    pub fn with_recursive(mut self, recursive: bool) -> Self {
+        self.recursive = recursive;
+        if !recursive {
+            self.no_recursive = true;
+        }
+        self
+    }
+
+    /// Builder: set the `--directory` flag.
+    pub fn with_directory(mut self, directory: bool) -> Self {
+        self.directory = directory;
+        self
+    }
+
     /// Convert command options to TrackingOptions.
     fn get_tracking_options(&self) -> TrackingOptions {
         let recursive = self.recursive && !self.no_recursive;

@@ -17,7 +17,45 @@ use super::*;
 /// # Returns
 ///
 /// A vector of `DiffHunk`s representing the changes with context.
-pub(super) fn build_hunks_from_diff(
+/// Format a stat graph bar for a file's changes.
+///
+/// Creates a visual bar like `+++---` showing the ratio of insertions
+/// to deletions, scaled to fit within `max_width` characters.
+///
+/// # Arguments
+///
+/// * `insertions` - Number of lines added
+/// * `deletions` - Number of lines deleted
+/// * `max_width` - Maximum width of the graph bar
+///
+/// # Returns
+///
+/// A string containing `+` and `-` characters representing the change ratio.
+pub(crate) fn format_stat_graph(insertions: usize, deletions: usize, max_width: usize) -> String {
+    let total = insertions + deletions;
+    if total == 0 {
+        return String::new();
+    }
+
+    let width = total.min(max_width);
+    let ins_width = if total <= max_width {
+        insertions
+    } else {
+        (insertions as f64 / total as f64 * max_width as f64).round() as usize
+    };
+    let del_width = width.saturating_sub(ins_width);
+
+    let mut result = String::with_capacity(width);
+    for _ in 0..ins_width {
+        result.push('+');
+    }
+    for _ in 0..del_width {
+        result.push('-');
+    }
+    result
+}
+
+pub(crate) fn build_hunks_from_diff(
     diff_result: &DiffResult,
     old_lines: &[&[u8]],
     new_lines: &[&[u8]],

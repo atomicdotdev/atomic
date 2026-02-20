@@ -155,6 +155,70 @@ impl Diff {
         }
     }
 
+    /// Builder: set files to diff.
+    pub fn with_files<I, S>(mut self, files: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.files = files.into_iter().map(|s| s.into()).collect();
+        self
+    }
+
+    /// Builder: set the change to compare against.
+    pub fn with_change(mut self, change: impl Into<String>) -> Self {
+        self.change = Some(change.into());
+        self
+    }
+
+    /// Builder: set the diff algorithm.
+    pub fn with_algorithm(mut self, algorithm: impl Into<String>) -> Self {
+        self.algorithm = algorithm.into();
+        self
+    }
+
+    /// Builder: set the number of context lines.
+    pub fn with_context(mut self, context: usize) -> Self {
+        self.context = context;
+        self
+    }
+
+    /// Builder: set the stat flag.
+    pub fn with_stat(mut self, stat: bool) -> Self {
+        self.stat = stat;
+        self
+    }
+
+    /// Builder: set the no-color flag.
+    pub fn with_no_color(mut self, no_color: bool) -> Self {
+        self.no_color = no_color;
+        self
+    }
+
+    /// Builder: set the name-only flag.
+    pub fn with_name_only(mut self, name_only: bool) -> Self {
+        self.name_only = name_only;
+        self
+    }
+
+    /// Builder: set the name-status flag.
+    pub fn with_name_status(mut self, name_status: bool) -> Self {
+        self.name_status = name_status;
+        self
+    }
+
+    /// Builder: set the stack to compare against.
+    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
+        self.stack = Some(stack.into());
+        self
+    }
+
+    /// Builder: set the word-diff flag.
+    pub fn with_word_diff(mut self, word_diff: bool) -> Self {
+        self.word_diff = word_diff;
+        self
+    }
+
     /// Get the output format based on command flags.
     pub fn get_format(&self) -> DiffFormat {
         if self.name_only {
@@ -169,7 +233,7 @@ impl Diff {
     }
 
     /// Parse the algorithm string into an Algorithm enum.
-    fn parse_algorithm(&self) -> CliResult<Algorithm> {
+    pub(crate) fn parse_algorithm(&self) -> CliResult<Algorithm> {
         self.algorithm
             .parse()
             .map_err(|_| CliError::InvalidArgument {
@@ -181,7 +245,7 @@ impl Diff {
     }
 
     /// Create a DiffOutputConfig from the command settings.
-    fn get_output_config(&self) -> DiffOutputConfig {
+    pub(crate) fn get_output_config(&self) -> DiffOutputConfig {
         DiffOutputConfig {
             context_lines: self.context,
             color: !self.no_color,

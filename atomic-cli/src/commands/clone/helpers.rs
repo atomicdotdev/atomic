@@ -282,6 +282,16 @@ impl CleanupGuard {
     pub fn disable(mut self) {
         self.enabled = false;
     }
+
+    /// Check if cleanup has been disabled.
+    pub fn is_disabled(&self) -> bool {
+        !self.enabled
+    }
+
+    /// Get a reference to the guarded path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl Drop for CleanupGuard {
@@ -472,6 +482,33 @@ pub fn format_count(count: usize, singular: &str) -> String {
 /// assert_eq!(format_bytes(512), "512 B");
 /// assert_eq!(format_bytes(1536), "1.5 KB");
 /// ```
+/// Normalize a URL by removing trailing slashes.
+///
+/// # Arguments
+///
+/// * `url` - The URL to normalize
+///
+/// # Returns
+///
+/// The URL with any trailing slashes removed.
+pub fn normalize_url(url: &str) -> String {
+    url.trim_end_matches('/').to_string()
+}
+
+/// Clean up a directory on error (e.g., failed clone).
+///
+/// Silently removes the directory and all its contents. Does nothing
+/// if the path doesn't exist.
+///
+/// # Arguments
+///
+/// * `path` - The directory to remove
+pub fn cleanup_on_error(path: &Path) {
+    if path.exists() {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
 pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;

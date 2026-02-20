@@ -1,6 +1,5 @@
 use super::*;
 
-
 // TESTS
 
 #[cfg(test)]
@@ -39,13 +38,13 @@ mod tests {
 
     #[test]
     fn test_options_max_hunk_size() {
-        let opts = GlobalizeOptions::new().max_hunk_size(1024);
+        let opts = GlobalizeOptions::new().with_max_hunk_size(1024);
         assert_eq!(opts.max_hunk_size(), 1024);
     }
 
     #[test]
     fn test_options_default_encoding() {
-        let opts = GlobalizeOptions::new().default_encoding(Encoding::Binary);
+        let opts = GlobalizeOptions::new().with_default_encoding(Encoding::Binary);
         assert_eq!(opts.default_encoding(), Encoding::Binary);
     }
 
@@ -54,8 +53,8 @@ mod tests {
         let opts = GlobalizeOptions::new()
             .with_include_empty_files(true)
             .with_validate_positions(false)
-            .max_hunk_size(2048)
-            .default_encoding(Encoding::Latin1);
+            .with_max_hunk_size(2048)
+            .with_default_encoding(Encoding::Latin1);
 
         assert!(opts.include_empty_files());
         assert!(!opts.validate_positions());

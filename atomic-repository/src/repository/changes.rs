@@ -553,4 +553,181 @@ impl Repository {
 
         Ok(matches.into_iter().next())
     }
+
+    // =========================================================================
+    // Provenance Graph Operations
+    // =========================================================================
+
+    /// Save a provenance graph to the repository.
+    ///
+    /// Serializes the graph to disk, registers it in the pristine database
+    /// with `node_type::PROVENANCE`, and records dependencies on the
+    /// changes this graph explains.
+    ///
+    /// # Returns
+    ///
+    /// The content hash of the saved provenance graph.
+    pub fn save_provenance_graph(
+        &self,
+        graph: &atomic_core::change::ProvenanceGraph,
+    ) -> Result<Hash, RepositoryError> {
+        use atomic_core::pristine::MutTxnT;
+
+        // Save to disk
+        let hash = self
+            .change_store
+            .save_provenance_graph(graph)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Register in the graph
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let prov_id = txn
+            .register_provenance(&hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Register dependencies: provenance → explained changes
+        for change_hash in &graph.changes_explained {
+            if let Ok(Some(change_id)) = txn.get_internal(change_hash) {
+                txn.put_dep(prov_id, change_id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            }
+        }
+
+        // If chained, register dependency on previous provenance graph too
+        if let Some(ref prev_hash) = graph.previous {
+            if let Ok(Some(prev_id)) = txn.get_internal(prev_hash) {
+                txn.put_dep(prov_id, prev_id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            }
+        }
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(hash)
+    }
+
+    /// Load a provenance graph from the repository by hash.
+    pub fn load_provenance_graph(
+        &self,
+        hash: &Hash,
+    ) -> Result<atomic_core::change::ProvenanceGraph, RepositoryError> {
+        self.change_store
+            .load_provenance_graph(hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))
+    }
+
+    /// Check if a provenance graph exists in the repository.
+    pub fn has_provenance_graph(&self, hash: &Hash) -> bool {
+        self.change_store.has_provenance_graph(hash)
+    }
+
+    /// Find all provenance graphs that explain a specific change.
+    ///
+    /// Uses REV_DEPS to find nodes that depend on the given change,
+    /// then filters by `node_type::PROVENANCE`.
+    ///
+    /// # Arguments
+    ///
+    /// * `change_hash` - The hash of the change to find provenance for
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(Hash, ProvenanceGraph)` pairs explaining this change.
+    pub fn find_provenance_for_change(
+        &self,
+        change_hash: &Hash,
+    ) -> Result<Vec<(Hash, atomic_core::change::ProvenanceGraph)>, RepositoryError> {
+        use atomic_core::pristine::{node_type, GraphTxnT};
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Get the internal ID for this change
+        let change_id = match txn
+            .get_internal(change_hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            Some(id) => id,
+            None => return Ok(Vec::new()),
+        };
+
+        // Look up REV_DEPS: who depends on this change?
+        let rev_deps = txn
+            .get_rev_deps(change_id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut graphs = Vec::new();
+
+        for dep_id in rev_deps {
+            // Check if this dependent is a provenance graph
+            let node_type_val = txn
+                .get_node_type(dep_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+            if node_type_val != Some(node_type::PROVENANCE) {
+                continue;
+            }
+
+            // Get the external hash
+            let dep_hash = match txn
+                .get_external(dep_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                Some(h) => h,
+                None => continue,
+            };
+
+            // Load the provenance graph from disk
+            match self.load_provenance_graph(&dep_hash) {
+                Ok(graph) => graphs.push((dep_hash, graph)),
+                Err(_) => continue, // File missing or corrupt — skip
+            }
+        }
+
+        Ok(graphs)
+    }
+
+    /// Find all provenance graphs for a session by scanning disk.
+    ///
+    /// Iterates over all provenance graph files and filters by session ID.
+    /// This is a full scan — use `find_provenance_for_change` when you have
+    /// a specific change hash.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The session identifier to match
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(Hash, ProvenanceGraph)` pairs for this session,
+    /// ordered by timestamp (oldest first).
+    pub fn find_provenance_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(Hash, atomic_core::change::ProvenanceGraph)>, RepositoryError> {
+        let mut graphs = Vec::new();
+
+        for result in self.change_store.iter_provenance_graphs() {
+            let hash = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+            match self.load_provenance_graph(&hash) {
+                Ok(graph) if graph.session_id == session_id => {
+                    graphs.push((hash, graph));
+                }
+                _ => continue,
+            }
+        }
+
+        // Sort by timestamp (oldest first) for chain reconstruction
+        graphs.sort_by_key(|(_, g)| g.timestamp);
+
+        Ok(graphs)
+    }
 }

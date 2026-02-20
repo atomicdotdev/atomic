@@ -175,6 +175,7 @@ mod output;
 mod types;
 
 pub use command::*;
+pub(crate) use output::{build_hunks_from_diff, format_stat_graph};
 pub use types::*;
 
 #[cfg(test)]

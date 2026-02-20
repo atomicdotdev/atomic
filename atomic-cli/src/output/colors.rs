@@ -40,6 +40,115 @@ use console::{style, StyledObject};
 
 // Color Mode
 
+/// Controls when colors should be used in output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorMode {
+    /// Automatically detect whether to use colors (based on terminal support).
+    Auto,
+    /// Always use colors, even when output is not a terminal.
+    Always,
+    /// Never use colors.
+    Never,
+}
+
+impl Default for ColorMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl ColorMode {
+    /// Check if colors should be used based on this mode.
+    pub fn should_colorize(&self) -> bool {
+        match self {
+            Self::Auto => console::colors_enabled(),
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
+impl std::fmt::Display for ColorMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Always => write!(f, "always"),
+            Self::Never => write!(f, "never"),
+        }
+    }
+}
+
+impl std::str::FromStr for ColorMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "always" | "yes" | "true" | "1" => Ok(Self::Always),
+            "never" | "no" | "false" | "0" => Ok(Self::Never),
+            other => Err(format!(
+                "Invalid color mode: '{}'. Use auto, always, or never.",
+                other
+            )),
+        }
+    }
+}
+
+// Status Characters
+
+/// Single-character status indicators for file status display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusChar {
+    /// File was added.
+    Added,
+    /// File was modified.
+    Modified,
+    /// File was deleted.
+    Deleted,
+    /// File was renamed.
+    Renamed,
+    /// File is untracked.
+    Untracked,
+    /// File has a conflict.
+    Conflict,
+    /// File is clean (unchanged).
+    Clean,
+}
+
+impl StatusChar {
+    /// Get the raw character for this status.
+    pub fn char(&self) -> char {
+        match self {
+            Self::Added => 'A',
+            Self::Modified => 'M',
+            Self::Deleted => 'D',
+            Self::Renamed => 'R',
+            Self::Untracked => '?',
+            Self::Conflict => 'C',
+            Self::Clean => ' ',
+        }
+    }
+
+    /// Get a styled version of this status character.
+    pub fn styled(&self) -> StyledObject<char> {
+        match self {
+            Self::Added => style(self.char()).green(),
+            Self::Modified => style(self.char()).yellow(),
+            Self::Deleted => style(self.char()).red(),
+            Self::Renamed => style(self.char()).cyan(),
+            Self::Untracked => style(self.char()).red(),
+            Self::Conflict => style(self.char()).red().bold(),
+            Self::Clean => style(self.char()),
+        }
+    }
+}
+
+impl std::fmt::Display for StatusChar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.char())
+    }
+}
+
 // Color Detection
 
 // Status Colors
@@ -385,6 +494,20 @@ pub fn emphasis<D: std::fmt::Display>(text: D) -> StyledObject<D> {
 /// ```
 pub fn command<D: std::fmt::Display>(text: D) -> StyledObject<D> {
     style(text).cyan().bold()
+}
+
+/// Format renamed content in cyan.
+///
+/// Use this for renamed files or moved content.
+pub fn renamed<D: std::fmt::Display>(text: D) -> StyledObject<D> {
+    style(text).cyan()
+}
+
+/// Format conflict content in bold red.
+///
+/// Use this for conflict markers or conflicted file indicators.
+pub fn conflict<D: std::fmt::Display>(text: D) -> StyledObject<D> {
+    style(text).red().bold()
 }
 
 // File Status Prefix

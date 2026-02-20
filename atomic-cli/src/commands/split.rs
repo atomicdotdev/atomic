@@ -129,6 +129,26 @@ pub struct Split {
 }
 
 impl Split {
+    /// Create a new Split command with the given name.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            source: None,
+            switch: false,
+        }
+    }
+
+    /// Builder: set the source stack to split from.
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    /// Builder: set the switch flag.
+    pub fn with_switch(mut self, switch: bool) -> Self {
+        self.switch = switch;
+        self
+    }
 }
 
 impl Default for Split {

@@ -40,7 +40,7 @@ use atomic_repository::{Repository, TagOptions};
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{print_success, emphasis};
+use crate::output::{emphasis, print_success};
 
 #[cfg(test)]
 use std::path::PathBuf;
@@ -117,23 +117,69 @@ pub struct Create {
 }
 
 impl Create {
+    /// Create a new Create command with default settings.
+    pub fn new() -> Self {
+        Self {
+            name: None,
+            message: None,
+            author: None,
+            stack: None,
+            force: false,
+        }
+    }
+
+    /// Create a new Create command with the given tag name.
+    pub fn with_name(name: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+            message: None,
+            author: None,
+            stack: None,
+            force: false,
+        }
+    }
+
+    /// Builder: set the message.
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+
+    /// Builder: set the author.
+    pub fn with_author(mut self, author: impl Into<String>) -> Self {
+        self.author = Some(author.into());
+        self
+    }
+
+    /// Builder: set the stack.
+    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
+        self.stack = Some(stack.into());
+        self
+    }
+
+    /// Builder: set the force flag.
+    pub fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
+    }
 }
 
 impl Command for Create {
     fn run(&self) -> CliResult<()> {
         // Get the tag name
-        let name = self.name.as_ref().ok_or_else(|| CliError::InvalidArgument {
-            message: "Tag name is required".to_string(),
-        })?;
+        let name = self
+            .name
+            .as_ref()
+            .ok_or_else(|| CliError::InvalidArgument {
+                message: "Tag name is required".to_string(),
+            })?;
 
         // Find the repository
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(|e| match e {
-            atomic_repository::RepositoryError::NotFound { path } => {
-                CliError::RepositoryNotFound {
-                    searched_path: path.into(),
-                }
-            }
+            atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
+                searched_path: path.into(),
+            },
             other => CliError::Repository(other),
         })?;
 

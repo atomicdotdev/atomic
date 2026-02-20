@@ -164,6 +164,20 @@ impl Column {
         self.min_width = width;
         self
     }
+
+    /// Set the maximum width for this column.
+    ///
+    /// # Arguments
+    ///
+    /// * `width` - The maximum width in characters (0 means no maximum)
+    ///
+    /// # Returns
+    ///
+    /// Self for method chaining.
+    pub fn max_width(mut self, width: usize) -> Self {
+        self.max_width = width;
+        self
+    }
 }
 
 // Row
@@ -178,6 +192,27 @@ pub struct Row {
 }
 
 impl Row {
+    /// Create a new empty row.
+    pub fn new() -> Self {
+        Self { cells: Vec::new() }
+    }
+
+    /// Get the number of cells in this row.
+    pub fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// Check if this row has no cells.
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
+    /// Add a cell to this row (builder style).
+    pub fn add_cell<S: Into<String>>(mut self, cell: S) -> Self {
+        self.cells.push(cell.into());
+        self
+    }
+
     /// Create a row from a vector of values.
     ///
     /// # Arguments
@@ -258,6 +293,45 @@ impl Table {
             column_separator: "  ".to_string(),
             use_colors: true,
         }
+    }
+
+    /// Check if the table has no rows.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Get the number of data rows (excluding the header).
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Get the number of columns.
+    pub fn column_count(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Set the header row from simple string values.
+    ///
+    /// This creates columns with default settings from header strings.
+    pub fn set_header<I, S>(&mut self, headers: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.columns = headers.into_iter().map(|h| Column::new(h)).collect();
+        self
+    }
+
+    /// Set whether to show the header separator line.
+    pub fn show_header_separator(&mut self, show: bool) -> &mut Self {
+        self.show_header_separator = show;
+        self
+    }
+
+    /// Set the column separator string.
+    pub fn column_separator(&mut self, sep: impl Into<String>) -> &mut Self {
+        self.column_separator = sep.into();
+        self
     }
 
     /// Set the columns with full configuration.
@@ -437,7 +511,109 @@ impl fmt::Display for Table {
     }
 }
 
-// Simple Table Builder
+// Key-Value Table
+
+/// A simple two-column key-value table.
+///
+/// Useful for displaying metadata, configuration, or summary information.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let table = KeyValueTable::new()
+///     .add("Name", "Alice")
+///     .add("Age", "30");
+/// println!("{}", table);
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct KeyValueTable {
+    /// Key-value pairs
+    entries: Vec<(String, String)>,
+    /// Separator between key and value
+    separator: String,
+    /// Whether to align values (pad keys to same width)
+    align_values: bool,
+}
+
+impl KeyValueTable {
+    /// Create a new empty key-value table.
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            separator: ": ".to_string(),
+            align_values: true,
+        }
+    }
+
+    /// Add a key-value pair.
+    pub fn add<K: Into<String>, V: Into<String>>(mut self, key: K, value: V) -> Self {
+        self.entries.push((key.into(), value.into()));
+        self
+    }
+
+    /// Set the separator between keys and values.
+    pub fn separator<S: Into<String>>(mut self, sep: S) -> Self {
+        self.separator = sep.into();
+        self
+    }
+
+    /// Set whether to align values by padding keys.
+    pub fn align_values(mut self, align: bool) -> Self {
+        self.align_values = align;
+        self
+    }
+
+    /// Get the number of entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Check if the table is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Render the table to a string.
+    fn render(&self) -> String {
+        if self.entries.is_empty() {
+            return String::new();
+        }
+
+        let max_key_width = if self.align_values {
+            self.entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0)
+        } else {
+            0
+        };
+
+        let mut output = String::new();
+        for (key, value) in &self.entries {
+            if self.align_values {
+                output.push_str(&format!(
+                    "{:width$}{}{}\n",
+                    key,
+                    self.separator,
+                    value,
+                    width = max_key_width
+                ));
+            } else {
+                output.push_str(&format!("{}{}{}\n", key, self.separator, value));
+            }
+        }
+
+        // Remove trailing newline
+        if output.ends_with('\n') {
+            output.pop();
+        }
+
+        output
+    }
+}
+
+impl fmt::Display for KeyValueTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.render())
+    }
+}
 
 // Tests
 

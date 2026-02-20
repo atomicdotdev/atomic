@@ -58,14 +58,13 @@ pub mod table;
 
 // Re-export commonly used items for convenience
 pub use colors::{
-    added, author, command, deleted, emphasis, error, hash, hint, info, modified, path, stack, success, timestamp, untracked, warning,
+    added, author, command, conflict, deleted, emphasis, error, hash, hint, info, modified, path,
+    renamed, stack, success, timestamp, untracked, warning, ColorMode, StatusChar,
 };
 
-pub use progress::{
-    create_progress_bar, create_spinner, finish_error,
-    finish_success,
-};
+pub use table::{Alignment, Column, KeyValueTable, Row, Table};
 
+pub use progress::{create_progress_bar, create_spinner, finish_error, finish_success};
 
 // Convenience Print Functions
 

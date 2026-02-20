@@ -330,7 +330,115 @@ impl CliError {
         }
     }
 
+    /// Create a `RepositoryNotFound` error for the given path.
+    pub fn repository_not_found<P: Into<PathBuf>>(path: P) -> Self {
+        Self::RepositoryNotFound {
+            searched_path: path.into(),
+        }
+    }
+
+    /// Create a `StackNotFound` error for the given name.
+    pub fn stack_not_found(name: impl Into<String>) -> Self {
+        Self::StackNotFound { name: name.into() }
+    }
+
+    /// Create a `FileNotFound` error for the given path.
+    pub fn file_not_found<P: Into<PathBuf>>(path: P) -> Self {
+        Self::FileNotFound { path: path.into() }
+    }
+
+    /// Create a `ChangeNotFound` error for the given hash.
+    pub fn change_not_found(hash: impl Into<String>) -> Self {
+        Self::ChangeNotFound { hash: hash.into() }
+    }
+
+    /// Create a `RemoteError` with an optional URL.
+    pub fn remote_error(message: impl Into<String>, url: Option<String>) -> Self {
+        Self::RemoteError {
+            message: message.into(),
+            url,
+        }
+    }
+
     // Error Classification
+
+    /// Check if this error indicates something was not found.
+    pub fn is_not_found(&self) -> bool {
+        matches!(
+            self,
+            Self::RepositoryNotFound { .. }
+                | Self::StackNotFound { .. }
+                | Self::FileNotFound { .. }
+                | Self::ChangeNotFound { .. }
+                | Self::RemoteNotFound { .. }
+        )
+    }
+
+    /// Check if this error is related to stack operations.
+    pub fn is_stack_error(&self) -> bool {
+        matches!(
+            self,
+            Self::StackNotFound { .. }
+                | Self::StackAlreadyExists { .. }
+                | Self::CannotDeleteCurrentStack { .. }
+        )
+    }
+
+    /// Check if this error is related to file operations.
+    pub fn is_file_error(&self) -> bool {
+        matches!(
+            self,
+            Self::FileNotFound { .. }
+                | Self::FileNotTracked { .. }
+                | Self::FileAlreadyTracked { .. }
+                | Self::PathOutsideRepository { .. }
+                | Self::PathIgnored { .. }
+        )
+    }
+
+    /// Check if this error is related to remote operations.
+    pub fn is_remote_error(&self) -> bool {
+        matches!(
+            self,
+            Self::RemoteError { .. }
+                | Self::RemoteNotFound { .. }
+                | Self::AuthenticationFailed { .. }
+        )
+    }
+
+    /// Check if this error is fixable by the user (not a bug).
+    pub fn is_user_fixable(&self) -> bool {
+        matches!(
+            self,
+            Self::RepositoryNotFound { .. }
+                | Self::RepositoryExists { .. }
+                | Self::StackNotFound { .. }
+                | Self::StackAlreadyExists { .. }
+                | Self::CannotDeleteCurrentStack { .. }
+                | Self::FileNotFound { .. }
+                | Self::FileNotTracked { .. }
+                | Self::FileAlreadyTracked { .. }
+                | Self::PathOutsideRepository { .. }
+                | Self::PathIgnored { .. }
+                | Self::NothingToRecord
+                | Self::ChangeNotFound { .. }
+                | Self::AmbiguousHash { .. }
+                | Self::MissingDependency { .. }
+                | Self::Conflict { .. }
+                | Self::IdentityNotFound(_)
+                | Self::IdentityAlreadyExists(_)
+                | Self::RemoteNotFound { .. }
+                | Self::AuthenticationFailed { .. }
+                | Self::InvalidArgument { .. }
+                | Self::InvalidRepository { .. }
+                | Self::InvalidPath { .. }
+        )
+    }
+
+    /// Check if this is an internal error (likely a bug).
+    pub fn is_internal(&self) -> bool {
+        matches!(self, Self::Internal(_))
+    }
 
     // User Guidance
 

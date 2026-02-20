@@ -1269,6 +1269,20 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// ```
     fn register_attestation(&mut self, hash: &Hash) -> Result<NodeId, PristineError>;
 
+    /// Register a provenance graph and get its internal ID.
+    ///
+    /// Similar to [`register_change`] and [`register_attestation`], but
+    /// for provenance graph artifacts. Uses `node_type::PROVENANCE`.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - The content hash of the provenance graph
+    ///
+    /// # Returns
+    ///
+    /// The internal `NodeId` assigned to this provenance graph.
+    fn register_provenance(&mut self, hash: &Hash) -> Result<NodeId, PristineError>;
+
     // Graph Modification
 
     /// Add an edge to the graph

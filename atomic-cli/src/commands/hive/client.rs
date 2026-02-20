@@ -41,6 +41,8 @@ pub struct RegistrationResult {
 #[derive(Debug, Deserialize)]
 pub struct PulledIdentity {
     pub name: String,
+    #[serde(default)]
+    pub slug: String,
     pub email: Option<String>,
     pub usage: String,
     #[serde(rename = "publicKey")]
@@ -136,6 +138,13 @@ struct RegisterRequest {
 struct ApiErrorResponse {
     error: Option<String>,
     message: Option<String>,
+}
+
+/// Response from the claim status endpoint.
+#[derive(Debug, Clone, Deserialize)]
+struct ClaimStatusResponse {
+    /// The claim status (e.g., "claimed", "pending_claim").
+    pub status: String,
 }
 
 // Client

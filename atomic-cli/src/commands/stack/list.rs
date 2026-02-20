@@ -59,7 +59,18 @@ pub struct List {
     pub verbose: bool,
 }
 
-impl List {}
+impl List {
+    /// Create a new List command with default settings.
+    pub fn new() -> Self {
+        Self { verbose: false }
+    }
+
+    /// Builder: set the verbose flag.
+    pub fn with_verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
+    }
+}
 
 impl Command for List {
     fn run(&self) -> CliResult<()> {

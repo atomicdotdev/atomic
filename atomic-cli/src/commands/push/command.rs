@@ -148,6 +148,54 @@ impl Push {
         }
     }
 
+    /// Builder: set the remote name or URL.
+    pub fn with_remote(mut self, remote: impl Into<String>) -> Self {
+        self.remote = remote.into();
+        self
+    }
+
+    /// Builder: set the remote stack to push to.
+    pub fn with_to_stack(mut self, stack: impl Into<String>) -> Self {
+        self.to_stack = Some(stack.into());
+        self
+    }
+
+    /// Builder: set the local stack to push from.
+    pub fn with_from_stack(mut self, stack: impl Into<String>) -> Self {
+        self.from_stack = Some(stack.into());
+        self
+    }
+
+    /// Builder: set the dry-run flag.
+    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
+    /// Builder: set the force flag.
+    pub fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
+    }
+
+    /// Builder: set the --all flag.
+    pub fn with_all(mut self, all: bool) -> Self {
+        self.all = all;
+        self
+    }
+
+    /// Builder: set the insecure flag.
+    pub fn with_insecure(mut self, insecure: bool) -> Self {
+        self.insecure = insecure;
+        self
+    }
+
+    /// Builder: set the timeout in seconds.
+    pub fn with_timeout(mut self, timeout: u64) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     /// Resolve the remote URL.
     ///
     /// If the remote is a URL (contains "://"), returns it directly.
@@ -528,6 +576,60 @@ impl Push {
             }
         }
 
+        // Upload provenance graphs that explain the pushed changes.
+        // Provenance graphs are causal decision DAGs — they travel with
+        // their dependencies but aren't part of any stack's changelog.
+        let mut provenance_count = 0;
+        {
+            let all_pushed_hashes: Vec<Hash> = to_upload.iter().map(|c| c.hash).collect();
+            for pushed_hash in &all_pushed_hashes {
+                let graphs = repo
+                    .find_provenance_for_change(pushed_hash)
+                    .unwrap_or_default();
+
+                for (prov_hash, graph) in &graphs {
+                    // Only upload if all explained changes have been pushed
+                    let all_explained = graph
+                        .changes_explained
+                        .iter()
+                        .all(|h| all_pushed_hashes.contains(h));
+
+                    if !all_explained {
+                        continue;
+                    }
+
+                    // Load and upload the raw provenance bytes
+                    let prov_data = match graph.serialize() {
+                        Ok(data) => Bytes::from(data),
+                        Err(_) => continue,
+                    };
+
+                    match remote
+                        .upload_provenance(&prov_hash.to_base32(), prov_data)
+                        .await
+                    {
+                        Ok(()) => {
+                            provenance_count += 1;
+                            println!(
+                                "  {} {} provenance ({} nodes, {} changes)",
+                                success("✓"),
+                                style_hash(&format_hash(prov_hash, false)),
+                                graph.node_count(),
+                                graph.change_count(),
+                            );
+                        }
+                        Err(e) => {
+                            print_warning(&format!(
+                                "Failed to upload provenance graph {}: {}",
+                                &prov_hash.to_base32()[..12],
+                                e
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // Summary
         print_blank();
         let mut summary = format!(
@@ -546,6 +648,12 @@ impl Push {
             summary.push_str(&format!(
                 ", {} synced",
                 format_count(attest_count, "attestation")
+            ));
+        }
+        if provenance_count > 0 {
+            summary.push_str(&format!(
+                ", {} synced",
+                format_count(provenance_count, "provenance graph")
             ));
         }
         print_success(&summary);

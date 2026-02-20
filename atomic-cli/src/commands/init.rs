@@ -317,6 +317,27 @@ impl Init {
         }
     }
 
+    /// Create a new Init command targeting a specific path.
+    pub fn at_path<P: Into<PathBuf>>(path: P) -> Self {
+        Self {
+            path: path.into(),
+            stack: DEFAULT_STACK_NAME.to_string(),
+            kind: None,
+        }
+    }
+
+    /// Builder: set the initial stack name.
+    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
+        self.stack = stack.into();
+        self
+    }
+
+    /// Builder: set the project kind for .atomicignore template.
+    pub fn with_kind(mut self, kind: impl Into<String>) -> Self {
+        self.kind = Some(kind.into());
+        self
+    }
+
     /// Resolve the target path to an absolute path.
     ///
     /// If the path is relative, it's resolved relative to the current
@@ -325,17 +346,15 @@ impl Init {
         let path = if self.path.is_absolute() {
             self.path.clone()
         } else {
-            let cwd = std::env::current_dir().map_err(|e| {
-                CliError::invalid_path(&self.path, Some(e))
-            })?;
+            let cwd =
+                std::env::current_dir().map_err(|e| CliError::invalid_path(&self.path, Some(e)))?;
             cwd.join(&self.path)
         };
 
         // Canonicalize if the path exists, otherwise just normalize it
         if path.exists() {
-            path.canonicalize().map_err(|e| {
-                CliError::invalid_path(&self.path, Some(e))
-            })
+            path.canonicalize()
+                .map_err(|e| CliError::invalid_path(&self.path, Some(e)))
         } else {
             Ok(path)
         }
@@ -365,9 +384,7 @@ impl Init {
             return Ok(false);
         }
 
-        std::fs::write(&ignore_path, template).map_err(|e| {
-            CliError::Io(e)
-        })?;
+        std::fs::write(&ignore_path, template).map_err(|e| CliError::Io(e))?;
 
         Ok(true)
     }
@@ -438,9 +455,8 @@ impl Command for Init {
 
         // Create the directory if it doesn't exist
         if !target_path.exists() {
-            std::fs::create_dir_all(&target_path).map_err(|e| {
-                CliError::invalid_path(&target_path, Some(e))
-            })?;
+            std::fs::create_dir_all(&target_path)
+                .map_err(|e| CliError::invalid_path(&target_path, Some(e)))?;
         }
 
         // Check if a repository already exists
@@ -464,14 +480,12 @@ impl Command for Init {
         // Repository::init() already creates a "dev" stack by default
         if self.stack != atomic_repository::DEFAULT_STACK {
             // Create the requested stack
-            repo.create_stack(&self.stack).map_err(|e| {
-                CliError::Repository(e)
-            })?;
+            repo.create_stack(&self.stack)
+                .map_err(|e| CliError::Repository(e))?;
 
             // Set it as the current stack
-            repo.set_current_stack(&self.stack).map_err(|e| {
-                CliError::Repository(e)
-            })?;
+            repo.set_current_stack(&self.stack)
+                .map_err(|e| CliError::Repository(e))?;
         }
 
         // Print success message
@@ -757,7 +771,11 @@ mod tests {
         if let Err(ref e) = result1 {
             eprintln!("First init failed: {:?}", e);
         }
-        assert!(result1.is_ok(), "First init should succeed: {:?}", result1.err());
+        assert!(
+            result1.is_ok(),
+            "First init should succeed: {:?}",
+            result1.err()
+        );
 
         // Second init should fail
         let init2 = Init::at_path(temp.path());

@@ -404,7 +404,10 @@ mod tests {
         assert!(opts.detect_encoding());
         assert!(opts.detect_permissions());
         assert!(opts.prefix().is_empty());
-        assert_eq!(opts.with_max_file_size(), Some(WorkflowOptions::DEFAULT_MAX_FILE_SIZE));
+        assert_eq!(
+            opts.max_file_size(),
+            Some(WorkflowOptions::DEFAULT_MAX_FILE_SIZE)
+        );
         assert!(!opts.force_rediff());
         assert!(!opts.ignore_missing());
     }
@@ -449,20 +452,20 @@ mod tests {
 
     #[test]
     fn test_prefix_builder_string() {
-        let opts = WorkflowOptions::new().prefix(String::from("tests/"));
+        let opts = WorkflowOptions::new().with_prefix(String::from("tests/"));
         assert_eq!(opts.prefix(), "tests/");
     }
 
     #[test]
     fn test_max_file_size_builder_some() {
         let opts = WorkflowOptions::new().with_max_file_size(1024u64);
-        assert_eq!(opts.with_max_file_size(), Some(1024));
+        assert_eq!(opts.max_file_size(), Some(1024));
     }
 
     #[test]
     fn test_max_file_size_builder_none() {
-        let opts = WorkflowOptions::new().with_max_file_size(None);
-        assert_eq!(opts.with_max_file_size(), None);
+        let opts = WorkflowOptions::new().with_max_file_size(None::<u64>);
+        assert_eq!(opts.max_file_size(), None);
     }
 
     #[test]
@@ -492,7 +495,7 @@ mod tests {
         assert!(!opts.check_mtime());
         assert!(!opts.detect_moves());
         assert_eq!(opts.prefix(), "src/");
-        assert_eq!(opts.with_max_file_size(), Some(1024));
+        assert_eq!(opts.max_file_size(), Some(1024));
         assert!(opts.force_rediff());
         assert!(opts.ignore_missing());
     }

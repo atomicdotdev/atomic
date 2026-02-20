@@ -788,6 +788,105 @@ impl HttpRemote {
         }
     }
 
+    /// Upload a provenance graph to the remote server.
+    ///
+    /// Provenance graphs are content-addressed DAGs that capture the causal
+    /// decision chain of an AI agent session. They are stored separately
+    /// from changes and don't modify the content graph.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - The base32-encoded hash of the provenance graph.
+    /// * `data` - The raw serialized provenance graph bytes (.provenance format).
+    pub async fn upload_provenance(&self, hash: &str, data: Bytes) -> RemoteResult<()> {
+        let url = format!("{}?provenance={}", self.base_url, hash);
+        debug!("POST provenance: {} ({} bytes)", url, data.len());
+
+        let response = self
+            .client
+            .post(&url)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(data)
+            .send()
+            .await
+            .map_err(|e| RemoteError::connection_failed(&url, e))?;
+
+        let status = response.status();
+
+        match status {
+            StatusCode::OK => {
+                debug!("Successfully uploaded provenance graph {}", hash);
+                Ok(())
+            }
+            StatusCode::NOT_FOUND => Err(RemoteError::repo_not_found(&url)),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::auth_failed(&url, msg))
+            }
+            StatusCode::BAD_REQUEST => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::protocol(format!(
+                    "Failed to upload provenance graph: {}",
+                    msg
+                )))
+            }
+            _ => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::http(status.as_u16(), msg))
+            }
+        }
+    }
+
+    /// Download a provenance graph from the remote server.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - The base32-encoded hash of the provenance graph.
+    ///
+    /// # Returns
+    ///
+    /// The raw provenance graph bytes.
+    pub async fn download_provenance(&self, hash: &str) -> RemoteResult<Bytes> {
+        let url = format!("{}?provenance={}", self.base_url, hash);
+        debug!("GET provenance: {}", url);
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| RemoteError::connection_failed(&url, e))?;
+
+        let status = response.status();
+
+        match status {
+            StatusCode::OK => {
+                let data = response
+                    .bytes()
+                    .await
+                    .map_err(|e| RemoteError::connection_failed(&url, e))?;
+                debug!(
+                    "Downloaded provenance graph {} ({} bytes)",
+                    hash,
+                    data.len()
+                );
+                Ok(data)
+            }
+            StatusCode::NOT_FOUND => Err(RemoteError::protocol(format!(
+                "Provenance graph not found: {}",
+                hash
+            ))),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::auth_failed(&url, msg))
+            }
+            _ => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::http(status.as_u16(), msg))
+            }
+        }
+    }
+
     // Streaming V3 Protocol Methods
 
     /// Upload a change file by reading directly from disk.

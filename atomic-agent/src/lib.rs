@@ -61,6 +61,7 @@
 //! - [`error`] — Error types for all agent operations
 //! - [`event`] — Turn lifecycle event types (`HookType`, `TurnEvent`, `TurnChanges`)
 //! - [`hooks`] — Agent hook adapters (`AgentHook` trait, `AgentRegistry`, Claude Code adapter)
+//! - [`provenance`] — Causal decision DAG for agent sessions
 //! - [`watcher`] — Watchman file watching integration (planned)
 //! - [`turn`] — Turn state machine and session management (planned)
 //!
@@ -88,6 +89,7 @@ pub mod event;
 pub mod hooks;
 pub mod identity;
 pub mod learnings;
+pub mod provenance;
 pub mod record;
 pub mod transcript;
 pub mod turn;
@@ -98,6 +100,9 @@ pub use envelope::SessionEnvelope;
 pub use error::{AgentError, AgentResult};
 pub use event::{HookType, TurnChanges, TurnEvent};
 pub use hooks::{AgentHook, AgentRegistry};
+pub use provenance::{
+    EdgeKind, GraphEdge, GraphNode, GraphStats, NodeKind, ProvenanceAccumulator, SerializedGraph,
+};
 pub use record::{record_turn, TurnRecordOptions, TurnRecordOutcome};
 pub use turn::{
     apply_common_actions, transition, Action, AgentSession, Event, Phase, SessionStore,
@@ -118,6 +123,11 @@ mod tests {
         let _: Phase = Phase::Idle;
         let _envelope = SessionEnvelope::builder("s", "a").build();
         let _session = AgentSession::new("s", "a", "A");
+
+        // Provenance graph types
+        let _: NodeKind = NodeKind::Goal;
+        let _: EdgeKind = EdgeKind::LedTo;
+        let _acc = ProvenanceAccumulator::new("test");
     }
 
     #[test]

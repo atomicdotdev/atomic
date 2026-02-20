@@ -27,7 +27,7 @@ use std::collections::HashSet;
 
 use bytes::Bytes;
 
-use atomic_core::types::{Base32, Hash};
+use atomic_core::types::{Base32, Hash, Merkle, NodeId};
 use atomic_remote::{ChangelistEntry, RemoteError, StateResponse};
 use atomic_repository::history::HistoryEntry;
 use atomic_repository::Repository;

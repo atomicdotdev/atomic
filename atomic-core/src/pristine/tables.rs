@@ -38,6 +38,7 @@ pub mod node_type {
     pub const CHANGE: u8 = 0;
     pub const TAG: u8 = 1;
     pub const ATTESTATION: u8 = 2;
+    pub const PROVENANCE: u8 = 3;
 }
 
 // Graph Tables

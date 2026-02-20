@@ -258,6 +258,144 @@ pub struct Record {
     pub ai_session_id: Option<String>,
 }
 
+impl Record {
+    /// Builder: set the commit message.
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+
+    /// Builder: set the --all flag.
+    pub fn with_all(mut self, all: bool) -> Self {
+        self.all = all;
+        self
+    }
+
+    /// Builder: set files to record.
+    pub fn with_files<I, S>(mut self, files: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.files = files.into_iter().map(|s| s.into()).collect();
+        self
+    }
+
+    /// Builder: set the author.
+    pub fn with_author(mut self, author: impl Into<String>) -> Self {
+        self.author = Some(author.into());
+        self
+    }
+
+    /// Builder: set the identity.
+    pub fn with_identity(mut self, identity: impl Into<String>) -> Self {
+        self.identity = Some(identity.into());
+        self
+    }
+
+    /// Builder: set the usage context.
+    pub fn with_usage(mut self, usage: impl Into<String>) -> Self {
+        self.usage = Some(usage.into());
+        self
+    }
+
+    /// Builder: set the edit flag.
+    pub fn with_edit(mut self, edit: bool) -> Self {
+        self.edit = edit;
+        self
+    }
+
+    /// Builder: set the diff algorithm.
+    pub fn with_algorithm(mut self, algorithm: impl Into<String>) -> Self {
+        self.algorithm = algorithm.into();
+        self
+    }
+
+    /// Builder: set the dry-run flag.
+    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
+    /// Builder: set the skip-binary flag.
+    pub fn with_skip_binary(mut self, skip_binary: bool) -> Self {
+        self.skip_binary = skip_binary;
+        self
+    }
+
+    /// Builder: set the max file size.
+    pub fn with_max_size(mut self, max_size: u64) -> Self {
+        self.max_size = Some(max_size);
+        self
+    }
+
+    /// Builder: alias for with_max_size.
+    pub fn with_max_file_size(mut self, max_size: u64) -> Self {
+        self.max_size = Some(max_size);
+        self
+    }
+
+    /// Builder: set the AI-assisted flag.
+    pub fn with_ai_assisted(mut self, ai_assisted: bool) -> Self {
+        self.ai_assisted = ai_assisted;
+        self
+    }
+
+    /// Builder: set the AI provider.
+    pub fn with_ai_provider(mut self, provider: impl Into<String>) -> Self {
+        self.ai_provider = Some(provider.into());
+        self
+    }
+
+    /// Builder: set the AI model.
+    pub fn with_ai_model(mut self, model: impl Into<String>) -> Self {
+        self.ai_model = Some(model.into());
+        self
+    }
+
+    /// Builder: set the AI tool.
+    pub fn with_ai_tool(mut self, tool: impl Into<String>) -> Self {
+        self.ai_tool = Some(tool.into());
+        self
+    }
+
+    /// Builder: set the AI suggestion type.
+    pub fn with_ai_suggestion_type(mut self, suggestion_type: impl Into<String>) -> Self {
+        self.ai_suggestion_type = Some(suggestion_type.into());
+        self
+    }
+
+    /// Builder: set the AI input tokens.
+    pub fn with_ai_input_tokens(mut self, tokens: u64) -> Self {
+        self.ai_input_tokens = Some(tokens);
+        self
+    }
+
+    /// Builder: set the AI output tokens.
+    pub fn with_ai_output_tokens(mut self, tokens: u64) -> Self {
+        self.ai_output_tokens = Some(tokens);
+        self
+    }
+
+    /// Builder: set the AI cost in USD.
+    pub fn with_ai_cost_usd(mut self, cost: f64) -> Self {
+        self.ai_cost_usd = Some(cost);
+        self
+    }
+
+    /// Builder: set the AI request ID.
+    pub fn with_ai_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.ai_request_id = Some(request_id.into());
+        self
+    }
+
+    /// Builder: set the AI session ID.
+    pub fn with_ai_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.ai_session_id = Some(session_id.into());
+        self
+    }
+}
+
 mod builder;
 mod command;
 mod format;

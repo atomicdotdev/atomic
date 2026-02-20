@@ -76,23 +76,45 @@ pub struct Delete {
 }
 
 impl Delete {
+    /// Create a new Delete command targeting the given stack.
+    pub fn with_name(name: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+            force: false,
+        }
+    }
+
+    /// Create a new Delete command with default settings.
+    pub fn new() -> Self {
+        Self {
+            name: None,
+            force: false,
+        }
+    }
+
+    /// Builder: set the force flag.
+    pub fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
+    }
 }
 
 impl Command for Delete {
     fn run(&self) -> CliResult<()> {
         // Get the stack name
-        let name = self.name.as_ref().ok_or_else(|| CliError::InvalidArgument {
-            message: "Stack name is required".to_string(),
-        })?;
+        let name = self
+            .name
+            .as_ref()
+            .ok_or_else(|| CliError::InvalidArgument {
+                message: "Stack name is required".to_string(),
+            })?;
 
         // Find the repository
         let repo_root = find_repository_root()?;
         let mut repo = Repository::open(&repo_root).map_err(|e| match e {
-            atomic_repository::RepositoryError::NotFound { path } => {
-                CliError::RepositoryNotFound {
-                    searched_path: path.into(),
-                }
-            }
+            atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
+                searched_path: path.into(),
+            },
             other => CliError::Repository(other),
         })?;
 
@@ -231,7 +253,15 @@ mod tests {
         // Initialize a repository and create a stack, then drop to release lock
         {
             let mut repo = Repository::init(repo_path).unwrap();
-            repo.create_stack("to-delete").unwrap();
+            // Create a local stack (shared stacks cannot be deleted)
+            {
+                use atomic_core::pristine::{MutTxnT, StackKind, StackTxnT};
+                let mut txn = repo.pristine().write_txn().unwrap();
+                let dev = txn.get_stack("dev").unwrap().unwrap();
+                txn.create_stack("to-delete", StackKind::Local, Some(dev.id))
+                    .unwrap();
+                txn.commit().unwrap();
+            }
             // Verify it exists
             assert!(repo.stack_exists("to-delete").unwrap());
         }
@@ -316,10 +346,18 @@ mod tests {
         let temp = tempdir().unwrap();
         let repo_path = temp.path();
 
-        // Initialize a repository and create a stack, then drop to release lock
+        // Initialize a repository and create a local stack, then drop to release lock
         {
-            let mut repo = Repository::init(repo_path).unwrap();
-            repo.create_stack("force-delete").unwrap();
+            let repo = Repository::init(repo_path).unwrap();
+            // Create a local stack (shared stacks cannot be deleted)
+            {
+                use atomic_core::pristine::{MutTxnT, StackKind, StackTxnT};
+                let mut txn = repo.pristine().write_txn().unwrap();
+                let dev = txn.get_stack("dev").unwrap().unwrap();
+                txn.create_stack("force-delete", StackKind::Local, Some(dev.id))
+                    .unwrap();
+                txn.commit().unwrap();
+            }
         }
 
         // Change to the repo directory

@@ -155,6 +155,23 @@ impl PullChange {
         self
     }
 
+    /// Builder: set the message.
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+
+    /// Check if this change is tagged.
+    pub fn is_tagged(&self) -> bool {
+        self.tagged
+    }
+
+    /// Check if this change has a message.
+    pub fn has_message(&self) -> bool {
+        self.message.is_some()
+    }
+
+    /// message_or_default
     /// Get the message or a default placeholder.
     ///
     /// Returns the change message if one is set, or "(no message)" as a
@@ -372,9 +389,157 @@ impl PullStats {
     pub fn record_applied(&mut self) {
         self.changes_applied += 1;
     }
+
+    /// Get total number of items downloaded (changes + tags).
+    pub fn total_downloaded(&self) -> usize {
+        self.changes_downloaded + self.tags_downloaded
+    }
+
+    /// Check if any items were downloaded.
+    pub fn has_downloads(&self) -> bool {
+        self.total_downloaded() > 0
+    }
+
+    /// Check if the pull was a no-op (nothing downloaded, nothing applied, nothing skipped).
+    ///
+    /// Returns `false` if any work was done, including skipping changes
+    /// that already exist locally (since that means the remote had changes).
+    pub fn is_noop(&self) -> bool {
+        self.changes_downloaded == 0
+            && self.tags_downloaded == 0
+            && self.changes_applied == 0
+            && self.changes_failed == 0
+            && self.changes_skipped == 0
+    }
+
+    /// Record a successfully downloaded tag.
+    pub fn record_tag_downloaded(&mut self, bytes: u64) {
+        self.tags_downloaded += 1;
+        self.bytes_transferred += bytes;
+    }
+
+    /// Record a skipped change (already exists locally).
+    pub fn record_skipped(&mut self) {
+        self.changes_skipped += 1;
+    }
+
+    /// Merge another stats instance into this one.
+    pub fn merge(&mut self, other: &PullStats) {
+        self.changes_downloaded += other.changes_downloaded;
+        self.tags_downloaded += other.tags_downloaded;
+        self.bytes_transferred += other.bytes_transferred;
+        self.changes_skipped += other.changes_skipped;
+        self.changes_failed += other.changes_failed;
+        self.changes_applied += other.changes_applied;
+    }
 }
 
 // PullOutcome
+
+/// The result of a pull operation.
+///
+/// Contains the final statistics, state information, and any warnings
+/// that occurred during the pull.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PullOutcome {
+    /// Pull statistics.
+    pub stats: PullStats,
+    /// Whether this was a dry-run pull (no changes applied).
+    pub dry_run: bool,
+    /// Whether this was a download-only pull (no apply).
+    pub download_only: bool,
+    /// The remote Merkle state after pulling.
+    pub remote_state: Option<Merkle>,
+    /// The local Merkle state after pulling.
+    pub local_state: Option<Merkle>,
+    /// Any warnings produced during the pull.
+    pub warnings: Vec<String>,
+    /// Changes that exist locally but not on the remote.
+    pub local_only_changes: Vec<String>,
+}
+
+impl PullOutcome {
+    /// Create a new pull outcome with the given stats.
+    pub fn new(stats: PullStats) -> Self {
+        Self {
+            stats,
+            dry_run: false,
+            download_only: false,
+            remote_state: None,
+            local_state: None,
+            warnings: Vec::new(),
+            local_only_changes: Vec::new(),
+        }
+    }
+
+    /// Create a dry-run pull outcome.
+    pub fn dry_run(stats: PullStats) -> Self {
+        Self {
+            stats,
+            dry_run: true,
+            download_only: false,
+            remote_state: None,
+            local_state: None,
+            warnings: Vec::new(),
+            local_only_changes: Vec::new(),
+        }
+    }
+
+    /// Create a download-only pull outcome.
+    pub fn download_only(stats: PullStats) -> Self {
+        Self {
+            stats,
+            dry_run: false,
+            download_only: true,
+            remote_state: None,
+            local_state: None,
+            warnings: Vec::new(),
+            local_only_changes: Vec::new(),
+        }
+    }
+
+    /// Builder: set the remote state.
+    pub fn with_remote_state(mut self, state: Merkle) -> Self {
+        self.remote_state = Some(state);
+        self
+    }
+
+    /// Builder: set the local state.
+    pub fn with_local_state(mut self, state: Merkle) -> Self {
+        self.local_state = Some(state);
+        self
+    }
+
+    /// Add a warning message.
+    pub fn add_warning(&mut self, warning: impl Into<String>) {
+        self.warnings.push(warning.into());
+    }
+
+    /// Add a local-only change hash.
+    pub fn add_local_only_change(&mut self, hash: impl Into<String>) {
+        self.local_only_changes.push(hash.into());
+    }
+
+    /// Check if the pull was successful (no failures).
+    pub fn is_success(&self) -> bool {
+        !self.stats.has_failures()
+    }
+
+    /// Check if there are warnings.
+    pub fn has_warnings(&self) -> bool {
+        !self.warnings.is_empty()
+    }
+
+    /// Check if there are local-only changes.
+    pub fn has_local_only_changes(&self) -> bool {
+        !self.local_only_changes.is_empty()
+    }
+
+    /// Get the number of local-only changes.
+    pub fn local_only_count(&self) -> usize {
+        self.local_only_changes.len()
+    }
+}
 
 // Tests
 

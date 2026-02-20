@@ -143,6 +143,33 @@ impl Remove {
         }
     }
 
+    /// Builder: set the keep flag.
+    pub fn with_keep(mut self, keep: bool) -> Self {
+        self.keep = keep;
+        self
+    }
+
+    /// Builder: set the recursive flag.
+    pub fn with_recursive(mut self, recursive: bool) -> Self {
+        self.recursive = recursive;
+        if !recursive {
+            self.no_recursive = true;
+        }
+        self
+    }
+
+    /// Builder: set the dry-run flag.
+    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
+    /// Builder: set the force flag.
+    pub fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
+    }
+
     /// Convert to TrackingOptions.
     fn to_tracking_options(&self) -> TrackingOptions {
         let mut options = TrackingOptions::default()

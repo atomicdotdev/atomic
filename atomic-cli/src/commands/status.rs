@@ -104,14 +104,14 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use atomic_core::types::Base32;
-use atomic_repository::status::{RepositoryStatus, StatusOptions};
+use atomic_repository::status::{FileStatus, RepositoryStatus, StatusOptions};
 use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command, DEFAULT_HASH_LENGTH};
 use crate::error::{CliError, CliResult};
 use crate::output::{
-    added, deleted, hash, hint, info, modified, path as style_path, print_blank,
-    print_hint, print_section, stack as style_stack, untracked as style_untracked, warning,
+    added, deleted, hash, hint, info, modified, path as style_path, print_blank, print_hint,
+    print_section, stack as style_stack, untracked as style_untracked, warning,
 };
 
 // Status Output Configuration
@@ -196,6 +196,24 @@ impl Status {
         }
     }
 
+    /// Builder: set the path filter.
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    /// Builder: set short output mode.
+    pub fn with_short(mut self, short: bool) -> Self {
+        self.short = short;
+        self
+    }
+
+    /// Builder: set whether to hide untracked files.
+    pub fn with_no_untracked(mut self, no_untracked: bool) -> Self {
+        self.no_untracked = no_untracked;
+        self
+    }
+
     /// Get status options based on command settings.
     fn get_status_options(&self) -> StatusOptions {
         let mut options = StatusOptions::default();
@@ -241,10 +259,7 @@ impl Status {
         let has_untracked = status.untracked_count() > 0;
 
         if !has_changes && !has_untracked {
-            println!(
-                "{}",
-                info("nothing to record, working tree clean")
-            );
+            println!("{}", info("nothing to record, working tree clean"));
             return Ok(());
         }
 
@@ -449,9 +464,10 @@ impl Command for Status {
         let repo_root = find_repository_root()?;
 
         // Open the repository
-        let repo = Repository::open_readonly(&repo_root).map_err(|e| CliError::InvalidRepository {
-            reason: e.to_string(),
-        })?;
+        let repo =
+            Repository::open_readonly(&repo_root).map_err(|e| CliError::InvalidRepository {
+                reason: e.to_string(),
+            })?;
 
         // Debug ignore patterns if requested
         if self.debug_ignore {
@@ -462,7 +478,9 @@ impl Command for Status {
         let options = self.get_status_options();
 
         // Compute status
-        let status = repo.status(options).map_err(|e| CliError::Internal(e.into()))?;
+        let status = repo
+            .status(options)
+            .map_err(|e| CliError::Internal(e.into()))?;
 
         // Print in appropriate format
         if self.short {
@@ -473,7 +491,90 @@ impl Command for Status {
     }
 }
 
+// Helper Types
+
+/// Output configuration for status display.
+///
+/// Controls how status information is formatted and filtered.
+#[derive(Debug, Clone, Default)]
+pub struct StatusOutputConfig {
+    /// Use short/porcelain format.
+    pub short: bool,
+    /// Hide untracked files.
+    pub no_untracked: bool,
+    /// Filter to a specific path prefix.
+    pub path_filter: Option<String>,
+}
+
+impl StatusOutputConfig {
+    /// Create a new config with defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable short format.
+    pub fn short(mut self) -> Self {
+        self.short = true;
+        self
+    }
+
+    /// Hide untracked files.
+    pub fn hide_untracked(mut self) -> Self {
+        self.no_untracked = true;
+        self
+    }
+
+    /// Filter to a specific path prefix.
+    pub fn filter_path(mut self, path: impl Into<String>) -> Self {
+        self.path_filter = Some(path.into());
+        self
+    }
+}
+
 // Helper Functions
+
+/// Get the single-character status code for a file status.
+pub fn status_code(status: FileStatus) -> char {
+    match status {
+        FileStatus::Clean => ' ',
+        FileStatus::Modified => 'M',
+        FileStatus::Added => 'A',
+        FileStatus::Deleted => 'D',
+        FileStatus::Untracked => '?',
+        FileStatus::Conflicted => 'C',
+        FileStatus::TypeChanged => 'T',
+        FileStatus::PermissionsChanged => 'P',
+    }
+}
+
+/// Get a human-readable description for a file status.
+pub fn status_description(status: FileStatus) -> &'static str {
+    match status {
+        FileStatus::Clean => "clean",
+        FileStatus::Modified => "modified",
+        FileStatus::Added => "new file",
+        FileStatus::Deleted => "deleted",
+        FileStatus::Untracked => "untracked",
+        FileStatus::Conflicted => "conflict",
+        FileStatus::TypeChanged => "type changed",
+        FileStatus::PermissionsChanged => "permissions",
+    }
+}
+
+/// Check if a file status represents a recordable change.
+///
+/// Recordable statuses are changes that can be included in a `record` operation.
+/// Clean, untracked, and conflicted files are not directly recordable.
+pub fn is_recordable(status: FileStatus) -> bool {
+    matches!(
+        status,
+        FileStatus::Modified
+            | FileStatus::Added
+            | FileStatus::Deleted
+            | FileStatus::TypeChanged
+            | FileStatus::PermissionsChanged
+    )
+}
 
 // Tests
 
@@ -481,7 +582,7 @@ impl Command for Status {
 mod tests {
     use super::*;
     use atomic_core::types::Merkle;
-    use atomic_repository::status::FileStatusEntry;
+    use atomic_repository::status::{FileStatus, FileStatusEntry};
     use std::path::PathBuf;
 
     // Status Command Construction Tests
@@ -684,7 +785,10 @@ mod tests {
 
     #[test]
     fn test_status_description_permissions_changed() {
-        assert_eq!(status_description(FileStatus::PermissionsChanged), "permissions");
+        assert_eq!(
+            status_description(FileStatus::PermissionsChanged),
+            "permissions"
+        );
     }
 
     // Is Recordable Tests
@@ -876,7 +980,11 @@ mod tests {
         // database lock conflicts (redb only allows one open handle at a time)
         {
             let repo_result = Repository::init(repo_path);
-            assert!(repo_result.is_ok(), "Failed to init repository: {:?}", repo_result.err());
+            assert!(
+                repo_result.is_ok(),
+                "Failed to init repository: {:?}",
+                repo_result.err()
+            );
         } // Repository dropped here, releasing database lock
 
         // Change to repo directory
@@ -899,7 +1007,11 @@ mod tests {
         // Initialize a repository and drop handle to release lock
         {
             let repo_result = Repository::init(repo_path);
-            assert!(repo_result.is_ok(), "Failed to init repository: {:?}", repo_result.err());
+            assert!(
+                repo_result.is_ok(),
+                "Failed to init repository: {:?}",
+                repo_result.err()
+            );
         }
 
         // Change to repo directory
@@ -908,7 +1020,11 @@ mod tests {
         let status = Status::new().with_short(true);
         let result = status.run();
 
-        assert!(result.is_ok(), "Status short command failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Status short command failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -921,7 +1037,11 @@ mod tests {
         // Initialize a repository and drop handle to release lock
         {
             let repo_result = Repository::init(repo_path);
-            assert!(repo_result.is_ok(), "Failed to init repository: {:?}", repo_result.err());
+            assert!(
+                repo_result.is_ok(),
+                "Failed to init repository: {:?}",
+                repo_result.err()
+            );
         }
 
         // Create an untracked file
@@ -933,7 +1053,11 @@ mod tests {
         let status = Status::new().with_no_untracked(true);
         let result = status.run();
 
-        assert!(result.is_ok(), "Status no-untracked command failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Status no-untracked command failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -946,7 +1070,11 @@ mod tests {
         // Initialize a repository and drop handle to release lock
         {
             let repo_result = Repository::init(repo_path);
-            assert!(repo_result.is_ok(), "Failed to init repository: {:?}", repo_result.err());
+            assert!(
+                repo_result.is_ok(),
+                "Failed to init repository: {:?}",
+                repo_result.err()
+            );
         }
 
         // Create directory structure
@@ -959,7 +1087,11 @@ mod tests {
         let status = Status::new().with_path("src/");
         let result = status.run();
 
-        assert!(result.is_ok(), "Status with path filter failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Status with path filter failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -972,7 +1104,11 @@ mod tests {
         // Initialize a repository and drop handle to release lock
         {
             let repo_result = Repository::init(repo_path);
-            assert!(repo_result.is_ok(), "Failed to init repository: {:?}", repo_result.err());
+            assert!(
+                repo_result.is_ok(),
+                "Failed to init repository: {:?}",
+                repo_result.err()
+            );
         }
 
         // Create subdirectory
@@ -986,7 +1122,11 @@ mod tests {
         let result = status.run();
 
         // Should find repo by walking up to parent
-        assert!(result.is_ok(), "Status in subdirectory failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Status in subdirectory failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -999,7 +1139,11 @@ mod tests {
         // Initialize a repository and drop handle to release lock
         {
             let repo_result = Repository::init(repo_path);
-            assert!(repo_result.is_ok(), "Failed to init repository: {:?}", repo_result.err());
+            assert!(
+                repo_result.is_ok(),
+                "Failed to init repository: {:?}",
+                repo_result.err()
+            );
         }
 
         // Create various file types
@@ -1014,7 +1158,11 @@ mod tests {
         let status = Status::new();
         let result = status.run();
 
-        assert!(result.is_ok(), "Status with multiple files failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Status with multiple files failed: {:?}",
+            result.err()
+        );
     }
 
     // Edge Case Tests
@@ -1222,9 +1370,9 @@ mod tests {
         let entry = FileStatusEntry::with_details(
             PathBuf::from("conflicted.rs"),
             FileStatus::Conflicted,
-            None, // inode
-            None, // recorded_hash
-            None, // current_hash
+            None,                               // inode
+            None,                               // recorded_hash
+            None,                               // current_hash
             Some("merge conflict".to_string()), // details
         );
         repo_status.add_entry(entry);

@@ -246,12 +246,10 @@ mod tests {
         let verbs_and_types = vec![
             ("session-start", HookType::SessionStart),
             ("session-end", HookType::SessionEnd),
-            ("before-model", HookType::TurnStart),
-            ("after-model", HookType::TurnEnd),
+            ("before-agent", HookType::TurnStart),
+            ("after-agent", HookType::TurnEnd),
             ("before-tool", HookType::PreToolUse),
             ("after-tool", HookType::PostToolUse),
-            ("before-agent", HookType::PreToolUse),
-            ("after-agent", HookType::PostToolUse),
         ];
 
         for (verb, expected) in verbs_and_types {
