@@ -629,9 +629,21 @@ where
     result.edges_traversed = retrieve_result.edges_traversed;
     result.was_truncated = retrieve_result.truncated;
 
-    // Handle empty graph (empty file)
+    // Handle empty graph.
+    //
+    // When a change_filter is active (stack-aware output), an empty graph
+    // means the file has no content on the target stack.  In that case we
+    // must NOT create the file — it belongs to a different stack and should
+    // not appear in the working copy.
+    //
+    // Without a change_filter the empty graph represents a genuinely empty
+    // file, so we create it as before.
     if retrieve_result.graph.is_empty() {
-        // Create empty file
+        if retrieve_result.was_filtered {
+            // File has no vertices after filtering — skip it entirely.
+            return Ok(result);
+        }
+        // No filter active: create an empty file on disk.
         let writer = working_copy
             .write_file(path, inode)
             .map_err(FileOutputError::WorkingCopy)?;

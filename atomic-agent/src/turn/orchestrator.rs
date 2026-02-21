@@ -397,6 +397,21 @@ impl TurnOrchestrator {
                             );
                         }
                     }
+
+                    // Switch to the agent stack so that all file writes during
+                    // the session (tool calls, npm install, builds, etc.) happen
+                    // while current_stack points to the agent stack. This ensures
+                    // status/add/record see the right view. session-end will
+                    // switch back to the user's stack.
+                    if let Err(e) = repo.set_current_stack(&session.stack_name) {
+                        log::warn!(
+                            "Could not switch to agent stack '{}': {} (non-fatal)",
+                            session.stack_name,
+                            e,
+                        );
+                    } else {
+                        log::info!("Switched to agent stack '{}'", session.stack_name,);
+                    }
                 }
                 Err(e) => {
                     log::warn!(
@@ -652,6 +667,31 @@ impl TurnOrchestrator {
         // is available.
         if session.turn_count > 0 {
             self.create_session_attestation(&session);
+        }
+
+        // Switch back to the user's original stack. session-start switched
+        // to the agent stack so that all file writes happened there. Now
+        // that the session is over, restore the user's view.
+        if let Some(ref parent) = session.parent_stack {
+            match atomic_repository::Repository::open(&self.repo_root) {
+                Ok(mut repo) => {
+                    if let Err(e) = repo.switch_stack(parent) {
+                        log::warn!(
+                            "Could not switch back to user stack '{}': {} (non-fatal)",
+                            parent,
+                            e,
+                        );
+                    } else {
+                        log::info!("Restored user stack '{}'", parent);
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Could not open repository to restore user stack: {} (non-fatal)",
+                        e,
+                    );
+                }
+            }
         }
 
         Ok(DispatchResult::new(session_id, session.phase))

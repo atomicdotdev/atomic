@@ -31,18 +31,18 @@
 //!
 //! # Examples
 //!
-//! Remove and delete a file:
+//! Remove a file from tracking (keeps on disk):
 //! ```text
 //! $ atomic remove old_file.txt
-//! Removing: old_file.txt
+//! Untracking: old_file.txt
 //! ✓ Removed 1 file
 //! ```
 //!
-//! Remove but keep the file on disk:
+//! Remove from tracking AND delete from disk:
 //! ```text
-//! $ atomic remove --keep secrets.txt
-//! Untracking: secrets.txt (keeping file)
-//! ✓ Untracked 1 file
+//! $ atomic remove --delete old_file.txt
+//! Removing: old_file.txt
+//! ✓ Removed 1 file
 //! ```
 //!
 //! Remove a directory recursively:
@@ -69,18 +69,18 @@ use crate::output::{print_hint, print_success, print_warning};
 /// Remove files from tracking.
 ///
 /// The `remove` command stops tracking files in the repository. By default,
-/// files are also deleted from the working copy. Use `--keep` to only
-/// stop tracking without deleting.
+/// files are kept on disk (only untracked). Use `--delete` to also delete
+/// from the working copy.
 ///
 /// # Behavior
 ///
-/// - Files: Removed from tracking and optionally deleted
+/// - Files: Removed from tracking, kept on disk by default
 /// - Directories: Removed recursively by default
 /// - Untracked files: Error unless `--force` is used
 ///
 /// # Options
 ///
-/// - `--keep`: Keep files on disk, only remove from tracking
+/// - `--delete`: Also delete files from disk
 /// - `--recursive` / `-r`: Recursively remove directory contents (default: true)
 /// - `--no-recursive`: Don't recursively remove directory contents
 /// - `--dry-run` / `-n`: Preview what would be removed
@@ -95,11 +95,18 @@ pub struct Remove {
     #[arg(value_name = "PATHS", required = true)]
     pub paths: Vec<String>,
 
+    /// Also delete files from disk.
+    ///
+    /// Without this flag, files are kept on the working copy (only
+    /// untracked).  Use this when you want to both stop versioning
+    /// and remove the file from the working copy.
+    #[arg(long)]
+    pub delete: bool,
+
     /// Keep files on disk but stop tracking them.
     ///
-    /// Without this flag, files are deleted from the working copy.
-    /// Use this when you want to stop versioning a file but keep it locally.
-    #[arg(long)]
+    /// This is now the default behaviour. Kept for backward compatibility.
+    #[arg(long, hide = true)]
     pub keep: bool,
 
     /// Recursively remove directory contents.
@@ -135,6 +142,7 @@ impl Remove {
     pub fn new(paths: Vec<String>) -> Self {
         Self {
             paths,
+            delete: false,
             keep: false,
             recursive: true,
             no_recursive: false,
@@ -143,7 +151,13 @@ impl Remove {
         }
     }
 
-    /// Builder: set the keep flag.
+    /// Builder: set the delete flag.
+    pub fn with_delete(mut self, delete: bool) -> Self {
+        self.delete = delete;
+        self
+    }
+
+    /// Builder: set the keep flag (legacy, now the default).
     pub fn with_keep(mut self, keep: bool) -> Self {
         self.keep = keep;
         self
@@ -257,7 +271,7 @@ impl Command for Remove {
                     total_removed += stats.files_removed;
 
                     // Collect files to delete if not keeping
-                    if !self.keep && !self.dry_run {
+                    if self.delete && !self.keep && !self.dry_run {
                         files_to_delete.push(PathBuf::from(&normalized));
                     }
                 }

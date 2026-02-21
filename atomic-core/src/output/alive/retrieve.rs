@@ -314,58 +314,78 @@ impl RetrieveOptions {
             return Ok(true);
         }
 
-        // Check all parent edges to this vertex
-        // We need to look for:
-        // 1. Non-deleted parent edges (from changes in filter) - means vertex is alive
-        // 2. DELETED parent edges from changes IN our filter - means vertex was deleted
-        let parent_flags = EdgeFlags::PARENT;
-        let max_flags = EdgeFlags::all(); // Include deleted edges
+        // Check parent edges to determine if this vertex is alive at the
+        // target state defined by the change filter.
+        //
+        // Key insight for Replacement operations and divergent stacks:
+        //
+        // When stack A and stack B both modify the same file, they each
+        // create a Replacement that deletes the original content vertex
+        // and adds a new one.  In the global graph the original vertex
+        // ends up with TWO DELETED parent edges:
+        //
+        //   - One introduced by stack A's change (in A's filter)
+        //   - One introduced by stack B's change (in B's filter)
+        //
+        // The original non-deleted parent edge from the creating change
+        // was removed by `del_edge_with_reverse` during the first
+        // Replacement apply.  So the vertex may have NO non-deleted
+        // parent edges at all — only DELETED ones from different changes.
+        //
+        // A DELETED edge from OUTSIDE the filter means "this vertex was
+        // alive, then a change we cannot see deleted it."  From our
+        // stack's perspective that deletion has not happened yet, so the
+        // vertex IS still alive — UNLESS our own filter also contains a
+        // change that explicitly deleted it.
+        //
+        // Logic:
+        //   - NON-deleted parent edge              → live parent
+        //   - DELETED parent, introduced OUTSIDE filter → live parent
+        //     (the deletion is "in the future" from our perspective)
+        //   - DELETED parent, introduced IN filter  → marks vertex dead
+        //
+        // The vertex is alive when it has at least one live parent AND
+        // was not deleted by an in-filter change.
 
-        let adj = txn.iter_adjacent(vertex, parent_flags, max_flags)?;
-
-        let mut has_live_parent_in_filter = false;
+        let mut has_live_parent = false;
         let mut deleted_by_filter_change = false;
+
+        let parent_flags = EdgeFlags::PARENT;
+        let max_flags = EdgeFlags::all();
+        let adj = txn.iter_adjacent(vertex, parent_flags, max_flags)?;
 
         for edge_result in adj {
             let edge = edge_result?;
             let flag = edge.flag();
 
-            // Skip pseudo-only edges
-            let pseudo_flag = EdgeFlags::PSEUDO | EdgeFlags::PARENT;
-            if (flag & pseudo_flag) == EdgeFlags::PSEUDO {
+            if !flag.contains(EdgeFlags::PARENT) {
                 continue;
             }
 
             let introduced_by = edge.introduced_by();
 
             if flag.contains(EdgeFlags::DELETED) {
-                // This is a deletion edge - check who introduced the deletion
                 if self.passes_filter(introduced_by) {
-                    // Deletion was introduced by a change IN our filter
-                    // This vertex is deleted at the target state
+                    // Deletion from a change in our filter → vertex is dead
                     deleted_by_filter_change = true;
                 } else {
-                    // Deletion was introduced by a change OUTSIDE our filter
-                    // This means at our target state, the deletion hadn't happened yet
-                    // So this edge counts as a LIVE parent (ignore the DELETED flag)
+                    // Deletion from a change OUTSIDE our filter.
+                    // From our perspective that deletion hasn't happened yet,
+                    // so this edge still counts as a live connection.
                     if flag.contains(EdgeFlags::BLOCK) || vertex.is_empty() {
-                        has_live_parent_in_filter = true;
+                        has_live_parent = true;
                     }
                 }
             } else if flag.contains(EdgeFlags::BLOCK) || vertex.is_empty() {
-                // Non-deleted parent edge
-                has_live_parent_in_filter = true;
+                // Non-deleted parent edge → vertex is connected (alive)
+                has_live_parent = true;
             }
         }
 
-        // Vertex is alive if:
-        // 1. It has a live parent edge, AND
-        // 2. It wasn't deleted by a change in our filter
-        //
-        // Note: We already verified the vertex's change is in the filter before calling this,
-        // so we just need to check if there's any live parent (meaning it was connected)
-        // and if it was deleted by something in our filter.
-        Ok(has_live_parent_in_filter && !deleted_by_filter_change)
+        // Vertex is alive if it has at least one live parent (non-deleted
+        // or deleted-by-outside-change) AND was not explicitly deleted by
+        // a change in our filter.
+        Ok(has_live_parent && !deleted_by_filter_change)
     }
 }
 
@@ -399,6 +419,14 @@ pub struct RetrieveResult {
 
     /// Number of edges traversed.
     pub edges_traversed: usize,
+
+    /// Whether a change_filter was active during retrieval.
+    ///
+    /// When `true` and `graph.is_empty()`, it means the file has no
+    /// content on the target stack (all vertices were filtered out).
+    /// Callers can use this to distinguish "genuinely empty file" from
+    /// "file belongs to a different stack".
+    pub was_filtered: bool,
 }
 
 impl RetrieveResult {
@@ -409,6 +437,7 @@ impl RetrieveResult {
             truncated: false,
             positions_visited: 0,
             edges_traversed: 0,
+            was_filtered: false,
         }
     }
 }
@@ -466,8 +495,13 @@ pub fn retrieve_graph<T: GraphTxnT>(
     // Check if root span passes the change filter
     if !options.passes_filter(start_pos.change) {
         // Root span is filtered out - return empty graph
+        result.was_filtered = options.has_filter();
         return Ok(result);
     }
+
+    // Track whether a change filter is active so callers can distinguish
+    // "genuinely empty file" from "file belongs to a different stack".
+    result.was_filtered = options.has_filter();
 
     let root_alive = AliveVertex::new(root_vertex);
     result.graph.push_vertex(root_alive);

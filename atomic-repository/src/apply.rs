@@ -507,15 +507,40 @@ pub fn apply_change_to_graph<T: MutTxnT + StackTxnT>(
     // Shared stacks → global GRAPH; Local workspaces → STACK_GRAPH[(stack_id, vertex)].
     let apply_target = ApplyTarget::from_stack_kind(stack.kind, stack.id);
 
-    // Only apply hunks if the change isn't already in the graph.
-    // If it's already in the graph (e.g., applied via another stack), we just
-    // need to add it to this stack's change log - the graph already has the data.
+    // Only apply hunks if the change isn't already visible through the
+    // target stack's graph view.
     //
-    // NOTE: For Local workspaces, `already_in_graph` refers to the global GRAPH.
-    // An Local workspace always writes to its own STACK_GRAPH, so we still need
-    // to apply hunks even if the change exists in the global graph — the
-    // local workspace needs its own copy of the edges.
-    let should_apply_hunks = !already_in_graph || apply_target.is_local();
+    // For **Shared** stacks the check is simple: if the change is already
+    // registered in the global GRAPH we skip hunk application.
+    //
+    // For **Local** stacks the situation is nuanced.  A Local stack's
+    // overlay chain is `STACK_GRAPH[self] ∪ ... ∪ GRAPH`.  If the change
+    // is already in the global GRAPH (e.g. it was recorded on a Shared
+    // parent) AND the Local stack's overlay reaches GRAPH (i.e. it has a
+    // Shared ancestor), then the edges are already visible — re-applying
+    // them into STACK_GRAPH would create duplicates that conflict with
+    // future Replacement operations on divergent stacks.
+    //
+    // We only force re-application for Local stacks when the change is
+    // NOT in the global GRAPH (meaning it was recorded on another Local
+    // stack whose STACK_GRAPH is invisible to us).
+    let should_apply_hunks = if already_in_graph {
+        // Change is in global GRAPH.
+        // Shared target: skip (edges are already there).
+        // Local target with Shared parent: skip (overlay sees GRAPH).
+        // Local target with NO parent: must re-apply (overlay doesn't reach GRAPH).
+        match &apply_target {
+            ApplyTarget::Global => false,
+            ApplyTarget::Local { .. } => {
+                // Check if the stack has a Shared ancestor by looking at
+                // the parent chain.  If so, the overlay reaches GRAPH.
+                !stack.parent.is_some()
+            }
+        }
+    } else {
+        // Change is not in global GRAPH — must apply hunks.
+        true
+    };
 
     if should_apply_hunks {
         // Process each graph_op (graph layer)

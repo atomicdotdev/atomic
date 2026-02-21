@@ -97,6 +97,153 @@ pub fn apply_edge_map<T: MutTxnT>(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Overlay-aware vertex resolution for Local stacks
+// ---------------------------------------------------------------------------
+//
+// When applying to a Local stack, newly created vertices live in
+// STACK_GRAPH (written by `apply_new_vertex` via `put_stack_graph`).
+// Subsequent edge operations in the SAME change need to reference those
+// vertices, but the standard `find_block` / `find_block_end` on a
+// `WriteTxn` only searches the global GRAPH table.
+//
+// The helpers below first check STACK_GRAPH for the target Local stack,
+// then fall back to the global GRAPH.  For Shared (Global) targets they
+// delegate directly to the normal `find_block` / `find_block_end`.
+
+/// Find the source vertex for an edge, checking STACK_GRAPH first for
+/// Local targets.
+pub(super) fn find_source_vertex_overlay<T: MutTxnT>(
+    txn: &T,
+    pos: Position<NodeId>,
+    target: &ApplyTarget,
+) -> Result<GraphNode<NodeId>, LocalApplyError> {
+    if pos.change.is_root() {
+        return Ok(GraphNode::root());
+    }
+
+    match target {
+        ApplyTarget::Local { stack_id } => {
+            // Try STACK_GRAPH first (vertices written in this transaction)
+            if let Ok(v) = find_block_end_in_stack_graph(txn, *stack_id, pos) {
+                return Ok(v);
+            }
+            // Fall back to global GRAPH
+            txn.find_block_end(pos)
+                .map_err(|_| LocalApplyError::BlockNotFound { position: pos })
+        }
+        ApplyTarget::Global => txn
+            .find_block_end(pos)
+            .map_err(|_| LocalApplyError::BlockNotFound { position: pos }),
+    }
+}
+
+/// Find the target vertex for an edge, checking STACK_GRAPH first for
+/// Local targets.
+pub(super) fn find_target_vertex_overlay<T: MutTxnT>(
+    txn: &T,
+    pos: Position<NodeId>,
+    target: &ApplyTarget,
+) -> Result<GraphNode<NodeId>, LocalApplyError> {
+    if pos.change.is_root() {
+        return Ok(GraphNode::root());
+    }
+
+    match target {
+        ApplyTarget::Local { stack_id } => {
+            // Try STACK_GRAPH first (vertices written in this transaction)
+            if let Ok(v) = find_block_in_stack_graph(txn, *stack_id, pos) {
+                return Ok(v);
+            }
+            // Fall back to global GRAPH
+            txn.find_block(pos)
+                .map_err(|_| LocalApplyError::BlockNotFound { position: pos })
+        }
+        ApplyTarget::Global => txn
+            .find_block(pos)
+            .map_err(|_| LocalApplyError::BlockNotFound { position: pos }),
+    }
+}
+
+/// Search STACK_GRAPH for a vertex whose end matches the given position
+/// (equivalent to `find_block_end` but scoped to a single stack's graph).
+fn find_block_end_in_stack_graph<T: MutTxnT>(
+    txn: &T,
+    stack_id: u64,
+    pos: Position<NodeId>,
+) -> Result<GraphNode<NodeId>, LocalApplyError> {
+    use crate::types::{ChangePosition, EdgeFlags, L64};
+
+    let target_change = pos.change;
+    let target_pos = pos.pos;
+
+    // Check for an empty vertex at exactly this position
+    let empty_node = GraphNode::new(target_change, target_pos, target_pos);
+    let min = EdgeFlags::empty();
+    let max = EdgeFlags::all();
+    if let Ok(iter) = txn.iter_stack_graph_adjacent(stack_id, empty_node, min, max) {
+        if iter.into_iter().next().is_some() {
+            return Ok(empty_node);
+        }
+    }
+
+    // Scan for a non-empty vertex ending at this position.
+    // iter_stack_graph_vertices_for_change returns Vec<(u64, u64)>
+    // representing (start, end) byte ranges for vertices of the given
+    // change in this stack's STACK_GRAPH.
+    if let Ok(pairs) = txn.iter_stack_graph_vertices_for_change(stack_id, target_change.get()) {
+        for (start, end) in pairs {
+            let s = ChangePosition(L64::from(start));
+            let e = ChangePosition(L64::from(end));
+            if e == target_pos {
+                return Ok(GraphNode::new(target_change, s, e));
+            }
+        }
+    }
+
+    Err(LocalApplyError::BlockNotFound { position: pos })
+}
+
+/// Search STACK_GRAPH for a vertex containing the given position
+/// (equivalent to `find_block` but scoped to a single stack's graph).
+fn find_block_in_stack_graph<T: MutTxnT>(
+    txn: &T,
+    stack_id: u64,
+    pos: Position<NodeId>,
+) -> Result<GraphNode<NodeId>, LocalApplyError> {
+    use crate::types::{ChangePosition, L64};
+
+    let target_change = pos.change;
+    let target_pos = pos.pos;
+
+    // Prefer non-empty vertices over empty ones (same logic as find_block)
+    let mut empty_match: Option<GraphNode<NodeId>> = None;
+
+    // iter_stack_graph_vertices_for_change returns Vec<(u64, u64)>
+    // representing (start, end) byte ranges for vertices of the given
+    // change in this stack's STACK_GRAPH.
+    if let Ok(pairs) = txn.iter_stack_graph_vertices_for_change(stack_id, target_change.get()) {
+        for (start, end) in pairs {
+            let s = ChangePosition(L64::from(start));
+            let e = ChangePosition(L64::from(end));
+            // Non-empty vertex containing the position
+            if s != e && s <= target_pos && target_pos < e {
+                return Ok(GraphNode::new(target_change, s, e));
+            }
+            // Empty vertex at exactly this position
+            if s == e && s == target_pos {
+                empty_match = Some(GraphNode::new(target_change, s, e));
+            }
+        }
+    }
+
+    if let Some(v) = empty_match {
+        return Ok(v);
+    }
+
+    Err(LocalApplyError::BlockNotFound { position: pos })
+}
+
 /// Apply a single NewEdge operation.
 ///
 /// This handles the actual edge modification in the graph.
@@ -121,13 +268,14 @@ fn apply_new_edge<T: MutTxnT>(
     // Resolve the introduced_by change
     let introduced_by = resolve_introduced_by(txn, &edge.introduced_by, change_id)?;
 
-    // Find source span
+    // Find source span — overlay-aware so Local stacks can see vertices
+    // written to STACK_GRAPH earlier in the same change.
     let source_pos = resolve_position(txn, &edge.from, change_id)?;
-    let source = find_source_vertex(txn, source_pos)?;
+    let source = find_source_vertex_overlay(txn, source_pos, apply_target)?;
 
-    // Find target span
+    // Find target span — same overlay-aware lookup.
     let target_pos = resolve_position(txn, &edge.to.start_pos(), change_id)?;
-    let mut target = find_target_vertex(txn, target_pos)?;
+    let mut target = find_target_vertex_overlay(txn, target_pos, apply_target)?;
 
     // Resolve inode for indexing
     let resolved_inode = resolve_inode(txn, inode, change_id)?;

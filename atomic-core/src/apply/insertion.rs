@@ -92,6 +92,12 @@ pub fn apply_new_vertex<T: MutTxnT>(
     change: &Change,
     target: &ApplyTarget,
 ) -> Result<(), LocalApplyError> {
+    // Import overlay-aware helpers so that predecessor / successor
+    // resolution can find vertices written to STACK_GRAPH earlier in
+    // the same change (required for Local stacks).
+    use super::edge::{find_source_vertex_overlay, find_target_vertex_overlay};
+    use super::position::resolve_context_vertex_overlay;
+
     // Create the new span
     let node = GraphNode {
         change: change_id,
@@ -102,10 +108,12 @@ pub fn apply_new_vertex<T: MutTxnT>(
     // Clear workspace context for this span
     workspace.clear_context();
 
-    // Resolve predecessors: vertices that come BEFORE this new content
+    // Resolve predecessors: vertices that come BEFORE this new content.
+    // Use the overlay-aware resolver so Local stacks can find vertices
+    // written to STACK_GRAPH earlier in the same change.
     for up_pos in &insertion.predecessors {
         let internal_pos = resolve_position(txn, up_pos, change_id)?;
-        let up_vertex = resolve_context_vertex(txn, internal_pos, true)?;
+        let up_vertex = resolve_context_vertex_overlay(txn, internal_pos, true, target)?;
         // Store the end position (where new content connects)
         workspace.add_up_context(up_vertex.end_pos());
 
@@ -113,7 +121,8 @@ pub fn apply_new_vertex<T: MutTxnT>(
         check_deleted_context(txn, workspace, change, up_vertex)?;
     }
 
-    // Resolve successors: vertices that come AFTER this new content
+    // Resolve successors: vertices that come AFTER this new content.
+    // Same overlay-aware resolver for Local stack compatibility.
     for down_pos in &insertion.successors {
         let internal_pos = resolve_position(txn, down_pos, change_id)?;
 
@@ -124,7 +133,7 @@ pub fn apply_new_vertex<T: MutTxnT>(
             });
         }
 
-        let down_vertex = resolve_context_vertex(txn, internal_pos, false)?;
+        let down_vertex = resolve_context_vertex_overlay(txn, internal_pos, false, target)?;
         // Store the start position (where new content connects)
         workspace.add_down_context(down_vertex.start_pos());
 
@@ -142,12 +151,13 @@ pub fn apply_new_vertex<T: MutTxnT>(
     // containing position 12".
     let up_flag = insertion.flag | EdgeFlags::BLOCK;
     for up_pos in workspace.predecessors().to_vec() {
-        // Find the span ending at this position to use as edge source
+        // Find the span ending at this position to use as edge source.
+        // Use overlay-aware lookup so Local stacks can find vertices
+        // written to STACK_GRAPH earlier in the same change.
         let up_vertex = if up_pos.change.is_root() {
             GraphNode::root()
         } else {
-            txn.find_block_end(up_pos)
-                .map_err(|_| LocalApplyError::BlockNotFound { position: up_pos })?
+            find_source_vertex_overlay(txn, up_pos, target)?
         };
         add_edge_with_reverse(
             txn,
@@ -169,12 +179,13 @@ pub fn apply_new_vertex<T: MutTxnT>(
     };
 
     for down_pos in workspace.successors().to_vec() {
-        // Find the span containing this position to use as edge target
+        // Find the span containing this position to use as edge target.
+        // Use overlay-aware lookup so Local stacks can find vertices
+        // written to STACK_GRAPH earlier in the same change.
         let down_vertex = if down_pos.change.is_root() {
             GraphNode::root()
         } else {
-            txn.find_block(down_pos)
-                .map_err(|_| LocalApplyError::BlockNotFound { position: down_pos })?
+            find_target_vertex_overlay(txn, down_pos, target)?
         };
         add_edge_with_reverse(
             txn,

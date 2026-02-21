@@ -1,4 +1,5 @@
 use super::*;
+use atomic_core::pristine::OverlayTxn;
 
 impl Repository {
     // Status Methods
@@ -56,6 +57,29 @@ impl Repository {
 
         let mut status = RepositoryStatus::new(self.current_stack.clone(), stack_state);
 
+        // ── Stack-aware filtering ──────────────────────────────────────
+        // Collect every change NodeId that belongs to the current stack.
+        // We use this below to decide whether a recorded file is "ours"
+        // (its creating change is on this stack) or "foreign" (recorded
+        // on a different stack and should be invisible here).
+        let current_stack_change_ids: std::collections::HashSet<atomic_core::types::NodeId> = {
+            let mut ids = std::collections::HashSet::new();
+            if let Some(ref stack) = txn
+                .get_stack(&self.current_stack)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                let iter = txn
+                    .iter_changes(stack, 0)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                for result in iter {
+                    let (_seq, node_id, _merkle) =
+                        result.map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    ids.insert(node_id);
+                }
+            }
+            ids
+        };
+
         // Load ignore rules if respecting ignore files
         let rules = if options.respect_ignore_files {
             Some(self.ignore_rules())
@@ -74,12 +98,34 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Build a set of tracked paths for quick lookup
-        // We also normalize paths to handle any incorrectly stored absolute paths
+        // We also normalize paths to handle any incorrectly stored absolute paths.
+        //
+        // Stack-aware filtering: a file that has been recorded (has an
+        // INODES position) but whose creating change is NOT on the current
+        // stack is excluded from tracked_paths.  This prevents files
+        // recorded on other stacks from appearing in status.  Files that
+        // have been `add`ed but not yet recorded (no INODES position) are
+        // kept — they are pending working-copy state.
         let mut tracked_paths: std::collections::HashSet<PathBuf> =
             std::collections::HashSet::new();
 
         for result in tracked_files {
-            let (path, _inode) = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let (path, inode) = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+            // ── Stack filter ───────────────────────────────────────────
+            // If this file has been recorded (has INODES position), check
+            // whether the creating change is on the current stack.  If
+            // not, skip it entirely — it belongs to another stack.
+            if let Ok(Some(position)) = txn.inode_position(inode) {
+                if !position.change.is_root()
+                    && !current_stack_change_ids.contains(&position.change)
+                {
+                    // File is recorded on a different stack — invisible here
+                    continue;
+                }
+            }
+            // Files with no INODES position (added, not recorded) pass through.
+
             let path_buf = PathBuf::from(&path);
 
             // Normalize: if the path is absolute and starts with the repo root,
@@ -146,8 +192,18 @@ impl Repository {
                 path_buf
             };
 
-            // Use the original path for database lookup since that's what's stored
+            // Use the original path for database lookup since that's what's stored.
+            // Apply the same stack-awareness filter here: skip inodes whose
+            // creating change is not on the current stack.
             if let Ok(Some(inode)) = txn.get_inode(&original_path) {
+                // Stack filter (mirrors the tracked_paths filter above)
+                if let Ok(Some(position)) = txn.inode_position(inode) {
+                    if !position.change.is_root()
+                        && !current_stack_change_ids.contains(&position.change)
+                    {
+                        continue;
+                    }
+                }
                 inode_map.insert(normalized_path.clone(), inode);
                 // Check if this inode is a directory
                 if txn.is_directory(inode).unwrap_or(false) {

@@ -147,24 +147,23 @@ pub struct New {
     #[arg(value_name = "NAME")]
     pub name: Option<String>,
 
-    /// Create from an existing stack (fork/split).
+    /// Fork from a specific stack instead of the current one.
     ///
-    /// When specified, the new stack will be created with all changes
-    /// from the source stack applied. This is useful for creating
-    /// feature branches or hotfix stacks.
+    /// By default, `stack new` forks from the current stack.  Use
+    /// `--from <STACK>` to fork from a different stack instead.
     ///
-    /// If not specified, defaults to forking from the current stack.
-    /// Use `--empty` to create a stack with no history.
+    /// The new stack inherits all changes from the source and gets
+    /// its own isolated edge storage (`STACK_GRAPH`) so that future
+    /// changes recorded on it are invisible to the source.
     #[arg(long, value_name = "STACK")]
     pub from: Option<String>,
 
-    /// Create an empty stack with no history.
+    /// Create an empty stack with no inherited history.
     ///
-    /// By default, new stacks are forked from the current stack.
-    /// Use this flag to create a truly independent stack with no
-    /// changes applied. This is rarely needed and primarily useful
-    /// for advanced workflows like importing external changes.
-    #[arg(long)]
+    /// Rarely needed — this is what `stash` is for.  Kept for
+    /// backward compatibility and advanced workflows like importing
+    /// external changes.
+    #[arg(long, hide = true)]
     pub empty: bool,
 
     /// Switch to the new stack after creating it.
@@ -345,51 +344,72 @@ impl Command for New {
             return self.run_two_tier(name, &mut repo);
         }
 
-        // Legacy path: --empty or --from (backward compatible)
-        // Determine the source stack:
-        // 1. If --empty is specified, create an orphan stack with no history
-        // 2. If --from is specified, use that stack
-        // 3. Otherwise, default to forking from the current stack
-        if self.empty {
-            // Create an empty stack (rare use case)
-            repo.create_stack(name).map_err(CliError::Repository)?;
-            print_success(&format!("Created stack: {} (empty)", style_stack(name)));
-        } else {
-            // Determine source: explicit --from or current stack
-            let source = self
-                .from
-                .clone()
-                .unwrap_or_else(|| repo.current_stack().to_string());
-
-            if !repo.stack_exists(&source).map_err(CliError::Repository)? {
+        // Determine how to create the new stack:
+        //
+        //   --from X → create Local parented on X, apply X's changes
+        //   default  → create Local parented on nearest Shared ancestor,
+        //              with an EMPTY change log (no files until `apply`)
+        //
+        // The new stack is a Local workspace whose edges go to
+        // STACK_GRAPH (isolated from other stacks).  The parent link
+        // gives the overlay chain read-access to the shared graph for
+        // record-time diff computation.
+        //
+        // When --from is specified, the source's changes are applied
+        // immediately so the new stack starts with the source's files.
+        // Without --from, the change log starts empty — the user brings
+        // in changes explicitly via `apply from-stack`.  This is the
+        // normal workflow:
+        //
+        //   atomic stack new feature          # empty workspace
+        //   atomic apply from-stack dev       # inherit dev's files
+        //   # ... make changes, record ...
+        //   atomic apply from-stack feature --to-stack dev  # promote
+        if let Some(ref source) = self.from {
+            // Explicit --from: fork from the specified stack.
+            if !repo.stack_exists(source).map_err(CliError::Repository)? {
                 return Err(CliError::StackNotFound {
                     name: source.to_string(),
                 });
             }
 
-            // Get source stack info for reporting
-            let source_info = repo.get_stack_info(&source).map_err(CliError::Repository)?;
+            let source_info = repo.get_stack_info(source).map_err(CliError::Repository)?;
             let change_count = source_info.change_count;
 
-            // Create the stack by copying change log from source
-            // This does NOT re-apply changes - it just copies metadata
-            repo.create_stack_from(name, &source)
+            // create_stack_from creates a Local workspace parented on
+            // the source, with the source's change log copied over.
+            repo.create_stack_from(name, source)
                 .map_err(CliError::Repository)?;
 
             if change_count > 0 {
                 print_success(&format!(
                     "Created stack: {} (forked from {} with {} changes)",
                     style_stack(name),
-                    style_stack(&source),
-                    change_count
+                    style_stack(source),
+                    change_count,
                 ));
             } else {
                 print_success(&format!(
                     "Created stack: {} (forked from {} - empty)",
                     style_stack(name),
-                    style_stack(&source)
+                    style_stack(source),
                 ));
             }
+        } else {
+            // No --from: create an empty Local workspace parented on the
+            // nearest Shared ancestor.  No changes are inherited — the
+            // user applies them explicitly.
+            repo.create_stack(name).map_err(CliError::Repository)?;
+
+            print_success(&format!(
+                "Created stack: {} (forked from {} - empty)",
+                style_stack(name),
+                style_stack(
+                    &repo
+                        .nearest_shared_ancestor(repo.current_stack())
+                        .unwrap_or_else(|_| repo.current_stack().to_string())
+                ),
+            ));
         }
 
         self.maybe_switch(name, &mut repo)

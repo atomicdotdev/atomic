@@ -45,7 +45,10 @@ use atomic_core::output::repo::{
     output_repository, RepositoryOutputOptions, RepositoryOutputResult,
 };
 use atomic_core::output::FileSystem;
-use atomic_core::pristine::{GraphTxnT, MutTxnT, Pristine, StackKind, StackTxnT, TreeTxnT};
+use atomic_core::output::WorkingCopy;
+use atomic_core::pristine::{
+    GraphTxnT, MutTxnT, OverlayTxn, Pristine, StackKind, StackTxnT, TreeTxnT,
+};
 use atomic_core::record::workflow::retrieve::{RetrieveContentOptions, RetrieveResult};
 use atomic_core::types::{Base32, Hash, Inode, Merkle, NodeId, Position};
 
@@ -500,11 +503,121 @@ default = "{}"
     /// println!("Updated {} files", result.files_written);
     /// ```
     pub fn switch_stack(&mut self, stack: &str) -> Result<RepositoryOutputResult, RepositoryError> {
-        // First, set the current stack (validates it exists)
+        let old_stack_name = self.current_stack.clone();
+
+        // Compute files visible on the OLD stack via its overlay.
+        let old_files = self.visible_file_paths(&old_stack_name)?;
+
+        // Set the current stack (validates it exists)
         self.set_current_stack(stack)?;
 
-        // Then output the working copy to match the new stack's state
+        // Compute files visible on the NEW stack via its overlay.
+        let new_files = self.visible_file_paths(stack)?;
+
+        // Delete from disk: files visible on the old stack but NOT visible
+        // on the new stack.  Untracked files (not recorded on any stack)
+        // are left alone because they never appear in either set.
+        let working_copy = FileSystem::from_root(&self.root);
+        let mut files_removed: usize = 0;
+        for path in old_files.difference(&new_files) {
+            let abs_path = self.root.join(path);
+            if abs_path.exists() && !abs_path.is_dir() {
+                if working_copy.remove_path(path, false).is_ok() {
+                    files_removed += 1;
+                }
+            }
+        }
+
+        // Clean up empty parent directories left behind after file removal.
+        if files_removed > 0 {
+            let mut dirs_to_try: HashSet<PathBuf> = HashSet::new();
+            for path in old_files.difference(&new_files) {
+                let p = PathBuf::from(path);
+                let mut ancestor = p.parent();
+                while let Some(dir) = ancestor {
+                    if dir == Path::new("") || dir == Path::new(".") {
+                        break;
+                    }
+                    dirs_to_try.insert(dir.to_path_buf());
+                    ancestor = dir.parent();
+                }
+            }
+            let mut sorted_dirs: Vec<PathBuf> = dirs_to_try.into_iter().collect();
+            sorted_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+            for dir in sorted_dirs {
+                let abs_dir = self.root.join(&dir);
+                if abs_dir.is_dir() {
+                    let _ = std::fs::remove_dir(&abs_dir);
+                }
+            }
+        }
+
+        // Output the working copy using the overlay model.
         self.output_working_copy()
+    }
+
+    /// Compute the set of file paths whose creating change is on a stack.
+    ///
+    /// Visibility is determined by the stack's **change log**, not the
+    /// overlay chain.  The overlay provides graph-level read access for
+    /// record / diff operations, but file *materialization* (what shows
+    /// up on disk after `switch_stack`) is governed by which changes have
+    /// been explicitly applied to the stack.
+    ///
+    /// A file is visible on a stack when:
+    /// 1. It appears in the global TREE table (has been `add`ed).
+    /// 2. Its inode has a graph position in the INODES table (has been
+    ///    `record`ed).
+    /// 3. The change that introduced that position is present in the
+    ///    stack's change log (via `iter_changes`).
+    ///
+    /// Files that have been `add`ed but not yet `record`ed (no INODES
+    /// entry) are NOT returned — they persist across switches as
+    /// working-copy state.
+    pub fn visible_file_paths(&self, stack_name: &str) -> Result<HashSet<String>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let stack = match txn
+            .get_stack(stack_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            Some(s) => s,
+            None => return Ok(HashSet::new()),
+        };
+
+        // Collect every change NodeId on this stack's log.
+        let mut stack_change_ids: HashSet<NodeId> = HashSet::new();
+        let iter = txn
+            .iter_changes(&stack, 0)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        for result in iter {
+            let (_seq, node_id, _merkle) =
+                result.map_err(|e| RepositoryError::Database(e.to_string()))?;
+            stack_change_ids.insert(node_id);
+        }
+
+        // Walk TREE and keep paths whose introducing change is in the log.
+        let mut paths: HashSet<String> = HashSet::new();
+        let tree_iter = txn
+            .iter_tree()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        for result in tree_iter {
+            let (path, inode) = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
+            if let Some(position) = txn
+                .inode_position(inode)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                if stack_change_ids.contains(&position.change) {
+                    paths.insert(path);
+                }
+            }
+        }
+
+        Ok(paths)
     }
 
     /// Output the working copy to match the current stack's state.
@@ -553,7 +666,20 @@ default = "{}"
                 name: self.current_stack.clone(),
             })?;
 
-        // Collect all change NodeIds in the current stack
+        // Build the overlay for this stack's perspective.
+        //
+        // For Local stacks the overlay reads STACK_GRAPH[this] ∪ ... ∪ GRAPH.
+        // For Shared stacks the overlay is empty and falls through to GRAPH.
+        // This is the architectural foundation of per-stack file isolation:
+        // edges written by a Local stack live in its STACK_GRAPH and are
+        // invisible to other stacks.
+        let overlay = OverlayTxn::from_stack(&txn, &stack)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Collect all change NodeIds in the current stack for the
+        // change_filter.  Even though the overlay isolates edges, we
+        // still need the filter so that `output_repository` can skip
+        // TREE entries whose creating change is not on this stack.
         let mut change_filter: HashSet<NodeId> = HashSet::new();
         let iter = txn
             .iter_changes(&stack, 0)
@@ -568,7 +694,10 @@ default = "{}"
         let working_copy = FileSystem::from_root(&self.root);
         let options = RepositoryOutputOptions::new().with_change_filter(change_filter);
 
-        let result = output_repository(&txn, &self.change_store, &working_copy, options)
+        // Use the overlay transaction for graph reads so that Local
+        // stacks see their own STACK_GRAPH edges while Shared stacks
+        // read from the global GRAPH as before.
+        let result = output_repository(&overlay, &self.change_store, &working_copy, options)
             .map_err(|e| RepositoryError::Output(format!("{}", e)))?;
 
         Ok(result)
@@ -616,12 +745,31 @@ default = "{}"
     /// - The stack already exists
     /// - The database operation fails
     pub fn create_stack(&mut self, name: &str) -> Result<(), RepositoryError> {
+        // Create a **Local** workspace parented on the nearest Shared
+        // ancestor of the current stack.  The change log starts EMPTY —
+        // no changes are inherited automatically.
+        //
+        // The parent link gives the stack read-access to the shared
+        // graph content (via the overlay chain) so that `record` can
+        // compute diffs against the existing state.  But no files are
+        // *materialised* on disk until changes are explicitly `apply`-ed
+        // to this stack (which copies them into the stack's change log
+        // and writes edges to its STACK_GRAPH).
+        //
+        // This means:
+        //   `stack new feature`            → empty workspace, no files
+        //   `apply from-stack dev feature` → inherits dev's files
+        //
+        // Using the nearest Shared ancestor (instead of the current
+        // stack directly) prevents sibling Local stacks from seeing
+        // each other's STACK_GRAPH edges through the overlay chain.
+        let parent_name = self.nearest_shared_ancestor(&self.current_stack.clone())?;
+
         let mut txn = self
             .pristine
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Check if the stack already exists
         if txn
             .get_stack(name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
@@ -632,14 +780,63 @@ default = "{}"
             });
         }
 
-        // Create the stack
-        txn.open_or_create_stack(name)
+        let parent_stack = txn
+            .get_stack(&parent_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::StackNotFound {
+                name: parent_name.clone(),
+            })?;
+
+        txn.create_stack(name, StackKind::Local, Some(parent_stack.id))
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Walk the parent chain from `stack_name` and return the name of the
+    /// first Shared stack encountered.  If `stack_name` is itself Shared,
+    /// it is returned immediately.  This is used to determine the correct
+    /// parent for newly created Local stacks.
+    pub fn nearest_shared_ancestor(&self, stack_name: &str) -> Result<String, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let stack = txn
+            .get_stack(stack_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::StackNotFound {
+                name: stack_name.to_string(),
+            })?;
+
+        // Already Shared → use it directly.
+        if stack.kind.is_shared() {
+            return Ok(stack_name.to_string());
+        }
+
+        // Walk up the parent chain looking for a Shared ancestor.
+        let mut cursor = stack.parent;
+        while let Some(parent_id) = cursor {
+            if let Some(parent) = txn
+                .get_stack_by_id(parent_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                if parent.kind.is_shared() {
+                    return Ok(parent.name.clone());
+                }
+                cursor = parent.parent;
+            } else {
+                break;
+            }
+        }
+
+        // Fallback: if no Shared ancestor found (shouldn't happen in
+        // normal use — dev is always Shared), use the current stack.
+        Ok(stack_name.to_string())
     }
 
     /// Create a new stack that inherits changes from another stack.
@@ -695,6 +892,8 @@ default = "{}"
                 name: from_stack.to_string(),
             })?;
 
+        let source_id = source_stack.id;
+
         // Collect all changes from the source stack
         let changes: Vec<(NodeId, Hash)> = {
             let iter = txn
@@ -719,12 +918,19 @@ default = "{}"
             result
         };
 
-        // Create the new stack
+        // Create the new stack as a **Local** workspace parented on the
+        // source stack.  Local stacks write edges to STACK_GRAPH which
+        // isolates them from other stacks.  The parent link means the
+        // overlay chain (STACK_GRAPH[self] ∪ ... ∪ GRAPH) includes the
+        // source's content.
         let mut new_stack = txn
-            .open_or_create_stack(name)
+            .create_stack(name, StackKind::Local, Some(source_id))
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Copy all changes to the new stack
+        // Copy all changes from the source to the new stack's log.
+        // This does NOT re-apply hunks — the edges already exist in
+        // GRAPH (for Shared sources) or in the source's STACK_GRAPH.
+        // The new stack sees them via the overlay chain.
         for (node_id, hash) in changes {
             txn.put_change(&mut new_stack, node_id, &hash)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;

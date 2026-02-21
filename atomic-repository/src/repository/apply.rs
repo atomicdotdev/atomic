@@ -1,7 +1,65 @@
 use super::*;
 
-impl Repository {
+/// Check whether a file's creating change exists ONLY on the given stack
+/// (and no other stack).  Returns `true` when it is safe to remove the
+/// file's TREE / INODES entries because no other stack needs them.
+///
+/// When the inode has no INODES position (not yet recorded) the function
+/// returns `true` — there is nothing to protect.
+fn is_file_only_on_stack<T: GraphTxnT + StackTxnT + TreeTxnT>(
+    txn: &T,
+    inode: Inode,
+    current_stack: &str,
+) -> bool {
+    // Look up the position for this inode.  If there is no position the
+    // file was never recorded, so removing from TREE is safe.
+    let position = match txn.inode_position(inode) {
+        Ok(Some(pos)) => pos,
+        _ => return true,
+    };
 
+    let creating_change = position.change;
+    if creating_change.is_root() {
+        return true;
+    }
+
+    // Walk every stack and check whether the creating change appears on
+    // any stack OTHER than `current_stack`.
+    let stack_names = match txn.list_stacks() {
+        Ok(names) => names,
+        Err(_) => return true,
+    };
+
+    for name in stack_names {
+        if name == current_stack {
+            continue;
+        }
+        let stack = match txn.get_stack(&name) {
+            Ok(Some(s)) => s,
+            _ => continue,
+        };
+        // Check whether the creating change is on this other stack.
+        let changes_iter = match txn.iter_changes(&stack, 0) {
+            Ok(it) => it,
+            Err(_) => continue,
+        };
+        for change_result in changes_iter {
+            let (_seq, node_id, _merkle) = match change_result {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if node_id == creating_change {
+                // Another stack still references this file — not safe to remove.
+                return false;
+            }
+        }
+    }
+
+    // No other stack references the creating change.
+    true
+}
+
+impl Repository {
     // Change Application Methods
 
     /// Apply a change to the current stack.
@@ -50,15 +108,69 @@ impl Repository {
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Check if the change is already in the graph (applied via another stack)
-        // This is important because stacks share the same graph - we don't want
-        // to re-apply hunks that are already there.
-        let already_in_graph = txn
+        // Check if the change's edges are already in the TARGET graph.
+        //
+        // `get_internal(hash)` only tells us the change is *registered*
+        // (has a NodeId).  Registration happens during `record` regardless
+        // of stack kind, but edges are written to STACK_GRAPH for Local
+        // stacks and to GRAPH for Shared stacks.
+        //
+        // When a change was recorded on a Local stack and is now being
+        // applied to a Shared stack (e.g. `apply from-stack feature dev`),
+        // the change IS registered but its edges live only in STACK_GRAPH.
+        // The Shared stack needs the edges in the global GRAPH, so we must
+        // re-apply the hunks.
+        //
+        // Conversely, when applying to a Local stack, `should_apply_hunks`
+        // below already forces re-application (`|| apply_target.is_local()`),
+        // so the value of `already_in_graph` doesn't matter for Local targets.
+        //
+        // Strategy: a change is "already in the global graph" only if it is
+        // registered AND at least one of its vertices can be found via the
+        // global `find_block` (which reads GRAPH, not STACK_GRAPH).
+        let already_in_graph = if let Some(node_id) = txn
             .get_internal(hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .is_some();
+        {
+            // The change is registered.  Probe the global GRAPH for one of
+            // its vertices.  Use the first FileAdd inode position as a
+            // cheap check — if it exists in GRAPH the change was applied
+            // globally.
+            let change = self.load_change(hash)?;
+            let mut found_in_graph = false;
+            for graph_op in change.hunks() {
+                match graph_op {
+                    GraphOp::FileAdd { add_inode, .. } | GraphOp::DirAdd { add_inode, .. } => {
+                        let pos = Position::new(node_id, add_inode.start);
+                        let inode_node = pos.inode_node();
+                        // Try to find this vertex in the global GRAPH
+                        if txn.find_block(pos).is_ok() || txn.find_block_end(pos).is_ok() {
+                            found_in_graph = true;
+                            break;
+                        }
+                        // Also check via iter_adjacent on the inode node
+                        if let Ok(adj) = txn.iter_adjacent(
+                            inode_node,
+                            atomic_core::types::EdgeFlags::empty(),
+                            atomic_core::types::EdgeFlags::all(),
+                        ) {
+                            if adj.into_iter().next().is_some() {
+                                found_in_graph = true;
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            found_in_graph
+        } else {
+            false
+        };
 
-        // Register the change to get an internal ID (or get existing ID)
+        // Register the change to get an internal ID (or get existing ID).
+        // (If get_internal succeeded above, register_change just returns
+        // the existing ID without re-registering.)
         let change_id = txn
             .register_change(hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -101,8 +213,13 @@ impl Repository {
                             .map_err(|e| RepositoryError::Database(e.to_string()))?;
                     }
                     GraphOp::FileDel { path, .. } => {
-                        if let Ok(Some(_inode)) = txn.get_inode(path) {
-                            let _ = txn.del_tree(path);
+                        // Stack-aware: only remove TREE entry when no other
+                        // stack still references the file's creating change.
+                        if let Ok(Some(inode)) = txn.get_inode(path) {
+                            let dominated = is_file_only_on_stack(&txn, inode, stack_name);
+                            if dominated {
+                                let _ = txn.del_tree(path);
+                            }
                         }
                     }
                     _ => {}
@@ -349,25 +466,32 @@ impl Repository {
                         .map_err(|e| RepositoryError::Database(e.to_string()))?;
                 }
                 GraphOp::FileDel { path, .. } => {
-                    // Remove file from tree tables
-                    // First get the inode for this path
+                    // Stack-aware deletion: only remove TREE/INODES entries
+                    // when no OTHER stack still references the file's creating
+                    // change.  The TREE and INODES tables are global — removing
+                    // an entry here would make the file invisible on every
+                    // stack, not just the one where the deletion was recorded.
                     if let Ok(Some(inode)) = txn.get_inode(path) {
-                        // Remove from tree tables (path ↔ inode)
-                        let _ = txn.del_tree(path);
-                        // Remove from inode tables (inode ↔ position)
-                        let _ = txn.del_inode(inode);
+                        let dominated = is_file_only_on_stack(&txn, inode, stack_name);
+                        if dominated {
+                            let _ = txn.del_tree(path);
+                            let _ = txn.del_inode(inode);
+                        }
+                        // When other stacks still reference the file we leave
+                        // TREE/INODES intact.  The deletion is represented in
+                        // the graph via DELETED edges and will be honoured by
+                        // output_working_copy's change_filter / retrieve_graph.
                     }
                 }
                 GraphOp::DirDel { path, .. } => {
-                    // Remove directory from tree tables
-                    // First get the inode for this path
+                    // Same stack-aware logic as FileDel above.
                     if let Ok(Some(inode)) = txn.get_inode(path) {
-                        // Remove from tree tables (path ↔ inode)
-                        let _ = txn.del_tree(path);
-                        // Remove from inode tables (inode ↔ position)
-                        let _ = txn.del_inode(inode);
-                        // Remove directory marker from DIRECTORIES table
-                        let _ = txn.del_directory(inode);
+                        let dominated = is_file_only_on_stack(&txn, inode, stack_name);
+                        if dominated {
+                            let _ = txn.del_tree(path);
+                            let _ = txn.del_inode(inode);
+                            let _ = txn.del_directory(inode);
+                        }
                     }
                 }
                 _ => {}
@@ -377,13 +501,14 @@ impl Repository {
         // Handle file deletions tracked in the outcome.
         // Since we use GraphOp::Edit with EdgeUpdate for deletions (not GraphOp::FileDel),
         // we need to explicitly remove deleted files from the tree tables.
+        // Stack-aware: only remove if no other stack still references the file.
         for deleted_path in outcome.deleted_files() {
-            // Get the inode for this path
             if let Ok(Some(inode)) = txn.get_inode(deleted_path) {
-                // Remove from tree tables (path ↔ inode)
-                let _ = txn.del_tree(deleted_path);
-                // Remove from inode tables (inode ↔ position)
-                let _ = txn.del_inode(inode);
+                let dominated = is_file_only_on_stack(&txn, inode, stack_name);
+                if dominated {
+                    let _ = txn.del_tree(deleted_path);
+                    let _ = txn.del_inode(inode);
+                }
             }
         }
 

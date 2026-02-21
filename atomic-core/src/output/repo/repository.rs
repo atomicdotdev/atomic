@@ -920,8 +920,54 @@ where
     // Process each item
     let file_options = options.to_file_options();
 
+    // ── Stack-aware pre-filter ──────────────────────────────────────
+    // When a change_filter is active (stack-aware output), we pre-compute
+    // the set of file paths whose introducing change passes the filter.
+    // Directories are only created if they are ancestors of at least one
+    // passing file.  This prevents recreating directories (and empty files)
+    // that belong to a different stack.
+    let passing_file_paths: Option<std::collections::HashSet<String>> =
+        if let Some(ref filter) = options.change_filter {
+            let mut paths = std::collections::HashSet::new();
+            for item in &items {
+                if item.is_directory {
+                    continue;
+                }
+                // Check whether the file's introducing change is in the filter.
+                // position.change gives us the NodeId of the change that created
+                // this file's inode vertex.
+                let change_id = item.position.change;
+                if change_id == crate::types::NodeId::ROOT || filter.contains(&change_id) {
+                    paths.insert(item.path.clone());
+                }
+            }
+            Some(paths)
+        } else {
+            None
+        };
+
+    // Helper: check if a directory path is an ancestor of any passing file.
+    let dir_has_passing_children = |dir_path: &str| -> bool {
+        match &passing_file_paths {
+            None => true, // No filter — always create directories
+            Some(paths) => {
+                let prefix = if dir_path.ends_with('/') {
+                    dir_path.to_string()
+                } else {
+                    format!("{}/", dir_path)
+                };
+                paths.iter().any(|p| p.starts_with(&prefix))
+            }
+        }
+    };
+
     for item in items {
         if item.is_directory {
+            // Only create directories that will contain files on this stack
+            if !dir_has_passing_children(&item.path) {
+                result.record_skipped();
+                continue;
+            }
             // Create directory
             working_copy
                 .create_dir_all(&item.path)
@@ -932,6 +978,16 @@ where
             if !options.matches_prefix(&item.path) {
                 result.record_skipped();
                 continue;
+            }
+
+            // Stack-aware skip: if the file's introducing change is not in the
+            // filter, skip it entirely.  This avoids calling output_file_with_filter
+            // which would otherwise create an empty file on disk.
+            if let Some(ref paths) = passing_file_paths {
+                if !paths.contains(&item.path) {
+                    result.record_skipped();
+                    continue;
+                }
             }
 
             // Output file

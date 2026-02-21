@@ -28,7 +28,7 @@
 //! let found = txn.find_block(internal_pos)?;
 //! ```
 
-use crate::pristine::{GraphTxnT, TreeTxnT};
+use crate::pristine::{GraphTxnT, MutTxnT, TreeTxnT};
 use crate::types::{GraphNode, Hash, Inode, NodeId, Position};
 
 use super::error::LocalApplyError;
@@ -278,6 +278,62 @@ pub fn resolve_context_vertex<T: GraphTxnT>(
         let found = txn
             .find_block(pos)
             .map_err(|_| LocalApplyError::BlockNotFound { position: pos })?;
+
+        // If position is mid-span, return portion from pos onward
+        if found.start < pos.pos && found.end > pos.pos {
+            Ok(GraphNode {
+                change: found.change,
+                start: pos.pos,
+                end: found.end,
+            })
+        } else {
+            Ok(found)
+        }
+    }
+}
+
+/// Overlay-aware variant of [`resolve_context_vertex`].
+///
+/// When applying to a **Local** stack, vertices created earlier in the
+/// same change live in `STACK_GRAPH`, not the global `GRAPH`.  The
+/// standard `find_block` / `find_block_end` on a `WriteTxn` only
+/// searches the global `GRAPH`, so they miss those vertices and return
+/// `BlockNotFound`.
+///
+/// This function checks `STACK_GRAPH` first (via the helpers in
+/// `super::edge`) before falling back to the global `GRAPH`.  For
+/// `ApplyTarget::Global` it behaves identically to the non-overlay
+/// version.
+pub fn resolve_context_vertex_overlay<T: MutTxnT>(
+    txn: &T,
+    pos: Position<NodeId>,
+    is_predecessor: bool,
+    target: &super::ApplyTarget,
+) -> Result<GraphNode<NodeId>, LocalApplyError> {
+    use super::edge::{find_source_vertex_overlay, find_target_vertex_overlay};
+
+    // Handle ROOT position
+    if pos.change.is_root() {
+        return Ok(GraphNode::root());
+    }
+
+    if is_predecessor {
+        // For predecessors, find the span that ENDS at this position.
+        let found = find_source_vertex_overlay(txn, pos, target)?;
+
+        // If position is mid-span, return portion up to pos
+        if found.end > pos.pos && found.start < pos.pos {
+            Ok(GraphNode {
+                change: found.change,
+                start: found.start,
+                end: pos.pos,
+            })
+        } else {
+            Ok(found)
+        }
+    } else {
+        // For successors, find the span containing this position
+        let found = find_target_vertex_overlay(txn, pos, target)?;
 
         // If position is mid-span, return portion from pos onward
         if found.start < pos.pos && found.end > pos.pos {
