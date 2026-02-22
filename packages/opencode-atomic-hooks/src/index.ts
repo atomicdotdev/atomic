@@ -171,8 +171,9 @@ export const AtomicHooksPlugin: Plugin = async ({ $, directory }) => {
     state.turnCacheWrite = 0;
     state.turnCost = 0;
 
-    // Clear last tool summary for next turn
+    // Clear per-turn state for next turn
     state.lastToolSummary = undefined;
+    state.prompt = undefined;
   };
 
   log(`plugin loaded dir=${directory}`);
@@ -264,8 +265,9 @@ export const AtomicHooksPlugin: Plugin = async ({ $, directory }) => {
           state.turnCost += part.cost ?? 0;
         }
 
-        // First user text = the prompt
-        if (part.type === "text" && part.text && !state.prompt) {
+        // Capture user text as the prompt for the current turn.
+        // Always overwrite — each turn gets its own prompt.
+        if (part.type === "text" && part.text) {
           state.prompt = part.text.substring(0, 500);
         }
 
