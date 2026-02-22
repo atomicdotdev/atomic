@@ -229,6 +229,17 @@ impl GraphTxnT for ReadTxn {
         }
         Ok(result)
     }
+
+    fn has_change_in_graph(&self, change_id: NodeId) -> PristineResult<bool> {
+        let table = self.txn.open_multimap_table(GRAPH)?;
+        let start_key = encode_vertex(change_id.get(), 0, 0);
+        let end_key = encode_vertex(change_id.get() + 1, 0, 0);
+        let has = table
+            .range::<&[u8; 24]>(&start_key..&end_key)?
+            .next()
+            .is_some();
+        Ok(has)
+    }
 }
 
 // StackTxnT Implementation

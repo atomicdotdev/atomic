@@ -86,6 +86,105 @@ pub const DOT_DIR: &str = ".atomic";
 /// The default stack name
 pub const DEFAULT_STACK: &str = "dev";
 
+/// Subdirectory inside `.atomic/` that holds per-stack workspace state.
+///
+/// Each stack gets a directory at `.atomic/workspaces/<stack_name>/` where
+/// ignored/artifact files are shelved on `switch_stack` and restored when
+/// switching back.  This is the mechanism by which stacks achieve full
+/// working copy isolation — not just tracked files (managed by the graph)
+/// but also build artifacts like `node_modules/`, `dist/`, `.next/`, etc.
+const WORKSPACES_DIR: &str = "workspaces";
+
+/// Return the workspace directory path for a given stack.
+///
+/// The path is `.atomic/workspaces/<stack_name>/`.  Stack names may
+/// contain `/` (e.g. `agent/ses_abc123`), which becomes a nested
+/// directory structure.
+fn workspace_path(dot_dir: &Path, stack_name: &str) -> PathBuf {
+    dot_dir.join(WORKSPACES_DIR).join(stack_name)
+}
+
+/// Ensure the workspace directory for a stack exists.
+///
+/// Creates `.atomic/workspaces/<stack_name>/` and any intermediate
+/// directories.  This is called from `init`, `create_stack`, and
+/// `create_stack_from`.
+fn ensure_workspace_dir(dot_dir: &Path, stack_name: &str) -> Result<(), RepositoryError> {
+    let ws = workspace_path(dot_dir, stack_name);
+    std::fs::create_dir_all(&ws)?;
+    Ok(())
+}
+
+/// Remove empty ancestor directories after file removal.
+///
+/// Given an iterator of relative paths that were just deleted, this
+/// collects every parent directory, sorts them deepest-first, and
+/// attempts `std::fs::remove_dir` on each.  Because `remove_dir` only
+/// succeeds on *empty* directories, this is always safe — a directory
+/// that still contains files (tracked, untracked, or otherwise) will
+/// simply fail silently.
+///
+/// Extracting this into a standalone helper keeps `switch_stack` at the
+/// orchestration level and makes the cleanup logic reusable for other
+/// operations (e.g. `atomic clean`).
+fn cleanup_empty_ancestors<'a>(root: &Path, removed_paths: impl Iterator<Item = &'a str>) {
+    let mut dirs: HashSet<PathBuf> = HashSet::new();
+    for path in removed_paths {
+        let p = PathBuf::from(path);
+        let mut ancestor = p.parent();
+        while let Some(dir) = ancestor {
+            if dir == Path::new("") || dir == Path::new(".") {
+                break;
+            }
+            dirs.insert(dir.to_path_buf());
+            ancestor = dir.parent();
+        }
+    }
+    // Sort deepest-first so children are removed before parents.
+    let mut sorted: Vec<PathBuf> = dirs.into_iter().collect();
+    sorted.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+    for dir in sorted {
+        let abs = root.join(&dir);
+        if abs.is_dir() {
+            // Only succeeds if the directory is empty — safe by construction.
+            let _ = std::fs::remove_dir(&abs);
+        }
+    }
+}
+
+/// Collect all change `NodeId`s applied to a stack into a `HashSet`.
+///
+/// This is the canonical helper for building a **change filter** — the set
+/// of changes that define a stack's content.  It is used by:
+///
+/// - `output_working_copy` (to filter which files are materialised)
+/// - `visible_file_paths` (to compute the file set for `switch_stack`)
+/// - `status` (to decide which tracked files are "ours")
+/// - `get_file_content*` variants (to scope graph retrieval)
+///
+/// Centralising this pattern eliminates duplication and ensures every
+/// call site uses the same iteration + error handling.
+///
+/// # Complexity
+///
+/// O(C) where C is the number of changes on the stack — a single linear
+/// scan of `STACK_CHANGES`.
+pub fn collect_stack_change_ids<T: StackTxnT>(
+    txn: &T,
+    stack: &atomic_core::pristine::StackState,
+) -> Result<HashSet<NodeId>, RepositoryError> {
+    let mut ids = HashSet::new();
+    let iter = txn
+        .iter_changes(stack, 0)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    for result in iter {
+        let (_seq, node_id, _merkle) =
+            result.map_err(|e| RepositoryError::Database(e.to_string()))?;
+        ids.insert(node_id);
+    }
+    Ok(ids)
+}
+
 /// Information about a stack.
 ///
 /// This struct provides metadata about a stack including its current
@@ -211,6 +310,7 @@ impl Repository {
         // Create directory structure
         std::fs::create_dir_all(&dot_dir)?;
         std::fs::create_dir_all(dot_dir.join("changes"))?;
+        std::fs::create_dir_all(dot_dir.join(WORKSPACES_DIR))?;
 
         // Create initial config
         let config_path = dot_dir.join("config.toml");
@@ -232,7 +332,7 @@ default = "{}"
         let pristine = Pristine::open(dot_dir.join("pristine.redb"))
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Create the default stack
+        // Create the default stack and its workspace directory
         {
             let mut txn = pristine
                 .write_txn()
@@ -242,6 +342,7 @@ default = "{}"
             txn.commit()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
         }
+        ensure_workspace_dir(&dot_dir, DEFAULT_STACK)?;
 
         // Initialize the change store
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
@@ -514,46 +615,204 @@ default = "{}"
         // Compute files visible on the NEW stack via its overlay.
         let new_files = self.visible_file_paths(stack)?;
 
-        // Delete from disk: files visible on the old stack but NOT visible
-        // on the new stack.  Untracked files (not recorded on any stack)
-        // are left alone because they never appear in either set.
         let working_copy = FileSystem::from_root(&self.root);
-        let mut files_removed: usize = 0;
+
+        // ── Phase 1: Shelve ignored files into the OLD stack's workspace ──
+        //
+        // Ignored files (node_modules/, dist/, .next/, etc.) are build
+        // artifacts that belong to the stack that created them.  We move
+        // them into `.atomic/workspaces/<old_stack>/` so they can be
+        // restored when the user switches back.
+        //
+        // This uses `rename()` which is O(1) on the same filesystem —
+        // no data is copied, just inode pointers are updated.
+        //
+        // The rule:
+        //   - Tracked files      → managed by the graph (phases 2-4)
+        //   - Untracked, ignored → shelved/restored per-stack (phases 1 & 5)
+        //   - Untracked, novel   → user's undecided work, left alone
+        let old_ws = workspace_path(&self.dot_dir, &old_stack_name);
+        ensure_workspace_dir(&self.dot_dir, &old_stack_name)?;
+        let ignored_paths = self.collect_ignored_paths_on_disk();
+        if !ignored_paths.is_empty() {
+            // Clear old workspace content, then move current ignored files in.
+            // We clear first because the workspace may contain stale state
+            // from a previous shelve.
+            for path in &ignored_paths {
+                let ws_dest = old_ws.join(path);
+                // Remove stale entry in workspace if it exists
+                if ws_dest.is_dir() {
+                    let _ = std::fs::remove_dir_all(&ws_dest);
+                } else if ws_dest.exists() {
+                    let _ = std::fs::remove_file(&ws_dest);
+                }
+                // Ensure parent dirs exist in workspace
+                if let Some(parent) = ws_dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                // Move from working copy → workspace (O(1) rename)
+                let src = self.root.join(path);
+                if src.exists() {
+                    let _ = std::fs::rename(&src, &ws_dest);
+                }
+            }
+        }
+
+        // ── Phase 2: Remove tracked files that belong to the old stack ──
+        //
+        // Files visible on the old stack but NOT on the new stack are
+        // removed from disk.
+        let mut removed_paths: Vec<String> = Vec::new();
         for path in old_files.difference(&new_files) {
             let abs_path = self.root.join(path);
             if abs_path.exists() && !abs_path.is_dir() {
                 if working_copy.remove_path(path, false).is_ok() {
-                    files_removed += 1;
+                    removed_paths.push(path.clone());
                 }
             }
         }
 
-        // Clean up empty parent directories left behind after file removal.
-        if files_removed > 0 {
-            let mut dirs_to_try: HashSet<PathBuf> = HashSet::new();
-            for path in old_files.difference(&new_files) {
-                let p = PathBuf::from(path);
-                let mut ancestor = p.parent();
-                while let Some(dir) = ancestor {
-                    if dir == Path::new("") || dir == Path::new(".") {
-                        break;
+        // ── Phase 3: Clean up empty ancestor directories ────────────────
+        let all_removed = removed_paths
+            .iter()
+            .map(|s| s.as_str())
+            .chain(ignored_paths.iter().map(|s| s.as_str()));
+        cleanup_empty_ancestors(&self.root, all_removed);
+
+        // ── Phase 4: Output the new stack's tracked files from graph ─────
+        let result = self.output_working_copy()?;
+
+        // ── Phase 5: Restore ignored files from the NEW stack's workspace ─
+        //
+        // Move artifacts from `.atomic/workspaces/<new_stack>/` back into
+        // the working copy.  Again O(1) renames, no data copying.
+        let new_ws = workspace_path(&self.dot_dir, stack);
+        if new_ws.is_dir() {
+            self.restore_workspace_to_working_copy(&new_ws);
+        }
+
+        Ok(result)
+    }
+
+    /// Restore entries from a workspace directory into the working copy.
+    ///
+    /// Walks the top-level entries in `ws_dir` and moves each into the
+    /// project root via `rename()`.  Skips the `.atomic` directory if
+    /// present.
+    fn restore_workspace_to_working_copy(&self, ws_dir: &Path) {
+        let entries = match std::fs::read_dir(ws_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            // Never move .atomic into the working copy
+            if name_str == DOT_DIR {
+                continue;
+            }
+
+            let src = entry.path();
+            let dst = self.root.join(&*name_str);
+
+            // If the destination already exists (e.g. a directory that
+            // was created by output_working_copy for tracked content),
+            // merge by recursing into it rather than replacing it.
+            if dst.is_dir() && src.is_dir() {
+                self.merge_dir_into(&src, &dst);
+                let _ = std::fs::remove_dir_all(&src);
+            } else {
+                // Ensure parent exists
+                if let Some(parent) = dst.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::rename(&src, &dst);
+            }
+        }
+    }
+
+    /// Recursively merge the contents of `src_dir` into `dst_dir`.
+    ///
+    /// Files in `src_dir` are moved into `dst_dir`.  If a subdirectory
+    /// exists in both, the merge recurses.  This is used when restoring
+    /// workspace artifacts into a directory that already contains tracked
+    /// files (e.g. `src/` might have tracked `.ts` files from the graph
+    /// AND ignored `.cache/` from the workspace).
+    fn merge_dir_into(&self, src_dir: &Path, dst_dir: &Path) {
+        let entries = match std::fs::read_dir(src_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let src = entry.path();
+            let dst = dst_dir.join(&name);
+
+            if dst.is_dir() && src.is_dir() {
+                self.merge_dir_into(&src, &dst);
+                let _ = std::fs::remove_dir_all(&src);
+            } else {
+                if let Some(parent) = dst.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::rename(&src, &dst);
+            }
+        }
+    }
+
+    /// Walk the working copy and collect relative paths of files and
+    /// directories that match `.atomicignore` rules.
+    ///
+    /// Only top-level ignored entries are returned — if `node_modules/`
+    /// matches, we return `"node_modules"` rather than enumerating every
+    /// file inside it (the caller will `remove_dir_all`).
+    ///
+    /// Paths that live inside `.atomic/` are never returned.
+    fn collect_ignored_paths_on_disk(&self) -> Vec<String> {
+        let rules = self.ignore_rules();
+        let mut result = Vec::new();
+
+        // Recursive walker that stops descending into ignored directories.
+        fn walk(
+            root: &Path,
+            dir: &Path,
+            rules: &crate::ignore::IgnoreRules,
+            out: &mut Vec<String>,
+        ) {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            for entry in entries.flatten() {
+                let abs = entry.path();
+                let rel = match abs.strip_prefix(root) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+
+                // Never touch the .atomic directory itself.
+                if rel.starts_with(DOT_DIR) {
+                    continue;
+                }
+
+                let is_dir = abs.is_dir();
+
+                if rules.is_ignored(rel, is_dir) {
+                    // Collect the top-level ignored entry — don't recurse.
+                    if let Some(s) = rel.to_str() {
+                        out.push(s.to_string());
                     }
-                    dirs_to_try.insert(dir.to_path_buf());
-                    ancestor = dir.parent();
+                } else if is_dir {
+                    // Not ignored — recurse to find ignored children.
+                    walk(root, &abs, rules, out);
                 }
-            }
-            let mut sorted_dirs: Vec<PathBuf> = dirs_to_try.into_iter().collect();
-            sorted_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
-            for dir in sorted_dirs {
-                let abs_dir = self.root.join(&dir);
-                if abs_dir.is_dir() {
-                    let _ = std::fs::remove_dir(&abs_dir);
-                }
+                // Non-ignored files are left alone.
             }
         }
 
-        // Output the working copy using the overlay model.
-        self.output_working_copy()
+        walk(&self.root, &self.root, &rules, &mut result);
+        result
     }
 
     /// Compute the set of file paths whose creating change is on a stack.
@@ -588,16 +847,7 @@ default = "{}"
             None => return Ok(HashSet::new()),
         };
 
-        // Collect every change NodeId on this stack's log.
-        let mut stack_change_ids: HashSet<NodeId> = HashSet::new();
-        let iter = txn
-            .iter_changes(&stack, 0)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        for result in iter {
-            let (_seq, node_id, _merkle) =
-                result.map_err(|e| RepositoryError::Database(e.to_string()))?;
-            stack_change_ids.insert(node_id);
-        }
+        let stack_change_ids = collect_stack_change_ids(&txn, &stack)?;
 
         // Walk TREE and keep paths whose introducing change is in the log.
         let mut paths: HashSet<String> = HashSet::new();
@@ -680,16 +930,7 @@ default = "{}"
         // change_filter.  Even though the overlay isolates edges, we
         // still need the filter so that `output_repository` can skip
         // TREE entries whose creating change is not on this stack.
-        let mut change_filter: HashSet<NodeId> = HashSet::new();
-        let iter = txn
-            .iter_changes(&stack, 0)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        for result in iter {
-            let (_seq, node_id, _merkle) =
-                result.map_err(|e| RepositoryError::Database(e.to_string()))?;
-            change_filter.insert(node_id);
-        }
+        let change_filter = collect_stack_change_ids(&txn, &stack)?;
 
         let working_copy = FileSystem::from_root(&self.root);
         let options = RepositoryOutputOptions::new().with_change_filter(change_filter);
@@ -745,6 +986,9 @@ default = "{}"
     /// - The stack already exists
     /// - The database operation fails
     pub fn create_stack(&mut self, name: &str) -> Result<(), RepositoryError> {
+        // Create the workspace directory for this stack.
+        ensure_workspace_dir(&self.dot_dir, name)?;
+
         // Create a **Local** workspace parented on the nearest Shared
         // ancestor of the current stack.  The change log starts EMPTY —
         // no changes are inherited automatically.
@@ -923,6 +1167,9 @@ default = "{}"
         // isolates them from other stacks.  The parent link means the
         // overlay chain (STACK_GRAPH[self] ∪ ... ∪ GRAPH) includes the
         // source's content.
+        // Create workspace directory for the new stack.
+        ensure_workspace_dir(&self.dot_dir, name)?;
+
         let mut new_stack = txn
             .create_stack(name, StackKind::Local, Some(source_id))
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -1021,6 +1268,15 @@ default = "{}"
         // - Shared stacks cannot be deleted (returns CannotDeleteSharedStack)
         // - Stacks with children cannot be deleted (returns StackHasChildren)
         // - Local workspaces cascade-delete all STACK_GRAPH edges (zero orphans)
+        // Remove workspace directory for this stack before deleting
+        // the stack from the database.  This cleans up any shelved
+        // artifacts (node_modules, dist, etc.) that were stored when
+        // the user last switched away from this stack.
+        let ws = workspace_path(&self.dot_dir, name);
+        if ws.is_dir() {
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+
         txn.del_stack(&stack).map_err(|e| match &e {
             atomic_core::pristine::PristineError::CannotDeleteSharedStack { name } => {
                 RepositoryError::InvalidOperation {

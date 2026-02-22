@@ -83,6 +83,7 @@ pub mod stack;
 pub mod stash;
 pub mod status;
 pub mod tag;
+pub mod unrecord;
 
 // Phase 6: Agent Integration
 pub mod agent;
@@ -123,6 +124,7 @@ pub use stack::Stack;
 pub use stash::Stash;
 pub use status::Status;
 pub use tag::Tag;
+pub use unrecord::Unrecord;
 
 // Command Trait
 

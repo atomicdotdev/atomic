@@ -67,13 +67,13 @@ use crate::turn::phase::Phase;
 ///
 /// Persisted as JSON in `.atomic/sessions/{session_id}.json`. Updated on every
 /// hook callback via the orchestrator. The session links to an Atomic stack
-/// named `agent/{session_id}` where turn changes are recorded.
+/// named `agent-{session_id}` where turn changes are recorded.
 ///
 /// # Identity
 ///
 /// Each session is uniquely identified by `session_id`, which is assigned by the
 /// agent (e.g., a UUID from Claude Code). The `stack_name` is derived as
-/// `agent/{session_id}`.
+/// `agent-{session_id}`.
 ///
 /// # Thread Safety
 ///
@@ -89,7 +89,7 @@ pub struct AgentSession {
 
     /// The Atomic stack name for this session's turn changes.
     ///
-    /// Format: `agent/{session_id}`. Created on first turn recording.
+    /// Format: `agent-{session_id}`. Created on first turn recording.
     pub stack_name: String,
 
     /// Current lifecycle phase.
@@ -213,9 +213,12 @@ impl AgentSession {
 
     /// Derive the Atomic stack name from a session ID.
     ///
-    /// Format: `agent/{session_id}`
+    /// Format: `agent-{session_id}`
+    ///
+    /// Uses `-` as the separator because `/` is forbidden in stack names
+    /// (it would create nested directories in `.atomic/workspaces/`).
     pub fn make_stack_name(session_id: &str) -> String {
-        format!("agent/{}", session_id)
+        format!("agent-{}", session_id)
     }
 
     /// Set the AI vendor and model.
@@ -627,7 +630,7 @@ mod tests {
         assert_eq!(s.session_id, "sess-abc-123");
         assert_eq!(s.agent_name, "claude-code");
         assert_eq!(s.agent_display_name, "Claude Code");
-        assert_eq!(s.stack_name, "agent/sess-abc-123");
+        assert_eq!(s.stack_name, "agent-sess-abc-123");
         assert_eq!(s.phase, Phase::Idle);
         assert_eq!(s.turn_count, 0);
         assert!(s.last_interaction.is_some());
@@ -640,10 +643,10 @@ mod tests {
 
     #[test]
     fn test_make_stack_name() {
-        assert_eq!(AgentSession::make_stack_name("sess-123"), "agent/sess-123");
+        assert_eq!(AgentSession::make_stack_name("sess-123"), "agent-sess-123");
         assert_eq!(
             AgentSession::make_stack_name("2026-01-15-abc"),
-            "agent/2026-01-15-abc"
+            "agent-2026-01-15-abc"
         );
     }
 
@@ -907,7 +910,7 @@ mod tests {
         // Simulate an older session file missing optional fields
         let json = r#"{
             "session_id": "old-sess",
-            "stack_name": "agent/old-sess",
+            "stack_name": "agent-old-sess",
             "phase": "idle",
             "turn_count": 5,
             "agent_name": "claude-code",

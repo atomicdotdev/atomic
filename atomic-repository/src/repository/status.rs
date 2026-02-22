@@ -1,5 +1,4 @@
 use super::*;
-use atomic_core::pristine::OverlayTxn;
 
 impl Repository {
     // Status Methods
@@ -62,22 +61,13 @@ impl Repository {
         // We use this below to decide whether a recorded file is "ours"
         // (its creating change is on this stack) or "foreign" (recorded
         // on a different stack and should be invisible here).
-        let current_stack_change_ids: std::collections::HashSet<atomic_core::types::NodeId> = {
-            let mut ids = std::collections::HashSet::new();
-            if let Some(ref stack) = txn
-                .get_stack(&self.current_stack)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?
-            {
-                let iter = txn
-                    .iter_changes(stack, 0)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                for result in iter {
-                    let (_seq, node_id, _merkle) =
-                        result.map_err(|e| RepositoryError::Database(e.to_string()))?;
-                    ids.insert(node_id);
-                }
-            }
-            ids
+        let current_stack_change_ids: HashSet<NodeId> = if let Some(ref stack) = txn
+            .get_stack(&self.current_stack)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            collect_stack_change_ids(&txn, stack)?
+        } else {
+            HashSet::new()
         };
 
         // Load ignore rules if respecting ignore files

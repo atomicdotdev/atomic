@@ -311,15 +311,27 @@ impl<'a, T: GraphTxnT + StackTxnT> GraphTxnT for OverlayTxn<'a, T> {
         // Check global GRAPH
         self.inner.has_vertex(node)
     }
+
+    fn has_change_in_graph(&self, change_id: NodeId) -> PristineResult<bool> {
+        // Intentionally checks only the global GRAPH — this method answers
+        // "are this change's edges in the permanent shared graph?" which is
+        // the correct semantics for deciding whether to re-apply hunks.
+        // STACK_GRAPH edges are ephemeral and don't count.
+        self.inner.has_change_in_graph(change_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers for STACK_GRAPH vertex lookup
+// Shared helpers for STACK_GRAPH vertex lookup
+//
+// These are pub(crate) so that the apply module can reuse the same lookup
+// logic instead of reimplementing it.  The canonical vertex-resolution
+// strategy lives HERE; all other modules delegate to these helpers.
 // ---------------------------------------------------------------------------
 
 /// Controls which position-matching strategy `find_block_in_stack_graph` uses.
 #[derive(Debug, Clone, Copy)]
-enum FindBlockMode {
+pub(crate) enum FindBlockMode {
     /// Match a vertex that **contains** the position: `start <= pos < end`
     /// (non-empty) or `start == pos == end` (empty, fallback).
     /// Used by `find_block`.
@@ -348,7 +360,7 @@ enum FindBlockMode {
 /// # Returns
 ///
 /// `Ok(Some(vertex))` if a matching vertex was found, `Ok(None)` otherwise.
-fn find_block_in_stack_graph<T: StackTxnT>(
+pub(crate) fn find_block_in_stack_graph<T: StackTxnT>(
     txn: &T,
     stack_id: u64,
     change_id: u64,
@@ -465,7 +477,7 @@ fn find_block_in_stack_graph<T: StackTxnT>(
 /// For now, we use a trait method that returns vertex+edge pairs and
 /// extract just the vertex coordinates. A future optimization could add
 /// a dedicated `iter_stack_graph_vertices` method to `StackTxnT`.
-fn collect_stack_graph_vertices_for_change<T: StackTxnT>(
+pub(crate) fn collect_stack_graph_vertices_for_change<T: StackTxnT>(
     txn: &T,
     stack_id: u64,
     change_id: u64,

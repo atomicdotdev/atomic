@@ -835,6 +835,10 @@ mod tests {
         fn get_rev_deps(&self, _dep_id: NodeId) -> Result<Vec<NodeId>, PristineError> {
             Ok(Vec::new())
         }
+
+        fn has_change_in_graph(&self, _change_id: NodeId) -> Result<bool, PristineError> {
+            Ok(false)
+        }
     }
 
     impl TreeTxnT for MockTxn {

@@ -946,18 +946,31 @@ where
             None
         };
 
-    // Helper: check if a directory path is an ancestor of any passing file.
-    let dir_has_passing_children = |dir_path: &str| -> bool {
-        match &passing_file_paths {
-            None => true, // No filter — always create directories
-            Some(paths) => {
-                let prefix = if dir_path.ends_with('/') {
-                    dir_path.to_string()
-                } else {
-                    format!("{}/", dir_path)
-                };
-                paths.iter().any(|p| p.starts_with(&prefix))
+    // Pre-compute the set of ancestor directory paths from passing files.
+    // This turns the directory visibility check from O(dirs × files) into
+    // O(1) per directory via HashSet lookup.
+    let passing_ancestors: Option<std::collections::HashSet<String>> =
+        passing_file_paths.as_ref().map(|paths| {
+            let mut ancestors = std::collections::HashSet::new();
+            for path in paths {
+                let p = std::path::Path::new(path);
+                // Walk every ancestor of this file path and record it.
+                for ancestor in p.ancestors() {
+                    let s = match ancestor.to_str() {
+                        Some(s) if !s.is_empty() && s != "." => s,
+                        _ => break,
+                    };
+                    ancestors.insert(s.to_string());
+                }
             }
+            ancestors
+        });
+
+    // O(1) check: is this directory an ancestor of at least one passing file?
+    let dir_has_passing_children = |dir_path: &str| -> bool {
+        match &passing_ancestors {
+            None => true, // No filter — always create directories
+            Some(ancestors) => ancestors.contains(dir_path),
         }
     };
 

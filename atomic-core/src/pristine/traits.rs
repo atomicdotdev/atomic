@@ -318,6 +318,28 @@ pub trait GraphTxnT {
     /// the given node. Used to find attestations that cover a change
     /// (filter results by `node_type::ATTESTATION`).
     fn get_rev_deps(&self, dep_id: NodeId) -> Result<Vec<NodeId>, PristineError>;
+
+    /// Check whether a change has any vertices in the global GRAPH.
+    ///
+    /// Performs an O(log N) range probe on the GRAPH B-tree for keys
+    /// whose change_id matches `change_id`.  This is far cheaper than
+    /// loading the full `Change` and probing individual hunks.
+    ///
+    /// # Use Case
+    ///
+    /// When applying a change to a stack, we need to know whether the
+    /// change's edges already exist in the global GRAPH (so we can skip
+    /// redundant hunk application).  Previously this was done by loading
+    /// the change file and probing individual vertices — fragile and
+    /// expensive.  This method replaces that with a single B-tree range
+    /// scan.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)`  — At least one vertex for this change exists in GRAPH
+    /// * `Ok(false)` — No vertices for this change exist in GRAPH
+    /// * `Err(_)`    — Database error
+    fn has_change_in_graph(&self, change_id: NodeId) -> Result<bool, PristineError>;
 }
 
 // StackState - Stack Metadata

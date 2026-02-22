@@ -46,7 +46,7 @@ use clap::{Parser, Subcommand};
 
 use commands::{
     Add, Agent, Apply, ChangeCmd, Clone, Command, Diff, Hive, Identity, Init, Log, Move, Pull,
-    Push, Record, Remote, Remove, Reset, Revise, Split, Stack, Stash, Status, Tag,
+    Push, Record, Remote, Remove, Reset, Revise, Split, Stack, Stash, Status, Tag, Unrecord,
 };
 use output::{print_error, print_hint};
 
@@ -473,6 +473,22 @@ enum Commands {
     /// atomic tag delete v1.0.0
     /// ```
     Tag(Tag),
+
+    /// Remove the last change from the current stack.
+    ///
+    /// The change is removed from the stack's change log but NOT deleted
+    /// from the change store. It can be re-applied later with `atomic apply`.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Unrecord the most recent change
+    /// atomic unrecord
+    ///
+    /// # Preview without actually unrecording
+    /// atomic unrecord --dry-run
+    /// ```
+    Unrecord(Unrecord),
 }
 
 // Main Entry Point
@@ -538,6 +554,8 @@ fn main() {
         Commands::Remote(remote) => remote.run(),
 
         Commands::Tag(tag) => tag.run(),
+
+        Commands::Unrecord(unrecord) => unrecord.run(),
     };
 
     // Handle errors with user-friendly output

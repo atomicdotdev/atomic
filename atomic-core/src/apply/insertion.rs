@@ -51,7 +51,7 @@ use crate::types::{EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, Serializ
 use super::ApplyTarget;
 
 use super::error::LocalApplyError;
-use super::position::{resolve_context_vertex, resolve_inode, resolve_position};
+use super::position::{resolve_context_vertex_for_target, resolve_inode, resolve_position};
 use super::workspace::Workspace;
 
 // Insertion Application
@@ -92,11 +92,12 @@ pub fn apply_new_vertex<T: MutTxnT>(
     change: &Change,
     target: &ApplyTarget,
 ) -> Result<(), LocalApplyError> {
-    // Import overlay-aware helpers so that predecessor / successor
-    // resolution can find vertices written to STACK_GRAPH earlier in
-    // the same change (required for Local stacks).
-    use super::edge::{find_source_vertex_overlay, find_target_vertex_overlay};
-    use super::position::resolve_context_vertex_overlay;
+    // Import the unified overlay-aware vertex resolver.  This delegates to
+    // the shared `overlay::find_block_in_stack_graph` — the canonical
+    // STACK_GRAPH lookup — so there is a single source of truth for
+    // vertex resolution across both the apply pipeline and OverlayTxn.
+    use super::edge::resolve_vertex_for_target;
+    use crate::pristine::overlay::FindBlockMode;
 
     // Create the new span
     let node = GraphNode {
@@ -109,11 +110,11 @@ pub fn apply_new_vertex<T: MutTxnT>(
     workspace.clear_context();
 
     // Resolve predecessors: vertices that come BEFORE this new content.
-    // Use the overlay-aware resolver so Local stacks can find vertices
-    // written to STACK_GRAPH earlier in the same change.
+    // Uses the unified overlay-aware resolver so Local stacks can find
+    // vertices written to STACK_GRAPH earlier in the same change.
     for up_pos in &insertion.predecessors {
         let internal_pos = resolve_position(txn, up_pos, change_id)?;
-        let up_vertex = resolve_context_vertex_overlay(txn, internal_pos, true, target)?;
+        let up_vertex = resolve_context_vertex_for_target(txn, internal_pos, true, target)?;
         // Store the end position (where new content connects)
         workspace.add_up_context(up_vertex.end_pos());
 
@@ -122,7 +123,6 @@ pub fn apply_new_vertex<T: MutTxnT>(
     }
 
     // Resolve successors: vertices that come AFTER this new content.
-    // Same overlay-aware resolver for Local stack compatibility.
     for down_pos in &insertion.successors {
         let internal_pos = resolve_position(txn, down_pos, change_id)?;
 
@@ -133,7 +133,7 @@ pub fn apply_new_vertex<T: MutTxnT>(
             });
         }
 
-        let down_vertex = resolve_context_vertex_overlay(txn, internal_pos, false, target)?;
+        let down_vertex = resolve_context_vertex_for_target(txn, internal_pos, false, target)?;
         // Store the start position (where new content connects)
         workspace.add_down_context(down_vertex.start_pos());
 
@@ -152,13 +152,8 @@ pub fn apply_new_vertex<T: MutTxnT>(
     let up_flag = insertion.flag | EdgeFlags::BLOCK;
     for up_pos in workspace.predecessors().to_vec() {
         // Find the span ending at this position to use as edge source.
-        // Use overlay-aware lookup so Local stacks can find vertices
-        // written to STACK_GRAPH earlier in the same change.
-        let up_vertex = if up_pos.change.is_root() {
-            GraphNode::root()
-        } else {
-            find_source_vertex_overlay(txn, up_pos, target)?
-        };
+        let up_vertex =
+            resolve_vertex_for_target(txn, up_pos, target, FindBlockMode::EndingAtPosition)?;
         add_edge_with_reverse(
             txn,
             resolved_inode,
@@ -180,13 +175,8 @@ pub fn apply_new_vertex<T: MutTxnT>(
 
     for down_pos in workspace.successors().to_vec() {
         // Find the span containing this position to use as edge target.
-        // Use overlay-aware lookup so Local stacks can find vertices
-        // written to STACK_GRAPH earlier in the same change.
-        let down_vertex = if down_pos.change.is_root() {
-            GraphNode::root()
-        } else {
-            find_target_vertex_overlay(txn, down_pos, target)?
-        };
+        let down_vertex =
+            resolve_vertex_for_target(txn, down_pos, target, FindBlockMode::ContainingPosition)?;
         add_edge_with_reverse(
             txn,
             resolved_inode,

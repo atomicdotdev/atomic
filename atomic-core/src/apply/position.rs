@@ -28,6 +28,7 @@
 //! let found = txn.find_block(internal_pos)?;
 //! ```
 
+use crate::pristine::overlay::FindBlockMode;
 use crate::pristine::{GraphTxnT, MutTxnT, TreeTxnT};
 use crate::types::{GraphNode, Hash, Inode, NodeId, Position};
 
@@ -251,101 +252,99 @@ pub fn resolve_context_vertex<T: GraphTxnT>(
     pos: Position<NodeId>,
     is_predecessor: bool,
 ) -> Result<GraphNode<NodeId>, LocalApplyError> {
-    // Handle ROOT position
     if pos.change.is_root() {
         return Ok(GraphNode::root());
     }
 
-    if is_predecessor {
-        // For predecessors, find the span that ENDS at this position.
-        // This is because predecessors references the end of a predecessor.
-        let found = txn
-            .find_block_end(pos)
-            .map_err(|_| LocalApplyError::BlockNotFound { position: pos })?;
+    let found = if is_predecessor {
+        txn.find_block_end(pos)
+    } else {
+        txn.find_block(pos)
+    }
+    .map_err(|_| LocalApplyError::BlockNotFound { position: pos })?;
 
-        // If position is mid-span, return portion up to pos
+    Ok(adjust_for_mid_span(found, pos, is_predecessor))
+}
+
+// ---------------------------------------------------------------------------
+// Mid-span adjustment
+// ---------------------------------------------------------------------------
+
+/// Adjust a found vertex when the context position falls mid-span.
+///
+/// Context positions may reference a byte offset inside a larger vertex.
+/// When that happens the caller needs only the *relevant portion* of the
+/// vertex — everything up to the position for predecessors, or everything
+/// from the position onward for successors.
+///
+/// This helper is shared by both `resolve_context_vertex` and
+/// `resolve_context_vertex_for_target` so the splitting logic has a
+/// single definition.
+#[inline]
+fn adjust_for_mid_span(
+    found: GraphNode<NodeId>,
+    pos: Position<NodeId>,
+    is_predecessor: bool,
+) -> GraphNode<NodeId> {
+    if is_predecessor {
+        // Predecessor: return the portion up to `pos`
         if found.end > pos.pos && found.start < pos.pos {
-            Ok(GraphNode {
+            GraphNode {
                 change: found.change,
                 start: found.start,
                 end: pos.pos,
-            })
+            }
         } else {
-            Ok(found)
+            found
         }
     } else {
-        // For successors, find the span containing this position
-        let found = txn
-            .find_block(pos)
-            .map_err(|_| LocalApplyError::BlockNotFound { position: pos })?;
-
-        // If position is mid-span, return portion from pos onward
+        // Successor: return the portion from `pos` onward
         if found.start < pos.pos && found.end > pos.pos {
-            Ok(GraphNode {
+            GraphNode {
                 change: found.change,
                 start: pos.pos,
                 end: found.end,
-            })
+            }
         } else {
-            Ok(found)
+            found
         }
     }
 }
 
-/// Overlay-aware variant of [`resolve_context_vertex`].
+// ---------------------------------------------------------------------------
+// Overlay-aware context resolution for the apply pipeline
+// ---------------------------------------------------------------------------
+
+/// Resolve a context vertex using the overlay-aware vertex finder.
 ///
-/// When applying to a **Local** stack, vertices created earlier in the
-/// same change live in `STACK_GRAPH`, not the global `GRAPH`.  The
-/// standard `find_block` / `find_block_end` on a `WriteTxn` only
-/// searches the global `GRAPH`, so they miss those vertices and return
-/// `BlockNotFound`.
+/// This is the apply-pipeline counterpart of [`resolve_context_vertex`].
+/// It delegates vertex lookup to [`super::edge::resolve_vertex_for_target`],
+/// which consults STACK_GRAPH (via the shared `overlay::find_block_in_stack_graph`)
+/// before falling back to the global GRAPH.  For `ApplyTarget::Global` the
+/// behaviour is identical to the non-overlay version.
 ///
-/// This function checks `STACK_GRAPH` first (via the helpers in
-/// `super::edge`) before falling back to the global `GRAPH`.  For
-/// `ApplyTarget::Global` it behaves identically to the non-overlay
-/// version.
-pub fn resolve_context_vertex_overlay<T: MutTxnT>(
+/// The mid-span adjustment logic is shared with `resolve_context_vertex`
+/// via [`adjust_for_mid_span`], ensuring a single source of truth.
+pub fn resolve_context_vertex_for_target<T: MutTxnT>(
     txn: &T,
     pos: Position<NodeId>,
     is_predecessor: bool,
     target: &super::ApplyTarget,
 ) -> Result<GraphNode<NodeId>, LocalApplyError> {
-    use super::edge::{find_source_vertex_overlay, find_target_vertex_overlay};
+    use super::edge::resolve_vertex_for_target;
 
-    // Handle ROOT position
     if pos.change.is_root() {
         return Ok(GraphNode::root());
     }
 
-    if is_predecessor {
-        // For predecessors, find the span that ENDS at this position.
-        let found = find_source_vertex_overlay(txn, pos, target)?;
-
-        // If position is mid-span, return portion up to pos
-        if found.end > pos.pos && found.start < pos.pos {
-            Ok(GraphNode {
-                change: found.change,
-                start: found.start,
-                end: pos.pos,
-            })
-        } else {
-            Ok(found)
-        }
+    let mode = if is_predecessor {
+        FindBlockMode::EndingAtPosition
     } else {
-        // For successors, find the span containing this position
-        let found = find_target_vertex_overlay(txn, pos, target)?;
+        FindBlockMode::ContainingPosition
+    };
 
-        // If position is mid-span, return portion from pos onward
-        if found.start < pos.pos && found.end > pos.pos {
-            Ok(GraphNode {
-                change: found.change,
-                start: pos.pos,
-                end: found.end,
-            })
-        } else {
-            Ok(found)
-        }
-    }
+    let found = resolve_vertex_for_target(txn, pos, target, mode)?;
+    Ok(adjust_for_mid_span(found, pos, is_predecessor))
 }
 
 // Tests

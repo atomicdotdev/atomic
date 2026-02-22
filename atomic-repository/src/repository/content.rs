@@ -75,16 +75,8 @@ impl Repository {
             Err(e) => return Err(RepositoryError::Database(e.to_string())),
         };
 
-        // Build a change filter for this stack's changes
-        let mut change_filter: HashSet<NodeId> = HashSet::new();
-        let iter = txn
-            .iter_changes(&stack, 0)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        for result in iter {
-            let (_seq, node_id, _merkle) =
-                result.map_err(|e| RepositoryError::Database(e.to_string()))?;
-            change_filter.insert(node_id);
-        }
+        // Build a change filter starting from this stack's own changes.
+        let mut change_filter = collect_stack_change_ids(&txn, &stack)?;
 
         // For local workspaces, also include changes from parent stacks in the
         // overlay chain, since those changes' vertices should be visible too.
@@ -100,14 +92,8 @@ impl Repository {
                     .get_stack_by_id(ancestor_id)
                     .map_err(|e| RepositoryError::Database(e.to_string()))?
                 {
-                    let ancestor_iter = txn
-                        .iter_changes(&ancestor, 0)
-                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                    for result in ancestor_iter {
-                        let (_seq, node_id, _merkle) =
-                            result.map_err(|e| RepositoryError::Database(e.to_string()))?;
-                        change_filter.insert(node_id);
-                    }
+                    let ancestor_ids = collect_stack_change_ids(&txn, &ancestor)?;
+                    change_filter.extend(ancestor_ids);
                 }
             }
 
@@ -123,15 +109,8 @@ impl Repository {
                             .map_err(|e| RepositoryError::Database(e.to_string()))?;
                         match parent {
                             Some(p) if p.kind.is_shared() => {
-                                // Include this shared stack's changes
-                                let p_iter = txn
-                                    .iter_changes(&p, 0)
-                                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                                for result in p_iter {
-                                    let (_seq, node_id, _merkle) = result
-                                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                                    change_filter.insert(node_id);
-                                }
+                                let shared_ids = collect_stack_change_ids(&txn, &p)?;
+                                change_filter.extend(shared_ids);
                                 break;
                             }
                             Some(p) => cursor = p.parent,
@@ -312,17 +291,7 @@ impl Repository {
                 name: self.current_stack.clone(),
             })?;
 
-        // Collect all change NodeIds in the current stack
-        let mut change_filter: HashSet<NodeId> = HashSet::new();
-        let iter = txn
-            .iter_changes(&stack, 0)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        for result in iter {
-            let (_seq, node_id, _merkle) =
-                result.map_err(|e| RepositoryError::Database(e.to_string()))?;
-            change_filter.insert(node_id);
-        }
+        let change_filter = collect_stack_change_ids(&txn, &stack)?;
 
         // Use the filtered retrieval method
         self.get_file_content_with_filter(&txn, &normalized, change_filter)
@@ -364,17 +333,7 @@ impl Repository {
                 name: stack_name.to_string(),
             })?;
 
-        // Collect all change NodeIds in the specified stack
-        let mut change_filter: HashSet<NodeId> = HashSet::new();
-        let iter = txn
-            .iter_changes(&stack, 0)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        for result in iter {
-            let (_seq, node_id, _merkle) =
-                result.map_err(|e| RepositoryError::Database(e.to_string()))?;
-            change_filter.insert(node_id);
-        }
+        let change_filter = collect_stack_change_ids(&txn, &stack)?;
 
         // Use the filtered retrieval method
         self.get_file_content_with_filter(&txn, &normalized, change_filter)

@@ -427,65 +427,95 @@ impl Stash {
         repo.create_stack(&stash_name)
             .map_err(CliError::Repository)?;
 
-        // Switch to stash stack temporarily
-        let original_stack = repo.current_stack().to_string();
-        repo.set_current_stack(&stash_name)
-            .map_err(CliError::Repository)?;
+        // ── Save dirty files as raw bytes to a sidecar directory ────────
+        //
+        // Stash is a **pure working-copy operation**.  We save the exact
+        // bytes of every dirty file to `.atomic/stashes/<stash_name>/`.
+        // This is completely immune to graph mutations — even if the user
+        // records new changes between push and pop, pop will restore the
+        // exact content that was stashed.
+        //
+        // We do NOT go through the graph/record/apply machinery at all.
 
-        // Build record options
-        let options = RecordOptions::new()
-            .with_all(include_untracked || self.include_untracked)
-            .apply_after_record(true)
-            .save_to_store(true);
+        let stash_dir = repo.dot_dir().join("stashes").join(&stash_name);
+        std::fs::create_dir_all(&stash_dir).map_err(|e| {
+            CliError::Internal(anyhow::anyhow!("Failed to create stash dir: {}", e))
+        })?;
 
-        // If including untracked, add them first
+        // Collect every dirty file (modified + added)
+        let mut stashed_paths: Vec<String> = Vec::new();
+
+        for entry in status.modified() {
+            let p = entry.path().to_string_lossy().to_string();
+            let abs = repo.root().join(&p);
+            if abs.is_file() {
+                let rel_dir = stash_dir.join(
+                    std::path::Path::new(&p)
+                        .parent()
+                        .unwrap_or(std::path::Path::new("")),
+                );
+                let _ = std::fs::create_dir_all(&rel_dir);
+                let _ = std::fs::copy(&abs, stash_dir.join(&p));
+                stashed_paths.push(p);
+            }
+        }
+
+        for entry in status.added() {
+            let p = entry.path().to_string_lossy().to_string();
+            let abs = repo.root().join(&p);
+            if abs.is_file() {
+                let rel_dir = stash_dir.join(
+                    std::path::Path::new(&p)
+                        .parent()
+                        .unwrap_or(std::path::Path::new("")),
+                );
+                let _ = std::fs::create_dir_all(&rel_dir);
+                let _ = std::fs::copy(&abs, stash_dir.join(&p));
+                stashed_paths.push(p);
+            }
+        }
+
         if include_untracked || self.include_untracked {
             for entry in status.untracked() {
-                let _ = repo.add(entry.path(), Default::default());
-            }
-        }
-
-        // Record changes to stash stack
-        let header = atomic_core::change::ChangeHeader::builder()
-            .message(&format!("stash: {}", stash_message))
-            .build();
-
-        let result = repo.record(header, options);
-
-        // Always switch back to original stack
-        repo.set_current_stack(&original_stack)
-            .map_err(CliError::Repository)?;
-
-        // Handle record result
-        match result {
-            Ok(_outcome) => {
-                // Get stash index for display
-                let stashes = self.list_stashes(repo)?;
-                let stash_ref = stashes
-                    .iter()
-                    .find(|s| s.stack_name == stash_name)
-                    .map(|s| s.reference())
-                    .unwrap_or_else(|| "stash@{0}".to_string());
-
-                print_success(&format!("Saved working copy to {}", stash_ref));
-
-                // Restore working copy to clean state (unless --keep)
-                if !keep && !self.keep {
-                    repo.output_working_copy().map_err(CliError::Repository)?;
-                    print_success("Working copy restored to clean state");
+                let p = entry.path().to_string_lossy().to_string();
+                let abs = repo.root().join(&p);
+                if abs.is_file() {
+                    let rel_dir = stash_dir.join(
+                        std::path::Path::new(&p)
+                            .parent()
+                            .unwrap_or(std::path::Path::new("")),
+                    );
+                    let _ = std::fs::create_dir_all(&rel_dir);
+                    let _ = std::fs::copy(&abs, stash_dir.join(&p));
+                    stashed_paths.push(p);
                 }
-
-                Ok(())
-            }
-            Err(e) => {
-                // Clean up: delete the stash stack on failure
-                let _ = repo.delete_stack(&stash_name);
-                Err(CliError::Internal(anyhow::anyhow!(
-                    "Failed to record stash: {}",
-                    e
-                )))
             }
         }
+
+        // Write a manifest so we know which files were stashed
+        let manifest_path = stash_dir.join("MANIFEST");
+        let manifest_content = stashed_paths.join("\n");
+        std::fs::write(&manifest_path, &manifest_content).map_err(|e| {
+            CliError::Internal(anyhow::anyhow!("Failed to write stash manifest: {}", e))
+        })?;
+
+        // Get stash index for display
+        let stashes = self.list_stashes(repo)?;
+        let stash_ref = stashes
+            .iter()
+            .find(|s| s.stack_name == stash_name)
+            .map(|s| s.reference())
+            .unwrap_or_else(|| "stash@{0}".to_string());
+
+        print_success(&format!("Saved working copy to {}", stash_ref));
+
+        // Restore working copy to clean state (unless --keep)
+        if !keep && !self.keep {
+            repo.output_working_copy().map_err(CliError::Repository)?;
+            print_success("Working copy restored to clean state");
+        }
+
+        Ok(())
     }
 
     /// Execute stash pop (apply and delete).
@@ -516,22 +546,47 @@ impl Stash {
     }
 
     /// Apply a stash to the current working copy.
+    ///
+    /// Reads raw file bytes from the sidecar directory
+    /// (`.atomic/stashes/<stash_name>/`) and writes them to disk.
+    /// This is a pure filesystem operation — no graph interaction.
     fn apply_stash(&self, repo: &mut Repository, stash: &StashEntry) -> CliResult<()> {
-        use atomic_repository::apply::CrossStackApplyOptions;
+        let stash_dir = repo.dot_dir().join("stashes").join(&stash.stack_name);
+        let manifest_path = stash_dir.join("MANIFEST");
 
-        let current_stack = repo.current_stack().to_string();
+        if !manifest_path.exists() {
+            return Err(CliError::Internal(anyhow::anyhow!(
+                "Stash sidecar not found: {}",
+                manifest_path.display()
+            )));
+        }
 
-        // Apply changes from stash stack to current stack
-        let options =
-            CrossStackApplyOptions::new(&stash.stack_name, &current_stack).with_dependencies(true);
+        let manifest = std::fs::read_to_string(&manifest_path).map_err(|e| {
+            CliError::Internal(anyhow::anyhow!("Failed to read stash manifest: {}", e))
+        })?;
 
-        let outcome = repo
-            .apply_from_stack(options)
-            .map_err(|e| CliError::Conflict {
-                description: format!("Failed to apply stash: {}", e),
-            })?;
+        let repo_root = repo.root().to_path_buf();
+        let mut files_restored = 0usize;
 
-        if outcome.has_applied() {
+        for line in manifest.lines() {
+            let path = line.trim();
+            if path.is_empty() {
+                continue;
+            }
+            let src = stash_dir.join(path);
+            let dst = repo_root.join(path);
+
+            if src.is_file() {
+                if let Some(parent) = dst.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if std::fs::copy(&src, &dst).is_ok() {
+                    files_restored += 1;
+                }
+            }
+        }
+
+        if files_restored > 0 {
             print_success(&format!("Applied {} to working copy", stash.reference()));
         } else {
             print_warning("Stash was already applied or is empty");
@@ -595,11 +650,17 @@ impl Stash {
     fn run_drop(&self, repo: &mut Repository, stash_ref: Option<&str>) -> CliResult<()> {
         let stash = self.parse_stash_ref(repo, stash_ref)?;
 
+        // Delete the sidecar directory
+        let stash_dir = repo.dot_dir().join("stashes").join(&stash.stack_name);
+        if stash_dir.exists() {
+            let _ = std::fs::remove_dir_all(&stash_dir);
+        }
+
+        // Delete the stash stack
         repo.delete_stack(&stash.stack_name)
             .map_err(CliError::Repository)?;
 
         print_success(&format!("Dropped {}", stash.reference()));
-
         Ok(())
     }
 

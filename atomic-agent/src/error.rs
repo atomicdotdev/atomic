@@ -234,7 +234,7 @@ pub enum AgentError {
     StackError {
         /// "create", "open", or "switch".
         operation: String,
-        /// The stack name (e.g., "agent/2026-01-15-abc123").
+        /// The stack name (e.g., "agent-2026-01-15-abc123").
         stack_name: String,
         /// What went wrong.
         reason: String,
