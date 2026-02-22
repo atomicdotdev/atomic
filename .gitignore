@@ -161,3 +161,6 @@ fuzz/artifacts/
 # - All source code in src/
 
 # =============================================================================
+
+packages/node_modules/
+packages/dist/
