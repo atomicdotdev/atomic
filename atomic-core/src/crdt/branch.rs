@@ -292,6 +292,35 @@ pub enum BranchOp {
         content: Vec<LeafOp>,
     },
 
+    /// Modify an existing line (replace its content).
+    ///
+    /// This is a first-class semantic operation: the line's identity is
+    /// preserved but its content changed.  Unlike a Delete+Insert pair,
+    /// a Modify explicitly carries both the old and new content so that
+    /// every consumer (CLI, WebUI, API) can render word-level diffs
+    /// without heuristic re-pairing.
+    ///
+    /// At the graph layer a Modify is equivalent to deleting the old
+    /// branch and inserting a new one, but at the semantic layer it
+    /// preserves the relationship between old and new — enabling:
+    ///
+    /// - Side-by-side diff alignment (the two lines occupy the same row)
+    /// - Token-level highlighting (word-diff within the line)
+    /// - Accurate blame (the line was *changed*, not removed + added)
+    ///
+    /// # Backward Compatibility
+    ///
+    /// Older changes that lack Modify will still have Delete+Insert
+    /// pairs.  Display code should handle both representations.
+    Modify {
+        /// The branch being modified.
+        branch: BranchId,
+        /// The old content of the line (tokens before the change).
+        old_content: Vec<LeafOp>,
+        /// The new content of the line (tokens after the change).
+        new_content: Vec<LeafOp>,
+    },
+
     /// Restore a deleted line.
     ///
     /// Returns the line to the alive state.
@@ -309,6 +338,7 @@ impl BranchOp {
         match self {
             BranchOp::Insert { .. } => None,
             BranchOp::Delete { branch, .. } => Some(*branch),
+            BranchOp::Modify { branch, .. } => Some(*branch),
             BranchOp::Restore { branch } => Some(*branch),
         }
     }
@@ -319,14 +349,48 @@ impl BranchOp {
         matches!(self, BranchOp::Insert { .. })
     }
 
+    /// Returns `true` if this is a modify operation.
+    #[inline]
+    pub fn is_modify(&self) -> bool {
+        matches!(self, BranchOp::Modify { .. })
+    }
+
     /// Returns the content of the operation (for Insert or Delete).
     ///
+    /// For Modify, returns the **new** content.
     /// Returns `None` for `Restore` operations.
     pub fn content(&self) -> Option<&[LeafOp]> {
         match self {
             BranchOp::Insert { content, .. } => Some(content),
             BranchOp::Delete { content, .. } => Some(content),
+            BranchOp::Modify { new_content, .. } => Some(new_content),
             BranchOp::Restore { .. } => None,
+        }
+    }
+
+    /// Returns the old content for a Delete or Modify operation.
+    ///
+    /// For Delete, this is the content at deletion time.
+    /// For Modify, this is the content before the change.
+    /// Returns `None` for Insert and Restore.
+    pub fn old_content(&self) -> Option<&[LeafOp]> {
+        match self {
+            BranchOp::Delete { content, .. } => Some(content),
+            BranchOp::Modify { old_content, .. } => Some(old_content),
+            _ => None,
+        }
+    }
+
+    /// Returns the new content for an Insert or Modify operation.
+    ///
+    /// For Insert, this is the initial content.
+    /// For Modify, this is the content after the change.
+    /// Returns `None` for Delete and Restore.
+    pub fn new_content(&self) -> Option<&[LeafOp]> {
+        match self {
+            BranchOp::Insert { content, .. } => Some(content),
+            BranchOp::Modify { new_content, .. } => Some(new_content),
+            _ => None,
         }
     }
 
@@ -347,6 +411,7 @@ impl BranchOp {
         match self {
             BranchOp::Insert { .. } => "insert",
             BranchOp::Delete { .. } => "delete",
+            BranchOp::Modify { .. } => "modify",
             BranchOp::Restore { .. } => "restore",
         }
     }
@@ -372,6 +437,19 @@ impl fmt::Display for BranchOp {
                 write!(f, " ({} tokens)", content.len())
             }
             BranchOp::Delete { branch, .. } => write!(f, "delete {}", branch),
+            BranchOp::Modify {
+                branch,
+                old_content,
+                new_content,
+            } => {
+                write!(
+                    f,
+                    "modify {} ({} → {} tokens)",
+                    branch,
+                    old_content.len(),
+                    new_content.len()
+                )
+            }
             BranchOp::Restore { branch } => write!(f, "restore {}", branch),
         }
     }
@@ -551,7 +629,10 @@ mod tests {
     #[test]
     fn test_branch_op_delete() {
         let branch_id = BranchId::new(NodeId::new(1), 0);
-        let op = BranchOp::Delete { branch: branch_id, content: Vec::new() };
+        let op = BranchOp::Delete {
+            branch: branch_id,
+            content: Vec::new(),
+        };
         assert!(op.is_delete());
         assert!(!op.is_insert());
         assert_eq!(op.branch_id(), Some(branch_id));
@@ -580,7 +661,10 @@ mod tests {
         assert!(format!("{}", insert_op).contains("START"));
 
         let branch_id = BranchId::new(NodeId::new(1), 0);
-        let delete_op = BranchOp::Delete { branch: branch_id, content: Vec::new() };
+        let delete_op = BranchOp::Delete {
+            branch: branch_id,
+            content: Vec::new(),
+        };
         assert!(format!("{}", delete_op).contains("delete"));
 
         let restore_op = BranchOp::Restore { branch: branch_id };

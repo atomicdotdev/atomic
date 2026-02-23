@@ -482,19 +482,48 @@ impl Repository {
             return Err(RecordError::NothingToRecord);
         }
 
-        // Assemble the change
-        // Note: Full globalization requires a write transaction to resolve positions.
-        // For now, we create a simple change with the recorded content.
+        // Assemble the change.
+        //
+        // The globalization pipeline (find_content_vertices, create_deletion_edges)
+        // needs to see ALL content vertices for the file — including those written
+        // to STACK_GRAPH by earlier changes on a local stack.
+        //
+        // A raw ReadTxn only sees the global GRAPH table. For local stacks, the
+        // content vertices live in STACK_GRAPH. Without the overlay, find_content_vertices
+        // returns an empty list, the Replacement atom gets zero deletion edges, and
+        // the old content is never marked as DELETED — causing duplication on output.
+        //
+        // Fix: wrap the ReadTxn in an OverlayTxn for the current stack so that
+        // iter_adjacent / find_block see STACK_GRAPH ∪ GRAPH.
         let txn = self
             .pristine
             .read_txn()
             .map_err(|e| RecordError::Database(e.to_string()))?;
 
+        let stack = txn
+            .get_stack(&self.current_stack)
+            .map_err(|e| RecordError::Database(e.to_string()))?
+            .ok_or_else(|| {
+                RecordError::Database(format!(
+                    "Stack '{}' not found during record assembly",
+                    self.current_stack
+                ))
+            })?;
+
+        let overlay_txn = OverlayTxn::from_stack(&txn, &stack)
+            .map_err(|e| RecordError::Database(e.to_string()))?;
+
         let assembly_options = options.to_assembly_options();
 
-        // Use the assembly module to create the change
-        let assembly_result =
-            assemble_change(&txn, &recorded_files, final_header, &assembly_options)?;
+        // Use the assembly module to create the change.
+        // Pass the overlay transaction so the globalization pipeline can see
+        // vertices in STACK_GRAPH (for local stacks) as well as GRAPH.
+        let assembly_result = assemble_change(
+            &overlay_txn,
+            &recorded_files,
+            final_header,
+            &assembly_options,
+        )?;
 
         let change = assembly_result.into_change();
         stats.dependency_count = change.dependencies().len();

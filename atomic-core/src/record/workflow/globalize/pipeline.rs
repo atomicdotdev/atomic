@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// Globalize all hunks in a recorded file.
 ///
 /// This processes all hunks in a `RecordedFile` and converts them to

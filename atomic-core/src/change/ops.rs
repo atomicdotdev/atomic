@@ -458,6 +458,51 @@ impl LineOps {
         }
     }
 
+    /// Creates a line modify operation (old content → new content).
+    ///
+    /// This is the canonical representation for a modified line.
+    /// Both old and new line numbers should be set via the builder methods.
+    ///
+    /// # Arguments
+    ///
+    /// * `branch_id` - The branch (line) being modified
+    /// * `old_content` - Tokens of the line before the change
+    /// * `new_content` - Tokens of the line after the change
+    pub fn modify(branch_id: BranchId, old_content: Vec<LeafOp>, new_content: Vec<LeafOp>) -> Self {
+        Self {
+            branch_id,
+            operation: BranchOp::Modify {
+                branch: branch_id,
+                old_content,
+                new_content,
+            },
+            old_line_num: None,
+            new_line_num: None,
+            content_range: None,
+        }
+    }
+
+    /// Creates a line modify operation with line numbers.
+    pub fn modify_at(
+        branch_id: BranchId,
+        old_content: Vec<LeafOp>,
+        new_content: Vec<LeafOp>,
+        old_line_num: usize,
+        new_line_num: usize,
+    ) -> Self {
+        Self {
+            branch_id,
+            operation: BranchOp::Modify {
+                branch: branch_id,
+                old_content,
+                new_content,
+            },
+            old_line_num: Some(old_line_num),
+            new_line_num: Some(new_line_num),
+            content_range: None,
+        }
+    }
+
     /// Set the old line number.
     pub fn with_old_line_num(mut self, line_num: usize) -> Self {
         self.old_line_num = Some(line_num);
@@ -529,13 +574,15 @@ impl LineOps {
         &self.operation
     }
 
-    /// Returns the leaf operations (for inserts and deletes).
+    /// Returns the leaf operations (new content for Insert/Modify, old
+    /// content for Delete).
     ///
-    /// Returns an empty slice for restore operations.
+    /// Returns an empty slice for Restore operations.
     pub fn leaf_ops(&self) -> &[LeafOp] {
         match &self.operation {
             BranchOp::Insert { content, .. } => content,
             BranchOp::Delete { content, .. } => content,
+            BranchOp::Modify { new_content, .. } => new_content,
             BranchOp::Restore { .. } => &[],
         }
     }
@@ -553,6 +600,11 @@ impl LineOps {
     /// Returns true if this is a delete operation.
     pub fn is_delete(&self) -> bool {
         matches!(self.operation, BranchOp::Delete { .. })
+    }
+
+    /// Returns true if this is a modify operation.
+    pub fn is_modify(&self) -> bool {
+        matches!(self.operation, BranchOp::Modify { .. })
     }
 
     /// Returns true if this is a restore operation.
@@ -584,6 +636,15 @@ impl fmt::Display for LineOps {
         let op_type = match &self.operation {
             BranchOp::Insert { content, .. } => format!("insert({} tokens)", content.len()),
             BranchOp::Delete { .. } => "delete".to_string(),
+            BranchOp::Modify {
+                old_content,
+                new_content,
+                ..
+            } => format!(
+                "modify({} → {} tokens)",
+                old_content.len(),
+                new_content.len()
+            ),
             BranchOp::Restore { .. } => "restore".to_string(),
         };
         write!(f, "LineOps({}, {})", self.branch_id, op_type)
@@ -655,6 +716,29 @@ impl FileOpsStats {
                         }
                     }
                     BranchOp::Delete { .. } => stats.lines_deleted += 1,
+                    BranchOp::Modify {
+                        new_content,
+                        old_content,
+                        ..
+                    } => {
+                        // A Modify counts as both a deletion and an addition
+                        stats.lines_added += 1;
+                        stats.lines_deleted += 1;
+                        for leaf_op in new_content {
+                            match leaf_op {
+                                LeafOp::Insert { .. } => stats.tokens_added += 1,
+                                LeafOp::Delete { .. } => stats.tokens_deleted += 1,
+                                LeafOp::Replace { .. } => stats.tokens_replaced += 1,
+                                LeafOp::Restore { .. } => {}
+                            }
+                        }
+                        for leaf_op in old_content {
+                            match leaf_op {
+                                LeafOp::Delete { .. } => stats.tokens_deleted += 1,
+                                _ => {}
+                            }
+                        }
+                    }
                     BranchOp::Restore { .. } => stats.lines_restored += 1,
                 }
             }

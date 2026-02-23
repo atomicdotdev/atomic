@@ -394,7 +394,10 @@ impl LineOps {
     pub fn delete(branch_id: BranchId, content: Vec<LeafOp>) -> Self {
         Self {
             branch_id,
-            operation: BranchOp::Delete { branch: branch_id, content },
+            operation: BranchOp::Delete {
+                branch: branch_id,
+                content,
+            },
             token_ops: Vec::new(),
             old_line_num: None,
             new_line_num: None,
@@ -407,7 +410,10 @@ impl LineOps {
     pub fn delete_empty(branch_id: BranchId) -> Self {
         Self {
             branch_id,
-            operation: BranchOp::Delete { branch: branch_id, content: Vec::new() },
+            operation: BranchOp::Delete {
+                branch: branch_id,
+                content: Vec::new(),
+            },
             token_ops: Vec::new(),
             old_line_num: None,
             new_line_num: None,
@@ -424,6 +430,43 @@ impl LineOps {
     pub fn with_new_line_num(mut self, line_num: usize) -> Self {
         self.new_line_num = Some(line_num);
         self
+    }
+
+    /// Creates a line modify operation (old content → new content).
+    ///
+    /// This is the canonical representation for a modified line.  Carries
+    /// both old and new content so every consumer can render word-level
+    /// diffs without heuristic re-pairing.
+    pub fn modify(branch_id: BranchId, old_content: Vec<LeafOp>, new_content: Vec<LeafOp>) -> Self {
+        Self {
+            branch_id,
+            operation: BranchOp::Modify {
+                branch: branch_id,
+                old_content,
+                new_content,
+            },
+            token_ops: Vec::new(),
+            old_line_num: None,
+            new_line_num: None,
+        }
+    }
+
+    /// Returns `true` if this is a delete operation.
+    #[inline]
+    pub fn is_delete(&self) -> bool {
+        matches!(self.operation, BranchOp::Delete { .. })
+    }
+
+    /// Returns `true` if this is an insert operation.
+    #[inline]
+    pub fn is_insert(&self) -> bool {
+        matches!(self.operation, BranchOp::Insert { .. })
+    }
+
+    /// Returns `true` if this is a modify operation.
+    #[inline]
+    pub fn is_modify(&self) -> bool {
+        matches!(self.operation, BranchOp::Modify { .. })
     }
 
     /// Get the old line number.
@@ -575,10 +618,8 @@ impl FileOps {
         );
 
         for line_op in &self.line_ops {
-            let change_line_op = crate::change::ops::LineOps::new(
-                line_op.branch_id(),
-                line_op.operation().clone(),
-            );
+            let change_line_op =
+                crate::change::ops::LineOps::new(line_op.branch_id(), line_op.operation().clone());
             result.add_line_op(change_line_op);
         }
 
@@ -587,19 +628,13 @@ impl FileOps {
 
     /// Consume and convert to the serializable `change::ops::FileOps` type.
     pub fn into_change_ops(self) -> crate::change::ops::FileOps {
-        let mut result = crate::change::ops::FileOps::new(
-            self.trunk_id,
-            self.path,
-            self.trunk_op,
-        );
+        let mut result = crate::change::ops::FileOps::new(self.trunk_id, self.path, self.trunk_op);
 
         for line_op in self.line_ops {
             let old_line_num = line_op.old_line_num();
             let new_line_num = line_op.new_line_num();
-            let mut change_line_op = crate::change::ops::LineOps::new(
-                line_op.branch_id(),
-                line_op.into_operation(),
-            );
+            let mut change_line_op =
+                crate::change::ops::LineOps::new(line_op.branch_id(), line_op.into_operation());
             // Preserve line numbers if set
             if let Some(n) = old_line_num {
                 change_line_op = change_line_op.with_old_line_num(n);
@@ -672,10 +707,7 @@ impl CrdtChangeResult {
 
     /// Returns all trunk operations.
     pub fn trunk_ops(&self) -> Vec<&TrunkOp> {
-        self.file_ops
-            .iter()
-            .filter_map(|f| f.trunk_op())
-            .collect()
+        self.file_ops.iter().filter_map(|f| f.trunk_op()).collect()
     }
 
     /// Returns all branch operations with their IDs.
@@ -987,11 +1019,7 @@ impl CrdtChangeBuilder {
             self.file_ops[file_idx].add_line_op(line_op);
         } else {
             // Branch not in index - create a placeholder file op
-            let file_op = FileOps::new(
-                TrunkId::new(NodeId::new(0), 0),
-                String::new(),
-                None,
-            );
+            let file_op = FileOps::new(TrunkId::new(NodeId::new(0), 0), String::new(), None);
             let mut file_op = file_op;
             file_op.add_line_op(line_op);
             self.file_ops.push(file_op);
@@ -1332,10 +1360,13 @@ mod tests {
     fn test_line_ops_add_token_op() {
         let branch_id = BranchId::new(NodeId::new(1), 0);
         let leaf_id = LeafId::new(NodeId::new(1), 0);
-        let mut line_ops = LineOps::new(branch_id, BranchOp::Insert {
-            after: None,
-            content: vec![],
-        });
+        let mut line_ops = LineOps::new(
+            branch_id,
+            BranchOp::Insert {
+                after: None,
+                content: vec![],
+            },
+        );
 
         line_ops.add_token_op(TokenOps::new(leaf_id, LeafOp::Delete { leaf: leaf_id }));
 

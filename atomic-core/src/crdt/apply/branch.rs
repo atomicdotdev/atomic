@@ -104,6 +104,25 @@ pub fn apply_branch_op<T: MutCrdtTxnT>(
             content: leaf_ops,
         } => apply_insert(txn, context, trunk_id, branch_id, *after, leaf_ops, content),
         BranchOp::Delete { branch, .. } => apply_delete(txn, context, *branch),
+        BranchOp::Modify {
+            branch,
+            new_content,
+            ..
+        } => {
+            // A Modify is semantically a delete-then-insert at the graph
+            // layer.  Delete the old branch and insert a new one with the
+            // new content.
+            apply_delete(txn, context, *branch)?;
+            apply_insert(
+                txn,
+                context,
+                trunk_id,
+                branch_id,
+                Some(*branch),
+                new_content,
+                content,
+            )
+        }
         BranchOp::Restore { branch } => apply_restore(txn, context, *branch),
     }
 }
@@ -131,6 +150,12 @@ pub fn apply_branch_op_only<T: MutCrdtTxnT>(
             apply_insert_only(txn, context, trunk_id, branch_id, *after)
         }
         BranchOp::Delete { branch, .. } => apply_delete(txn, context, *branch),
+        BranchOp::Modify { branch, .. } => {
+            // At the graph layer, a Modify deletes the old branch and
+            // inserts a new one in its place.
+            apply_delete(txn, context, *branch)?;
+            apply_insert_only(txn, context, trunk_id, branch_id, Some(*branch))
+        }
         BranchOp::Restore { branch } => apply_restore(txn, context, *branch),
     }
 }

@@ -282,6 +282,31 @@ fn apply_line_ops_with_position<T: MutTxnT>(
             stats.branches_deleted += 1;
         }
 
+        BranchOp::Modify { new_content, .. } => {
+            // A Modify is semantically a delete-then-insert at the storage
+            // layer: mark the old branch deleted, create a new one with the
+            // new content.  The old_content is carried only for diff display
+            // and is not persisted separately.
+            update_branch_state(txn, branch_id, BranchState::Deleted)?;
+            stats.branches_deleted += 1;
+
+            // Create the replacement branch (reuse branch_id — the CRDT
+            // model allows this because the Modify preserves line identity)
+            let serialized = SerializedBranch {
+                trunk_id,
+                state: BranchState::Alive,
+                line_hash: 0,
+            };
+            put_branch(txn, trunk_id, branch_id, &serialized)?;
+            stats.branches_created += 1;
+
+            // Apply leaf operations for the new content
+            for (leaf_idx, leaf_op) in new_content.iter().enumerate() {
+                let leaf_id = LeafId::new(branch_id.change_id(), leaf_idx as u32);
+                apply_leaf_op(txn, branch_id, leaf_id, leaf_op, stats)?;
+            }
+        }
+
         BranchOp::Restore { .. } => {
             update_branch_state(txn, branch_id, BranchState::Alive)?;
             stats.branches_restored += 1;

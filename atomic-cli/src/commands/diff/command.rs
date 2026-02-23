@@ -866,6 +866,36 @@ impl Diff {
                             deletions += 1;
                             current_hunk.old_count += 1;
                         }
+                        BranchOp::Modify {
+                            old_content,
+                            new_content,
+                            ..
+                        } => {
+                            // A Modify carries both old and new content.
+                            // Emit them as adjacent removed + added lines
+                            // so print_unified can pair them for word-level
+                            // highlighting.
+                            let old_line_content = if old_content.is_empty() {
+                                String::from("<modified line>")
+                            } else {
+                                Self::reconstruct_line_from_leaf_ops(old_content)
+                            };
+                            let new_line_content =
+                                Self::reconstruct_line_from_leaf_ops(new_content);
+
+                            let old_ln = line_op.old_line_num().unwrap_or(old_line_num);
+                            let new_ln = line_op.new_line_num().unwrap_or(new_line_num);
+
+                            current_hunk.add_line(HunkLine::removed(old_line_content, old_ln));
+                            current_hunk.add_line(HunkLine::added(new_line_content, new_ln));
+
+                            old_line_num = old_ln + 1;
+                            new_line_num = new_ln + 1;
+                            deletions += 1;
+                            insertions += 1;
+                            current_hunk.old_count += 1;
+                            current_hunk.new_count += 1;
+                        }
                         BranchOp::Restore { .. } => {
                             // Restore is like an add for display purposes
                             let line_num = line_op.new_line_num().unwrap_or(new_line_num);

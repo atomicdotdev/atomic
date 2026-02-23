@@ -349,13 +349,18 @@ impl TurnOrchestrator {
             session.set_transcript_path(path);
         }
 
-        // Extract model from SessionStart raw_json if present.
+        // Extract model and provider from SessionStart raw_json if present.
         // Claude Code sends: {"model": "claude-sonnet-4-5-20250929", "source": "startup", ...}
-        // See: https://code.claude.com/docs/en/hooks#sessionstart-input
+        // OpenCode sends:    {"model": "claude-opus-4-5", "provider": "anthropic", ...}
         if let Some(ref raw) = event.raw_json {
             if let Some(model) = raw.get("model").and_then(|v| v.as_str()) {
                 if !model.is_empty() {
                     session.model = model.to_string();
+                }
+            }
+            if let Some(provider) = raw.get("provider").and_then(|v| v.as_str()) {
+                if !provider.is_empty() {
+                    session.agent_vendor = provider.to_string();
                 }
             }
         }
@@ -451,6 +456,23 @@ impl TurnOrchestrator {
             session.set_transcript_path(path);
         }
 
+        // Extract model/provider from raw_json if present.
+        // OpenCode sends: {"model": "claude-opus-4-5", "provider": "anthropic", ...}
+        // This is the most reliable source of model info — it comes from the
+        // chat.message hook which fires at the start of every turn.
+        if let Some(ref raw) = event.raw_json {
+            if let Some(model) = raw.get("model").and_then(|v| v.as_str()) {
+                if !model.is_empty() {
+                    session.model = model.to_string();
+                }
+            }
+            if let Some(provider) = raw.get("provider").and_then(|v| v.as_str()) {
+                if !provider.is_empty() {
+                    session.agent_vendor = provider.to_string();
+                }
+            }
+        }
+
         // Begin file watching for this turn
         if let Err(e) = self.watcher.begin_turn(session_id).await {
             log::warn!(
@@ -506,6 +528,24 @@ impl TurnOrchestrator {
         let session_id = &event.session_id;
 
         let mut session = self.load_or_create_session(session_id, &event)?;
+
+        // Extract model/provider from the TurnEnd event's raw_json.
+        // OpenCode sends model and provider in every stop payload.
+        // This is the last chance to capture the info before recording,
+        // in case TurnStart didn't have it (e.g., session was created
+        // outside the plugin, or the chat.message hook didn't fire).
+        if let Some(ref raw) = event.raw_json {
+            if let Some(model) = raw.get("model").and_then(|v| v.as_str()) {
+                if !model.is_empty() {
+                    session.model = model.to_string();
+                }
+            }
+            if let Some(provider) = raw.get("provider").and_then(|v| v.as_str()) {
+                if !provider.is_empty() {
+                    session.agent_vendor = provider.to_string();
+                }
+            }
+        }
 
         // Release the watcher if it was active (best-effort, ignore errors)
         if self.watcher.is_active() {
