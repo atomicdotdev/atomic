@@ -1,20 +1,95 @@
 # Atomic
 
-A mathematically sound distributed version control system.
+A mathematically sound distributed version control system — built for the age of AI.
 
-## Overview
+## Why Atomic?
 
-Atomic is a next-generation VCS built on **patch theory** — representing changes as composable, commutative operations on a directed graph. Unlike line-based systems (Git, Mercurial), Atomic tracks the semantic structure of changes, enabling:
+Git was designed for humans writing code in text editors. It tracks lines in files. That worked for 20 years.
 
-- **Conflict-free merges** when changes are truly independent
-- **Precise conflict detection** when real conflicts exist
-- **Accurate rename tracking** across the entire history
-- **Cherry-picking and reverting** that actually work
-- **AI attribution & provenance** — every line traces back to an agent, model, and context
+Now AI agents write most of the code. They work in sessions and turns, use multiple models, cost money per token, and produce changes that need to be audited, attributed, and explained. Git doesn't know about any of this — you're bolting on external tools to answer basic questions like "which model wrote this?" or "how much did this session cost?"
 
-## Status
+Atomic is version control that understands AI-assisted development from the ground up.
 
-🚧 **Under Development** — Not yet ready for production use.
+## Atomic vs Git for Agentic Workflows
+
+| | Git | Atomic |
+|---|---|---|
+| **Change model** | Line-based diffs | Patch theory — composable operations on a DAG |
+| **AI attribution** | None — commits say "Co-authored-by" in prose | Every change records model, provider, session, tokens, and cost |
+| **Provenance** | Not tracked | Causal decision graph: goal → exploration → commitment → verification |
+| **Attestation** | Not tracked | Session-level audit nodes with cost, token breakdown, and change coverage |
+| **Turn recording** | Manual commits or wrapper scripts | Automatic — each agent turn is a change with full metadata |
+| **Agent isolation** | Branches diverge and need merging | Stacks are views of the same graph — isolated agent work, zero-orphan cleanup |
+| **Conflict granularity** | Whole lines | Token-level — two agents editing different tokens on the same line don't conflict |
+| **Identity** | Name + email string | Ed25519 cryptographic identity with agent delegation scopes |
+| **Merge correctness** | Heuristic 3-way merge | Mathematical — commutative when changes are independent, precise when they're not |
+| **Rename tracking** | Heuristic similarity matching | Structural — inodes survive renames across the entire history |
+
+## How It Works
+
+### Automatic Turn Recording
+
+Enable agent hooks once. Every turn is recorded automatically.
+
+```bash
+# Enable for your agent (auto-detects Claude Code, Gemini CLI, OpenCode)
+atomic agent enable
+
+# That's it. Every agent turn now produces an Atomic change with:
+#   - Model and provider identity
+#   - Session and turn number
+#   - Token usage and cost
+#   - Cryptographic signature
+#   - Provenance graph (why the agent made each decision)
+```
+
+### Provenance Graphs
+
+Every agent session builds a causal decision DAG. Not just *what* changed, but *why*:
+
+```
+Goal: "Fix the authentication bug"
+  ├── Exploration: read src/auth.rs
+  ├── Exploration: grep "verify_token"
+  ├── Commitment: edit src/auth.rs (fix token validation)
+  ├── Verification: bash "cargo test"
+  └── PatchProposal: Change XMJZ3IPF (2 files)
+```
+
+These graphs are content-addressed, stored alongside changes, and pushed to remotes. Your team can review not just the code, but the agent's reasoning.
+
+### Attestations
+
+When a session ends, Atomic creates an attestation — a graph-level audit node covering the session:
+
+```bash
+$ atomic agent attest
+
+  XMJZ3IPF OpenCode · claude-sonnet-4-5 · 12.4k tokens · 3m 42s · 2 changes
+  R3KQP7YN Claude Code · claude-sonnet-4-5 · 8.1k tokens · 1m 15s · 1 change
+
+──────────────────────────────────────────
+Total: $0.12 · 3 changes covered · 20.5k tokens
+```
+
+### Stacks, Not Branches
+
+Agents work on isolated stacks — lightweight views of the same underlying graph. No branch divergence, no merge commits, no orphaned history.
+
+```bash
+# Agent session creates an isolated stack automatically
+# Stack: agent-ses_3781fc7a6ffet5c6r1ILy1BEbv (Local, parent: dev)
+
+# When done, apply changes to the parent stack
+atomic apply @~1 --to dev
+
+# Delete the agent stack — cascade-deletes its edges, zero orphans
+atomic stack delete agent-ses_3781fc7a6ffet5c6r1ILy1BEbv
+```
+
+### Token-Level Diff
+
+Atomic's CRDT semantic layer (Trunk → Branch → Leaf) tracks changes at the token level. Two agents editing different words on the same line produce independent patches that merge cleanly — Git would flag this as a conflict.
 
 ## Quick Start
 
@@ -26,7 +101,10 @@ atomic init
 atomic add src/
 atomic record -m "Initial commit"
 
-# Create a stack (view of graph)
+# Enable AI agent hooks
+atomic agent enable
+
+# Create a stack
 atomic stack new feature-x
 
 # Push to a remote
@@ -37,7 +115,7 @@ atomic push origin
 
 ### Patch Theory
 
-Traditional VCS systems store snapshots or line-based diffs. Atomic stores **patches** — well-defined transformations on a graph structure. This mathematical foundation means:
+Changes are composable, commutative operations on a directed graph:
 
 - Merging `A` then `B` gives the same result as merging `B` then `A` (when no conflicts)
 - Every change has a well-defined inverse
@@ -45,34 +123,14 @@ Traditional VCS systems store snapshots or line-based diffs. Atomic stores **pat
 
 ### The Repository Graph
 
-Files are represented as directed acyclic graphs (DAGs) where:
-- **Vertices** = chunks of content (typically lines)
-- **Edges** = ordering relationships between chunks
-- **Changes** = transformations that add/remove vertices and edges
+Files are directed acyclic graphs (DAGs) where vertices hold content chunks, edges define ordering, and changes are transformations that add or remove vertices and edges. This is not a commit graph — it's the actual file structure.
 
-### Stacks
-
-Stacks are named views of the repository at a particular state. Multiple stacks can share the same underlying storage, differing only in which changes have been applied. Stacks are **not** branches — they are perspectives on the same graph.
-
-### Dual-Layer Diff
+### Dual-Layer Architecture
 
 Every change stores two parallel representations:
 
 - **Graph layer** — Content-addressed nodes and edges for mathematically sound merging
 - **Semantic layer** — Files (Trunk), Lines (Branch), Tokens (Leaf) for human-readable diffs and token-level blame
-
-This dual-layer architecture means Atomic can merge at the token level — resolving "conflicts" that Git would flag when two developers edit the same line but different tokens.
-
-### AI Agent Integration
-
-Atomic natively supports AI coding agents through the `atomic agent` command. When enabled, every agent turn is automatically recorded as an Atomic change with full provenance:
-
-- **Model & provider** — Which AI and which model generated the change
-- **Token usage & cost** — Resource consumption per turn
-- **Session tracking** — Turn numbers, timing, and conversation context
-- **Cryptographic identity** — Every agent change is attributable via Ed25519 signatures
-
-Supported agents: Claude Code, Gemini CLI, OpenCode.
 
 ## CLI Reference
 
@@ -135,8 +193,6 @@ Supported agents: Claude Code, Gemini CLI, OpenCode.
 
 ### Agent Commands
 
-Manage AI agent integration for turn-level recording.
-
 | Command | Description |
 |---------|-------------|
 | `atomic agent enable` | Install agent hooks (auto-detect or `--agent claude-code`) |
@@ -155,90 +211,13 @@ Manage AI agent integration for turn-level recording.
 
 ## Documentation
 
-Full documentation is available at [docs.atomic.dev](https://docs.atomic.dev/).
+Full documentation at **[docs.atomic.dev](https://docs.atomic.dev/)**.
 
 - [Getting Started](https://docs.atomic.dev/getting-started/installation) — Installation and first repository
 - [Concepts](https://docs.atomic.dev/concepts/the-lego-story) — How Atomic works under the hood
+- [Agent Integration](https://docs.atomic.dev/agents/overview) — Setting up AI agent hooks
 - [Command Reference](https://docs.atomic.dev/commands/overview) — Complete CLI reference
-- [AGENTS.md](AGENTS.md) — Comprehensive development guide for AI agents
-
-## Project Structure
-
-```
-atomic/
-├── atomic-cli/               # CLI application
-│   └── src/
-│       ├── commands/
-│       │   ├── init.rs        # Repository initialization
-│       │   ├── status.rs      # Working copy status
-│       │   ├── add.rs         # File tracking
-│       │   ├── record.rs      # Change recording
-│       │   ├── revise.rs      # In-place change modification
-│       │   ├── diff.rs        # Working copy differences
-│       │   ├── log.rs         # Change history
-│       │   ├── stack/         # Stack management
-│       │   ├── stash.rs       # Temporary change storage
-│       │   ├── identity/      # Identity management
-│       │   ├── agent/         # AI agent integration
-│       │   ├── push/          # Remote push
-│       │   ├── pull/          # Remote pull
-│       │   ├── clone/         # Remote clone
-│       │   ├── remote/        # Remote management
-│       │   └── tag/           # Tag management
-│       ├── error.rs           # CLI error types
-│       └── output/            # Terminal output formatting
-├── atomic-core/              # Core VCS engine
-│   ├── change/                # Change representation & provenance
-│   ├── diff/                  # Diff algorithms (Myers, Patience, word-level)
-│   ├── crdt/                  # Hierarchical CRDT (Trunk → Branch → Leaf)
-│   ├── pristine/              # Storage layer (redb)
-│   ├── record/                # Change recording workflow
-│   ├── apply/                 # Change application
-│   └── output/                # Working copy output
-├── atomic-agent/             # AI agent integration
-│   ├── hooks/                 # Agent adapters (Claude Code, Gemini CLI, OpenCode)
-│   ├── turn/                  # Turn orchestrator & state machine
-│   ├── watcher/               # File change detection
-│   ├── record.rs              # Turn recording workflow
-│   ├── envelope.rs            # Session metadata encoding
-│   ├── identity.rs            # Agent identity resolution
-│   ├── transcript.rs          # Transcript parsing & reasoning
-│   └── learnings.rs           # Knowledge flywheel (CLAUDE.md, GEMINI.md, etc.)
-├── atomic-config/            # Configuration management
-├── atomic-identity/          # User identity & Ed25519 signing
-│   ├── identity.rs            # Identity types & builder
-│   ├── keypair.rs             # Ed25519 key generation & signing
-│   ├── signing.rs             # Signature creation & verification
-│   ├── delegation.rs          # Agent delegation support
-│   ├── usage.rs               # Usage contexts (personal, work, bot)
-│   └── store.rs               # Identity persistence
-└── atomic-repository/        # High-level repository operations
-    ├── repository.rs          # Main Repository struct
-    ├── status.rs              # Working copy status
-    ├── tracking.rs            # File tracking
-    ├── history.rs             # Change history
-    ├── apply.rs               # Change application
-    ├── tags.rs                # Named state snapshots
-    ├── unrecord.rs            # Change removal
-    ├── archive.rs             # Repository export
-    └── ignore.rs              # .atomicignore pattern matching
-```
-
-### Related Projects
-
-| Project | Location | Description |
-|---------|----------|-------------|
-| **atomic-api** | `atomic-enterprise/atomic-api` | Rust/Axum HTTP API for remote push/pull/clone, multi-tenant repository hosting |
-| **atomic-remote-client** | `atomic-enterprise/atomic-remote` | HTTP client library for remote operations |
-| **atomic-docs** | `atomic-docs/` | Documentation site at [docs.atomic.dev](https://docs.atomic.dev/) |
-
-## Design Principles
-
-1. **Mathematical Soundness** — Operations are well-defined transformations with provable properties
-2. **Efficiency** — O(n) file operations via smart indexing, not O(N) repository-wide scans
-3. **Correctness Over Speed** — Validate invariants aggressively, prefer clarity over micro-optimizations
-4. **Clean Separation** — Core engine has minimal dependencies, storage is abstracted
-5. **Cryptographic Identity** — Every change is attributable via Ed25519 signatures
+- [AGENTS.md](AGENTS.md) — Development guide for contributors and AI agents
 
 ## Building
 
@@ -249,30 +228,44 @@ cargo build --release
 # Run tests
 cargo test
 
-# Run just CLI tests
-cargo test -p atomic-cli
-
 # Install CLI
 cargo install --path atomic-cli
 
 # Verify installation
 atomic --version
-atomic --help
 ```
 
-## Test Coverage
+## Project Structure
 
-| Crate | Tests | Description |
-|-------|-------|-------------|
-| atomic-core | 2,789 | Types, pristine, change, diff, record, apply, output, CRDT |
-| atomic-agent | 691 | Hooks, events, turn orchestrator, recording, identity, learnings |
-| atomic-repository | 497 | Repository, status, tracking, history, tags, apply, archive |
-| atomic-identity | 79 | Identity, keypair, signing, delegation, store |
-| **Total** | **4,600+** | All passing |
+```
+atomic/
+├── atomic-cli/               # CLI application
+├── atomic-core/              # Core VCS engine (types, pristine, change, diff, CRDT)
+├── atomic-agent/             # AI agent integration (hooks, turns, provenance)
+├── atomic-config/            # Configuration management
+├── atomic-identity/          # User identity & Ed25519 signing
+└── atomic-repository/        # High-level repository operations
+```
+
+### Related Projects
+
+| Project | Location | Description |
+|---------|----------|-------------|
+| **atomic-api** | `atomic-enterprise/atomic-api` | HTTP API for remote operations and multi-tenant hosting |
+| **atomic-remote-client** | `atomic-enterprise/atomic-remote` | HTTP client library for push/pull/clone |
+| **atomic-docs** | `atomic-docs/` | Documentation site ([docs.atomic.dev](https://docs.atomic.dev/)) |
+
+## Design Principles
+
+1. **Mathematical Soundness** — Operations are well-defined transformations with provable properties
+2. **AI-Native** — Provenance, attestation, and agent identity are core concepts, not afterthoughts
+3. **Correctness Over Speed** — Validate invariants aggressively, prefer clarity over micro-optimizations
+4. **Efficiency** — O(n) file operations via inode indexing, not O(N) repository-wide scans
+5. **Cryptographic Identity** — Every change is attributable via Ed25519 signatures
 
 ## Why "Atomic"?
 
-Because version control should have **no doubt** about what changed, when, and why. Every change is a well-defined, composable transformation — atomic in the mathematical sense.
+Because version control should have **no doubt** about what changed, when, why, and who — human or machine. Every change is a well-defined, composable transformation. Atomic in the mathematical sense.
 
 ## License
 
