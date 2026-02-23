@@ -62,6 +62,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
+use crate::provenance::accumulator::ProvenanceAccumulator;
 use crate::record::{record_turn, TurnRecordOptions, TurnRecordOutcome};
 use crate::turn::phase::{self, Action, Event, Phase, TransitionContext};
 use crate::turn::session::{AgentSession, SessionStore};
@@ -505,6 +506,17 @@ impl TurnOrchestrator {
             }
         }
 
+        // Provenance: append a goal node from the user's prompt.
+        // Best-effort — failures are logged but never block the session.
+        if let Some(ref prompt) = event.prompt {
+            if !prompt.is_empty() {
+                if let Some(mut acc) = self.load_accumulator(session_id) {
+                    acc.append_goal(prompt, event.timestamp.timestamp());
+                    self.save_accumulator(session_id, &acc);
+                }
+            }
+        }
+
         self.session_store.save(&session)?;
 
         Ok(dispatch)
@@ -593,6 +605,10 @@ impl TurnOrchestrator {
                             // Track the recorded files in the session
                             let recorded_files: Vec<String> = outcome.recorded_file_list().to_vec();
                             session.add_files_touched(&recorded_files);
+
+                            // Provenance: append a patch proposal node and save
+                            // the provenance graph to the repository.
+                            self.save_turn_provenance(session_id, &session, &outcome, &event);
 
                             log::info!(
                                 "Recorded turn {} for session {}: {}",
@@ -762,12 +778,37 @@ impl TurnOrchestrator {
             );
         }
 
-        // Sub-turn recording for sub-agent tools (Task) is planned but not
-        // yet implemented. The design is:
-        //   1. Take a watcher snapshot at PreToolUse
-        //   2. Diff at PostToolUse to get sub-agent file changes
-        //   3. Create a sub-turn recording with the sub-agent's identity
-        // See ATOMIC-AGENT-TASKS.md Phase 17.3 for details.
+        // Provenance: append tool call nodes on PostToolUse.
+        //
+        // PreToolUse doesn't have output or duration yet, so we only
+        // record on PostToolUse where the full picture is available.
+        // The classifier uses tool name + input + output to determine
+        // the node kind (Exploration, Commitment, Verification, etc.).
+        if event.event_type == HookType::PostToolUse {
+            if let Some(mut acc) = self.load_accumulator(session_id) {
+                let tool_name = event.tool_name.as_deref().unwrap_or("unknown");
+                let tool_call_id = event.tool_use_id.as_deref();
+
+                // Extract tool_input, tool_output, status, duration from raw_json
+                let raw = event.raw_json.as_ref();
+                let tool_input = raw.and_then(|r| r.get("tool_input"));
+                let tool_output = raw.and_then(|r| r.get("tool_output").and_then(|v| v.as_str()));
+                let status = raw.and_then(|r| r.get("status").and_then(|v| v.as_str()));
+                let duration_ms = raw.and_then(|r| r.get("duration").and_then(|v| v.as_u64()));
+
+                acc.append_tool_call(
+                    tool_name,
+                    tool_call_id,
+                    tool_input,
+                    tool_output,
+                    status,
+                    duration_ms,
+                    event.timestamp.timestamp(),
+                );
+
+                self.save_accumulator(session_id, &acc);
+            }
+        }
 
         Ok(DispatchResult::new(session_id, session.phase))
     }
@@ -814,6 +855,129 @@ impl TurnOrchestrator {
 /// `"model": "claude-sonnet-4-5-20250929"`). We don't guess the model —
 /// only the vendor, which is deterministic from the agent name.
 impl TurnOrchestrator {
+    // =========================================================================
+    // Provenance graph helpers
+    // =========================================================================
+
+    /// Get the session directory for provenance graph storage.
+    ///
+    /// Returns `{sessions_dir}/{session_id}/` — a subdirectory alongside
+    /// the session's JSON file. The `ProvenanceAccumulator` stores its
+    /// `graph.json` here.
+    fn session_graph_dir(&self, session_id: &str) -> PathBuf {
+        self.session_store.sessions_dir().join(session_id)
+    }
+
+    /// Load or create the provenance accumulator for a session.
+    ///
+    /// Best-effort: returns `None` on failure (logged, never fatal).
+    fn load_accumulator(&self, session_id: &str) -> Option<ProvenanceAccumulator> {
+        let dir = self.session_graph_dir(session_id);
+        match ProvenanceAccumulator::load_or_create(&dir, session_id) {
+            Ok(acc) => Some(acc),
+            Err(e) => {
+                log::warn!(
+                    "Failed to load provenance accumulator for {}: {}",
+                    session_id,
+                    e,
+                );
+                None
+            }
+        }
+    }
+
+    /// Save the provenance accumulator for a session.
+    ///
+    /// Best-effort: failures are logged but never fatal.
+    fn save_accumulator(&self, session_id: &str, acc: &ProvenanceAccumulator) {
+        let dir = self.session_graph_dir(session_id);
+        if let Err(e) = acc.save(&dir) {
+            log::warn!(
+                "Failed to save provenance accumulator for {}: {}",
+                session_id,
+                e,
+            );
+        }
+    }
+
+    /// Save the provenance graph for a recorded turn.
+    ///
+    /// Appends a patch proposal node to the accumulator, converts to a
+    /// content-addressed `ProvenanceGraph`, and saves it to the repository.
+    /// The accumulator's `last_provenance_hash` is updated so subsequent
+    /// graphs chain correctly via `previous`.
+    ///
+    /// Best-effort: all failures are logged but never block the session.
+    fn save_turn_provenance(
+        &self,
+        session_id: &str,
+        session: &AgentSession,
+        outcome: &TurnRecordOutcome,
+        event: &TurnEvent,
+    ) {
+        use atomic_core::types::Base32;
+
+        let mut acc = match self.load_accumulator(session_id) {
+            Some(a) => a,
+            None => return,
+        };
+
+        // Append a patch proposal node for the recorded change
+        let change_hash_base32 = outcome.hash.to_base32();
+        acc.append_patch_proposal(
+            &change_hash_base32,
+            &outcome.recorded_file_list().to_vec(),
+            event.timestamp.timestamp(),
+        );
+
+        // Convert the accumulated graph to a content-addressed ProvenanceGraph
+        let change_hashes = vec![outcome.hash];
+        let graph = acc.to_provenance_graph(
+            &session.agent_name,
+            &session.agent_display_name,
+            &session.agent_vendor,
+            &change_hashes,
+        );
+
+        // Save to the repository
+        match atomic_repository::Repository::open(&self.repo_root) {
+            Ok(repo) => match repo.save_provenance_graph(&graph) {
+                Ok(hash) => {
+                    acc.set_last_provenance_hash(hash.to_base32());
+                    log::info!(
+                        "Saved provenance graph {} for session {} ({} nodes, {} edges, {} changes)",
+                        hash.to_base32(),
+                        session_id,
+                        graph.node_count(),
+                        graph.edge_count(),
+                        graph.change_count(),
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to save provenance graph for session {}: {}",
+                        session_id,
+                        e,
+                    );
+                }
+            },
+            Err(e) => {
+                log::warn!(
+                    "Could not open repository to save provenance graph for session {}: {}",
+                    session_id,
+                    e,
+                );
+            }
+        }
+
+        // Persist the updated accumulator (with last_provenance_hash)
+        self.save_accumulator(session_id, &acc);
+    }
+
+    // =========================================================================
+    // Attestation
+    // =========================================================================
+
     /// Create an attestation covering changes in a session's agent stack.
     ///
     /// On a fresh session, this covers all changes in the stack. On a
@@ -821,21 +985,20 @@ impl TurnOrchestrator {
     /// changes that aren't already covered by a previous attestation,
     /// and chains to that attestation via `previous_attestation`.
     ///
-    /// Cost and token data are NOT estimated here — the transcript format
-    /// makes accurate parsing unreliable (streaming duplicates, missing
-    /// internal model calls, partial output counts). Instead, the
-    /// attestation is created with accurate data we DO have (changes
-    /// covered, agent identity, wall clock duration) and can be enriched
-    /// later via `atomic agent attest --enrich` when authoritative cost
-    /// data is available.
+    /// The attestation is enriched with data from the provenance entries
+    /// embedded in each covered change: model name, token counts, cost,
+    /// and line-level code change statistics. This data was recorded by
+    /// `build_turn_provenance()` at `record_turn()` time.
     ///
     /// Best-effort: if anything fails (repo can't open, stack doesn't exist,
     /// no changes recorded), we log and continue — the session still ended
     /// successfully.
     fn create_session_attestation(&self, session: &AgentSession) {
-        use atomic_core::change::attestation::{AttestAgent, Attestation, CodeChangeStats};
+        use atomic_core::change::attestation::{
+            AttestAgent, Attestation, CodeChangeStats, ModelUsage,
+        };
         use atomic_core::types::Base32;
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
 
         // Open the repository
         let repo = match atomic_repository::Repository::open(&self.repo_root) {
@@ -939,17 +1102,95 @@ impl TurnOrchestrator {
             })
             .unwrap_or(0);
 
-        // Build the attestation with the data we have.
-        // Cost and token data are left at zero — they can't be reliably
-        // parsed from the transcript (streaming duplicates, missing internal
-        // model calls, partial output token counts). Use
-        // `atomic agent attest --enrich` to add authoritative cost data.
-        let vendor = vendor_from_agent_name(&session.agent_name);
+        // Aggregate provenance data from the covered changes.
+        //
+        // Each change carries provenance entries (model, tokens, cost) set by
+        // `build_turn_provenance()` at record time. We aggregate across all
+        // covered changes to populate the attestation with real data instead
+        // of leaving it at zeros.
+        let mut total_cost: f64 = 0.0;
+        let total_api_ms: u64 = 0;
+        let mut lines_added: u64 = 0;
+        let mut lines_removed: u64 = 0;
+        let mut model_agg: HashMap<String, (u64, u64, u64, u64, f64)> = HashMap::new();
+
+        for change_hash in &new_change_hashes {
+            let change = match repo.load_change(change_hash) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::debug!(
+                        "Could not load change {} for attestation enrichment: {}",
+                        change_hash.to_base32(),
+                        e,
+                    );
+                    continue;
+                }
+            };
+
+            // Aggregate provenance (model, tokens, cost) from each change
+            for prov in change.provenance() {
+                total_cost += prov.cost.usd;
+
+                let entry = model_agg
+                    .entry(prov.model.clone())
+                    .or_insert((0, 0, 0, 0, 0.0));
+                entry.0 += prov.tokens.input_tokens;
+                entry.1 += prov.tokens.output_tokens;
+                entry.2 += prov.tokens.cache_read_tokens;
+                entry.3 += prov.tokens.cache_write_tokens;
+                entry.4 += prov.cost.usd;
+            }
+
+            // Count lines from file operations (CRDT semantic layer)
+            for file_op in change.file_ops() {
+                for line_op in file_op.line_ops() {
+                    if line_op.is_insert() {
+                        lines_added += 1;
+                    } else if line_op.is_delete() {
+                        lines_removed += 1;
+                    }
+                }
+            }
+        }
+
+        // Build model usage entries from aggregated provenance data
+        let models: Vec<ModelUsage> = model_agg
+            .into_iter()
+            .map(|(model, (inp, out, cr, cw, cost))| {
+                ModelUsage::new(&model)
+                    .with_input(inp)
+                    .with_output(out)
+                    .with_cache_read(cr)
+                    .with_cache_write(cw)
+                    .with_cost(cost)
+            })
+            .collect();
+
+        // If no provenance data was found in the changes but we know the
+        // model from the session, create a minimal model entry so the
+        // attestation at least names the model.
+        let models = if models.is_empty() && !session.model.is_empty() {
+            vec![ModelUsage::new(&session.model)]
+        } else {
+            models
+        };
+
+        // Use the session's vendor (set from OpenCode's provider field)
+        // instead of inferring from the agent name, since the session
+        // has more accurate data from the actual provider used.
+        let vendor = if session.agent_vendor.is_empty() {
+            vendor_from_agent_name(&session.agent_name)
+        } else {
+            &session.agent_vendor
+        };
         let agent = AttestAgent::new(&session.agent_name, &session.agent_display_name, vendor);
 
         let mut builder = Attestation::builder(&session.session_id, agent)
+            .cost_usd(total_cost)
+            .duration_api_ms(total_api_ms)
             .duration_wall_ms(wall_duration_ms)
-            .code_changes(CodeChangeStats::default())
+            .code_changes(CodeChangeStats::new(lines_added, lines_removed))
+            .models(models)
             .changes_covered(new_change_hashes.clone());
 
         // Chain to previous attestation if this is a resumed session
@@ -978,11 +1219,14 @@ impl TurnOrchestrator {
         match repo.save_attestation(&attestation) {
             Ok(hash) => {
                 log::info!(
-                    "Created attestation {} for session {} ({}{} changes, wall: {})",
+                    "Created attestation {} for session {} ({}{} changes, {} models, +{} -{}, wall: {})",
                     hash.to_base32(),
                     session.session_id,
                     if is_resume { "new: " } else { "" },
                     new_change_hashes.len(),
+                    attestation.models.len(),
+                    attestation.code_changes.lines_added,
+                    attestation.code_changes.lines_removed,
                     attestation.wall_duration_display(),
                 );
             }

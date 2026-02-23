@@ -365,7 +365,7 @@ pub struct TransitionResult {
 
     /// Actions to execute after the transition.
     ///
-    /// May be empty for no-op transitions (e.g., `Idle + TurnEnd`).
+    /// May be empty for no-op transitions (e.g., `Idle + SessionStart`).
     pub actions: Vec<Action>,
 }
 
@@ -871,9 +871,15 @@ mod tests {
 
     #[test]
     fn test_idle_turn_end() {
+        // TurnEnd from Idle still attempts recording because OpenCode's
+        // plugin can fire session.idle (TurnEnd) without a preceding
+        // TurnStart when bus event ordering doesn't guarantee it.
         let r = transition(Phase::Idle, Event::TurnEnd, TransitionContext::default());
         assert_eq!(r.new_phase, Phase::Idle);
-        assert!(r.is_noop());
+        assert_eq!(
+            r.actions,
+            vec![Action::RecordIfChanged, Action::UpdateInteraction]
+        );
     }
 
     #[test]
