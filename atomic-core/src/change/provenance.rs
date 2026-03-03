@@ -286,6 +286,15 @@ pub struct TokenUsage {
     /// Cache write tokens (if applicable)
     #[serde(default)]
     pub cache_write_tokens: u64,
+    /// Reasoning/thinking tokens (extended thinking, o1/o3, chain-of-thought)
+    ///
+    /// Separate billing category for models that expose reasoning tokens.
+    /// For Anthropic extended thinking, the reasoning text arrives as
+    /// `ReasoningPart` events but tokens may be billed under `output_tokens`
+    /// rather than this field (model-dependent). For OpenAI o1/o3, reasoning
+    /// tokens are billed separately and reported here.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
 }
 
 impl TokenUsage {
@@ -297,6 +306,7 @@ impl TokenUsage {
             total_tokens: input + output,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            reasoning_tokens: 0,
         }
     }
 
@@ -308,39 +318,67 @@ impl TokenUsage {
             total_tokens: input + output,
             cache_read_tokens: cache_read,
             cache_write_tokens: cache_write,
+            reasoning_tokens: 0,
+        }
+    }
+
+    /// Create token usage with all fields including reasoning tokens.
+    pub fn full(
+        input: u64,
+        output: u64,
+        reasoning: u64,
+        cache_read: u64,
+        cache_write: u64,
+    ) -> Self {
+        Self {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output + reasoning,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
+            reasoning_tokens: reasoning,
         }
     }
 
     /// Check if any tokens were used.
     pub fn is_empty(&self) -> bool {
-        self.total_tokens == 0
+        self.total_tokens == 0 && self.reasoning_tokens == 0
     }
 
     /// Check if caching was used.
     pub fn used_cache(&self) -> bool {
         self.cache_read_tokens > 0 || self.cache_write_tokens > 0
     }
+
+    /// Check if reasoning tokens were used.
+    pub fn used_reasoning(&self) -> bool {
+        self.reasoning_tokens > 0
+    }
 }
 
 impl fmt::Display for TokenUsage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.used_cache() {
-            write!(
-                f,
-                "{} tokens (in: {}, out: {}, cache: r{}/w{})",
-                self.total_tokens,
-                self.input_tokens,
-                self.output_tokens,
-                self.cache_read_tokens,
-                self.cache_write_tokens
-            )
-        } else {
-            write!(
-                f,
-                "{} tokens (in: {}, out: {})",
-                self.total_tokens, self.input_tokens, self.output_tokens
-            )
+        let has_cache = self.used_cache();
+        let has_reasoning = self.used_reasoning();
+
+        write!(
+            f,
+            "{} tokens (in: {}, out: {}",
+            self.total_tokens, self.input_tokens, self.output_tokens
+        )?;
+
+        if has_reasoning {
+            write!(f, ", reasoning: {}", self.reasoning_tokens)?;
         }
+        if has_cache {
+            write!(
+                f,
+                ", cache: r{}/w{}",
+                self.cache_read_tokens, self.cache_write_tokens
+            )?;
+        }
+
+        write!(f, ")")
     }
 }
 
@@ -549,6 +587,72 @@ pub struct Provenance {
     /// Additional metadata (provider-specific key-value pairs)
     #[serde(default)]
     pub metadata: Vec<(String, String)>,
+
+    // =========================================================================
+    // Agent context fields — added for rich provenance from coding agents
+    // =========================================================================
+    /// Agent mode: "build", "code", "ask", etc.
+    ///
+    /// Determines the accountability context:
+    /// - "build" = agent has full autonomy to create/edit/run
+    /// - "code" = agent can edit but doesn't run commands
+    /// - "ask" = advisory only, no file modifications
+    #[serde(default)]
+    pub agent_mode: Option<String>,
+
+    /// Why the model stopped generating on the final step of this turn.
+    ///
+    /// - "stop" = agent decided it was done
+    /// - "tool-calls" = agent wanted to execute tools (multi-step)
+    /// - "length" = context window exhausted
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+
+    /// Number of LLM roundtrips (steps) in this turn.
+    ///
+    /// Each step is one model invocation. A turn with 14 steps means the
+    /// model was called 14 times (interleaved with tool executions).
+    #[serde(default)]
+    pub step_count: Option<u32>,
+
+    /// Human-readable session slug (e.g., "mighty-rocket").
+    ///
+    /// Assigned by the coding agent (OpenCode), useful for display and
+    /// correlation. More memorable than the session UUID.
+    #[serde(default)]
+    pub session_slug: Option<String>,
+
+    /// Cryptographic signature from the model provider on reasoning blocks.
+    ///
+    /// Currently Anthropic-specific: proves the chain-of-thought was genuinely
+    /// produced by the model, not fabricated or tampered with. Stored as the
+    /// last complete reasoning block's signature from the turn.
+    ///
+    /// This is a key differentiator for provenance: it's cryptographic proof
+    /// from the model vendor that the reasoning is authentic.
+    #[serde(default)]
+    pub reasoning_signature: Option<String>,
+
+    /// Concatenated reasoning/thinking text from all reasoning blocks in the turn.
+    ///
+    /// Contains the agent's chain-of-thought: why it made the decisions it did,
+    /// what alternatives it considered, and how it planned its approach. Each
+    /// reasoning block is separated by "\n---\n".
+    ///
+    /// Truncated to 10KB to avoid bloating change files. For the full text,
+    /// see the ProvenanceGraph's Decision nodes.
+    #[serde(default)]
+    pub reasoning_text: Option<String>,
+
+    /// Agent's structured task plan at turn completion.
+    ///
+    /// A snapshot of the agent's todo list when the turn finished. Each entry
+    /// has `content` (task description), `status` ("pending", "in_progress",
+    /// "completed", "cancelled"), and `priority` ("high", "medium", "low").
+    ///
+    /// Stored as a JSON string for flexibility.
+    #[serde(default)]
+    pub task_plan: Option<String>,
 }
 
 impl Provenance {
@@ -569,6 +673,13 @@ impl Provenance {
             request_id: None,
             session_id: None,
             metadata: Vec::new(),
+            agent_mode: None,
+            finish_reason: None,
+            step_count: None,
+            session_slug: None,
+            reasoning_signature: None,
+            reasoning_text: None,
+            task_plan: None,
         }
     }
 
@@ -637,6 +748,13 @@ impl Default for Provenance {
             request_id: None,
             session_id: None,
             metadata: Vec::new(),
+            agent_mode: None,
+            finish_reason: None,
+            step_count: None,
+            session_slug: None,
+            reasoning_signature: None,
+            reasoning_text: None,
+            task_plan: None,
         }
     }
 }
@@ -657,6 +775,13 @@ impl PartialEq for Provenance {
             && self.request_id == other.request_id
             && self.session_id == other.session_id
             && self.metadata == other.metadata
+            && self.agent_mode == other.agent_mode
+            && self.finish_reason == other.finish_reason
+            && self.step_count == other.step_count
+            && self.session_slug == other.session_slug
+            && self.reasoning_signature == other.reasoning_signature
+            && self.reasoning_text == other.reasoning_text
+            && self.task_plan == other.task_plan
     }
 }
 
@@ -665,11 +790,20 @@ impl Eq for Provenance {}
 impl fmt::Display for Provenance {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.summary())?;
+        if let Some(ref mode) = self.agent_mode {
+            write!(f, " [{}]", mode)?;
+        }
         if self.has_tokens() {
             write!(f, " - {}", self.tokens)?;
         }
         if self.has_cost() {
             write!(f, " - {}", self.cost)?;
+        }
+        if let Some(steps) = self.step_count {
+            write!(f, " ({} steps)", steps)?;
+        }
+        if self.reasoning_signature.is_some() {
+            write!(f, " ✓signed")?;
         }
         Ok(())
     }
@@ -692,6 +826,13 @@ pub struct ProvenanceBuilder {
     request_id: Option<String>,
     session_id: Option<String>,
     metadata: Vec<(String, String)>,
+    agent_mode: Option<String>,
+    finish_reason: Option<String>,
+    step_count: Option<u32>,
+    session_slug: Option<String>,
+    reasoning_signature: Option<String>,
+    reasoning_text: Option<String>,
+    task_plan: Option<String>,
 }
 
 impl ProvenanceBuilder {
@@ -819,6 +960,55 @@ impl ProvenanceBuilder {
         self
     }
 
+    /// Set the agent mode (e.g., "build", "code", "ask").
+    pub fn agent_mode(mut self, mode: impl Into<String>) -> Self {
+        self.agent_mode = Some(mode.into());
+        self
+    }
+
+    /// Set the finish reason (e.g., "stop", "tool-calls", "length").
+    pub fn finish_reason(mut self, reason: impl Into<String>) -> Self {
+        self.finish_reason = Some(reason.into());
+        self
+    }
+
+    /// Set the number of LLM steps in the turn.
+    pub fn step_count(mut self, count: u32) -> Self {
+        self.step_count = Some(count);
+        self
+    }
+
+    /// Set the human-readable session slug.
+    pub fn session_slug(mut self, slug: impl Into<String>) -> Self {
+        self.session_slug = Some(slug.into());
+        self
+    }
+
+    /// Set the reasoning signature (cryptographic proof from model provider).
+    pub fn reasoning_signature(mut self, sig: impl Into<String>) -> Self {
+        self.reasoning_signature = Some(sig.into());
+        self
+    }
+
+    /// Set the concatenated reasoning text from all thinking blocks.
+    pub fn reasoning_text(mut self, text: impl Into<String>) -> Self {
+        self.reasoning_text = Some(text.into());
+        self
+    }
+
+    /// Set the agent's task plan (JSON string of todo items).
+    pub fn task_plan(mut self, plan: impl Into<String>) -> Self {
+        self.task_plan = Some(plan.into());
+        self
+    }
+
+    /// Set reasoning tokens.
+    pub fn reasoning_tokens(mut self, tokens: u64) -> Self {
+        self.tokens.reasoning_tokens = tokens;
+        self.tokens.total_tokens = self.tokens.input_tokens + self.tokens.output_tokens + tokens;
+        self
+    }
+
     /// Build the provenance.
     ///
     /// # Panics
@@ -840,6 +1030,13 @@ impl ProvenanceBuilder {
             request_id: self.request_id,
             session_id: self.session_id,
             metadata: self.metadata,
+            agent_mode: self.agent_mode,
+            finish_reason: self.finish_reason,
+            step_count: self.step_count,
+            session_slug: self.session_slug,
+            reasoning_signature: self.reasoning_signature,
+            reasoning_text: self.reasoning_text,
+            task_plan: self.task_plan,
         }
     }
 
@@ -903,7 +1100,10 @@ mod tests {
     fn test_tool_description() {
         assert_eq!(AITool::Api.description(), "API");
         assert_eq!(AITool::Chat.description(), "Chat");
-        assert_eq!(AITool::Editor("vscode".to_string()).description(), "Editor: vscode");
+        assert_eq!(
+            AITool::Editor("vscode".to_string()).description(),
+            "Editor: vscode"
+        );
         assert_eq!(AITool::editor("zed").description(), "Editor: zed");
     }
 
@@ -1191,8 +1391,12 @@ mod tests {
             .metadata("quantization", "q4_k_m")
             .build();
 
-        assert!(prov.metadata.contains(&("gpu".to_string(), "rtx4090".to_string())));
-        assert!(prov.metadata.contains(&("quantization".to_string(), "q4_k_m".to_string())));
+        assert!(prov
+            .metadata
+            .contains(&("gpu".to_string(), "rtx4090".to_string())));
+        assert!(prov
+            .metadata
+            .contains(&("quantization".to_string(), "q4_k_m".to_string())));
     }
 
     #[test]

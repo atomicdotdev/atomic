@@ -135,6 +135,115 @@ impl Repository {
         }
     }
 
+    /// Get file content via overlay, excluding a specific change.
+    ///
+    /// This is identical to [`get_file_content_via_overlay`] but removes
+    /// `exclude_hash` from the change filter. Use this to get the file
+    /// content as it was **before** a specific change was applied — pass
+    /// the change's hash as `exclude_hash` and you get the prior state.
+    pub fn get_file_content_via_overlay_excluding<P: AsRef<Path>>(
+        &self,
+        path: P,
+        stack_name: &str,
+        exclude_hash: &Hash,
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        use atomic_core::output::alive::RetrieveOptions;
+        use atomic_core::record::workflow::retrieve::retrieve_content_with_filter;
+
+        let path = path.as_ref();
+        let normalized = normalize_path(path);
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let stack = txn
+            .get_stack(stack_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::StackNotFound {
+                name: stack_name.to_string(),
+            })?;
+
+        let overlay = OverlayTxn::from_stack(&txn, &stack)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if !is_tracked(&overlay, &normalized)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            return Ok(None);
+        }
+
+        let inode = match get_inode(&overlay, &normalized) {
+            Ok(Some(inode)) => inode,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(RepositoryError::Database(e.to_string())),
+        };
+
+        let position = match overlay.inner().inode_position(inode) {
+            Ok(Some(pos)) => pos,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(RepositoryError::Database(e.to_string())),
+        };
+
+        let mut change_filter = collect_stack_change_ids(&txn, &stack)?;
+
+        if stack.kind.is_local() {
+            let chain = txn
+                .resolve_overlay_chain(&stack)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            for &ancestor_id in &chain {
+                if ancestor_id == stack.id {
+                    continue;
+                }
+                if let Some(ancestor) = txn
+                    .get_stack_by_id(ancestor_id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                {
+                    let ancestor_ids = collect_stack_change_ids(&txn, &ancestor)?;
+                    change_filter.extend(ancestor_ids);
+                }
+            }
+
+            let mut cursor = stack.parent;
+            loop {
+                match cursor {
+                    Some(pid) => {
+                        let parent = txn
+                            .get_stack_by_id(pid)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        match parent {
+                            Some(p) if p.kind.is_shared() => {
+                                let shared_ids = collect_stack_change_ids(&txn, &p)?;
+                                change_filter.extend(shared_ids);
+                                break;
+                            }
+                            Some(p) => cursor = p.parent,
+                            None => break,
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        // Remove the excluded change from the filter
+        if let Ok(Some(exclude_id)) = txn.get_internal(exclude_hash) {
+            change_filter.remove(&exclude_id);
+        }
+
+        let options = RetrieveOptions::new().with_change_filter(change_filter);
+
+        let content = retrieve_content_with_filter(&overlay, &self.change_store, position, options)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if content.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(content))
+        }
+    }
+
     /// Diff two stacks: returns (changes only in A, changes only in B, common changes).
     ///
     /// This is the change-level diff. For file-content diff, use

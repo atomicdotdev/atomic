@@ -263,9 +263,23 @@ impl Attestation {
         data.len() >= MAGIC.len() && &data[..4] == MAGIC
     }
 
-    /// Total tokens across all models.
+    /// Total tokens across all models (input + output + cache).
     pub fn total_tokens(&self) -> u64 {
         self.models.iter().map(|m| m.total_tokens()).sum()
+    }
+
+    /// Used tokens across all models (input + output only).
+    ///
+    /// This is the number that should be displayed as the headline "Tokens"
+    /// metric — it matches what the user sees in OpenCode and represents
+    /// actual computation, not cached context.
+    pub fn used_tokens(&self) -> u64 {
+        self.models.iter().map(|m| m.used_tokens()).sum()
+    }
+
+    /// Cache tokens across all models (cache read + cache write).
+    pub fn cache_tokens(&self) -> u64 {
+        self.models.iter().map(|m| m.cache_tokens()).sum()
     }
 
     /// Number of changes covered.
@@ -307,10 +321,11 @@ impl fmt::Display for Attestation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "Attestation — {} · {} · {} tokens · {} API",
+            "Attestation — {} · {} · {} tokens ({} cached) · {} API",
             self.agent.display_name,
             self.cost_display(),
-            format_tokens(self.total_tokens()),
+            format_tokens(self.used_tokens()),
+            format_tokens(self.cache_tokens()),
             self.api_duration_display(),
         )?;
         for model in &self.models {
@@ -435,9 +450,30 @@ impl ModelUsage {
         }
     }
 
-    /// Total tokens for this model (input + output + cache).
+    /// Total tokens for this model (input + output + cache read + cache write).
+    ///
+    /// This is the raw total across all token categories. For display purposes,
+    /// prefer `used_tokens()` (what was actually computed) vs `cache_tokens()`
+    /// (what was served from cache).
     pub fn total_tokens(&self) -> u64 {
         self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
+    }
+
+    /// Tokens that represent actual computation: input + output.
+    ///
+    /// This matches what OpenCode displays as "Context: N tokens" — the tokens
+    /// the model actually processed and generated, excluding cached context.
+    pub fn used_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+
+    /// Tokens served from or written to cache: cache_read + cache_write.
+    ///
+    /// Cache tokens represent reused context window — they reduce cost but
+    /// don't represent new computation. Displayed separately from used tokens
+    /// so users understand what they're paying for vs what was free/cheap.
+    pub fn cache_tokens(&self) -> u64 {
+        self.cache_read_tokens + self.cache_write_tokens
     }
 
     /// Set input tokens.
@@ -1039,6 +1075,30 @@ mod tests {
         // sonnet: 176 + 8400 + 526900 + 13100 = 548576
         // haiku:  9400 + 403 + 0 + 0 = 9803
         assert_eq!(a.total_tokens(), 548_576 + 9_803);
+    }
+
+    #[test]
+    fn test_used_tokens() {
+        let a = make_attestation();
+        // used = input + output only (no cache)
+        // sonnet: 176 + 8400 = 8576
+        // haiku:  9400 + 403 = 9803
+        assert_eq!(a.used_tokens(), 8_576 + 9_803);
+    }
+
+    #[test]
+    fn test_cache_tokens() {
+        let a = make_attestation();
+        // cache = cache_read + cache_write
+        // sonnet: 526900 + 13100 = 540000
+        // haiku:  0 + 0 = 0
+        assert_eq!(a.cache_tokens(), 540_000);
+    }
+
+    #[test]
+    fn test_used_plus_cache_equals_total() {
+        let a = make_attestation();
+        assert_eq!(a.used_tokens() + a.cache_tokens(), a.total_tokens());
     }
 
     #[test]

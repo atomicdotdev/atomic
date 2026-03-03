@@ -528,49 +528,64 @@ impl Push {
         let mut attest_count = 0;
         {
             let all_pushed_hashes: Vec<Hash> = to_upload.iter().map(|c| c.hash).collect();
+
+            // Collect unique attestations — the same attestation can cover
+            // multiple changes, so searching per-change produces duplicates.
+            let mut seen_attest: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+            let mut unique_attestations: Vec<(
+                Hash,
+                atomic_core::change::attestation::Attestation,
+            )> = Vec::new();
+
             for pushed_hash in &all_pushed_hashes {
                 let attestations = repo
                     .find_attestations_for_change(pushed_hash)
                     .unwrap_or_default();
 
-                for (attest_hash, attestation) in &attestations {
+                for (attest_hash, attestation) in attestations {
+                    if !seen_attest.insert(attest_hash) {
+                        continue; // Already collected this attestation
+                    }
+
                     // Only upload if all covered changes have been pushed
                     let all_covered = attestation
                         .changes_covered
                         .iter()
                         .all(|h| all_pushed_hashes.contains(h));
 
-                    if !all_covered {
-                        continue;
+                    if all_covered {
+                        unique_attestations.push((attest_hash, attestation));
                     }
+                }
+            }
 
-                    // Load and upload the raw attestation bytes
-                    let attest_data = match attestation.serialize() {
-                        Ok(data) => Bytes::from(data),
-                        Err(_) => continue,
-                    };
+            for (attest_hash, attestation) in &unique_attestations {
+                // Load and upload the raw attestation bytes
+                let attest_data = match attestation.serialize() {
+                    Ok(data) => Bytes::from(data),
+                    Err(_) => continue,
+                };
 
-                    match remote
-                        .upload_attestation(&attest_hash.to_base32(), attest_data)
-                        .await
-                    {
-                        Ok(()) => {
-                            attest_count += 1;
-                            println!(
-                                "  {} {} attestation ({}, {} covered)",
-                                success("✓"),
-                                style_hash(&format_hash(attest_hash, false)),
-                                attestation.cost_display(),
-                                attestation.change_count(),
-                            );
-                        }
-                        Err(e) => {
-                            print_warning(&format!(
-                                "Failed to upload attestation {}: {}",
-                                &attest_hash.to_base32()[..12],
-                                e
-                            ));
-                        }
+                match remote
+                    .upload_attestation(&attest_hash.to_base32(), attest_data)
+                    .await
+                {
+                    Ok(()) => {
+                        attest_count += 1;
+                        println!(
+                            "  {} {} attestation ({}, {} covered)",
+                            success("✓"),
+                            style_hash(&format_hash(attest_hash, false)),
+                            attestation.cost_display(),
+                            attestation.change_count(),
+                        );
+                    }
+                    Err(e) => {
+                        print_warning(&format!(
+                            "Failed to upload attestation {}: {}",
+                            &attest_hash.to_base32()[..12],
+                            e
+                        ));
                     }
                 }
             }
@@ -582,49 +597,60 @@ impl Push {
         let mut provenance_count = 0;
         {
             let all_pushed_hashes: Vec<Hash> = to_upload.iter().map(|c| c.hash).collect();
+
+            // Collect unique provenance graphs — same dedup logic as attestations.
+            let mut seen_prov: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+            let mut unique_graphs: Vec<(Hash, atomic_core::change::ProvenanceGraph)> = Vec::new();
+
             for pushed_hash in &all_pushed_hashes {
                 let graphs = repo
                     .find_provenance_for_change(pushed_hash)
                     .unwrap_or_default();
 
-                for (prov_hash, graph) in &graphs {
-                    // Only upload if all explained changes have been pushed
-                    let all_explained = graph
-                        .changes_explained
-                        .iter()
-                        .all(|h| all_pushed_hashes.contains(h));
-
-                    if !all_explained {
-                        continue;
+                for (prov_hash, graph) in graphs {
+                    if seen_prov.insert(prov_hash) {
+                        unique_graphs.push((prov_hash, graph));
                     }
+                }
+            }
 
-                    // Load and upload the raw provenance bytes
-                    let prov_data = match graph.serialize() {
-                        Ok(data) => Bytes::from(data),
-                        Err(_) => continue,
-                    };
+            for (prov_hash, graph) in &unique_graphs {
+                // Only upload if all explained changes have been pushed
+                let all_explained = graph
+                    .changes_explained
+                    .iter()
+                    .all(|h| all_pushed_hashes.contains(h));
 
-                    match remote
-                        .upload_provenance(&prov_hash.to_base32(), prov_data)
-                        .await
-                    {
-                        Ok(()) => {
-                            provenance_count += 1;
-                            println!(
-                                "  {} {} provenance ({} nodes, {} changes)",
-                                success("✓"),
-                                style_hash(&format_hash(prov_hash, false)),
-                                graph.node_count(),
-                                graph.change_count(),
-                            );
-                        }
-                        Err(e) => {
-                            print_warning(&format!(
-                                "Failed to upload provenance graph {}: {}",
-                                &prov_hash.to_base32()[..12],
-                                e
-                            ));
-                        }
+                if !all_explained {
+                    continue;
+                }
+
+                // Load and upload the raw provenance bytes
+                let prov_data = match graph.serialize() {
+                    Ok(data) => Bytes::from(data),
+                    Err(_) => continue,
+                };
+
+                match remote
+                    .upload_provenance(&prov_hash.to_base32(), prov_data)
+                    .await
+                {
+                    Ok(()) => {
+                        provenance_count += 1;
+                        println!(
+                            "  {} {} provenance ({} nodes, {} changes)",
+                            success("✓"),
+                            style_hash(&format_hash(prov_hash, false)),
+                            graph.node_count(),
+                            graph.change_count(),
+                        );
+                    }
+                    Err(e) => {
+                        print_warning(&format!(
+                            "Failed to upload provenance graph {}: {}",
+                            &prov_hash.to_base32()[..12],
+                            e
+                        ));
                     }
                 }
             }

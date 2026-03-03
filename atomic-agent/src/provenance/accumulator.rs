@@ -134,6 +134,14 @@ pub struct ProvenanceAccumulator {
     /// Base32 hash of the last content-addressed ProvenanceGraph artifact
     /// saved for this session. Used to chain per-turn graphs via `previous`.
     last_provenance_hash: Option<String>,
+
+    /// Number of nodes that were included in the last saved ProvenanceGraph.
+    /// Used to export only the delta (new nodes) on the next save.
+    /// When `to_provenance_graph()` is called, it slices `nodes[nodes_saved_count..]`.
+    nodes_saved_count: usize,
+
+    /// Number of edges that were included in the last saved ProvenanceGraph.
+    edges_saved_count: usize,
 }
 
 impl ProvenanceAccumulator {
@@ -155,6 +163,8 @@ impl ProvenanceAccumulator {
             pending_human_gate: None,
             commitments_since_last_patch: Vec::new(),
             last_provenance_hash: None,
+            nodes_saved_count: 0,
+            edges_saved_count: 0,
         }
     }
 
@@ -200,6 +210,9 @@ impl ProvenanceAccumulator {
         }
         commitments_since_last_patch.reverse();
 
+        let nodes_saved_count = s.nodes_saved_count.unwrap_or(s.nodes.len());
+        let edges_saved_count = s.edges_saved_count.unwrap_or(s.edges.len());
+
         Self {
             session_id: s.session_id,
             session_prefix,
@@ -214,6 +227,8 @@ impl ProvenanceAccumulator {
             pending_human_gate: s.pending_human_gate,
             commitments_since_last_patch,
             last_provenance_hash: s.last_provenance_hash,
+            nodes_saved_count,
+            edges_saved_count,
         }
     }
 
@@ -295,6 +310,87 @@ impl ProvenanceAccumulator {
         // Infer edges based on the classified kind
         self.infer_edges(&node_id, kind);
 
+        self.push_node(node);
+        node_id
+    }
+
+    /// Append a reasoning/thinking node (chain-of-thought from the model).
+    ///
+    /// These are created from the reasoning blocks captured by the OpenCode
+    /// plugin. Each block represents a distinct thinking step where the agent
+    /// planned its approach, evaluated alternatives, or reasoned about the
+    /// codebase.
+    ///
+    /// The node is classified as `Decision` (the existing kind for strategic
+    /// choices). Edges link from the current goal to the reasoning node, and
+    /// from the reasoning node to subsequent commitments/explorations.
+    ///
+    /// Returns the new node's ID.
+    pub fn append_reasoning(
+        &mut self,
+        text: &str,
+        duration_ms: Option<u64>,
+        signature: Option<&str>,
+        timestamp: i64,
+    ) -> String {
+        // Truncate for summary: first line or first 100 chars
+        let first_line = text.lines().next().unwrap_or(text);
+        let summary = if first_line.len() > 100 {
+            let truncated: String = first_line.chars().take(97).collect();
+            format!("{}...", truncated)
+        } else {
+            first_line.to_string()
+        };
+
+        let mut node = GraphNode::new(self.next_id(), NodeKind::Decision, timestamp, &summary);
+
+        if let Some(ms) = duration_ms {
+            node = node.with_duration_ms(ms);
+        }
+
+        // Build detail with the full reasoning text and signature
+        let mut detail = serde_json::json!({
+            "reasoning_text": text,
+        });
+        if let Some(ms) = duration_ms {
+            detail["reasoning_duration_ms"] = serde_json::Value::Number(ms.into());
+        }
+        if let Some(sig) = signature {
+            detail["anthropic_signature"] = serde_json::Value::String(sig.to_string());
+        }
+        detail["text_length"] = serde_json::Value::Number(text.len().into());
+        node.detail = Some(detail);
+
+        // Mark as classified so the Phase 3 consolidator doesn't touch it
+        node.classified = true;
+        node.confidence = Some(1.0);
+
+        let node_id = node.id.clone();
+
+        // Edge: goal --led_to-→ reasoning (if we have a current goal)
+        if let Some(ref goal) = self.current_goal {
+            self.edges.push(GraphEdge::new(
+                goal.clone(),
+                node_id.clone(),
+                EdgeKind::LedTo,
+            ));
+            self.stats.edge_count += 1;
+        }
+
+        // Also chain from previous node for temporal ordering
+        if let Some(ref prev) = self.last_node {
+            // Only add led_to if previous wasn't already the goal
+            if self.current_goal.as_ref() != Some(prev) {
+                self.edges.push(GraphEdge::new(
+                    prev.clone(),
+                    node_id.clone(),
+                    EdgeKind::LedTo,
+                ));
+                self.stats.edge_count += 1;
+            }
+        }
+
+        self.stats.decision_count += 1;
         self.push_node(node);
         node_id
     }
@@ -538,15 +634,16 @@ impl ProvenanceAccumulator {
     /// Convert the accumulated graph to a content-addressed `ProvenanceGraph`
     /// suitable for storage in the Atomic graph alongside changes and attestations.
     ///
-    /// This converts from the agent-side types (JSON, String hashes) to the
-    /// core types (postcard, `Hash` values). The resulting `ProvenanceGraph`
-    /// can be saved via `Repository::save_provenance_graph()`.
+    /// **Per-turn delta**: Only includes nodes and edges added since the last
+    /// save (tracked by `nodes_saved_count` / `edges_saved_count`). Each
+    /// turn's provenance graph is self-contained — the `previous` field links
+    /// to the prior turn's graph for historical context.
     ///
     /// The `previous` field is automatically set from `last_provenance_hash`
     /// if a prior graph was saved for this session. Call
     /// [`set_last_provenance_hash`] after saving to maintain the chain.
     pub fn to_provenance_graph(
-        &self,
+        &mut self,
         agent_name: &str,
         agent_display_name: &str,
         agent_vendor: &str,
@@ -556,8 +653,26 @@ impl ProvenanceAccumulator {
             .last_provenance_hash
             .as_ref()
             .and_then(|s| Hash::from_base32(s.as_bytes()));
-        let nodes: Vec<pg::ProvenanceNode> = self
-            .nodes
+
+        // Only export nodes/edges added since the last save (per-turn delta).
+        let new_nodes = &self.nodes[self.nodes_saved_count..];
+        let new_edges = &self.edges[self.edges_saved_count..];
+
+        // Collect IDs of new nodes for edge filtering
+        let new_node_ids: std::collections::HashSet<&str> =
+            new_nodes.iter().map(|n| n.id.as_str()).collect();
+
+        // Only include edges where BOTH endpoints are in the new node set.
+        // Cross-turn edges (e.g., goal from turn 1 → exploration in turn 2)
+        // are dropped — each turn's graph is self-contained.
+        let relevant_edges: Vec<&GraphEdge> = new_edges
+            .iter()
+            .filter(|e| {
+                new_node_ids.contains(e.from.as_str()) || new_node_ids.contains(e.to.as_str())
+            })
+            .collect();
+
+        let nodes: Vec<pg::ProvenanceNode> = new_nodes
             .iter()
             .map(|n| pg::ProvenanceNode {
                 id: n.id.clone(),
@@ -578,8 +693,7 @@ impl ProvenanceAccumulator {
             })
             .collect();
 
-        let edges: Vec<pg::ProvenanceEdge> = self
-            .edges
+        let edges: Vec<pg::ProvenanceEdge> = relevant_edges
             .iter()
             .map(|e| pg::ProvenanceEdge {
                 from: e.from.clone(),
@@ -587,6 +701,10 @@ impl ProvenanceAccumulator {
                 kind: convert_edge_kind(e.kind),
             })
             .collect();
+
+        // Mark the save point so the next call only exports new nodes
+        self.nodes_saved_count = self.nodes.len();
+        self.edges_saved_count = self.edges.len();
 
         let mut builder = pg::ProvenanceGraph::builder(&self.session_id, agent_name)
             .agent_display_name(agent_display_name)
@@ -667,6 +785,8 @@ impl ProvenanceAccumulator {
             last_node: self.last_node.clone(),
             pending_human_gate: self.pending_human_gate.clone(),
             last_provenance_hash: self.last_provenance_hash.clone(),
+            nodes_saved_count: Some(self.nodes_saved_count),
+            edges_saved_count: Some(self.edges_saved_count),
         }
     }
 
@@ -978,17 +1098,75 @@ fn build_tool_detail(
         }
 
         NodeKind::Commitment => {
+            // Extract file path from tool_input — OpenCode uses "filePath" (camelCase)
+            // while other agents may use "path", "file", or "file_path" (snake_case).
+            // Also check the top-level "file_path" field added by the enriched plugin.
             let path = tool_input
                 .and_then(|v| {
-                    v.get("path")
+                    v.get("filePath")
+                        .or_else(|| v.get("path"))
                         .or_else(|| v.get("file"))
                         .or_else(|| v.get("file_path"))
                 })
                 .and_then(|v| v.as_str());
+
             let mut detail = serde_json::json!({"tool": tool_name});
+
             if let Some(p) = path {
-                detail["file"] = serde_json::Value::String(p.to_string());
+                // Store both the full path and a shortened display path
+                detail["file_path"] = serde_json::Value::String(p.to_string());
+                // Shorten: take last 2-3 path components for display
+                let short = shorten_path(p);
+                detail["file"] = serde_json::Value::String(short);
             }
+
+            // Determine operation: create vs edit
+            // "write" tool = create (new file), "edit"/"multiedit"/"patch" = edit
+            let operation = match tool_name.to_lowercase().as_str() {
+                "write" | "write_file" | "create" | "create_file" => "create",
+                "delete_file" | "remove_file" => "delete",
+                _ => "edit",
+            };
+            detail["operation"] = serde_json::Value::String(operation.to_string());
+
+            // Pull in filediff from the enriched after-tool payload if present.
+            // The plugin sends: { filediff: { file, before, after, additions, deletions } }
+            if let Some(filediff) = tool_input.and_then(|v| v.get("filediff")).cloned() {
+                detail["filediff"] = filediff;
+            }
+
+            // Pull in unified diff string
+            if let Some(diff) = tool_input
+                .and_then(|v| v.get("diff"))
+                .and_then(|v| v.as_str())
+            {
+                detail["diff"] = serde_json::Value::String(diff.to_string());
+            }
+
+            // Pull in diagnostics from the enriched after-tool payload
+            if let Some(diag) = tool_input.and_then(|v| v.get("diagnostics")).cloned() {
+                detail["diagnostics"] = diag;
+            }
+
+            // Pull in title (human-readable description)
+            if let Some(title) = tool_input
+                .and_then(|v| v.get("title"))
+                .and_then(|v| v.as_str())
+            {
+                detail["title"] = serde_json::Value::String(title.to_string());
+            }
+
+            // Check if the file existed before (write to new file vs overwrite)
+            if let Some(exists) = tool_input
+                .and_then(|v| v.get("exists"))
+                .and_then(|v| v.as_bool())
+            {
+                detail["exists"] = serde_json::Value::Bool(exists);
+                if !exists {
+                    detail["operation"] = serde_json::Value::String("create".to_string());
+                }
+            }
+
             Some(detail)
         }
 
@@ -996,12 +1174,26 @@ fn build_tool_detail(
             let cmd = tool_input
                 .and_then(|v| v.get("command").or_else(|| v.get("cmd")))
                 .and_then(|v| v.as_str());
+            let description = tool_input
+                .and_then(|v| v.get("description"))
+                .and_then(|v| v.as_str());
+            let exit_code = tool_input
+                .and_then(|v| v.get("exit_code"))
+                .and_then(|v| v.as_i64());
             let mut detail = serde_json::json!({});
             if let Some(c) = cmd {
                 detail["command"] = serde_json::Value::String(c.to_string());
             }
-            // Try to determine pass/fail from output
-            if let Some(output) = tool_output {
+            if let Some(d) = description {
+                detail["description"] = serde_json::Value::String(d.to_string());
+            }
+            if let Some(code) = exit_code {
+                detail["exit_code"] = serde_json::Value::Number(code.into());
+            }
+            // Try to determine pass/fail from exit code first, then output heuristics
+            if let Some(code) = exit_code {
+                detail["passed"] = serde_json::Value::Bool(code == 0);
+            } else if let Some(output) = tool_output {
                 let lower = output.to_lowercase();
                 if lower.contains("fail") || lower.contains("error") || lower.contains("failed") {
                     detail["passed"] = serde_json::Value::Bool(false);
@@ -1012,6 +1204,15 @@ fn build_tool_detail(
                     detail["passed"] = serde_json::Value::Bool(true);
                 }
             }
+            // Pull in diagnostics if present
+            if let Some(diag) = tool_input.and_then(|v| v.get("diagnostics")).cloned() {
+                detail["diagnostics"] = diag;
+            }
+            // Truncated output summary
+            if let Some(output) = tool_output {
+                let truncated: String = output.chars().take(300).collect();
+                detail["output_summary"] = serde_json::Value::String(truncated);
+            }
             Some(detail)
         }
 
@@ -1019,7 +1220,32 @@ fn build_tool_detail(
             let cmd = tool_input
                 .and_then(|v| v.get("command").or_else(|| v.get("cmd")))
                 .and_then(|v| v.as_str());
-            cmd.map(|c| serde_json::json!({"command": c}))
+            let description = tool_input
+                .and_then(|v| v.get("description"))
+                .and_then(|v| v.as_str());
+            let exit_code = tool_input
+                .and_then(|v| v.get("exit_code"))
+                .and_then(|v| v.as_i64());
+            let mut detail = serde_json::json!({});
+            if let Some(c) = cmd {
+                detail["command"] = serde_json::Value::String(c.to_string());
+            }
+            if let Some(d) = description {
+                detail["description"] = serde_json::Value::String(d.to_string());
+            }
+            if let Some(code) = exit_code {
+                detail["exit_code"] = serde_json::Value::Number(code.into());
+            }
+            // Truncated output summary
+            if let Some(output) = tool_output {
+                let truncated: String = output.chars().take(300).collect();
+                detail["output_summary"] = serde_json::Value::String(truncated);
+            }
+            if detail.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                None
+            } else {
+                Some(detail)
+            }
         }
 
         NodeKind::Error => {
@@ -1034,6 +1260,28 @@ fn build_tool_detail(
 
         _ => None,
     }
+}
+
+/// Shorten a file path to the last 2-3 components for display.
+///
+/// `/Users/leefaus/Projects/hello-world/src/index.ts` → `src/index.ts`
+/// `/Users/leefaus/Projects/hello-world/tsconfig.json` → `tsconfig.json`
+fn shorten_path(full_path: &str) -> String {
+    let parts: Vec<&str> = full_path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() <= 2 {
+        return parts.join("/");
+    }
+
+    // Look for common project markers to find the project-relative path
+    let markers = ["src", "lib", "app", "test", "tests", "dist", "pkg", "cmd"];
+    for (i, part) in parts.iter().enumerate() {
+        if markers.contains(&part.to_lowercase().as_str()) {
+            return parts[i..].join("/");
+        }
+    }
+
+    // Fall back to the last 2 segments
+    parts[parts.len() - 2..].join("/")
 }
 
 // =============================================================================

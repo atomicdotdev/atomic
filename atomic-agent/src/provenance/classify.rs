@@ -410,41 +410,119 @@ fn is_read_command(cmd: &str) -> bool {
 // =============================================================================
 
 fn summarize_exploration(tool_name: &str, tool_input: Option<&serde_json::Value>) -> String {
-    // Try to extract the file/path being read
+    // Try to extract the file/path being explored.
+    // OpenCode uses "filePath" (camelCase); other agents use "path", "file", etc.
+    // For bash-based reads (ls, cat, find), the path is embedded in the command string.
     let path = tool_input
         .and_then(|v| {
-            v.get("path")
+            v.get("filePath")
+                .or_else(|| v.get("path"))
                 .or_else(|| v.get("file"))
+                .or_else(|| v.get("file_path"))
                 .or_else(|| v.get("glob"))
                 .or_else(|| v.get("regex"))
                 .or_else(|| v.get("pattern"))
         })
         .and_then(|v| v.as_str());
 
-    match path {
-        Some(p) => {
-            let display = truncate_for_summary(p, 80);
+    // For bash tools, try to extract a meaningful target from the command string
+    let bash_target = if path.is_none() {
+        tool_input
+            .and_then(|v| v.get("command").or_else(|| v.get("cmd")))
+            .and_then(|v| v.as_str())
+            .map(|cmd| {
+                // Extract the last meaningful argument from common read commands
+                // "ls -la /some/path" → "/some/path"
+                // "cat src/index.ts" → "src/index.ts"
+                // "find . -name '*.ts'" → "*.ts files"
+                let cmd = cmd.trim();
+                if let Some(rest) = cmd
+                    .strip_prefix("cat ")
+                    .or_else(|| cmd.strip_prefix("head "))
+                    .or_else(|| cmd.strip_prefix("tail "))
+                {
+                    let target = rest.split_whitespace().last().unwrap_or(rest);
+                    return shorten_explore_path(target);
+                }
+                if let Some(rest) = cmd.strip_prefix("ls ") {
+                    let target = rest
+                        .split_whitespace()
+                        .filter(|s| !s.starts_with('-'))
+                        .last()
+                        .unwrap_or(".");
+                    return format!("directory {}", shorten_explore_path(target));
+                }
+                // For other commands, use the description if available
+                String::new()
+            })
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
+    // Also check for a human-readable description (from enriched after-tool payload)
+    let description = tool_input
+        .and_then(|v| v.get("description"))
+        .and_then(|v| v.as_str());
+
+    // Build the summary with the best available information
+    match (path, bash_target.as_deref(), description) {
+        (Some(p), _, _) => {
+            let display = shorten_explore_path(p);
             let verb = match tool_name.to_lowercase().as_str() {
                 "grep" | "rg" | "ripgrep" => "Search",
                 "find_path" | "find" | "glob" => "Find",
                 "list_directory" | "listdir" | "ls" | "tree" => "List",
                 "thinking" | "think" => "Reasoning about",
-                _ => "Read",
+                "read" | "read_file" => "Examine",
+                _ => "Examine",
             };
             format!("{} {}", verb, display)
         }
-        None => {
+        (None, Some(target), _) => {
+            format!("Examine {}", target)
+        }
+        (None, None, Some(desc)) => truncate_for_summary(desc, 80),
+        (None, None, None) => {
             let verb = match tool_name.to_lowercase().as_str() {
                 "grep" | "rg" | "ripgrep" | "search" => "Search codebase",
                 "find_path" | "find" | "glob" => "Find files",
                 "list_directory" | "listdir" | "ls" | "tree" => "List directory",
                 "thinking" | "think" => "Internal reasoning",
                 "fetch" => "Fetch URL",
-                _ => "Read",
+                "read" | "read_file" => "Examine file",
+                "bash" => "Explore",
+                _ => "Explore",
             };
             verb.to_string()
         }
     }
+}
+
+/// Shorten a file path for exploration summaries.
+///
+/// Prefers project-relative paths: `/Users/lee/Projects/hello-world/src/index.ts` → `src/index.ts`
+fn shorten_explore_path(full_path: &str) -> String {
+    let full_path = full_path.trim().trim_matches('"').trim_matches('\'');
+    if full_path == "." || full_path == "./" {
+        return "project root".to_string();
+    }
+
+    let parts: Vec<&str> = full_path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() <= 2 {
+        return parts.join("/");
+    }
+
+    // Look for common project markers to find the project-relative path
+    let markers = ["src", "lib", "app", "test", "tests", "dist", "pkg", "cmd"];
+    for (i, part) in parts.iter().enumerate() {
+        if markers.contains(&part.to_lowercase().as_str()) {
+            return parts[i..].join("/");
+        }
+    }
+
+    // Fall back to last 2 segments
+    parts[parts.len() - 2..].join("/")
 }
 
 fn summarize_commitment(tool_name: &str, tool_input: Option<&serde_json::Value>) -> String {
@@ -453,6 +531,7 @@ fn summarize_commitment(tool_name: &str, tool_input: Option<&serde_json::Value>)
             v.get("path")
                 .or_else(|| v.get("file"))
                 .or_else(|| v.get("file_path"))
+                .or_else(|| v.get("filePath"))
         })
         .and_then(|v| v.as_str());
 
@@ -1005,7 +1084,7 @@ mod tests {
     fn test_summarize_exploration_with_path() {
         let input = serde_json::json!({"path": "src/auth/login.rs"});
         let summary = summarize_tool_call("read", NodeKind::Exploration, Some(&input), None, None);
-        assert_eq!(summary, "Read src/auth/login.rs");
+        assert_eq!(summary, "Examine src/auth/login.rs");
     }
 
     #[test]
@@ -1018,7 +1097,7 @@ mod tests {
     #[test]
     fn test_summarize_exploration_no_path() {
         let summary = summarize_tool_call("read", NodeKind::Exploration, None, None, None);
-        assert_eq!(summary, "Read");
+        assert_eq!(summary, "Examine file");
     }
 
     #[test]
@@ -1031,7 +1110,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(summary, "List src/auth/");
+        assert_eq!(summary, "List src/auth");
     }
 
     #[test]

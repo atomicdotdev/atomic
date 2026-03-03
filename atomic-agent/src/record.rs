@@ -78,7 +78,7 @@
 use std::path::Path;
 
 use atomic_core::change::{
-    AITool, AIVendor, ChangeHeader, PromptContent, Provenance, SuggestionType,
+    AITool, AIVendor, ChangeHeader, Cost, PromptContent, Provenance, SuggestionType, TokenUsage,
 };
 use atomic_core::types::{Base32, Hash};
 
@@ -593,6 +593,91 @@ fn build_turn_provenance(options: &TurnRecordOptions<'_>) -> Provenance {
 
     let timestamp = options.event.timestamp.timestamp();
 
+    // Extract enriched metadata from the raw JSON payload sent by the plugin.
+    // The plugin accumulates data across all events within a turn and sends
+    // it in the `stop` payload. All fields are optional — old plugins that
+    // don't send them will simply leave these as None/default.
+    let raw = options.event.raw_json.as_ref();
+
+    // Helper closures for extracting typed values from raw JSON
+    let raw_str = |key: &str| -> Option<String> {
+        raw.and_then(|r| r.get(key))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let raw_u64 =
+        |key: &str| -> Option<u64> { raw.and_then(|r| r.get(key)).and_then(|v| v.as_u64()) };
+    let raw_f64 =
+        |key: &str| -> Option<f64> { raw.and_then(|r| r.get(key)).and_then(|v| v.as_f64()) };
+    let raw_u32 = |key: &str| -> Option<u32> {
+        raw.and_then(|r| r.get(key))
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+    };
+
+    // Token usage — now includes reasoning tokens
+    let input = raw_u64("input_tokens").unwrap_or(0);
+    let output = raw_u64("output_tokens").unwrap_or(0);
+    let reasoning = raw_u64("reasoning_tokens").unwrap_or(0);
+    let cache_read = raw_u64("cache_read_tokens").unwrap_or(0);
+    let cache_write = raw_u64("cache_write_tokens").unwrap_or(0);
+
+    let tokens = if input > 0 || output > 0 || reasoning > 0 || cache_read > 0 || cache_write > 0 {
+        TokenUsage::full(input, output, reasoning, cache_read, cache_write)
+    } else {
+        TokenUsage::default()
+    };
+
+    // Cost
+    let cost = match raw_f64("cost_usd") {
+        Some(usd) if usd > 0.0 => Cost::from_usd(usd),
+        _ => Cost::zero(),
+    };
+
+    // Agent mode — "build", "code", "ask"
+    let agent_mode = raw_str("agent");
+
+    // Finish reason — "stop", "tool-calls", "length"
+    let finish_reason = raw_str("finish_reason");
+
+    // Step count — number of LLM roundtrips in this turn
+    let step_count = raw_u32("step_count");
+
+    // Session slug — human-readable name like "mighty-rocket"
+    let session_slug = raw_str("session_slug");
+
+    // Reasoning signature — Anthropic cryptographic proof
+    let reasoning_signature = raw_str("reasoning_signature");
+
+    // Reasoning text — concatenated chain-of-thought, truncated to 10KB
+    let reasoning_text = raw_str("reasoning_text").map(|t| {
+        if t.len() > 10_240 {
+            format!("{}...[truncated, {} chars total]", &t[..10_240], t.len())
+        } else {
+            t
+        }
+    });
+
+    // Task plan — agent's todo list serialized as JSON string
+    let task_plan = raw
+        .and_then(|r| r.get("todos"))
+        .and_then(|v| serde_json::to_string(v).ok());
+
+    // Build metadata key-value pairs
+    let mut metadata = vec![
+        ("turn_number".to_string(), options.turn_number.to_string()),
+        ("agent_name".to_string(), options.session.agent_name.clone()),
+    ];
+    if let Some(ref mode) = agent_mode {
+        metadata.push(("agent_mode".to_string(), mode.clone()));
+    }
+    if let Some(ref reason) = finish_reason {
+        metadata.push(("finish_reason".to_string(), reason.clone()));
+    }
+    if let Some(steps) = step_count {
+        metadata.push(("step_count".to_string(), steps.to_string()));
+    }
+
     Provenance {
         vendor,
         model,
@@ -601,16 +686,20 @@ fn build_turn_provenance(options: &TurnRecordOptions<'_>) -> Provenance {
         suggestion_type: SuggestionType::Complete,
         prompt: prompt_content,
         system_prompt_hash: None,
-        tokens: Default::default(),
-        cost: Default::default(),
+        tokens,
+        cost,
         temperature: None,
         timestamp: Some(timestamp),
         request_id: None,
         session_id: Some(options.session.session_id.clone()),
-        metadata: vec![
-            ("turn_number".to_string(), options.turn_number.to_string()),
-            ("agent_name".to_string(), options.session.agent_name.clone()),
-        ],
+        metadata,
+        agent_mode,
+        finish_reason,
+        step_count,
+        session_slug,
+        reasoning_signature,
+        reasoning_text,
+        task_plan,
     }
 }
 

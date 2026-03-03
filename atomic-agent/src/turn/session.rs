@@ -156,6 +156,15 @@ pub struct AgentSession {
     #[serde(default)]
     pub first_prompt: Option<String>,
 
+    /// The current turn's user prompt (updated on every `TurnStart`).
+    ///
+    /// Unlike `first_prompt` which is set-once, this is overwritten on each
+    /// new turn so the change message reflects the prompt that triggered
+    /// THIS turn, not the session's opening prompt.
+    /// Cleared after recording via `clear_current_prompt()`.
+    #[serde(default)]
+    pub current_prompt: Option<String>,
+
     /// Accumulated list of files touched across all turns.
     ///
     /// Deduplicated. Used for session-level reporting and for the
@@ -206,6 +215,7 @@ impl AgentSession {
             parent_stack: None,
             transcript_path: None,
             first_prompt: None,
+            current_prompt: None,
             files_touched: Vec::new(),
             current_turn_started_at: None,
         }
@@ -248,16 +258,37 @@ impl AgentSession {
         }
     }
 
+    /// Clear the current prompt after recording a turn.
+    ///
+    /// Called after `record_turn` so that if the agent continues without
+    /// a new user prompt, the next turn doesn't reuse the old one.
+    pub fn clear_current_prompt(&mut self) {
+        self.current_prompt = None;
+    }
+
     /// Set the first prompt if not already set. Truncates to MAX_PROMPT_LENGTH.
+    /// Also updates `current_prompt` on every call so the change message
+    /// reflects this turn's intent, not the session's opening prompt.
     pub fn set_first_prompt(&mut self, prompt: &str) {
-        if self.first_prompt.is_none() && !prompt.is_empty() {
-            if prompt.len() <= Self::MAX_PROMPT_LENGTH {
-                self.first_prompt = Some(prompt.to_string());
-            } else {
-                let truncated: String = prompt.chars().take(Self::MAX_PROMPT_LENGTH - 3).collect();
-                self.first_prompt = Some(format!("{}...", truncated));
-            }
+        if prompt.is_empty() {
+            return;
         }
+
+        let stored = if prompt.len() <= Self::MAX_PROMPT_LENGTH {
+            prompt.to_string()
+        } else {
+            let truncated: String = prompt.chars().take(Self::MAX_PROMPT_LENGTH - 3).collect();
+            format!("{}...", truncated)
+        };
+
+        // first_prompt is set-once (preserves the session's opening prompt)
+        if self.first_prompt.is_none() {
+            self.first_prompt = Some(stored.clone());
+        }
+
+        // current_prompt is updated every turn so the change message
+        // reflects THIS turn's intent, not the session's opening prompt.
+        self.current_prompt = Some(stored);
     }
 
     /// Add files to the accumulated files_touched list (deduplicating).

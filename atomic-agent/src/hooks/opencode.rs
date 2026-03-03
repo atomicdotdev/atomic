@@ -154,6 +154,10 @@ struct UserPromptInput {
     #[serde(default)]
     provider: Option<String>,
 
+    /// Agent mode: "build", "code", "ask"
+    #[serde(default)]
+    agent: Option<String>,
+
     #[serde(default)]
     cwd: Option<String>,
 
@@ -182,6 +186,10 @@ struct StopInput {
     #[serde(default)]
     provider: Option<String>,
 
+    /// Agent mode: "build", "code", "ask"
+    #[serde(default)]
+    agent: Option<String>,
+
     /// Whether the turn ended due to an error
     #[serde(default)]
     error: Option<bool>,
@@ -194,6 +202,10 @@ struct StopInput {
     #[serde(default)]
     output_tokens: Option<u64>,
 
+    /// Reasoning/thinking tokens (extended thinking, o1/o3)
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
+
     /// Cache read tokens
     #[serde(default)]
     cache_read_tokens: Option<u64>,
@@ -205,6 +217,37 @@ struct StopInput {
     /// Cost in USD for this turn
     #[serde(default)]
     cost_usd: Option<f64>,
+
+    /// Actual wall-clock turn duration in milliseconds.
+    /// Computed by the plugin as the time from chat.message to session.idle.
+    /// More accurate than the Rust-side computation which only measures the
+    /// gap between the user-prompt and stop CLI invocations.
+    #[serde(default)]
+    turn_duration_ms: Option<u64>,
+
+    /// Number of LLM steps (model invocations) in this turn
+    #[serde(default)]
+    step_count: Option<u32>,
+
+    /// Why the model stopped on the final step: "stop", "tool-calls", "length"
+    #[serde(default)]
+    finish_reason: Option<String>,
+
+    /// Human-readable session slug (e.g., "mighty-rocket")
+    #[serde(default)]
+    session_slug: Option<String>,
+
+    /// Concatenated reasoning text from all thinking blocks in this turn
+    #[serde(default)]
+    reasoning_text: Option<String>,
+
+    /// Cryptographic signature from the model provider on the last reasoning block
+    #[serde(default)]
+    reasoning_signature: Option<String>,
+
+    /// Agent's structured task plan at turn completion (JSON array of todos)
+    #[serde(default)]
+    todos: Option<serde_json::Value>,
 
     #[serde(default)]
     cwd: Option<String>,
@@ -264,6 +307,26 @@ struct AfterToolInput {
     /// Truncated tool output (up to 500 chars from the plugin)
     #[serde(default)]
     tool_output: Option<String>,
+
+    /// Human-readable title (e.g., "Install TypeScript as dev dependency")
+    #[serde(default)]
+    title: Option<String>,
+
+    /// Absolute file path for write/edit tools
+    #[serde(default)]
+    file_path: Option<String>,
+
+    /// Structured file diff: { file, before, after, additions, deletions }
+    #[serde(default)]
+    filediff: Option<serde_json::Value>,
+
+    /// LSP diagnostics at time of edit: { "/path/file.ts": [{ range, message }] }
+    #[serde(default)]
+    diagnostics: Option<serde_json::Value>,
+
+    /// Exit code for bash tools
+    #[serde(default)]
+    exit_code: Option<i32>,
 
     #[serde(default)]
     cwd: Option<String>,

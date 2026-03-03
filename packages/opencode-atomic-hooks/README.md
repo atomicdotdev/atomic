@@ -42,6 +42,13 @@ Remove the plugin entry from `opencode.jsonc`:
 }
 ```
 
+## Developer Workflow
+
+1. Edit `src/index.ts` in the hooks package
+2. Run `bun run build` in `atomic/packages/opencode-atomic-hooks/`
+3. Restart OpenCode — it picks up the new build automatically via the symlink
+4. Check `.atomic/plugin-debug.log` in whatever project you're running
+
 ## How It Works
 
 ```

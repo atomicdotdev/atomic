@@ -569,6 +569,17 @@ pub struct SerializedGraph {
     /// via the `previous` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_provenance_hash: Option<String>,
+
+    /// Number of nodes included in the last saved ProvenanceGraph.
+    /// Used by the accumulator to export only the per-turn delta
+    /// (nodes added since the last save) instead of the full cumulative set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nodes_saved_count: Option<usize>,
+
+    /// Number of edges included in the last saved ProvenanceGraph.
+    /// Used alongside `nodes_saved_count` for per-turn delta export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edges_saved_count: Option<usize>,
 }
 
 impl SerializedGraph {
@@ -592,6 +603,8 @@ impl Default for SerializedGraph {
             last_node: None,
             pending_human_gate: None,
             last_provenance_hash: None,
+            nodes_saved_count: None,
+            edges_saved_count: None,
         }
     }
 }

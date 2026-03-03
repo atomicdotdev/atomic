@@ -564,8 +564,17 @@ impl TurnOrchestrator {
             let _ = self.watcher.cancel_turn().await;
         }
 
-        // Compute turn metadata
-        let turn_duration_ms = session.current_turn_duration_ms().unwrap_or(0);
+        // Compute turn metadata.
+        // Prefer the plugin-provided duration (chat.message → session.idle wall-clock)
+        // over the Rust-side computation (user-prompt CLI → stop CLI, which is ~0ms
+        // because the plugin sends both in rapid succession at idle time).
+        let plugin_duration_ms = event
+            .raw_json
+            .as_ref()
+            .and_then(|r| r.get("turn_duration_ms"))
+            .and_then(|v| v.as_u64());
+        let turn_duration_ms =
+            plugin_duration_ms.unwrap_or_else(|| session.current_turn_duration_ms().unwrap_or(0));
         let turn_number = session.end_turn(); // increments turn_count, returns new count
 
         // State machine transition — always say files MAY have changed.
@@ -586,10 +595,14 @@ impl TurnOrchestrator {
         for action in &remaining {
             match action {
                 Action::RecordTurn | Action::RecordIfChanged => {
-                    // Get the prompt from the event or session
+                    // Get the prompt for this turn's change message.
+                    // Priority: event.prompt (from TurnEnd, rare)
+                    //         > session.current_prompt (set on each TurnStart)
+                    //         > session.first_prompt (fallback for legacy/missing)
                     let prompt = event
                         .prompt
                         .clone()
+                        .or_else(|| session.current_prompt.clone())
                         .or_else(|| session.first_prompt.clone());
 
                     let record_options = TurnRecordOptions {
@@ -606,8 +619,13 @@ impl TurnOrchestrator {
                             let recorded_files: Vec<String> = outcome.recorded_file_list().to_vec();
                             session.add_files_touched(&recorded_files);
 
-                            // Provenance: append a patch proposal node and save
-                            // the provenance graph to the repository.
+                            // Clear current_prompt so the next turn doesn't
+                            // reuse this turn's prompt as the change message.
+                            session.clear_current_prompt();
+
+                            // Provenance: inject reasoning blocks as Decision nodes,
+                            // then append a patch proposal node and save the graph.
+                            self.inject_reasoning_nodes(session_id, &event);
                             self.save_turn_provenance(session_id, &session, &outcome, &event);
 
                             log::info!(
@@ -789,17 +807,47 @@ impl TurnOrchestrator {
                 let tool_name = event.tool_name.as_deref().unwrap_or("unknown");
                 let tool_call_id = event.tool_use_id.as_deref();
 
-                // Extract tool_input, tool_output, status, duration from raw_json
+                // Extract tool_input, tool_output, status, duration from raw_json.
+                //
+                // The enriched OpenCode plugin sends top-level fields alongside
+                // tool_input: filediff, diagnostics, title, file_path, exit_code.
+                // We merge these INTO tool_input so the accumulator's classify
+                // and detail-building functions can find them without changing
+                // their signature.
                 let raw = event.raw_json.as_ref();
-                let tool_input = raw.and_then(|r| r.get("tool_input"));
                 let tool_output = raw.and_then(|r| r.get("tool_output").and_then(|v| v.as_str()));
                 let status = raw.and_then(|r| r.get("status").and_then(|v| v.as_str()));
                 let duration_ms = raw.and_then(|r| r.get("duration").and_then(|v| v.as_u64()));
 
+                // Build a merged tool_input that includes both the original
+                // tool_input fields AND the top-level enriched fields.
+                let merged_input: Option<serde_json::Value> = raw.map(|r| {
+                    let mut merged = r
+                        .get("tool_input")
+                        .and_then(|v| v.as_object().cloned())
+                        .unwrap_or_default();
+
+                    // Merge enriched top-level fields into tool_input
+                    for key in &[
+                        "filediff",
+                        "diagnostics",
+                        "title",
+                        "file_path",
+                        "exit_code",
+                        "diff",
+                    ] {
+                        if let Some(val) = r.get(*key) {
+                            merged.insert(key.to_string(), val.clone());
+                        }
+                    }
+
+                    serde_json::Value::Object(merged)
+                });
+
                 acc.append_tool_call(
                     tool_name,
                     tool_call_id,
-                    tool_input,
+                    merged_input.as_ref(),
                     tool_output,
                     status,
                     duration_ms,
@@ -811,6 +859,79 @@ impl TurnOrchestrator {
         }
 
         Ok(DispatchResult::new(session_id, session.phase))
+    }
+
+    /// Inject reasoning/thinking blocks from the stop event into the
+    /// ProvenanceAccumulator as Decision nodes.
+    ///
+    /// The OpenCode plugin sends `reasoning_text` (blocks separated by
+    /// `\n---\n`) and `reasoning_signature` (last block's Anthropic signature)
+    /// in the `stop` payload. Each block becomes a Decision node in the
+    /// provenance graph with the full thinking text and signature in its detail.
+    fn inject_reasoning_nodes(&mut self, session_id: &str, event: &TurnEvent) {
+        let raw = match event.raw_json.as_ref() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let mut acc = match self.load_accumulator(session_id) {
+            Some(a) => a,
+            None => return,
+        };
+
+        let timestamp = event.timestamp.timestamp();
+        let mut block_count = 0;
+
+        // Prefer the structured `reasoning_blocks` array when available.
+        // Each entry has { text, duration_ms, signature? } with per-block metadata.
+        // Falls back to splitting `reasoning_text` on "\n---\n" for older plugins.
+        if let Some(blocks_arr) = raw.get("reasoning_blocks").and_then(|v| v.as_array()) {
+            for block in blocks_arr {
+                let text = match block.get("text").and_then(|v| v.as_str()) {
+                    Some(t) if !t.trim().is_empty() => t.trim(),
+                    _ => continue,
+                };
+                let duration_ms = block.get("duration_ms").and_then(|v| v.as_u64());
+                let signature = block.get("signature").and_then(|v| v.as_str());
+
+                acc.append_reasoning(text, duration_ms, signature, timestamp);
+                block_count += 1;
+            }
+        } else {
+            // Fallback: split concatenated reasoning_text on "\n---\n"
+            let reasoning_text = match raw.get("reasoning_text").and_then(|v| v.as_str()) {
+                Some(t) if !t.is_empty() => t,
+                _ => return,
+            };
+            let reasoning_signature = raw.get("reasoning_signature").and_then(|v| v.as_str());
+
+            let blocks: Vec<&str> = reasoning_text
+                .split("\n---\n")
+                .filter(|b| !b.trim().is_empty())
+                .collect();
+
+            let total = blocks.len();
+            for (i, block) in blocks.iter().enumerate() {
+                // Only the last block gets the signature
+                let sig = if i == total - 1 {
+                    reasoning_signature
+                } else {
+                    None
+                };
+                acc.append_reasoning(block.trim(), None, sig, timestamp);
+                block_count += 1;
+            }
+        }
+
+        if block_count > 0 {
+            log::info!(
+                "Injected {} reasoning node{} into provenance for session {}",
+                block_count,
+                if block_count == 1 { "" } else { "s" },
+                session_id,
+            );
+            self.save_accumulator(session_id, &acc);
+        }
     }
 
     // Helpers
