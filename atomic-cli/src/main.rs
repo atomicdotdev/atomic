@@ -45,7 +45,7 @@ mod output;
 use clap::{Parser, Subcommand};
 
 use commands::{
-    Add, Agent, Apply, ChangeCmd, Clone, Command, Diff, Hive, Identity, Init, Log, Move, Pull,
+    Add, Agent, Apply, ChangeCmd, Clone, Command, Diff, Git, Hive, Identity, Init, Log, Move, Pull,
     Push, Record, Remote, Remove, Reset, Revise, Split, Stack, Stash, Status, Tag, Unrecord,
 };
 use output::{print_error, print_hint};
@@ -316,6 +316,28 @@ enum Commands {
     /// ```
     Diff(Diff),
 
+    /// Git interoperability commands.
+    ///
+    /// Import Git repositories into Atomic, preserving history, authorship,
+    /// and file operations.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Import current Git repository
+    /// atomic git import
+    ///
+    /// # Import specific branch
+    /// atomic git import --branch main
+    ///
+    /// # Import all branches as stacks
+    /// atomic git import --all-branches
+    ///
+    /// # Preview without creating repository
+    /// atomic git import --dry-run
+    /// ```
+    Git(Git),
+
     /// Manage stacks (views of the graph).
     ///
     /// Stacks in Atomic are similar to branches in Git, but they represent
@@ -534,6 +556,8 @@ fn main() {
         Commands::Change(change) => change.run(),
 
         Commands::Diff(diff) => diff.run(),
+
+        Commands::Git(git) => git.run(),
 
         Commands::Apply(apply) => apply.run(),
 

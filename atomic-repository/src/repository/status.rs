@@ -316,22 +316,31 @@ impl Repository {
                                             // Otherwise keep as Clean
                                         }
                                         Ok(None) => {
-                                            // No recorded content - keep as Clean
-                                            debug_assert!(
-                                                !has_graph_content || {
-                                                    let is_empty_file = std::fs::metadata(&abs_path)
-                                                        .map(|m| m.len() == 0)
-                                                        .unwrap_or(false);
-                                                    if !is_empty_file {
-                                                        eprintln!(
-                                                            "WARNING: File '{}' has graph content but get_file_content returned None.",
-                                                            path.display()
-                                                        );
+                                            // No recorded content retrieved.
+                                            // If the file has graph content but retrieval returned None,
+                                            // this indicates a retrieval issue - mark as Modified to be safe.
+                                            // This ensures git import doesn't miss changes when content
+                                            // retrieval fails (e.g., due to change filter issues).
+                                            if has_graph_content {
+                                                let is_empty_file = std::fs::metadata(&abs_path)
+                                                    .map(|m| m.len() == 0)
+                                                    .unwrap_or(false);
+                                                if !is_empty_file {
+                                                    // File has graph content but retrieval failed - treat as modified
+                                                    entry = FileStatusEntry::new(
+                                                        path.clone(),
+                                                        FileStatus::Modified,
+                                                    );
+                                                    if let Some(inode) = inode {
+                                                        entry.set_inode(inode);
                                                     }
-                                                    true
-                                                },
-                                                "Unexpected: has_graph_content=true but no content retrieved"
-                                            );
+                                                    entry.set_current_hash(current_hash);
+                                                    entry.set_details(
+                                                        "Content retrieval failed".to_string(),
+                                                    );
+                                                }
+                                            }
+                                            // For files without graph content, keep as Clean
                                         }
                                         Err(_) => {
                                             // Error retrieving content - assume modified to be safe

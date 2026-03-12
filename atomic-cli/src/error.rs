@@ -272,6 +272,16 @@ pub enum CliError {
         remote: String,
     },
 
+    // Git Interop Errors
+    /// A Git operation failed.
+    ///
+    /// This occurs during git import or other git interoperability operations.
+    #[error("Git error: {message}")]
+    GitError {
+        /// Description of what went wrong
+        message: String,
+    },
+
     // User Input Errors
     /// The user cancelled the operation.
     #[error("Operation cancelled by user")]
@@ -507,6 +517,9 @@ impl CliError {
             Self::AuthenticationFailed { .. } => {
                 Some("Check your credentials. You may need to set up SSH keys or update your access token.")
             }
+            Self::GitError { .. } => {
+                Some("Ensure you are in a Git repository. Run 'git status' to verify.")
+            }
             Self::IdentityNotFound(_) => {
                 Some("Run 'atomic identity list' to see available identities, or 'atomic identity new <name>' to create one.")
             }
@@ -570,7 +583,8 @@ impl CliError {
             // Remote/network errors
             Self::RemoteError { .. }
             | Self::RemoteNotFound { .. }
-            | Self::AuthenticationFailed { .. } => 4,
+            | Self::AuthenticationFailed { .. }
+            | Self::GitError { .. } => 4,
 
             // IO and config errors
             Self::Io(_) | Self::Config(_) => 3,

@@ -226,13 +226,15 @@ impl Log {
                 output.push('\n');
             }
 
-            // Change header line
+            // Change header line with sequence number for scripting compatibility
             let hash_str = format_hash_with_length(&entry.hash, hash_length);
             let tagged_marker = if entry.is_tagged { " (tag)" } else { "" };
+            let seq_str = format!("#{}", entry.sequence);
             output.push_str(&format!(
-                "{} {}{}\n",
-                style_hash("change"),
+                "{} {} {}{}\n",
+                hint(&seq_str),
                 style_hash(&hash_str),
+                style_hash("change"),
                 hint(tagged_marker)
             ));
 
