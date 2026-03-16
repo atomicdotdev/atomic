@@ -870,17 +870,6 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         Ok(())
     }
 
-    fn get_deps(&self, change_id: NodeId) -> PristineResult<Vec<NodeId>> {
-        let table = self.txn.open_multimap_table(DEPS)?;
-        let mut deps = Vec::new();
-        for result in table.get(change_id.get())? {
-            if let Ok(v) = result {
-                deps.push(NodeId::new(v.value()));
-            }
-        }
-        Ok(deps)
-    }
-
     fn alloc_inode(&mut self) -> PristineResult<Inode> {
         let id = self.next_inode.fetch_add(1, Ordering::SeqCst);
         Ok(Inode::new(id))

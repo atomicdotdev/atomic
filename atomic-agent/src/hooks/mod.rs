@@ -59,6 +59,7 @@
 pub mod claude_code;
 pub mod gemini_cli;
 pub mod opencode;
+pub mod sherpa;
 
 use std::fmt;
 use std::path::Path;
@@ -246,6 +247,7 @@ impl AgentRegistry {
         registry.register(Box::new(claude_code::ClaudeCodeHook::new()));
         registry.register(Box::new(gemini_cli::GeminiCliHook::new()));
         registry.register(Box::new(opencode::OpenCodeHook::new()));
+        registry.register(Box::new(sherpa::SherpaHook::new()));
         registry
     }
 

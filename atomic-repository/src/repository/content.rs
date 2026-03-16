@@ -75,8 +75,30 @@ impl Repository {
             Err(e) => return Err(RepositoryError::Database(e.to_string())),
         };
 
-        // Build a change filter starting from this stack's own changes.
+        // Build a change filter starting from this stack's own changes,
+        // then expand with their dependencies (from the change FILES,
+        // not the DEPS table which is for attestations).
+        //
+        // After a content revise, the stack has A' but not A.  A' depends
+        // on A (its hunks modify A's vertices).  Without including A's
+        // NodeId in the filter, the alive-graph traversal would exclude
+        // A's vertices and fail to produce content.
         let mut change_filter = collect_stack_change_ids(&txn, &stack)?;
+
+        // Expand: for each stack change, load its change file, resolve
+        // each dependency hash to a NodeId, and add to the filter.
+        let direct_ids: Vec<NodeId> = change_filter.iter().copied().collect();
+        for node_id in direct_ids {
+            if let Ok(Some(hash)) = txn.get_external(node_id) {
+                if let Ok(change) = self.load_change(&hash) {
+                    for dep_hash in change.dependencies() {
+                        if let Ok(Some(dep_id)) = txn.get_internal(dep_hash) {
+                            change_filter.insert(dep_id);
+                        }
+                    }
+                }
+            }
+        }
 
         // For local workspaces, also include changes from parent stacks in the
         // overlay chain, since those changes' vertices should be visible too.

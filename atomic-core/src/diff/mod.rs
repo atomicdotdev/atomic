@@ -505,6 +505,180 @@ pub fn diff_with_separator<'a>(
     diff(&old_lines, &new_lines, algorithm)
 }
 
+/// Three-way merge of byte content.
+///
+/// Given three versions of a file:
+/// - `base`   — the common ancestor (A's original content)
+/// - `ours`   — our modified version (A' after revise)
+/// - `theirs` — their modified version (A+B content after B was applied to A)
+///
+/// This computes B's delta via `diff(base, theirs)`, then applies that
+/// delta to `ours`.  For each region:
+///
+/// - **Equal** (B didn't change): keep whatever `ours` has (which may
+///   differ from base if A' modified it).
+/// - **Insert** (B added lines): insert them into the output.
+/// - **Delete** (B removed lines): if `ours` still has the same lines,
+///   remove them.  If `ours` already changed them → conflict.
+/// - **Replace** (B replaced lines): if `ours` still has the originals,
+///   apply B's replacement.  If `ours` already changed them → conflict.
+///
+/// # Returns
+///
+/// `Ok(merged_bytes)` on clean merge, `Err(description)` on conflict.
+///
+/// # Example
+///
+/// ```rust
+/// use atomic_core::diff::merge_text;
+///
+/// let base   = b"line alpha\n";
+/// let ours   = b"line alpha revised\n";
+/// let theirs = b"line alpha\nline beta\n";
+///
+/// let merged = merge_text(base, ours, theirs).unwrap();
+/// assert_eq!(merged, b"line alpha revised\nline beta\n");
+/// ```
+pub fn merge_text(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<Vec<u8>, String> {
+    let base_lines: Vec<Line> = Line::from_bytes(base);
+    let ours_lines: Vec<Line> = Line::from_bytes(ours);
+    let theirs_lines: Vec<Line> = Line::from_bytes(theirs);
+
+    // Compute what "they" changed relative to the common base.
+    let b_delta = diff(&base_lines, &theirs_lines, Algorithm::Myers);
+
+    // Compute what "we" changed relative to the common base.
+    let a_delta = diff(&base_lines, &ours_lines, Algorithm::Myers);
+
+    // Build a set of base line indices that "we" modified (deleted or replaced).
+    // If B also touches any of these lines, that's a conflict.
+    let mut our_changed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for op in a_delta.ops() {
+        match op {
+            DiffOp::Delete { old_pos, len, .. }
+            | DiffOp::Replace {
+                old_pos,
+                old_len: len,
+                ..
+            } => {
+                for i in *old_pos..(*old_pos + *len) {
+                    our_changed.insert(i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Walk B's delta and build the merged output.
+    //
+    // We track our position in `ours_lines` via `ours_idx`.  For Equal
+    // regions we advance ours_idx by the number of base lines consumed
+    // (which maps 1:1 to ours lines in unchanged regions).  For regions
+    // B changed, we check for conflicts against our_changed.
+    let mut output: Vec<u8> = Vec::new();
+    let mut base_idx: usize = 0; // current position in base
+    let mut ours_idx: usize = 0; // current position in ours
+
+    for op in b_delta.ops() {
+        match op {
+            DiffOp::Equal { old_pos, len, .. } => {
+                // B didn't change this region.  Emit from ours (which may
+                // have A' modifications for these lines).
+                // First, advance to old_pos in base.
+                let skip = old_pos - base_idx;
+                // ours_idx should already be aligned; advance by the
+                // same number of lines we skip in base.
+                ours_idx += skip;
+                base_idx = *old_pos;
+
+                // Emit `len` lines from ours at ours_idx.
+                for i in 0..*len {
+                    if ours_idx + i < ours_lines.len() {
+                        output.extend_from_slice(ours_lines[ours_idx + i].content());
+                    }
+                }
+                ours_idx += len;
+                base_idx += len;
+            }
+
+            DiffOp::Insert {
+                old_pos,
+                new_pos,
+                len,
+            } => {
+                // B inserted lines here.  Advance ours to this point,
+                // then emit B's inserted lines from theirs.
+                let skip = old_pos - base_idx;
+                ours_idx += skip;
+                base_idx = *old_pos;
+
+                for i in 0..*len {
+                    if new_pos + i < theirs_lines.len() {
+                        output.extend_from_slice(theirs_lines[new_pos + i].content());
+                    }
+                }
+                // base_idx and ours_idx don't advance (insert is between lines)
+            }
+
+            DiffOp::Delete { old_pos, len, .. } => {
+                // B deleted lines from base.  Check if ours also changed them.
+                let skip = old_pos - base_idx;
+                ours_idx += skip;
+                base_idx = *old_pos;
+
+                for i in 0..*len {
+                    if our_changed.contains(&(old_pos + i)) {
+                        return Err(format!(
+                            "Conflict at base line {}: both sides modified",
+                            old_pos + i + 1
+                        ));
+                    }
+                }
+                // Skip these lines in both base and ours (B deleted them).
+                ours_idx += len;
+                base_idx += len;
+            }
+
+            DiffOp::Replace {
+                old_pos,
+                old_len,
+                new_pos,
+                new_len,
+            } => {
+                // B replaced lines.  Check for conflict.
+                let skip = old_pos - base_idx;
+                ours_idx += skip;
+                base_idx = *old_pos;
+
+                for i in 0..*old_len {
+                    if our_changed.contains(&(old_pos + i)) {
+                        return Err(format!(
+                            "Conflict at base line {}: both sides modified",
+                            old_pos + i + 1
+                        ));
+                    }
+                }
+                // Emit B's replacement lines from theirs.
+                for i in 0..*new_len {
+                    if new_pos + i < theirs_lines.len() {
+                        output.extend_from_slice(theirs_lines[new_pos + i].content());
+                    }
+                }
+                ours_idx += old_len;
+                base_idx += old_len;
+            }
+        }
+    }
+
+    // Emit any remaining lines from ours (after the last B delta op).
+    while ours_idx < ours_lines.len() {
+        output.extend_from_slice(ours_lines[ours_idx].content());
+        ours_idx += 1;
+    }
+
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

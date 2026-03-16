@@ -121,10 +121,25 @@ use crate::types::Hash;
 const MAGIC: &[u8; 4] = b"PRVG";
 
 /// Current provenance graph schema version.
-const SCHEMA_VERSION: u8 = 1;
+///
+/// v1 → v2: added `profile: Option<String>` as the last field.
+/// The `deserialize` method handles v1 payloads by deserializing into
+/// `ProvenanceGraphV1` and upgrading to `ProvenanceGraph` in-memory.
+const SCHEMA_VERSION: u8 = 2;
 
 /// File extension for provenance graph files.
 pub const PROVENANCE_GRAPH_EXTENSION: &str = "provenance";
+
+/// Profile identifier for Sherpa-structured provenance graphs.
+///
+/// When `ProvenanceGraph.profile` is set to this value, the UI knows the
+/// node `detail` fields contain Sherpa-specific structured JSON
+/// (intent/todos/verification). Absent means a generic agent graph.
+///
+/// Semver rules:
+/// - Minor bump (1.1.0): new optional fields added to any detail struct
+/// - Major bump (2.0.0): breaking change to required fields
+pub const SHERPA_PROFILE: &str = "sherpa-trace/1.0.0";
 
 // =============================================================================
 // ProvenanceGraph
@@ -182,6 +197,28 @@ pub struct ProvenanceGraph {
 
     /// Aggregate statistics for quick filtering without loading the full graph.
     pub stats: ProvenanceStats,
+
+    /// Schema profile identifier.
+    ///
+    /// `None` — generic agent graph (atomic-agent, Claude Code, OpenCode).
+    /// `Some("sherpa-trace/1.0.0")` — Sherpa structured graph: node `detail`
+    /// fields carry intent/todo/execution/verification JSON. Use the
+    /// [`SHERPA_PROFILE`] constant rather than a raw string literal.
+    ///
+    /// The UI checks this field first. If absent it falls back to generic
+    /// rendering. If present it renders the full intent/todo/verification
+    /// panels and applies the versioned detail schema.
+    ///
+    /// Must remain the LAST field in this struct. Postcard uses a positional
+    /// binary format — appending here ensures old serialized graphs (which
+    /// have no profile bytes) still deserialize correctly with `profile: None`.
+    ///
+    /// Note: do NOT add `skip_serializing_if` here. Postcard is a positional
+    /// format — every field must always be present in the byte stream.
+    /// Skipping would cause deserialization to read the wrong bytes for this
+    /// field and corrupt the payload. `None` encodes as a single `0x00` byte.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl ProvenanceGraph {
@@ -229,17 +266,44 @@ impl ProvenanceGraph {
             });
         }
 
-        let graph: Self =
-            postcard::from_bytes(&data[4..]).map_err(|e| ProvenanceGraphError::Codec {
-                reason: format!("postcard deserialize failed: {}", e),
-            })?;
+        // Peek at the version byte without fully deserializing.
+        // The first field in the postcard payload is `version: u8`.
+        let version_byte = data[4];
 
-        if graph.version > SCHEMA_VERSION {
+        if version_byte > SCHEMA_VERSION {
             return Err(ProvenanceGraphError::UnsupportedVersion {
-                version: graph.version,
+                version: version_byte,
                 max_supported: SCHEMA_VERSION,
             });
         }
+
+        let graph: Self = if version_byte <= 1 {
+            // v1 payload: no `profile` field. Deserialize into the v1 shim
+            // struct (identical to the current struct minus `profile`) and
+            // upgrade to v2 in-memory with `profile: None`.
+            let v1: ProvenanceGraphV1 =
+                postcard::from_bytes(&data[4..]).map_err(|e| ProvenanceGraphError::Codec {
+                    reason: format!("postcard deserialize failed (v1): {}", e),
+                })?;
+            ProvenanceGraph {
+                version: SCHEMA_VERSION,
+                timestamp: v1.timestamp,
+                session_id: v1.session_id,
+                agent_name: v1.agent_name,
+                agent_display_name: v1.agent_display_name,
+                agent_vendor: v1.agent_vendor,
+                nodes: v1.nodes,
+                edges: v1.edges,
+                changes_explained: v1.changes_explained,
+                previous: v1.previous,
+                stats: v1.stats,
+                profile: None,
+            }
+        } else {
+            postcard::from_bytes(&data[4..]).map_err(|e| ProvenanceGraphError::Codec {
+                reason: format!("postcard deserialize failed: {}", e),
+            })?
+        };
 
         let hash = Hash::of(data);
         Ok((graph, hash))
@@ -441,22 +505,59 @@ impl fmt::Display for ProvenanceNode {
 /// Mirrors `atomic_agent::provenance::types::NodeKind` but is independently
 /// defined in `atomic-core` so the storage layer doesn't depend on the agent
 /// crate.
+///
+/// ## Sherpa Workflow Mapping
+///
+/// When `ProvenanceGraph::profile == "sherpa-trace/1.0.0"` the following
+/// variants are used with Sherpa-specific JSON payloads in `node.detail`:
+///
+/// | Variant        | Sherpa concept                                      | Detail struct       |
+/// |----------------|-----------------------------------------------------|---------------------|
+/// | `Goal`         | IntentNode — turn anchor with phase token breakdown | `GoalDetail`        |
+/// | `Commitment`   | Todo that produced file changes, file attribution   | `CommitmentDetail`  |
+/// | `Execution`    | `bash` tool call linked to the active todo          | `ExecutionDetail`   |
+/// | `Verification` | Verification state — outcome + learnings            | `VerificationDetail`|
+/// | `HumanGate`    | `/accept` or `/guide [ids]` resolution              | *(summary only)*    |
+///
+/// The remaining variants (`Exploration`, `Decision`, `PatchProposal`,
+/// `Error`) are used by the generic `atomic-agent` path and are not emitted
+/// by the Sherpa structured workflow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvenanceNodeKind {
-    /// Human prompt — what was asked for.
+    /// Human prompt / Sherpa intent — what was asked for.
+    ///
+    /// In Sherpa graphs (`profile == "sherpa-trace/1.0.0"`) carries a
+    /// `GoalDetail` JSON payload in `node.detail` with intent fields and
+    /// per-phase token breakdown.
     Goal,
     /// Read/search/grep — understanding the codebase.
     Exploration,
     /// Consolidated: agent chose strategy X over Y.
     Decision,
     /// Write/edit/patch — file changes on disk.
+    ///
+    /// In Sherpa graphs one node is emitted per todo that produced file
+    /// changes. Carries a `CommitmentDetail` JSON payload with todo fields,
+    /// file attribution, and token slice.
     Commitment,
     /// Test/lint/typecheck/build — validating work.
+    ///
+    /// In Sherpa graphs written when the state machine reaches
+    /// `State::Verification`. Carries a `VerificationDetail` JSON payload
+    /// with outcome, learnings, and turn-level cost rollup.
     Verification,
     /// Bash (non-test) or other side effects.
+    ///
+    /// In Sherpa graphs one node is emitted per `bash` tool call. Carries an
+    /// `ExecutionDetail` JSON payload with command, exit code, duration, and
+    /// the active todo ID at time of call.
     Execution,
     /// Permission asked — agent uncertainty surfaced to human.
+    ///
+    /// In Sherpa graphs written on `/accept` or `/guide [ids]` resolution.
+    /// The node summary records which path was taken; contributor attribution
+    /// is propagated to the associated `CommitmentDetail` nodes.
     HumanGate,
     /// Recorded change — the output artifact.
     PatchProposal,
@@ -660,6 +761,33 @@ impl fmt::Display for ProvenanceStats {
 }
 
 // =============================================================================
+// ProvenanceGraphV1  (migration shim — do not use for new code)
+// =============================================================================
+
+/// Schema v1 layout — identical to [`ProvenanceGraph`] but without `profile`.
+///
+/// Used only inside [`ProvenanceGraph::deserialize`] to read files written by
+/// older versions of Atomic. After loading, the caller upgrades to the current
+/// struct by setting `profile: None`.
+#[derive(Serialize, Deserialize)]
+struct ProvenanceGraphV1 {
+    version: u8,
+    timestamp: i64,
+    session_id: String,
+    agent_name: String,
+    #[serde(default)]
+    agent_display_name: String,
+    #[serde(default)]
+    agent_vendor: String,
+    nodes: Vec<ProvenanceNode>,
+    edges: Vec<ProvenanceEdge>,
+    changes_explained: Vec<Hash>,
+    #[serde(default)]
+    previous: Option<Hash>,
+    stats: ProvenanceStats,
+}
+
+// =============================================================================
 // ProvenanceGraphBuilder
 // =============================================================================
 
@@ -669,6 +797,7 @@ pub struct ProvenanceGraphBuilder {
     agent_name: String,
     agent_display_name: String,
     agent_vendor: String,
+    profile: Option<String>,
     nodes: Vec<ProvenanceNode>,
     edges: Vec<ProvenanceEdge>,
     changes_explained: Vec<Hash>,
@@ -684,6 +813,7 @@ impl ProvenanceGraphBuilder {
             agent_name: agent_name.into(),
             agent_display_name: String::new(),
             agent_vendor: String::new(),
+            profile: None,
             nodes: Vec::new(),
             edges: Vec::new(),
             changes_explained: Vec::new(),
@@ -701,6 +831,15 @@ impl ProvenanceGraphBuilder {
     /// Set the AI vendor identifier.
     pub fn agent_vendor(mut self, vendor: impl Into<String>) -> Self {
         self.agent_vendor = vendor.into();
+        self
+    }
+
+    /// Set the schema profile identifier.
+    ///
+    /// Use [`SHERPA_PROFILE`] for Sherpa-structured graphs. Omit for generic
+    /// agent graphs — `profile` defaults to `None` if not set.
+    pub fn profile(mut self, profile: impl Into<String>) -> Self {
+        self.profile = Some(profile.into());
         self
     }
 
@@ -775,6 +914,7 @@ impl ProvenanceGraphBuilder {
             changes_explained: self.changes_explained,
             previous: self.previous,
             stats,
+            profile: self.profile,
         }
     }
 }
@@ -921,17 +1061,79 @@ mod tests {
             .timestamp(1000)
             .build();
 
-        assert_eq!(graph.version, SCHEMA_VERSION);
+        assert_eq!(graph.version, 2);
         assert_eq!(graph.timestamp, 1000);
         assert_eq!(graph.session_id, "sess-1");
         assert_eq!(graph.agent_name, "agent");
         assert!(graph.agent_display_name.is_empty());
         assert!(graph.agent_vendor.is_empty());
+        assert!(graph.profile.is_none());
         assert!(graph.nodes.is_empty());
         assert!(graph.edges.is_empty());
         assert!(graph.changes_explained.is_empty());
         assert!(graph.previous.is_none());
         assert!(graph.stats.is_empty());
+    }
+
+    #[test]
+    fn test_builder_with_sherpa_profile() {
+        let graph = ProvenanceGraph::builder("sess-1", "sherpa")
+            .timestamp(1000)
+            .profile(SHERPA_PROFILE)
+            .build();
+
+        assert_eq!(graph.profile, Some(SHERPA_PROFILE.to_string()));
+    }
+
+    #[test]
+    fn test_profile_none_by_default() {
+        let graph = sample_graph();
+        assert!(graph.profile.is_none());
+    }
+
+    #[test]
+    fn test_profile_roundtrips_through_serialization() {
+        let graph = ProvenanceGraph::builder("sess-1", "sherpa")
+            .timestamp(1000)
+            .profile(SHERPA_PROFILE)
+            .build();
+
+        let bytes = graph.serialize().unwrap();
+        let (loaded, _) = ProvenanceGraph::deserialize(&bytes).unwrap();
+
+        assert_eq!(loaded.profile, Some(SHERPA_PROFILE.to_string()));
+    }
+
+    #[test]
+    fn test_profile_absent_on_old_graph_deserializes_as_none() {
+        // Simulate a v1 payload: build a ProvenanceGraphV1 directly and
+        // serialize it with postcard (no profile field), then wrap it with
+        // the PRVG magic and verify that deserialize upgrades it to v2 with
+        // profile = None.
+        let v1 = ProvenanceGraphV1 {
+            version: 1,
+            timestamp: 500,
+            session_id: "sess-old".into(),
+            agent_name: "claude-code".into(),
+            agent_display_name: String::new(),
+            agent_vendor: String::new(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            changes_explained: Vec::new(),
+            previous: None,
+            stats: ProvenanceStats::default(),
+        };
+
+        let payload = postcard::to_allocvec(&v1).unwrap();
+        let mut bytes = b"PRVG".to_vec();
+        bytes.extend_from_slice(&payload);
+
+        let (loaded, _) = ProvenanceGraph::deserialize(&bytes).unwrap();
+
+        assert!(loaded.profile.is_none());
+        // Version is upgraded to current schema version in memory.
+        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.session_id, "sess-old");
     }
 
     #[test]
@@ -1039,7 +1241,7 @@ mod tests {
         let bytes = graph.serialize().unwrap();
         let (loaded, hash) = ProvenanceGraph::deserialize(&bytes).unwrap();
 
-        assert_eq!(loaded.version, SCHEMA_VERSION);
+        assert_eq!(loaded.version, 2);
         assert_eq!(loaded.session_id, "sess-1");
         assert_eq!(loaded.agent_name, "agent");
         assert_eq!(loaded.timestamp, 1000);

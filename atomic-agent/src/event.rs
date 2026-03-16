@@ -153,7 +153,7 @@ impl HookType {
     /// ```
     pub fn from_verb(verb: &str) -> Option<Self> {
         match verb {
-            // Session boundaries (shared by Claude Code, Gemini CLI, OpenCode)
+            // Session boundaries (shared by Claude Code, Gemini CLI, OpenCode, Sherpa)
             "session-start" => Some(HookType::SessionStart),
             "session-end" => Some(HookType::SessionEnd),
 
@@ -168,6 +168,12 @@ impl HookType {
             // OpenCode turn boundaries
             "user-prompt" => Some(HookType::TurnStart),
             // OpenCode also uses "stop" for TurnEnd (handled above)
+
+            // Sherpa TUI turn boundaries
+            "turn-start" => Some(HookType::TurnStart),
+            "turn-end" => Some(HookType::TurnEnd),
+            // Sherpa verification triggers turn-end
+            "verification" => Some(HookType::TurnEnd),
 
             // Claude Code tool use
             "pre-task" => Some(HookType::PreToolUse),

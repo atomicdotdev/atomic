@@ -623,6 +623,18 @@ impl TurnOrchestrator {
                             // reuse this turn's prompt as the change message.
                             session.clear_current_prompt();
 
+                            // Sherpa: ingest the JSONL trace file into the provenance accumulator
+                            // so the resulting ProvenanceGraph has rich node data (file attribution,
+                            // bash commands, todo structure) instead of just the thin Goal node.
+                            if let Some(trace_path) = event
+                                .raw_json
+                                .as_ref()
+                                .and_then(|r| r.get("trace_file"))
+                                .and_then(|v| v.as_str())
+                            {
+                                self.ingest_sherpa_trace(session_id, Path::new(trace_path));
+                            }
+
                             // Provenance: inject reasoning blocks as Decision nodes,
                             // then append a patch proposal node and save the graph.
                             self.inject_reasoning_nodes(session_id, &event);
@@ -1019,6 +1031,126 @@ impl TurnOrchestrator {
                 e,
             );
         }
+    }
+
+    /// Read a Sherpa JSONL trace file and feed each record into the
+    /// provenance accumulator.
+    ///
+    /// Best-effort: parse errors on individual lines are logged and skipped.
+    /// Returns `true` if at least one record was successfully ingested.
+    fn ingest_sherpa_trace(&self, session_id: &str, trace_path: &Path) -> bool {
+        let mut acc = match self.load_accumulator(session_id) {
+            Some(a) => a,
+            None => return false,
+        };
+
+        let content = match std::fs::read_to_string(trace_path) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!(
+                    "sherpa trace: failed to read {}: {}",
+                    trace_path.display(),
+                    e
+                );
+                return false;
+            }
+        };
+
+        let mut ingested = 0u32;
+        for (line_no, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("sherpa trace: line {} parse error: {}", line_no + 1, e);
+                    continue;
+                }
+            };
+
+            let dev_atomic = &record["metadata"]["dev.atomic"];
+            let record_type = dev_atomic["record_type"].as_str().unwrap_or("");
+            let timestamp = record["timestamp"]
+                .as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp())
+                .unwrap_or_else(|| chrono::Utc::now().timestamp());
+
+            match record_type {
+                "intent" => {
+                    let title = dev_atomic["intent_title"].as_str().unwrap_or("");
+                    if !title.is_empty() {
+                        acc.append_goal(title, timestamp);
+                        ingested += 1;
+                    }
+                }
+                "commitment" => {
+                    // Commitment maps to a write_file/edit_file tool call
+                    let file_path = record["files"]
+                        .as_array()
+                        .and_then(|f| f.first())
+                        .and_then(|f| f["path"].as_str())
+                        .unwrap_or("");
+                    let tool_input = serde_json::json!({
+                        "path": file_path,
+                        "todo_id": dev_atomic["todo_id"].as_str().unwrap_or(""),
+                    });
+                    acc.append_tool_call(
+                        "write_file",
+                        None,
+                        Some(&tool_input),
+                        None,
+                        Some("completed"),
+                        None,
+                        timestamp,
+                    );
+                    ingested += 1;
+                }
+                "execution" => {
+                    let command = dev_atomic["command"].as_str().unwrap_or("");
+                    let exit_code = dev_atomic["exit_code"].as_i64().unwrap_or(0);
+                    let duration_ms = dev_atomic["duration_ms"].as_u64();
+                    let tool_input = serde_json::json!({ "command": command });
+                    let output = dev_atomic["output_summary"].as_str();
+                    let status = if exit_code == 0 { "completed" } else { "error" };
+                    acc.append_tool_call(
+                        "bash",
+                        None,
+                        Some(&tool_input),
+                        output,
+                        Some(status),
+                        duration_ms,
+                        timestamp,
+                    );
+                    ingested += 1;
+                }
+                "verification" => {
+                    // Verification is a summary — currently no specific accumulator
+                    // method for it, but append_tool_call with a test-like command
+                    // will classify as Verification via the existing classifier.
+                    // The detail is preserved in the ProvenanceGraph via the
+                    // GoalDetail/VerificationDetail in the node detail strings.
+                    // For now, skip — the accumulator already has all the
+                    // constituent nodes from the above records.
+                    ingested += 1;
+                }
+                other => {
+                    log::debug!("sherpa trace: skipping unknown record_type '{}'", other);
+                }
+            }
+        }
+
+        if ingested > 0 {
+            self.save_accumulator(session_id, &acc);
+            log::info!(
+                "sherpa trace: ingested {} records from {}",
+                ingested,
+                trace_path.display()
+            );
+        }
+
+        ingested > 0
     }
 
     /// Save the provenance graph for a recorded turn.
