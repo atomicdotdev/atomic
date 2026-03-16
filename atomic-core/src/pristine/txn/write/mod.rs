@@ -858,6 +858,17 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         Ok(pos)
     }
 
+    fn get_deps(&self, change_id: NodeId) -> PristineResult<Vec<NodeId>> {
+        let table = self.txn.open_multimap_table(DEPS)?;
+        let mut result = Vec::new();
+        let iter = table.get(change_id.get())?;
+        for item in iter {
+            let value = item?;
+            result.push(NodeId::new(value.value()));
+        }
+        Ok(result)
+    }
+
     fn put_dep(&mut self, change_id: NodeId, dep_id: NodeId) -> PristineResult<()> {
         {
             let mut table = self.txn.open_multimap_table(DEPS)?;
