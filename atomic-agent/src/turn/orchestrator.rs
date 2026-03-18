@@ -1033,12 +1033,18 @@ impl TurnOrchestrator {
         }
     }
 
-    /// Read a Sherpa JSONL trace file and feed each record into the
-    /// provenance accumulator.
+    /// Read a Sherpa JSONL trace file and create provenance nodes for
+    /// every record, preserving the full agent-trace + Sherpa extension data.
     ///
-    /// Best-effort: parse errors on individual lines are logged and skipped.
+    /// Every JSONL line becomes a typed `ProvenanceNode` with the full
+    /// `metadata["dev.atomic"]` payload in its `detail` field. The semantic
+    /// knowledge graph can now query by node kind (Todo, PhaseTransition, etc.)
+    /// without parsing JSON blobs.
+    ///
     /// Returns `true` if at least one record was successfully ingested.
     fn ingest_sherpa_trace(&self, session_id: &str, trace_path: &Path) -> bool {
+        use crate::provenance::types::NodeKind;
+
         let mut acc = match self.load_accumulator(session_id) {
             Some(a) => a,
             None => return false,
@@ -1061,6 +1067,7 @@ impl TurnOrchestrator {
             if line.trim().is_empty() {
                 continue;
             }
+
             let record: serde_json::Value = match serde_json::from_str(line) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1070,75 +1077,95 @@ impl TurnOrchestrator {
             };
 
             let dev_atomic = &record["metadata"]["dev.atomic"];
-            let record_type = dev_atomic["record_type"].as_str().unwrap_or("");
+            let record_type = dev_atomic["record_type"].as_str().unwrap_or("unknown");
             let timestamp = record["timestamp"]
                 .as_str()
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.timestamp())
                 .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
-            match record_type {
-                "intent" => {
-                    let title = dev_atomic["intent_title"].as_str().unwrap_or("");
-                    if !title.is_empty() {
-                        acc.append_goal(title, timestamp);
-                        ingested += 1;
-                    }
-                }
+            // Map record_type to NodeKind.
+            let (kind, summary) = match record_type {
+                "intent" => (
+                    NodeKind::Goal,
+                    dev_atomic["intent_title"]
+                        .as_str()
+                        .unwrap_or("intent")
+                        .to_string(),
+                ),
                 "commitment" => {
-                    // Commitment maps to a write_file/edit_file tool call
-                    let file_path = record["files"]
+                    let file = record["files"]
                         .as_array()
                         .and_then(|f| f.first())
                         .and_then(|f| f["path"].as_str())
                         .unwrap_or("");
-                    let tool_input = serde_json::json!({
-                        "path": file_path,
-                        "todo_id": dev_atomic["todo_id"].as_str().unwrap_or(""),
-                    });
-                    acc.append_tool_call(
-                        "write_file",
-                        None,
-                        Some(&tool_input),
-                        None,
-                        Some("completed"),
-                        None,
-                        timestamp,
+                    (NodeKind::Commitment, format!("wrote {}", file))
+                }
+                "execution" => (
+                    NodeKind::Execution,
+                    dev_atomic["command"]
+                        .as_str()
+                        .unwrap_or("command")
+                        .to_string(),
+                ),
+                "todo" => {
+                    let tid = dev_atomic["todo_id"].as_str().unwrap_or("");
+                    let content = dev_atomic["content"].as_str().unwrap_or("");
+                    (NodeKind::Todo, format!("[{}] {}", tid, content))
+                }
+                "todo_status" => {
+                    let tid = dev_atomic["todo_id"].as_str().unwrap_or("");
+                    let from = dev_atomic["from_status"].as_str().unwrap_or("");
+                    let to = dev_atomic["to_status"].as_str().unwrap_or("");
+                    (
+                        NodeKind::TodoStatusChange,
+                        format!("{}: {} → {}", tid, from, to),
+                    )
+                }
+                "phase_transition" => {
+                    let from = dev_atomic["from_phase"].as_str().unwrap_or("");
+                    let to = dev_atomic["to_phase"].as_str().unwrap_or("");
+                    (NodeKind::PhaseTransition, format!("{} → {}", from, to))
+                }
+                "lesson" => (
+                    NodeKind::Lesson,
+                    dev_atomic["label"].as_str().unwrap_or("lesson").to_string(),
+                ),
+                "llm_response" => (
+                    NodeKind::LlmResponse,
+                    dev_atomic["reply"]
+                        .as_str()
+                        .unwrap_or("llm response")
+                        .to_string(),
+                ),
+                "verification" => (
+                    NodeKind::Verification,
+                    dev_atomic["summary"]
+                        .as_str()
+                        .unwrap_or("verification")
+                        .to_string(),
+                ),
+                "human_gate" => {
+                    let resolution = dev_atomic["resolution"].as_str().unwrap_or("");
+                    (
+                        NodeKind::HumanGateResolution,
+                        format!("resolution: {}", resolution),
+                    )
+                }
+                _ => {
+                    log::debug!(
+                        "sherpa trace: skipping unknown record_type '{}'",
+                        record_type
                     );
-                    ingested += 1;
+                    continue;
                 }
-                "execution" => {
-                    let command = dev_atomic["command"].as_str().unwrap_or("");
-                    let exit_code = dev_atomic["exit_code"].as_i64().unwrap_or(0);
-                    let duration_ms = dev_atomic["duration_ms"].as_u64();
-                    let tool_input = serde_json::json!({ "command": command });
-                    let output = dev_atomic["output_summary"].as_str();
-                    let status = if exit_code == 0 { "completed" } else { "error" };
-                    acc.append_tool_call(
-                        "bash",
-                        None,
-                        Some(&tool_input),
-                        output,
-                        Some(status),
-                        duration_ms,
-                        timestamp,
-                    );
-                    ingested += 1;
-                }
-                "verification" => {
-                    // Verification is a summary — currently no specific accumulator
-                    // method for it, but append_tool_call with a test-like command
-                    // will classify as Verification via the existing classifier.
-                    // The detail is preserved in the ProvenanceGraph via the
-                    // GoalDetail/VerificationDetail in the node detail strings.
-                    // For now, skip — the accumulator already has all the
-                    // constituent nodes from the above records.
-                    ingested += 1;
-                }
-                other => {
-                    log::debug!("sherpa trace: skipping unknown record_type '{}'", other);
-                }
-            }
+            };
+
+            // Create a node with the full dev.atomic payload as detail.
+            // This preserves all the session data (intent description, todo
+            // content, phase timing, etc.) for extraction by populate_session_tables.
+            acc.append_raw_node(kind, timestamp, &summary, Some(dev_atomic.clone()));
+            ingested += 1;
         }
 
         if ingested > 0 {
@@ -1185,12 +1212,18 @@ impl TurnOrchestrator {
 
         // Convert the accumulated graph to a content-addressed ProvenanceGraph
         let change_hashes = vec![outcome.hash];
-        let graph = acc.to_provenance_graph(
+        let mut graph = acc.to_provenance_graph(
             &session.agent_name,
             &session.agent_display_name,
             &session.agent_vendor,
             &change_hashes,
         );
+
+        // Set the Sherpa profile if this is a Sherpa session.
+        // This gates session table population on the server.
+        if session.agent_name == "sherpa" {
+            graph.profile = Some("sherpa-trace/1.0.0".to_string());
+        }
 
         // Save to the repository
         match atomic_repository::Repository::open(&self.repo_root) {

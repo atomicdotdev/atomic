@@ -525,6 +525,124 @@ impl TreeTxnT for ReadTxn {
     }
 }
 
+// Session data queries
+
+impl ReadTxn {
+    /// Get all session events for a provenance graph.
+    ///
+    /// Returns events in sequence order. Empty if the provenance is not Sherpa
+    /// or has no session data.
+    pub fn get_session_events(
+        &self,
+        provenance_id: u64,
+    ) -> PristineResult<Vec<crate::change::session::SessionEvent>> {
+        use crate::change::session::{decode_session_event_key, SessionEvent};
+
+        let table = self.txn.open_table(SESSION_EVENTS)?;
+        let mut events = Vec::new();
+
+        for result in table.iter()? {
+            let (key, value) = result?;
+            let (prov_id, _seq) = decode_session_event_key(key.value());
+            if prov_id != provenance_id {
+                continue;
+            }
+            match SessionEvent::from_bytes(value.value()) {
+                Ok(event) => events.push(event),
+                Err(e) => {
+                    log::warn!("Failed to deserialize session event: {}", e);
+                }
+            }
+        }
+
+        events.sort_by_key(|e| e.seq);
+        Ok(events)
+    }
+
+    /// Get all todos for a provenance graph.
+    ///
+    /// Returns snapshots of all todo items from the turn.
+    /// Empty if the provenance is not Sherpa or has no session data.
+    pub fn get_session_todos(
+        &self,
+        provenance_id: u64,
+    ) -> PristineResult<Vec<crate::change::session::TodoSnapshot>> {
+        use crate::change::session::{decode_session_todo_key_provenance_id, TodoSnapshot};
+
+        let table = self.txn.open_table(SESSION_TODOS)?;
+        let mut todos = Vec::new();
+
+        for result in table.iter()? {
+            let (key, value) = result?;
+            let prov_id = decode_session_todo_key_provenance_id(key.value());
+            if prov_id != provenance_id {
+                continue;
+            }
+            match TodoSnapshot::from_bytes(value.value()) {
+                Ok(snapshot) => todos.push(snapshot),
+                Err(e) => {
+                    log::warn!("Failed to deserialize todo snapshot: {}", e);
+                }
+            }
+        }
+
+        Ok(todos)
+    }
+
+    /// Get phase timing breakdown for a provenance graph.
+    ///
+    /// Returns timing data for each phase in the turn.
+    /// Empty if the provenance is not Sherpa or has no session data.
+    pub fn get_session_phases(
+        &self,
+        provenance_id: u64,
+    ) -> PristineResult<Vec<crate::change::session::PhaseTimingEntry>> {
+        use crate::change::session::{decode_session_phase_key_provenance_id, PhaseTimingEntry};
+
+        let table = self.txn.open_table(SESSION_PHASES)?;
+        let mut phases = Vec::new();
+
+        for result in table.iter()? {
+            let (key, value) = result?;
+            let prov_id = decode_session_phase_key_provenance_id(key.value());
+            if prov_id != provenance_id {
+                continue;
+            }
+            match PhaseTimingEntry::from_bytes(value.value()) {
+                Ok(entry) => phases.push(entry),
+                Err(e) => {
+                    log::warn!("Failed to deserialize phase timing entry: {}", e);
+                }
+            }
+        }
+
+        Ok(phases)
+    }
+
+    /// Get intent metadata for a provenance graph.
+    ///
+    /// Returns the intent entry if this is a Sherpa provenance, `None` otherwise.
+    pub fn get_session_intent(
+        &self,
+        provenance_id: u64,
+    ) -> PristineResult<Option<crate::change::session::IntentEntry>> {
+        use crate::change::session::IntentEntry;
+
+        let table = self.txn.open_table(SESSION_INTENTS)?;
+
+        match table.get(provenance_id)? {
+            Some(guard) => match IntentEntry::from_bytes(guard.value()) {
+                Ok(entry) => Ok(Some(entry)),
+                Err(e) => {
+                    log::warn!("Failed to deserialize intent entry: {}", e);
+                    Ok(None)
+                }
+            },
+            None => Ok(None),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

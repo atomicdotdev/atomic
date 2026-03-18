@@ -140,7 +140,15 @@ fn find_sequences(nodes: &[GraphNode]) -> Vec<Vec<usize>> {
 
         match node.kind {
             // Structural boundaries break sequences
-            NodeKind::Goal | NodeKind::PatchProposal | NodeKind::HumanGate => {
+            NodeKind::Goal
+            | NodeKind::PatchProposal
+            | NodeKind::HumanGate
+            | NodeKind::Todo
+            | NodeKind::TodoStatusChange
+            | NodeKind::PhaseTransition
+            | NodeKind::Lesson
+            | NodeKind::LlmResponse
+            | NodeKind::HumanGateResolution => {
                 if current.len() >= 2 {
                     sequences.push(std::mem::take(&mut current));
                 } else {

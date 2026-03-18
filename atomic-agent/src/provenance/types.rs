@@ -76,6 +76,24 @@ pub enum NodeKind {
 
     /// Tool failure or session error.
     Error,
+
+    /// A single todo item in the checklist (Sherpa only).
+    Todo,
+
+    /// A todo item's status changed (Sherpa only).
+    TodoStatusChange,
+
+    /// A Petri net phase transition (Sherpa only).
+    PhaseTransition,
+
+    /// An unexpected failure or change of approach (Sherpa only).
+    Lesson,
+
+    /// The LLM's final response for a phase (Sherpa only).
+    LlmResponse,
+
+    /// HumanGate resolution — which command the user chose (Sherpa only).
+    HumanGateResolution,
 }
 
 impl NodeKind {
@@ -108,6 +126,12 @@ impl NodeKind {
             NodeKind::HumanGate => "human_gate",
             NodeKind::PatchProposal => "patch_proposal",
             NodeKind::Error => "error",
+            NodeKind::Todo => "todo",
+            NodeKind::TodoStatusChange => "todo_status_change",
+            NodeKind::PhaseTransition => "phase_transition",
+            NodeKind::Lesson => "lesson",
+            NodeKind::LlmResponse => "llm_response",
+            NodeKind::HumanGateResolution => "human_gate_resolution",
         }
     }
 }
@@ -372,6 +396,18 @@ pub struct GraphStats {
     pub execution_count: u32,
     pub patch_proposal_count: u32,
     pub edge_count: u32,
+    #[serde(default)]
+    pub todo_count: u32,
+    #[serde(default)]
+    pub todo_status_change_count: u32,
+    #[serde(default)]
+    pub phase_transition_count: u32,
+    #[serde(default)]
+    pub lesson_count: u32,
+    #[serde(default)]
+    pub llm_response_count: u32,
+    #[serde(default)]
+    pub human_gate_resolution_count: u32,
 }
 
 impl GraphStats {
@@ -386,6 +422,12 @@ impl GraphStats {
             + self.error_count
             + self.execution_count
             + self.patch_proposal_count
+            + self.todo_count
+            + self.todo_status_change_count
+            + self.phase_transition_count
+            + self.lesson_count
+            + self.llm_response_count
+            + self.human_gate_resolution_count
     }
 
     /// Increment the counter for the given node kind.
@@ -400,6 +442,12 @@ impl GraphStats {
             NodeKind::HumanGate => self.human_gate_count += 1,
             NodeKind::PatchProposal => self.patch_proposal_count += 1,
             NodeKind::Error => self.error_count += 1,
+            NodeKind::Todo => self.todo_count += 1,
+            NodeKind::TodoStatusChange => self.todo_status_change_count += 1,
+            NodeKind::PhaseTransition => self.phase_transition_count += 1,
+            NodeKind::Lesson => self.lesson_count += 1,
+            NodeKind::LlmResponse => self.llm_response_count += 1,
+            NodeKind::HumanGateResolution => self.human_gate_resolution_count += 1,
         }
     }
 
