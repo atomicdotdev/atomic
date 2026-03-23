@@ -62,6 +62,9 @@ serde_json = { workspace = true }
 bytes = { workspace = true }
 url = { workspace = true }
 
+# Parallelism
+rayon = { workspace = true }
+
 # Git interop
 git2 = { workspace = true }
 

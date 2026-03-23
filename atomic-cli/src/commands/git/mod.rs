@@ -51,6 +51,7 @@
 //! ```
 
 pub mod import;
+pub mod parallel;
 
 use clap::Subcommand;
 

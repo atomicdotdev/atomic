@@ -23,20 +23,17 @@
 //! - Binary files are imported as-is
 //! - Merge commits are linearized (first parent only)
 
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::collections::HashSet;
 
-use chrono::{TimeZone, Utc};
 use clap::Parser;
-use git2::{DiffOptions, ObjectType, Oid, Repository as GitRepository, Sort};
+use git2::{Repository as GitRepository, Sort};
 
-use atomic_core::change::{Author, ChangeHeader};
-use atomic_core::types::Hash;
-use atomic_repository::{RecordOptions, Repository};
+use atomic_repository::Repository;
 
+use super::parallel::{ParallelImportOptions, ParallelImporter};
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{print_error, print_info, print_success, print_warning};
+use crate::output::{print_info, print_success};
 
 /// Import a Git repository into Atomic.
 ///
@@ -73,7 +70,7 @@ pub struct Import {
 }
 
 impl Import {
-    /// Import a single branch into an Atomic stack.
+    /// Import a single branch into an Atomic stack using parallel processing.
     fn import_branch(
         &self,
         git_repo: &GitRepository,
@@ -81,139 +78,28 @@ impl Import {
         repo: &mut Repository,
         imported_shas: &HashSet<String>,
     ) -> CliResult<usize> {
-        // Resolve the branch reference
-        let reference = git_repo
-            .find_branch(branch_name, git2::BranchType::Local)
-            .map_err(|e| CliError::GitError {
-                message: format!("Branch '{}' not found: {}", branch_name, e),
-            })?;
-
-        let target_oid = reference.get().target().ok_or_else(|| CliError::GitError {
-            message: format!("Branch '{}' has no target commit", branch_name),
-        })?;
-
-        // Collect commits in topological order (oldest first)
-        let commits = self.collect_commits(git_repo, target_oid, imported_shas)?;
-
-        if commits.is_empty() {
-            if self.incremental {
-                print_info(&format!(
-                    "No new commits to import on branch '{}'",
-                    branch_name
-                ));
-            } else {
-                print_info(&format!("No commits found on branch '{}'", branch_name));
-            }
-            return Ok(0);
-        }
-
-        print_info(&format!(
-            "Importing {} commits from branch '{}'...",
-            commits.len(),
-            branch_name
-        ));
-
-        // Map Git OID -> Atomic Hash for dependency tracking
-        let mut oid_to_hash: HashMap<Oid, Hash> = HashMap::new();
-
-        let mut imported_count = 0;
-        for (index, oid) in commits.iter().enumerate() {
-            let commit = git_repo.find_commit(*oid).map_err(|e| CliError::GitError {
-                message: format!("Failed to find commit {}: {}", oid, e),
-            })?;
-
-            // Progress indicator for large repos
-            if commits.len() > 100 && (index + 1) % 100 == 0 {
-                print_info(&format!(
-                    "  Processed {}/{} commits...",
-                    index + 1,
-                    commits.len()
-                ));
-            }
-
-            // Import the commit
-            match self.import_commit(git_repo, &commit, repo, &oid_to_hash) {
-                Ok(Some(hash)) => {
-                    oid_to_hash.insert(*oid, hash);
-                    imported_count += 1;
-                }
-                Ok(None) => {
-                    // Empty commit, skip
-                }
-                Err(e) => {
-                    print_warning(&format!("Skipping commit {}: {}", &oid.to_string()[..8], e));
-                }
-            }
-        }
-
-        Ok(imported_count)
-    }
-
-    /// Collect commits from HEAD to root in topological order (oldest first).
-    ///
-    /// Uses first-parent-only traversal to ensure merge commits correctly represent
-    /// the changes they bring in. Without this, we'd process merged branch commits
-    /// before the merge, making the merge appear to have no changes.
-    fn collect_commits(
-        &self,
-        git_repo: &GitRepository,
-        head_oid: Oid,
-        imported_shas: &HashSet<String>,
-    ) -> CliResult<Vec<Oid>> {
-        let mut revwalk = git_repo.revwalk().map_err(|e| CliError::GitError {
-            message: format!("Failed to create revwalk: {}", e),
-        })?;
-
-        // Start from HEAD
-        revwalk.push(head_oid).map_err(|e| CliError::GitError {
-            message: format!("Failed to push HEAD to revwalk: {}", e),
-        })?;
-
-        // NOTE: We do NOT use simplify_first_parent() because the test expects
-        // ALL commits to be imported (including those on merged branches).
-        // The test harness counts commits with `git rev-list --count` which
-        // includes all ancestors, not just first-parent.
-
-        // Topological order, oldest first
-        revwalk
-            .set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)
-            .map_err(|e| CliError::GitError {
-                message: format!("Failed to set sorting: {}", e),
-            })?;
-
-        let mut commits = Vec::new();
-        for oid_result in revwalk {
-            let oid = oid_result.map_err(|e| CliError::GitError {
-                message: format!("Revwalk error: {}", e),
-            })?;
-
-            // Skip already imported commits in incremental mode
-            if self.incremental && imported_shas.contains(&oid.to_string()) {
-                continue;
-            }
-
-            commits.push(oid);
-        }
-
-        Ok(commits)
-    }
-
-    /// Import a single Git commit as an Atomic change.
-    ///
-    /// This method uses git checkout to set the working copy to the commit's tree state,
-    /// then tracks new files and lets Atomic's record workflow detect all changes.
-    fn import_commit(
-        &self,
-        git_repo: &GitRepository,
-        commit: &git2::Commit,
-        repo: &mut Repository,
-        _oid_to_hash: &HashMap<Oid, Hash>,
-    ) -> CliResult<Option<Hash>> {
-        let oid = commit.id();
-        let sha = oid.to_string();
-
         // Get repository name from remote URL or working directory
-        let repo_name = git_repo
+        let repo_name = self.get_repo_name(git_repo);
+
+        // Create parallel importer with options
+        let options = ParallelImportOptions {
+            incremental: self.incremental,
+            imported_shas: imported_shas.clone(),
+            repo_name,
+        };
+
+        let importer = ParallelImporter::new(git_repo, options);
+
+        // Run the three-phase parallel import
+        let stats = importer.import_branch(branch_name, repo)?;
+
+        // Return total changes created (written + empty + merge)
+        Ok(stats.changes_written + stats.empty_commits + stats.merge_commits)
+    }
+
+    /// Get repository name from remote URL or working directory.
+    fn get_repo_name(&self, git_repo: &GitRepository) -> String {
+        git_repo
             .find_remote("origin")
             .ok()
             .and_then(|remote| remote.url().map(|s| s.to_string()))
@@ -234,225 +120,7 @@ impl Import {
                     .and_then(|n| n.to_str())
                     .map(|s| s.to_string())
             })
-            .unwrap_or_else(|| "unknown".to_string());
-
-        // Extract commit metadata
-        let author = commit.author();
-        let author_name = author.name().unwrap_or("Unknown");
-        let author_email = author.email();
-
-        let message = commit.message().unwrap_or("");
-        let (subject, description) = parse_commit_message(message);
-
-        // Convert Git timestamp to chrono DateTime
-        let timestamp = {
-            let time = commit.time();
-            Utc.timestamp_opt(time.seconds(), 0)
-                .single()
-                .unwrap_or_else(Utc::now)
-        };
-
-        // Build the change header
-        let mut header_builder = ChangeHeader::builder()
-            .message(&subject)
-            .author(Author::new(author_name, author_email))
-            .timestamp(timestamp);
-
-        if let Some(desc) = description {
-            header_builder = header_builder.description(desc);
-        }
-
-        let header = header_builder.build();
-
-        // Get the tree for this commit
-        let tree = commit.tree().map_err(|e| CliError::GitError {
-            message: format!("Failed to get tree for commit {}: {}", &sha[..8], e),
-        })?;
-
-        // Get parent tree (or empty tree for root commit)
-        let parent_tree = if commit.parent_count() > 0 {
-            Some(
-                commit
-                    .parent(0)
-                    .map_err(|e| CliError::GitError {
-                        message: format!("Failed to get parent commit: {}", e),
-                    })?
-                    .tree()
-                    .map_err(|e| CliError::GitError {
-                        message: format!("Failed to get parent tree: {}", e),
-                    })?,
-            )
-        } else {
-            None
-        };
-
-        // Compute the diff between parent and this commit to identify what changed
-        let mut diff_opts = DiffOptions::new();
-        diff_opts.include_untracked(false);
-
-        let diff = git_repo
-            .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut diff_opts))
-            .map_err(|e| CliError::GitError {
-                message: format!("Failed to compute diff: {}", e),
-            })?;
-
-        // Check if there are any changes in Git's view
-        let stats = diff.stats().map_err(|e| CliError::GitError {
-            message: format!("Failed to get diff stats: {}", e),
-        })?;
-
-        // Check if this is an empty commit in Git's view
-        if stats.files_changed() == 0 {
-            // Empty Git commit - create an empty Atomic change to preserve metadata
-            use atomic_core::change::Change;
-
-            let mut change = Change::empty(header);
-            change.unhashed = Some(serde_json::json!({
-                "git": {
-                    "repository": repo_name,
-                    "sha": sha,
-                    "short_sha": &sha[..8.min(sha.len())],
-                    "empty_commit": true,
-                }
-            }));
-
-            let hash = change.hash().map_err(|e| CliError::Internal(e.into()))?;
-
-            repo.save_change(&change)
-                .map_err(|e| CliError::Internal(e.into()))?;
-
-            repo.apply_change(&hash, Default::default())
-                .map_err(|e| CliError::Internal(e.into()))?;
-
-            return Ok(Some(hash));
-        }
-
-        let workdir = git_repo.workdir().ok_or_else(|| CliError::GitError {
-            message: "Git repository has no working directory".to_string(),
-        })?;
-
-        // Use git checkout to set working copy to this commit's tree state.
-        // This ensures the working copy exactly matches what Git sees for this commit,
-        // regardless of what previous commits in the topological walk did.
-        git_repo
-            .checkout_tree(
-                tree.as_object(),
-                Some(git2::build::CheckoutBuilder::new().force()),
-            )
-            .map_err(|e| CliError::GitError {
-                message: format!("Failed to checkout tree: {}", e),
-            })?;
-
-        // Collect files to add (new files that weren't in parent)
-        let mut files_to_add: Vec<std::path::PathBuf> = Vec::new();
-        let mut has_submodule_warning = false;
-
-        // Identify new files that need to be tracked
-        diff.foreach(
-            &mut |delta, _| {
-                let new_file = delta.new_file();
-                let old_file = delta.old_file();
-
-                // Check for submodules
-                if new_file.mode() == git2::FileMode::Commit
-                    || old_file.mode() == git2::FileMode::Commit
-                {
-                    if !has_submodule_warning {
-                        print_warning("Submodules detected - skipping submodule entries");
-                        has_submodule_warning = true;
-                    }
-                    return true; // Continue
-                }
-
-                match delta.status() {
-                    git2::Delta::Added | git2::Delta::Copied => {
-                        // New file - needs to be tracked
-                        if let Some(path) = new_file.path() {
-                            files_to_add.push(path.to_path_buf());
-                        }
-                    }
-                    git2::Delta::Renamed => {
-                        // Renamed file - new path needs to be tracked
-                        if let Some(new_path) = new_file.path() {
-                            files_to_add.push(new_path.to_path_buf());
-                        }
-                    }
-                    _ => {}
-                }
-                true // Continue iteration
-            },
-            None,
-            None,
-            None,
-        )
-        .map_err(|e| CliError::GitError {
-            message: format!("Failed to iterate diff: {}", e),
-        })?;
-
-        // Add new files to tracking
-        for file_path in &files_to_add {
-            let _ = repo.add(file_path, atomic_repository::TrackingOptions::default());
-        }
-
-        // Note: We do NOT call repo.remove() for deleted files here.
-        // The record workflow will detect deleted files by checking which
-        // tracked files (in TREE) are missing from disk (checkout removed them).
-
-        // Record the change using Atomic's record workflow
-        // Don't auto-save/apply - we need to set unhashed first
-        let options = RecordOptions::new()
-            .with_all(true)
-            .save_to_store(false)
-            .apply_after_record(false);
-
-        let (change, hash) = match repo.record(header.clone(), options) {
-            Ok(mut result) => {
-                let hash = *result.hash();
-
-                // Set unhashed metadata with Git info
-                result.change_mut().unhashed = Some(serde_json::json!({
-                    "git": {
-                        "repository": repo_name,
-                        "sha": sha,
-                        "short_sha": &sha[..8.min(sha.len())],
-                    }
-                }));
-
-                (result.into_change(), hash)
-            }
-            Err(atomic_repository::RecordError::NothingToRecord) => {
-                // Atomic detected no changes, but Git did show changes.
-                // This typically happens with merge commits where the content from
-                // the merged branch was already imported. We still create a change
-                // to preserve the merge metadata (author, timestamp, message).
-                use atomic_core::change::Change;
-
-                let mut change = Change::empty(header);
-                change.unhashed = Some(serde_json::json!({
-                    "git": {
-                        "repository": repo_name,
-                        "sha": sha,
-                        "short_sha": &sha[..8.min(sha.len())],
-                        "empty_merge": true,
-                    }
-                }));
-
-                // Compute hash of the empty change
-                let hash = change.hash().map_err(|e| CliError::Internal(e.into()))?;
-
-                (change, hash)
-            }
-            Err(e) => return Err(CliError::Internal(e.into())),
-        };
-
-        // Save and apply the change
-        repo.save_change(&change)
-            .map_err(|e| CliError::Internal(e.into()))?;
-
-        repo.apply_change(&hash, Default::default())
-            .map_err(|e| CliError::Internal(e.into()))?;
-
-        Ok(Some(hash))
+            .unwrap_or_else(|| "unknown".to_string())
     }
 
     /// Get the set of already imported Git SHAs from existing changes.
@@ -523,6 +191,43 @@ impl Import {
             message: "Could not determine default branch".to_string(),
         })
     }
+
+    /// Count commits for dry-run mode.
+    fn count_commits(
+        &self,
+        git_repo: &GitRepository,
+        head_oid: git2::Oid,
+        imported_shas: &HashSet<String>,
+    ) -> CliResult<usize> {
+        let mut revwalk = git_repo.revwalk().map_err(|e| CliError::GitError {
+            message: format!("Failed to create revwalk: {}", e),
+        })?;
+
+        revwalk.push(head_oid).map_err(|e| CliError::GitError {
+            message: format!("Failed to push HEAD to revwalk: {}", e),
+        })?;
+
+        revwalk
+            .set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)
+            .map_err(|e| CliError::GitError {
+                message: format!("Failed to set sorting: {}", e),
+            })?;
+
+        let mut count = 0;
+        for oid_result in revwalk {
+            let oid = oid_result.map_err(|e| CliError::GitError {
+                message: format!("Revwalk error: {}", e),
+            })?;
+
+            if self.incremental && imported_shas.contains(&oid.to_string()) {
+                continue;
+            }
+
+            count += 1;
+        }
+
+        Ok(count)
+    }
 }
 
 impl Command for Import {
@@ -550,11 +255,10 @@ impl Command for Import {
             for branch_name in &branches {
                 if let Ok(reference) = git_repo.find_branch(branch_name, git2::BranchType::Local) {
                     if let Some(target) = reference.get().target() {
-                        let commits = self.collect_commits(&git_repo, target, &HashSet::new())?;
+                        let count = self.count_commits(&git_repo, target, &HashSet::new())?;
                         print_info(&format!(
                             "Would import {} commits from branch '{}'",
-                            commits.len(),
-                            branch_name
+                            count, branch_name
                         ));
                     }
                 }
@@ -648,104 +352,9 @@ impl Command for Import {
     }
 }
 
-/// Parse a Git commit message into subject and optional description.
-fn parse_commit_message(message: &str) -> (String, Option<String>) {
-    let lines: Vec<&str> = message.lines().collect();
-
-    if lines.is_empty() {
-        return ("(no message)".to_string(), None);
-    }
-
-    let subject = lines[0].trim().to_string();
-
-    // Find the body (skip empty lines after subject)
-    let body_lines: Vec<&str> = lines
-        .iter()
-        .skip(1)
-        .skip_while(|line| line.trim().is_empty())
-        .copied()
-        .collect();
-
-    let description = if body_lines.is_empty() {
-        None
-    } else {
-        Some(body_lines.join("\n").trim().to_string())
-    };
-
-    (subject, description)
-}
-
-/// Write a file from a Git tree to the working directory.
-fn write_file_from_tree(
-    git_repo: &GitRepository,
-    tree: &git2::Tree,
-    path: &Path,
-    workdir: &Path,
-) -> Result<(), String> {
-    let entry = tree
-        .get_path(path)
-        .map_err(|e| format!("Path not found in tree: {}", e))?;
-
-    // Only handle blobs (regular files)
-    if entry.kind() != Some(ObjectType::Blob) {
-        return Ok(()); // Skip directories, submodules, etc.
-    }
-
-    let blob = git_repo
-        .find_blob(entry.id())
-        .map_err(|e| format!("Failed to find blob: {}", e))?;
-
-    let full_path = workdir.join(path);
-
-    // Create parent directories
-    if let Some(parent) = full_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create directory: {}", e))?;
-    }
-
-    // Write the file
-    std::fs::write(&full_path, blob.content())
-        .map_err(|e| format!("Failed to write file: {}", e))?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_commit_message_subject_only() {
-        let (subject, description) = parse_commit_message("Add new feature");
-        assert_eq!(subject, "Add new feature");
-        assert!(description.is_none());
-    }
-
-    #[test]
-    fn test_parse_commit_message_with_body() {
-        let message =
-            "Add new feature\n\nThis implements the widget system\nwith full documentation.";
-        let (subject, description) = parse_commit_message(message);
-        assert_eq!(subject, "Add new feature");
-        assert_eq!(
-            description,
-            Some("This implements the widget system\nwith full documentation.".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_commit_message_empty() {
-        let (subject, description) = parse_commit_message("");
-        assert_eq!(subject, "(no message)");
-        assert!(description.is_none());
-    }
-
-    #[test]
-    fn test_parse_commit_message_whitespace() {
-        let (subject, description) = parse_commit_message("  Fix bug  \n\n  Details here  ");
-        assert_eq!(subject, "Fix bug");
-        assert_eq!(description, Some("Details here".to_string()));
-    }
 
     #[test]
     fn test_default_import() {
