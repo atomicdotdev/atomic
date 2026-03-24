@@ -411,8 +411,15 @@ pub fn normalize_path(path: &Path) -> String {
 pub fn normalize_path_with_root(path: &Path, repo_root: Option<&Path>) -> String {
     let mut path_to_normalize = path.to_path_buf();
 
-    // If path is absolute and we have a repo root, try to make it relative
-    if path_to_normalize.is_absolute() {
+    // If path is absolute and we have a repo root, try to make it relative.
+    // We check both Path::is_absolute() (handles native absolute paths) and
+    // a leading '/' in the string representation (handles Unix-style paths on
+    // Windows, where "/repo/src" is not considered absolute by the OS but must
+    // still be treated as absolute for prefix-stripping purposes).
+    let path_str_raw = path.to_string_lossy();
+    let is_absolute = path_to_normalize.is_absolute() || path_str_raw.starts_with('/');
+
+    if is_absolute {
         if let Some(root) = repo_root {
             // Try stripping the root directly
             if let Ok(rel) = path_to_normalize.strip_prefix(root) {
@@ -421,6 +428,25 @@ pub fn normalize_path_with_root(path: &Path, repo_root: Option<&Path>) -> String
                 // On macOS, /tmp -> /private/tmp, so try canonical
                 if let Ok(rel) = path_to_normalize.strip_prefix(&canonical_root) {
                     path_to_normalize = rel.to_path_buf();
+                }
+            } else {
+                // Path::strip_prefix uses OS path semantics, which on Windows
+                // won't match Unix-style "/repo" against "/repo/src/main.rs"
+                // as a proper prefix.  Fall back to string-level stripping so
+                // that Unix-style paths work correctly on Windows in tests and
+                // cross-platform scenarios.
+                let root_str = root.to_string_lossy();
+                let root_str = root_str.replace('\\', "/");
+                let path_str = path_str_raw.replace('\\', "/");
+                let root_with_sep = if root_str.ends_with('/') {
+                    root_str.to_string()
+                } else {
+                    format!("{}/", root_str)
+                };
+                if let Some(rel) = path_str.strip_prefix(root_with_sep.as_str()) {
+                    path_to_normalize = PathBuf::from(rel);
+                } else if path_str == root_str {
+                    path_to_normalize = PathBuf::new();
                 }
             }
         }
