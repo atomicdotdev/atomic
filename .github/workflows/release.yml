@@ -181,11 +181,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history so generate-notes can diff against the previous tag
+          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          merge-multiple: true
 
       - name: List artifacts
         run: find artifacts -type f | sort
@@ -193,63 +197,105 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          find . -name "*.tar.gz" -o -name "*.zip" | while read f; do
+          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) | while read f; do
             sha256sum "$f" >> ../checksums-sha256.txt
           done
           cd ..
           cat checksums-sha256.txt
 
-      - name: Create or update release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.version.outputs.tag }}
-          name: Atomic ${{ needs.version.outputs.tag }}
-          draft: false
-          prerelease: ${{ contains(needs.version.outputs.version, '-') }}
-          generate_release_notes: true
-          body: |
-            ## Installation
-
-            Download the binary for your platform below, extract it, and add it to your `PATH`.
-
-            ### macOS (Apple Silicon)
-            ```bash
-            curl -L https://github.com/atomicdotdev/atomic/releases/download/${{ needs.version.outputs.tag }}/atomic-aarch64-apple-darwin.tar.gz | tar xz
-            sudo mv atomic /usr/local/bin/
-            ```
-
-            ### macOS (Intel)
-            ```bash
-            curl -L https://github.com/atomicdotdev/atomic/releases/download/${{ needs.version.outputs.tag }}/atomic-x86_64-apple-darwin.tar.gz | tar xz
-            sudo mv atomic /usr/local/bin/
-            ```
-
-            ### Linux (x86_64)
-            ```bash
-            curl -L https://github.com/atomicdotdev/atomic/releases/download/${{ needs.version.outputs.tag }}/atomic-x86_64-unknown-linux-gnu.tar.gz | tar xz
-            sudo mv atomic /usr/local/bin/
-            ```
-
-            ### Linux (aarch64)
-            ```bash
-            curl -L https://github.com/atomicdotdev/atomic/releases/download/${{ needs.version.outputs.tag }}/atomic-aarch64-unknown-linux-gnu.tar.gz | tar xz
-            sudo mv atomic /usr/local/bin/
-            ```
-
-            ### Windows (x86_64)
-            Download `atomic-x86_64-pc-windows-msvc.zip`, extract, and add to your `PATH`.
-
-            ### Verify
-            ```bash
-            atomic --version
-            ```
-
-            ---
-
-            See [checksums-sha256.txt](https://github.com/atomicdotdev/atomic/releases/download/${{ needs.version.outputs.tag }}/checksums-sha256.txt) for SHA-256 checksums of all artifacts.
-          files: |
-            artifacts/**/*.tar.gz
-            artifacts/**/*.zip
-            checksums-sha256.txt
+      - name: Generate release notes (GitHub Copilot)
+        id: notes
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Find the previous release tag to bound the commit range.
+          PREV_TAG=$(gh release list --repo "$REPO" --limit 10 --json tagName \
+            --jq '[.[].tagName | select(. != env.TAG)] | first // ""')
+
+          # Call GitHub's generate-notes API (powers the Copilot-assisted
+          # "Auto-generate release notes" button in the GitHub UI).
+          PAYLOAD=$(jq -n \
+            --arg tag  "$TAG" \
+            --arg prev "$PREV_TAG" \
+            '{tag_name: $tag, previous_tag_name: (if $prev == "" then null else $prev end)}')
+
+          NOTES=$(gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/releases/generate-notes" \
+            --input - <<< "$PAYLOAD" \
+            --jq '.body')
+
+          # Prepend the installation instructions to the generated notes.
+          INSTALL=$(cat <<'INSTALL_EOF'
+          ## Installation
+
+          Download the binary for your platform below, extract it, and add it to your `PATH`.
+
+          ### macOS (Apple Silicon)
+          ```bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.tag }}/atomic-aarch64-apple-darwin.tar.gz | tar xz
+          sudo mv atomic /usr/local/bin/
+          ```
+
+          ### macOS (Intel)
+          ```bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.tag }}/atomic-x86_64-apple-darwin.tar.gz | tar xz
+          sudo mv atomic /usr/local/bin/
+          ```
+
+          ### Linux (x86_64)
+          ```bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.tag }}/atomic-x86_64-unknown-linux-gnu.tar.gz | tar xz
+          sudo mv atomic /usr/local/bin/
+          ```
+
+          ### Linux (aarch64)
+          ```bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.tag }}/atomic-aarch64-unknown-linux-gnu.tar.gz | tar xz
+          sudo mv atomic /usr/local/bin/
+          ```
+
+          ### Windows (x86_64)
+          Download `atomic-x86_64-pc-windows-msvc.zip`, extract, and add to your `PATH`.
+
+          ### Verify
+          ```bash
+          atomic --version
+          ```
+
+          ---
+
+          See [checksums-sha256.txt](https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.tag }}/checksums-sha256.txt) for SHA-256 checksums of all artifacts.
+
+          ---
+
+          INSTALL_EOF
+          )
+
+          # Write the combined body to a file (avoids shell quoting issues).
+          printf '%s\n%s\n' "$INSTALL" "$NOTES" > release-notes.md
+          echo "Generated release notes:"
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          PRERELEASE_FLAG=""
+          if echo "$VERSION" | grep -q '-'; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "Atomic ${TAG}" \
+            --notes-file release-notes.md \
+            $PRERELEASE_FLAG \
+            artifacts/*.tar.gz \
+            artifacts/*.zip \
+            checksums-sha256.txt
