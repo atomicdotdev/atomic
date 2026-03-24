@@ -117,7 +117,7 @@ impl<'a> WriteTxn<'a> {
                 .unwrap_or_else(|| node.kind.label().to_string());
             let event = SessionEvent {
                 seq,
-                timestamp: format_timestamp_ms(node.timestamp * 1000),
+                timestamp: format_timestamp_ms(node.timestamp),
                 event_kind: node.kind.label().to_string(),
                 place: None,
                 transition: None,
