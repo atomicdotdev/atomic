@@ -518,7 +518,7 @@ impl CliError {
                 Some("Check your credentials. You may need to set up SSH keys or update your access token.")
             }
             Self::GitError { .. } => {
-                Some("Ensure you are in a Git repository. Run 'git status' to verify.")
+                Some("A Git operation failed. Ensure you are in a valid Git repository, the referenced branch or commit exists, and you have the necessary permissions. Run 'git status' and 'git branch' to investigate.")
             }
             Self::IdentityNotFound(_) => {
                 Some("Run 'atomic identity list' to see available identities, or 'atomic identity new <name>' to create one.")
