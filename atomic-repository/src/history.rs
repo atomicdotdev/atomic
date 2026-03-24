@@ -229,9 +229,7 @@ impl HistoryEntry {
 
     /// Get the description if a header is loaded.
     pub fn description(&self) -> Option<&str> {
-        self.header
-            .as_ref()
-            .and_then(|h| h.description.as_deref())
+        self.header.as_ref().and_then(|h| h.description.as_deref())
     }
 
     /// Get the timestamp if a header is loaded.
@@ -534,7 +532,10 @@ impl fmt::Display for PathModificationType {
 pub struct HistoryIter<'a, T: StackTxnT> {
     txn: &'a T,
     stack: StackState,
-    inner: Box<dyn Iterator<Item = Result<(u64, NodeId, Merkle), atomic_core::pristine::PristineError>> + 'a>,
+    inner: Box<
+        dyn Iterator<Item = Result<(u64, NodeId, Merkle), atomic_core::pristine::PristineError>>
+            + 'a,
+    >,
     limit: Option<usize>,
     count: usize,
     load_headers: bool,
@@ -545,7 +546,10 @@ impl<'a, T: StackTxnT> HistoryIter<'a, T> {
     pub(crate) fn new(
         txn: &'a T,
         stack: StackState,
-        inner: Box<dyn Iterator<Item = Result<(u64, NodeId, Merkle), atomic_core::pristine::PristineError>> + 'a>,
+        inner: Box<
+            dyn Iterator<Item = Result<(u64, NodeId, Merkle), atomic_core::pristine::PristineError>>
+                + 'a,
+        >,
         options: &HistoryOptions,
     ) -> Self {
         Self {
@@ -714,10 +718,7 @@ pub fn reverse_log<T: StackTxnT>(
 /// # Returns
 ///
 /// A `HistorySummary` with aggregate statistics.
-pub fn history_summary<T: StackTxnT>(
-    txn: &T,
-    stack: &StackState,
-) -> HistoryResult<HistorySummary> {
+pub fn history_summary<T: StackTxnT>(txn: &T, stack: &StackState) -> HistoryResult<HistorySummary> {
     let mut summary = HistorySummary::new(&stack.name, stack);
 
     // Get first change
@@ -1240,12 +1241,8 @@ mod tests {
 
     #[test]
     fn test_state_before_change_parent_max_sequence_later() {
-        let state_info = StateBeforeChange::new(
-            Some(5),
-            Merkle::of(b"parent"),
-            6,
-            Merkle::of(b"change"),
-        );
+        let state_info =
+            StateBeforeChange::new(Some(5), Merkle::of(b"parent"), 6, Merkle::of(b"change"));
 
         // Parent at sequence 5, so max exclusive is 6 (includes 0-5)
         assert_eq!(state_info.parent_max_sequence_exclusive(), 6);
@@ -1475,8 +1472,8 @@ mod tests {
         let first = Hash::of(b"first");
         let last = Hash::of(b"last");
 
-        let summary = HistorySummary::new("main", &stack_state)
-            .with_bounds(Some(first), Some(last));
+        let summary =
+            HistorySummary::new("main", &stack_state).with_bounds(Some(first), Some(last));
 
         assert_eq!(summary.first_change, Some(first));
         assert_eq!(summary.last_change, Some(last));
@@ -1485,8 +1482,7 @@ mod tests {
     #[test]
     fn test_history_summary_with_tagged_count() {
         let stack_state = StackState::new(1, "main".to_string());
-        let summary = HistorySummary::new("main", &stack_state)
-            .with_tagged_count(5);
+        let summary = HistorySummary::new("main", &stack_state).with_tagged_count(5);
 
         assert_eq!(summary.tagged_count, 5);
     }
@@ -1494,8 +1490,7 @@ mod tests {
     #[test]
     fn test_history_summary_display() {
         let stack_state = StackState::new(1, "main".to_string());
-        let summary = HistorySummary::new("main", &stack_state)
-            .with_tagged_count(3);
+        let summary = HistorySummary::new("main", &stack_state).with_tagged_count(3);
 
         let display = format!("{}", summary);
         assert!(display.contains("main"));
@@ -1510,7 +1505,8 @@ mod tests {
         let hash = Hash::of(b"test");
         let state = Merkle::of(b"state");
         let entry = HistoryEntry::new(1, NodeId::new(1), hash, state);
-        let path_entry = PathHistoryEntry::new(entry, "src/main.rs", PathModificationType::Modified);
+        let path_entry =
+            PathHistoryEntry::new(entry, "src/main.rs", PathModificationType::Modified);
 
         assert_eq!(path_entry.path, "src/main.rs");
         assert_eq!(path_entry.modification_type, PathModificationType::Modified);
@@ -1533,7 +1529,8 @@ mod tests {
         let hash = Hash::of(b"test");
         let state = Merkle::of(b"state");
         let entry = HistoryEntry::new(5, NodeId::new(1), hash, state);
-        let path_entry = PathHistoryEntry::new(entry, "src/main.rs", PathModificationType::Modified);
+        let path_entry =
+            PathHistoryEntry::new(entry, "src/main.rs", PathModificationType::Modified);
 
         assert_eq!(path_entry.sequence(), 5);
         assert_eq!(*path_entry.hash(), hash);
@@ -1553,7 +1550,10 @@ mod tests {
     #[test]
     fn test_path_modification_type_equality() {
         assert_eq!(PathModificationType::Created, PathModificationType::Created);
-        assert_ne!(PathModificationType::Created, PathModificationType::Modified);
+        assert_ne!(
+            PathModificationType::Created,
+            PathModificationType::Modified
+        );
     }
 
     // HistoryError Tests

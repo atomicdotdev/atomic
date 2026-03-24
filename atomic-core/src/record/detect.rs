@@ -383,7 +383,9 @@ impl FileChangeKind {
             Self::Added { .. } => true,
             Self::Modified { .. } => true,
             Self::Deleted => true,
-            Self::Moved { content_changed, .. } => *content_changed,
+            Self::Moved {
+                content_changed, ..
+            } => *content_changed,
             Self::MetadataOnly { .. } => false,
         }
     }
@@ -716,7 +718,11 @@ impl DetectResult {
 /// let ops = compare_content(old, new, Algorithm::Myers);
 /// assert!(!ops.is_empty());
 /// ```
-pub fn compare_content(old_content: &[u8], new_content: &[u8], algorithm: Algorithm) -> Vec<DiffOp> {
+pub fn compare_content(
+    old_content: &[u8],
+    new_content: &[u8],
+    algorithm: Algorithm,
+) -> Vec<DiffOp> {
     // Convert to lines
     let old_lines: Vec<Line> = Line::from_bytes(old_content);
     let new_lines: Vec<Line> = Line::from_bytes(new_content);
@@ -1065,8 +1071,8 @@ mod tests {
 
     #[test]
     fn test_file_change_with_metadata() {
-        let change = FileChange::added("test.rs", Encoding::Utf8)
-            .with_metadata(FileMetadata::executable());
+        let change =
+            FileChange::added("test.rs", Encoding::Utf8).with_metadata(FileMetadata::executable());
 
         assert!(change.metadata.is_some());
         assert!(change.metadata.unwrap().is_executable());

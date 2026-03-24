@@ -257,11 +257,7 @@ impl IgnoreRules {
     ///
     /// Returns a string describing the match result for debugging.
     pub fn debug_match(&self, path: &Path, is_dir: bool) -> String {
-        let mut result = format!(
-            "Checking path: {:?}, is_dir: {}\n",
-            path.display(),
-            is_dir
-        );
+        let mut result = format!("Checking path: {:?}, is_dir: {}\n", path.display(), is_dir);
 
         result.push_str(&format!(
             "Local rules loaded: {}, pattern count: {}\n",
@@ -285,7 +281,10 @@ impl IgnoreRules {
             result.push_str(&format!("Global match result: {:?}\n", matched));
         }
 
-        result.push_str(&format!("Final is_ignored: {}\n", self.is_ignored(path, is_dir)));
+        result.push_str(&format!(
+            "Final is_ignored: {}\n",
+            self.is_ignored(path, is_dir)
+        ));
 
         result
     }
@@ -734,7 +733,10 @@ mod tests {
             "node_modules directory should be ignored"
         );
         assert!(
-            rules.is_ignored(Path::new("node_modules/typescript/lib/lib.es2015.proxy.d.ts"), false),
+            rules.is_ignored(
+                Path::new("node_modules/typescript/lib/lib.es2015.proxy.d.ts"),
+                false
+            ),
             "Files inside node_modules should be ignored"
         );
     }
@@ -762,13 +764,19 @@ mod tests {
 
         // Should ignore files inside node_modules
         assert!(
-            rules.is_ignored(Path::new("node_modules/typescript/lib/lib.es2015.proxy.d.ts"), false),
+            rules.is_ignored(
+                Path::new("node_modules/typescript/lib/lib.es2015.proxy.d.ts"),
+                false
+            ),
             "Files inside node_modules should be ignored"
         );
 
         // Should ignore deeply nested files
         assert!(
-            rules.is_ignored(Path::new("node_modules/@types/node/child_process.d.ts"), false),
+            rules.is_ignored(
+                Path::new("node_modules/@types/node/child_process.d.ts"),
+                false
+            ),
             "Deeply nested files in node_modules should be ignored"
         );
 

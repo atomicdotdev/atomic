@@ -917,13 +917,8 @@ mod tests {
             .message("First line\nSecond line\nThird line")
             .build();
 
-        let entry = HistoryEntry::new(
-            1,
-            NodeId::from(1),
-            create_test_hash(),
-            create_test_merkle(),
-        )
-        .with_change_header(header);
+        let entry = HistoryEntry::new(1, NodeId::from(1), create_test_hash(), create_test_merkle())
+            .with_change_header(header);
 
         let output = log.format_short(&[entry], 8);
 
@@ -940,13 +935,8 @@ mod tests {
             .author(Author::new("Test", None::<String>))
             .build();
 
-        let entry = HistoryEntry::new(
-            1,
-            NodeId::from(1),
-            create_test_hash(),
-            create_test_merkle(),
-        )
-        .with_change_header(header);
+        let entry = HistoryEntry::new(1, NodeId::from(1), create_test_hash(), create_test_merkle())
+            .with_change_header(header);
 
         let output = log.format_oneline(&[entry], 8);
 
@@ -964,13 +954,8 @@ mod tests {
             .description("This is a detailed description\nwith multiple lines.")
             .build();
 
-        let entry = HistoryEntry::new(
-            1,
-            NodeId::from(1),
-            create_test_hash(),
-            create_test_merkle(),
-        )
-        .with_change_header(header);
+        let entry = HistoryEntry::new(1, NodeId::from(1), create_test_hash(), create_test_merkle())
+            .with_change_header(header);
 
         let output = log.format_default(&[entry], 8);
 
@@ -1092,9 +1077,7 @@ mod tests {
 
     #[test]
     fn test_log_output_config_clone() {
-        let config = LogOutputConfig::new()
-            .format(LogFormat::Json)
-            .count(10);
+        let config = LogOutputConfig::new().format(LogFormat::Json).count(10);
         let cloned = config.clone();
 
         assert_eq!(config.format, cloned.format);
@@ -1165,13 +1148,8 @@ mod tests {
             ))
             .build();
 
-        let entry = HistoryEntry::new(
-            1,
-            NodeId::from(1),
-            create_test_hash(),
-            create_test_merkle(),
-        )
-        .with_change_header(header);
+        let entry = HistoryEntry::new(1, NodeId::from(1), create_test_hash(), create_test_merkle())
+            .with_change_header(header);
 
         let output = log.format_oneline(&[entry], 8);
 

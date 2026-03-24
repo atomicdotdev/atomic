@@ -1,6 +1,5 @@
 use super::*;
 
-
 // MAIN GLOBALIZATION FUNCTIONS
 
 /// Globalize a single built graph_op into a graph graph_op.
@@ -411,7 +410,6 @@ where
     T: GraphTxnT,
 {
     use crate::output::alive::{retrieve_graph, RetrieveOptions};
-    
 
     let options = RetrieveOptions::default();
     let result = match retrieve_graph(txn, inode_pos, options) {

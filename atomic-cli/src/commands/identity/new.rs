@@ -146,14 +146,12 @@ impl Command for New {
         let identity = builder
             .public_key(keypair.public.clone())
             .build()
-            .map_err(|e| {
-                CliError::Internal(anyhow::anyhow!("Failed to create identity: {}", e))
-            })?;
+            .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to create identity: {}", e)))?;
 
         // Save the identity with its keypair
-        store.save_with_keypair(&identity, &keypair, None).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to save identity: {}", e))
-        })?;
+        store
+            .save_with_keypair(&identity, &keypair, None)
+            .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to save identity: {}", e)))?;
 
         // Set as default if requested
         if self.set_default {
@@ -163,9 +161,11 @@ impl Command for New {
         }
 
         if self.set_default_for_usage {
-            store.set_default_for_usage(&identity.usage, &identity.id).map_err(|e| {
-                CliError::Internal(anyhow::anyhow!("Failed to set as default for usage: {}", e))
-            })?;
+            store
+                .set_default_for_usage(&identity.usage, &identity.id)
+                .map_err(|e| {
+                    CliError::Internal(anyhow::anyhow!("Failed to set as default for usage: {}", e))
+                })?;
         }
 
         // Print success message
@@ -177,7 +177,10 @@ impl Command for New {
         if let Some(email) = &identity.email {
             println!("  Email:      {}", email);
         }
-        println!("  Type:       {}", super::format_identity_type(&identity.identity_type));
+        println!(
+            "  Type:       {}",
+            super::format_identity_type(&identity.identity_type)
+        );
         println!("  Usage:      {}", super::format_usage(&identity.usage));
         println!("  Public Key: {}...", &identity.public_key_base32()[..16]);
 
@@ -196,10 +199,14 @@ impl Command for New {
         if !self.set_default {
             println!();
             println!("{}", crate::output::hint("Next steps:"));
-            println!("  {}  Set as default identity",
-                crate::output::command(&format!("atomic identity default {}", self.name)));
-            println!("  {}  View identity details",
-                crate::output::command(&format!("atomic identity show {}", self.name)));
+            println!(
+                "  {}  Set as default identity",
+                crate::output::command(&format!("atomic identity default {}", self.name))
+            );
+            println!(
+                "  {}  View identity details",
+                crate::output::command(&format!("atomic identity show {}", self.name))
+            );
         }
 
         Ok(())

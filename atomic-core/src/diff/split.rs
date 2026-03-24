@@ -118,9 +118,7 @@ impl Separator {
                 if haystack.len() < 2 {
                     return None;
                 }
-                haystack
-                    .windows(2)
-                    .position(|window| window == b"\r\n")
+                haystack.windows(2).position(|window| window == b"\r\n")
             }
             Separator::Custom(needle) => {
                 if needle.is_empty() || needle.len() > haystack.len() {

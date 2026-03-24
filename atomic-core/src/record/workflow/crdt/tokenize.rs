@@ -281,7 +281,10 @@ impl fmt::Display for TokenizeError {
                     line_number, length, max_length
                 )
             }
-            TokenizeError::InvalidUtf8 { line_number, offset } => {
+            TokenizeError::InvalidUtf8 {
+                line_number,
+                offset,
+            } => {
                 write!(
                     f,
                     "invalid UTF-8 at line {}, offset {}",
@@ -874,7 +877,11 @@ impl<'a> ContentTokenizer<'a> {
                 continue;
             }
 
-            tokens.push(TokenizedToken::new(kind, content_bytes, offset..offset + len));
+            tokens.push(TokenizedToken::new(
+                kind,
+                content_bytes,
+                offset..offset + len,
+            ));
         }
 
         // Flush any remaining whitespace
@@ -984,7 +991,10 @@ mod tests {
         assert!(opts.code_aware());
         assert!(!opts.get_include_newlines());
         assert!(opts.get_track_offsets());
-        assert_eq!(opts.get_max_line_length(), TokenizeOptions::DEFAULT_MAX_LINE_LENGTH);
+        assert_eq!(
+            opts.get_max_line_length(),
+            TokenizeOptions::DEFAULT_MAX_LINE_LENGTH
+        );
     }
 
     #[test]
@@ -1263,9 +1273,7 @@ mod tests {
 
     #[test]
     fn test_tokenized_line_into_tokens() {
-        let tokens = vec![
-            TokenizedToken::new(TokenKind::Word, b"x".to_vec(), 0..1),
-        ];
+        let tokens = vec![TokenizedToken::new(TokenKind::Word, b"x".to_vec(), 0..1)];
         let line = TokenizedLine::new(0, b"x".to_vec(), tokens);
 
         let owned_tokens = line.into_tokens();
@@ -1274,9 +1282,7 @@ mod tests {
 
     #[test]
     fn test_tokenized_line_display() {
-        let tokens = vec![
-            TokenizedToken::new(TokenKind::Word, b"hi".to_vec(), 0..2),
-        ];
+        let tokens = vec![TokenizedToken::new(TokenKind::Word, b"hi".to_vec(), 0..2)];
         let line = TokenizedLine::new(3, b"hi".to_vec(), tokens);
         let display = format!("{}", line);
         assert!(display.contains("Line 3"));
@@ -1329,9 +1335,11 @@ mod tests {
     fn test_token_stats_add_whitespace_only_line() {
         let mut stats = TokenStats::new();
 
-        let tokens = vec![
-            TokenizedToken::new(TokenKind::Whitespace, b"  ".to_vec(), 0..2),
-        ];
+        let tokens = vec![TokenizedToken::new(
+            TokenKind::Whitespace,
+            b"  ".to_vec(),
+            0..2,
+        )];
         let line = TokenizedLine::new(0, b"  ".to_vec(), tokens);
         stats.add_line(&line);
 
@@ -1343,17 +1351,23 @@ mod tests {
         let mut stats = TokenStats::new();
 
         // Short line
-        let line1 = TokenizedLine::new(0, b"hi".to_vec(), vec![
-            TokenizedToken::new(TokenKind::Word, b"hi".to_vec(), 0..2),
-        ]);
+        let line1 = TokenizedLine::new(
+            0,
+            b"hi".to_vec(),
+            vec![TokenizedToken::new(TokenKind::Word, b"hi".to_vec(), 0..2)],
+        );
         stats.add_line(&line1);
 
         // Longer line with more tokens
-        let line2 = TokenizedLine::new(1, b"hello world".to_vec(), vec![
-            TokenizedToken::new(TokenKind::Word, b"hello".to_vec(), 0..5),
-            TokenizedToken::new(TokenKind::Whitespace, b" ".to_vec(), 5..6),
-            TokenizedToken::new(TokenKind::Word, b"world".to_vec(), 6..11),
-        ]);
+        let line2 = TokenizedLine::new(
+            1,
+            b"hello world".to_vec(),
+            vec![
+                TokenizedToken::new(TokenKind::Word, b"hello".to_vec(), 0..5),
+                TokenizedToken::new(TokenKind::Whitespace, b" ".to_vec(), 5..6),
+                TokenizedToken::new(TokenKind::Word, b"world".to_vec(), 6..11),
+            ],
+        );
         stats.add_line(&line2);
 
         assert_eq!(stats.max_line_length, 11);
@@ -1589,10 +1603,7 @@ mod tests {
         let tokenizer = ContentTokenizer::with_options(content, options);
 
         let lines: Vec<_> = tokenizer.lines().collect();
-        let has_eq_operator = lines[0]
-            .tokens()
-            .iter()
-            .any(|t| t.as_str() == "==");
+        let has_eq_operator = lines[0].tokens().iter().any(|t| t.as_str() == "==");
 
         assert!(has_eq_operator, "Should recognize == as single operator");
     }
@@ -1681,7 +1692,11 @@ mod tests {
         assert!(stats.tokens > 10);
 
         // First line should have: fn, space, main, (, ), space, {
-        let first_line_tokens: Vec<_> = lines[0].tokens().iter().map(|t| t.as_str().to_string()).collect();
+        let first_line_tokens: Vec<_> = lines[0]
+            .tokens()
+            .iter()
+            .map(|t| t.as_str().to_string())
+            .collect();
         assert!(first_line_tokens.contains(&"fn".to_string()));
         assert!(first_line_tokens.contains(&"main".to_string()));
     }

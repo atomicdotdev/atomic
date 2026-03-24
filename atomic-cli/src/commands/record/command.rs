@@ -1,6 +1,5 @@
 use super::*;
 
-
 impl Command for Record {
     /// Execute the record command.
     ///

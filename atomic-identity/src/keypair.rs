@@ -3,7 +3,7 @@
 //! This module provides cryptographic identity functionality for Atomic,
 //! including key generation, signing, and verification.
 
-use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};

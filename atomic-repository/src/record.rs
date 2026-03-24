@@ -1055,10 +1055,7 @@ mod tests {
         assert!(!opts.all());
         assert_eq!(opts.algorithm(), Algorithm::Myers);
         assert_eq!(opts.default_encoding(), Encoding::Utf8);
-        assert_eq!(
-            opts.max_file_size(),
-            RecordOptions::DEFAULT_MAX_FILE_SIZE
-        );
+        assert_eq!(opts.max_file_size(), RecordOptions::DEFAULT_MAX_FILE_SIZE);
         assert!(!opts.skip_binary());
         assert!(!opts.get_record_empty_files());
         assert_eq!(

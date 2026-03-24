@@ -64,7 +64,7 @@
 
 use crate::change::{Change, ChangeError, ChangeHeader};
 #[allow(unused_imports)]
-use crate::types::{Base32, ChangePosition, Hash, NodeId, GraphNode};
+use crate::types::{Base32, ChangePosition, GraphNode, Hash, NodeId};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -710,10 +710,7 @@ mod tests {
 
         let result = store.get_change(&hash);
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            MemoryStoreError::NotFound(_)
-        ));
+        assert!(matches!(result.unwrap_err(), MemoryStoreError::NotFound(_)));
     }
 
     #[test]
@@ -877,7 +874,9 @@ mod tests {
 
         // ROOT span should return 0
         let mut buf = vec![0u8; 10];
-        let n = store.get_contents(hash_fn, GraphNode::ROOT, &mut buf).unwrap();
+        let n = store
+            .get_contents(hash_fn, GraphNode::ROOT, &mut buf)
+            .unwrap();
         assert_eq!(n, 0);
     }
 
@@ -917,7 +916,11 @@ mod tests {
         // Hash function returns None
         let hash_fn = |_: NodeId| -> Option<Hash> { None };
 
-        let node = GraphNode::new(NodeId::new(1), ChangePosition::new(0), ChangePosition::new(10));
+        let node = GraphNode::new(
+            NodeId::new(1),
+            ChangePosition::new(0),
+            ChangePosition::new(10),
+        );
         let mut buf = vec![0u8; 10];
 
         let result = store.get_contents(hash_fn, node, &mut buf);

@@ -268,10 +268,7 @@ impl CrdtConflict {
     pub fn concurrent_insert(entity1: ConflictEntity, entity2: ConflictEntity) -> Self {
         Self {
             kind: ConflictKind::ConcurrentInsert,
-            description: format!(
-                "Concurrent insertions: {} and {}",
-                entity1, entity2
-            ),
+            description: format!("Concurrent insertions: {} and {}", entity1, entity2),
             entity: entity1,
             other_entity: entity2,
             resolved: false,
@@ -283,10 +280,7 @@ impl CrdtConflict {
     pub fn delete_modify(deleted: ConflictEntity, modified: ConflictEntity) -> Self {
         Self {
             kind: ConflictKind::DeleteModify,
-            description: format!(
-                "Entity {} deleted while {} was modified",
-                deleted, modified
-            ),
+            description: format!("Entity {} deleted while {} was modified", deleted, modified),
             entity: deleted,
             other_entity: modified,
             resolved: false,
@@ -298,10 +292,7 @@ impl CrdtConflict {
     pub fn duplicate_path(path: String, trunk1: TrunkId, trunk2: TrunkId) -> Self {
         Self {
             kind: ConflictKind::DuplicatePath,
-            description: format!(
-                "Path {:?} claimed by both {} and {}",
-                path, trunk1, trunk2
-            ),
+            description: format!("Path {:?} claimed by both {} and {}", path, trunk1, trunk2),
             entity: ConflictEntity::Trunk(trunk1),
             other_entity: ConflictEntity::Trunk(trunk2),
             resolved: false,
@@ -472,7 +463,9 @@ impl CrdtConflictBuilder {
     pub fn build(self) -> CrdtConflict {
         CrdtConflict {
             kind: self.kind,
-            description: self.description.unwrap_or_else(|| self.kind.description().to_string()),
+            description: self
+                .description
+                .unwrap_or_else(|| self.kind.description().to_string()),
             entity: self.entity,
             other_entity: self.other_entity,
             resolved: false,
@@ -546,7 +539,8 @@ impl CrdtConflictTracker {
     /// Adds a conflict with a specific kind and description.
     #[inline]
     pub fn add_simple(&mut self, kind: ConflictKind, description: impl Into<String>) {
-        self.conflicts.push(CrdtConflict::new(kind, description.into()));
+        self.conflicts
+            .push(CrdtConflict::new(kind, description.into()));
     }
 
     /// Returns `true` if any conflicts have been recorded.
@@ -858,11 +852,7 @@ mod tests {
         let trunk1 = TrunkId::new(NodeId::new(1), 0);
         let trunk2 = TrunkId::new(NodeId::new(2), 0);
 
-        let conflict = CrdtConflict::duplicate_path(
-            "src/main.rs".to_string(),
-            trunk1,
-            trunk2,
-        );
+        let conflict = CrdtConflict::duplicate_path("src/main.rs".to_string(), trunk1, trunk2);
 
         assert_eq!(conflict.kind(), ConflictKind::DuplicatePath);
         assert!(conflict.description().contains("main.rs"));
@@ -870,10 +860,7 @@ mod tests {
 
     #[test]
     fn test_conflict_mark_resolved() {
-        let mut conflict = CrdtConflict::new(
-            ConflictKind::ConcurrentInsert,
-            "test".to_string(),
-        );
+        let mut conflict = CrdtConflict::new(ConflictKind::ConcurrentInsert, "test".to_string());
 
         assert!(!conflict.is_resolved());
 
@@ -885,10 +872,7 @@ mod tests {
 
     #[test]
     fn test_conflict_mark_unresolved() {
-        let mut conflict = CrdtConflict::new(
-            ConflictKind::ConcurrentInsert,
-            "test".to_string(),
-        );
+        let mut conflict = CrdtConflict::new(ConflictKind::ConcurrentInsert, "test".to_string());
         conflict.mark_resolved(Some("resolved".to_string()));
 
         conflict.mark_unresolved();
@@ -911,10 +895,7 @@ mod tests {
 
     #[test]
     fn test_conflict_display_resolved() {
-        let mut conflict = CrdtConflict::new(
-            ConflictKind::ConcurrentInsert,
-            "test".to_string(),
-        );
+        let mut conflict = CrdtConflict::new(ConflictKind::ConcurrentInsert, "test".to_string());
         conflict.mark_resolved(None);
 
         let display = conflict.to_string();
@@ -923,10 +904,7 @@ mod tests {
 
     #[test]
     fn test_conflict_serde() {
-        let conflict = CrdtConflict::new(
-            ConflictKind::DeleteModify,
-            "test".to_string(),
-        );
+        let conflict = CrdtConflict::new(ConflictKind::DeleteModify, "test".to_string());
         let json = serde_json::to_string(&conflict).unwrap();
         let restored: CrdtConflict = serde_json::from_str(&json).unwrap();
 

@@ -209,7 +209,9 @@ pub mod workflow;
 pub use builder::{RecordBuilder, RecordStats, Recorded};
 
 // Context types
-pub use context::{DetectContext, PristineFileState, RecordContext, RecordItem as ContextRecordItem};
+pub use context::{
+    DetectContext, PristineFileState, RecordContext, RecordItem as ContextRecordItem,
+};
 
 // Detection types
 pub use detect::{

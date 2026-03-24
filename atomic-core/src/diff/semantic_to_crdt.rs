@@ -346,12 +346,18 @@ impl SemanticToCrdt {
         change: &LineChange<'a>,
     ) -> ConversionResult<Vec<LineOps>> {
         match change {
-            LineChange::Added { line_num, line, tokens, .. } => {
-                self.convert_added_line(*line_num, line, tokens)
-            }
-            LineChange::Deleted { line_num, line, tokens, .. } => {
-                self.convert_deleted_line(*line_num, line, tokens)
-            }
+            LineChange::Added {
+                line_num,
+                line,
+                tokens,
+                ..
+            } => self.convert_added_line(*line_num, line, tokens),
+            LineChange::Deleted {
+                line_num,
+                line,
+                tokens,
+                ..
+            } => self.convert_deleted_line(*line_num, line, tokens),
             LineChange::Modified {
                 old_line_num,
                 new_line_num,
@@ -359,7 +365,13 @@ impl SemanticToCrdt {
                 after,
                 token_changes,
                 ..
-            } => self.convert_modified_line(*old_line_num, *new_line_num, before, after, token_changes),
+            } => self.convert_modified_line(
+                *old_line_num,
+                *new_line_num,
+                before,
+                after,
+                token_changes,
+            ),
         }
     }
 
@@ -375,8 +387,7 @@ impl SemanticToCrdt {
         // Convert all tokens to LeafOp::Insert
         let leaf_ops = self.convert_tokens_to_inserts(tokens)?;
 
-        let line_ops = LineOps::insert(branch_id, None, leaf_ops)
-            .with_new_line_num(line_num);
+        let line_ops = LineOps::insert(branch_id, None, leaf_ops).with_new_line_num(line_num);
 
         self.stats.lines_inserted += 1;
 
@@ -395,8 +406,7 @@ impl SemanticToCrdt {
         // Store the original content as LeafOps for diff display
         let content_ops = self.convert_tokens_to_inserts(tokens)?;
 
-        let line_ops = LineOps::delete(branch_id, content_ops)
-            .with_old_line_num(line_num);
+        let line_ops = LineOps::delete(branch_id, content_ops).with_old_line_num(line_num);
 
         self.stats.lines_deleted += 1;
 
@@ -478,11 +488,7 @@ impl SemanticToCrdt {
                     }
                 }
 
-                TokenChange::Replaced {
-                    
-                    new_token,
-                    ..
-                } => {
+                TokenChange::Replaced { new_token, .. } => {
                     if self.should_include_token(new_token.kind()) {
                         let leaf_id = self.allocator.alloc_leaf();
 

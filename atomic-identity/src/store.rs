@@ -315,7 +315,11 @@ impl IdentityFilter {
         }
 
         if let Some(ref pattern) = self.name_pattern {
-            if !identity.name.to_lowercase().contains(&pattern.to_lowercase()) {
+            if !identity
+                .name
+                .to_lowercase()
+                .contains(&pattern.to_lowercase())
+            {
                 return false;
             }
         }
@@ -390,9 +394,8 @@ impl IdentityStore {
     ///
     /// The default location is `~/.atomic/identities/` in the user's home directory.
     fn default_store_path() -> Result<PathBuf, IdentityError> {
-        let home_dir = dirs::home_dir().ok_or_else(|| {
-            IdentityError::Config(atomic_config::ConfigError::NoConfigDir)
-        })?;
+        let home_dir = dirs::home_dir()
+            .ok_or_else(|| IdentityError::Config(atomic_config::ConfigError::NoConfigDir))?;
 
         Ok(home_dir.join(".atomic").join("identities"))
     }
@@ -721,10 +724,17 @@ impl IdentityStore {
         let safe_name = identity
             .name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect::<String>();
 
-        self.root.join(format!("{}-{}", safe_name, identity.id.short()))
+        self.root
+            .join(format!("{}-{}", safe_name, identity.id.short()))
     }
 
     /// Find the directory for an identity by ID.

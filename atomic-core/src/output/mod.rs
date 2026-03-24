@@ -172,21 +172,21 @@ pub use filesystem::{FileSystem, FileWriter, DOT_DIR};
 
 // Re-export repository output types
 pub use repo::{
-    FileConflict, FileConflictType, FileWritten, OutputError as OutputRepoError,
-    OutputOptions, OutputOutcome, OutputResult as OutputRepoResult,
+    FileConflict, FileConflictType, FileWritten, OutputError as OutputRepoError, OutputOptions,
+    OutputOutcome, OutputResult as OutputRepoResult,
 };
 
 // Re-export alive graph types
 pub use alive::{
-    compute_order, retrieve_graph, AliveGraph, AliveVertex, ConflictPath, ConflictTree,
-    GraphStats, OrderResult, PathElement, RedundantEdge, RetrieveOptions, RetrieveResult, SccId,
-    VertexFlags, VertexId,
+    compute_order, retrieve_graph, AliveGraph, AliveVertex, ConflictPath, ConflictTree, GraphStats,
+    OrderResult, PathElement, RedundantEdge, RetrieveOptions, RetrieveResult, SccId, VertexFlags,
+    VertexId,
 };
 
 // Re-export CRDT content retrieval types
 pub use crdt::{
-    get_file, get_file_lines, get_file_lines_with_options, get_file_with_options,
-    get_trunk_id, file_exists, File, Line, Token, RetrievalOptions,
+    file_exists, get_file, get_file_lines, get_file_lines_with_options, get_file_with_options,
+    get_trunk_id, File, Line, RetrievalOptions, Token,
 };
 
 use crate::types::{Hash, Inode, NodeId, Position};
@@ -479,25 +479,13 @@ mod tests {
 
     #[test]
     fn test_conflict_zombie() {
-        let conflict = Conflict::zombie(
-            "test.txt".to_string(),
-            Position::ROOT,
-            10,
-            vec![],
-            5,
-        );
+        let conflict = Conflict::zombie("test.txt".to_string(), Position::ROOT, 10, vec![], 5);
         assert_eq!(conflict.conflict_type(), ConflictType::Zombie);
     }
 
     #[test]
     fn test_conflict_cyclic() {
-        let conflict = Conflict::cyclic(
-            "circular.rs".to_string(),
-            Position::ROOT,
-            1,
-            vec![],
-            3,
-        );
+        let conflict = Conflict::cyclic("circular.rs".to_string(), Position::ROOT, 1, vec![], 3);
         assert_eq!(conflict.conflict_type(), ConflictType::Cyclic);
     }
 
@@ -533,22 +521,14 @@ mod tests {
 
     #[test]
     fn test_output_item_file() {
-        let item = OutputItem::file(
-            Inode::ROOT,
-            "test.txt".to_string(),
-            Position::ROOT,
-        );
+        let item = OutputItem::file(Inode::ROOT, "test.txt".to_string(), Position::ROOT);
         assert!(!item.is_directory());
         assert!(!item.is_zombie());
     }
 
     #[test]
     fn test_output_item_directory() {
-        let item = OutputItem::directory(
-            Inode::ROOT,
-            "src".to_string(),
-            Position::ROOT,
-        );
+        let item = OutputItem::directory(Inode::ROOT, "src".to_string(), Position::ROOT);
         assert!(item.is_directory());
     }
 
@@ -675,7 +655,11 @@ mod tests {
         let mut writer = Writer::new(&mut output);
 
         // Write a simple span
-        let v = GraphNode::new(NodeId::new(1), ChangePosition::new(0), ChangePosition::new(5));
+        let v = GraphNode::new(
+            NodeId::new(1),
+            ChangePosition::new(0),
+            ChangePosition::new(5),
+        );
         let result: Result<(), std::io::Error> = writer.output_line(v, |buf| {
             buf.copy_from_slice(b"hello");
             Ok(())

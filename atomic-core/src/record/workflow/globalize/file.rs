@@ -1,6 +1,5 @@
 use super::*;
 
-
 // GLOBALIZATION RESULT
 
 /// Result of globalizing a single file.

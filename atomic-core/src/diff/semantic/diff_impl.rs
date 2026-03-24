@@ -1,6 +1,5 @@
 use super::*;
 
-
 // Core diffing functions
 
 /// Compute a semantic diff between two byte slices.

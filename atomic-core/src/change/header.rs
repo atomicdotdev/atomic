@@ -300,7 +300,10 @@ impl ChangeHeader {
         }
 
         // Timestamp
-        result.push_str(&format!("Date:   {}\n", self.timestamp.format("%Y-%m-%d %H:%M:%S UTC")));
+        result.push_str(&format!(
+            "Date:   {}\n",
+            self.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+        ));
 
         // Message
         result.push_str(&format!("\n    {}\n", self.message));
@@ -526,9 +529,7 @@ mod tests {
 
     #[test]
     fn test_header_builder_basic() {
-        let header = ChangeHeader::builder()
-            .message("Add feature")
-            .build();
+        let header = ChangeHeader::builder().message("Add feature").build();
         assert_eq!(header.message, "Add feature");
     }
 
@@ -542,7 +543,10 @@ mod tests {
             .build();
 
         assert_eq!(header.message, "Add feature");
-        assert_eq!(header.description, Some("This adds the widget feature".to_string()));
+        assert_eq!(
+            header.description,
+            Some("This adds the widget feature".to_string())
+        );
         assert_eq!(header.authors.len(), 2);
     }
 
@@ -562,17 +566,13 @@ mod tests {
 
     #[test]
     fn test_header_try_build_success() {
-        let result = ChangeHeader::builder()
-            .message("Valid message")
-            .try_build();
+        let result = ChangeHeader::builder().message("Valid message").try_build();
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_header_try_build_empty_message() {
-        let result = ChangeHeader::builder()
-            .message("")
-            .try_build();
+        let result = ChangeHeader::builder().message("").try_build();
         assert!(result.is_err());
     }
 

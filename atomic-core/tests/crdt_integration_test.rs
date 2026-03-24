@@ -16,9 +16,7 @@ use atomic_core::crdt::{
 };
 use atomic_core::diff::token::TokenKind;
 use atomic_core::pristine::PristineError;
-use atomic_core::record::workflow::crdt::{
-    AnalysisOptions, CrdtChangeBuilder, LineAnalyzer,
-};
+use atomic_core::record::workflow::crdt::{AnalysisOptions, CrdtChangeBuilder, LineAnalyzer};
 use atomic_core::types::{Inode, NodeId};
 
 // Mock Transaction Implementation
@@ -67,9 +65,7 @@ impl MockCrdtTxn {
 
     /// Get trunk by path
     fn get_trunk_by_path_helper(&self, path: &str) -> Option<&Trunk> {
-        self.path_index
-            .get(path)
-            .and_then(|id| self.trunks.get(id))
+        self.path_index.get(path).and_then(|id| self.trunks.get(id))
     }
 }
 
@@ -127,7 +123,11 @@ impl MutCrdtTxnT for MockCrdtTxn {
         Ok(self.inode_index.get(&inode).copied())
     }
 
-    fn put_branch(&mut self, branch: &Branch, after: Option<BranchId>) -> Result<bool, Self::Error> {
+    fn put_branch(
+        &mut self,
+        branch: &Branch,
+        after: Option<BranchId>,
+    ) -> Result<bool, Self::Error> {
         let id = branch.id();
         let is_new = !self.branches.contains_key(&id);
         self.branches.insert(id, branch.clone());
@@ -451,7 +451,15 @@ fn test_apply_branch_operations() {
         after: None, // Insert at start
         content: vec![],
     };
-    apply_branch_op(&mut txn, &mut ctx, trunk_id, branch_id_1, &insert_op_1, content).unwrap();
+    apply_branch_op(
+        &mut txn,
+        &mut ctx,
+        trunk_id,
+        branch_id_1,
+        &insert_op_1,
+        content,
+    )
+    .unwrap();
 
     // Insert second line after first
     let branch_id_2 = BranchId::new(change_id, 1);
@@ -459,7 +467,15 @@ fn test_apply_branch_operations() {
         after: Some(branch_id_1),
         content: vec![],
     };
-    apply_branch_op(&mut txn, &mut ctx, trunk_id, branch_id_2, &insert_op_2, content).unwrap();
+    apply_branch_op(
+        &mut txn,
+        &mut ctx,
+        trunk_id,
+        branch_id_2,
+        &insert_op_2,
+        content,
+    )
+    .unwrap();
 
     // Verify branches were created
     assert_eq!(txn.branch_count_for_trunk(&trunk_id), 2);
@@ -471,7 +487,15 @@ fn test_apply_branch_operations() {
         branch: branch_id_1,
         content: vec![],
     };
-    apply_branch_op(&mut txn, &mut ctx, trunk_id, branch_id_1, &delete_op, content).unwrap();
+    apply_branch_op(
+        &mut txn,
+        &mut ctx,
+        trunk_id,
+        branch_id_1,
+        &delete_op,
+        content,
+    )
+    .unwrap();
 
     // Verify first line is marked deleted
     let branch_1 = txn.get_branch(branch_id_1).unwrap().unwrap();
@@ -504,7 +528,15 @@ fn test_apply_leaf_operations() {
         after: None,
         content: vec![],
     };
-    apply_branch_op(&mut txn, &mut ctx, trunk_id, branch_id, &insert_branch, content).unwrap();
+    apply_branch_op(
+        &mut txn,
+        &mut ctx,
+        trunk_id,
+        branch_id,
+        &insert_branch,
+        content,
+    )
+    .unwrap();
 
     // Insert tokens using content bytes directly
     let leaf_id_1 = LeafId::new(change_id, 0);
@@ -513,7 +545,15 @@ fn test_apply_leaf_operations() {
         kind: TokenKind::Word,
         content: b"fn".to_vec(),
     };
-    apply_leaf_op(&mut txn, &mut ctx, branch_id, leaf_id_1, &insert_leaf_1, content).unwrap();
+    apply_leaf_op(
+        &mut txn,
+        &mut ctx,
+        branch_id,
+        leaf_id_1,
+        &insert_leaf_1,
+        content,
+    )
+    .unwrap();
 
     let leaf_id_2 = LeafId::new(change_id, 1);
     let insert_leaf_2 = LeafOp::Insert {
@@ -521,7 +561,15 @@ fn test_apply_leaf_operations() {
         kind: TokenKind::Whitespace,
         content: b" ".to_vec(),
     };
-    apply_leaf_op(&mut txn, &mut ctx, branch_id, leaf_id_2, &insert_leaf_2, content).unwrap();
+    apply_leaf_op(
+        &mut txn,
+        &mut ctx,
+        branch_id,
+        leaf_id_2,
+        &insert_leaf_2,
+        content,
+    )
+    .unwrap();
 
     let leaf_id_3 = LeafId::new(change_id, 2);
     let insert_leaf_3 = LeafOp::Insert {
@@ -529,7 +577,15 @@ fn test_apply_leaf_operations() {
         kind: TokenKind::Word,
         content: b"main".to_vec(),
     };
-    apply_leaf_op(&mut txn, &mut ctx, branch_id, leaf_id_3, &insert_leaf_3, content).unwrap();
+    apply_leaf_op(
+        &mut txn,
+        &mut ctx,
+        branch_id,
+        leaf_id_3,
+        &insert_leaf_3,
+        content,
+    )
+    .unwrap();
 
     // Verify leaves were created
     assert_eq!(txn.leaf_count_for_branch(&branch_id), 3);
@@ -543,7 +599,15 @@ fn test_apply_leaf_operations() {
 
     // Delete a token
     let delete_leaf = LeafOp::Delete { leaf: leaf_id_2 };
-    apply_leaf_op(&mut txn, &mut ctx, branch_id, leaf_id_2, &delete_leaf, content).unwrap();
+    apply_leaf_op(
+        &mut txn,
+        &mut ctx,
+        branch_id,
+        leaf_id_2,
+        &delete_leaf,
+        content,
+    )
+    .unwrap();
 
     // Verify token is marked deleted (not removed)
     let leaf_2 = txn.get_leaf(leaf_id_2).unwrap().unwrap();
@@ -572,7 +636,15 @@ fn test_apply_leaf_replace_preserves_id() {
         after: None,
         content: vec![],
     };
-    apply_branch_op(&mut txn, &mut ctx, trunk_id, branch_id, &insert_branch, content).unwrap();
+    apply_branch_op(
+        &mut txn,
+        &mut ctx,
+        trunk_id,
+        branch_id,
+        &insert_branch,
+        content,
+    )
+    .unwrap();
 
     let leaf_id = LeafId::new(change_id, 0);
     let insert_leaf = LeafOp::Insert {
@@ -580,7 +652,15 @@ fn test_apply_leaf_replace_preserves_id() {
         kind: TokenKind::Word,
         content: b"old_value".to_vec(),
     };
-    apply_leaf_op(&mut txn, &mut ctx, branch_id, leaf_id, &insert_leaf, content).unwrap();
+    apply_leaf_op(
+        &mut txn,
+        &mut ctx,
+        branch_id,
+        leaf_id,
+        &insert_leaf,
+        content,
+    )
+    .unwrap();
 
     // Verify original leaf exists
     let leaf = txn.get_leaf(leaf_id).unwrap().unwrap();

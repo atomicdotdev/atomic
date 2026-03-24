@@ -217,11 +217,14 @@ pub struct Default {
 
 impl Command for Default {
     fn run(&self) -> CliResult<()> {
-        use atomic_identity::{IdentityStore, IdentityUsage};
         use crate::output::{print_success, print_warning};
+        use atomic_identity::{IdentityStore, IdentityUsage};
 
         let mut store = IdentityStore::open_default().map_err(|e| {
-            crate::error::CliError::Internal(anyhow::anyhow!("Failed to open identity store: {}", e))
+            crate::error::CliError::Internal(anyhow::anyhow!(
+                "Failed to open identity store: {}",
+                e
+            ))
         })?;
 
         if self.clear {
@@ -237,28 +240,39 @@ impl Command for Default {
                 ));
             } else {
                 store.clear_default().map_err(|e| {
-                    crate::error::CliError::Internal(anyhow::anyhow!("Failed to clear default: {}", e))
+                    crate::error::CliError::Internal(anyhow::anyhow!(
+                        "Failed to clear default: {}",
+                        e
+                    ))
                 })?;
                 print_success("Cleared default identity");
             }
         } else if let Some(name) = &self.name {
             // Load the identity by name
-            let identity = store.load_by_name(name).map_err(|_| {
-                crate::error::CliError::IdentityNotFound(name.clone())
-            })?;
+            let identity = store
+                .load_by_name(name)
+                .map_err(|_| crate::error::CliError::IdentityNotFound(name.clone()))?;
 
             if let Some(usage_str) = &self.usage {
                 let usage = IdentityUsage::parse(usage_str);
-                store.set_default_for_usage(&usage, &identity.id).map_err(|e| {
-                    crate::error::CliError::Internal(anyhow::anyhow!("Failed to set default: {}", e))
-                })?;
+                store
+                    .set_default_for_usage(&usage, &identity.id)
+                    .map_err(|e| {
+                        crate::error::CliError::Internal(anyhow::anyhow!(
+                            "Failed to set default: {}",
+                            e
+                        ))
+                    })?;
                 print_success(&format!(
                     "Set '{}' as default identity for {} usage",
                     name, usage
                 ));
             } else {
                 store.set_default(&identity.id).map_err(|e| {
-                    crate::error::CliError::Internal(anyhow::anyhow!("Failed to set default: {}", e))
+                    crate::error::CliError::Internal(anyhow::anyhow!(
+                        "Failed to set default: {}",
+                        e
+                    ))
                 })?;
                 print_success(&format!("Set '{}' as default identity", name));
             }

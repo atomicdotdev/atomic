@@ -114,7 +114,10 @@ mod writer;
 pub use conflict::{FileConflict, FileConflictType};
 pub use content::output_graph_content;
 pub use error::{OutputError, OutputResult};
-pub use file::{output_file, output_file_to_buffer, output_file_to_buffer_with_options, FileOutputError, FileOutputOptions, FileOutputResult};
+pub use file::{
+    output_file, output_file_to_buffer, output_file_to_buffer_with_options, FileOutputError,
+    FileOutputOptions, FileOutputResult,
+};
 pub use options::OutputOptions;
 pub use outcome::{FileWritten, OutputOutcome};
 pub use repository::{
@@ -122,7 +125,7 @@ pub use repository::{
     RepositoryOutputError, RepositoryOutputOptions, RepositoryOutputResult,
 };
 pub use tree::{
-    build_tree_hierarchy, collect_directories, collect_files, collect_tree,
-    TreeCollectOptions, TreeCollectResult, TreeItem,
+    build_tree_hierarchy, collect_directories, collect_files, collect_tree, TreeCollectOptions,
+    TreeCollectResult, TreeItem,
 };
 pub use writer::{markers, ConflictWriter};

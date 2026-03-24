@@ -172,12 +172,7 @@ impl Trunk {
     /// Creates a new trunk with the given properties.
     ///
     /// The trunk starts in the [`TrunkState::Alive`] state.
-    pub fn new(
-        id: TrunkId,
-        inode: Inode,
-        path: String,
-        encoding: Option<Encoding>,
-    ) -> Self {
+    pub fn new(id: TrunkId, inode: Inode, path: String, encoding: Option<Encoding>) -> Self {
         Trunk {
             id,
             inode,
@@ -257,13 +252,7 @@ impl Trunk {
 
 impl fmt::Display for Trunk {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Trunk({}, {}, state={})",
-            self.id,
-            self.path,
-            self.state
-        )
+        write!(f, "Trunk({}, {}, state={})", self.id, self.path, self.state)
     }
 }
 

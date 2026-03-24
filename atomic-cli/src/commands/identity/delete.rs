@@ -66,9 +66,9 @@ impl Command for Delete {
         })?;
 
         // Load the identity by name to get its ID
-        let identity = store.load_by_name(&self.name).map_err(|_| {
-            CliError::IdentityNotFound(self.name.clone())
-        })?;
+        let identity = store
+            .load_by_name(&self.name)
+            .map_err(|_| CliError::IdentityNotFound(self.name.clone()))?;
 
         // Check if this is the default identity
         let is_default = store
@@ -89,13 +89,16 @@ impl Command for Delete {
         if !self.force {
             use std::io::{self, Write};
 
-            print!("Are you sure you want to delete identity '{}'? [y/N] ", self.name);
+            print!(
+                "Are you sure you want to delete identity '{}'? [y/N] ",
+                self.name
+            );
             io::stdout().flush().unwrap();
 
             let mut input = String::new();
-            io::stdin().read_line(&mut input).map_err(|e| {
-                CliError::Internal(anyhow::anyhow!("Failed to read input: {}", e))
-            })?;
+            io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to read input: {}", e)))?;
 
             let input = input.trim().to_lowercase();
             if input != "y" && input != "yes" {
@@ -105,9 +108,9 @@ impl Command for Delete {
         }
 
         // Delete the identity
-        store.delete(&identity.id).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to delete identity: {}", e))
-        })?;
+        store
+            .delete(&identity.id)
+            .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to delete identity: {}", e)))?;
 
         print_success(&format!("Deleted identity: {}", self.name));
 

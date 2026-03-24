@@ -795,9 +795,10 @@ pub fn collect_working_copy_files_with_rules(
         if let Ok(rel_path) = entry.path().strip_prefix(root) {
             // Check path filters if specified
             if !options.path_filters.is_empty() {
-                let matches_filter = options.path_filters.iter().any(|filter| {
-                    rel_path.starts_with(filter) || filter.starts_with(rel_path)
-                });
+                let matches_filter = options
+                    .path_filters
+                    .iter()
+                    .any(|filter| rel_path.starts_with(filter) || filter.starts_with(rel_path));
                 if !matches_filter {
                     continue;
                 }

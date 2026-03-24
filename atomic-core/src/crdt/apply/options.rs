@@ -626,41 +626,31 @@ mod tests {
 
     #[test]
     fn test_builder_validate_ordering() {
-        let options = ApplyOptions::builder()
-            .validate_ordering(false)
-            .build();
+        let options = ApplyOptions::builder().validate_ordering(false).build();
         assert!(!options.validate_ordering());
     }
 
     #[test]
     fn test_builder_validate_references() {
-        let options = ApplyOptions::builder()
-            .validate_references(false)
-            .build();
+        let options = ApplyOptions::builder().validate_references(false).build();
         assert!(!options.validate_references());
     }
 
     #[test]
     fn test_builder_track_conflicts() {
-        let options = ApplyOptions::builder()
-            .track_conflicts(false)
-            .build();
+        let options = ApplyOptions::builder().track_conflicts(false).build();
         assert!(!options.track_conflicts());
     }
 
     #[test]
     fn test_builder_fail_on_conflict() {
-        let options = ApplyOptions::builder()
-            .fail_on_conflict(true)
-            .build();
+        let options = ApplyOptions::builder().fail_on_conflict(true).build();
         assert!(options.fail_on_conflict());
     }
 
     #[test]
     fn test_builder_allow_duplicate_ids() {
-        let options = ApplyOptions::builder()
-            .allow_duplicate_ids(true)
-            .build();
+        let options = ApplyOptions::builder().allow_duplicate_ids(true).build();
         assert!(options.allow_duplicate_ids());
     }
 
@@ -674,17 +664,13 @@ mod tests {
 
     #[test]
     fn test_builder_max_operations() {
-        let options = ApplyOptions::builder()
-            .max_operations(Some(100))
-            .build();
+        let options = ApplyOptions::builder().max_operations(Some(100)).build();
         assert_eq!(options.max_operations(), Some(100));
     }
 
     #[test]
     fn test_builder_max_operations_none() {
-        let options = ApplyOptions::builder()
-            .max_operations(None)
-            .build();
+        let options = ApplyOptions::builder().max_operations(None).build();
         assert!(options.max_operations().is_none());
     }
 
@@ -783,9 +769,7 @@ mod tests {
 
     #[test]
     fn test_exceeds_limit_no_limit() {
-        let options = ApplyOptions::builder()
-            .max_operations(None)
-            .build();
+        let options = ApplyOptions::builder().max_operations(None).build();
         assert!(!options.exceeds_limit(0));
         assert!(!options.exceeds_limit(1000));
         assert!(!options.exceeds_limit(usize::MAX));
@@ -793,9 +777,7 @@ mod tests {
 
     #[test]
     fn test_exceeds_limit_with_limit() {
-        let options = ApplyOptions::builder()
-            .max_operations(Some(100))
-            .build();
+        let options = ApplyOptions::builder().max_operations(Some(100)).build();
         assert!(!options.exceeds_limit(0));
         assert!(!options.exceeds_limit(99));
         assert!(options.exceeds_limit(100));
@@ -804,9 +786,7 @@ mod tests {
 
     #[test]
     fn test_exceeds_limit_zero() {
-        let options = ApplyOptions::builder()
-            .max_operations(Some(0))
-            .build();
+        let options = ApplyOptions::builder().max_operations(Some(0)).build();
         assert!(options.exceeds_limit(0));
     }
 
@@ -835,9 +815,7 @@ mod tests {
 
     #[test]
     fn test_display_with_max() {
-        let options = ApplyOptions::builder()
-            .max_operations(Some(500))
-            .build();
+        let options = ApplyOptions::builder().max_operations(Some(500)).build();
         let display = options.to_string();
         assert!(display.contains("500"));
     }
@@ -878,9 +856,7 @@ mod tests {
 
     #[test]
     fn test_clone() {
-        let options = ApplyOptions::builder()
-            .max_operations(Some(100))
-            .build();
+        let options = ApplyOptions::builder().max_operations(Some(100)).build();
         let cloned = options.clone();
         assert_eq!(options, cloned);
     }

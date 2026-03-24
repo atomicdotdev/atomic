@@ -1399,7 +1399,13 @@ impl HunkBuilder {
                     // in the new content this graph_op covers. The caller will use this
                     // to calculate actual byte positions in the content buffer.
                     // old_start is the insertion point (insert AFTER this line in old content)
-                    BuiltHunk::new_edit_with_lines(local, encoding, pending.old_start, pending.new_start, pending.new_len)
+                    BuiltHunk::new_edit_with_lines(
+                        local,
+                        encoding,
+                        pending.old_start,
+                        pending.new_start,
+                        pending.new_len,
+                    )
                 }
                 PendingChangeKind::Delete => {
                     let deleted: Vec<usize> =
@@ -1411,7 +1417,14 @@ impl HunkBuilder {
                         (pending.old_start..pending.old_start + pending.old_len).collect();
                     // Use the new_replace_with_lines constructor to track which lines
                     // in the new content this graph_op covers.
-                    BuiltHunk::new_replace_with_lines(local, encoding, deleted, pending.old_start, pending.new_start, pending.new_len)
+                    BuiltHunk::new_replace_with_lines(
+                        local,
+                        encoding,
+                        deleted,
+                        pending.old_start,
+                        pending.new_start,
+                        pending.new_len,
+                    )
                 }
             };
 
@@ -1456,7 +1469,10 @@ mod tests {
     fn test_options_default() {
         let opts = HunkBuildOptions::default();
         assert!(opts.is_binary());
-        assert_eq!(opts.get_context_lines(), HunkBuildOptions::DEFAULT_CONTEXT_LINES);
+        assert_eq!(
+            opts.get_context_lines(),
+            HunkBuildOptions::DEFAULT_CONTEXT_LINES
+        );
     }
 
     #[test]

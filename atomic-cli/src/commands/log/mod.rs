@@ -104,7 +104,6 @@
 //! - `0`: Success
 //! - `1`: Error (repository not found, stack not found, etc.)
 
-
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 
@@ -118,18 +117,17 @@ use crate::commands::{
 };
 use crate::error::{CliError, CliResult};
 use crate::output::{
-    author as style_author, hash as style_hash, hint, print_hint,
-    stack as style_stack, timestamp as style_timestamp, warning,
+    author as style_author, hash as style_hash, hint, print_hint, stack as style_stack,
+    timestamp as style_timestamp, warning,
 };
 
 // Output Format
 
-
-mod types;
 mod command;
+mod types;
 
-pub use types::*;
 pub use command::*;
+pub use types::*;
 
 #[cfg(test)]
 mod tests;

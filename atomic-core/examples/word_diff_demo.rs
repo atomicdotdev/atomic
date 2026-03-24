@@ -8,9 +8,7 @@
 //!
 //! Run with: cargo run --example word_diff_demo
 
-use atomic_core::diff::{
-    compute_inline_diff, Algorithm, DiffOp, Line, HunkKind, Tokenizer,
-};
+use atomic_core::diff::{compute_inline_diff, Algorithm, DiffOp, HunkKind, Line, Tokenizer};
 
 fn main() {
     println!("╔══════════════════════════════════════════════════════════════════╗");
@@ -232,10 +230,7 @@ fn demo_tokenizer() {
     println!("│");
 
     let code = b"let result: i32 = calculate(x + y) * 2; // compute";
-    println!(
-        "│ Input: {}",
-        String::from_utf8_lossy(code)
-    );
+    println!("│ Input: {}", String::from_utf8_lossy(code));
     println!("│");
     println!("│ Tokens:");
 

@@ -755,7 +755,10 @@ pub fn update_directory_flags<T: MutTxnT>(
 ///
 /// * `txn` - A mutable transaction
 /// * `inode` - The directory's inode
-pub fn mark_directory_has_children<T: MutTxnT + TreeTxnT>(txn: &mut T, inode: Inode) -> TrackingResult<()> {
+pub fn mark_directory_has_children<T: MutTxnT + TreeTxnT>(
+    txn: &mut T,
+    inode: Inode,
+) -> TrackingResult<()> {
     if let Some(flags) = txn
         .get_directory_flags(inode)
         .map_err(|e| TrackingError::Database(e.to_string()))?
@@ -778,7 +781,10 @@ pub fn mark_directory_has_children<T: MutTxnT + TreeTxnT>(txn: &mut T, inode: In
 ///
 /// * `txn` - A mutable transaction
 /// * `inode` - The directory's inode
-pub fn mark_directory_empty<T: MutTxnT + TreeTxnT>(txn: &mut T, inode: Inode) -> TrackingResult<()> {
+pub fn mark_directory_empty<T: MutTxnT + TreeTxnT>(
+    txn: &mut T,
+    inode: Inode,
+) -> TrackingResult<()> {
     if let Some(flags) = txn
         .get_directory_flags(inode)
         .map_err(|e| TrackingError::Database(e.to_string()))?
@@ -945,14 +951,9 @@ pub fn list_tracked<T: TreeTxnT>(txn: &T) -> TrackingResult<Vec<TrackedFile>> {
 /// # Returns
 ///
 /// A vector of tracked directories.
-pub fn list_tracked_directories<T: TreeTxnT>(
-    txn: &T,
-) -> TrackingResult<Vec<TrackedFile>> {
+pub fn list_tracked_directories<T: TreeTxnT>(txn: &T) -> TrackingResult<Vec<TrackedFile>> {
     let all_tracked = list_tracked(txn)?;
-    Ok(all_tracked
-        .into_iter()
-        .filter(|f| f.is_directory)
-        .collect())
+    Ok(all_tracked.into_iter().filter(|f| f.is_directory).collect())
 }
 
 /// List all explicitly tracked empty directories.
@@ -964,9 +965,7 @@ pub fn list_tracked_directories<T: TreeTxnT>(
 /// # Returns
 ///
 /// A vector of explicitly tracked empty directories.
-pub fn list_explicit_empty_directories<T: TreeTxnT>(
-    txn: &T,
-) -> TrackingResult<Vec<TrackedFile>> {
+pub fn list_explicit_empty_directories<T: TreeTxnT>(txn: &T) -> TrackingResult<Vec<TrackedFile>> {
     let all_tracked = list_tracked(txn)?;
     let mut results = Vec::new();
 
@@ -1195,7 +1194,12 @@ mod tests {
         ));
 
         // Test without rules (should still ignore internal dirs)
-        assert!(should_ignore_with_rules(Path::new(".atomic"), true, true, None));
+        assert!(should_ignore_with_rules(
+            Path::new(".atomic"),
+            true,
+            true,
+            None
+        ));
         assert!(!should_ignore_with_rules(
             Path::new("src/main.rs"),
             true,
@@ -1229,9 +1233,13 @@ mod tests {
             collect_files_for_tracking(temp.path(), Path::new("."), &options).unwrap();
 
         // Collect with rules
-        let files_with_rules =
-            collect_files_for_tracking_with_rules(temp.path(), Path::new("."), &options, Some(&rules))
-                .unwrap();
+        let files_with_rules = collect_files_for_tracking_with_rules(
+            temp.path(),
+            Path::new("."),
+            &options,
+            Some(&rules),
+        )
+        .unwrap();
 
         // Without rules, should include target/ and *.log files
         assert!(files_no_rules.iter().any(|p| p.starts_with("target")));
@@ -1473,7 +1481,10 @@ mod tests {
         let result = collect_files_for_tracking(root, Path::new("nonexistent.txt"), &options);
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), TrackingError::PathNotFound { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            TrackingError::PathNotFound { .. }
+        ));
     }
 
     #[test]
@@ -1511,7 +1522,8 @@ mod tests {
         let files = collect_files_for_tracking(root, Path::new("normal.txt"), &options).unwrap();
         assert_eq!(files.len(), 1);
 
-        let hidden_result = collect_files_for_tracking(root, Path::new(".hidden"), &options).unwrap();
+        let hidden_result =
+            collect_files_for_tracking(root, Path::new(".hidden"), &options).unwrap();
         assert!(hidden_result.is_empty());
     }
 
@@ -1669,12 +1681,14 @@ mod tests {
         // List them
         {
             let txn = pristine.read_txn().unwrap();
-            let tracked: Vec<TrackedFile> = list_tracked(&txn)
-                .unwrap();
+            let tracked: Vec<TrackedFile> = list_tracked(&txn).unwrap();
 
             assert_eq!(tracked.len(), 3);
 
-            let paths: Vec<_> = tracked.iter().map(|f| f.path.to_string_lossy().to_string()).collect();
+            let paths: Vec<_> = tracked
+                .iter()
+                .map(|f| f.path.to_string_lossy().to_string())
+                .collect();
             assert!(paths.contains(&"file1.txt".to_string()));
             assert!(paths.contains(&"file2.txt".to_string()));
             assert!(paths.contains(&"src/main.rs".to_string()));
@@ -1735,7 +1749,10 @@ mod tests {
             let mut txn = pristine.write_txn().unwrap();
             let result = move_tracked(&mut txn, "file1.txt", "file2.txt");
             assert!(result.is_err());
-            assert!(matches!(result.unwrap_err(), TrackingError::DestinationExists { .. }));
+            assert!(matches!(
+                result.unwrap_err(),
+                TrackingError::DestinationExists { .. }
+            ));
         }
     }
 
@@ -1754,7 +1771,10 @@ mod tests {
             let mut txn = pristine.write_txn().unwrap();
             let result = move_tracked(&mut txn, "nonexistent.txt", "new.txt");
             assert!(result.is_err());
-            assert!(matches!(result.unwrap_err(), TrackingError::NotTracked { .. }));
+            assert!(matches!(
+                result.unwrap_err(),
+                TrackingError::NotTracked { .. }
+            ));
         }
     }
 }

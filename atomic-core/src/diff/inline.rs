@@ -136,10 +136,10 @@ impl HunkKind {
     /// Returns the escape sequence for the appropriate color.
     pub fn ansi_color(&self) -> &'static str {
         match self {
-            HunkKind::Deleted => "\x1b[41m",   // Red background
-            HunkKind::Inserted => "\x1b[42m",  // Green background
-            HunkKind::Modified => "\x1b[43m",  // Yellow background
-            HunkKind::Unchanged => "",         // No color
+            HunkKind::Deleted => "\x1b[41m",  // Red background
+            HunkKind::Inserted => "\x1b[42m", // Green background
+            HunkKind::Modified => "\x1b[43m", // Yellow background
+            HunkKind::Unchanged => "",        // No color
         }
     }
 
@@ -541,7 +541,10 @@ impl<'a> InlineDiff<'a> {
             let escaped = html_escape(&text);
 
             if hunk.is_change() {
-                result.push_str(&format!("<span class=\"diff-{}\">{}</span>", class, escaped));
+                result.push_str(&format!(
+                    "<span class=\"diff-{}\">{}</span>",
+                    class, escaped
+                ));
             } else {
                 result.push_str(&escaped);
             }
@@ -655,7 +658,10 @@ fn convert_word_diff_to_hunks<'a>(
 
     for op in word_result.ops() {
         match op {
-            WordDiffOp::Equal { old_range, new_range } => {
+            WordDiffOp::Equal {
+                old_range,
+                new_range,
+            } => {
                 // Add unchanged hunks
                 if let (Some(first_old), Some(last_old)) = (
                     old_tokens.get(old_range.start),
@@ -702,7 +708,10 @@ fn convert_word_diff_to_hunks<'a>(
                 }
             }
 
-            WordDiffOp::Replace { old_range, new_range } => {
+            WordDiffOp::Replace {
+                old_range,
+                new_range,
+            } => {
                 has_changes = true;
 
                 if let (Some(first), Some(last)) = (

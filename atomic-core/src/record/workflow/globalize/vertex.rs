@@ -1,6 +1,5 @@
 use super::*;
 
-
 // VERTEX CREATION
 
 /// Create a Insertion for adding a filename to a parent directory.

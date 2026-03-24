@@ -393,10 +393,7 @@ where
                 }
             }
             Err(e) => {
-                result.add_error(
-                    "<iteration error>",
-                    format!("Tree iteration failed: {}", e),
-                );
+                result.add_error("<iteration error>", format!("Tree iteration failed: {}", e));
             }
         }
     }
@@ -444,9 +441,12 @@ where
     let mut result = CollectionResult::new();
 
     // Walk the working copy directory tree
-    let paths = working_copy
-        .walk_files(prefix)
-        .map_err(|e| RecordError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+    let paths = working_copy.walk_files(prefix).map_err(|e| {
+        RecordError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        ))
+    })?;
 
     for path in paths {
         let mut file = WorkingFile::new(&path);

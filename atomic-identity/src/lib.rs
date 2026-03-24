@@ -234,7 +234,9 @@ mod tests {
         let signature = signer.sign(message);
 
         assert!(signature.verify(message, &identity.public_key).is_ok());
-        assert!(signature.verify(b"wrong message", &identity.public_key).is_err());
+        assert!(signature
+            .verify(b"wrong message", &identity.public_key)
+            .is_err());
     }
 
     #[test]

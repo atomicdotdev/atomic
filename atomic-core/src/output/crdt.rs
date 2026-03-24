@@ -57,9 +57,7 @@
 //! }
 //! ```
 
-use crate::crdt::tables::{
-    decode_branch_id, decode_leaf_id, encode_trunk_id, SerializedTrunk,
-};
+use crate::crdt::tables::{decode_branch_id, decode_leaf_id, encode_trunk_id, SerializedTrunk};
 use crate::crdt::{BranchId, BranchState, LeafId, LeafState, TrunkId, TrunkState};
 use crate::diff::token::TokenKind;
 use crate::pristine::{MutTxnT, PristineResult};
@@ -364,7 +362,12 @@ pub fn get_file_lines_by_trunk<T: MutTxnT>(
             continue;
         }
 
-        let mut line = Line::new(branch_id, line_number, branch_data.state, branch_data.line_hash);
+        let mut line = Line::new(
+            branch_id,
+            line_number,
+            branch_data.state,
+            branch_data.line_hash,
+        );
 
         // Get all leaves for this branch
         let leaf_keys: Vec<[u8; 12]> = txn

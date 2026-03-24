@@ -1,6 +1,5 @@
 use super::*;
 
-
 // Tests
 
 #[cfg(test)]
@@ -483,7 +482,9 @@ mod tests {
         // Note: The tokenizer may not perfectly handle all scientific notation
         // The important thing is that numeric content is captured
         assert!(nums.len() >= 1);
-        assert!(nums.iter().any(|t| t.as_str().contains("1e10") || t.as_str() == "1e10"));
+        assert!(nums
+            .iter()
+            .any(|t| t.as_str().contains("1e10") || t.as_str() == "1e10"));
     }
 
     #[test]
@@ -500,7 +501,9 @@ mod tests {
         assert!(nums.len() >= 3);
         // Verify the numeric parts are present
         assert!(nums.iter().any(|t| t.as_str().starts_with("42")));
-        assert!(nums.iter().any(|t| t.as_str().starts_with("3.14") || t.as_str() == "3"));
+        assert!(nums
+            .iter()
+            .any(|t| t.as_str().starts_with("3.14") || t.as_str() == "3"));
         assert!(nums.iter().any(|t| t.as_str().starts_with("100")));
     }
 
@@ -547,14 +550,14 @@ mod tests {
         let code = b"a b c";
         let tokens: Vec<Token> = Tokenizer::new(code).collect();
 
-        assert_eq!(tokens[0].offset(), 0);    // 'a'
+        assert_eq!(tokens[0].offset(), 0); // 'a'
         assert_eq!(tokens[0].end_offset(), 1);
-        assert_eq!(tokens[1].offset(), 1);    // ' '
+        assert_eq!(tokens[1].offset(), 1); // ' '
         assert_eq!(tokens[1].end_offset(), 2);
-        assert_eq!(tokens[2].offset(), 2);    // 'b'
+        assert_eq!(tokens[2].offset(), 2); // 'b'
         assert_eq!(tokens[2].end_offset(), 3);
-        assert_eq!(tokens[3].offset(), 3);    // ' '
-        assert_eq!(tokens[4].offset(), 4);    // 'c'
+        assert_eq!(tokens[3].offset(), 3); // ' '
+        assert_eq!(tokens[4].offset(), 4); // 'c'
         assert_eq!(tokens[4].end_offset(), 5);
     }
 
@@ -563,11 +566,11 @@ mod tests {
         let code = b"foo == bar";
         let tokens: Vec<Token> = Tokenizer::new(code).collect();
 
-        assert_eq!(tokens[0].offset(), 0);    // 'foo'
+        assert_eq!(tokens[0].offset(), 0); // 'foo'
         assert_eq!(tokens[0].end_offset(), 3);
-        assert_eq!(tokens[2].offset(), 4);    // '=='
+        assert_eq!(tokens[2].offset(), 4); // '=='
         assert_eq!(tokens[2].end_offset(), 6);
-        assert_eq!(tokens[4].offset(), 7);    // 'bar'
+        assert_eq!(tokens[4].offset(), 7); // 'bar'
         assert_eq!(tokens[4].end_offset(), 10);
     }
 
@@ -766,7 +769,10 @@ mod tests {
         assert!(tokens.len() > 10);
 
         // Check some specific tokens
-        let words: Vec<_> = tokens.iter().filter(|t| t.kind() == TokenKind::Word).collect();
+        let words: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.kind() == TokenKind::Word)
+            .collect();
         assert!(words.iter().any(|t| t.as_str() == "pub"));
         assert!(words.iter().any(|t| t.as_str() == "fn"));
         assert!(words.iter().any(|t| t.as_str() == "calculate"));

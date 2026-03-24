@@ -107,18 +107,25 @@ pub fn apply_leaf_op<T: MutCrdtTxnT>(
     content: &[u8],
 ) -> ApplyResult<()> {
     match op {
-        LeafOp::Insert { after, kind, content: leaf_content } => {
-            apply_insert(txn, context, branch_id, leaf_id, *after, *kind, leaf_content, content)
-        }
-        LeafOp::Delete { leaf } => {
-            apply_delete(txn, context, *leaf)
-        }
+        LeafOp::Insert {
+            after,
+            kind,
+            content: leaf_content,
+        } => apply_insert(
+            txn,
+            context,
+            branch_id,
+            leaf_id,
+            *after,
+            *kind,
+            leaf_content,
+            content,
+        ),
+        LeafOp::Delete { leaf } => apply_delete(txn, context, *leaf),
         LeafOp::Replace { leaf, new_content } => {
             apply_replace(txn, context, *leaf, new_content, content)
         }
-        LeafOp::Restore { leaf } => {
-            apply_restore(txn, context, *leaf)
-        }
+        LeafOp::Restore { leaf } => apply_restore(txn, context, *leaf),
     }
 }
 
@@ -150,7 +157,10 @@ fn apply_insert<T: MutCrdtTxnT>(
     _content: &[u8],
 ) -> ApplyResult<()> {
     // Check for duplicate ID
-    if txn.has_leaf(leaf_id).map_err(|e| storage_err(e, "checking leaf exists"))? {
+    if txn
+        .has_leaf(leaf_id)
+        .map_err(|e| storage_err(e, "checking leaf exists"))?
+    {
         if context.options().allow_duplicate_ids() {
             context.record_skipped();
             return Ok(());
@@ -160,7 +170,10 @@ fn apply_insert<T: MutCrdtTxnT>(
 
     // Validate branch exists (optional based on validation settings)
     if context.options().validate_references() {
-        if !txn.has_branch(branch_id).map_err(|e| storage_err(e, "checking branch exists"))? {
+        if !txn
+            .has_branch(branch_id)
+            .map_err(|e| storage_err(e, "checking branch exists"))?
+        {
             return Err(ApplyError::branch_not_found(branch_id));
         }
     }
@@ -168,7 +181,10 @@ fn apply_insert<T: MutCrdtTxnT>(
     // Validate "after" reference if provided
     if context.options().validate_references() {
         if let Some(after_id) = after {
-            if !txn.has_leaf(after_id).map_err(|e| storage_err(e, "checking after leaf"))? {
+            if !txn
+                .has_leaf(after_id)
+                .map_err(|e| storage_err(e, "checking after leaf"))?
+            {
                 return Err(ApplyError::leaf_not_found(after_id));
             }
         }
@@ -211,7 +227,8 @@ fn apply_delete<T: MutCrdtTxnT>(
     leaf_id: LeafId,
 ) -> ApplyResult<()> {
     // Verify leaf exists
-    let leaf = txn.get_leaf(leaf_id)
+    let leaf = txn
+        .get_leaf(leaf_id)
         .map_err(|e| storage_err(e, "getting leaf"))?
         .ok_or_else(|| ApplyError::leaf_not_found(leaf_id))?;
 
@@ -221,11 +238,7 @@ fn apply_delete<T: MutCrdtTxnT>(
             context.record_skipped();
             return Ok(());
         }
-        return Err(ApplyError::invalid_leaf_state(
-            leaf_id,
-            "deleted",
-            "delete",
-        ));
+        return Err(ApplyError::invalid_leaf_state(leaf_id, "deleted", "delete"));
     }
 
     // Update state to deleted
@@ -260,16 +273,15 @@ fn apply_replace<T: MutCrdtTxnT>(
     _content: &[u8],
 ) -> ApplyResult<()> {
     // Verify leaf exists
-    let leaf = txn.get_leaf(leaf_id)
+    let leaf = txn
+        .get_leaf(leaf_id)
         .map_err(|e| storage_err(e, "getting leaf"))?
         .ok_or_else(|| ApplyError::leaf_not_found(leaf_id))?;
 
     // Check current state
     if leaf.state().is_deleted() {
         return Err(ApplyError::invalid_leaf_state(
-            leaf_id,
-            "deleted",
-            "replace",
+            leaf_id, "deleted", "replace",
         ));
     }
 
@@ -306,7 +318,8 @@ fn apply_restore<T: MutCrdtTxnT>(
     leaf_id: LeafId,
 ) -> ApplyResult<()> {
     // Verify leaf exists
-    let leaf = txn.get_leaf(leaf_id)
+    let leaf = txn
+        .get_leaf(leaf_id)
         .map_err(|e| storage_err(e, "getting leaf"))?
         .ok_or_else(|| ApplyError::leaf_not_found(leaf_id))?;
 
@@ -316,11 +329,7 @@ fn apply_restore<T: MutCrdtTxnT>(
             context.record_skipped();
             return Ok(());
         }
-        return Err(ApplyError::invalid_leaf_state(
-            leaf_id,
-            "alive",
-            "restore",
-        ));
+        return Err(ApplyError::invalid_leaf_state(leaf_id, "alive", "restore"));
     }
 
     // Update state to alive
@@ -349,7 +358,8 @@ pub fn validate_leaf_state<T: MutCrdtTxnT>(
     leaf_id: LeafId,
     expected_state: Option<LeafState>,
 ) -> ApplyResult<Leaf> {
-    let leaf = txn.get_leaf(leaf_id)
+    let leaf = txn
+        .get_leaf(leaf_id)
         .map_err(|e| storage_err(e, "getting leaf"))?
         .ok_or_else(|| ApplyError::leaf_not_found(leaf_id))?;
 
@@ -387,7 +397,8 @@ pub fn validate_leaf_parent<T: MutCrdtTxnT>(
     leaf_id: LeafId,
     expected_branch: BranchId,
 ) -> ApplyResult<()> {
-    let leaf = txn.get_leaf(leaf_id)
+    let leaf = txn
+        .get_leaf(leaf_id)
         .map_err(|e| storage_err(e, "getting leaf"))?
         .ok_or_else(|| ApplyError::leaf_not_found(leaf_id))?;
 
@@ -460,7 +471,11 @@ mod tests {
             Ok(self.trunks.remove(&id).is_some())
         }
 
-        fn update_trunk_state(&mut self, id: TrunkId, state: TrunkState) -> Result<(), Self::Error> {
+        fn update_trunk_state(
+            &mut self,
+            id: TrunkId,
+            state: TrunkState,
+        ) -> Result<(), Self::Error> {
             if let Some(trunk) = self.trunks.get_mut(&id) {
                 trunk.set_state(state);
             }
@@ -480,7 +495,11 @@ mod tests {
         }
 
         // Branch methods
-        fn put_branch(&mut self, branch: &Branch, _after: Option<BranchId>) -> Result<bool, Self::Error> {
+        fn put_branch(
+            &mut self,
+            branch: &Branch,
+            _after: Option<BranchId>,
+        ) -> Result<bool, Self::Error> {
             let is_new = !self.branches.contains_key(&branch.id());
             self.branches.insert(branch.id(), branch.clone());
             self.trunk_branches
@@ -509,7 +528,11 @@ mod tests {
             }
         }
 
-        fn update_branch_state(&mut self, id: BranchId, state: BranchState) -> Result<(), Self::Error> {
+        fn update_branch_state(
+            &mut self,
+            id: BranchId,
+            state: BranchState,
+        ) -> Result<(), Self::Error> {
             if let Some(branch) = self.branches.get_mut(&id) {
                 branch.set_state(state);
             }
@@ -517,7 +540,11 @@ mod tests {
         }
 
         fn list_branches(&self, trunk_id: TrunkId) -> Result<Vec<BranchId>, Self::Error> {
-            Ok(self.trunk_branches.get(&trunk_id).cloned().unwrap_or_default())
+            Ok(self
+                .trunk_branches
+                .get(&trunk_id)
+                .cloned()
+                .unwrap_or_default())
         }
 
         fn count_branches(&self, trunk_id: TrunkId) -> Result<usize, Self::Error> {
@@ -561,7 +588,11 @@ mod tests {
             Ok(())
         }
 
-        fn update_leaf_content(&mut self, id: LeafId, range: std::ops::Range<u32>) -> Result<(), Self::Error> {
+        fn update_leaf_content(
+            &mut self,
+            id: LeafId,
+            range: std::ops::Range<u32>,
+        ) -> Result<(), Self::Error> {
             if let Some(leaf) = self.leaves.get_mut(&id) {
                 leaf.set_content_range(range);
             }
@@ -569,7 +600,11 @@ mod tests {
         }
 
         fn list_leaves(&self, branch_id: BranchId) -> Result<Vec<LeafId>, Self::Error> {
-            Ok(self.branch_leaves.get(&branch_id).cloned().unwrap_or_default())
+            Ok(self
+                .branch_leaves
+                .get(&branch_id)
+                .cloned()
+                .unwrap_or_default())
         }
 
         fn count_leaves(&self, branch_id: BranchId) -> Result<usize, Self::Error> {
@@ -722,7 +757,15 @@ mod tests {
             kind: TokenKind::Word,
             content: b"hello".to_vec(),
         };
-        apply_leaf_op(&mut txn, &mut context, branch_id, leaf_id, &insert_op, b"hello").unwrap();
+        apply_leaf_op(
+            &mut txn,
+            &mut context,
+            branch_id,
+            leaf_id,
+            &insert_op,
+            b"hello",
+        )
+        .unwrap();
 
         // Delete
         let delete_op = LeafOp::Delete { leaf: leaf_id };
@@ -760,7 +803,15 @@ mod tests {
             kind: TokenKind::Word,
             content: b"hello".to_vec(),
         };
-        apply_leaf_op(&mut txn, &mut context, branch_id, leaf_id, &insert_op, b"hello").unwrap();
+        apply_leaf_op(
+            &mut txn,
+            &mut context,
+            branch_id,
+            leaf_id,
+            &insert_op,
+            b"hello",
+        )
+        .unwrap();
 
         let delete_op = LeafOp::Delete { leaf: leaf_id };
         apply_leaf_op(&mut txn, &mut context, branch_id, leaf_id, &delete_op, &[]).unwrap();
@@ -786,14 +837,30 @@ mod tests {
             kind: TokenKind::Word,
             content: b"hello".to_vec(),
         };
-        apply_leaf_op(&mut txn, &mut context, branch_id, leaf_id, &insert_op, b"hello").unwrap();
+        apply_leaf_op(
+            &mut txn,
+            &mut context,
+            branch_id,
+            leaf_id,
+            &insert_op,
+            b"hello",
+        )
+        .unwrap();
 
         // Replace content
         let replace_op = LeafOp::Replace {
             leaf: leaf_id,
             new_content: b"world".to_vec(),
         };
-        apply_leaf_op(&mut txn, &mut context, branch_id, leaf_id, &replace_op, b"world").unwrap();
+        apply_leaf_op(
+            &mut txn,
+            &mut context,
+            branch_id,
+            leaf_id,
+            &replace_op,
+            b"world",
+        )
+        .unwrap();
 
         // Leaf should still exist with same ID
         let leaf = txn.get_leaf(leaf_id).unwrap().unwrap();
@@ -831,7 +898,15 @@ mod tests {
             kind: TokenKind::Word,
             content: b"hello".to_vec(),
         };
-        apply_leaf_op(&mut txn, &mut context, branch_id, leaf_id, &insert_op, b"hello").unwrap();
+        apply_leaf_op(
+            &mut txn,
+            &mut context,
+            branch_id,
+            leaf_id,
+            &insert_op,
+            b"hello",
+        )
+        .unwrap();
 
         let delete_op = LeafOp::Delete { leaf: leaf_id };
         apply_leaf_op(&mut txn, &mut context, branch_id, leaf_id, &delete_op, &[]).unwrap();
@@ -841,7 +916,14 @@ mod tests {
             leaf: leaf_id,
             new_content: b"world".to_vec(),
         };
-        let result = apply_leaf_op(&mut txn, &mut context, branch_id, leaf_id, &replace_op, b"world");
+        let result = apply_leaf_op(
+            &mut txn,
+            &mut context,
+            branch_id,
+            leaf_id,
+            &replace_op,
+            b"world",
+        );
 
         assert!(result.is_err());
         assert!(result.unwrap_err().is_invalid_state());
@@ -862,7 +944,15 @@ mod tests {
             kind: TokenKind::Word,
             content: b"hello".to_vec(),
         };
-        apply_leaf_op(&mut txn, &mut context, branch_id, leaf_id, &insert_op, b"hello").unwrap();
+        apply_leaf_op(
+            &mut txn,
+            &mut context,
+            branch_id,
+            leaf_id,
+            &insert_op,
+            b"hello",
+        )
+        .unwrap();
 
         let delete_op = LeafOp::Delete { leaf: leaf_id };
         apply_leaf_op(&mut txn, &mut context, branch_id, leaf_id, &delete_op, &[]).unwrap();
@@ -889,7 +979,15 @@ mod tests {
             kind: TokenKind::Word,
             content: b"hello".to_vec(),
         };
-        apply_leaf_op(&mut txn, &mut context, branch_id, leaf_id, &insert_op, b"hello").unwrap();
+        apply_leaf_op(
+            &mut txn,
+            &mut context,
+            branch_id,
+            leaf_id,
+            &insert_op,
+            b"hello",
+        )
+        .unwrap();
 
         // Try to restore
         let restore_op = LeafOp::Restore { leaf: leaf_id };
@@ -928,7 +1026,15 @@ mod tests {
             kind: TokenKind::Word,
             content: b"hello".to_vec(),
         };
-        apply_leaf_op(&mut txn, &mut context, branch_id, leaf_id, &insert_op, b"hello").unwrap();
+        apply_leaf_op(
+            &mut txn,
+            &mut context,
+            branch_id,
+            leaf_id,
+            &insert_op,
+            b"hello",
+        )
+        .unwrap();
 
         // Validate alive state
         let leaf = validate_leaf_state(&txn, leaf_id, Some(LeafState::Alive)).unwrap();
@@ -952,7 +1058,15 @@ mod tests {
             kind: TokenKind::Word,
             content: b"hello".to_vec(),
         };
-        apply_leaf_op(&mut txn, &mut context, branch_id, leaf_id, &insert_op, b"hello").unwrap();
+        apply_leaf_op(
+            &mut txn,
+            &mut context,
+            branch_id,
+            leaf_id,
+            &insert_op,
+            b"hello",
+        )
+        .unwrap();
 
         // Should pass for correct branch
         validate_leaf_parent(&txn, leaf_id, branch_id).unwrap();

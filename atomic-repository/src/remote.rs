@@ -61,10 +61,16 @@ pub enum RemoteError {
     InvalidUrl { url: String, reason: String },
 
     /// Failed to read configuration file.
-    ReadError { path: String, source: std::io::Error },
+    ReadError {
+        path: String,
+        source: std::io::Error,
+    },
 
     /// Failed to write configuration file.
-    WriteError { path: String, source: std::io::Error },
+    WriteError {
+        path: String,
+        source: std::io::Error,
+    },
 
     /// Failed to parse configuration file.
     ParseError { path: String, message: String },
@@ -518,9 +524,11 @@ impl RemoteConfig {
     /// assert!(!config.contains("origin"));
     /// ```
     pub fn remove(&mut self, name: &str) -> RemoteResult<RemoteEntry> {
-        self.remotes.remove(name).ok_or_else(|| RemoteError::NotFound {
-            name: name.to_string(),
-        })
+        self.remotes
+            .remove(name)
+            .ok_or_else(|| RemoteError::NotFound {
+                name: name.to_string(),
+            })
     }
 
     /// Update the URL of an existing remote.
@@ -544,9 +552,12 @@ impl RemoteConfig {
             });
         }
 
-        let entry = self.remotes.get_mut(name).ok_or_else(|| RemoteError::NotFound {
-            name: name.to_string(),
-        })?;
+        let entry = self
+            .remotes
+            .get_mut(name)
+            .ok_or_else(|| RemoteError::NotFound {
+                name: name.to_string(),
+            })?;
 
         entry.url = url;
         Ok(())
@@ -862,10 +873,7 @@ default = true"#;
             .add("origin", RemoteEntry::new("https://origin.com/repo"))
             .unwrap();
         config
-            .add(
-                "upstream",
-                RemoteEntry::new("https://upstream.com/repo"),
-            )
+            .add("upstream", RemoteEntry::new("https://upstream.com/repo"))
             .unwrap();
 
         config.set_default("upstream").unwrap();
@@ -1008,7 +1016,10 @@ default = true"#;
 
         let mut config = RemoteConfig::new();
         config
-            .add("origin", RemoteEntry::new_default("https://origin.com/repo"))
+            .add(
+                "origin",
+                RemoteEntry::new_default("https://origin.com/repo"),
+            )
             .unwrap();
         config
             .add("upstream", RemoteEntry::new("https://upstream.com/repo"))
@@ -1123,10 +1134,16 @@ key = "value"
     fn test_add_default_unmarks_existing() {
         let mut config = RemoteConfig::new();
         config
-            .add("origin", RemoteEntry::new_default("https://origin.com/repo"))
+            .add(
+                "origin",
+                RemoteEntry::new_default("https://origin.com/repo"),
+            )
             .unwrap();
         config
-            .add("upstream", RemoteEntry::new_default("https://upstream.com/repo"))
+            .add(
+                "upstream",
+                RemoteEntry::new_default("https://upstream.com/repo"),
+            )
             .unwrap();
 
         // Adding a new default should unmark the old one
