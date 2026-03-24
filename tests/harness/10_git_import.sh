@@ -98,15 +98,16 @@ git checkout -b feature --quiet
 git_commit "Feature commit" "feature.txt" "feature content"
 
 # Switch back to main (or master, depending on git version)
-main_branch="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|origin/||' || echo "main")"
-# For local repos without origin, just use the first branch created
-if ! git checkout main --quiet 2>/dev/null; then
-    git checkout master --quiet 2>/dev/null || true
+main_branch="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|origin/||')"
+# For local repos without origin, fall back to the currently checked-out branch
+if [ -z "$main_branch" ]; then
+    main_branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo "main")"
 fi
+git checkout "$main_branch" --quiet 2>/dev/null || true
 
 # Import main branch
 atomic init >/dev/null 2>&1
-assert_success "import main branch" atomic git import --branch main
+assert_success "import main branch" atomic git import --branch "$main_branch"
 assert_atomic_log_count "main has 2 commits" 2
 
 # Import feature branch
