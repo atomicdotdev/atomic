@@ -119,9 +119,23 @@ jobs:
         if: matrix.cross
         run: |
           sudo dpkg --add-architecture arm64
-          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs) main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs)-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+
+          # Restrict all existing amd64 sources to [arch=amd64] so apt does not
+          # try to fetch arm64 packages from mirrors that don't carry them
+          # (security.ubuntu.com, azure.archive.ubuntu.com, etc.).
+          # This must cover both /etc/apt/sources.list and sources.list.d/*.
+          sudo sed -i 's/^deb \(https\?:\/\/\)/deb [arch=amd64] \1/' /etc/apt/sources.list
+          for f in /etc/apt/sources.list.d/*.list; do
+            sudo sed -i 's/^deb \(https\?:\/\/\)/deb [arch=amd64] \1/' "$f"
+          done
+
+          # Add ports.ubuntu.com as the arm64 source (it carries all arches for
+          # Noble; security updates are mirrored there as noble-security).
+          CODENAME=$(lsb_release -cs)
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${CODENAME} main restricted universe multiverse"           | sudo tee -a /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${CODENAME}-updates main restricted universe multiverse"   | sudo tee -a /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${CODENAME}-security main restricted universe multiverse"  | sudo tee -a /etc/apt/sources.list
+
           sudo apt-get update -qq
           sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev:arm64
 
