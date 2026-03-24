@@ -1081,8 +1081,8 @@ impl TurnOrchestrator {
             let timestamp = record["timestamp"]
                 .as_str()
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.timestamp())
-                .unwrap_or_else(|| chrono::Utc::now().timestamp());
+                .map(|dt| dt.timestamp_millis())
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
             // Map record_type to NodeKind.
             let (kind, summary) = match record_type {
