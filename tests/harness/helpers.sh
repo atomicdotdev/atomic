@@ -480,9 +480,15 @@ clone_git_repo() {
     local ref="${2:-HEAD}"
     GIT_REPO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/atomic-git-test-XXXXXX")"
     _HARNESS_TMPDIRS+=("$GIT_REPO_DIR")
-    git clone --quiet "$url" "$GIT_REPO_DIR" 2>/dev/null
+    if ! git clone --quiet "$url" "$GIT_REPO_DIR"; then
+        echo "${YELLOW}SKIPPING: failed to clone git repo '$url'${RESET}"
+        exit 0
+    fi
     if [[ "$ref" != "HEAD" ]]; then
-        (cd "$GIT_REPO_DIR" && git checkout --quiet "$ref")
+        if ! (cd "$GIT_REPO_DIR" && git checkout --quiet "$ref"); then
+            echo "${YELLOW}SKIPPING: failed to checkout ref '$ref' in git repo '$url'${RESET}"
+            exit 0
+        fi
     fi
 }
 
