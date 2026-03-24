@@ -569,6 +569,30 @@ mod tests {
     #[test]
     fn test_find_repository_root_not_found() {
         let temp = TempDir::new().unwrap();
+
+        // On some CI environments (especially Windows), a .atomic directory
+        // may exist somewhere above the temp dir in the filesystem hierarchy.
+        // Verify the precondition before asserting, and skip gracefully if not met.
+        let has_atomic_ancestor = {
+            let mut check = temp.path().to_path_buf();
+            let mut found = false;
+            loop {
+                if check.join(DOT_DIR).is_dir() {
+                    found = true;
+                    break;
+                }
+                if !check.pop() {
+                    break;
+                }
+            }
+            found
+        };
+        if has_atomic_ancestor {
+            // A real .atomic dir exists above the temp dir; this test cannot
+            // reliably assert "not found" in this environment — skip it.
+            return;
+        }
+
         let result = find_repository_root_from(temp.path());
         assert!(result.is_err());
         assert!(matches!(

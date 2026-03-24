@@ -167,7 +167,11 @@ impl Reset {
     /// Otherwise returns the path as-is.
     pub fn normalize_path(&self, repo_root: &std::path::Path, path: &str) -> CliResult<String> {
         let p = std::path::Path::new(path);
-        if p.is_absolute() {
+        // On Windows, Path::is_absolute() returns false for Unix-style "/foo"
+        // paths (they're drive-relative). Treat a leading '/' as absolute on
+        // all platforms so cross-platform behaviour is consistent.
+        let looks_absolute = p.is_absolute() || path.starts_with('/');
+        if looks_absolute {
             match p.strip_prefix(repo_root) {
                 Ok(rel) => Ok(rel.to_string_lossy().to_string()),
                 Err(_) => Err(CliError::PathOutsideRepository {

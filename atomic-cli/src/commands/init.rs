@@ -343,7 +343,12 @@ impl Init {
     /// If the path is relative, it's resolved relative to the current
     /// working directory.
     fn resolve_path(&self) -> CliResult<PathBuf> {
-        let path = if self.path.is_absolute() {
+        // On Windows, Path::is_absolute() returns false for Unix-style "/foo"
+        // paths (they're drive-relative). Treat a leading '/' as absolute on
+        // all platforms so cross-platform tests and user input behave the same.
+        let looks_absolute =
+            self.path.is_absolute() || self.path.to_string_lossy().starts_with('/');
+        let path = if looks_absolute {
             self.path.clone()
         } else {
             let cwd =
