@@ -654,7 +654,7 @@ impl LogOutputConfig {
     }
 
     /// Builder: set starting sequence number.
-    #[allow(clippy::should_implement_trait)]
+    #[allow(clippy::wrong_self_convention)]
     pub fn from_sequence(mut self, seq: u64) -> Self {
         self.from_sequence = seq;
         self
