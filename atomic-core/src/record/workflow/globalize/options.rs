@@ -1,6 +1,5 @@
 use super::*;
 
-
 // CONFIGURATION
 
 /// Configuration options for globalization.
@@ -112,7 +111,7 @@ impl GlobalizeOptions {
     /// ```rust
     /// use atomic_core::record::workflow::globalize::GlobalizeOptions;
     ///
-    /// let options = GlobalizeOptions::new().max_hunk_size(1024 * 1024);
+    /// let options = GlobalizeOptions::new().with_max_hunk_size(1024 * 1024);
     /// assert_eq!(options.max_hunk_size(), 1024 * 1024);
     /// ```
     #[must_use]
@@ -133,7 +132,7 @@ impl GlobalizeOptions {
     /// use atomic_core::record::workflow::globalize::GlobalizeOptions;
     /// use atomic_core::change::Encoding;
     ///
-    /// let options = GlobalizeOptions::new().default_encoding(Encoding::Binary);
+    /// let options = GlobalizeOptions::new().with_default_encoding(Encoding::Binary);
     /// assert_eq!(options.default_encoding(), Encoding::Binary);
     /// ```
     #[must_use]
