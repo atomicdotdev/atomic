@@ -290,6 +290,11 @@ begin_section "Git Import: All Branches Mode"
 make_temp_repo "git-import-all-branches"
 init_git_repo
 
+# Normalize initial branch name to 'main' if necessary
+initial_branch="$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+if [ -n "$initial_branch" ] && [ "$initial_branch" != "main" ]; then
+    git branch -m "$initial_branch" main
+fi
 # Create main with a commit
 git_commit "Main 1" "main.txt" "main"
 
