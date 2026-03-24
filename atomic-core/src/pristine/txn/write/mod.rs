@@ -118,7 +118,7 @@ impl<'a> WriteTxn<'a> {
             let event = SessionEvent {
                 seq,
                 timestamp: format_timestamp_ms(node.timestamp),
-                event_kind: node.kind.label().to_string(),
+                event_kind,
                 place: None,
                 transition: None,
                 token_id: node.id.clone(),
