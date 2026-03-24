@@ -88,7 +88,7 @@ impl<'a> WriteTxn<'a> {
                 match serde_json::from_str(s) {
                     Ok(v) => Some(v),
                     Err(e) => {
-                        eprintln!(
+                        log::warn!(
                             "Warning: failed to parse provenance node detail JSON (node id={}, kind={}): {}",
                             node.id,
                             node.kind.label(),
