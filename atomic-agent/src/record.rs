@@ -1123,7 +1123,6 @@ mod tests {
     use super::*;
     use crate::event::{HookType, TurnEvent};
     use crate::turn::session::AgentSession;
-    use std::path::PathBuf;
 
     fn make_session() -> AgentSession {
         let mut s = AgentSession::new("sess-test-123", "claude-code", "Claude Code");

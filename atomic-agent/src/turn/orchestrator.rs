@@ -1568,7 +1568,7 @@ impl std::fmt::Debug for TurnOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::TurnChanges;
+
     use crate::watcher::fallback::FallbackWatcher;
     use std::fs;
     use tempfile::TempDir;

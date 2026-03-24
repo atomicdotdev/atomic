@@ -1821,7 +1821,7 @@ mod tests {
     fn test_serialization_preserves_accumulator_state() {
         let mut acc = ProvenanceAccumulator::new("state-test");
         acc.append_goal("Goal", 1000);
-        let r1 = acc.append_tool_call("read", Some("c1"), None, None, None, None, 1001);
+        let _r1 = acc.append_tool_call("read", Some("c1"), None, None, None, None, 1001);
         acc.append_tool_call("edit", Some("c2"), None, None, None, None, 1002);
 
         let serialized = acc.to_serialized_graph();
