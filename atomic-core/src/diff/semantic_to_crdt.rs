@@ -742,7 +742,7 @@ mod tests {
 
         let config = ConversionConfig::new().use_replace_ops(true);
         let mut converter = SemanticToCrdt::new(test_change_id(), test_trunk_id(), config);
-        let file_ops = converter.convert_diff(&diff, "test.rs").unwrap();
+        let _file_ops = converter.convert_diff(&diff, "test.rs").unwrap();
 
         let stats = converter.stats();
         // Should have token replacements (foo -> bar, 1 -> 2)
@@ -758,7 +758,7 @@ mod tests {
 
         let config = ConversionConfig::new().use_replace_ops(false);
         let mut converter = SemanticToCrdt::new(test_change_id(), test_trunk_id(), config);
-        let file_ops = converter.convert_diff(&diff, "test.rs").unwrap();
+        let _file_ops = converter.convert_diff(&diff, "test.rs").unwrap();
 
         let stats = converter.stats();
         // Without replace ops, should use delete + insert pairs
@@ -842,7 +842,7 @@ mod tests {
         assert!(diff.has_changes());
 
         let mut converter = SemanticToCrdt::with_defaults(test_change_id(), test_trunk_id());
-        let file_ops = converter.convert_diff(&diff, "main.rs").unwrap();
+        let _file_ops = converter.convert_diff(&diff, "main.rs").unwrap();
 
         let stats = converter.stats();
         assert!(stats.has_operations());

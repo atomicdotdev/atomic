@@ -812,7 +812,7 @@ mod tests {
 
     #[test]
     fn test_collect_working_paths_existing() {
-        let mut working_copy = Memory::new();
+        let working_copy = Memory::new();
         working_copy.add_file("exists.txt", b"content");
 
         let paths = vec!["exists.txt", "missing.txt"];
@@ -824,7 +824,7 @@ mod tests {
 
     #[test]
     fn test_collect_working_paths_multiple() {
-        let mut working_copy = Memory::new();
+        let working_copy = Memory::new();
         working_copy.add_file("a.txt", b"a");
         working_copy.add_file("b.txt", b"b");
         working_copy.add_file("c.txt", b"c");
@@ -839,7 +839,7 @@ mod tests {
 
     #[test]
     fn test_get_working_file_exists() {
-        let mut working_copy = Memory::new();
+        let working_copy = Memory::new();
         working_copy.add_file("found.txt", b"hello");
 
         let result = get_working_file(&working_copy, "found.txt").unwrap();
@@ -861,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_get_working_file_directory() {
-        let mut working_copy = Memory::new();
+        let working_copy = Memory::new();
         working_copy.add_directory("mydir");
 
         let result = get_working_file(&working_copy, "mydir").unwrap();
@@ -961,7 +961,7 @@ mod tests {
 
     #[test]
     fn test_collect_working_files_excludes_directories() {
-        let mut working_copy = Memory::new();
+        let working_copy = Memory::new();
         working_copy.add_file("file.txt", b"content");
         working_copy.add_directory("empty_dir");
 

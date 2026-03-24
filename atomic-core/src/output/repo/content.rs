@@ -270,7 +270,7 @@ where
 mod tests {
     use super::*;
     use crate::change::{Change, ChangeHeader, MemoryChangeStore};
-    use crate::output::alive::{AliveGraph, AliveVertex, OrderResult, VertexFlags, VertexId};
+    use crate::output::alive::{AliveGraph, AliveVertex, OrderResult, VertexId};
     use crate::output::repo::ConflictWriter;
     use crate::types::{ChangePosition, GraphNode, Position};
 

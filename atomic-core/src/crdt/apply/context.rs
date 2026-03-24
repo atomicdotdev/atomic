@@ -980,8 +980,6 @@ mod tests {
     #[test]
     fn test_context_add_conflict() {
         use super::super::conflict::{ConflictKind, CrdtConflict};
-        use crate::crdt::BranchId;
-        use crate::types::NodeId;
 
         let options = ApplyOptions::builder().fail_on_conflict(false).build();
         let mut context = ApplyContext::new(options);

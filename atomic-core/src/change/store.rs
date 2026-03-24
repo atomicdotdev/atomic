@@ -527,7 +527,7 @@ impl ChangeStore for MemoryChangeStore {
 mod tests {
     use super::*;
     use crate::change::ChangeHeader;
-    use crate::types::{Base32, ChangePosition};
+    use crate::types::ChangePosition;
 
     fn create_test_change(message: &str, content: &[u8]) -> Change {
         let mut change = Change::empty(ChangeHeader::new(message));

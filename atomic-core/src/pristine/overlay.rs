@@ -610,7 +610,7 @@ impl<'a, T: GraphTxnT + StackTxnT> StackTxnT for OverlayTxn<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pristine::{MutTxnT, Pristine, StackKind, StackState, StackTxnT};
+    use crate::pristine::{MutTxnT, Pristine, StackKind, StackTxnT};
     use crate::types::Position;
     use tempfile::tempdir;
 

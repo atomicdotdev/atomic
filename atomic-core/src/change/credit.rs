@@ -716,7 +716,6 @@ impl fmt::Display for FileCredits {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Base32;
 
     fn test_hash() -> Hash {
         Hash::of(b"test change")
