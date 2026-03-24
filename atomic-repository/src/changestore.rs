@@ -1077,17 +1077,15 @@ impl<'a> Iterator for AttestationIterator<'a> {
 /// Iterator over provenance graph hashes in the changes directory.
 ///
 /// Walks the two-level directory structure looking for `.provenance` files.
-struct ProvenanceIterator<'a> {
-    changes_dir: &'a Path,
+struct ProvenanceIterator {
     prefix_dirs: Option<fs::ReadDir>,
     current_files: Option<fs::ReadDir>,
 }
 
-impl<'a> ProvenanceIterator<'a> {
-    fn new(changes_dir: &'a Path) -> Self {
+impl ProvenanceIterator {
+    fn new(changes_dir: &Path) -> Self {
         let prefix_dirs = fs::read_dir(changes_dir).ok();
         Self {
-            changes_dir,
             prefix_dirs,
             current_files: None,
         }
@@ -1129,7 +1127,7 @@ impl<'a> ProvenanceIterator<'a> {
     }
 }
 
-impl<'a> Iterator for ProvenanceIterator<'a> {
+impl Iterator for ProvenanceIterator {
     type Item = ChangeStoreResult<Hash>;
 
     fn next(&mut self) -> Option<Self::Item> {
