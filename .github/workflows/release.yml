@@ -74,7 +74,7 @@ jobs:
     needs: [test, version]
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           # Linux x86_64
@@ -87,7 +87,6 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact: atomic-aarch64-unknown-linux-gnu.tar.gz
             cross: true
-            openssl_arch: arm64
 
           # macOS x86_64 (Intel)
           - os: macos-latest
@@ -118,26 +117,10 @@ jobs:
       - name: Install cross-compilation OpenSSL (aarch64)
         if: matrix.cross
         run: |
-          sudo dpkg --add-architecture arm64
-
-          # Restrict all existing amd64 sources to [arch=amd64] so apt does not
-          # try to fetch arm64 packages from mirrors that don't carry them
-          # (security.ubuntu.com, azure.archive.ubuntu.com, etc.).
-          # This must cover both /etc/apt/sources.list and sources.list.d/*.
-          sudo sed -i 's/^deb \(https\?:\/\/\)/deb [arch=amd64] \1/' /etc/apt/sources.list
-          for f in /etc/apt/sources.list.d/*.list; do
-            sudo sed -i 's/^deb \(https\?:\/\/\)/deb [arch=amd64] \1/' "$f"
-          done
-
-          # Add ports.ubuntu.com as the arm64 source (it carries all arches for
-          # Noble; security updates are mirrored there as noble-security).
-          CODENAME=$(lsb_release -cs)
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${CODENAME} main restricted universe multiverse"           | sudo tee -a /etc/apt/sources.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${CODENAME}-updates main restricted universe multiverse"   | sudo tee -a /etc/apt/sources.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${CODENAME}-security main restricted universe multiverse"  | sudo tee -a /etc/apt/sources.list
-
+          # Install only the cross-compiler toolchain. OpenSSL is built from
+          # source via OPENSSL_VENDORED so no arm64 system libraries are needed.
           sudo apt-get update -qq
-          sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev:arm64
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -157,11 +140,8 @@ jobs:
       - name: Build release binary (cross)
         if: matrix.cross
         env:
-          PKG_CONFIG_ALLOW_CROSS: "1"
-          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
-          OPENSSL_INCLUDE_DIR: /usr/include/aarch64-linux-gnu
-          OPENSSL_LIB_DIR: /usr/lib/aarch64-linux-gnu
-          OPENSSL_DIR: /usr
+          # OpenSSL is compiled from source via git2's vendored-openssl feature.
+          # Only the linker needs to be set explicitly for the target triple.
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }} -p atomic-cli
 

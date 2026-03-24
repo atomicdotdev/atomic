@@ -86,7 +86,10 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 similar = "2.4"
 
 # Git interop
-git2 = "0.19"
+# vendored-openssl compiles OpenSSL from source, which is required for
+# cross-compilation targets (e.g. aarch64-unknown-linux-gnu) where the
+# target architecture's OpenSSL system libraries are not available.
+git2 = { version = "0.19", features = ["vendored-openssl"] }
 
 # Testing
 quickcheck = "1.0"
