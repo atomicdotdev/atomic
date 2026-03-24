@@ -1534,7 +1534,7 @@ mod tests {
 
     #[test]
     fn test_options_provenance_set_vec() {
-        use atomic_core::change::{AITool, AIVendor, SuggestionType};
+        use atomic_core::change::AIVendor;
 
         let prov1 = Provenance::builder()
             .vendor(AIVendor::Anthropic)
@@ -1577,7 +1577,7 @@ mod tests {
 
     #[test]
     fn test_options_to_assembly_options_includes_provenance() {
-        use atomic_core::change::{AITool, AIVendor, SuggestionType};
+        use atomic_core::change::AIVendor;
 
         let prov = Provenance::builder()
             .vendor(AIVendor::Anthropic)
@@ -1597,7 +1597,7 @@ mod tests {
 
     #[test]
     fn test_options_clone_preserves_provenance() {
-        use atomic_core::change::{AITool, AIVendor};
+        use atomic_core::change::AIVendor;
 
         let prov = Provenance::builder()
             .vendor(AIVendor::OpenAI)

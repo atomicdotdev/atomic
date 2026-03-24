@@ -1286,8 +1286,6 @@ mod tests {
 
     // Existing Tests (below this line)
 
-    use super::*;
-
     // HistoryEntry Tests
 
     #[test]
