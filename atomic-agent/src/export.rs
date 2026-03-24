@@ -69,7 +69,7 @@ pub struct TraceRecord {
     /// ISO 8601 / RFC 3339 timestamp.
     pub timestamp: String,
 
-    /// VCS context (best-effort — absent if not a git repo).
+    /// VCS context (best-effort — absent if Atomic stack state is unavailable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vcs: Option<VcsInfo>,
 
