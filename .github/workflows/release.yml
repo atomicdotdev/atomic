@@ -216,10 +216,15 @@ jobs:
 
           # Call GitHub's generate-notes API (powers the Copilot-assisted
           # "Auto-generate release notes" button in the GitHub UI).
-          PAYLOAD=$(jq -n \
-            --arg tag  "$TAG" \
-            --arg prev "$PREV_TAG" \
-            '{tag_name: $tag, previous_tag_name: (if $prev == "" then null else $prev end)}')
+          # Omit previous_tag_name entirely on the first release — the API
+          # rejects null and there is no prior tag to diff against anyway.
+          if [[ -n "$PREV_TAG" ]]; then
+            PAYLOAD=$(jq -n --arg tag "$TAG" --arg prev "$PREV_TAG" \
+              '{tag_name: $tag, previous_tag_name: $prev}')
+          else
+            PAYLOAD=$(jq -n --arg tag "$TAG" \
+              '{tag_name: $tag}')
+          fi
 
           NOTES=$(gh api \
             --method POST \
