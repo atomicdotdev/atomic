@@ -1,3 +1,6 @@
+[features]
+remote = []
+
 [package]
 name = "atomic-cli"
 version.workspace = true
