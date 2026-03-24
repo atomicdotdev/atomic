@@ -85,7 +85,7 @@ record_change "Add feature.txt on feature" >/dev/null 2>&1 || true
 
 # Log on feature should have 2 entries (base + feature file)
 feature_log="$(atomic log 2>/dev/null || true)"
-feature_count="$(echo "$feature_log" | grep -c "^change " || true)"
+feature_count="$(echo "$feature_log" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
 
 if [[ $feature_count -ge 2 ]]; then
     _pass "feature log has 2+ changes ($feature_count)"
@@ -168,7 +168,7 @@ apply_from_stack "feature" "dev" >/dev/null 2>&1 || true
 switch_stack "dev" >/dev/null 2>&1 || true
 
 dev_log_after="$(atomic log 2>/dev/null || true)"
-dev_count_after="$(echo "$dev_log_after" | grep -c "^change " || true)"
+dev_count_after="$(echo "$dev_log_after" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
 
 if [[ $dev_count_after -ge 2 ]]; then
     _pass "dev log has 2+ changes after apply ($dev_count_after)"
@@ -568,7 +568,7 @@ assert_success "add app.py" atomic add app.py
 record_change "Add app.py v1" >/dev/null 2>&1 || true
 
 dev_log_v1="$(atomic log 2>/dev/null || true)"
-dev_count_v1="$(echo "$dev_log_v1" | grep -c "^change " || true)"
+dev_count_v1="$(echo "$dev_log_v1" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
 
 # Step 2: create feature, apply dev
 new_stack "feature" >/dev/null 2>&1 || true
@@ -588,7 +588,7 @@ else
 fi
 
 feature_log="$(atomic log 2>/dev/null || true)"
-feature_count="$(echo "$feature_log" | grep -c "^change " || true)"
+feature_count="$(echo "$feature_log" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
 if [[ $feature_count -ge 2 ]]; then
     _pass "feature log has 2+ entries ($feature_count)"
 else
@@ -599,7 +599,7 @@ fi
 switch_stack "dev" >/dev/null 2>&1 || true
 
 dev_log_isolated="$(atomic log 2>/dev/null || true)"
-dev_count_isolated="$(echo "$dev_log_isolated" | grep -c "^change " || true)"
+dev_count_isolated="$(echo "$dev_log_isolated" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
 
 if [[ $dev_count_isolated -eq $dev_count_v1 ]]; then
     _pass "dev log unchanged after feature record ($dev_count_isolated changes)"
@@ -624,7 +624,7 @@ apply_from_stack "feature" "dev" >/dev/null 2>&1 || true
 switch_stack "dev" >/dev/null 2>&1 || true
 
 dev_log_after_apply="$(atomic log 2>/dev/null || true)"
-dev_count_after="$(echo "$dev_log_after_apply" | grep -c "^change " || true)"
+dev_count_after="$(echo "$dev_log_after_apply" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
 
 if [[ $dev_count_after -gt $dev_count_v1 ]]; then
     _pass "dev log grew after apply ($dev_count_after changes)"
@@ -795,7 +795,7 @@ for i in 1 2 3; do
 done
 
 dev_log="$(atomic log 2>/dev/null || true)"
-dev_count="$(echo "$dev_log" | grep -c "^change " || true)"
+dev_count="$(echo "$dev_log" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
 if [[ $dev_count -eq 3 ]]; then
     _pass "dev has exactly 3 changes"
 else
@@ -814,7 +814,7 @@ for i in 4 5; do
 done
 
 feature_log="$(atomic log 2>/dev/null || true)"
-feature_count="$(echo "$feature_log" | grep -c "^change " || true)"
+feature_count="$(echo "$feature_log" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
 if [[ $feature_count -eq 5 ]]; then
     _pass "feature has exactly 5 changes (3 inherited + 2 own)"
 else
@@ -824,7 +824,7 @@ fi
 # Dev should still have exactly 3
 switch_stack "dev" >/dev/null 2>&1 || true
 dev_log2="$(atomic log 2>/dev/null || true)"
-dev_count2="$(echo "$dev_log2" | grep -c "^change " || true)"
+dev_count2="$(echo "$dev_log2" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
 if [[ $dev_count2 -eq 3 ]]; then
     _pass "dev still has exactly 3 changes"
 else
@@ -836,7 +836,7 @@ apply_from_stack "feature" "dev" >/dev/null 2>&1 || true
 switch_stack "dev" >/dev/null 2>&1 || true
 
 dev_log3="$(atomic log 2>/dev/null || true)"
-dev_count3="$(echo "$dev_log3" | grep -c "^change " || true)"
+dev_count3="$(echo "$dev_log3" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
 if [[ $dev_count3 -eq 5 ]]; then
     _pass "dev has 5 changes after apply"
 else
@@ -846,7 +846,7 @@ fi
 # Unrecord last on dev.  Should go back to 4.
 unrecord_last >/dev/null 2>&1 || true
 dev_log4="$(atomic log 2>/dev/null || true)"
-dev_count4="$(echo "$dev_log4" | grep -c "^change " || true)"
+dev_count4="$(echo "$dev_log4" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
 if [[ $dev_count4 -eq 4 ]]; then
     _pass "dev has 4 changes after unrecord"
 else
@@ -856,7 +856,7 @@ fi
 # Feature should still have 5 (unrecord was on dev)
 switch_stack "feature" >/dev/null 2>&1 || true
 feature_log2="$(atomic log 2>/dev/null || true)"
-feature_count2="$(echo "$feature_log2" | grep -c "^change " || true)"
+feature_count2="$(echo "$feature_log2" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
 if [[ $feature_count2 -eq 5 ]]; then
     _pass "feature still has 5 changes after dev unrecord"
 else
