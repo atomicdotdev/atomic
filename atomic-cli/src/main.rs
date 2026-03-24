@@ -38,6 +38,16 @@
 //! atomic status
 //! ```
 
+// Many commands are scaffold/stub implementations with builder APIs not yet
+// fully wired up. Suppress dead_code and unused_imports until they are.
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_mut,
+    unused_variables,
+    unused_assignments
+)]
+
 mod commands;
 mod error;
 mod output;
