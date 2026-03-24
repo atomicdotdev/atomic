@@ -446,18 +446,19 @@ pub const CHANGE_UNHASHED: TableDefinition<&[u8; 32], &[u8]> =
 // replay log. Values are postcard-encoded session structs from
 // `atomic_core::change::session`.
 //
-// Composite keys use the same `[u8; 16]` pattern as `STACK_CHANGES`:
-// first 8 bytes = provenance_id (u64 LE), second 8 bytes = secondary
-// component (seq, or first-8-bytes-of-blake3 for string IDs).
+// Composite keys use the same `[u8; 16]` shape as `STACK_CHANGES`:
+// first 8 bytes = provenance_id (u64, big-endian), second 8 bytes = secondary
+// component (u64, big-endian: seq, or first-8-bytes-of-blake3 for string IDs).
 
 /// Session events: (provenance_id, seq) → SessionEvent
 ///
 /// The full ordered Petri net replay log for a turn. Each row is one
 /// NetEvent from the JSONL trace file. Keys are composite `[u8; 16]`
-/// values `(provenance_id_le, seq_le)` and are ordered lexicographically
-/// by their little-endian byte representation. This groups events by
-/// `provenance_id` for efficient prefix scans, but does *not* guarantee
-/// numeric ordering by `seq` within a provenance.
+/// values `(provenance_id_be, seq_be)` as produced by
+/// `atomic_core::change::session::encode_session_*`. They are ordered
+/// lexicographically by their big-endian byte representation, so the
+/// key order matches numeric order: first by `provenance_id`, then by
+/// `seq` within each provenance, enabling efficient prefix and range scans.
 pub const SESSION_EVENTS: TableDefinition<&[u8; 16], &[u8]> =
     TableDefinition::new("session_events");
 
