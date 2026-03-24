@@ -240,21 +240,27 @@ make_temp_repo "git-import-errors"
 atomic init >/dev/null 2>&1
 
 # Should fail with clear error about not being a git repo
-out="$(atomic git import 2>&1)" || true
-if echo "$out" | grep -qiE "not.*git|no.*repository|git.*not found"; then
+out="$(atomic git import 2>&1)"
+status=$?
+if [ "$status" -eq 0 ]; then
+    _fail "atomic git import unexpectedly succeeded in non-git directory"
+elif echo "$out" | grep -qiE "not.*git|no.*repository|git.*not found"; then
     _pass "clear error for non-git directory"
 else
-    _pass "import fails in non-git directory"
+    _fail "import fails in non-git directory, but error message was unclear"
 fi
 
 # Now make it a git repo and test invalid branch
 init_git_repo
 git_commit "test" "test.txt" "test"
-out="$(atomic git import --branch nonexistent 2>&1)" || true
-if echo "$out" | grep -qiE "branch.*not found|no.*branch|invalid.*branch|unknown.*branch"; then
+out="$(atomic git import --branch nonexistent 2>&1)"
+status=$?
+if [ "$status" -eq 0 ]; then
+    _fail "atomic git import unexpectedly succeeded for invalid branch"
+elif echo "$out" | grep -qiE "branch.*not found|no.*branch|invalid.*branch|unknown.*branch"; then
     _pass "clear error for invalid branch"
 else
-    _pass "import fails for invalid branch"
+    _fail "import fails for invalid branch, but error message was unclear"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
