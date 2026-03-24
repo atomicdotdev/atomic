@@ -4,7 +4,7 @@
 //! that captures the causal decision chain of an AI agent session. The graph
 //! is built incrementally by the [`super::accumulator::ProvenanceAccumulator`]
 //! as agent hook events arrive, and serialized for persistence and transport
-//! by [`super::serialize`].
+//! by the `provenance` serialization layer.
 //!
 //! # Node Kinds
 //!

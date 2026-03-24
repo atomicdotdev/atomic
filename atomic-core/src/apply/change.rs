@@ -486,8 +486,16 @@ mod tests {
     fn test_vertex_is_empty() {
         use crate::types::GraphNode;
 
-        let empty_vertex = GraphNode::new(NodeId::new(1), ChangePosition::new(10), ChangePosition::new(10));
-        let non_empty = GraphNode::new(NodeId::new(1), ChangePosition::new(10), ChangePosition::new(20));
+        let empty_vertex = GraphNode::new(
+            NodeId::new(1),
+            ChangePosition::new(10),
+            ChangePosition::new(10),
+        );
+        let non_empty = GraphNode::new(
+            NodeId::new(1),
+            ChangePosition::new(10),
+            ChangePosition::new(20),
+        );
 
         assert!(empty_vertex.is_empty());
         assert!(!non_empty.is_empty());

@@ -1490,7 +1490,7 @@ mod tests {
         let change_id = NodeId::new(1);
         let mut builder = CrdtChangeBuilder::new(change_id);
 
-        let trunk_id = builder.add_file("main.rs", Some(Encoding::Utf8));
+        let _trunk_id = builder.add_file("main.rs", Some(Encoding::Utf8));
         let result = builder.finish();
 
         assert_eq!(result.file_count(), 1);
@@ -1508,7 +1508,7 @@ mod tests {
         let mut builder = CrdtChangeBuilder::new(change_id);
 
         let content = b"line one\nline two\n";
-        let trunk_id = builder.add_file_with_content("test.txt", content, None);
+        let _trunk_id = builder.add_file_with_content("test.txt", content, None);
 
         let result = builder.finish();
 
@@ -1559,7 +1559,7 @@ mod tests {
         let mut builder = CrdtChangeBuilder::new(change_id);
 
         let trunk_id = builder.add_file("test.rs", None);
-        let branch_id = builder.add_line_with_content(trunk_id, None, b"let x = 42;");
+        let _branch_id = builder.add_line_with_content(trunk_id, None, b"let x = 42;");
 
         assert!(builder.current_stats().tokens_added > 0);
     }

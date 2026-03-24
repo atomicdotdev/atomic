@@ -73,9 +73,9 @@ impl Command for Show {
         })?;
 
         // Load the identity by name
-        let identity = store.load_by_name(&self.name).map_err(|_| {
-            CliError::IdentityNotFound(self.name.clone())
-        })?;
+        let identity = store
+            .load_by_name(&self.name)
+            .map_err(|_| CliError::IdentityNotFound(self.name.clone()))?;
 
         // Check if this is the default identity
         let is_default = store
@@ -108,19 +108,29 @@ impl Show {
             println!("  Email:       {}", email);
         }
 
-        println!("  Type:        {}", super::format_identity_type(&identity.identity_type));
+        println!(
+            "  Type:        {}",
+            super::format_identity_type(&identity.identity_type)
+        );
         println!("  Usage:       {}", super::format_usage(&identity.usage));
 
         // Metadata
-        println!("  Created:     {}", identity.metadata.created_at.format("%Y-%m-%d %H:%M:%S UTC"));
+        println!(
+            "  Created:     {}",
+            identity.metadata.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+        );
 
         if let Some(modified) = identity.metadata.modified_at {
-            println!("  Modified:    {}", modified.format("%Y-%m-%d %H:%M:%S UTC"));
+            println!(
+                "  Modified:    {}",
+                modified.format("%Y-%m-%d %H:%M:%S UTC")
+            );
         }
 
         if let Some(expires) = identity.metadata.expires_at {
             let expired = identity.is_expired();
-            println!("  Expires:     {} {}",
+            println!(
+                "  Expires:     {} {}",
                 expires.format("%Y-%m-%d %H:%M:%S UTC"),
                 if expired { "(EXPIRED)" } else { "" }
             );
@@ -140,8 +150,10 @@ impl Show {
         if self.show_public_key {
             println!("  Public Key:  {}", identity.public_key_base32());
         } else {
-            println!("  Public Key:  {}... (use --show-public-key for full key)",
-                &identity.public_key_base32()[..24]);
+            println!(
+                "  Public Key:  {}... (use --show-public-key for full key)",
+                &identity.public_key_base32()[..24]
+            );
         }
 
         // Default status

@@ -392,7 +392,7 @@ impl DetectionOptions {
     /// Check if a file size exceeds the max diff size.
     #[must_use]
     pub fn exceeds_max_size(&self, size: usize) -> bool {
-        self.max_diff_size.map_or(false, |max| size > max)
+        self.max_diff_size.is_some_and(|max| size > max)
     }
 }
 

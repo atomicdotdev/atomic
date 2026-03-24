@@ -97,7 +97,7 @@ use crate::redb_change_store::{RedbChangeStore, RedbStoreError};
 pub enum RegenError {
     /// Error accessing the redb store.
     #[error("Store error: {0}")]
-    Store(#[from] RedbStoreError),
+    Store(#[from] Box<RedbStoreError>),
 
     /// Error during tokenization.
     #[error("Tokenization error for {path}: {reason}")]
@@ -126,6 +126,12 @@ pub enum RegenError {
 
 /// Convenience result type.
 pub type RegenResult<T> = Result<T, RegenError>;
+
+impl From<RedbStoreError> for RegenError {
+    fn from(e: RedbStoreError) -> Self {
+        RegenError::Store(Box::new(e))
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // RegenOptions — configuration
@@ -688,7 +694,7 @@ fn store_semantic_sections(
     // that writes directly to CHANGE_SEMANTIC without a full re-import.
 
     // Load the current change
-    let change = store.load_change(hash).map_err(|e| RegenError::Store(e))?;
+    let change = store.load_change(hash).map_err(RegenError::from)?;
 
     // Build a new change with the regenerated semantic ops
     // The payloads are serialized Vec<FileOps>, but we need to extract them
@@ -709,7 +715,7 @@ fn store_semantic_sections(
     updated.hashed.file_ops = all_file_ops;
 
     // Re-save to the store (this will update both graph and semantic sections)
-    store.save_change(&updated).map_err(RegenError::Store)?;
+    store.save_change(&updated).map_err(RegenError::from)?;
 
     Ok(())
 }

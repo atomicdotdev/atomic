@@ -640,7 +640,7 @@ impl RepositoryOutputResult {
 
         // Record directories created
         for i in 0..self.directories_created {
-            outcome.record_directory(&format!("dir_{}", i));
+            outcome.record_directory(format!("dir_{}", i));
         }
 
         // Record skipped files

@@ -43,7 +43,7 @@ pub mod node_type {
 
 // Graph Tables
 
-/// Main graph table: GraphNode → [GraphEdge] (multimap)
+/// Main graph table: GraphNode → `GraphEdge` (multimap)
 ///
 /// Key: 24 bytes encoding (change_id: u64, start: u64, end: u64)
 /// Value: 24 bytes encoding SerializedGraphEdge
@@ -228,7 +228,7 @@ pub mod directory_flags {
 
 // Dependency Tables
 
-/// Dependencies: change_id → [dep_id] (multimap)
+/// Dependencies: change_id → `dep_id` (multimap)
 ///
 /// Key: change NodeId
 /// Value: dependency NodeId
@@ -236,7 +236,7 @@ pub mod directory_flags {
 /// Tracks which changes a given change depends on.
 pub const DEPS: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new("deps");
 
-/// Reverse dependencies: dep_id → [change_id] (multimap)
+/// Reverse dependencies: dep_id → `change_id` (multimap)
 ///
 /// Key: dependency NodeId
 /// Value: dependent change NodeId

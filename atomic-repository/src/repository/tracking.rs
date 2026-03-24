@@ -98,13 +98,8 @@ impl Repository {
             if is_tracked(&txn, &normalized)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?
             {
-                if options.force {
-                    stats.skip(file_path, "already tracked");
-                    continue;
-                } else {
-                    stats.skip(file_path, "already tracked");
-                    continue;
-                }
+                stats.skip(file_path, "already tracked");
+                continue;
             }
 
             // Add to tree (only files, not directories)

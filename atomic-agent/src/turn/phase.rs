@@ -65,11 +65,13 @@ use serde::{Deserialize, Serialize};
 /// transitions are possible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Phase {
     /// No active turn. The session is waiting for the next prompt.
     ///
     /// This is the initial phase and the phase after a turn completes.
     /// Recording is possible (e.g., user manually records between turns).
+    #[default]
     Idle,
 
     /// An agent turn is in progress (between TurnStart and TurnEnd).
@@ -157,12 +159,6 @@ impl Phase {
             Phase::ActiveRecorded => "active_recorded",
             Phase::Ended => "ended",
         }
-    }
-}
-
-impl Default for Phase {
-    fn default() -> Self {
-        Phase::Idle
     }
 }
 

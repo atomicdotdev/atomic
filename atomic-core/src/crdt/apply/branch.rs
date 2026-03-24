@@ -227,13 +227,12 @@ fn apply_insert_only<T: MutCrdtTxnT>(
     }
 
     // Validate trunk exists (optional based on validation settings)
-    if context.options().validate_references() {
-        if !txn
+    if context.options().validate_references()
+        && !txn
             .has_trunk(trunk_id)
             .map_err(|e| storage_err(e, "checking trunk exists"))?
-        {
-            return Err(ApplyError::trunk_not_found(trunk_id));
-        }
+    {
+        return Err(ApplyError::trunk_not_found(trunk_id));
     }
 
     // Validate "after" reference if provided

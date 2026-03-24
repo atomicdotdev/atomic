@@ -13,7 +13,7 @@
 //! # Command Structure
 //!
 //! Commands are organized into modules under `commands/`, with each command
-//! implementing the [`Command`](commands::Command) trait. This provides:
+//! implementing the [`Command`] trait. This provides:
 //!
 //! - Consistent error handling across all commands
 //! - Testable command implementations
@@ -37,6 +37,16 @@
 //! # Check status
 //! atomic status
 //! ```
+
+// Many commands are scaffold/stub implementations with builder APIs not yet
+// fully wired up. Suppress dead_code and unused_imports until they are.
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_mut,
+    unused_variables,
+    unused_assignments
+)]
 
 mod commands;
 mod error;

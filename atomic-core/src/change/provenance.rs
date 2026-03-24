@@ -104,7 +104,7 @@ impl AIVendor {
     }
 
     /// Parse a vendor from a string.
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "anthropic" | "claude" => AIVendor::Anthropic,
             "openai" | "gpt" | "chatgpt" => AIVendor::OpenAI,
@@ -460,7 +460,7 @@ impl fmt::Display for Cost {
 ///
 /// For privacy, prompts can be stored as just a hash. For full
 /// auditability, the complete prompt can be stored (compressed).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptContent {
     /// Only the hash of the prompt is stored (for privacy)
@@ -470,6 +470,7 @@ pub enum PromptContent {
     /// The prompt is stored compressed (for large prompts)
     Compressed(Vec<u8>),
     /// No prompt information available
+    #[default]
     None,
 }
 
@@ -515,12 +516,6 @@ impl PromptContent {
     /// Check if any prompt information is available.
     pub fn is_available(&self) -> bool {
         !matches!(self, PromptContent::None)
-    }
-}
-
-impl Default for PromptContent {
-    fn default() -> Self {
-        PromptContent::None
     }
 }
 
@@ -844,7 +839,7 @@ impl ProvenanceBuilder {
 
     /// Set the vendor from a string.
     pub fn vendor_str(mut self, vendor: &str) -> Self {
-        self.vendor = Some(AIVendor::from_str(vendor));
+        self.vendor = Some(AIVendor::parse(vendor));
         self
     }
 
@@ -1070,13 +1065,13 @@ mod tests {
 
     #[test]
     fn test_vendor_from_str() {
-        assert_eq!(AIVendor::from_str("anthropic"), AIVendor::Anthropic);
-        assert_eq!(AIVendor::from_str("claude"), AIVendor::Anthropic);
-        assert_eq!(AIVendor::from_str("openai"), AIVendor::OpenAI);
-        assert_eq!(AIVendor::from_str("gpt"), AIVendor::OpenAI);
-        assert_eq!(AIVendor::from_str("ollama"), AIVendor::Local);
+        assert_eq!(AIVendor::parse("anthropic"), AIVendor::Anthropic);
+        assert_eq!(AIVendor::parse("claude"), AIVendor::Anthropic);
+        assert_eq!(AIVendor::parse("openai"), AIVendor::OpenAI);
+        assert_eq!(AIVendor::parse("gpt"), AIVendor::OpenAI);
+        assert_eq!(AIVendor::parse("ollama"), AIVendor::Local);
         assert_eq!(
-            AIVendor::from_str("custom-ai"),
+            AIVendor::parse("custom-ai"),
             AIVendor::Other("custom-ai".to_string())
         );
     }

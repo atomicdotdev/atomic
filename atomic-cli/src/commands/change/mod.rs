@@ -124,17 +124,17 @@ use crate::commands::{
 };
 use crate::error::{CliError, CliResult};
 use crate::output::{
-    author as style_author, emphasis, hash as style_hash, hint, info, path as style_path, timestamp as style_timestamp,
+    author as style_author, emphasis, hash as style_hash, hint, info, path as style_path,
+    timestamp as style_timestamp,
 };
 
 // Output Format
 
-
-mod types;
 mod command;
+mod types;
 
-pub use types::*;
 pub use command::*;
+pub use types::*;
 
 #[cfg(test)]
 mod tests;

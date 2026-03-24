@@ -3,7 +3,7 @@
 //! This module defines the [`AgentHook`] trait that each agent adapter implements,
 //! and the [`AgentRegistry`] that manages available adapters. The trait normalizes
 //! agent-specific hook formats (Claude Code, Gemini CLI, Codex, OpenCode) into
-//! the common [`TurnEvent`](crate::event::TurnEvent) type.
+//! the common [`TurnEvent`] type.
 //!
 //! # Architecture
 //!
@@ -289,7 +289,7 @@ impl AgentRegistry {
     pub fn require(&self, name: &str) -> AgentResult<&dyn AgentHook> {
         self.get(name).ok_or_else(|| AgentError::AgentNotFound {
             name: name.to_string(),
-            available: self.list().iter().copied().collect::<Vec<_>>().join(", "),
+            available: self.list().to_vec().join(", "),
         })
     }
 

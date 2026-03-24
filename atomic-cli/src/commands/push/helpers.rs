@@ -299,7 +299,7 @@ pub async fn upload_change_smart(
         remote
             .upload_change(&hash_str, stack, change_data)
             .await
-            .map_err(|e| convert_remote_error(e, &remote.url().to_string()))?;
+            .map_err(|e| convert_remote_error(e, remote.url().as_ref()))?;
 
         Ok(PushTransferResult::direct(data_len as u64))
     } else {
@@ -331,7 +331,7 @@ pub async fn upload_change_smart(
                 remote
                     .upload_change(&hash_str, stack, change_data)
                     .await
-                    .map_err(|e| convert_remote_error(e, &remote.url().to_string()))?;
+                    .map_err(|e| convert_remote_error(e, remote.url().as_ref()))?;
 
                 Ok(PushTransferResult::direct(data_len as u64))
             }
@@ -340,7 +340,7 @@ pub async fn upload_change_smart(
                 remote
                     .upload_change(&hash_str, stack, change_data)
                     .await
-                    .map_err(|e| convert_remote_error(e, &remote.url().to_string()))?;
+                    .map_err(|e| convert_remote_error(e, remote.url().as_ref()))?;
 
                 Ok(PushTransferResult::direct(data_len as u64))
             }

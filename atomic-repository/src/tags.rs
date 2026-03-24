@@ -638,15 +638,13 @@ fn matches_pattern(name: &str, pattern: &str) -> bool {
         return name.contains(inner);
     }
 
-    if pattern.starts_with('*') {
+    if let Some(suffix) = pattern.strip_prefix('*') {
         // Ends with
-        let suffix = &pattern[1..];
         return name.ends_with(suffix);
     }
 
-    if pattern.ends_with('*') {
+    if let Some(prefix) = pattern.strip_suffix('*') {
         // Starts with
-        let prefix = &pattern[..pattern.len() - 1];
         return name.starts_with(prefix);
     }
 
@@ -730,8 +728,8 @@ pub fn save_tag(tags_dir: &Path, tag: &Tag) -> TagResult<()> {
         });
     }
 
-    let contents = serde_json::to_string_pretty(tag)
-        .map_err(|e| TagError::Serialization(e.to_string()))?;
+    let contents =
+        serde_json::to_string_pretty(tag).map_err(|e| TagError::Serialization(e.to_string()))?;
 
     std::fs::write(&path, contents)?;
 
@@ -765,8 +763,8 @@ pub fn save_tag_force(tags_dir: &Path, tag: &Tag, force: bool) -> TagResult<()> 
         });
     }
 
-    let contents = serde_json::to_string_pretty(tag)
-        .map_err(|e| TagError::Serialization(e.to_string()))?;
+    let contents =
+        serde_json::to_string_pretty(tag).map_err(|e| TagError::Serialization(e.to_string()))?;
 
     std::fs::write(&path, contents)?;
 
@@ -794,9 +792,7 @@ pub fn load_tag(tags_dir: &Path, stack: &str, name: &str) -> TagResult<Option<Ta
     let contents = std::fs::read_to_string(&path)?;
 
     let tag: Tag = serde_json::from_str(&contents)
-        .map_err(|_| TagError::InvalidTagFile {
-            path: path.clone(),
-        })?;
+        .map_err(|_| TagError::InvalidTagFile { path: path.clone() })?;
 
     Ok(Some(tag))
 }
@@ -824,9 +820,7 @@ pub fn load_tag_any_stack(tags_dir: &Path, name: &str) -> TagResult<Option<Tag>>
         let path = entry.path();
 
         if path.is_dir() {
-            let stack = path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let stack = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
             if let Some(tag) = load_tag(tags_dir, stack, name)? {
                 return Ok(Some(tag));
@@ -893,7 +887,7 @@ pub fn list_tags(tags_dir: &Path, stack: &str) -> TagResult<Vec<Tag>> {
         let entry = entry?;
         let path = entry.path();
 
-        if path.extension().map_or(false, |ext| ext == "tag") {
+        if path.extension().is_some_and(|ext| ext == "tag") {
             let contents = std::fs::read_to_string(&path)?;
             if let Ok(tag) = serde_json::from_str::<Tag>(&contents) {
                 tags.push(tag);
@@ -926,9 +920,7 @@ pub fn list_all_tags(tags_dir: &Path) -> TagResult<Vec<Tag>> {
         let path = entry.path();
 
         if path.is_dir() {
-            let stack = path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let stack = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
             // Get tags from this stack
             let stack_tags = list_tags(tags_dir, stack)?;
@@ -991,10 +983,7 @@ pub fn list_tags_filtered(tags_dir: &Path, filter: &TagFilter) -> TagResult<Vec<
         list_all_tags(tags_dir)?
     };
 
-    let mut tags: Vec<Tag> = all_tags
-        .into_iter()
-        .filter(|t| filter.matches(t))
-        .collect();
+    let mut tags: Vec<Tag> = all_tags.into_iter().filter(|t| filter.matches(t)).collect();
 
     // Sort
     match filter.sort {
@@ -1030,11 +1019,7 @@ pub fn count_tags(tags_dir: &Path, stack: &str) -> TagResult<usize> {
 
     let count = std::fs::read_dir(&stack_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map_or(false, |ext| ext == "tag")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "tag"))
         .count();
 
     Ok(count)
@@ -1061,9 +1046,7 @@ pub fn count_all_tags(tags_dir: &Path) -> TagResult<usize> {
         let path = entry.path();
 
         if path.is_dir() {
-            let stack = path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let stack = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             count += count_tags(tags_dir, stack)?;
         }
     }
@@ -1568,7 +1551,11 @@ mod tests {
 
         let state = Merkle::of(b"test");
         save_tag(tags_dir, &Tag::new("v1.0.0", "main", 1, state)).unwrap();
-        save_tag(tags_dir, &Tag::new("v2.0.0", "main", 2, state).with_message("Annotated")).unwrap();
+        save_tag(
+            tags_dir,
+            &Tag::new("v2.0.0", "main", 2, state).with_message("Annotated"),
+        )
+        .unwrap();
         save_tag(tags_dir, &Tag::new("release-1", "other", 3, state)).unwrap();
 
         // Filter by pattern
@@ -1662,10 +1649,14 @@ mod tests {
 
     #[test]
     fn test_tag_error_display() {
-        let err = TagError::AlreadyExists { name: "v1.0.0".to_string() };
+        let err = TagError::AlreadyExists {
+            name: "v1.0.0".to_string(),
+        };
         assert!(format!("{}", err).contains("v1.0.0"));
 
-        let err = TagError::NotFound { name: "missing".to_string() };
+        let err = TagError::NotFound {
+            name: "missing".to_string(),
+        };
         assert!(format!("{}", err).contains("missing"));
 
         let err = TagError::InvalidName {

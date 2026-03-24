@@ -163,7 +163,11 @@ impl CompareResult {
     /// * `old_encoding` - Encoding of pristine content
     /// * `new_encoding` - Encoding of working content
     /// * `diff_ops` - The diff operations
-    pub fn with_diff(old_encoding: Encoding, new_encoding: Encoding, diff_ops: Vec<DiffOp>) -> Self {
+    pub fn with_diff(
+        old_encoding: Encoding,
+        new_encoding: Encoding,
+        diff_ops: Vec<DiffOp>,
+    ) -> Self {
         let content_changed = !diff_ops.is_empty();
         Self {
             old_encoding,
@@ -330,7 +334,11 @@ pub fn is_binary(content: &[u8]) -> bool {
 /// assert!(result.has_changes());
 /// assert!(!result.is_binary);
 /// ```
-pub fn compare_content(old_content: &[u8], new_content: &[u8], algorithm: Algorithm) -> CompareResult {
+pub fn compare_content(
+    old_content: &[u8],
+    new_content: &[u8],
+    algorithm: Algorithm,
+) -> CompareResult {
     // Detect encodings
     let old_encoding = detect_encoding(old_content);
     let new_encoding = detect_encoding(new_content);
@@ -456,7 +464,11 @@ mod tests {
 
     #[test]
     fn test_compare_result_with_diff() {
-        let ops = vec![DiffOp::Insert { old_pos: 0, new_pos: 0, len: 1 }];
+        let ops = vec![DiffOp::Insert {
+            old_pos: 0,
+            new_pos: 0,
+            len: 1,
+        }];
         let result = CompareResult::with_diff(Encoding::Utf8, Encoding::Utf8, ops);
 
         assert!(result.has_changes());
@@ -489,7 +501,10 @@ mod tests {
     fn test_detect_encoding_utf8() {
         assert_eq!(detect_encoding(b"Hello, World!"), Encoding::Utf8);
         assert_eq!(detect_encoding(b""), Encoding::Utf8);
-        assert_eq!(detect_encoding("UTF-8 with émojis 🎉".as_bytes()), Encoding::Utf8);
+        assert_eq!(
+            detect_encoding("UTF-8 with émojis 🎉".as_bytes()),
+            Encoding::Utf8
+        );
     }
 
     #[test]
@@ -665,9 +680,7 @@ mod tests {
     fn test_generate_diff_empty() {
         let ops = generate_diff(b"same\n", b"same\n", Algorithm::Myers);
         // When content is identical, we may get Equal ops but no Insert/Delete/Replace
-        let has_changes = ops.iter().any(|op| {
-            !matches!(op, DiffOp::Equal { .. })
-        });
+        let has_changes = ops.iter().any(|op| !matches!(op, DiffOp::Equal { .. }));
         assert!(!has_changes, "identical content should have no change ops");
     }
 
@@ -714,7 +727,11 @@ mod tests {
         let result = CompareResult::with_diff(
             Encoding::Utf8,
             Encoding::Utf8,
-            vec![DiffOp::Insert { old_pos: 0, new_pos: 0, len: 1 }],
+            vec![DiffOp::Insert {
+                old_pos: 0,
+                new_pos: 0,
+                len: 1,
+            }],
         );
         let cloned = result.clone();
 

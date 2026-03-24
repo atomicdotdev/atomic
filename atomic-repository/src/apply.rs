@@ -555,7 +555,7 @@ pub fn apply_change_to_graph<T: MutTxnT + StackTxnT>(
             ApplyTarget::Local { .. } => {
                 // Check if the stack has a Shared ancestor by looking at
                 // the parent chain.  If so, the overlay reaches GRAPH.
-                !stack.parent.is_some()
+                stack.parent.is_none()
             }
         }
     } else {
@@ -615,6 +615,7 @@ pub fn apply_change_to_graph<T: MutTxnT + StackTxnT>(
 }
 
 /// Apply a single graph_op to the graph.
+#[allow(clippy::too_many_arguments)]
 fn apply_hunk<T: MutTxnT>(
     txn: &mut T,
     workspace: &mut Workspace,

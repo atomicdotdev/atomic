@@ -318,13 +318,13 @@ fn adjust_for_mid_span(
 /// Resolve a context vertex using the overlay-aware vertex finder.
 ///
 /// This is the apply-pipeline counterpart of [`resolve_context_vertex`].
-/// It delegates vertex lookup to [`super::edge::resolve_vertex_for_target`],
+/// It delegates vertex lookup to `super::edge::resolve_vertex_for_target`,
 /// which consults STACK_GRAPH (via the shared `overlay::find_block_in_stack_graph`)
 /// before falling back to the global GRAPH.  For `ApplyTarget::Global` the
 /// behaviour is identical to the non-overlay version.
 ///
 /// The mid-span adjustment logic is shared with `resolve_context_vertex`
-/// via [`adjust_for_mid_span`], ensuring a single source of truth.
+/// via `adjust_for_mid_span`, ensuring a single source of truth.
 pub fn resolve_context_vertex_for_target<T: MutTxnT>(
     txn: &T,
     pos: Position<NodeId>,

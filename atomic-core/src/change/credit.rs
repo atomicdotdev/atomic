@@ -313,7 +313,7 @@ impl Credit {
         }
     }
 
-    /// Get a short attribution string (e.g., "alice [H]" or "bob [A:claude]").
+    /// Get a short attribution string (e.g., "alice `[H]`" or "bob `[A:claude]`").
     pub fn short_attribution(&self) -> String {
         let type_code = self.credit_type.short_code();
         match (&self.ai_vendor, &self.ai_model) {
@@ -596,11 +596,7 @@ impl fmt::Display for CreditRange {
         if self.start_line == self.end_line {
             write!(f, "L{}: {}", self.start_line, self.credit)
         } else {
-            write!(
-                f,
-                "L{}-{}: {}",
-                self.start_line, self.end_line, self.credit
-            )
+            write!(f, "L{}-{}: {}", self.start_line, self.end_line, self.credit)
         }
     }
 }
@@ -720,7 +716,6 @@ impl fmt::Display for FileCredits {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Base32;
 
     fn test_hash() -> Hash {
         Hash::of(b"test change")
@@ -793,7 +788,12 @@ mod tests {
 
     #[test]
     fn test_credit_human() {
-        let credit = Credit::human("alice", Some("alice@example.com"), test_hash(), test_timestamp());
+        let credit = Credit::human(
+            "alice",
+            Some("alice@example.com"),
+            test_hash(),
+            test_timestamp(),
+        );
 
         assert_eq!(credit.author_name, "alice");
         assert_eq!(credit.author_email, Some("alice@example.com".to_string()));
@@ -838,8 +838,12 @@ mod tests {
 
     #[test]
     fn test_credit_author_display() {
-        let with_email =
-            Credit::human("alice", Some("alice@example.com"), test_hash(), test_timestamp());
+        let with_email = Credit::human(
+            "alice",
+            Some("alice@example.com"),
+            test_hash(),
+            test_timestamp(),
+        );
         assert_eq!(with_email.author_display(), "alice <alice@example.com>");
 
         let without_email = Credit::human("bob", None::<String>, test_hash(), test_timestamp());
@@ -964,7 +968,12 @@ mod tests {
         let mut stats = CreditStats::new();
 
         for _ in 0..7 {
-            stats.add(&Credit::human("alice", None::<String>, test_hash(), test_timestamp()));
+            stats.add(&Credit::human(
+                "alice",
+                None::<String>,
+                test_hash(),
+                test_timestamp(),
+            ));
         }
         for _ in 0..3 {
             stats.add(&Credit::ai_generated(
@@ -985,7 +994,12 @@ mod tests {
     #[test]
     fn test_credit_stats_merge() {
         let mut stats1 = CreditStats::new();
-        stats1.add(&Credit::human("alice", None::<String>, test_hash(), test_timestamp()));
+        stats1.add(&Credit::human(
+            "alice",
+            None::<String>,
+            test_hash(),
+            test_timestamp(),
+        ));
 
         let mut stats2 = CreditStats::new();
         stats2.add(&Credit::ai_generated(

@@ -189,10 +189,10 @@ impl WatcherConfig {
 ///
 /// Two implementations are planned:
 ///
-/// - [`WatchmanTurnWatcher`] — Uses Watchman's `clock` + `since` queries
+/// - `WatchmanTurnWatcher` — Uses Watchman's `clock` + `since` queries
 ///   for O(changed-files) detection with zero scanning.
 ///
-/// - [`FallbackWatcher`] — Uses filesystem snapshots via `walkdir` for
+/// - [`crate::watcher::fallback::FallbackWatcher`] — Uses filesystem snapshots via `walkdir` for
 ///   O(all-files) detection when Watchman is unavailable.
 ///
 /// The trait is async because the Watchman client is async (`tokio`-based).
@@ -232,8 +232,8 @@ pub trait FileWatcher: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`AgentError::WatchmanQueryFailed`] if the Watchman clock
-    /// or state_enter call fails. Returns [`AgentError::Io`] if the
+    /// Returns [`crate::error::AgentError::WatchmanQueryFailed`] if the Watchman clock
+    /// or state_enter call fails. Returns [`crate::error::AgentError::Io`] if the
     /// fallback watcher cannot read the filesystem.
     fn begin_turn(
         &mut self,
@@ -253,8 +253,8 @@ pub trait FileWatcher: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`AgentError::TurnNotActive`] if `begin_turn()` was not
-    /// called first. Returns [`AgentError::WatchmanQueryFailed`] if the
+    /// Returns [`crate::error::AgentError::TurnNotActive`] if `begin_turn()` was not
+    /// called first. Returns [`crate::error::AgentError::WatchmanQueryFailed`] if the
     /// Watchman query fails.
     fn end_turn(&mut self) -> Pin<Box<dyn Future<Output = AgentResult<TurnChanges>> + Send + '_>>;
 

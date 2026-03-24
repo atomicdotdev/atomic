@@ -386,7 +386,7 @@ impl fmt::Display for ApplyStats {
 ///
 /// # Lifecycle
 ///
-/// 1. Create with [`ApplyContext::new`] or [`ApplyContext::with_content`]
+/// 1. Create with [`ApplyContext::new`] or `ApplyContext::with_content`
 /// 2. Use during apply operations to record stats and conflicts
 /// 3. Call [`ApplyContext::finish`] to get the final [`ApplyOutcome`]
 ///
@@ -601,7 +601,8 @@ impl ApplyContext {
     /// Returns `true` if the operation limit has been exceeded.
     #[inline]
     pub fn exceeds_operation_limit(&self) -> bool {
-        self.options.exceeds_limit(self.stats.total_operations() as usize)
+        self.options
+            .exceeds_limit(self.stats.total_operations() as usize)
     }
 
     /// Checks if we should continue applying operations.
@@ -979,18 +980,12 @@ mod tests {
     #[test]
     fn test_context_add_conflict() {
         use super::super::conflict::{ConflictKind, CrdtConflict};
-        use crate::crdt::BranchId;
-        use crate::types::NodeId;
 
-        let options = ApplyOptions::builder()
-            .fail_on_conflict(false)
-            .build();
+        let options = ApplyOptions::builder().fail_on_conflict(false).build();
         let mut context = ApplyContext::new(options);
 
-        let conflict = CrdtConflict::new(
-            ConflictKind::ConcurrentInsert,
-            "test conflict".to_string(),
-        );
+        let conflict =
+            CrdtConflict::new(ConflictKind::ConcurrentInsert, "test conflict".to_string());
         context.add_conflict(conflict);
 
         assert!(context.has_conflicts());
@@ -1002,15 +997,11 @@ mod tests {
     fn test_context_add_conflict_with_fail() {
         use super::super::conflict::{ConflictKind, CrdtConflict};
 
-        let options = ApplyOptions::builder()
-            .fail_on_conflict(true)
-            .build();
+        let options = ApplyOptions::builder().fail_on_conflict(true).build();
         let mut context = ApplyContext::new(options);
 
-        let conflict = CrdtConflict::new(
-            ConflictKind::ConcurrentInsert,
-            "test conflict".to_string(),
-        );
+        let conflict =
+            CrdtConflict::new(ConflictKind::ConcurrentInsert, "test conflict".to_string());
         context.add_conflict(conflict);
 
         assert!(context.has_conflicts());
@@ -1039,9 +1030,7 @@ mod tests {
 
     #[test]
     fn test_context_exceeds_operation_limit() {
-        let options = ApplyOptions::builder()
-            .max_operations(Some(2))
-            .build();
+        let options = ApplyOptions::builder().max_operations(Some(2)).build();
         let mut context = ApplyContext::new(options);
 
         assert!(!context.exceeds_operation_limit());
@@ -1100,15 +1089,10 @@ mod tests {
     fn test_outcome_with_conflicts() {
         use super::super::conflict::{ConflictKind, CrdtConflict};
 
-        let options = ApplyOptions::builder()
-            .fail_on_conflict(false)
-            .build();
+        let options = ApplyOptions::builder().fail_on_conflict(false).build();
         let mut context = ApplyContext::new(options);
 
-        let conflict = CrdtConflict::new(
-            ConflictKind::ConcurrentInsert,
-            "test".to_string(),
-        );
+        let conflict = CrdtConflict::new(ConflictKind::ConcurrentInsert, "test".to_string());
         context.add_conflict(conflict);
 
         let outcome = context.finish();
@@ -1133,15 +1117,10 @@ mod tests {
     fn test_outcome_into_conflicts() {
         use super::super::conflict::{ConflictKind, CrdtConflict};
 
-        let options = ApplyOptions::builder()
-            .fail_on_conflict(false)
-            .build();
+        let options = ApplyOptions::builder().fail_on_conflict(false).build();
         let mut context = ApplyContext::new(options);
 
-        let conflict = CrdtConflict::new(
-            ConflictKind::ConcurrentInsert,
-            "test".to_string(),
-        );
+        let conflict = CrdtConflict::new(ConflictKind::ConcurrentInsert, "test".to_string());
         context.add_conflict(conflict);
 
         let outcome = context.finish();
@@ -1154,16 +1133,11 @@ mod tests {
     fn test_outcome_into_parts() {
         use super::super::conflict::{ConflictKind, CrdtConflict};
 
-        let options = ApplyOptions::builder()
-            .fail_on_conflict(false)
-            .build();
+        let options = ApplyOptions::builder().fail_on_conflict(false).build();
         let mut context = ApplyContext::new(options);
         context.record_trunk_created();
 
-        let conflict = CrdtConflict::new(
-            ConflictKind::ConcurrentInsert,
-            "test".to_string(),
-        );
+        let conflict = CrdtConflict::new(ConflictKind::ConcurrentInsert, "test".to_string());
         context.add_conflict(conflict);
 
         let outcome = context.finish();
@@ -1200,15 +1174,10 @@ mod tests {
     fn test_outcome_display_with_conflicts() {
         use super::super::conflict::{ConflictKind, CrdtConflict};
 
-        let options = ApplyOptions::builder()
-            .fail_on_conflict(false)
-            .build();
+        let options = ApplyOptions::builder().fail_on_conflict(false).build();
         let mut context = ApplyContext::new(options);
 
-        let conflict = CrdtConflict::new(
-            ConflictKind::ConcurrentInsert,
-            "test".to_string(),
-        );
+        let conflict = CrdtConflict::new(ConflictKind::ConcurrentInsert, "test".to_string());
         context.add_conflict(conflict);
 
         let outcome = context.finish();
@@ -1226,6 +1195,9 @@ mod tests {
         let cloned = outcome.clone();
 
         assert_eq!(outcome.is_success(), cloned.is_success());
-        assert_eq!(outcome.stats().trunks_created(), cloned.stats().trunks_created());
+        assert_eq!(
+            outcome.stats().trunks_created(),
+            cloned.stats().trunks_created()
+        );
     }
 }

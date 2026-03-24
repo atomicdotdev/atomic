@@ -68,10 +68,7 @@ impl Record {
     /// 5. Fallback to empty author (let repository handle it)
     pub(super) fn resolve_author(&self) -> CliResult<Option<Author>> {
         // Try to open identity store
-        let store = match IdentityStore::open_default() {
-            Ok(s) => Some(s),
-            Err(_) => None, // Identity store not available, continue without
-        };
+        let store = IdentityStore::open_default().ok();
 
         // 1. If --identity is specified, load that specific identity
         if let Some(identity_name) = &self.identity {

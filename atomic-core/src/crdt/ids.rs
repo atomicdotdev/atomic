@@ -61,7 +61,10 @@ impl TrunkId {
     /// Creates a new [`TrunkId`].
     #[inline]
     pub const fn new(change_id: NodeId, file_idx: u32) -> Self {
-        TrunkId { change_id, file_idx }
+        TrunkId {
+            change_id,
+            file_idx,
+        }
     }
 
     /// Returns the change that created this file.
@@ -96,7 +99,10 @@ impl TrunkId {
     pub fn from_bytes(bytes: &[u8; 12]) -> Self {
         let change_id = NodeId::new(u64::from_le_bytes(bytes[0..8].try_into().unwrap()));
         let file_idx = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        TrunkId { change_id, file_idx }
+        TrunkId {
+            change_id,
+            file_idx,
+        }
     }
 }
 
@@ -143,7 +149,10 @@ impl BranchId {
     /// Creates a new [`BranchId`].
     #[inline]
     pub const fn new(change_id: NodeId, branch_idx: u32) -> Self {
-        BranchId { change_id, branch_idx }
+        BranchId {
+            change_id,
+            branch_idx,
+        }
     }
 
     /// Returns the change that created this line.
@@ -178,7 +187,10 @@ impl BranchId {
     pub fn from_bytes(bytes: &[u8; 12]) -> Self {
         let change_id = NodeId::new(u64::from_le_bytes(bytes[0..8].try_into().unwrap()));
         let branch_idx = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        BranchId { change_id, branch_idx }
+        BranchId {
+            change_id,
+            branch_idx,
+        }
     }
 }
 
@@ -225,7 +237,10 @@ impl LeafId {
     /// Creates a new [`LeafId`].
     #[inline]
     pub const fn new(change_id: NodeId, leaf_idx: u32) -> Self {
-        LeafId { change_id, leaf_idx }
+        LeafId {
+            change_id,
+            leaf_idx,
+        }
     }
 
     /// Returns the change that created this token.
@@ -260,7 +275,10 @@ impl LeafId {
     pub fn from_bytes(bytes: &[u8; 12]) -> Self {
         let change_id = NodeId::new(u64::from_le_bytes(bytes[0..8].try_into().unwrap()));
         let leaf_idx = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        LeafId { change_id, leaf_idx }
+        LeafId {
+            change_id,
+            leaf_idx,
+        }
     }
 }
 

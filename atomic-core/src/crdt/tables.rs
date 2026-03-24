@@ -854,9 +854,18 @@ mod tests {
 
     #[test]
     fn test_trunk_state_encoding_roundtrip() {
-        assert_eq!(decode_trunk_state(encode_trunk_state(TrunkState::Alive)), TrunkState::Alive);
-        assert_eq!(decode_trunk_state(encode_trunk_state(TrunkState::Deleted)), TrunkState::Deleted);
-        assert_eq!(decode_trunk_state(encode_trunk_state(TrunkState::Zombie)), TrunkState::Zombie);
+        assert_eq!(
+            decode_trunk_state(encode_trunk_state(TrunkState::Alive)),
+            TrunkState::Alive
+        );
+        assert_eq!(
+            decode_trunk_state(encode_trunk_state(TrunkState::Deleted)),
+            TrunkState::Deleted
+        );
+        assert_eq!(
+            decode_trunk_state(encode_trunk_state(TrunkState::Zombie)),
+            TrunkState::Zombie
+        );
     }
 
     #[test]
@@ -867,8 +876,14 @@ mod tests {
 
     #[test]
     fn test_branch_state_encoding_roundtrip() {
-        assert_eq!(decode_branch_state(encode_branch_state(BranchState::Alive)), BranchState::Alive);
-        assert_eq!(decode_branch_state(encode_branch_state(BranchState::Deleted)), BranchState::Deleted);
+        assert_eq!(
+            decode_branch_state(encode_branch_state(BranchState::Alive)),
+            BranchState::Alive
+        );
+        assert_eq!(
+            decode_branch_state(encode_branch_state(BranchState::Deleted)),
+            BranchState::Deleted
+        );
     }
 
     #[test]
@@ -878,8 +893,14 @@ mod tests {
 
     #[test]
     fn test_leaf_state_encoding_roundtrip() {
-        assert_eq!(decode_leaf_state(encode_leaf_state(LeafState::Alive)), LeafState::Alive);
-        assert_eq!(decode_leaf_state(encode_leaf_state(LeafState::Deleted)), LeafState::Deleted);
+        assert_eq!(
+            decode_leaf_state(encode_leaf_state(LeafState::Alive)),
+            LeafState::Alive
+        );
+        assert_eq!(
+            decode_leaf_state(encode_leaf_state(LeafState::Deleted)),
+            LeafState::Deleted
+        );
     }
 
     #[test]
@@ -1160,7 +1181,11 @@ mod tests {
 
             let bytes = encode_trunk_value(&data);
             let decoded = decode_trunk_value(&bytes).expect("decode failed");
-            assert_eq!(data.encoding, decoded.encoding, "Failed for encoding {}", enc);
+            assert_eq!(
+                data.encoding, decoded.encoding,
+                "Failed for encoding {}",
+                enc
+            );
         }
     }
 

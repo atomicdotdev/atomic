@@ -142,21 +142,42 @@ pub use trunk::TrunkOp;
 
 // Re-export table definitions and encoding helpers
 pub use tables::{
-    // Table definitions
-    BRANCHES, BRANCH_LEAVES, INODE_TRUNK, LEAVES, PATH_TRUNK, TRUNKS, TRUNK_BRANCHES,
     // ID encoding/decoding
-    decode_branch_id, decode_leaf_id, decode_trunk_id, encode_branch_id, encode_leaf_id,
-    encode_trunk_id,
-    // Value encoding/decoding
-    decode_branch_value, decode_leaf_value, decode_trunk_value, encode_branch_value,
-    encode_leaf_value, encode_trunk_value,
-    // Serialized value types
-    SerializedBranch, SerializedLeaf, SerializedTrunk,
+    decode_branch_id,
     // State encoding/decoding
-    decode_branch_state, decode_leaf_state, decode_trunk_state, encode_branch_state,
-    encode_leaf_state, encode_trunk_state,
+    decode_branch_state,
+    // Value encoding/decoding
+    decode_branch_value,
+    decode_leaf_id,
+    decode_leaf_state,
+    decode_leaf_value,
     // TokenKind encoding/decoding
-    decode_token_kind, encode_token_kind,
+    decode_token_kind,
+    decode_trunk_id,
+    decode_trunk_state,
+    decode_trunk_value,
+    encode_branch_id,
+    encode_branch_state,
+    encode_branch_value,
+    encode_leaf_id,
+    encode_leaf_state,
+    encode_leaf_value,
+    encode_token_kind,
+    encode_trunk_id,
+    encode_trunk_state,
+    encode_trunk_value,
+    // Serialized value types
+    SerializedBranch,
+    SerializedLeaf,
+    SerializedTrunk,
+    // Table definitions
+    BRANCHES,
+    BRANCH_LEAVES,
+    INODE_TRUNK,
+    LEAVES,
+    PATH_TRUNK,
+    TRUNKS,
+    TRUNK_BRANCHES,
 };
 
 #[cfg(test)]

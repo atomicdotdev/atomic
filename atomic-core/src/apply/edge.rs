@@ -264,12 +264,12 @@ fn apply_new_edge<T: MutTxnT>(
 /// edges originate from the END of the predecessor span.
 ///
 /// For example, if we have:
-/// - Inode span V[17:17] (empty)
-/// - Content span V[17:27]
+/// - Inode span V\[17:17\] (empty)
+/// - Content span V\[17:27\]
 ///
 /// And we want to find the source for an edge at position 17, we want
-/// the inode span V[17:17] (which ENDS at 17), not the content span
-/// V[17:27] (which STARTS at 17).
+/// the inode span V\[17:17\] (which ENDS at 17), not the content span
+/// V\[17:27\] (which STARTS at 17).
 ///
 /// # Arguments
 ///

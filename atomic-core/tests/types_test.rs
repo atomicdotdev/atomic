@@ -4,8 +4,8 @@
 //! foundation of the Atomic VCS graph model.
 
 use atomic_core::types::{
-    Base32, ChangePosition, EdgeFlags, GraphEdge, GraphNode, Hash, Inode, Merkle,
-    NodeId, Position, SerializedGraphEdge, L64,
+    Base32, ChangePosition, EdgeFlags, GraphEdge, GraphNode, Hash, Inode, Merkle, NodeId, Position,
+    SerializedGraphEdge, L64,
 };
 
 // L64 Tests - Little-endian 64-bit wrapper

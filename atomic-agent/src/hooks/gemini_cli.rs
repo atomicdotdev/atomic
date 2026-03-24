@@ -286,7 +286,7 @@ struct GeminiHooks {
 ///
 /// Handles hook JSON parsing, installation into `.gemini/settings.json`,
 /// and presence detection via the `.gemini/` directory.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct GeminiCliHook {
     _private: (),
 }
@@ -294,7 +294,7 @@ pub struct GeminiCliHook {
 impl GeminiCliHook {
     /// Create a new Gemini CLI hook adapter.
     pub fn new() -> Self {
-        Self { _private: () }
+        Self::default()
     }
 
     /// Returns the path to `.gemini/settings.json` relative to the repo root.

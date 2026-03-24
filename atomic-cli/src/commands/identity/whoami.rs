@@ -120,7 +120,10 @@ impl WhoAmI {
         context: Option<&IdentityUsage>,
     ) {
         if let Some(usage) = context {
-            print_section(&format!("Current identity for {}: {}", usage, identity.name));
+            print_section(&format!(
+                "Current identity for {}: {}",
+                usage, identity.name
+            ));
         } else {
             print_section(&format!("Current identity: {}", identity.name));
         }
@@ -130,7 +133,10 @@ impl WhoAmI {
             println!("  Email:       {}", email);
         }
 
-        println!("  Type:        {}", super::format_identity_type(&identity.identity_type));
+        println!(
+            "  Type:        {}",
+            super::format_identity_type(&identity.identity_type)
+        );
         println!("  Usage:       {}", super::format_usage(&identity.usage));
         println!("  Public Key:  {}...", &identity.public_key_base32()[..24]);
 
@@ -148,11 +154,7 @@ impl WhoAmI {
     }
 
     /// Output identity as JSON.
-    fn output_json(
-        &self,
-        identity: &atomic_identity::Identity,
-        context: Option<&IdentityUsage>,
-    ) {
+    fn output_json(&self, identity: &atomic_identity::Identity, context: Option<&IdentityUsage>) {
         use serde_json::json;
 
         let mut obj = json!({

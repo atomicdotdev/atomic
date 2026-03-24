@@ -71,7 +71,7 @@
 //!
 //! This is typically done interactively by the user.
 
-use crate::types::{Hash, NodeId, Position, GraphNode};
+use crate::types::{GraphNode, Hash, NodeId, Position};
 use std::collections::HashSet;
 
 // Zombie Conflicts

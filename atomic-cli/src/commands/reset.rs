@@ -167,7 +167,11 @@ impl Reset {
     /// Otherwise returns the path as-is.
     pub fn normalize_path(&self, repo_root: &std::path::Path, path: &str) -> CliResult<String> {
         let p = std::path::Path::new(path);
-        if p.is_absolute() {
+        // On Windows, Path::is_absolute() returns false for Unix-style "/foo"
+        // paths (they're drive-relative). Treat a leading '/' as absolute on
+        // all platforms so cross-platform behaviour is consistent.
+        let looks_absolute = p.is_absolute() || path.starts_with('/');
+        if looks_absolute {
             match p.strip_prefix(repo_root) {
                 Ok(rel) => Ok(rel.to_string_lossy().to_string()),
                 Err(_) => Err(CliError::PathOutsideRepository {
@@ -374,10 +378,10 @@ impl Command for Reset {
 
         // Check if there's anything to reset
         if files_to_reset.is_empty() {
-            if self.stack.is_some() {
+            if let Some(stack) = &self.stack {
                 print_success(&format!(
                     "Switched to stack '{}' (working copy already clean)",
-                    self.stack.as_ref().unwrap()
+                    stack
                 ));
             } else {
                 println!("Nothing to reset - working copy is clean");

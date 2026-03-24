@@ -233,7 +233,10 @@ impl WordDiffOp {
 impl std::fmt::Display for WordDiffOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WordDiffOp::Equal { old_range, new_range } => {
+            WordDiffOp::Equal {
+                old_range,
+                new_range,
+            } => {
                 write!(f, "Equal(old:{:?}, new:{:?})", old_range, new_range)
             }
             WordDiffOp::Insert { old_pos, new_range } => {
@@ -242,7 +245,10 @@ impl std::fmt::Display for WordDiffOp {
             WordDiffOp::Delete { old_range, new_pos } => {
                 write!(f, "Delete(old:{:?}, @{})", old_range, new_pos)
             }
-            WordDiffOp::Replace { old_range, new_range } => {
+            WordDiffOp::Replace {
+                old_range,
+                new_range,
+            } => {
                 write!(f, "Replace(old:{:?}, new:{:?})", old_range, new_range)
             }
         }
@@ -1049,9 +1055,10 @@ mod tests {
         assert!(result.has_changes());
 
         // The number 1 should be replaced with 2
-        let has_replace_or_del_ins = result.ops().iter().any(|op| {
-            op.is_replace() || op.is_delete() || op.is_insert()
-        });
+        let has_replace_or_del_ins = result
+            .ops()
+            .iter()
+            .any(|op| op.is_replace() || op.is_delete() || op.is_insert());
         assert!(has_replace_or_del_ins);
     }
 
@@ -1252,9 +1259,7 @@ mod tests {
         let result = word_diff(b"a b c", b"a b c");
 
         // Should be one Equal operation, not three separate ones
-        let equals: Vec<_> = result.ops().iter()
-            .filter(|op| op.is_equal())
-            .collect();
+        let equals: Vec<_> = result.ops().iter().filter(|op| op.is_equal()).collect();
 
         // After merging, equal ranges should be combined
         assert!(!equals.is_empty());

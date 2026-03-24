@@ -90,20 +90,15 @@ use crate::output::{print_hint, print_success, print_warning};
 // Reference Parsing
 
 /// A parsed change reference.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ChangeRef {
     /// The last change (`@` or no argument)
+    #[default]
     Last,
     /// N changes back from the last (`@~N`)
     Relative(u64),
     /// A specific change by hash or hash prefix
     Hash(String),
-}
-
-impl Default for ChangeRef {
-    fn default() -> Self {
-        Self::Last
-    }
 }
 
 impl ChangeRef {
@@ -223,7 +218,7 @@ pub struct Revise {
     #[arg(long)]
     pub no_edit: bool,
 
-    /// Author for the revised change (format: "Name <email>").
+    /// Author for the revised change (format: `"Name <email>"`).
     ///
     /// If not provided, uses the original author.
     #[arg(short, long)]

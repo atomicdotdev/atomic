@@ -93,16 +93,16 @@ init_git_repo
 git_commit "Initial commit" "main.txt" "main content"
 git_commit "Second commit" "main.txt" "updated main"
 
+# Capture the current branch name BEFORE switching to feature,
+# so we know which branch is "main".  The pipefail-safe form avoids
+# a non-zero exit from git symbolic-ref (no origin) killing the script.
+main_branch="$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")"
+
 # Create feature branch with additional commits
 git checkout -b feature --quiet
 git_commit "Feature commit" "feature.txt" "feature content"
 
-# Switch back to main (or master, depending on git version)
-main_branch="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|origin/||')"
-# For local repos without origin, fall back to the currently checked-out branch
-if [ -z "$main_branch" ]; then
-    main_branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo "main")"
-fi
+# Switch back to the original (main) branch
 git checkout "$main_branch" --quiet 2>/dev/null || true
 
 # Import main branch

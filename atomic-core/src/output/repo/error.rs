@@ -89,7 +89,7 @@ pub enum OutputError {
     Graph(Box<dyn std::error::Error + Send + Sync>),
 
     /// Pristine database operation failed.
-    Pristine(PristineError),
+    Pristine(Box<PristineError>),
 
     /// Path not found in the repository tree.
     PathNotFound {
@@ -317,7 +317,7 @@ impl std::error::Error for OutputError {
             Self::WorkingCopy(err) => Some(err.as_ref()),
             Self::ChangeStore(err) => Some(err.as_ref()),
             Self::Graph(err) => Some(err.as_ref()),
-            Self::Pristine(err) => Some(err),
+            Self::Pristine(err) => Some(err.as_ref()),
             Self::PathNotFound { .. } | Self::InodeNotFound { .. } => None,
         }
     }
@@ -331,7 +331,7 @@ impl From<std::io::Error> for OutputError {
 
 impl From<PristineError> for OutputError {
     fn from(err: PristineError) -> Self {
-        Self::Pristine(err)
+        Self::Pristine(Box::new(err))
     }
 }
 
@@ -443,7 +443,9 @@ mod tests {
 
     #[test]
     fn test_from_pristine_error() {
-        let pristine_err = PristineError::StackNotFound { name: "test".to_string() };
+        let pristine_err = PristineError::StackNotFound {
+            name: "test".to_string(),
+        };
         let err: OutputError = pristine_err.into();
 
         assert!(err.is_pristine());
@@ -488,10 +490,8 @@ mod tests {
 
     #[test]
     fn test_display_working_copy() {
-        let err = OutputError::working_copy(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "failed",
-        ));
+        let err =
+            OutputError::working_copy(std::io::Error::new(std::io::ErrorKind::Other, "failed"));
         let display = err.to_string();
 
         assert!(display.contains("Working copy"));
@@ -499,10 +499,8 @@ mod tests {
 
     #[test]
     fn test_display_change_store() {
-        let err = OutputError::change_store(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "failed",
-        ));
+        let err =
+            OutputError::change_store(std::io::Error::new(std::io::ErrorKind::Other, "failed"));
         let display = err.to_string();
 
         assert!(display.contains("Change store"));
@@ -510,10 +508,7 @@ mod tests {
 
     #[test]
     fn test_display_graph() {
-        let err = OutputError::graph(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "failed",
-        ));
+        let err = OutputError::graph(std::io::Error::new(std::io::ErrorKind::Other, "failed"));
         let display = err.to_string();
 
         assert!(display.contains("Graph"));
@@ -589,7 +584,10 @@ mod tests {
         let g = OutputError::graph(std::io::Error::new(std::io::ErrorKind::Other, ""));
         assert!(g.is_graph());
 
-        let p: OutputError = PristineError::StackNotFound { name: "test".to_string() }.into();
+        let p: OutputError = PristineError::StackNotFound {
+            name: "test".to_string(),
+        }
+        .into();
         assert!(p.is_pristine());
 
         let pnf = OutputError::path_not_found("test");

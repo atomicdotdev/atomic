@@ -469,9 +469,7 @@ impl FileMetadata {
         let is_directory = (byte & 0b01) != 0;
         let is_executable = (byte & 0b10) != 0;
 
-        let permissions = if is_directory {
-            0o755
-        } else if is_executable {
+        let permissions = if is_directory || is_executable {
             0o755
         } else {
             0o644
@@ -961,7 +959,8 @@ mod tests {
         let parent_pos = Position::new(NodeId::new(1), ChangePosition::new(50));
         let metadata = FileMetadata::executable();
 
-        let item = RecordItem::with_details(path.clone(), inode, parent_inode, parent_pos, metadata);
+        let item =
+            RecordItem::with_details(path.clone(), inode, parent_inode, parent_pos, metadata);
 
         assert_eq!(item.path(), path.as_path());
         assert_eq!(item.basename(), "README.md");
@@ -973,21 +972,13 @@ mod tests {
 
     #[test]
     fn test_record_item_path_string() {
-        let item = RecordItem::new(
-            PathBuf::from("src/lib.rs"),
-            Inode::new(1),
-            Position::ROOT,
-        );
+        let item = RecordItem::new(PathBuf::from("src/lib.rs"), Inode::new(1), Position::ROOT);
         assert_eq!(item.path_string(), "src/lib.rs");
     }
 
     #[test]
     fn test_record_item_set_metadata() {
-        let mut item = RecordItem::new(
-            PathBuf::from("script.sh"),
-            Inode::new(1),
-            Position::ROOT,
-        );
+        let mut item = RecordItem::new(PathBuf::from("script.sh"), Inode::new(1), Position::ROOT);
 
         assert!(!item.metadata().is_executable());
 
@@ -997,11 +988,7 @@ mod tests {
 
     #[test]
     fn test_record_item_set_parent_inode() {
-        let mut item = RecordItem::new(
-            PathBuf::from("file.txt"),
-            Inode::new(1),
-            Position::ROOT,
-        );
+        let mut item = RecordItem::new(PathBuf::from("file.txt"), Inode::new(1), Position::ROOT);
 
         assert_eq!(item.parent_inode(), Inode::ROOT);
 
@@ -1011,11 +998,7 @@ mod tests {
 
     #[test]
     fn test_record_item_is_dir() {
-        let mut item = RecordItem::new(
-            PathBuf::from("directory"),
-            Inode::new(1),
-            Position::ROOT,
-        );
+        let mut item = RecordItem::new(PathBuf::from("directory"), Inode::new(1), Position::ROOT);
 
         assert!(!item.is_dir());
 
@@ -1030,11 +1013,7 @@ mod tests {
         assert_eq!(root.basename(), "");
 
         // File at root level
-        let item = RecordItem::new(
-            PathBuf::from("file.txt"),
-            Inode::new(1),
-            Position::ROOT,
-        );
+        let item = RecordItem::new(PathBuf::from("file.txt"), Inode::new(1), Position::ROOT);
         assert_eq!(item.basename(), "file.txt");
     }
 
@@ -1051,21 +1030,9 @@ mod tests {
 
     #[test]
     fn test_record_item_equality() {
-        let item1 = RecordItem::new(
-            PathBuf::from("file.txt"),
-            Inode::new(1),
-            Position::ROOT,
-        );
-        let item2 = RecordItem::new(
-            PathBuf::from("file.txt"),
-            Inode::new(1),
-            Position::ROOT,
-        );
-        let item3 = RecordItem::new(
-            PathBuf::from("other.txt"),
-            Inode::new(2),
-            Position::ROOT,
-        );
+        let item1 = RecordItem::new(PathBuf::from("file.txt"), Inode::new(1), Position::ROOT);
+        let item2 = RecordItem::new(PathBuf::from("file.txt"), Inode::new(1), Position::ROOT);
+        let item3 = RecordItem::new(PathBuf::from("other.txt"), Inode::new(2), Position::ROOT);
 
         assert_eq!(item1, item2);
         assert_ne!(item1, item3);
@@ -1073,11 +1040,7 @@ mod tests {
 
     #[test]
     fn test_record_item_debug() {
-        let item = RecordItem::new(
-            PathBuf::from("test.rs"),
-            Inode::new(42),
-            Position::ROOT,
-        );
+        let item = RecordItem::new(PathBuf::from("test.rs"), Inode::new(42), Position::ROOT);
         let debug = format!("{:?}", item);
         assert!(debug.contains("test.rs"));
         assert!(debug.contains("42"));

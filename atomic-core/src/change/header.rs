@@ -39,7 +39,7 @@ use std::fmt;
 /// The `identity` field can contain a reference to a cryptographic identity
 /// (e.g., an Ed25519 public key in base32). This allows verifying that a
 /// change was actually created by the claimed author.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Author {
     /// Display name of the author (required)
     pub name: String,
@@ -124,21 +124,11 @@ impl Author {
 
     /// Get a short display string for this author.
     ///
-    /// Returns "Name <email>" if email is present, otherwise just "Name".
+    /// Returns "Name \<email\>" if email is present, otherwise just "Name".
     pub fn display_short(&self) -> String {
         match &self.email {
             Some(email) => format!("{} <{}>", self.name, email),
             None => self.name.clone(),
-        }
-    }
-}
-
-impl Default for Author {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            email: None,
-            identity: None,
         }
     }
 }
@@ -150,7 +140,7 @@ impl fmt::Display for Author {
 }
 
 impl From<&str> for Author {
-    /// Parse an author from a string like "Name <email>".
+    /// Parse an author from a string like "Name \<email\>".
     ///
     /// If no email is found, the entire string is used as the name.
     fn from(s: &str) -> Self {
@@ -300,7 +290,10 @@ impl ChangeHeader {
         }
 
         // Timestamp
-        result.push_str(&format!("Date:   {}\n", self.timestamp.format("%Y-%m-%d %H:%M:%S UTC")));
+        result.push_str(&format!(
+            "Date:   {}\n",
+            self.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+        ));
 
         // Message
         result.push_str(&format!("\n    {}\n", self.message));
@@ -526,9 +519,7 @@ mod tests {
 
     #[test]
     fn test_header_builder_basic() {
-        let header = ChangeHeader::builder()
-            .message("Add feature")
-            .build();
+        let header = ChangeHeader::builder().message("Add feature").build();
         assert_eq!(header.message, "Add feature");
     }
 
@@ -542,7 +533,10 @@ mod tests {
             .build();
 
         assert_eq!(header.message, "Add feature");
-        assert_eq!(header.description, Some("This adds the widget feature".to_string()));
+        assert_eq!(
+            header.description,
+            Some("This adds the widget feature".to_string())
+        );
         assert_eq!(header.authors.len(), 2);
     }
 
@@ -562,17 +556,13 @@ mod tests {
 
     #[test]
     fn test_header_try_build_success() {
-        let result = ChangeHeader::builder()
-            .message("Valid message")
-            .try_build();
+        let result = ChangeHeader::builder().message("Valid message").try_build();
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_header_try_build_empty_message() {
-        let result = ChangeHeader::builder()
-            .message("")
-            .try_build();
+        let result = ChangeHeader::builder().message("").try_build();
         assert!(result.is_err());
     }
 

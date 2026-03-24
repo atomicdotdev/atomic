@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 ///
 /// This is used for displaying diffs and change descriptions to users.
 /// The actual change operations use graph positions, not line numbers.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Local {
     /// Path to the file (relative to repository root)
     pub path: String,
@@ -112,15 +112,6 @@ impl Local {
     }
 }
 
-impl Default for Local {
-    fn default() -> Self {
-        Self {
-            path: String::new(),
-            line: 0,
-        }
-    }
-}
-
 impl fmt::Display for Local {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.path, self.line)
@@ -149,7 +140,7 @@ impl From<(String, u64)> for Local {
 /// - Binary file changes
 /// - Exact cursor positioning in editors
 /// - Conflict resolution at byte boundaries
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LocalByte {
     /// Path to the file (relative to repository root)
     pub path: String,
@@ -238,17 +229,6 @@ impl LocalByte {
     #[inline]
     pub fn has_inode(&self) -> bool {
         self.inode.is_some()
-    }
-}
-
-impl Default for LocalByte {
-    fn default() -> Self {
-        Self {
-            path: String::new(),
-            line: 0,
-            inode: None,
-            byte: 0,
-        }
     }
 }
 

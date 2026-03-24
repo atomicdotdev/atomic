@@ -106,6 +106,7 @@ fn validate_stack_name(name: &str) -> Result<(), String> {
 /// This is equivalent to `atomic stack new <NAME> --from <SOURCE>`.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "split")]
+#[derive(Default)]
 pub struct Split {
     /// Name of the new stack to create.
     ///
@@ -148,16 +149,6 @@ impl Split {
     pub fn with_switch(mut self, switch: bool) -> Self {
         self.switch = switch;
         self
-    }
-}
-
-impl Default for Split {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            source: None,
-            switch: false,
-        }
     }
 }
 

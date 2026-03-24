@@ -343,7 +343,11 @@ impl OutputOutcome {
         }
 
         if dirs > 0 {
-            let dir_word = if dirs == 1 { "directory" } else { "directories" };
+            let dir_word = if dirs == 1 {
+                "directory"
+            } else {
+                "directories"
+            };
             parts.push(format!("{} {} created", dirs, dir_word));
         }
 

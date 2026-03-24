@@ -86,7 +86,7 @@ impl Repository {
         config
             .get_default()
             .map(|(name, entry)| (name.to_string(), entry.clone()))
-            .ok_or_else(|| RepositoryError::NoRemotesConfigured)
+            .ok_or(RepositoryError::NoRemotesConfigured)
     }
 
     /// Add a new remote.
@@ -113,7 +113,7 @@ impl Repository {
         let mut config = self.load_remotes()?;
         config
             .add(name, RemoteEntry::new(url))
-            .map_err(|e| RepositoryError::Remote(e))?;
+            .map_err(RepositoryError::Remote)?;
         self.save_remotes(&config)
     }
 
@@ -127,7 +127,7 @@ impl Repository {
         let mut config = self.load_remotes()?;
         config
             .add(name, RemoteEntry::new_default(url))
-            .map_err(|e| RepositoryError::Remote(e))?;
+            .map_err(RepositoryError::Remote)?;
         self.save_remotes(&config)
     }
 
@@ -142,9 +142,7 @@ impl Repository {
     /// Returns an error if the remote doesn't exist.
     pub fn remove_remote(&self, name: &str) -> Result<(), RepositoryError> {
         let mut config = self.load_remotes()?;
-        config
-            .remove(name)
-            .map_err(|e| RepositoryError::Remote(e))?;
+        config.remove(name).map_err(RepositoryError::Remote)?;
         self.save_remotes(&config)
     }
 
@@ -160,9 +158,7 @@ impl Repository {
     /// Returns an error if the remote doesn't exist or the URL is invalid.
     pub fn set_remote_url(&self, name: &str, url: &str) -> Result<(), RepositoryError> {
         let mut config = self.load_remotes()?;
-        config
-            .set_url(name, url)
-            .map_err(|e| RepositoryError::Remote(e))?;
+        config.set_url(name, url).map_err(RepositoryError::Remote)?;
         self.save_remotes(&config)
     }
 
@@ -177,9 +173,7 @@ impl Repository {
     /// Returns an error if the remote doesn't exist.
     pub fn set_default_remote(&self, name: &str) -> Result<(), RepositoryError> {
         let mut config = self.load_remotes()?;
-        config
-            .set_default(name)
-            .map_err(|e| RepositoryError::Remote(e))?;
+        config.set_default(name).map_err(RepositoryError::Remote)?;
         self.save_remotes(&config)
     }
 
@@ -193,7 +187,7 @@ impl Repository {
         let mut config = self.load_remotes()?;
         config
             .rename(old_name, new_name)
-            .map_err(|e| RepositoryError::Remote(e))?;
+            .map_err(RepositoryError::Remote)?;
         self.save_remotes(&config)
     }
 

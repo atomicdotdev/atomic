@@ -393,10 +393,7 @@ impl AgentError {
 
 impl From<walkdir::Error> for AgentError {
     fn from(err: walkdir::Error) -> Self {
-        AgentError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            err.to_string(),
-        ))
+        AgentError::Io(std::io::Error::other(err.to_string()))
     }
 }
 

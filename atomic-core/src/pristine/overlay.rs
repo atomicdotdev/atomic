@@ -295,14 +295,14 @@ impl<'a, T: GraphTxnT + StackTxnT> GraphTxnT for OverlayTxn<'a, T> {
 
         // Check each STACK_GRAPH layer
         for &stack_id in &self.stack_chain {
-            let iter = self.inner.iter_stack_graph_adjacent(
+            let mut iter = self.inner.iter_stack_graph_adjacent(
                 stack_id,
                 node,
                 EdgeFlags::empty(),
                 EdgeFlags::all(),
             )?;
             // A vertex "exists" if it has at least one edge
-            for edge_result in iter {
+            if let Some(edge_result) = iter.next() {
                 let _ = edge_result?;
                 return Ok(true);
             }
@@ -376,13 +376,13 @@ pub(crate) fn find_block_in_stack_graph<T: StackTxnT>(
             ChangePosition::new(target_pos),
         );
         // Check if this exact vertex has edges in STACK_GRAPH
-        let iter = txn.iter_stack_graph_adjacent(
+        let mut iter = txn.iter_stack_graph_adjacent(
             stack_id,
             empty_node,
             EdgeFlags::empty(),
             EdgeFlags::all(),
         )?;
-        for edge_result in iter {
+        if let Some(edge_result) = iter.next() {
             let _ = edge_result?;
             return Ok(Some(empty_node));
         }
@@ -610,7 +610,7 @@ impl<'a, T: GraphTxnT + StackTxnT> StackTxnT for OverlayTxn<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pristine::{MutTxnT, Pristine, StackKind, StackState, StackTxnT};
+    use crate::pristine::{MutTxnT, Pristine, StackKind, StackTxnT};
     use crate::types::Position;
     use tempfile::tempdir;
 

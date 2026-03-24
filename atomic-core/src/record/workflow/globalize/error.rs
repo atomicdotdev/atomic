@@ -69,7 +69,7 @@ pub enum GlobalizeError {
 
     /// A database error occurred during globalization.
     #[error("Database error: {0}")]
-    Pristine(#[from] PristineError),
+    Pristine(Box<PristineError>),
 
     /// The recorded file is missing required information.
     #[error("Recorded file missing {field}: {path}")]
@@ -90,6 +90,12 @@ pub enum GlobalizeError {
         /// The maximum valid line number
         max_line: u64,
     },
+}
+
+impl From<PristineError> for GlobalizeError {
+    fn from(e: PristineError) -> Self {
+        Self::Pristine(Box::new(e))
+    }
 }
 
 /// Result type for globalization operations.

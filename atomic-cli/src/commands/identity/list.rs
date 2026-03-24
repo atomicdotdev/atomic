@@ -96,17 +96,13 @@ impl Command for List {
         })?;
 
         // Get the default identity ID for marking
-        let default_id = store
-            .get_default()
-            .ok()
-            .flatten()
-            .map(|i| i.id);
+        let default_id = store.get_default().ok().flatten().map(|i| i.id);
 
         // List identities with filter
         let filter = self.build_filter();
-        let identities = store.list_filtered(&filter).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to list identities: {}", e))
-        })?;
+        let identities = store
+            .list_filtered(&filter)
+            .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to list identities: {}", e)))?;
 
         if identities.is_empty() {
             print_info("No identities found");
@@ -157,7 +153,11 @@ impl List {
                 super::format_identity_type(&identity.identity_type).to_string(),
                 super::format_usage(&identity.usage),
                 identity.email.clone().unwrap_or_default(),
-                if is_default { "*".to_string() } else { String::new() },
+                if is_default {
+                    "*".to_string()
+                } else {
+                    String::new()
+                },
             ];
 
             if self.verbose {
@@ -172,7 +172,8 @@ impl List {
 
         // Print summary
         println!();
-        print_info(&format!("{} identit{} found",
+        print_info(&format!(
+            "{} identit{} found",
             identities.len(),
             if identities.len() == 1 { "y" } else { "ies" }
         ));

@@ -500,17 +500,32 @@ impl<'a, H> Iterator for HunkAtomIter<'a, H> {
             // FileAdd: add_name, add_inode, contents
             (GraphOp::FileAdd { add_name, .. }, 0) => Some(AtomRef::Insertion(add_name)),
             (GraphOp::FileAdd { add_inode, .. }, 1) => Some(AtomRef::Insertion(add_inode)),
-            (GraphOp::FileAdd { contents: Some(c), .. }, 2) => Some(AtomRef::Insertion(c)),
+            (
+                GraphOp::FileAdd {
+                    contents: Some(c), ..
+                },
+                2,
+            ) => Some(AtomRef::Insertion(c)),
             (GraphOp::FileAdd { .. }, _) => None,
 
             // FileDel: del, contents
             (GraphOp::FileDel { del, .. }, 0) => Some(AtomRef::EdgeUpdate(del)),
-            (GraphOp::FileDel { contents: Some(c), .. }, 1) => Some(AtomRef::EdgeUpdate(c)),
+            (
+                GraphOp::FileDel {
+                    contents: Some(c), ..
+                },
+                1,
+            ) => Some(AtomRef::EdgeUpdate(c)),
             (GraphOp::FileDel { .. }, _) => None,
 
             // FileUndel: undel, contents
             (GraphOp::FileUndel { undel, .. }, 0) => Some(AtomRef::EdgeUpdate(undel)),
-            (GraphOp::FileUndel { contents: Some(c), .. }, 1) => Some(AtomRef::EdgeUpdate(c)),
+            (
+                GraphOp::FileUndel {
+                    contents: Some(c), ..
+                },
+                1,
+            ) => Some(AtomRef::EdgeUpdate(c)),
             (GraphOp::FileUndel { .. }, _) => None,
 
             // FileMove: del, add
@@ -602,11 +617,17 @@ impl<H> GraphOp<H> {
     /// Count the number of atoms in this graph_op.
     pub fn atom_count(&self) -> usize {
         match self {
-            GraphOp::FileAdd { contents: Some(_), .. } => 3,
+            GraphOp::FileAdd {
+                contents: Some(_), ..
+            } => 3,
             GraphOp::FileAdd { contents: None, .. } => 2,
-            GraphOp::FileDel { contents: Some(_), .. } => 2,
+            GraphOp::FileDel {
+                contents: Some(_), ..
+            } => 2,
             GraphOp::FileDel { contents: None, .. } => 1,
-            GraphOp::FileUndel { contents: Some(_), .. } => 2,
+            GraphOp::FileUndel {
+                contents: Some(_), ..
+            } => 2,
             GraphOp::FileUndel { contents: None, .. } => 1,
             GraphOp::FileMove { .. } => 2,
             GraphOp::Edit { .. } => 1,

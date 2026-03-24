@@ -57,7 +57,7 @@
 //!
 //! # Thread Safety
 //!
-//! The [`ChangeStore`] uses interior mutability ([`RefCell`]) for the cache,
+//! The [`ChangeStore`] uses interior mutability ([`std::cell::RefCell`]) for the cache,
 //! making it `!Sync`. For concurrent access, wrap it in a `Mutex` or use
 //! separate instances per thread.
 
@@ -782,10 +782,10 @@ impl ChangeStore {
         let temp_file = tempfile::NamedTempFile::new_in(&self.changes_dir)?;
         temp_file.as_file().write_all(&data)?;
         temp_file.persist(&path).map_err(|e| {
-            ChangeStoreError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to persist attestation: {}", e),
-            ))
+            ChangeStoreError::Io(std::io::Error::other(format!(
+                "Failed to persist attestation: {}",
+                e
+            )))
         })?;
 
         log::debug!(
@@ -913,10 +913,10 @@ impl ChangeStore {
         let temp_file = tempfile::NamedTempFile::new_in(&self.changes_dir)?;
         temp_file.as_file().write_all(&data)?;
         temp_file.persist(&path).map_err(|e| {
-            ChangeStoreError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to persist provenance graph: {}", e),
-            ))
+            ChangeStoreError::Io(std::io::Error::other(format!(
+                "Failed to persist provenance graph: {}",
+                e
+            )))
         })?;
 
         log::debug!(
@@ -1016,7 +1016,7 @@ impl<'a> AttestationIterator<'a> {
                         }
                         if path
                             .extension()
-                            .map_or(true, |e| e != atomic_core::change::ATTESTATION_EXTENSION)
+                            .is_none_or(|e| e != atomic_core::change::ATTESTATION_EXTENSION)
                         {
                             continue;
                         }
@@ -1077,17 +1077,15 @@ impl<'a> Iterator for AttestationIterator<'a> {
 /// Iterator over provenance graph hashes in the changes directory.
 ///
 /// Walks the two-level directory structure looking for `.provenance` files.
-struct ProvenanceIterator<'a> {
-    changes_dir: &'a Path,
+struct ProvenanceIterator {
     prefix_dirs: Option<fs::ReadDir>,
     current_files: Option<fs::ReadDir>,
 }
 
-impl<'a> ProvenanceIterator<'a> {
-    fn new(changes_dir: &'a Path) -> Self {
+impl ProvenanceIterator {
+    fn new(changes_dir: &Path) -> Self {
         let prefix_dirs = fs::read_dir(changes_dir).ok();
         Self {
-            changes_dir,
             prefix_dirs,
             current_files: None,
         }
@@ -1102,9 +1100,10 @@ impl<'a> ProvenanceIterator<'a> {
                         if !path.is_file() {
                             continue;
                         }
-                        if path.extension().map_or(true, |e| {
-                            e != atomic_core::change::PROVENANCE_GRAPH_EXTENSION
-                        }) {
+                        if path
+                            .extension()
+                            .is_none_or(|e| e != atomic_core::change::PROVENANCE_GRAPH_EXTENSION)
+                        {
                             continue;
                         }
                         // Extract hash from filename (strip extension)
@@ -1129,7 +1128,7 @@ impl<'a> ProvenanceIterator<'a> {
     }
 }
 
-impl<'a> Iterator for ProvenanceIterator<'a> {
+impl Iterator for ProvenanceIterator {
     type Item = ChangeStoreResult<Hash>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1320,7 +1319,7 @@ impl ChangeIterator {
                     }
 
                     // Check for .change extension
-                    if path.extension().map_or(true, |e| e != CHANGE_EXTENSION) {
+                    if path.extension().is_none_or(|e| e != CHANGE_EXTENSION) {
                         continue;
                     }
 

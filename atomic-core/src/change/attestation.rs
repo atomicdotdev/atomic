@@ -242,7 +242,7 @@ impl Attestation {
         let mut data = Vec::new();
         reader
             .read_to_end(&mut data)
-            .map_err(|e| AttestationError::Io(e))?;
+            .map_err(AttestationError::Io)?;
         Self::deserialize(&data)
     }
 
@@ -250,9 +250,7 @@ impl Attestation {
     pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<Hash, AttestationError> {
         let data = self.serialize()?;
         let hash = Hash::of(&data);
-        writer
-            .write_all(&data)
-            .map_err(|e| AttestationError::Io(e))?;
+        writer.write_all(&data).map_err(AttestationError::Io)?;
         Ok(hash)
     }
 

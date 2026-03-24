@@ -508,11 +508,7 @@ impl TreeItem {
     /// assert_eq!(item.path, "src/main.rs");
     /// assert!(!item.is_directory);
     /// ```
-    pub fn file(
-        path: impl Into<String>,
-        inode: Inode,
-        position: Position<NodeId>,
-    ) -> Self {
+    pub fn file(path: impl Into<String>, inode: Inode, position: Position<NodeId>) -> Self {
         let path = path.into();
         let depth = TreeCollectOptions::path_depth(&path);
         Self {
@@ -830,13 +826,14 @@ pub fn collect_tree<T: TreeTxnT + GraphTxnT>(
                 }
 
                 // Check if we should include this directory
-                if !seen_directories.contains(&current) && options.should_include(&current) {
-                    if !options.exceeds_depth(&current) {
-                        seen_directories.insert(current.clone());
-                        // We don't have the inode for intermediate directories
-                        // In a full implementation, we'd look this up
-                        result.add_directory(TreeItem::directory(&current, Inode::ROOT));
-                    }
+                if !seen_directories.contains(&current)
+                    && options.should_include(&current)
+                    && !options.exceeds_depth(&current)
+                {
+                    seen_directories.insert(current.clone());
+                    // We don't have the inode for intermediate directories
+                    // In a full implementation, we'd look this up
+                    result.add_directory(TreeItem::directory(&current, Inode::ROOT));
                 }
             }
         }
@@ -847,10 +844,7 @@ pub fn collect_tree<T: TreeTxnT + GraphTxnT>(
             let position = match txn.inode_position(inode)? {
                 Some(pos) => pos,
                 None => {
-                    result.record_error(
-                        path.clone(),
-                        "No graph position for inode".to_string(),
-                    );
+                    result.record_error(path.clone(), "No graph position for inode".to_string());
                     continue;
                 }
             };
@@ -1414,9 +1408,7 @@ mod tests {
 
     #[test]
     fn test_build_hierarchy_deep_nesting() {
-        let items = vec![
-            TreeItem::file("a/b/c/d.rs", Inode::ROOT, Position::ROOT),
-        ];
+        let items = vec![TreeItem::file("a/b/c/d.rs", Inode::ROOT, Position::ROOT)];
 
         let hierarchy = build_tree_hierarchy(&items);
 

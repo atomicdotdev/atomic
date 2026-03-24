@@ -231,7 +231,7 @@ where
                 changes
                     .get_contents(&hash_fn, node, buf)
                     .map(|_| ())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                    .map_err(|e| std::io::Error::other(e.to_string()))
             };
 
             buffer
@@ -270,7 +270,7 @@ where
 mod tests {
     use super::*;
     use crate::change::{Change, ChangeHeader, MemoryChangeStore};
-    use crate::output::alive::{AliveGraph, AliveVertex, OrderResult, VertexFlags, VertexId};
+    use crate::output::alive::{AliveGraph, AliveVertex, OrderResult, VertexId};
     use crate::output::repo::ConflictWriter;
     use crate::types::{ChangePosition, GraphNode, Position};
 

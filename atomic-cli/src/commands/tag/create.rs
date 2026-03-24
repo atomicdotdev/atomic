@@ -47,7 +47,7 @@ use std::path::PathBuf;
 
 // Author Parsing
 
-/// Parse an author string in the format "Name <email>" or just "Name".
+/// Parse an author string in the format `"Name <email>"` or just `"Name"`.
 ///
 /// # Arguments
 ///
@@ -98,7 +98,7 @@ pub struct Create {
 
     /// Author for an annotated tag.
     ///
-    /// Format: "Name <email>" or just "Name".
+    /// Format: `"Name <email>"` or just `"Name"`.
     /// If not provided, uses the default identity.
     #[arg(long, short = 'a', value_name = "AUTHOR")]
     pub author: Option<String>,

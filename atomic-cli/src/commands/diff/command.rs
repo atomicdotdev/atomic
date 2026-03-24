@@ -398,6 +398,7 @@ impl Diff {
                                 let sem_diff = semantic_diff(old_content, new_content);
 
                                 let mut used_semantic = false;
+                                #[allow(clippy::collapsible_match)]
                                 if let Some(change) = sem_diff.changes().first() {
                                     if let LineChange::Modified { token_changes, .. } = change {
                                         // Print old line with semantic token highlighting
@@ -511,8 +512,8 @@ impl Diff {
                             }
 
                             // Print any remaining unpaired removed lines
-                            for k in pairs..removed_lines.len() {
-                                let removed_line = removed_lines[k];
+                            for removed_line in removed_lines.iter().skip(pairs) {
+                                let removed_line = *removed_line;
                                 let line_num_str = if config.show_line_numbers {
                                     format!(
                                         "{:>4} {:>4} ",
@@ -535,8 +536,8 @@ impl Diff {
                             }
 
                             // Print any remaining unpaired added lines
-                            for k in pairs..added_lines.len() {
-                                let added_line = added_lines[k];
+                            for added_line in added_lines.iter().skip(pairs) {
+                                let added_line = *added_line;
                                 let line_num_str = if config.show_line_numbers {
                                     format!(
                                         "{:>4} {:>4} ",

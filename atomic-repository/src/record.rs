@@ -1055,10 +1055,7 @@ mod tests {
         assert!(!opts.all());
         assert_eq!(opts.algorithm(), Algorithm::Myers);
         assert_eq!(opts.default_encoding(), Encoding::Utf8);
-        assert_eq!(
-            opts.max_file_size(),
-            RecordOptions::DEFAULT_MAX_FILE_SIZE
-        );
+        assert_eq!(opts.max_file_size(), RecordOptions::DEFAULT_MAX_FILE_SIZE);
         assert!(!opts.skip_binary());
         assert!(!opts.get_record_empty_files());
         assert_eq!(
@@ -1537,7 +1534,7 @@ mod tests {
 
     #[test]
     fn test_options_provenance_set_vec() {
-        use atomic_core::change::{AITool, AIVendor, SuggestionType};
+        use atomic_core::change::AIVendor;
 
         let prov1 = Provenance::builder()
             .vendor(AIVendor::Anthropic)
@@ -1580,7 +1577,7 @@ mod tests {
 
     #[test]
     fn test_options_to_assembly_options_includes_provenance() {
-        use atomic_core::change::{AITool, AIVendor, SuggestionType};
+        use atomic_core::change::AIVendor;
 
         let prov = Provenance::builder()
             .vendor(AIVendor::Anthropic)
@@ -1600,7 +1597,7 @@ mod tests {
 
     #[test]
     fn test_options_clone_preserves_provenance() {
-        use atomic_core::change::{AITool, AIVendor};
+        use atomic_core::change::AIVendor;
 
         let prov = Provenance::builder()
             .vendor(AIVendor::OpenAI)

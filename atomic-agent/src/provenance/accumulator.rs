@@ -4,7 +4,7 @@
 //!
 //! The accumulator maintains the graph using `atomic-agent` types (JSON-serialized,
 //! `String` change hashes). When a turn is recorded, [`ProvenanceAccumulator::to_provenance_graph`]
-//! converts the accumulated state to the `atomic-core` [`ProvenanceGraph`] type
+//! converts the accumulated state to the `atomic-core` [`atomic_core::change::provenance_graph::ProvenanceGraph`] type
 //! (postcard-serialized, `Hash` change hashes) for content-addressed storage.
 //!
 //! The [`ProvenanceAccumulator`] maintains the provenance graph for a single
@@ -279,6 +279,7 @@ impl ProvenanceAccumulator {
     /// `handle_tool_use` for `PostToolUse` events.
     ///
     /// Returns the new node's ID.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_tool_call(
         &mut self,
         tool_name: &str,
@@ -675,7 +676,7 @@ impl ProvenanceAccumulator {
     ///
     /// The `previous` field is automatically set from `last_provenance_hash`
     /// if a prior graph was saved for this session. Call
-    /// [`set_last_provenance_hash`] after saving to maintain the chain.
+    /// [`Self::set_last_provenance_hash`] after saving to maintain the chain.
     pub fn to_provenance_graph(
         &mut self,
         agent_name: &str,
@@ -758,7 +759,7 @@ impl ProvenanceAccumulator {
     /// graphs chain to it via `previous`.
     ///
     /// Call this after `Repository::save_provenance_graph()` succeeds,
-    /// then call [`save`] to persist the updated state.
+    /// then call [`Self::save`] to persist the updated state.
     pub fn set_last_provenance_hash(&mut self, hash_base32: impl Into<String>) {
         self.last_provenance_hash = Some(hash_base32.into());
     }
@@ -949,7 +950,7 @@ impl ProvenanceAccumulator {
         }
 
         // Trim trailing empty line
-        while lines.last().map_or(false, |l| l.is_empty()) {
+        while lines.last().is_some_and(|l| l.is_empty()) {
             lines.pop();
         }
 
@@ -1820,7 +1821,7 @@ mod tests {
     fn test_serialization_preserves_accumulator_state() {
         let mut acc = ProvenanceAccumulator::new("state-test");
         acc.append_goal("Goal", 1000);
-        let r1 = acc.append_tool_call("read", Some("c1"), None, None, None, None, 1001);
+        let _r1 = acc.append_tool_call("read", Some("c1"), None, None, None, None, 1001);
         acc.append_tool_call("edit", Some("c2"), None, None, None, None, 1002);
 
         let serialized = acc.to_serialized_graph();

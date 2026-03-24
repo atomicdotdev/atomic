@@ -111,23 +111,23 @@ use thiserror::Error;
 pub enum RedbStoreError {
     /// redb database error.
     #[error("Database error: {0}")]
-    Database(#[from] redb::DatabaseError),
+    Database(#[from] Box<redb::DatabaseError>),
 
     /// redb transaction error.
     #[error("Transaction error: {0}")]
-    Transaction(#[from] redb::TransactionError),
+    Transaction(#[from] Box<redb::TransactionError>),
 
     /// redb table error.
     #[error("Table error: {0}")]
-    Table(#[from] redb::TableError),
+    Table(#[from] Box<redb::TableError>),
 
     /// redb storage error.
     #[error("Storage error: {0}")]
-    Storage(#[from] redb::StorageError),
+    Storage(#[from] Box<redb::StorageError>),
 
     /// redb commit error.
     #[error("Commit error: {0}")]
-    Commit(#[from] redb::CommitError),
+    Commit(#[from] Box<redb::CommitError>),
 
     /// V3 format error (postcard, compression, hash mismatch, etc.).
     #[error("Format error: {0}")]
@@ -159,6 +159,36 @@ pub enum RedbStoreError {
 
 /// Convenience result type for redb store operations.
 pub type RedbStoreResult<T> = Result<T, RedbStoreError>;
+
+impl From<redb::DatabaseError> for RedbStoreError {
+    fn from(e: redb::DatabaseError) -> Self {
+        RedbStoreError::Database(Box::new(e))
+    }
+}
+
+impl From<redb::TransactionError> for RedbStoreError {
+    fn from(e: redb::TransactionError) -> Self {
+        RedbStoreError::Transaction(Box::new(e))
+    }
+}
+
+impl From<redb::TableError> for RedbStoreError {
+    fn from(e: redb::TableError) -> Self {
+        RedbStoreError::Table(Box::new(e))
+    }
+}
+
+impl From<redb::StorageError> for RedbStoreError {
+    fn from(e: redb::StorageError) -> Self {
+        RedbStoreError::Storage(Box::new(e))
+    }
+}
+
+impl From<redb::CommitError> for RedbStoreError {
+    fn from(e: redb::CommitError) -> Self {
+        RedbStoreError::Commit(Box::new(e))
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // StoredChangeMeta — metadata blob contents
@@ -374,7 +404,7 @@ impl RedbChangeStore {
         let mut cursor = Cursor::new(data);
         let mut reader = ChangeReader::open(&mut cursor)?;
 
-        let _file_header = reader.file_header().clone();
+        let _file_header = *reader.file_header();
         let hash_table = reader.hash_table().clone();
 
         // Read all sections
