@@ -78,6 +78,7 @@ use crate::output::{print_hint, print_success, print_warning};
 /// - `--force` / `-f`: Force move even if destination exists (overwrite tracking)
 #[derive(Parser, Debug, Clone)]
 #[command(name = "move")]
+#[derive(Default)]
 pub struct Move {
     /// Source file or directory to move.
     ///
@@ -133,7 +134,11 @@ impl Move {
     /// Normalize a path relative to the repository root.
     fn normalize_path(&self, repo_root: &Path, path: &str) -> CliResult<String> {
         let p = Path::new(path);
-        if p.is_absolute() {
+        // On Windows, Path::is_absolute() returns false for Unix-style "/foo"
+        // paths (they're drive-relative). Treat a leading '/' as absolute on
+        // all platforms so cross-platform behaviour is consistent.
+        let looks_absolute = p.is_absolute() || path.starts_with('/');
+        if looks_absolute {
             match p.strip_prefix(repo_root) {
                 Ok(rel) => Ok(rel.to_string_lossy().to_string()),
                 Err(_) => Err(CliError::PathOutsideRepository {
@@ -174,17 +179,6 @@ impl Move {
         }
 
         std::fs::rename(&from_path, &to_path)
-    }
-}
-
-impl Default for Move {
-    fn default() -> Self {
-        Self {
-            source: String::new(),
-            destination: String::new(),
-            dry_run: false,
-            force: false,
-        }
     }
 }
 

@@ -128,7 +128,7 @@ pub struct Record {
 
     /// Override the author for this change.
     ///
-    /// Format: "Name <email>" or just "Name"
+    /// Format: `"Name <email>"` or just `"Name"`
     /// If not provided, uses the default identity from the identity store.
     #[arg(long)]
     pub author: Option<String>,

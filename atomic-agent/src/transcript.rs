@@ -357,10 +357,10 @@ pub fn aggregate_tool_usage(entries: &[CondensedEntry]) -> Vec<ToolUseSummary> {
 
         // Track files affected by file-modifying tools
         if let Some(detail) = &entry.tool_detail {
-            if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
-                if !summary.files_affected.contains(detail) {
-                    summary.files_affected.push(detail.clone());
-                }
+            if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
+                && !summary.files_affected.contains(detail)
+            {
+                summary.files_affected.push(detail.clone());
             }
         }
     }

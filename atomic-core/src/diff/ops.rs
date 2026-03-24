@@ -224,17 +224,36 @@ impl fmt::Display for DiffOp {
                 old_pos,
                 new_pos,
                 len,
-            } => write!(f, "Equal(old={}..{}, new={}..{})", old_pos, old_pos + len, new_pos, new_pos + len),
+            } => write!(
+                f,
+                "Equal(old={}..{}, new={}..{})",
+                old_pos,
+                old_pos + len,
+                new_pos,
+                new_pos + len
+            ),
             DiffOp::Insert {
                 old_pos,
                 new_pos,
                 len,
-            } => write!(f, "Insert(at old={}, new={}..{})", old_pos, new_pos, new_pos + len),
+            } => write!(
+                f,
+                "Insert(at old={}, new={}..{})",
+                old_pos,
+                new_pos,
+                new_pos + len
+            ),
             DiffOp::Delete {
                 old_pos,
                 new_pos,
                 len,
-            } => write!(f, "Delete(old={}..{}, at new={})", old_pos, old_pos + len, new_pos),
+            } => write!(
+                f,
+                "Delete(old={}..{}, at new={})",
+                old_pos,
+                old_pos + len,
+                new_pos
+            ),
             DiffOp::Replace {
                 old_pos,
                 old_len,
@@ -758,7 +777,9 @@ mod tests {
         result.adjust_offsets(10);
 
         match &result[0] {
-            DiffOp::Equal { old_pos, new_pos, .. } => {
+            DiffOp::Equal {
+                old_pos, new_pos, ..
+            } => {
                 assert_eq!(*old_pos, 10);
                 assert_eq!(*new_pos, 10);
             }
@@ -766,7 +787,9 @@ mod tests {
         }
 
         match &result[1] {
-            DiffOp::Insert { old_pos, new_pos, .. } => {
+            DiffOp::Insert {
+                old_pos, new_pos, ..
+            } => {
                 assert_eq!(*old_pos, 11);
                 assert_eq!(*new_pos, 11);
             }

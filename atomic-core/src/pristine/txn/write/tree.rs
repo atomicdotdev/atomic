@@ -63,7 +63,7 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
                     results.push(Ok((k.value().to_string(), Inode::new(v.value()))));
                 }
                 Err(e) => {
-                    results.push(Err(PristineError::Storage(e)));
+                    results.push(Err(PristineError::Storage(Box::new(e))));
                 }
             }
         }
@@ -96,15 +96,13 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
                         end: ChangePosition::new(end),
                     };
 
-                    for v in values {
-                        if let Ok(v) = v {
-                            let edge = deserialize_edge(v.value());
-                            results.push(Ok((node, edge)));
-                        }
+                    for v in values.filter_map(|r| r.ok()) {
+                        let edge = deserialize_edge(v.value());
+                        results.push(Ok((node, edge)));
                     }
                 }
                 Err(e) => {
-                    results.push(Err(PristineError::Storage(e)));
+                    results.push(Err(PristineError::Storage(Box::new(e))));
                 }
             }
         }

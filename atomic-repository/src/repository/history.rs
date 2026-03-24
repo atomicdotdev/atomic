@@ -1,7 +1,6 @@
 use super::*;
 
 impl Repository {
-
     // History Methods
 
     /// Get a forward history log for the current stack.

@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// A tokenizer that splits content into tokens.
 ///
 /// The tokenizer is an iterator that yields tokens from the input content.
@@ -219,8 +218,20 @@ impl<'a> Tokenizer<'a> {
     fn is_operator(b: u8) -> bool {
         matches!(
             b,
-            b'+' | b'-' | b'*' | b'/' | b'%' | b'=' | b'!' | b'<' | b'>' | b'&' | b'|' | b'^'
-                | b'~' | b'?' | b':'
+            b'+' | b'-'
+                | b'*'
+                | b'/'
+                | b'%'
+                | b'='
+                | b'!'
+                | b'<'
+                | b'>'
+                | b'&'
+                | b'|'
+                | b'^'
+                | b'~'
+                | b'?'
+                | b':'
         )
     }
 
@@ -229,8 +240,19 @@ impl<'a> Tokenizer<'a> {
     fn is_punctuation(b: u8) -> bool {
         matches!(
             b,
-            b'(' | b')' | b'{' | b'}' | b'[' | b']' | b';' | b',' | b'.' | b'@' | b'#' | b'$'
-                | b'`' | b'\\'
+            b'(' | b')'
+                | b'{'
+                | b'}'
+                | b'['
+                | b']'
+                | b';'
+                | b','
+                | b'.'
+                | b'@'
+                | b'#'
+                | b'$'
+                | b'`'
+                | b'\\'
         )
     }
 
@@ -371,11 +393,7 @@ impl<'a> Tokenizer<'a> {
         }
 
         // Handle decimal point and fraction
-        if self.peek() == Some(b'.')
-            && self
-                .peek_at(1)
-                .map(|b| b.is_ascii_digit())
-                .unwrap_or(false)
+        if self.peek() == Some(b'.') && self.peek_at(1).map(|b| b.is_ascii_digit()).unwrap_or(false)
         {
             self.advance(); // consume '.'
             while let Some(b) = self.peek() {
@@ -481,11 +499,7 @@ impl<'a> Tokenizer<'a> {
     fn read_other(&mut self) -> Token<'a> {
         let start = self.position;
         self.advance();
-        Token::new(
-            &self.content[start..self.position],
-            TokenKind::Other,
-            start,
-        )
+        Token::new(&self.content[start..self.position], TokenKind::Other, start)
     }
 }
 

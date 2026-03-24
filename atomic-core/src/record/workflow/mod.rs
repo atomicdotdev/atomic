@@ -120,7 +120,7 @@ pub mod retrieve;
 
 // Re-export main types for convenience
 pub use assembly::{
-    assemble_change, compute_content_offsets, collect_dependencies, create_empty_change,
+    assemble_change, collect_dependencies, compute_content_offsets, create_empty_change,
     finalize_hunks, AssemblyContext, AssemblyError, AssemblyOptions, AssemblyResult_,
     AssemblyStats,
 };
@@ -154,7 +154,7 @@ pub use record::{
 
 // Re-export commonly used CRDT types for token-level diff support
 pub use crdt::{
-    CrdtBuildStats, CrdtChangeBuilder, CrdtChangeResult, ContentTokenizer, FileOps, LineOps,
+    ContentTokenizer, CrdtBuildStats, CrdtChangeBuilder, CrdtChangeResult, FileOps, LineOps,
     TokenOps, TokenizeOptions,
 };
 pub use retrieve::{

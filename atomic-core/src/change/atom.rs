@@ -136,7 +136,7 @@ impl<H> Atom<H> {
 }
 
 impl<H: Clone> Atom<H> {
-    /// Convert this atom to use Option<H> for the change references.
+    /// Convert this atom to use `Option<H>` for the change references.
     ///
     /// This is useful when building a change that references itself
     /// (using None for self-references).
@@ -242,7 +242,7 @@ impl<H> Insertion<H> {
 }
 
 impl<H: Clone> Insertion<H> {
-    /// Convert to use Option<H> for change references.
+    /// Convert to use `Option<H>` for change references.
     pub fn to_option(&self) -> Insertion<Option<H>> {
         Insertion {
             predecessors: self
@@ -339,7 +339,7 @@ impl<H> EdgeUpdate<H> {
 }
 
 impl<H: Clone> EdgeUpdate<H> {
-    /// Convert to use Option<H> for change references.
+    /// Convert to use `Option<H>` for change references.
     pub fn to_option(&self) -> EdgeUpdate<Option<H>> {
         EdgeUpdate {
             edges: self.edges.iter().map(|e| e.to_option()).collect(),
@@ -424,7 +424,7 @@ impl<H: Clone> NewEdge<H> {
         }
     }
 
-    /// Convert to use Option<H> for change references.
+    /// Convert to use `Option<H>` for change references.
     pub fn to_option(&self) -> NewEdge<Option<H>> {
         NewEdge {
             previous: self.previous,

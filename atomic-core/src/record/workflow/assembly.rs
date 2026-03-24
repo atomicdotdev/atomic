@@ -918,7 +918,7 @@ pub fn compute_content_offsets(files: &[RecordedFile]) -> Vec<(usize, usize, u64
 ///
 /// A sorted vector of dependency hashes.
 #[must_use]
-pub fn collect_dependencies(ctx: &GlobalizeContext<'_, impl GraphTxnT + TreeTxnT>) -> Vec<Hash> {
+pub fn collect_dependencies(ctx: &GlobalizeContext<'_, impl TreeTxnT>) -> Vec<Hash> {
     ctx.dependencies_sorted()
 }
 

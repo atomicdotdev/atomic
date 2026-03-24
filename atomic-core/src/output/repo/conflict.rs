@@ -486,7 +486,10 @@ mod tests {
         assert_eq!(FileConflictType::Order.marker_suffix(), None);
         assert_eq!(FileConflictType::Cyclic.marker_suffix(), Some("[cyclic]"));
         assert_eq!(FileConflictType::Zombie.marker_suffix(), Some("[zombie]"));
-        assert_eq!(FileConflictType::ZombieFile.marker_suffix(), Some("[zombie]"));
+        assert_eq!(
+            FileConflictType::ZombieFile.marker_suffix(),
+            Some("[zombie]")
+        );
     }
 
     #[test]
@@ -544,8 +547,7 @@ mod tests {
     #[test]
     fn test_file_conflict_with_change() {
         let hash = Hash::of(b"test change");
-        let conflict = FileConflict::new("file.rs", FileConflictType::Order)
-            .with_change(hash);
+        let conflict = FileConflict::new("file.rs", FileConflictType::Order).with_change(hash);
 
         assert_eq!(conflict.changes.len(), 1);
         assert_eq!(conflict.changes[0], hash);
@@ -568,8 +570,8 @@ mod tests {
         let hash1 = Hash::of(b"change 1");
         let hash2 = Hash::of(b"change 2");
 
-        let conflict = FileConflict::new("file.rs", FileConflictType::Order)
-            .with_changes(vec![hash1, hash2]);
+        let conflict =
+            FileConflict::new("file.rs", FileConflictType::Order).with_changes(vec![hash1, hash2]);
 
         assert_eq!(conflict.changes.len(), 2);
     }
@@ -589,24 +591,21 @@ mod tests {
 
     #[test]
     fn test_file_conflict_at_line() {
-        let conflict = FileConflict::new("file.rs", FileConflictType::Order)
-            .at_line(42);
+        let conflict = FileConflict::new("file.rs", FileConflictType::Order).at_line(42);
 
         assert_eq!(conflict.line, Some(42));
     }
 
     #[test]
     fn test_file_conflict_at_line_zero() {
-        let conflict = FileConflict::new("file.rs", FileConflictType::Order)
-            .at_line(0);
+        let conflict = FileConflict::new("file.rs", FileConflictType::Order).at_line(0);
 
         assert_eq!(conflict.line, Some(0));
     }
 
     #[test]
     fn test_file_conflict_with_id() {
-        let conflict = FileConflict::new("file.rs", FileConflictType::Order)
-            .with_id(5);
+        let conflict = FileConflict::new("file.rs", FileConflictType::Order).with_id(5);
 
         assert_eq!(conflict.id, Some(5));
     }
@@ -672,8 +671,8 @@ mod tests {
         let empty = FileConflict::new("file.rs", FileConflictType::Order);
         assert_eq!(empty.change_count(), 0);
 
-        let with_changes = FileConflict::new("file.rs", FileConflictType::Order)
-            .with_changes(vec![hash1, hash2]);
+        let with_changes =
+            FileConflict::new("file.rs", FileConflictType::Order).with_changes(vec![hash1, hash2]);
         assert_eq!(with_changes.change_count(), 2);
     }
 
@@ -693,8 +692,7 @@ mod tests {
 
     #[test]
     fn test_file_conflict_display_with_line() {
-        let conflict = FileConflict::new("src/main.rs", FileConflictType::Order)
-            .at_line(42);
+        let conflict = FileConflict::new("src/main.rs", FileConflictType::Order).at_line(42);
         let display = conflict.to_string();
 
         assert!(display.contains("line 42"));

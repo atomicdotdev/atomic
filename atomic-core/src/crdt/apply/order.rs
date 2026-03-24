@@ -183,10 +183,7 @@ pub fn find_insert_position<T: Ord>(new_id: &T, concurrent: &[T]) -> InsertPosit
 /// This is a convenience wrapper for [`find_insert_position`] specialized
 /// for branch IDs.
 #[inline]
-pub fn find_branch_insert_position(
-    new_id: &BranchId,
-    concurrent: &[BranchId],
-) -> InsertPosition {
+pub fn find_branch_insert_position(new_id: &BranchId, concurrent: &[BranchId]) -> InsertPosition {
     find_insert_position(new_id, concurrent)
 }
 
@@ -519,8 +516,14 @@ mod tests {
     #[test]
     fn test_find_position_middle() {
         let concurrent = vec![5, 10, 15];
-        assert_eq!(find_insert_position(&7, &concurrent), InsertPosition::After(0));
-        assert_eq!(find_insert_position(&12, &concurrent), InsertPosition::After(1));
+        assert_eq!(
+            find_insert_position(&7, &concurrent),
+            InsertPosition::After(0)
+        );
+        assert_eq!(
+            find_insert_position(&12, &concurrent),
+            InsertPosition::After(1)
+        );
     }
 
     #[test]

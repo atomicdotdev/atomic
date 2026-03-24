@@ -240,9 +240,7 @@ impl DelegationScope {
 
     /// Check if this scope has a specific permission.
     pub fn has_permission(&self, permission: DelegationPermission) -> bool {
-        self.permissions
-            .iter()
-            .any(|p| p.implies(&permission))
+        self.permissions.iter().any(|p| p.implies(&permission))
     }
 
     /// Check if this scope allows access to a repository.
@@ -251,9 +249,9 @@ impl DelegationScope {
             return true;
         }
 
-        self.repository_patterns.iter().any(|pattern| {
-            Self::matches_pattern(pattern, repo_path)
-        })
+        self.repository_patterns
+            .iter()
+            .any(|pattern| Self::matches_pattern(pattern, repo_path))
     }
 
     /// Check if this scope allows access to a stack.
@@ -262,9 +260,9 @@ impl DelegationScope {
             return true;
         }
 
-        self.stack_patterns.iter().any(|pattern| {
-            Self::matches_pattern(pattern, stack_name)
-        })
+        self.stack_patterns
+            .iter()
+            .any(|pattern| Self::matches_pattern(pattern, stack_name))
     }
 
     /// Simple glob pattern matching (supports * and ?).
@@ -280,12 +278,9 @@ impl DelegationScope {
             (Some('*'), _) => {
                 // Try matching zero or more characters
                 Self::matches_pattern_recursive(&pattern[1..], value)
-                    || (!value.is_empty()
-                        && Self::matches_pattern_recursive(pattern, &value[1..]))
+                    || (!value.is_empty() && Self::matches_pattern_recursive(pattern, &value[1..]))
             }
-            (Some('?'), Some(_)) => {
-                Self::matches_pattern_recursive(&pattern[1..], &value[1..])
-            }
+            (Some('?'), Some(_)) => Self::matches_pattern_recursive(&pattern[1..], &value[1..]),
             (Some(p), Some(v)) if p == v => {
                 Self::matches_pattern_recursive(&pattern[1..], &value[1..])
             }
@@ -324,7 +319,10 @@ impl DelegationScopeBuilder {
     }
 
     /// Add multiple permissions.
-    pub fn permissions(mut self, permissions: impl IntoIterator<Item = DelegationPermission>) -> Self {
+    pub fn permissions(
+        mut self,
+        permissions: impl IntoIterator<Item = DelegationPermission>,
+    ) -> Self {
         for p in permissions {
             if !self.permissions.contains(&p) {
                 self.permissions.push(p);
@@ -482,11 +480,7 @@ impl Delegation {
         scope: DelegationScope,
     ) -> Result<Self, IdentityError> {
         let created_at = Utc::now();
-        let id = DelegationId::from_delegation_data(
-            &delegator.id,
-            &delegate.id,
-            created_at,
-        );
+        let id = DelegationId::from_delegation_data(&delegator.id, &delegate.id, created_at);
 
         Ok(Self {
             id,
@@ -522,9 +516,7 @@ impl Delegation {
 
     /// Check if the delegation has expired.
     pub fn is_expired(&self) -> bool {
-        self.expires_at
-            .map(|exp| exp < Utc::now())
-            .unwrap_or(false)
+        self.expires_at.map(|exp| exp < Utc::now()).unwrap_or(false)
     }
 
     /// Revoke the delegation.

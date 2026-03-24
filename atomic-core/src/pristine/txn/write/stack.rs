@@ -33,14 +33,12 @@ impl<'a> StackTxnT for WriteTxn<'a> {
         );
 
         let mut edges = Vec::new();
-        for result in table.get(&key)? {
-            if let Ok(v) = result {
-                let bytes: &[u8; 24] = v.value();
-                let edge = deserialize_edge(bytes);
-                let flag = edge.flag();
-                if flag >= min_flag && flag <= max_flag {
-                    edges.push(edge);
-                }
+        for v in table.get(&key)?.filter_map(|r| r.ok()) {
+            let bytes: &[u8; 24] = v.value();
+            let edge = deserialize_edge(bytes);
+            let flag = edge.flag();
+            if flag >= min_flag && flag <= max_flag {
+                edges.push(edge);
             }
         }
 
@@ -91,10 +89,8 @@ impl<'a> StackTxnT for WriteTxn<'a> {
     fn list_stacks(&self) -> PristineResult<Vec<String>> {
         let table = self.txn.open_table(STACKS)?;
         let mut names = Vec::new();
-        for result in table.iter()? {
-            if let Ok((k, _)) = result {
-                names.push(k.value().to_string());
-            }
+        for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
+            names.push(k.value().to_string());
         }
         Ok(names)
     }
@@ -148,7 +144,7 @@ impl<'a> StackTxnT for WriteTxn<'a> {
                     results.push(Ok((seq, change_id, merkle)));
                 }
                 Err(e) => {
-                    results.push(Err(PristineError::Storage(e)));
+                    results.push(Err(PristineError::Storage(Box::new(e))));
                 }
             }
         }

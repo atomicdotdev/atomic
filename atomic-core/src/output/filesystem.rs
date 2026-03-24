@@ -272,9 +272,7 @@ impl FileSystem {
     /// }
     /// ```
     pub fn exists(&self, path: &str) -> bool {
-        self.resolve_path(path)
-            .map(|p| p.exists())
-            .unwrap_or(false)
+        self.resolve_path(path).map(|p| p.exists()).unwrap_or(false)
     }
 
     /// List files in a directory.
@@ -478,16 +476,12 @@ impl WorkingCopyRead for FileSystem {
     /// Unlike the inherent `exists` method, this one follows the trait signature
     /// and returns a `Result`.
     fn exists(&self, path: &str) -> bool {
-        self.resolve_path(path)
-            .map(|p| p.exists())
-            .unwrap_or(false)
+        self.resolve_path(path).map(|p| p.exists()).unwrap_or(false)
     }
 
     /// Check if a path is a directory.
     fn is_directory(&self, path: &str) -> bool {
-        self.resolve_path(path)
-            .map(|p| p.is_dir())
-            .unwrap_or(false)
+        self.resolve_path(path).map(|p| p.is_dir()).unwrap_or(false)
     }
 
     /// Walk the directory tree and return all file paths.
@@ -1034,11 +1028,8 @@ mod tests {
     fn test_file_metadata_symlink() {
         let (dir, fs) = temp_fs();
         fs::write(dir.path().join("target.txt"), "content").unwrap();
-        std::os::unix::fs::symlink(
-            dir.path().join("target.txt"),
-            dir.path().join("link.txt"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("target.txt"), dir.path().join("link.txt"))
+            .unwrap();
 
         let meta = fs.file_metadata("link.txt").unwrap();
         assert!(meta.is_symlink);
@@ -1387,8 +1378,10 @@ mod tests {
 
         assert_eq!(files.len(), 3);
         assert!(files.contains(&"root.txt".to_string()));
-        assert!(files.contains(&"a/middle.txt".to_string()) ||
-                files.contains(&"a\\middle.txt".to_string())); // Windows compat
+        assert!(
+            files.contains(&"a/middle.txt".to_string())
+                || files.contains(&"a\\middle.txt".to_string())
+        ); // Windows compat
     }
 
     #[test]
@@ -1498,7 +1491,9 @@ mod tests {
             w.write_all(b"fn main() {}").unwrap();
         }
         {
-            let mut w = fs.write_file("src/utils/helpers.rs", Inode::new(2)).unwrap();
+            let mut w = fs
+                .write_file("src/utils/helpers.rs", Inode::new(2))
+                .unwrap();
             w.write_all(b"pub fn help() {}").unwrap();
         }
 
@@ -1514,7 +1509,8 @@ mod tests {
         assert_eq!(main_content, b"fn main() {}");
 
         // Rename
-        fs.rename("src/utils/helpers.rs", "src/utils/lib.rs").unwrap();
+        fs.rename("src/utils/helpers.rs", "src/utils/lib.rs")
+            .unwrap();
         assert!(!fs.exists("src/utils/helpers.rs"));
         assert!(fs.exists("src/utils/lib.rs"));
 

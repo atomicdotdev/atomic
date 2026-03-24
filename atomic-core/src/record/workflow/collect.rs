@@ -366,7 +366,9 @@ where
     let mut result = CollectionResult::new();
 
     // Iterate over all tree entries (trait doesn't support prefix filtering)
-    let iter = txn.iter_tree().map_err(RecordError::Pristine)?;
+    let iter = txn
+        .iter_tree()
+        .map_err(|e| RecordError::Pristine(Box::new(e)))?;
 
     for item in iter {
         match item {
@@ -393,10 +395,7 @@ where
                 }
             }
             Err(e) => {
-                result.add_error(
-                    "<iteration error>",
-                    format!("Tree iteration failed: {}", e),
-                );
+                result.add_error("<iteration error>", format!("Tree iteration failed: {}", e));
             }
         }
     }
@@ -446,7 +445,7 @@ where
     // Walk the working copy directory tree
     let paths = working_copy
         .walk_files(prefix)
-        .map_err(|e| RecordError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        .map_err(|e| RecordError::Io(std::io::Error::other(e.to_string())))?;
 
     for path in paths {
         let mut file = WorkingFile::new(&path);
@@ -546,13 +545,19 @@ where
     T: GraphTxnT + TreeTxnT + StackTxnT,
 {
     // Look up the inode for this path
-    let inode = match txn.get_inode(path).map_err(RecordError::Pristine)? {
+    let inode = match txn
+        .get_inode(path)
+        .map_err(|e| RecordError::Pristine(Box::new(e)))?
+    {
         Some(inode) => inode,
         None => return Ok(None),
     };
 
     // Get the position for this inode
-    let position = match txn.inode_position(inode).map_err(RecordError::Pristine)? {
+    let position = match txn
+        .inode_position(inode)
+        .map_err(|e| RecordError::Pristine(Box::new(e)))?
+    {
         Some(pos) => pos,
         None => return Ok(None),
     };
@@ -807,7 +812,7 @@ mod tests {
 
     #[test]
     fn test_collect_working_paths_existing() {
-        let mut working_copy = Memory::new();
+        let working_copy = Memory::new();
         working_copy.add_file("exists.txt", b"content");
 
         let paths = vec!["exists.txt", "missing.txt"];
@@ -819,7 +824,7 @@ mod tests {
 
     #[test]
     fn test_collect_working_paths_multiple() {
-        let mut working_copy = Memory::new();
+        let working_copy = Memory::new();
         working_copy.add_file("a.txt", b"a");
         working_copy.add_file("b.txt", b"b");
         working_copy.add_file("c.txt", b"c");
@@ -834,7 +839,7 @@ mod tests {
 
     #[test]
     fn test_get_working_file_exists() {
-        let mut working_copy = Memory::new();
+        let working_copy = Memory::new();
         working_copy.add_file("found.txt", b"hello");
 
         let result = get_working_file(&working_copy, "found.txt").unwrap();
@@ -856,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_get_working_file_directory() {
-        let mut working_copy = Memory::new();
+        let working_copy = Memory::new();
         working_copy.add_directory("mydir");
 
         let result = get_working_file(&working_copy, "mydir").unwrap();
@@ -956,7 +961,7 @@ mod tests {
 
     #[test]
     fn test_collect_working_files_excludes_directories() {
-        let mut working_copy = Memory::new();
+        let working_copy = Memory::new();
         working_copy.add_file("file.txt", b"content");
         working_copy.add_directory("empty_dir");
 

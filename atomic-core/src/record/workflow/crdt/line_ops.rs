@@ -302,7 +302,10 @@ impl LineChangeKind {
     pub fn affects_old(&self) -> bool {
         matches!(
             self,
-            LineChangeKind::Equal | LineChangeKind::Delete | LineChangeKind::Modify | LineChangeKind::Move
+            LineChangeKind::Equal
+                | LineChangeKind::Delete
+                | LineChangeKind::Modify
+                | LineChangeKind::Move
         )
     }
 
@@ -311,7 +314,10 @@ impl LineChangeKind {
     pub fn affects_new(&self) -> bool {
         matches!(
             self,
-            LineChangeKind::Equal | LineChangeKind::Insert | LineChangeKind::Modify | LineChangeKind::Move
+            LineChangeKind::Equal
+                | LineChangeKind::Insert
+                | LineChangeKind::Modify
+                | LineChangeKind::Move
         )
     }
 
@@ -426,7 +432,12 @@ impl LineChange {
     }
 
     /// Creates a "modify" change (line content changed).
-    pub fn modify(old_index: usize, new_index: usize, old_content: Vec<u8>, new_content: Vec<u8>) -> Self {
+    pub fn modify(
+        old_index: usize,
+        new_index: usize,
+        old_content: Vec<u8>,
+        new_content: Vec<u8>,
+    ) -> Self {
         Self {
             kind: LineChangeKind::Modify,
             old_index: Some(old_index),
@@ -490,12 +501,16 @@ impl LineChange {
 
     /// Returns the old content as a string (lossy).
     pub fn old_content_str(&self) -> Option<std::borrow::Cow<'_, str>> {
-        self.old_content.as_ref().map(|c| String::from_utf8_lossy(c))
+        self.old_content
+            .as_ref()
+            .map(|c| String::from_utf8_lossy(c))
     }
 
     /// Returns the new content as a string (lossy).
     pub fn new_content_str(&self) -> Option<std::borrow::Cow<'_, str>> {
-        self.new_content.as_ref().map(|c| String::from_utf8_lossy(c))
+        self.new_content
+            .as_ref()
+            .map(|c| String::from_utf8_lossy(c))
     }
 
     /// Returns the existing branch ID (if set).
@@ -530,16 +545,8 @@ impl fmt::Display for LineChange {
                 self.old_index.unwrap_or(0),
                 self.new_index.unwrap_or(0)
             ),
-            LineChangeKind::Insert => write!(
-                f,
-                "+ new:{}",
-                self.new_index.unwrap_or(0)
-            ),
-            LineChangeKind::Delete => write!(
-                f,
-                "- old:{}",
-                self.old_index.unwrap_or(0)
-            ),
+            LineChangeKind::Insert => write!(f, "+ new:{}", self.new_index.unwrap_or(0)),
+            LineChangeKind::Delete => write!(f, "- old:{}", self.old_index.unwrap_or(0)),
             LineChangeKind::Modify => write!(
                 f,
                 "~ old:{} new:{}",
@@ -874,7 +881,11 @@ impl<'a> LineAnalyzer<'a> {
 
         for op in diff_result.ops() {
             match op {
-                DiffOp::Equal { old_pos, new_pos, len } => {
+                DiffOp::Equal {
+                    old_pos,
+                    new_pos,
+                    len,
+                } => {
                     for i in 0..*len {
                         let old_idx = old_pos + i;
                         let new_idx = new_pos + i;
@@ -884,7 +895,11 @@ impl<'a> LineAnalyzer<'a> {
                         changes.push(change);
                     }
                 }
-                DiffOp::Insert { old_pos: _, new_pos, len } => {
+                DiffOp::Insert {
+                    old_pos: _,
+                    new_pos,
+                    len,
+                } => {
                     for i in 0..*len {
                         let new_idx = new_pos + i;
                         let content = new_lines[new_idx].to_vec();
@@ -893,7 +908,11 @@ impl<'a> LineAnalyzer<'a> {
                         changes.push(change);
                     }
                 }
-                DiffOp::Delete { old_pos, new_pos: _, len } => {
+                DiffOp::Delete {
+                    old_pos,
+                    new_pos: _,
+                    len,
+                } => {
                     for i in 0..*len {
                         let old_idx = old_pos + i;
                         let content = old_lines[old_idx].to_vec();
@@ -902,14 +921,20 @@ impl<'a> LineAnalyzer<'a> {
                         changes.push(change);
                     }
                 }
-                DiffOp::Replace { old_pos, old_len, new_pos, new_len } => {
+                DiffOp::Replace {
+                    old_pos,
+                    old_len,
+                    new_pos,
+                    new_len,
+                } => {
                     // For replacements, we generate delete + insert pairs
                     // or modify if lengths match and content is similar
                     if *old_len == *new_len && *old_len == 1 {
                         // Single line change - treat as modify
                         let old_content = old_lines[*old_pos].to_vec();
                         let new_content = new_lines[*new_pos].to_vec();
-                        let change = LineChange::modify(*old_pos, *new_pos, old_content, new_content);
+                        let change =
+                            LineChange::modify(*old_pos, *new_pos, old_content, new_content);
                         stats.add_change(&change);
                         changes.push(change);
                     } else {
@@ -955,7 +980,10 @@ impl<'a> LineAnalyzer<'a> {
         // Handle final line without newline
         if start < content.len() {
             lines.push(&content[start..]);
-        } else if start == content.len() && !content.is_empty() && content[content.len() - 1] == b'\n' {
+        } else if start == content.len()
+            && !content.is_empty()
+            && content[content.len() - 1] == b'\n'
+        {
             // Trailing newline creates empty final line
             lines.push(&content[start..start]);
         }
@@ -1422,8 +1450,10 @@ mod tests {
 
         assert!(analysis.has_changes());
         // The middle line is modified (detected as delete+insert or modify)
-        assert!(analysis.stats().modified_lines >= 1 ||
-                (analysis.stats().deleted_lines >= 1 && analysis.stats().inserted_lines >= 1));
+        assert!(
+            analysis.stats().modified_lines >= 1
+                || (analysis.stats().deleted_lines >= 1 && analysis.stats().inserted_lines >= 1)
+        );
     }
 
     #[test]

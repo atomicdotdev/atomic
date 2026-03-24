@@ -93,7 +93,7 @@ pub enum RecordError {
     /// - Corruption in the pristine database
     /// - Missing expected data
     #[error("Pristine error: {0}")]
-    Pristine(#[from] PristineError),
+    Pristine(Box<PristineError>),
 
     /// The specified path is not within the repository.
     ///
@@ -484,6 +484,12 @@ impl RecordError {
 ///     Ok(vec![1, 2, 3])
 /// }
 /// ```
+impl From<PristineError> for RecordError {
+    fn from(e: PristineError) -> Self {
+        Self::Pristine(Box::new(e))
+    }
+}
+
 pub type RecordResult<T> = Result<T, RecordError>;
 
 #[cfg(test)]

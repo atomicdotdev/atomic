@@ -374,10 +374,8 @@ impl Log {
     ///
     /// Formatted JSON string.
     pub(crate) fn format_json(&self, entries: &[HistoryEntry]) -> String {
-        let json_entries: Vec<JsonLogEntry> = entries
-            .iter()
-            .map(|e| JsonLogEntry::from_entry(e))
-            .collect();
+        let json_entries: Vec<JsonLogEntry> =
+            entries.iter().map(JsonLogEntry::from_entry).collect();
 
         serde_json::to_string_pretty(&json_entries)
             .unwrap_or_else(|e| format!("{{\"error\": \"Failed to serialize: {}\"}}", e))
@@ -540,7 +538,7 @@ pub fn truncate_string(s: &str, max_len: usize) -> String {
 
 /// Format an author for display from an `Author` struct.
 ///
-/// Combines name and optional email into a standard "Name <email>" format.
+/// Combines name and optional email into a standard `"Name <email>"` format.
 ///
 /// # Arguments
 ///
@@ -656,6 +654,7 @@ impl LogOutputConfig {
     }
 
     /// Builder: set starting sequence number.
+    #[allow(clippy::wrong_self_convention)]
     pub fn from_sequence(mut self, seq: u64) -> Self {
         self.from_sequence = seq;
         self

@@ -73,7 +73,7 @@ use std::fmt;
 /// - **Readability**: Are the diffs easy for humans to understand?
 /// - **Performance**: How fast is it for various input sizes?
 ///
-/// See the [module documentation](self) for detailed comparison.
+/// See the module documentation for detailed comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Algorithm {
     /// Myers diff algorithm - finds the shortest edit script.
@@ -126,7 +126,7 @@ impl std::str::FromStr for Algorithm {
     ///
     /// # Errors
     ///
-    /// Returns [`AlgorithmParseError`] if the string doesn't match
+    /// Returns `AlgorithmParseError` if the string doesn't match
     /// any known algorithm name.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {

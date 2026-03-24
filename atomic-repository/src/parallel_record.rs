@@ -669,19 +669,19 @@ fn process_added_file(
                 ));
             }
 
-            let mut file_stats = FileRecordStats::default();
-            file_stats.hunks_created = recorded.hunk_count();
-            file_stats.content_bytes = recorded.content_len() as u64;
-            file_stats.vertices_added = 3; // name + inode + content
-
-            if let Some(crdt_stats) = recorded.crdt_stats() {
-                file_stats.lines_added = crdt_stats.lines_added;
-                file_stats.lines_deleted = crdt_stats.lines_deleted;
-                file_stats.lines_modified = crdt_stats.lines_modified;
-                file_stats.tokens_added = crdt_stats.tokens_added;
-                file_stats.tokens_deleted = crdt_stats.tokens_deleted;
-                file_stats.tokens_replaced = crdt_stats.tokens_replaced;
-            }
+            let crdt_stats = recorded.crdt_stats();
+            let file_stats = FileRecordStats {
+                hunks_created: recorded.hunk_count(),
+                content_bytes: recorded.content_len() as u64,
+                vertices_added: 3, // name + inode + content
+                lines_added: crdt_stats.map_or(0, |s| s.lines_added),
+                lines_deleted: crdt_stats.map_or(0, |s| s.lines_deleted),
+                lines_modified: crdt_stats.map_or(0, |s| s.lines_modified),
+                tokens_added: crdt_stats.map_or(0, |s| s.tokens_added),
+                tokens_deleted: crdt_stats.map_or(0, |s| s.tokens_deleted),
+                tokens_replaced: crdt_stats.map_or(0, |s| s.tokens_replaced),
+                ..FileRecordStats::default()
+            };
 
             Ok(FileRecordOutput {
                 path: input.path.clone(),
@@ -729,29 +729,32 @@ fn process_modified_file(
                 ));
             }
 
-            let mut file_stats = FileRecordStats::default();
-            file_stats.hunks_created = recorded.hunk_count();
-            file_stats.content_bytes = recorded.content_len() as u64;
-
+            let mut vertices_added: u64 = 0;
+            let mut edges_modified: u64 = 0;
             for graph_op in recorded.hunks() {
                 if graph_op.is_edit() {
-                    file_stats.vertices_added += 1;
+                    vertices_added += 1;
                 } else if graph_op.is_replace() {
-                    file_stats.vertices_added += 1;
-                    file_stats.edges_modified += 1;
+                    vertices_added += 1;
+                    edges_modified += 1;
                 } else if graph_op.is_delete() {
-                    file_stats.edges_modified += 1;
+                    edges_modified += 1;
                 }
             }
-
-            if let Some(crdt_stats) = recorded.crdt_stats() {
-                file_stats.lines_added = crdt_stats.lines_added;
-                file_stats.lines_deleted = crdt_stats.lines_deleted;
-                file_stats.lines_modified = crdt_stats.lines_modified;
-                file_stats.tokens_added = crdt_stats.tokens_added;
-                file_stats.tokens_deleted = crdt_stats.tokens_deleted;
-                file_stats.tokens_replaced = crdt_stats.tokens_replaced;
-            }
+            let crdt_stats = recorded.crdt_stats();
+            let file_stats = FileRecordStats {
+                hunks_created: recorded.hunk_count(),
+                content_bytes: recorded.content_len() as u64,
+                vertices_added,
+                edges_modified,
+                lines_added: crdt_stats.map_or(0, |s| s.lines_added),
+                lines_deleted: crdt_stats.map_or(0, |s| s.lines_deleted),
+                lines_modified: crdt_stats.map_or(0, |s| s.lines_modified),
+                tokens_added: crdt_stats.map_or(0, |s| s.tokens_added),
+                tokens_deleted: crdt_stats.map_or(0, |s| s.tokens_deleted),
+                tokens_replaced: crdt_stats.map_or(0, |s| s.tokens_replaced),
+                ..FileRecordStats::default()
+            };
 
             Ok(FileRecordOutput {
                 path: input.path.clone(),
@@ -776,18 +779,18 @@ fn process_deleted_file(
 
     match record_deleted_file(&detected, options) {
         Ok(recorded) => {
-            let mut file_stats = FileRecordStats::default();
-            file_stats.hunks_created = recorded.hunk_count();
-            file_stats.edges_modified = 1;
-
-            if let Some(crdt_stats) = recorded.crdt_stats() {
-                file_stats.lines_added = crdt_stats.lines_added;
-                file_stats.lines_deleted = crdt_stats.lines_deleted;
-                file_stats.lines_modified = crdt_stats.lines_modified;
-                file_stats.tokens_added = crdt_stats.tokens_added;
-                file_stats.tokens_deleted = crdt_stats.tokens_deleted;
-                file_stats.tokens_replaced = crdt_stats.tokens_replaced;
-            }
+            let crdt_stats = recorded.crdt_stats();
+            let file_stats = FileRecordStats {
+                hunks_created: recorded.hunk_count(),
+                edges_modified: 1,
+                lines_added: crdt_stats.map_or(0, |s| s.lines_added),
+                lines_deleted: crdt_stats.map_or(0, |s| s.lines_deleted),
+                lines_modified: crdt_stats.map_or(0, |s| s.lines_modified),
+                tokens_added: crdt_stats.map_or(0, |s| s.tokens_added),
+                tokens_deleted: crdt_stats.map_or(0, |s| s.tokens_deleted),
+                tokens_replaced: crdt_stats.map_or(0, |s| s.tokens_replaced),
+                ..FileRecordStats::default()
+            };
 
             Ok(FileRecordOutput {
                 path: input.path.clone(),
@@ -808,8 +811,10 @@ fn process_deleted_file(
 fn process_directory_added(input: &FileRecordInput) -> Result<FileRecordOutput, String> {
     let recorded = RecordedFile::new_directory(&input.path);
 
-    let mut file_stats = FileRecordStats::default();
-    file_stats.vertices_added = 2; // name + inode
+    let file_stats = FileRecordStats {
+        vertices_added: 2, // name + inode
+        ..FileRecordStats::default()
+    };
 
     Ok(FileRecordOutput {
         path: input.path.clone(),
@@ -831,8 +836,10 @@ fn process_directory_deleted(input: &FileRecordInput) -> Result<FileRecordOutput
         recorded.set_position(position);
     }
 
-    let mut file_stats = FileRecordStats::default();
-    file_stats.edges_modified = 1;
+    let file_stats = FileRecordStats {
+        edges_modified: 1,
+        ..FileRecordStats::default()
+    };
 
     Ok(FileRecordOutput {
         path: input.path.clone(),

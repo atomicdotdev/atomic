@@ -398,7 +398,10 @@ mod tests {
         let new_opts = OutputOptions::new();
         let default_opts = OutputOptions::default();
 
-        assert_eq!(new_opts.output_name_conflicts, default_opts.output_name_conflicts);
+        assert_eq!(
+            new_opts.output_name_conflicts,
+            default_opts.output_name_conflicts
+        );
         assert_eq!(new_opts.if_modified_since, default_opts.if_modified_since);
         assert_eq!(new_opts.prefix, default_opts.prefix);
         assert_eq!(new_opts.include_deleted, default_opts.include_deleted);
@@ -465,9 +468,7 @@ mod tests {
 
     #[test]
     fn test_builder_no_vertex_limit() {
-        let opts = OutputOptions::new()
-            .max_vertices(1000)
-            .no_vertex_limit();
+        let opts = OutputOptions::new().max_vertices(1000).no_vertex_limit();
         assert!(opts.max_vertices.is_none());
     }
 
@@ -572,9 +573,7 @@ mod tests {
 
     #[test]
     fn test_clone() {
-        let opts = OutputOptions::new()
-            .with_prefix("src/")
-            .salt(42);
+        let opts = OutputOptions::new().with_prefix("src/").salt(42);
 
         let cloned = opts.clone();
 

@@ -153,12 +153,7 @@ impl Leaf {
     /// Creates a new leaf with the given properties.
     ///
     /// The leaf starts in the [`LeafState::Alive`] state.
-    pub fn new(
-        id: LeafId,
-        branch: BranchId,
-        kind: TokenKind,
-        content_range: Range<u32>,
-    ) -> Self {
+    pub fn new(id: LeafId, branch: BranchId, kind: TokenKind, content_range: Range<u32>) -> Self {
         Leaf {
             id,
             branch,
@@ -439,7 +434,11 @@ impl LeafOp {
 impl fmt::Display for LeafOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LeafOp::Insert { after, kind, content } => {
+            LeafOp::Insert {
+                after,
+                kind,
+                content,
+            } => {
                 write!(f, "insert {:?} after ", kind)?;
                 match after {
                     Some(id) => write!(f, "{}", id)?,

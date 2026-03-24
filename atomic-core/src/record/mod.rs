@@ -127,7 +127,7 @@
 //!
 //! # Diff Algorithms
 //!
-//! The record module uses the diff algorithms from [`crate::diff`] to compare
+//! The record module uses the diff algorithms from the `crate::diff` module to compare
 //! file contents:
 //!
 //! - **Myers**: Optimal for finding minimal edits
@@ -209,7 +209,9 @@ pub mod workflow;
 pub use builder::{RecordBuilder, RecordStats, Recorded};
 
 // Context types
-pub use context::{DetectContext, PristineFileState, RecordContext, RecordItem as ContextRecordItem};
+pub use context::{
+    DetectContext, PristineFileState, RecordContext, RecordItem as ContextRecordItem,
+};
 
 // Detection types
 pub use detect::{

@@ -623,6 +623,7 @@ mod tests {
         Hash::of(b"change A")
     }
 
+    #[allow(dead_code)]
     fn hash_b() -> Hash {
         Hash::of(b"change B")
     }

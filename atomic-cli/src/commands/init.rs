@@ -47,7 +47,7 @@
 //! Created .atomicignore for rust project
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
@@ -343,7 +343,12 @@ impl Init {
     /// If the path is relative, it's resolved relative to the current
     /// working directory.
     fn resolve_path(&self) -> CliResult<PathBuf> {
-        let path = if self.path.is_absolute() {
+        // On Windows, Path::is_absolute() returns false for Unix-style "/foo"
+        // paths (they're drive-relative). Treat a leading '/' as absolute on
+        // all platforms so cross-platform tests and user input behave the same.
+        let looks_absolute =
+            self.path.is_absolute() || self.path.to_string_lossy().starts_with('/');
+        let path = if looks_absolute {
             self.path.clone()
         } else {
             let cwd =
@@ -361,7 +366,7 @@ impl Init {
     }
 
     /// Create the .atomicignore file if a kind is specified.
-    fn create_ignore_file(&self, repo_path: &PathBuf) -> CliResult<bool> {
+    fn create_ignore_file(&self, repo_path: &Path) -> CliResult<bool> {
         let Some(kind) = &self.kind else {
             return Ok(false);
         };
@@ -384,7 +389,7 @@ impl Init {
             return Ok(false);
         }
 
-        std::fs::write(&ignore_path, template).map_err(|e| CliError::Io(e))?;
+        std::fs::write(&ignore_path, template).map_err(CliError::Io)?;
 
         Ok(true)
     }
@@ -481,11 +486,11 @@ impl Command for Init {
         if self.stack != atomic_repository::DEFAULT_STACK {
             // Create the requested stack
             repo.create_stack(&self.stack)
-                .map_err(|e| CliError::Repository(e))?;
+                .map_err(CliError::Repository)?;
 
             // Set it as the current stack
             repo.set_current_stack(&self.stack)
-                .map_err(|e| CliError::Repository(e))?;
+                .map_err(CliError::Repository)?;
         }
 
         // Print success message

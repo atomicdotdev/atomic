@@ -576,6 +576,7 @@ impl Recorded {
     /// # Returns
     ///
     /// A tuple of (actions, contents, updatables).
+    #[allow(clippy::type_complexity)]
     pub fn into_parts(
         self,
     ) -> (

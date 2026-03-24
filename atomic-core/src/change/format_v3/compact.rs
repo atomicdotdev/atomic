@@ -640,9 +640,9 @@ impl fmt::Display for CompactGraphOp {
 ///
 /// # Error Handling
 ///
-/// - `compact_*` methods return [`FormatError::HashNotFound`] if a hash
+/// - `compact_*` methods return [`super::error::FormatError::HashNotFound`] if a hash
 ///   isn't in the dedup table. This means the table was built incorrectly.
-/// - `expand_*` methods return [`FormatError::HashIndexOutOfBounds`] if
+/// - `expand_*` methods return [`super::error::FormatError::HashIndexOutOfBounds`] if
 ///   an index exceeds the table size. This means the file is corrupt.
 ///
 /// # Examples
@@ -678,7 +678,7 @@ impl<'t> Compactor<'t> {
     ///
     /// # Errors
     ///
-    /// Returns [`FormatError::HashNotFound`] if the hash isn't in the dedup table.
+    /// Returns [`super::error::FormatError::HashNotFound`] if the hash isn't in the dedup table.
     pub fn compact_position(&self, pos: &Position<Option<Hash>>) -> FormatResult<CompactPosition> {
         let change = self.hash_to_index(&pos.change)?;
         Ok(CompactPosition::new(change, pos.pos.get() as u32))
@@ -688,7 +688,7 @@ impl<'t> Compactor<'t> {
     ///
     /// # Errors
     ///
-    /// Returns [`FormatError::HashNotFound`] if the hash isn't in the dedup table.
+    /// Returns [`super::error::FormatError::HashNotFound`] if the hash isn't in the dedup table.
     pub fn compact_graph_node(
         &self,
         node: &crate::GraphNode<Option<Hash>>,
@@ -924,7 +924,7 @@ impl<'t> Compactor<'t> {
     ///
     /// # Errors
     ///
-    /// Returns [`FormatError::HashIndexOutOfBounds`] if the index is invalid.
+    /// Returns [`super::error::FormatError::HashIndexOutOfBounds`] if the index is invalid.
     pub fn expand_position(&self, pos: &CompactPosition) -> FormatResult<Position<Option<Hash>>> {
         let change = self.index_to_hash(pos.change)?;
         Ok(Position {

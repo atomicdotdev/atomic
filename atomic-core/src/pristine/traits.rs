@@ -419,7 +419,7 @@ pub trait GraphTxnT {
 /// assert_eq!(kind as u8, 1);
 /// assert!(kind.is_shared());
 /// ```
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
 #[repr(u8)]
 pub enum StackKind {
     /// Ephemeral staging area (feature, bug, experiment).
@@ -432,6 +432,7 @@ pub enum StackKind {
     ///
     /// Edges are stored in the global `GRAPH[vertex]`.
     /// Deletion is restricted; these stacks are the canonical record.
+    #[default]
     Shared = 1,
 }
 
@@ -457,12 +458,6 @@ impl StackKind {
             1 => Some(Self::Shared),
             _ => None,
         }
-    }
-}
-
-impl Default for StackKind {
-    fn default() -> Self {
-        Self::Shared
     }
 }
 
@@ -658,7 +653,7 @@ pub trait StackTxnT: GraphTxnT {
     /// Look up a stack by its internal ID.
     ///
     /// This is used to resolve parent references when walking the overlay
-    /// chain. Unlike [`get_stack`] which looks up by name, this looks up
+    /// chain. Unlike [`Self::get_stack`] which looks up by name, this looks up
     /// by the internal numeric ID stored in `StackState::id`.
     ///
     /// # Arguments
@@ -785,7 +780,7 @@ pub trait StackTxnT: GraphTxnT {
     ///
     /// This performs a range scan on the `STACK_GRAPH` table to find all
     /// vertices belonging to a specific change in a specific stack. It is
-    /// used by [`OverlayTxn`] to implement `find_block` and `find_block_end`
+    /// used by [`crate::pristine::OverlayTxn`] to implement `find_block` and `find_block_end`
     /// against the `STACK_GRAPH`.
     ///
     /// # Arguments
@@ -906,6 +901,7 @@ pub trait StackTxnT: GraphTxnT {
     ///     println!("Change #{}: {:?} (state: {})", seq, change_id, state);
     /// }
     /// ```
+    #[allow(clippy::type_complexity)]
     fn iter_changes(
         &self,
         stack: &StackState,
@@ -1097,6 +1093,7 @@ pub trait TreeTxnT: GraphTxnT {
     /// # Note
     ///
     /// The order of iteration is not guaranteed.
+    #[allow(clippy::type_complexity)]
     fn iter_tree(
         &self,
     ) -> Result<Box<dyn Iterator<Item = Result<(String, Inode), PristineError>> + '_>, PristineError>;
@@ -1120,6 +1117,7 @@ pub trait TreeTxnT: GraphTxnT {
     /// This uses the INODE_GRAPH secondary index, providing O(m) complexity
     /// where m is the number of vertices in the file, rather than O(N) where
     /// N is the total graph size.
+    #[allow(clippy::type_complexity)]
     fn iter_inode_vertices(
         &self,
         inode: Inode,
@@ -1293,7 +1291,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
 
     /// Register a provenance graph and get its internal ID.
     ///
-    /// Similar to [`register_change`] and [`register_attestation`], but
+    /// Similar to [`Self::register_change`] and [`Self::register_attestation`], but
     /// for provenance graph artifacts. Uses `node_type::PROVENANCE`.
     ///
     /// # Arguments
@@ -1487,7 +1485,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// Create a new stack with explicit kind and parent.
     ///
     /// If a stack with the given name already exists, returns an error.
-    /// Use [`open_or_create_stack`] for the backward-compatible "get or create"
+    /// Use [`Self::open_or_create_stack`] for the backward-compatible "get or create"
     /// behavior (which defaults to Shared, no parent).
     ///
     /// # Arguments
@@ -1977,6 +1975,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// Iterate over all branches (lines) belonging to a trunk (file).
     ///
     /// Returns branch IDs in CRDT ordering (by BranchId).
+    #[allow(clippy::type_complexity)]
     fn iter_trunk_branches(
         &mut self,
         trunk_key: &[u8; 12],
@@ -1985,6 +1984,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// Iterate over all leaves (tokens) belonging to a branch (line).
     ///
     /// Returns leaf IDs in CRDT ordering (by LeafId).
+    #[allow(clippy::type_complexity)]
     fn iter_branch_leaves(
         &mut self,
         branch_key: &[u8; 12],

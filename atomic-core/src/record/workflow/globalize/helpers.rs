@@ -1,6 +1,5 @@
 use super::*;
 
-
 // HELPER FUNCTIONS
 
 /// Convert a Position<NodeId> to Position<Option<Hash>>.

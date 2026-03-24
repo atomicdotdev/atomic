@@ -314,7 +314,7 @@ fn detect_test_driven_iteration(
 
     let file_display = edited_file
         .as_deref()
-        .map(|f| short_path(f))
+        .map(short_path)
         .unwrap_or_else(|| "file".to_string());
 
     let summary = format!("Test-driven fix for {}", file_display);
@@ -380,7 +380,7 @@ fn detect_full_cycle(
 
     let file_display = committed_file
         .as_deref()
-        .map(|f| short_path(f))
+        .map(short_path)
         .unwrap_or_else(|| "file".to_string());
 
     let cmd_display = verify_cmd
@@ -449,7 +449,7 @@ fn detect_commit_and_verify(
 
     let file_display = committed_file
         .as_deref()
-        .map(|f| short_path(f))
+        .map(short_path)
         .unwrap_or_else(|| "file".to_string());
 
     let cmd_display = verify_cmd
@@ -509,7 +509,7 @@ fn detect_informed_commit(
 
     let file_display = committed_file
         .as_deref()
-        .map(|f| short_path(f))
+        .map(short_path)
         .unwrap_or_else(|| "file".to_string());
 
     let summary = format!(
@@ -695,11 +695,11 @@ fn build_decision_edges(nodes: &[GraphNode], seq: &[usize], decision_id: &str) -
 
     // Find the next patch proposal after this sequence to link to
     let last_idx = seq.last().copied().unwrap_or(first_idx);
-    for i in (last_idx + 1)..nodes.len() {
-        if nodes[i].kind == NodeKind::PatchProposal {
+    for node in nodes.iter().skip(last_idx + 1) {
+        if node.kind == NodeKind::PatchProposal {
             edges.push(GraphEdge::new(
                 decision_id.to_string(),
-                nodes[i].id.clone(),
+                node.id.clone(),
                 EdgeKind::CommittedVia,
             ));
             break;

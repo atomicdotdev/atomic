@@ -1,6 +1,5 @@
 use super::*;
 
-
 // Tests
 
 #[cfg(test)]
@@ -328,7 +327,10 @@ mod tests {
         let insertions: Vec<_> = token_changes.iter().filter(|tc| tc.is_inserted()).collect();
 
         // We should have insertions for ", c"
-        assert!(!insertions.is_empty(), "Expected token insertions for ', c'");
+        assert!(
+            !insertions.is_empty(),
+            "Expected token insertions for ', c'"
+        );
 
         // Verify we can find the 'c' token
         let has_c = insertions.iter().any(|tc| {
@@ -531,7 +533,10 @@ mod tests {
 
         // Most tokens should be unchanged
         let unchanged_count = token_changes.iter().filter(|tc| tc.is_unchanged()).count();
-        assert!(unchanged_count > insertions.len(), "Most tokens should be unchanged");
+        assert!(
+            unchanged_count > insertions.len(),
+            "Most tokens should be unchanged"
+        );
     }
 
     #[test]

@@ -201,7 +201,8 @@ pub trait MutCrdtTxnT {
     ///
     /// * `Ok(true)` - The branch was newly inserted
     /// * `Ok(false)` - An existing branch was updated
-    fn put_branch(&mut self, branch: &Branch, after: Option<BranchId>) -> Result<bool, Self::Error>;
+    fn put_branch(&mut self, branch: &Branch, after: Option<BranchId>)
+        -> Result<bool, Self::Error>;
 
     /// Retrieves a branch by ID.
     ///
@@ -507,7 +508,11 @@ mod tests {
             }
         }
 
-        fn update_trunk_state(&mut self, id: TrunkId, state: TrunkState) -> Result<(), Self::Error> {
+        fn update_trunk_state(
+            &mut self,
+            id: TrunkId,
+            state: TrunkState,
+        ) -> Result<(), Self::Error> {
             if let Some(trunk) = self.trunks.get_mut(&id) {
                 trunk.set_state(state);
             }
@@ -531,7 +536,11 @@ mod tests {
             Ok(self.inode_index.get(&inode).copied())
         }
 
-        fn put_branch(&mut self, branch: &Branch, _after: Option<BranchId>) -> Result<bool, Self::Error> {
+        fn put_branch(
+            &mut self,
+            branch: &Branch,
+            _after: Option<BranchId>,
+        ) -> Result<bool, Self::Error> {
             let is_new = !self.branches.contains_key(&branch.id());
             self.branches.insert(branch.id(), branch.clone());
             self.trunk_branches
@@ -560,7 +569,11 @@ mod tests {
             }
         }
 
-        fn update_branch_state(&mut self, id: BranchId, state: BranchState) -> Result<(), Self::Error> {
+        fn update_branch_state(
+            &mut self,
+            id: BranchId,
+            state: BranchState,
+        ) -> Result<(), Self::Error> {
             if let Some(branch) = self.branches.get_mut(&id) {
                 branch.set_state(state);
             }
@@ -568,7 +581,11 @@ mod tests {
         }
 
         fn list_branches(&self, trunk_id: TrunkId) -> Result<Vec<BranchId>, Self::Error> {
-            Ok(self.trunk_branches.get(&trunk_id).cloned().unwrap_or_default())
+            Ok(self
+                .trunk_branches
+                .get(&trunk_id)
+                .cloned()
+                .unwrap_or_default())
         }
 
         fn count_branches(&self, trunk_id: TrunkId) -> Result<usize, Self::Error> {
@@ -611,7 +628,11 @@ mod tests {
             Ok(())
         }
 
-        fn update_leaf_content(&mut self, id: LeafId, range: Range<u32>) -> Result<(), Self::Error> {
+        fn update_leaf_content(
+            &mut self,
+            id: LeafId,
+            range: Range<u32>,
+        ) -> Result<(), Self::Error> {
             if let Some(leaf) = self.leaves.get_mut(&id) {
                 leaf.set_content_range(range);
             }
@@ -619,7 +640,11 @@ mod tests {
         }
 
         fn list_leaves(&self, branch_id: BranchId) -> Result<Vec<LeafId>, Self::Error> {
-            Ok(self.branch_leaves.get(&branch_id).cloned().unwrap_or_default())
+            Ok(self
+                .branch_leaves
+                .get(&branch_id)
+                .cloned()
+                .unwrap_or_default())
         }
 
         fn count_leaves(&self, branch_id: BranchId) -> Result<usize, Self::Error> {
@@ -734,7 +759,8 @@ mod tests {
         let b2 = BranchId::new(NodeId::new(1), 1);
 
         txn.put_branch(&Branch::new(b1, trunk_id), None).unwrap();
-        txn.put_branch(&Branch::new(b2, trunk_id), Some(b1)).unwrap();
+        txn.put_branch(&Branch::new(b2, trunk_id), Some(b1))
+            .unwrap();
 
         let branches = txn.list_branches(trunk_id).unwrap();
         assert_eq!(branches.len(), 2);
@@ -776,8 +802,13 @@ mod tests {
         let l1 = LeafId::new(NodeId::new(1), 0);
         let l2 = LeafId::new(NodeId::new(1), 1);
 
-        txn.put_leaf(&Leaf::new(l1, branch_id, TokenKind::Word, 0..2), None).unwrap();
-        txn.put_leaf(&Leaf::new(l2, branch_id, TokenKind::Whitespace, 2..3), Some(l1)).unwrap();
+        txn.put_leaf(&Leaf::new(l1, branch_id, TokenKind::Word, 0..2), None)
+            .unwrap();
+        txn.put_leaf(
+            &Leaf::new(l2, branch_id, TokenKind::Whitespace, 2..3),
+            Some(l1),
+        )
+        .unwrap();
 
         let leaves = txn.list_leaves(branch_id).unwrap();
         assert_eq!(leaves.len(), 2);
@@ -804,7 +835,9 @@ mod tests {
         let mut txn = MockCrdtTxn::new();
         let id = TrunkId::new(NodeId::new(1), 0);
 
-        let trunk = txn.create_trunk(id, "test.rs", Some(Encoding::Utf8)).unwrap();
+        let trunk = txn
+            .create_trunk(id, "test.rs", Some(Encoding::Utf8))
+            .unwrap();
 
         assert_eq!(trunk.id(), id);
         assert_eq!(trunk.path(), "test.rs");
@@ -869,7 +902,9 @@ mod tests {
         let branch_id = BranchId::new(NodeId::new(1), 0);
         let leaf_id = LeafId::new(NodeId::new(1), 0);
 
-        let leaf = txn.create_leaf(leaf_id, branch_id, TokenKind::Word, 0..5, None).unwrap();
+        let leaf = txn
+            .create_leaf(leaf_id, branch_id, TokenKind::Word, 0..5, None)
+            .unwrap();
 
         assert_eq!(leaf.id(), leaf_id);
         assert_eq!(leaf.branch(), branch_id);
@@ -883,7 +918,8 @@ mod tests {
         let branch_id = BranchId::new(NodeId::new(1), 0);
         let leaf_id = LeafId::new(NodeId::new(1), 0);
 
-        txn.create_leaf(leaf_id, branch_id, TokenKind::Word, 0..5, None).unwrap();
+        txn.create_leaf(leaf_id, branch_id, TokenKind::Word, 0..5, None)
+            .unwrap();
         txn.mark_leaf_deleted(leaf_id).unwrap();
 
         let leaf = txn.get_leaf(leaf_id).unwrap().unwrap();

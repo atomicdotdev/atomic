@@ -298,7 +298,11 @@ impl SignatureSet {
     /// Add a signature to the set.
     pub fn add(&mut self, signature: SignatureInfo) {
         // Avoid duplicates by signer ID
-        if !self.signatures.iter().any(|s| s.signer_id == signature.signer_id) {
+        if !self
+            .signatures
+            .iter()
+            .any(|s| s.signer_id == signature.signer_id)
+        {
             self.signatures.push(signature);
         }
     }
@@ -350,7 +354,10 @@ impl SignatureSet {
 
     /// Get all signer names.
     pub fn signer_names(&self) -> Vec<&str> {
-        self.signatures.iter().map(|s| s.signer_name.as_str()).collect()
+        self.signatures
+            .iter()
+            .map(|s| s.signer_name.as_str())
+            .collect()
     }
 }
 
@@ -408,7 +415,10 @@ impl VerificationResult {
 impl fmt::Display for VerificationResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            VerificationResult::Valid { signer_id, signed_at } => {
+            VerificationResult::Valid {
+                signer_id,
+                signed_at,
+            } => {
                 write!(
                     f,
                     "Valid signature by {} at {}",
@@ -493,7 +503,12 @@ mod tests {
         let identity = Identity::new("alice", &keypair);
         let message = b"Message to sign";
 
-        let info = SignatureInfo::sign(message, &identity, &keypair, Some("Test reason".to_string()));
+        let info = SignatureInfo::sign(
+            message,
+            &identity,
+            &keypair,
+            Some("Test reason".to_string()),
+        );
 
         assert_eq!(info.signer_id, identity.id);
         assert_eq!(info.signer_name, "alice");

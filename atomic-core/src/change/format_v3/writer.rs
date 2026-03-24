@@ -411,7 +411,7 @@ pub struct WriteOutcome {
 /// `ChangeWriter` is NOT thread-safe. It wraps a `&mut W` writer and
 /// maintains internal state (hasher, stats). For parallel compression,
 /// compress sections in parallel first, then feed them to the writer
-/// sequentially via [`write_compressed_section`].
+/// sequentially via [`ChangeWriter::write_compressed_section`].
 pub struct ChangeWriter<'w, W: Write> {
     /// The underlying writer.
     writer: &'w mut W,

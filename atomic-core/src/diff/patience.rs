@@ -600,12 +600,7 @@ mod tests {
     #[test]
     fn test_patience_vs_myers_structural() {
         // A case where patience should produce better results
-        let old = lines(&[
-            "void foo() {\n",
-            "}\n",
-            "void bar() {\n",
-            "}\n",
-        ]);
+        let old = lines(&["void foo() {\n", "}\n", "void bar() {\n", "}\n"]);
         let new = lines(&[
             "void foo() {\n",
             "    int x;\n",
@@ -635,20 +630,8 @@ mod tests {
 
     #[test]
     fn test_complex_reordering() {
-        let old = lines(&[
-            "first\n",
-            "second\n",
-            "third\n",
-            "fourth\n",
-            "fifth\n",
-        ]);
-        let new = lines(&[
-            "first\n",
-            "third\n",
-            "inserted\n",
-            "fourth\n",
-            "fifth\n",
-        ]);
+        let old = lines(&["first\n", "second\n", "third\n", "fourth\n", "fifth\n"]);
+        let new = lines(&["first\n", "third\n", "inserted\n", "fourth\n", "fifth\n"]);
 
         let result = diff(&old, &new);
 

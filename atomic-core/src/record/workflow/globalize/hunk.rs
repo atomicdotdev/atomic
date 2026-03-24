@@ -1,6 +1,5 @@
 use super::*;
 
-
 // MAIN GLOBALIZATION FUNCTIONS
 
 /// Globalize a single built graph_op into a graph graph_op.
@@ -210,7 +209,6 @@ where
 ///
 /// The end position of the last content span, or the inode position if
 /// the file has no content.
-
 /// Result of finding insert context - determines how to handle the insertion.
 #[derive(Debug)]
 enum InsertContext {
@@ -411,7 +409,6 @@ where
     T: GraphTxnT,
 {
     use crate::output::alive::{retrieve_graph, RetrieveOptions};
-    
 
     let options = RetrieveOptions::default();
     let result = match retrieve_graph(txn, inode_pos, options) {
@@ -522,10 +519,11 @@ fn find_predecessor_end_position<T: GraphTxnT>(
 
     let adj = txn
         .iter_adjacent(node, min_flag, max_flag)
-        .map_err(GlobalizeError::Pristine)?;
+        .map_err(|e| GlobalizeError::Pristine(Box::new(e)))?;
 
-    for edge_result in adj {
-        let edge = edge_result.map_err(GlobalizeError::Pristine)?;
+    let mut adj_iter = adj;
+    if let Some(edge_result) = adj_iter.next() {
+        let edge = edge_result.map_err(|e| GlobalizeError::Pristine(Box::new(e)))?;
 
         // The edge dest() points to where the forward edge came FROM
         // (remember, this is a reverse/PARENT edge)

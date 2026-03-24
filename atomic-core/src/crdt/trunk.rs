@@ -172,12 +172,7 @@ impl Trunk {
     /// Creates a new trunk with the given properties.
     ///
     /// The trunk starts in the [`TrunkState::Alive`] state.
-    pub fn new(
-        id: TrunkId,
-        inode: Inode,
-        path: String,
-        encoding: Option<Encoding>,
-    ) -> Self {
+    pub fn new(id: TrunkId, inode: Inode, path: String, encoding: Option<Encoding>) -> Self {
         Trunk {
             id,
             inode,
@@ -220,7 +215,7 @@ impl Trunk {
     /// Returns `true` if this is a text file.
     #[inline]
     pub fn is_text(&self) -> bool {
-        self.encoding.map_or(false, |e| e.is_text())
+        self.encoding.is_some_and(|e| e.is_text())
     }
 
     /// Returns `true` if this is a binary file.
@@ -257,13 +252,7 @@ impl Trunk {
 
 impl fmt::Display for Trunk {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Trunk({}, {}, state={})",
-            self.id,
-            self.path,
-            self.state
-        )
+        write!(f, "Trunk({}, {}, state={})", self.id, self.path, self.state)
     }
 }
 

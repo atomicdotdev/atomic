@@ -489,6 +489,7 @@ impl ConvertedOps {
     }
 
     /// Consumes the result and returns the operations.
+    #[allow(clippy::type_complexity)]
     pub fn into_parts(
         self,
     ) -> (
@@ -798,7 +799,13 @@ impl HunkConverter {
     pub fn convert_line_delete(&mut self, branch_id: BranchId) -> ConvertedOps {
         let mut result = ConvertedOps::new();
 
-        result.add_branch_op(branch_id, BranchOp::Delete { branch: branch_id, content: Vec::new() });
+        result.add_branch_op(
+            branch_id,
+            BranchOp::Delete {
+                branch: branch_id,
+                content: Vec::new(),
+            },
+        );
         result.stats.hunks_converted += 1;
 
         result
@@ -914,7 +921,10 @@ mod tests {
         assert!(opts.preserve_whitespace());
         assert!(opts.code_aware());
         assert!(opts.include_empty_lines());
-        assert_eq!(opts.max_tokenize_size(), ConversionOptions::DEFAULT_MAX_TOKENIZE_SIZE);
+        assert_eq!(
+            opts.max_tokenize_size(),
+            ConversionOptions::DEFAULT_MAX_TOKENIZE_SIZE
+        );
     }
 
     #[test]
@@ -1127,10 +1137,13 @@ mod tests {
     fn test_converted_ops_add_branch_op() {
         let mut ops = ConvertedOps::new();
         let branch_id = BranchId::new(NodeId::new(1), 0);
-        ops.add_branch_op(branch_id, BranchOp::Insert {
-            after: None,
-            content: vec![],
-        });
+        ops.add_branch_op(
+            branch_id,
+            BranchOp::Insert {
+                after: None,
+                content: vec![],
+            },
+        );
 
         assert!(!ops.is_empty());
         assert_eq!(ops.branch_ops().len(), 1);
@@ -1141,11 +1154,14 @@ mod tests {
     fn test_converted_ops_add_leaf_op() {
         let mut ops = ConvertedOps::new();
         let leaf_id = LeafId::new(NodeId::new(1), 0);
-        ops.add_leaf_op(leaf_id, LeafOp::Insert {
-            after: None,
-            kind: TokenKind::Word,
-            content: b"test".to_vec(),
-        });
+        ops.add_leaf_op(
+            leaf_id,
+            LeafOp::Insert {
+                after: None,
+                kind: TokenKind::Word,
+                content: b"test".to_vec(),
+            },
+        );
 
         assert!(!ops.is_empty());
         assert_eq!(ops.leaf_ops().len(), 1);

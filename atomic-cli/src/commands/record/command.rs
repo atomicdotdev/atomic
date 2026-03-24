@@ -1,6 +1,5 @@
 use super::*;
 
-
 impl Command for Record {
     /// Execute the record command.
     ///
@@ -60,9 +59,7 @@ impl Command for Record {
         // Record the changes
         let outcome = repo.record(header, options).map_err(|e| match e {
             atomic_repository::record::RecordError::NothingToRecord => CliError::NothingToRecord,
-            atomic_repository::record::RecordError::NoFilesMatched { .. } => {
-                CliError::NothingToRecord
-            }
+            atomic_repository::record::RecordError::NoFilesMatched => CliError::NothingToRecord,
             atomic_repository::record::RecordError::FileNotFound { path } => {
                 CliError::FileNotFound {
                     path: PathBuf::from(path),

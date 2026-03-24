@@ -157,8 +157,7 @@ pub mod tokenize;
 
 // Re-export main types for convenience
 pub use builder::{
-    CrdtBuildError, CrdtBuildStats, CrdtChangeBuilder, CrdtChangeResult, FileOps, LineOps,
-    TokenOps,
+    CrdtBuildError, CrdtBuildStats, CrdtChangeBuilder, CrdtChangeResult, FileOps, LineOps, TokenOps,
 };
 pub use convert::{ConversionOptions, ConversionStats, ConvertError, ConvertedOps, HunkConverter};
 pub use line_ops::{

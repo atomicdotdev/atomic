@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// A token representing a word or symbol within a line.
 ///
 /// Tokens are the atomic units for word-level diffing. They're designed

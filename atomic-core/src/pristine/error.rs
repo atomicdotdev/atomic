@@ -75,21 +75,21 @@ pub enum PristineError {
     /// - The path is invalid or inaccessible
     /// - The database file is corrupted
     /// - Insufficient permissions
-    Database(redb::DatabaseError),
+    Database(Box<redb::DatabaseError>),
 
     /// Error beginning or managing a transaction
     ///
     /// This typically occurs when:
     /// - Another write transaction is active (for write txn)
     /// - The database is closed
-    Transaction(redb::TransactionError),
+    Transaction(Box<redb::TransactionError>),
 
     /// Error opening or accessing a table
     ///
     /// This typically occurs when:
     /// - Table doesn't exist (shouldn't happen with our init)
     /// - Table schema mismatch
-    Table(redb::TableError),
+    Table(Box<redb::TableError>),
 
     /// Error during storage operations (read/write)
     ///
@@ -97,14 +97,14 @@ pub enum PristineError {
     /// - Disk I/O failure
     /// - Memory mapping issues
     /// - Data corruption
-    Storage(redb::StorageError),
+    Storage(Box<redb::StorageError>),
 
     /// Error committing a transaction
     ///
     /// This typically occurs when:
     /// - Disk full
     /// - I/O error during flush
-    Commit(redb::CommitError),
+    Commit(Box<redb::CommitError>),
 
     // I/O Errors
     /// General I/O error (file operations, etc.)
@@ -124,8 +124,8 @@ pub enum PristineError {
 
     /// A stack with this name already exists
     ///
-    /// Returned by [`MutTxnT::create_stack`] when attempting to create a
-    /// stack whose name is already taken. Use [`MutTxnT::open_or_create_stack`]
+    /// Returned by `MutTxnT::create_stack` when attempting to create a
+    /// stack whose name is already taken. Use `MutTxnT::open_or_create_stack`
     /// if "get or create" semantics are desired.
     StackAlreadyExists {
         /// The name of the stack that already exists
@@ -285,11 +285,11 @@ impl fmt::Display for PristineError {
 impl std::error::Error for PristineError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Database(e) => Some(e),
-            Self::Transaction(e) => Some(e),
-            Self::Table(e) => Some(e),
-            Self::Storage(e) => Some(e),
-            Self::Commit(e) => Some(e),
+            Self::Database(e) => Some(e.as_ref()),
+            Self::Transaction(e) => Some(e.as_ref()),
+            Self::Table(e) => Some(e.as_ref()),
+            Self::Storage(e) => Some(e.as_ref()),
+            Self::Commit(e) => Some(e.as_ref()),
             Self::Io(e) => Some(e),
             _ => None,
         }
@@ -300,31 +300,31 @@ impl std::error::Error for PristineError {
 
 impl From<redb::DatabaseError> for PristineError {
     fn from(e: redb::DatabaseError) -> Self {
-        Self::Database(e)
+        Self::Database(Box::new(e))
     }
 }
 
 impl From<redb::TransactionError> for PristineError {
     fn from(e: redb::TransactionError) -> Self {
-        Self::Transaction(e)
+        Self::Transaction(Box::new(e))
     }
 }
 
 impl From<redb::TableError> for PristineError {
     fn from(e: redb::TableError) -> Self {
-        Self::Table(e)
+        Self::Table(Box::new(e))
     }
 }
 
 impl From<redb::StorageError> for PristineError {
     fn from(e: redb::StorageError) -> Self {
-        Self::Storage(e)
+        Self::Storage(Box::new(e))
     }
 }
 
 impl From<redb::CommitError> for PristineError {
     fn from(e: redb::CommitError) -> Self {
-        Self::Commit(e)
+        Self::Commit(Box::new(e))
     }
 }
 

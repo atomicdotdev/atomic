@@ -131,7 +131,6 @@ fn lcs_to_diff(lcs: &[LcsElement], old_len: usize, new_len: usize) -> DiffResult
         } else if ins_count > 0 {
             result.push(DiffOp::insert(old_pos, new_pos, ins_count));
         }
-
     }
 
     // Recalculate to properly merge consecutive equals

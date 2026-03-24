@@ -1,6 +1,5 @@
 use super::*;
 
-
 // POSITION RESOLUTION
 
 /// Resolve a file path to its inode.

@@ -78,18 +78,19 @@
 //! # Module Organization
 //!
 //! - [`ops`]: CRDT operations (FileOps, LineOps) for change storage
-//! - [`atom`]: Primitive graph operations (Insertion, EdgeUpdate, NewEdge) - DEPRECATED
-//! - [`encoding`]: Text file encoding detection and handling
-//! - [`header`]: Change metadata (ChangeHeader, Author)
-//! - [`graph_op`]: High-level modification units - DEPRECATED
-//! - [`local`]: Local context for human-readable output
-//! - [`provenance`]: AI provenance tracking (vendor, model, tokens, cost)
-//! - [`credit`]: AI-aware line-level attribution (like git blame)
-//! - [`change`]: Complete change structure and serialization
+//! - `atom`: Primitive graph operations (Insertion, EdgeUpdate, NewEdge) - DEPRECATED
+//! - `encoding`: Text file encoding detection and handling
+//! - `header`: Change metadata (ChangeHeader, Author)
+//! - `graph_op`: High-level modification units - DEPRECATED
+//! - `local`: Local context for human-readable output
+//! - `provenance`: AI provenance tracking (vendor, model, tokens, cost)
+//! - `credit`: AI-aware line-level attribution (like git blame)
+//! - `change`: Complete change structure and serialization
 //! - [`format_v3`]: V3 change file format — streaming, compressed, postcard-serialized (Phase 1)
 
 mod atom;
 pub mod attestation;
+#[allow(clippy::module_inception)]
 mod change;
 mod credit;
 mod encoding;

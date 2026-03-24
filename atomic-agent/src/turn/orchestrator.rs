@@ -3,7 +3,7 @@
 //! The `TurnOrchestrator` is the central coordinator that connects:
 //!
 //! - **Agent hooks** (via [`TurnEvent`]) — lifecycle events from the agent
-//! - **State machine** (via [`transition`]) — determines what actions to take
+//! - **State machine** (via [`crate::turn::phase::transition`]) — determines what actions to take
 //! - **File watcher** (via [`FileWatcher`]) — optional real-time file tracking
 //! - **Recording** (via [`record_turn`]) — status → add → record workflow
 //! - **Session store** (via [`SessionStore`]) — persists session state
@@ -1203,7 +1203,7 @@ impl TurnOrchestrator {
         let change_hash_base32 = outcome.hash.to_base32();
         acc.append_patch_proposal(
             &change_hash_base32,
-            &outcome.recorded_file_list().to_vec(),
+            outcome.recorded_file_list(),
             event.timestamp.timestamp(),
         );
 
@@ -1568,7 +1568,7 @@ impl std::fmt::Debug for TurnOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::TurnChanges;
+
     use crate::watcher::fallback::FallbackWatcher;
     use std::fs;
     use tempfile::TempDir;

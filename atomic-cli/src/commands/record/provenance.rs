@@ -38,7 +38,7 @@ impl Record {
             .unwrap_or_else(|| "unknown".to_string());
 
         // Parse vendor from provider string
-        let vendor = AIVendor::from_str(&provider);
+        let vendor = AIVendor::parse(&provider);
 
         // Get tool type
         let tool_from_env = std::env::var("ATOMIC_AI_TOOL").ok();
@@ -46,7 +46,7 @@ impl Record {
         let tool_str = self
             .ai_tool
             .clone()
-            .or_else(|| tool_from_env)
+            .or(tool_from_env)
             .unwrap_or_else(|| "cli".to_string());
 
         let tool = match tool_str.to_lowercase().as_str() {

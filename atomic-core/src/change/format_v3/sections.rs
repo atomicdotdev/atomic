@@ -276,7 +276,7 @@ impl GraphSectionPayload {
     ///
     /// # Errors
     ///
-    /// Returns [`FormatError::Postcard`] if serialization fails.
+    /// Returns [`super::error::FormatError::Postcard`] if serialization fails.
     pub fn to_postcard_bytes(&self) -> FormatResult<Vec<u8>> {
         Ok(postcard::to_allocvec(self)?)
     }
@@ -289,7 +289,7 @@ impl GraphSectionPayload {
     ///
     /// # Errors
     ///
-    /// Returns [`FormatError::Postcard`] if deserialization fails.
+    /// Returns [`super::error::FormatError::Postcard`] if deserialization fails.
     pub fn from_postcard_bytes(bytes: &[u8]) -> FormatResult<Self> {
         Ok(postcard::from_bytes(bytes)?)
     }
@@ -461,7 +461,7 @@ impl SemanticSectionPayload {
     ///
     /// # Errors
     ///
-    /// Returns [`FormatError::Postcard`] if serialization fails.
+    /// Returns [`super::error::FormatError::Postcard`] if serialization fails.
     pub fn to_postcard_bytes(&self) -> FormatResult<Vec<u8>> {
         Ok(postcard::to_allocvec(self)?)
     }
@@ -470,7 +470,7 @@ impl SemanticSectionPayload {
     ///
     /// # Errors
     ///
-    /// Returns [`FormatError::Postcard`] if deserialization fails.
+    /// Returns [`super::error::FormatError::Postcard`] if deserialization fails.
     pub fn from_postcard_bytes(bytes: &[u8]) -> FormatResult<Self> {
         Ok(postcard::from_bytes(bytes)?)
     }

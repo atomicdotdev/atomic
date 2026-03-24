@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     fn test_repo_status_ignores_atomic_dir() {
-        let (temp_dir, repo) = create_temp_repo();
+        let (_temp_dir, repo) = create_temp_repo();
 
         // The .atomic directory should be ignored
         let status = repo
@@ -1345,7 +1345,7 @@ mod tests {
 
         let dest = temp_dir.path().join("archive");
         let options = ArchiveOptions::directory().with_prefix("project-1.0/");
-        let outcome = repo.archive(&dest, options).unwrap();
+        let _outcome = repo.archive(&dest, options).unwrap();
 
         assert!(dest.exists());
         // The file should be at archive/project-1.0/test.txt
@@ -1785,7 +1785,6 @@ mod tests {
     #[test]
     fn test_deleting_lines_creates_replacement_hunks() {
         use crate::record::RecordOptions;
-        use atomic_core::change::GraphOp;
 
         let (temp_dir, repo) = create_temp_repo();
 
