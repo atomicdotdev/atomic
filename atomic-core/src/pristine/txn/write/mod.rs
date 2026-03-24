@@ -52,6 +52,239 @@ impl<'a> WriteTxn<'a> {
             next_inode,
         }
     }
+
+    /// Populate the session tables from a Sherpa provenance graph.
+    ///
+    /// Called during `save_provenance_graph` when the graph has
+    /// `profile == "sherpa-trace/1.0.0"`. Extracts session data from
+    /// the provenance nodes' `detail` fields and writes to the four
+    /// session tables.
+    ///
+    /// Best-effort: parse errors on individual nodes are logged and skipped.
+    pub fn populate_session_tables(
+        &mut self,
+        provenance_id: u64,
+        graph: &crate::change::ProvenanceGraph,
+    ) -> PristineResult<()> {
+        use crate::change::provenance_graph::ProvenanceNodeKind;
+        use crate::change::session::*;
+
+        // Gate on profile — only populate for Sherpa graphs.
+        match graph.profile.as_deref() {
+            Some(crate::SHERPA_PROFILE) => {}
+            _ => return Ok(()),
+        }
+
+        // Open all four tables.
+        let mut events_table = self.txn.open_table(SESSION_EVENTS)?;
+        let mut todos_table = self.txn.open_table(SESSION_TODOS)?;
+        let mut phases_table = self.txn.open_table(SESSION_PHASES)?;
+        let mut intents_table = self.txn.open_table(SESSION_INTENTS)?;
+
+        let mut seq: u64 = 0;
+
+        for node in &graph.nodes {
+            let detail: Option<serde_json::Value> = if let Some(s) = node.detail.as_deref() {
+                match serde_json::from_str(s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        log::warn!(
+                            "Warning: failed to parse provenance node detail JSON (node id={}, kind={}): {}",
+                            node.id,
+                            node.kind.label(),
+                            e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Write every node as a SessionEvent regardless of kind.
+            //
+            // `event_kind` and `record_type` are populated from the original
+            // Sherpa/agent-trace `record_type` field stored in the detail JSON
+            // (e.g. "intent", "todo_status", "phase_transition").  We fall back
+            // to `node.kind.label()` only when no such field is present so that
+            // non-Sherpa nodes still get a meaningful discriminant.
+            let sherpa_record_type = detail
+                .as_ref()
+                .and_then(|d| d["record_type"].as_str())
+                .map(|s| s.to_string());
+            let event_kind = sherpa_record_type
+                .clone()
+                .unwrap_or_else(|| node.kind.label().to_string());
+            let event = SessionEvent {
+                seq,
+                timestamp: format_timestamp_ms(node.timestamp),
+                event_kind,
+                place: None,
+                transition: None,
+                token_id: node.id.clone(),
+                token_kind: match node.kind {
+                    ProvenanceNodeKind::Goal => "turn".to_string(),
+                    _ => "todo".to_string(),
+                },
+                token_data: node.detail.clone().unwrap_or_default(),
+                record_type: Some(
+                    sherpa_record_type.unwrap_or_else(|| node.kind.label().to_string()),
+                ),
+            };
+
+            let event_key = encode_session_event_key(provenance_id, seq);
+            let event_bytes = event.to_bytes();
+            events_table.insert(&event_key, event_bytes.as_slice())?;
+            seq += 1;
+
+            // Extract structured data by node kind.
+            match node.kind {
+                ProvenanceNodeKind::Goal => {
+                    if let Some(ref detail) = detail {
+                        let intent = IntentEntry {
+                            title: detail["intent_title"]
+                                .as_str()
+                                .unwrap_or(&node.summary)
+                                .to_string(),
+                            description: detail["intent_description"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
+                            turn_id: detail["intent_turn_id"].as_u64().unwrap_or(0) as u32,
+                            model: detail["model"].as_str().unwrap_or("").to_string(),
+                            session_id: detail["session_id"]
+                                .as_str()
+                                .unwrap_or(&graph.session_id)
+                                .to_string(),
+                            outcome: String::new(),
+                            total_tokens: detail["turn_totals"]["total"].as_u64().unwrap_or(0),
+                            total_cost_usd: detail["turn_totals"]["cost_usd"]
+                                .as_f64()
+                                .unwrap_or(0.0),
+                        };
+                        let intent_bytes = intent.to_bytes();
+                        intents_table.insert(provenance_id, intent_bytes.as_slice())?;
+
+                        // Extract phase timing from GoalDetail.phases
+                        if let Some(phases) = detail["phases"].as_object() {
+                            for (phase_name, phase_data) in phases {
+                                let entry = PhaseTimingEntry {
+                                    phase: phase_name.clone(),
+                                    start_ts: None,
+                                    end_ts: None,
+                                    input_tokens: phase_data["input"].as_u64().unwrap_or(0),
+                                    output_tokens: phase_data["output"].as_u64().unwrap_or(0),
+                                    cost_usd: phase_data["cost_usd"].as_f64().unwrap_or(0.0),
+                                };
+                                let phase_key = encode_session_phase_key(provenance_id, phase_name);
+                                let phase_bytes = entry.to_bytes();
+                                phases_table.insert(&phase_key, phase_bytes.as_slice())?;
+                            }
+                        }
+                    }
+                }
+
+                ProvenanceNodeKind::Commitment => {
+                    if let Some(ref detail) = detail {
+                        let todo_id = detail["todo_id"].as_str().unwrap_or(&node.id).to_string();
+
+                        let snapshot = TodoSnapshot {
+                            todo_id: todo_id.clone(),
+                            content: detail["todo_content"]
+                                .as_str()
+                                .unwrap_or(&node.summary)
+                                .to_string(),
+                            owner: detail["contributor"].as_str().unwrap_or("ai").to_string(),
+                            final_status: "completed".to_string(),
+                            priority: detail["priority"].as_str().unwrap_or("").to_string(),
+                            file: detail["file"].as_str().map(|s| s.to_string()),
+                            start_line: detail["start_line"].as_u64().map(|n| n as u32),
+                            end_line: detail["end_line"].as_u64().map(|n| n as u32),
+                            started_at: None,
+                            completed_at: None,
+                        };
+                        let todo_key = encode_session_todo_key(provenance_id, &todo_id);
+                        let todo_bytes = snapshot.to_bytes();
+                        todos_table.insert(&todo_key, todo_bytes.as_slice())?;
+                    }
+                }
+
+                ProvenanceNodeKind::Verification => {
+                    if let Some(ref detail) = detail {
+                        // Update the intent entry with outcome and totals.
+                        // Read existing bytes in a separate scope so the
+                        // immutable borrow on `intents_table` is released
+                        // before we call `.insert()`.
+                        let existing_bytes: Option<Vec<u8>> = {
+                            match intents_table.get(provenance_id) {
+                                Ok(Some(guard)) => Some(guard.value().to_vec()),
+                                _ => None,
+                            }
+                        };
+
+                        if let Some(bytes) = existing_bytes {
+                            if let Ok(mut intent) = IntentEntry::from_bytes(&bytes) {
+                                intent.outcome = detail["outcome"]
+                                    .as_str()
+                                    .unwrap_or("completed")
+                                    .to_string();
+                                if let Some(t) = detail["turn_tokens_total"].as_u64() {
+                                    intent.total_tokens = t;
+                                }
+                                if let Some(c) = detail["turn_cost_usd"].as_f64() {
+                                    intent.total_cost_usd = c;
+                                }
+                                let intent_bytes = intent.to_bytes();
+                                intents_table.insert(provenance_id, intent_bytes.as_slice())?;
+                            }
+                        }
+                    }
+                }
+
+                ProvenanceNodeKind::Todo => {
+                    if let Some(ref detail) = detail {
+                        let todo_id = detail["todo_id"].as_str().unwrap_or(&node.id).to_string();
+
+                        let snapshot = TodoSnapshot {
+                            todo_id: todo_id.clone(),
+                            content: detail["content"]
+                                .as_str()
+                                .unwrap_or(&node.summary)
+                                .to_string(),
+                            owner: detail["owner"].as_str().unwrap_or("ai").to_string(),
+                            final_status: detail["status"]
+                                .as_str()
+                                .unwrap_or("pending")
+                                .to_string(),
+                            priority: detail["priority"].as_str().unwrap_or("").to_string(),
+                            file: None,
+                            start_line: None,
+                            end_line: None,
+                            started_at: None,
+                            completed_at: None,
+                        };
+                        let todo_key = encode_session_todo_key(provenance_id, &todo_id);
+                        let todo_bytes = snapshot.to_bytes();
+                        todos_table.insert(&todo_key, todo_bytes.as_slice())?;
+                    }
+                }
+
+                _ => {
+                    // Exploration, Execution, Decision, etc. —
+                    // already captured as SessionEvent above.
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Format a Unix epoch milliseconds timestamp to RFC-3339 string.
+fn format_timestamp_ms(epoch_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(epoch_ms)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| format!("{}", epoch_ms))
 }
 
 mod graph;
@@ -858,6 +1091,17 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         Ok(pos)
     }
 
+    fn get_deps(&self, change_id: NodeId) -> PristineResult<Vec<NodeId>> {
+        let table = self.txn.open_multimap_table(DEPS)?;
+        let mut result = Vec::new();
+        let iter = table.get(change_id.get())?;
+        for item in iter {
+            let value = item?;
+            result.push(NodeId::new(value.value()));
+        }
+        Ok(result)
+    }
+
     fn put_dep(&mut self, change_id: NodeId, dep_id: NodeId) -> PristineResult<()> {
         {
             let mut table = self.txn.open_multimap_table(DEPS)?;
@@ -868,17 +1112,6 @@ impl<'a> MutTxnT for WriteTxn<'a> {
             table.insert(dep_id.get(), change_id.get())?;
         }
         Ok(())
-    }
-
-    fn get_deps(&self, change_id: NodeId) -> PristineResult<Vec<NodeId>> {
-        let table = self.txn.open_multimap_table(DEPS)?;
-        let mut deps = Vec::new();
-        for result in table.get(change_id.get())? {
-            if let Ok(v) = result {
-                deps.push(NodeId::new(v.value()));
-            }
-        }
-        Ok(deps)
     }
 
     fn alloc_inode(&mut self) -> PristineResult<Inode> {

@@ -525,6 +525,126 @@ impl TreeTxnT for ReadTxn {
     }
 }
 
+// Session data queries
+
+impl ReadTxn {
+    /// Get all session events for a provenance graph.
+    ///
+    /// Returns events in sequence order. Empty if the provenance is not Sherpa
+    /// or has no session data.
+    pub fn get_session_events(
+        &self,
+        provenance_id: u64,
+    ) -> PristineResult<Vec<crate::change::session::SessionEvent>> {
+        use crate::change::session::{encode_session_prefix, SessionEvent};
+
+        let table = self.txn.open_table(SESSION_EVENTS)?;
+        let mut events = Vec::new();
+
+        // Use a bounded prefix range instead of a full-table scan.
+        // All keys for `provenance_id` lie in [prefix(id), prefix(id+1)).
+        let start = encode_session_prefix(provenance_id);
+        let end = encode_session_prefix(provenance_id.saturating_add(1));
+        for result in table.range::<&[u8; 16]>(&start..&end)? {
+            let (_key, value) = result?;
+            match SessionEvent::from_bytes(value.value()) {
+                Ok(event) => events.push(event),
+                Err(e) => {
+                    log::warn!("Failed to deserialize session event: {}", e);
+                }
+            }
+        }
+
+        // Events are already in seq order because keys encode (provenance_id,
+        // seq) with the same byte layout, but sort explicitly to be safe.
+        events.sort_by_key(|e| e.seq);
+        Ok(events)
+    }
+
+    /// Get all todos for a provenance graph.
+    ///
+    /// Returns snapshots of all todo items from the turn.
+    /// Empty if the provenance is not Sherpa or has no session data.
+    pub fn get_session_todos(
+        &self,
+        provenance_id: u64,
+    ) -> PristineResult<Vec<crate::change::session::TodoSnapshot>> {
+        use crate::change::session::{encode_session_prefix, TodoSnapshot};
+
+        let table = self.txn.open_table(SESSION_TODOS)?;
+        let mut todos = Vec::new();
+
+        // Bounded prefix scan: all todo keys for this provenance_id lie in
+        // [prefix(id), prefix(id+1)).
+        let start = encode_session_prefix(provenance_id);
+        let end = encode_session_prefix(provenance_id.saturating_add(1));
+        for result in table.range::<&[u8; 16]>(&start..&end)? {
+            let (_key, value) = result?;
+            match TodoSnapshot::from_bytes(value.value()) {
+                Ok(snapshot) => todos.push(snapshot),
+                Err(e) => {
+                    log::warn!("Failed to deserialize todo snapshot: {}", e);
+                }
+            }
+        }
+
+        Ok(todos)
+    }
+
+    /// Get phase timing breakdown for a provenance graph.
+    ///
+    /// Returns timing data for each phase in the turn.
+    /// Empty if the provenance is not Sherpa or has no session data.
+    pub fn get_session_phases(
+        &self,
+        provenance_id: u64,
+    ) -> PristineResult<Vec<crate::change::session::PhaseTimingEntry>> {
+        use crate::change::session::{encode_session_prefix, PhaseTimingEntry};
+
+        let table = self.txn.open_table(SESSION_PHASES)?;
+        let mut phases = Vec::new();
+
+        // Bounded prefix scan: all phase keys for this provenance_id lie in
+        // [prefix(id), prefix(id+1)).
+        let start = encode_session_prefix(provenance_id);
+        let end = encode_session_prefix(provenance_id.saturating_add(1));
+        for result in table.range::<&[u8; 16]>(&start..&end)? {
+            let (_key, value) = result?;
+            match PhaseTimingEntry::from_bytes(value.value()) {
+                Ok(entry) => phases.push(entry),
+                Err(e) => {
+                    log::warn!("Failed to deserialize phase timing entry: {}", e);
+                }
+            }
+        }
+
+        Ok(phases)
+    }
+
+    /// Get intent metadata for a provenance graph.
+    ///
+    /// Returns the intent entry if this is a Sherpa provenance, `None` otherwise.
+    pub fn get_session_intent(
+        &self,
+        provenance_id: u64,
+    ) -> PristineResult<Option<crate::change::session::IntentEntry>> {
+        use crate::change::session::IntentEntry;
+
+        let table = self.txn.open_table(SESSION_INTENTS)?;
+
+        match table.get(provenance_id)? {
+            Some(guard) => match IntentEntry::from_bytes(guard.value()) {
+                Ok(entry) => Ok(Some(entry)),
+                Err(e) => {
+                    log::warn!("Failed to deserialize intent entry: {}", e);
+                    Ok(None)
+                }
+            },
+            None => Ok(None),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

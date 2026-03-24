@@ -234,6 +234,14 @@ pub struct ApplyOptions {
     /// When `true`, detailed conflict tracking is performed.
     /// Default: `true`
     pub track_conflicts: bool,
+
+    /// Skip the "already applied" validation check.
+    ///
+    /// When `true`, `validate_can_apply` is bypassed.  This is used by
+    /// `rebuild_change_graph` which intentionally re-applies a change
+    /// that is already in the stack log (same NodeId, new hunks).
+    /// Default: `false`
+    pub skip_validation: bool,
 }
 
 impl Default for ApplyOptions {
@@ -244,6 +252,7 @@ impl Default for ApplyOptions {
             allow_conflicts: true,
             max_depth: 100,
             track_conflicts: true,
+            skip_validation: false,
         }
     }
 }
@@ -280,6 +289,15 @@ impl ApplyOptions {
     /// Set whether to allow conflicts.
     pub fn allow_conflict(mut self, allow: bool) -> Self {
         self.allow_conflicts = allow;
+        self
+    }
+
+    /// Skip the "already applied" validation check.
+    ///
+    /// Used by `rebuild_change_graph` which re-applies a change that is
+    /// already in the stack log (same NodeId, new hunks after revise).
+    pub fn skip_validation(mut self, skip: bool) -> Self {
+        self.skip_validation = skip;
         self
     }
 
@@ -500,8 +518,11 @@ pub fn apply_change_to_graph<T: MutTxnT + StackTxnT>(
         .open_or_create_stack(stack_name)
         .map_err(|e| ApplyError::Database(e.to_string()))?;
 
-    // Validate we can apply
-    validate_can_apply(txn, &stack, change_id, change_hash, change)?;
+    // Validate we can apply (unless caller explicitly skipped validation,
+    // e.g. rebuild_change_graph re-applying an existing change with new hunks).
+    if !options.skip_validation {
+        validate_can_apply(txn, &stack, change_id, change_hash, change)?;
+    }
 
     // Determine where edges should be written based on the stack kind.
     // Shared stacks → global GRAPH; Local workspaces → STACK_GRAPH[(stack_id, vertex)].

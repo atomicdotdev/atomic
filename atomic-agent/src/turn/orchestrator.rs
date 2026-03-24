@@ -623,6 +623,18 @@ impl TurnOrchestrator {
                             // reuse this turn's prompt as the change message.
                             session.clear_current_prompt();
 
+                            // Sherpa: ingest the JSONL trace file into the provenance accumulator
+                            // so the resulting ProvenanceGraph has rich node data (file attribution,
+                            // bash commands, todo structure) instead of just the thin Goal node.
+                            if let Some(trace_path) = event
+                                .raw_json
+                                .as_ref()
+                                .and_then(|r| r.get("trace_file"))
+                                .and_then(|v| v.as_str())
+                            {
+                                self.ingest_sherpa_trace(session_id, Path::new(trace_path));
+                            }
+
                             // Provenance: inject reasoning blocks as Decision nodes,
                             // then append a patch proposal node and save the graph.
                             self.inject_reasoning_nodes(session_id, &event);
@@ -1021,6 +1033,150 @@ impl TurnOrchestrator {
         }
     }
 
+    /// Read a Sherpa JSONL trace file and create provenance nodes for
+    /// every record, preserving the full agent-trace + Sherpa extension data.
+    ///
+    /// Every JSONL line becomes a typed `ProvenanceNode` with the full
+    /// `metadata["dev.atomic"]` payload in its `detail` field. The semantic
+    /// knowledge graph can now query by node kind (Todo, PhaseTransition, etc.)
+    /// without parsing JSON blobs.
+    ///
+    /// Returns `true` if at least one record was successfully ingested.
+    fn ingest_sherpa_trace(&self, session_id: &str, trace_path: &Path) -> bool {
+        use crate::provenance::types::NodeKind;
+
+        let mut acc = match self.load_accumulator(session_id) {
+            Some(a) => a,
+            None => return false,
+        };
+
+        let content = match std::fs::read_to_string(trace_path) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!(
+                    "sherpa trace: failed to read {}: {}",
+                    trace_path.display(),
+                    e
+                );
+                return false;
+            }
+        };
+
+        let mut ingested = 0u32;
+        for (line_no, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let record: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("sherpa trace: line {} parse error: {}", line_no + 1, e);
+                    continue;
+                }
+            };
+
+            let dev_atomic = &record["metadata"]["dev.atomic"];
+            let record_type = dev_atomic["record_type"].as_str().unwrap_or("unknown");
+            let timestamp = record["timestamp"]
+                .as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp_millis())
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+
+            // Map record_type to NodeKind.
+            let (kind, summary) = match record_type {
+                "intent" => (
+                    NodeKind::Goal,
+                    dev_atomic["intent_title"]
+                        .as_str()
+                        .unwrap_or("intent")
+                        .to_string(),
+                ),
+                "commitment" => {
+                    let file = record["files"]
+                        .as_array()
+                        .and_then(|f| f.first())
+                        .and_then(|f| f["path"].as_str())
+                        .unwrap_or("");
+                    (NodeKind::Commitment, format!("wrote {}", file))
+                }
+                "execution" => (
+                    NodeKind::Execution,
+                    dev_atomic["command"]
+                        .as_str()
+                        .unwrap_or("command")
+                        .to_string(),
+                ),
+                "todo" => {
+                    let tid = dev_atomic["todo_id"].as_str().unwrap_or("");
+                    let content = dev_atomic["content"].as_str().unwrap_or("");
+                    (NodeKind::Todo, format!("[{}] {}", tid, content))
+                }
+                "todo_status" => {
+                    let tid = dev_atomic["todo_id"].as_str().unwrap_or("");
+                    let from = dev_atomic["from_status"].as_str().unwrap_or("");
+                    let to = dev_atomic["to_status"].as_str().unwrap_or("");
+                    (
+                        NodeKind::TodoStatusChange,
+                        format!("{}: {} → {}", tid, from, to),
+                    )
+                }
+                "phase_transition" => {
+                    let from = dev_atomic["from_phase"].as_str().unwrap_or("");
+                    let to = dev_atomic["to_phase"].as_str().unwrap_or("");
+                    (NodeKind::PhaseTransition, format!("{} → {}", from, to))
+                }
+                "lesson" => (
+                    NodeKind::Lesson,
+                    dev_atomic["label"].as_str().unwrap_or("lesson").to_string(),
+                ),
+                "llm_response" => (
+                    NodeKind::LlmResponse,
+                    truncate_prompt(dev_atomic["reply"].as_str().unwrap_or("llm response"), 200),
+                ),
+                "verification" => (
+                    NodeKind::Verification,
+                    dev_atomic["summary"]
+                        .as_str()
+                        .unwrap_or("verification")
+                        .to_string(),
+                ),
+                "human_gate" => {
+                    let resolution = dev_atomic["resolution"].as_str().unwrap_or("");
+                    (
+                        NodeKind::HumanGateResolution,
+                        format!("resolution: {}", resolution),
+                    )
+                }
+                _ => {
+                    log::debug!(
+                        "sherpa trace: skipping unknown record_type '{}'",
+                        record_type
+                    );
+                    continue;
+                }
+            };
+
+            // Create a node with the full dev.atomic payload as detail.
+            // This preserves all the session data (intent description, todo
+            // content, phase timing, etc.) for extraction by populate_session_tables.
+            acc.append_raw_node(kind, timestamp, &summary, Some(dev_atomic.clone()));
+            ingested += 1;
+        }
+
+        if ingested > 0 {
+            self.save_accumulator(session_id, &acc);
+            log::info!(
+                "sherpa trace: ingested {} records from {}",
+                ingested,
+                trace_path.display()
+            );
+        }
+
+        ingested > 0
+    }
+
     /// Save the provenance graph for a recorded turn.
     ///
     /// Appends a patch proposal node to the accumulator, converts to a
@@ -1053,12 +1209,18 @@ impl TurnOrchestrator {
 
         // Convert the accumulated graph to a content-addressed ProvenanceGraph
         let change_hashes = vec![outcome.hash];
-        let graph = acc.to_provenance_graph(
+        let mut graph = acc.to_provenance_graph(
             &session.agent_name,
             &session.agent_display_name,
             &session.agent_vendor,
             &change_hashes,
         );
+
+        // Set the Sherpa profile if this is a Sherpa session.
+        // This gates session table population on the server.
+        if session.agent_name == "sherpa" {
+            graph.profile = Some("sherpa-trace/1.0.0".to_string());
+        }
 
         // Save to the repository
         match atomic_repository::Repository::open(&self.repo_root) {
@@ -1370,6 +1532,25 @@ fn vendor_from_agent_name(agent_name: &str) -> &'static str {
         "opencode" => "openai",
         _ => "unknown",
     }
+}
+
+/// Truncate a string to `max_len` bytes, breaking at a word boundary where
+/// possible and appending `"..."`.  Mirrors the same helper in sibling modules.
+fn truncate_prompt(prompt: &str, max_len: usize) -> String {
+    let trimmed = prompt.trim();
+    if trimmed.len() <= max_len {
+        return trimmed.to_string();
+    }
+
+    // Try to break at a word boundary in the first `max_len - 3` bytes.
+    let truncated = &trimmed[..max_len.saturating_sub(3)];
+    if let Some(last_space) = truncated.rfind(' ') {
+        if last_space > max_len / 2 {
+            return format!("{}...", &truncated[..last_space]);
+        }
+    }
+
+    format!("{}...", truncated)
 }
 
 impl std::fmt::Debug for TurnOrchestrator {

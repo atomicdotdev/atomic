@@ -30,6 +30,7 @@
 //! - [`types`] — Node, edge, and graph type definitions
 //! - [`classify`] — Rule-based tool call classification
 //! - [`accumulator`] — In-memory DAG builder with persistence
+//! - [`detail`] — Typed JSON payloads for Sherpa provenance nodes
 //!
 //! # Example
 //!
@@ -57,10 +58,15 @@
 pub mod accumulator;
 pub mod classify;
 pub mod consolidate;
+pub mod detail;
 pub mod types;
 
 // Re-export primary types for convenience.
 pub use accumulator::ProvenanceAccumulator;
 pub use classify::{classify_tool_call, summarize_tool_call};
 pub use consolidate::consolidate;
+pub use detail::{
+    CodeFinding, CommitmentDetail, Contributor, ExecutionDetail, GoalDetail, Learnings,
+    PhaseTokens, TurnOutcome, TurnTotals, VerificationDetail, COST_PER_M_INPUT, COST_PER_M_OUTPUT,
+};
 pub use types::{EdgeKind, GraphEdge, GraphNode, GraphStats, NodeKind, SerializedGraph};

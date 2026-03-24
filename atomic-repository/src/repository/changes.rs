@@ -605,6 +605,12 @@ impl Repository {
             }
         }
 
+        // Populate session tables if this is a Sherpa provenance graph.
+        // The write transaction is still open, so this is atomic with
+        // the provenance registration above.
+        txn.populate_session_tables(prov_id.get(), graph)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
@@ -729,5 +735,118 @@ impl Repository {
         graphs.sort_by_key(|(_, g)| g.timestamp);
 
         Ok(graphs)
+    }
+
+    // =========================================================================
+    // Session Data Queries (Sherpa-enriched provenance)
+    // =========================================================================
+
+    /// Get the full ordered replay log for a provenance graph.
+    ///
+    /// Returns all session events ordered by sequence number.
+    /// Empty if the provenance is not Sherpa or has no session data.
+    pub fn get_session_events(
+        &self,
+        provenance_hash: &Hash,
+    ) -> Result<Vec<atomic_core::change::session::SessionEvent>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let provenance_id = txn
+            .get_internal(provenance_hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ChangeNotFound {
+                hash: provenance_hash.to_base32(),
+            })?;
+        txn.get_session_events(provenance_id.get())
+            .map_err(|e| RepositoryError::Database(e.to_string()))
+    }
+
+    /// Get all todos for a provenance graph.
+    ///
+    /// Returns snapshots of all todo items from the turn.
+    /// Empty if the provenance is not Sherpa or has no session data.
+    pub fn get_session_todos(
+        &self,
+        provenance_hash: &Hash,
+    ) -> Result<Vec<atomic_core::change::session::TodoSnapshot>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let provenance_id = txn
+            .get_internal(provenance_hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ChangeNotFound {
+                hash: provenance_hash.to_base32(),
+            })?;
+        txn.get_session_todos(provenance_id.get())
+            .map_err(|e| RepositoryError::Database(e.to_string()))
+    }
+
+    /// Get phase timing breakdown for a provenance graph.
+    ///
+    /// Returns timing data for each phase in the turn.
+    /// Empty if the provenance is not Sherpa or has no session data.
+    pub fn get_session_phases(
+        &self,
+        provenance_hash: &Hash,
+    ) -> Result<Vec<atomic_core::change::session::PhaseTimingEntry>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let provenance_id = txn
+            .get_internal(provenance_hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ChangeNotFound {
+                hash: provenance_hash.to_base32(),
+            })?;
+        txn.get_session_phases(provenance_id.get())
+            .map_err(|e| RepositoryError::Database(e.to_string()))
+    }
+
+    /// Get intent metadata for a provenance graph.
+    ///
+    /// Returns the intent entry if this is a Sherpa provenance, `None` otherwise.
+    pub fn get_session_intent(
+        &self,
+        provenance_hash: &Hash,
+    ) -> Result<Option<atomic_core::change::session::IntentEntry>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let provenance_id = txn
+            .get_internal(provenance_hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ChangeNotFound {
+                hash: provenance_hash.to_base32(),
+            })?;
+        txn.get_session_intent(provenance_id.get())
+            .map_err(|e| RepositoryError::Database(e.to_string()))
+    }
+
+    /// Check if a provenance graph has session data.
+    ///
+    /// Returns `true` if the graph is a Sherpa provenance with populated
+    /// session tables. This is a fast gate for the UI — checking this first
+    /// avoids hitting the session tables for non-Sherpa provenance.
+    pub fn has_session_data(&self, provenance_hash: &Hash) -> bool {
+        let txn = match self.pristine.read_txn() {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+
+        let provenance_id = match txn.get_internal(provenance_hash) {
+            Ok(Some(id)) => id.get(),
+            _ => return false,
+        };
+
+        txn.get_session_intent(provenance_id)
+            .ok()
+            .flatten()
+            .is_some()
     }
 }

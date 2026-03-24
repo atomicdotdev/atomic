@@ -101,6 +101,12 @@ impl Pristine {
             // State tables
             write_txn.open_table(STATES)?;
             write_txn.open_table(TAGS)?;
+
+            // Session tables (Sherpa-enriched provenance data)
+            write_txn.open_table(SESSION_EVENTS)?;
+            write_txn.open_table(SESSION_TODOS)?;
+            write_txn.open_table(SESSION_PHASES)?;
+            write_txn.open_table(SESSION_INTENTS)?;
         }
         write_txn.commit()?;
 

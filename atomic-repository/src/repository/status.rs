@@ -57,15 +57,42 @@ impl Repository {
         let mut status = RepositoryStatus::new(self.current_stack.clone(), stack_state);
 
         // ── Stack-aware filtering ──────────────────────────────────────
-        // Collect every change NodeId that belongs to the current stack.
-        // We use this below to decide whether a recorded file is "ours"
-        // (its creating change is on this stack) or "foreign" (recorded
-        // on a different stack and should be invisible here).
+        // Collect every change NodeId that belongs to the current stack,
+        // PLUS all of their transitive dependencies (via the DEPS table).
+        //
+        // Why dependencies?  After a content revise, the stack log has A'
+        // (the revised change) but NOT A (the original).  A' depends on A
+        // because its hunks reference A's graph vertices.  The INODES
+        // position for the file still points to A's NodeId (which created
+        // the inode vertex).  Without including dependencies, the status
+        // stack filter would see A's NodeId as "not on this stack" and
+        // hide the file — even though A' (which superseded A) IS on the
+        // stack.
         let current_stack_change_ids: HashSet<NodeId> = if let Some(ref stack) = txn
             .get_stack(&self.current_stack)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
-            collect_stack_change_ids(&txn, stack)?
+            let mut ids = collect_stack_change_ids(&txn, stack)?;
+
+            // Expand with dependencies from change FILES (not the DEPS
+            // table, which is for attestations).  After a content revise,
+            // the stack has A' but not A.  A' depends on A (its hunks
+            // reference A's vertices).  Without including A's NodeId,
+            // the status filter would hide files introduced by A.
+            let direct_ids: Vec<NodeId> = ids.iter().copied().collect();
+            for node_id in direct_ids {
+                if let Ok(Some(hash)) = txn.get_external(node_id) {
+                    if let Ok(change) = self.load_change(&hash) {
+                        for dep_hash in change.dependencies() {
+                            if let Ok(Some(dep_id)) = txn.get_internal(dep_hash) {
+                                ids.insert(dep_id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            ids
         } else {
             HashSet::new()
         };

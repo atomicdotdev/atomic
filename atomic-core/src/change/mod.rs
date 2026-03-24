@@ -100,6 +100,7 @@ mod local;
 pub mod ops;
 mod provenance;
 pub mod provenance_graph;
+pub mod session;
 mod store;
 
 // Re-export all public types
