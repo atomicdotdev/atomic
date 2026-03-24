@@ -63,7 +63,7 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
                     results.push(Ok((k.value().to_string(), Inode::new(v.value()))));
                 }
                 Err(e) => {
-                    results.push(Err(PristineError::Storage(e)));
+                    results.push(Err(PristineError::Storage(Box::new(e))));
                 }
             }
         }
@@ -102,7 +102,7 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
                     }
                 }
                 Err(e) => {
-                    results.push(Err(PristineError::Storage(e)));
+                    results.push(Err(PristineError::Storage(Box::new(e))));
                 }
             }
         }

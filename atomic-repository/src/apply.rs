@@ -615,6 +615,7 @@ pub fn apply_change_to_graph<T: MutTxnT + StackTxnT>(
 }
 
 /// Apply a single graph_op to the graph.
+#[allow(clippy::too_many_arguments)]
 fn apply_hunk<T: MutTxnT>(
     txn: &mut T,
     workspace: &mut Workspace,

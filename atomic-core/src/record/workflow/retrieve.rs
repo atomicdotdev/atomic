@@ -289,7 +289,9 @@ where
     let opts = RetrieveContentOptions::new().max_vertices(1);
     match retrieve_content_with_options(txn, changes, position, opts) {
         Ok(result) => Ok(!result.is_empty()),
-        Err(RecordError::Pristine(PristineError::BlockNotFound { .. })) => Ok(false),
+        Err(RecordError::Pristine(e)) if matches!(*e, PristineError::BlockNotFound { .. }) => {
+            Ok(false)
+        }
         Err(e) => Err(e),
     }
 }

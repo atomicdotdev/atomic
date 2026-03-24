@@ -142,7 +142,7 @@ fn cleanup_empty_ancestors<'a>(root: &Path, removed_paths: impl Iterator<Item = 
     }
     // Sort deepest-first so children are removed before parents.
     let mut sorted: Vec<PathBuf> = dirs.into_iter().collect();
-    sorted.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.components().count()));
     for dir in sorted {
         let abs = root.join(&dir);
         if abs.is_dir() {
@@ -665,10 +665,12 @@ default = "{}"
         let mut removed_paths: Vec<String> = Vec::new();
         for path in old_files.difference(&new_files) {
             let abs_path = self.root.join(path);
-            if abs_path.exists() && !abs_path.is_dir()
-                && working_copy.remove_path(path, false).is_ok() {
-                    removed_paths.push(path.clone());
-                }
+            if abs_path.exists()
+                && !abs_path.is_dir()
+                && working_copy.remove_path(path, false).is_ok()
+            {
+                removed_paths.push(path.clone());
+            }
         }
 
         // ── Phase 3: Clean up empty ancestor directories ────────────────

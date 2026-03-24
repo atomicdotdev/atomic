@@ -89,7 +89,7 @@ pub enum OutputError {
     Graph(Box<dyn std::error::Error + Send + Sync>),
 
     /// Pristine database operation failed.
-    Pristine(PristineError),
+    Pristine(Box<PristineError>),
 
     /// Path not found in the repository tree.
     PathNotFound {
@@ -317,7 +317,7 @@ impl std::error::Error for OutputError {
             Self::WorkingCopy(err) => Some(err.as_ref()),
             Self::ChangeStore(err) => Some(err.as_ref()),
             Self::Graph(err) => Some(err.as_ref()),
-            Self::Pristine(err) => Some(err),
+            Self::Pristine(err) => Some(err.as_ref()),
             Self::PathNotFound { .. } | Self::InodeNotFound { .. } => None,
         }
     }
@@ -331,7 +331,7 @@ impl From<std::io::Error> for OutputError {
 
 impl From<PristineError> for OutputError {
     fn from(err: PristineError) -> Self {
-        Self::Pristine(err)
+        Self::Pristine(Box::new(err))
     }
 }
 

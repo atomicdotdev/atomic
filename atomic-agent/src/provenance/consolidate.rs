@@ -695,11 +695,11 @@ fn build_decision_edges(nodes: &[GraphNode], seq: &[usize], decision_id: &str) -
 
     // Find the next patch proposal after this sequence to link to
     let last_idx = seq.last().copied().unwrap_or(first_idx);
-    for i in (last_idx + 1)..nodes.len() {
-        if nodes[i].kind == NodeKind::PatchProposal {
+    for node in nodes.iter().skip(last_idx + 1) {
+        if node.kind == NodeKind::PatchProposal {
             edges.push(GraphEdge::new(
                 decision_id.to_string(),
-                nodes[i].id.clone(),
+                node.id.clone(),
                 EdgeKind::CommittedVia,
             ));
             break;

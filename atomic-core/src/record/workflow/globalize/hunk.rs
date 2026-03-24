@@ -519,11 +519,11 @@ fn find_predecessor_end_position<T: GraphTxnT>(
 
     let adj = txn
         .iter_adjacent(node, min_flag, max_flag)
-        .map_err(GlobalizeError::Pristine)?;
+        .map_err(|e| GlobalizeError::Pristine(Box::new(e)))?;
 
     let mut adj_iter = adj;
     if let Some(edge_result) = adj_iter.next() {
-        let edge = edge_result.map_err(GlobalizeError::Pristine)?;
+        let edge = edge_result.map_err(|e| GlobalizeError::Pristine(Box::new(e)))?;
 
         // The edge dest() points to where the forward edge came FROM
         // (remember, this is a reverse/PARENT edge)

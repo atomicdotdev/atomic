@@ -374,10 +374,10 @@ impl Command for Reset {
 
         // Check if there's anything to reset
         if files_to_reset.is_empty() {
-            if self.stack.is_some() {
+            if let Some(stack) = &self.stack {
                 print_success(&format!(
                     "Switched to stack '{}' (working copy already clean)",
-                    self.stack.as_ref().unwrap()
+                    stack
                 ));
             } else {
                 println!("Nothing to reset - working copy is clean");

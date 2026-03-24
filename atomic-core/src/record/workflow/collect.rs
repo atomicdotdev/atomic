@@ -366,7 +366,7 @@ where
     let mut result = CollectionResult::new();
 
     // Iterate over all tree entries (trait doesn't support prefix filtering)
-    let iter = txn.iter_tree().map_err(RecordError::Pristine)?;
+    let iter = txn.iter_tree().map_err(|e| RecordError::Pristine(Box::new(e)))?;
 
     for item in iter {
         match item {
@@ -543,13 +543,13 @@ where
     T: GraphTxnT + TreeTxnT + StackTxnT,
 {
     // Look up the inode for this path
-    let inode = match txn.get_inode(path).map_err(RecordError::Pristine)? {
+    let inode = match txn.get_inode(path).map_err(|e| RecordError::Pristine(Box::new(e)))? {
         Some(inode) => inode,
         None => return Ok(None),
     };
 
     // Get the position for this inode
-    let position = match txn.inode_position(inode).map_err(RecordError::Pristine)? {
+    let position = match txn.inode_position(inode).map_err(|e| RecordError::Pristine(Box::new(e)))? {
         Some(pos) => pos,
         None => return Ok(None),
     };

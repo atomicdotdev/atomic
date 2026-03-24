@@ -748,7 +748,7 @@ where
     // Retrieve the alive graph
     let retrieve_opts = options.to_retrieve_options();
     let retrieve_result =
-        retrieve_graph(txn, position, retrieve_opts).map_err(OutputError::Pristine)?;
+        retrieve_graph(txn, position, retrieve_opts).map_err(|e| OutputError::Pristine(Box::new(e)))?;
 
     // Handle empty graph
     if retrieve_result.graph.is_empty() {
@@ -884,7 +884,7 @@ where
 {
     // Retrieve the alive graph with the provided options (including change filter)
     let retrieve_result =
-        retrieve_graph(txn, position, retrieve_options).map_err(OutputError::Pristine)?;
+        retrieve_graph(txn, position, retrieve_options).map_err(|e| OutputError::Pristine(Box::new(e)))?;
 
     // Handle empty graph (no content at this state)
     if retrieve_result.graph.is_empty() {

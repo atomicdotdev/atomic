@@ -279,6 +279,7 @@ impl ProvenanceAccumulator {
     /// `handle_tool_use` for `PostToolUse` events.
     ///
     /// Returns the new node's ID.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_tool_call(
         &mut self,
         tool_name: &str,

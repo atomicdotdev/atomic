@@ -916,7 +916,7 @@ impl InodeGraphOps for ReadTxn {
             Ok(t) => t,
             Err(e) => {
                 adj.mark_exhausted();
-                return Some(Err(PristineError::Table(e)));
+                return Some(Err(PristineError::Table(Box::new(e))));
             }
         };
 
@@ -933,7 +933,7 @@ impl InodeGraphOps for ReadTxn {
             Ok(v) => v,
             Err(e) => {
                 adj.mark_exhausted();
-                return Some(Err(PristineError::Storage(e)));
+                return Some(Err(PristineError::Storage(Box::new(e))));
             }
         };
 
@@ -950,7 +950,7 @@ impl InodeGraphOps for ReadTxn {
                 }
                 Err(e) => {
                     adj.mark_exhausted();
-                    return Some(Err(PristineError::Storage(e)));
+                    return Some(Err(PristineError::Storage(Box::new(e))));
                 }
             }
         }
@@ -1048,7 +1048,7 @@ impl<'a> InodeGraphOps for WriteTxn<'a> {
             Ok(t) => t,
             Err(e) => {
                 adj.mark_exhausted();
-                return Some(Err(PristineError::Table(e)));
+                return Some(Err(PristineError::Table(Box::new(e))));
             }
         };
 
@@ -1065,7 +1065,7 @@ impl<'a> InodeGraphOps for WriteTxn<'a> {
             Ok(v) => v,
             Err(e) => {
                 adj.mark_exhausted();
-                return Some(Err(PristineError::Storage(e)));
+                return Some(Err(PristineError::Storage(Box::new(e))));
             }
         };
 
@@ -1082,7 +1082,7 @@ impl<'a> InodeGraphOps for WriteTxn<'a> {
                 }
                 Err(e) => {
                     adj.mark_exhausted();
-                    return Some(Err(PristineError::Storage(e)));
+                    return Some(Err(PristineError::Storage(Box::new(e))));
                 }
             }
         }

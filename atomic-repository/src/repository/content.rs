@@ -123,22 +123,17 @@ impl Repository {
             // graph base). Walk the parent chain past the overlay to find the
             // shared stack and include its changes.
             let mut cursor = stack.parent;
-            loop {
-                match cursor {
-                    Some(pid) => {
-                        let parent = txn
-                            .get_stack_by_id(pid)
-                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                        match parent {
-                            Some(p) if p.kind.is_shared() => {
-                                let shared_ids = collect_stack_change_ids(&txn, &p)?;
-                                change_filter.extend(shared_ids);
-                                break;
-                            }
-                            Some(p) => cursor = p.parent,
-                            None => break,
-                        }
+            while let Some(pid) = cursor {
+                let parent = txn
+                    .get_stack_by_id(pid)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                match parent {
+                    Some(p) if p.kind.is_shared() => {
+                        let shared_ids = collect_stack_change_ids(&txn, &p)?;
+                        change_filter.extend(shared_ids);
+                        break;
                     }
+                    Some(p) => cursor = p.parent,
                     None => break,
                 }
             }
@@ -228,22 +223,17 @@ impl Repository {
             }
 
             let mut cursor = stack.parent;
-            loop {
-                match cursor {
-                    Some(pid) => {
-                        let parent = txn
-                            .get_stack_by_id(pid)
-                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                        match parent {
-                            Some(p) if p.kind.is_shared() => {
-                                let shared_ids = collect_stack_change_ids(&txn, &p)?;
-                                change_filter.extend(shared_ids);
-                                break;
-                            }
-                            Some(p) => cursor = p.parent,
-                            None => break,
-                        }
+            while let Some(pid) = cursor {
+                let parent = txn
+                    .get_stack_by_id(pid)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                match parent {
+                    Some(p) if p.kind.is_shared() => {
+                        let shared_ids = collect_stack_change_ids(&txn, &p)?;
+                        change_filter.extend(shared_ids);
+                        break;
                     }
+                    Some(p) => cursor = p.parent,
                     None => break,
                 }
             }
@@ -288,6 +278,7 @@ impl Repository {
     /// println!("{} changes only in dev", only_dev.len());
     /// println!("{} changes in common", common.len());
     /// ```
+    #[allow(clippy::type_complexity)]
     pub fn diff_stacks(
         &self,
         stack_a: &str,
@@ -606,7 +597,7 @@ impl Repository {
     ///
     /// * `Ok(Some(content))` - The file content before the change
     /// * `Ok(None)` - The file didn't exist before this change, or the change
-    ///                is not in the current stack's history
+    ///   is not in the current stack's history
     /// * `Err(_)` - Database or I/O error
     ///
     /// # Example
@@ -700,7 +691,7 @@ impl Repository {
     ///
     /// * `Ok(Some(content))` - The file content after the change
     /// * `Ok(None)` - The file doesn't exist after this change (was deleted),
-    ///                or the change is not in the current stack's history
+    ///   or the change is not in the current stack's history
     /// * `Err(_)` - Database or I/O error
     ///
     /// # Example

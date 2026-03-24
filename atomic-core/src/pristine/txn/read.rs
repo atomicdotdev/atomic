@@ -384,7 +384,7 @@ impl StackTxnT for ReadTxn {
                     results.push(Ok((seq, change_id, merkle)));
                 }
                 Err(e) => {
-                    results.push(Err(PristineError::Storage(e)));
+                    results.push(Err(PristineError::Storage(Box::new(e))));
                 }
             }
         }
@@ -457,7 +457,7 @@ impl TreeTxnT for ReadTxn {
                     results.push(Ok((k.value().to_string(), Inode::new(v.value()))));
                 }
                 Err(e) => {
-                    results.push(Err(PristineError::Storage(e)));
+                    results.push(Err(PristineError::Storage(Box::new(e))));
                 }
             }
         }
@@ -497,7 +497,7 @@ impl TreeTxnT for ReadTxn {
                     }
                 }
                 Err(e) => {
-                    results.push(Err(PristineError::Storage(e)));
+                    results.push(Err(PristineError::Storage(Box::new(e))));
                 }
             }
         }

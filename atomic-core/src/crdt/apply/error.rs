@@ -63,7 +63,7 @@ use std::fmt;
 #[inline]
 pub fn storage_err<E: Into<PristineError>>(err: E, context: &str) -> ApplyError {
     ApplyError::Storage {
-        source: err.into(),
+        source: Box::new(err.into()),
         context: context.to_string(),
     }
 }
@@ -263,7 +263,7 @@ pub enum ApplyError {
     /// This wraps errors from the underlying pristine storage layer.
     Storage {
         /// The underlying storage error.
-        source: PristineError,
+        source: Box<PristineError>,
         /// Context about what operation was being performed.
         context: String,
     },
@@ -424,7 +424,7 @@ impl ApplyError {
     #[inline]
     pub fn storage(source: PristineError, context: impl Into<String>) -> Self {
         ApplyError::Storage {
-            source,
+            source: Box::new(source),
             context: context.into(),
         }
     }
@@ -747,7 +747,7 @@ impl fmt::Display for ApplyError {
 impl std::error::Error for ApplyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            ApplyError::Storage { source, .. } => Some(source),
+            ApplyError::Storage { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -756,7 +756,7 @@ impl std::error::Error for ApplyError {
 impl From<PristineError> for ApplyError {
     fn from(err: PristineError) -> Self {
         ApplyError::Storage {
-            source: err,
+            source: Box::new(err),
             context: "unknown operation".to_string(),
         }
     }

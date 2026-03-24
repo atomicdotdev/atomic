@@ -144,7 +144,7 @@ impl<'a> StackTxnT for WriteTxn<'a> {
                     results.push(Ok((seq, change_id, merkle)));
                 }
                 Err(e) => {
-                    results.push(Err(PristineError::Storage(e)));
+                    results.push(Err(PristineError::Storage(Box::new(e))));
                 }
             }
         }

@@ -47,7 +47,7 @@
 //! Created .atomicignore for rust project
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
@@ -361,7 +361,7 @@ impl Init {
     }
 
     /// Create the .atomicignore file if a kind is specified.
-    fn create_ignore_file(&self, repo_path: &PathBuf) -> CliResult<bool> {
+    fn create_ignore_file(&self, repo_path: &Path) -> CliResult<bool> {
         let Some(kind) = &self.kind else {
             return Ok(false);
         };

@@ -447,8 +447,7 @@ fn summarize_exploration(tool_name: &str, tool_input: Option<&serde_json::Value>
                 if let Some(rest) = cmd.strip_prefix("ls ") {
                     let target = rest
                         .split_whitespace()
-                        .filter(|s| !s.starts_with('-'))
-                        .next_back()
+                        .rfind(|s| !s.starts_with('-'))
                         .unwrap_or(".");
                     return format!("directory {}", shorten_explore_path(target));
                 }
@@ -557,27 +556,24 @@ fn summarize_verification(
     let cmd = extract_command(tool_input);
     let cmd = cmd.trim();
 
-    let passed = tool_output
-        .map(|o| {
-            let lower = o.to_lowercase();
-            // Heuristic: look for common pass/fail signals.
-            // Order matters: "0 failed" is a PASS signal, so check it before
-            // the generic "fail" pattern.
-            if lower.contains("0 failed")
-                || lower.contains("test result: ok")
-                || lower.contains("tests passed")
-            {
-                Some(true)
-            } else if lower.contains("fail") || lower.contains("failed") || lower.contains("error")
-            {
-                Some(false)
-            } else if lower.contains("pass") || lower.contains("ok") || lower.contains("success") {
-                Some(true)
-            } else {
-                None
-            }
-        })
-        .flatten();
+    let passed = tool_output.and_then(|o| {
+        let lower = o.to_lowercase();
+        // Heuristic: look for common pass/fail signals.
+        // Order matters: "0 failed" is a PASS signal, so check it before
+        // the generic "fail" pattern.
+        if lower.contains("0 failed")
+            || lower.contains("test result: ok")
+            || lower.contains("tests passed")
+        {
+            Some(true)
+        } else if lower.contains("fail") || lower.contains("failed") || lower.contains("error") {
+            Some(false)
+        } else if lower.contains("pass") || lower.contains("ok") || lower.contains("success") {
+            Some(true)
+        } else {
+            None
+        }
+    });
 
     let result_suffix = match passed {
         Some(true) => " (passed)",

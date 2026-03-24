@@ -91,8 +91,7 @@ impl ChangeIdentifier {
     /// - Otherwise, parses as `HashPrefix`
     pub fn parse(s: Option<&str>) -> Result<Self, String> {
         let s = match s {
-            None => return Ok(ChangeIdentifier::Latest),
-            Some(s) if s.is_empty() => return Ok(ChangeIdentifier::Latest),
+            None | Some("") => return Ok(ChangeIdentifier::Latest),
             Some(s) => s.trim(),
         };
 
@@ -269,12 +268,7 @@ impl JsonChange {
                 .iter()
                 .map(|h| h.to_base32())
                 .collect(),
-            hunks: change
-                .hashed
-                .hunks
-                .iter()
-                .map(hunk_to_summary)
-                .collect(),
+            hunks: change.hashed.hunks.iter().map(hunk_to_summary).collect(),
             has_provenance: change.has_provenance(),
             provenance: None,
             sequence,
