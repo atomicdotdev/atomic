@@ -104,7 +104,7 @@ impl<'a> WriteTxn<'a> {
             // Write every node as a SessionEvent regardless of kind.
             let event = SessionEvent {
                 seq,
-                timestamp: format_timestamp_ms(node.timestamp),
+                timestamp: format_timestamp_ms(node.timestamp * 1000),
                 event_kind: node.kind.label().to_string(),
                 place: None,
                 transition: None,
