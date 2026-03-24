@@ -832,10 +832,6 @@ mod tests {
             Ok(None)
         }
 
-        fn get_deps(&self, _change_id: NodeId) -> Result<Vec<NodeId>, PristineError> {
-            Ok(Vec::new())
-        }
-
         fn get_rev_deps(&self, _dep_id: NodeId) -> Result<Vec<NodeId>, PristineError> {
             Ok(Vec::new())
         }

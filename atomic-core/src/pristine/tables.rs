@@ -439,6 +439,46 @@ pub const CHANGE_CHUNKS: TableDefinition<&[u8; 36], &[u8; 32]> =
 pub const CHANGE_UNHASHED: TableDefinition<&[u8; 32], &[u8]> =
     TableDefinition::new("change_unhashed");
 
+// Session Tables (Sherpa-enriched provenance data)
+//
+// Populated when `ProvenanceGraph.profile == "sherpa-trace/1.0.0"`.
+// These tables store the structured turn data extracted from the Petri net
+// replay log. Values are postcard-encoded session structs from
+// `atomic_core::change::session`.
+//
+// Composite keys use the same `[u8; 16]` pattern as `STACK_CHANGES`:
+// first 8 bytes = provenance_id (u64 LE), second 8 bytes = secondary
+// component (seq, or first-8-bytes-of-blake3 for string IDs).
+
+/// Session events: (provenance_id, seq) → SessionEvent
+///
+/// The full ordered Petri net replay log for a turn. Each row is one
+/// NetEvent from the JSONL trace file. Keys are composite `[u8; 16]`
+/// values `(provenance_id_le, seq_le)` and are ordered lexicographically
+/// by their little-endian byte representation. This groups events by
+/// `provenance_id` for efficient prefix scans, but does *not* guarantee
+/// numeric ordering by `seq` within a provenance.
+pub const SESSION_EVENTS: TableDefinition<&[u8; 16], &[u8]> =
+    TableDefinition::new("session_events");
+
+/// Session todos: (provenance_id, todo_id_hash) → TodoSnapshot
+///
+/// Final state of each todo item at the end of the turn. The `todo_id`
+/// string is hashed to a fixed-size key (first 8 bytes of Blake3).
+pub const SESSION_TODOS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("session_todos");
+
+/// Session phases: (provenance_id, phase_hash) → PhaseTimingEntry
+///
+/// Timing breakdown by phase for the turn. The phase name is hashed to
+/// a fixed-size key (first 8 bytes of Blake3).
+pub const SESSION_PHASES: TableDefinition<&[u8; 16], &[u8]> =
+    TableDefinition::new("session_phases");
+
+/// Session intents: provenance_id → IntentEntry
+///
+/// Intent metadata for the turn. One entry per provenance graph.
+pub const SESSION_INTENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("session_intents");
+
 // V3 Change Storage Key Encoding
 
 /// Encode a change-hash + file-index as 36 bytes for CHANGE_GRAPH / CHANGE_SEMANTIC / CHANGE_CHUNKS keys.

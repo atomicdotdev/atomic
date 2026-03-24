@@ -485,6 +485,40 @@ impl ProvenanceAccumulator {
         node_id
     }
 
+    /// Append a raw node with full control over its fields.
+    ///
+    /// This method bypasses the usual edge inference logic and allows
+    /// direct insertion of nodes with custom details. Used for ingesting
+    /// external trace formats (e.g., Sherpa JSONL) that carry their own
+    /// structured data.
+    ///
+    /// Returns the new node's ID.
+    pub fn append_raw_node(
+        &mut self,
+        kind: NodeKind,
+        timestamp: i64,
+        summary: &str,
+        detail: Option<serde_json::Value>,
+    ) -> String {
+        let node = GraphNode {
+            id: self.next_id(),
+            kind,
+            timestamp,
+            summary: summary.to_string(),
+            detail,
+            change_hash: None,
+            tool_name: None,
+            tool_call_id: None,
+            duration_ms: None,
+            classified: false,
+            confidence: None,
+            consolidated_from: Vec::new(),
+        };
+        let node_id = node.id.clone();
+        self.push_node(node);
+        node_id
+    }
+
     /// Mark a human gate as resolved.
     ///
     /// Updates the gate node's detail and clears the pending gate state.
@@ -1010,6 +1044,12 @@ fn convert_node_kind(kind: NodeKind) -> pg::ProvenanceNodeKind {
         NodeKind::HumanGate => pg::ProvenanceNodeKind::HumanGate,
         NodeKind::PatchProposal => pg::ProvenanceNodeKind::PatchProposal,
         NodeKind::Error => pg::ProvenanceNodeKind::Error,
+        NodeKind::Todo => pg::ProvenanceNodeKind::Todo,
+        NodeKind::TodoStatusChange => pg::ProvenanceNodeKind::TodoStatusChange,
+        NodeKind::PhaseTransition => pg::ProvenanceNodeKind::PhaseTransition,
+        NodeKind::Lesson => pg::ProvenanceNodeKind::Lesson,
+        NodeKind::LlmResponse => pg::ProvenanceNodeKind::LlmResponse,
+        NodeKind::HumanGateResolution => pg::ProvenanceNodeKind::HumanGateResolution,
     }
 }
 

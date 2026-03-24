@@ -563,6 +563,36 @@ pub enum ProvenanceNodeKind {
     PatchProposal,
     /// Tool failure or session error.
     Error,
+    /// A single todo item in the checklist (Sherpa only).
+    ///
+    /// Emitted during Proposing when the LLM registers todos via the tool.
+    /// Carries content, priority, dependencies in `detail`.
+    Todo,
+    /// A todo item's status changed (Sherpa only).
+    ///
+    /// Tracks the full lifecycle: pending → in_progress → completed.
+    /// Carries from_status, to_status, todo_id in `detail`.
+    TodoStatusChange,
+    /// A Petri net phase transition (Sherpa only).
+    ///
+    /// Records every state machine movement: orienting → proposing, etc.
+    /// Carries from_phase, to_phase, trigger in `detail`.
+    PhaseTransition,
+    /// An unexpected failure or change of approach worth remembering (Sherpa only).
+    ///
+    /// Emitted by the LLM during Executing when something goes wrong.
+    /// The label describes what was learned.
+    Lesson,
+    /// The LLM's final response for a phase (Sherpa only).
+    ///
+    /// Captures what the model actually said (the reply text) and any
+    /// nodes it emitted. Distinct from Verification which is the outcome.
+    LlmResponse,
+    /// HumanGate resolution — which command the user chose (Sherpa only).
+    ///
+    /// Records `/accept`, `/guide [ids]`, `/reject`, `/revise` with the
+    /// contributor attribution map.
+    HumanGateResolution,
 }
 
 impl ProvenanceNodeKind {
@@ -578,6 +608,12 @@ impl ProvenanceNodeKind {
             Self::HumanGate => "human_gate",
             Self::PatchProposal => "patch_proposal",
             Self::Error => "error",
+            Self::Todo => "todo",
+            Self::TodoStatusChange => "todo_status_change",
+            Self::PhaseTransition => "phase_transition",
+            Self::Lesson => "lesson",
+            Self::LlmResponse => "llm_response",
+            Self::HumanGateResolution => "human_gate_resolution",
         }
     }
 }
@@ -673,6 +709,18 @@ pub struct ProvenanceStats {
     pub execution_count: u32,
     pub patch_proposal_count: u32,
     pub edge_count: u32,
+    #[serde(default)]
+    pub todo_count: u32,
+    #[serde(default)]
+    pub todo_status_change_count: u32,
+    #[serde(default)]
+    pub phase_transition_count: u32,
+    #[serde(default)]
+    pub lesson_count: u32,
+    #[serde(default)]
+    pub llm_response_count: u32,
+    #[serde(default)]
+    pub human_gate_resolution_count: u32,
 }
 
 impl ProvenanceStats {
@@ -687,6 +735,12 @@ impl ProvenanceStats {
             + self.error_count
             + self.execution_count
             + self.patch_proposal_count
+            + self.todo_count
+            + self.todo_status_change_count
+            + self.phase_transition_count
+            + self.lesson_count
+            + self.llm_response_count
+            + self.human_gate_resolution_count
     }
 
     /// Increment the counter for the given node kind.
@@ -701,6 +755,12 @@ impl ProvenanceStats {
             ProvenanceNodeKind::HumanGate => self.human_gate_count += 1,
             ProvenanceNodeKind::PatchProposal => self.patch_proposal_count += 1,
             ProvenanceNodeKind::Error => self.error_count += 1,
+            ProvenanceNodeKind::Todo => self.todo_count += 1,
+            ProvenanceNodeKind::TodoStatusChange => self.todo_status_change_count += 1,
+            ProvenanceNodeKind::PhaseTransition => self.phase_transition_count += 1,
+            ProvenanceNodeKind::Lesson => self.lesson_count += 1,
+            ProvenanceNodeKind::LlmResponse => self.llm_response_count += 1,
+            ProvenanceNodeKind::HumanGateResolution => self.human_gate_resolution_count += 1,
         }
     }
 
