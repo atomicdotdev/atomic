@@ -85,6 +85,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact: atomic-aarch64-unknown-linux-gnu.tar.gz
             cross: true
+            openssl_arch: arm64
 
           # macOS x86_64 (Intel)
           - os: macos-latest
@@ -110,9 +111,15 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Install cross (for cross-compilation)
+      - name: Install cross-compilation OpenSSL (aarch64)
         if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs) main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs)-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev:arm64
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -131,7 +138,14 @@ jobs:
 
       - name: Build release binary (cross)
         if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }} -p atomic-cli
+        env:
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
+          OPENSSL_INCLUDE_DIR: /usr/include/aarch64-linux-gnu
+          OPENSSL_LIB_DIR: /usr/lib/aarch64-linux-gnu
+          OPENSSL_DIR: /usr
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target ${{ matrix.target }} -p atomic-cli
 
       # Package: Unix (tar.gz)
       - name: Package binary (Unix)
