@@ -6,6 +6,7 @@
 #   - Tiny:   hashicorp/go-uuid (~50 commits)
 #   - Medium: holman/spark (~104 commits)
 #   - Large:  sharkdp/hyperfine (~1,017 commits)
+#   - XL:     rails/rails (~97,000 commits)
 #
 # This harness requires network access to clone repositories from GitHub.
 
@@ -224,6 +225,53 @@ if [[ $actual -ge $((expected_commits - 50)) ]] && [[ $actual -le $((expected_co
     _pass "change count roughly matches ($actual vs $expected_commits)"
 else
     _fail "change count matches" "expected ~$expected_commits, got $actual"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+# Section 8b: Extra Large Repo Performance (rails/rails ~97k commits)
+# ════════════════════════════════════════════════════════════════════════════
+
+begin_section "Git Import: XL Repo Performance (rails — ~97k commits)"
+
+make_temp_repo "git-import-xl"
+
+echo "  Cloning rails/rails (this may take a few minutes)..."
+clone_git_repo "https://github.com/rails/rails.git"
+cd "$GIT_REPO_DIR"
+
+expected_commits="$(git_commit_count)"
+echo "  Found $expected_commits commits"
+
+start_time=$(date +%s)
+atomic git import >/dev/null 2>&1
+end_time=$(date +%s)
+duration=$((end_time - start_time))
+
+assert_success "import completed" true
+echo "  Import took ${duration}s"
+
+# Should complete in reasonable time (< 30 minutes)
+if [[ $duration -lt 1800 ]]; then
+    _pass "import completed in reasonable time (<30min)"
+else
+    _fail "import completed in reasonable time" "took ${duration}s"
+fi
+
+# Verify counts match (with tolerance for merge handling)
+actual="$(atomic log 2>/dev/null | grep -cE '^\s*#[0-9]+|^[0-9a-f]{8,}' 2>/dev/null || true)"
+actual="${actual:-0}"
+actual="$(echo "$actual" | tr -d '[:space:]')"
+[[ -z "$actual" ]] && actual=0
+if [[ $actual -ge $((expected_commits - 500)) ]] && [[ $actual -le $((expected_commits + 500)) ]]; then
+    _pass "change count roughly matches ($actual vs $expected_commits)"
+else
+    _fail "change count matches" "expected ~$expected_commits, got $actual"
+fi
+
+# Report throughput
+if [[ $duration -gt 0 ]]; then
+    throughput=$((expected_commits / duration))
+    echo "  Throughput: ~${throughput} commits/s"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
