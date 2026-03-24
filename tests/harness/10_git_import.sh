@@ -299,22 +299,23 @@ fi
 git_commit "Main 1" "main.txt" "main"
 
 # Create feature-a branch
+initial_branch="$(git symbolic-ref --quiet --short HEAD || echo main)"
 git checkout -b feature-a --quiet
 git_commit "Feature A" "a.txt" "a"
 
-# Create feature-b branch (from main)
-git checkout main --quiet 2>/dev/null || git checkout master --quiet
+# Create feature-b branch (from initial branch)
+git checkout "$initial_branch" --quiet
 git checkout -b feature-b --quiet
 git_commit "Feature B" "b.txt" "b"
 
-# Return to main
-git checkout main --quiet 2>/dev/null || git checkout master --quiet
+# Return to initial branch
+git checkout "$initial_branch" --quiet
 
 atomic init >/dev/null 2>&1
 atomic git import --all-branches >/dev/null 2>&1
 
 # Verify all branches became stacks
-assert_stack_exists "main stack exists" "main"
+assert_stack_exists "${initial_branch} stack exists" "$initial_branch"
 assert_stack_exists "feature-a stack exists" "feature-a"
 assert_stack_exists "feature-b stack exists" "feature-b"
 
