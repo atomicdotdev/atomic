@@ -734,8 +734,8 @@ body{font-family:var(--font-body);font-size:16px;line-height:1.6;color:var(--tex
   </div>
 
   <div class="callout fade-up d5">
-    <div class="callout-title">💡 Why store by hash?</div>
-    <div class="callout-body">If two different repositories independently produce the same change (e.g., both add the same empty file), they get the same hash — and could share storage. More importantly: the hash is the change's identity. Any corruption or tampering changes the hash, making it immediately detectable.</div>
+    <div class="callout-title">💡 Two-way sync: redb ↔ .change files</div>
+    <div class="callout-body">The redb database and <code>.change</code> files are two sides of the same coin. redb is how Atomic reads and writes changes locally — fast, transactional, queryable. The <code>.change</code> file format is how changes and provenance travel across the network during push and pull. <code>import_v3_file</code> brings a received file into redb; <code>export_v3_file</code> serializes from redb to send out. The hash is shared between both — same data, same fingerprint, whichever form it's in.</div>
   </div>
 
   <!-- QUIZ 4 -->
@@ -759,15 +759,15 @@ body{font-family:var(--font-body);font-size:16px;line-height:1.6;color:var(--tex
     </div>
 
     <div class="qblock" id="q4b">
-      <div class="q-text">After recording, you realize you accidentally deleted the change file from <code>.atomic/changes/</code>. What does this break, and what survives?</div>
+      <div class="q-text">After recording, you realize you accidentally deleted a change file from <code>.atomic/changes/</code>. Is the data gone?</div>
       <div class="q-opts">
-        <div class="q-opt" onclick="answer(this,'q4b',false)"><span class="q-let">A</span>Nothing — the graph has a full copy of all content</div>
-        <div class="q-opt" onclick="answer(this,'q4b',false)"><span class="q-let">B</span>Everything — the graph and change file are the same thing</div>
-        <div class="q-opt" onclick="answer(this,'q4b',true)"><span class="q-let">C</span>The change file has the content bytes; the graph has the structure — both are needed</div>
-        <div class="q-opt" onclick="answer(this,'q4b',false)"><span class="q-let">D</span>Only the commit message is lost — the diff can be reconstructed</div>
+        <div class="q-opt" onclick="answer(this,'q4b',false)"><span class="q-let">A</span>Yes — the change file is the only copy of the content bytes</div>
+        <div class="q-opt" onclick="answer(this,'q4b',true)"><span class="q-let">B</span>No — the redb database stores all change data and can export the file back</div>
+        <div class="q-opt" onclick="answer(this,'q4b',false)"><span class="q-let">C</span>Partially — structure survives in the graph but content bytes are gone</div>
+        <div class="q-opt" onclick="answer(this,'q4b',false)"><span class="q-let">D</span>Only the provenance metadata is lost — the diff can be reconstructed from the working copy</div>
       </div>
-      <div class="q-fb correct" id="q4b-fb-c">Exactly! The graph (in the redb database) stores the structure — which nodes exist, how they connect, which change introduced each one. But the actual content bytes live in the change file. If the change file is missing, the graph knows "there's a node from change XYZ bytes 10-50" but can't read those bytes. Both pieces are essential.</div>
-      <div class="q-fb wrong" id="q4b-fb-w">Not quite. The system has two complementary stores: the graph database holds the structure (nodes, edges, ordering), and the change files hold the actual content bytes. The graph says "node from change XYZ at bytes 10-50." The change file has those bytes. Delete the change file and the content becomes unreachable — the graph structure survives but the content is gone.</div>
+      <div class="q-fb correct" id="q4b-fb-c">Exactly! The redb database and <code>.change</code> files form a two-way sync system. The redb store (<code>CONTENT_CHUNKS</code>, <code>CHANGE_GRAPH</code>, <code>CHANGE_META</code>, etc.) holds all change data for fast local access. The <code>.change</code> file format is the <em>wire format</em> — how changes and provenance travel across the network during push and pull. <code>import_v3_file</code> loads a received file into redb; <code>export_v3_file</code> serializes from redb to send out. Delete a local file and the data is still in redb, ready to be exported again.</div>
+      <div class="q-fb wrong" id="q4b-fb-w">Not quite — the <code>.change</code> files and the redb database are partners, not alternatives. The redb store keeps all change data locally in tables for fast access. The <code>.change</code> file format is the wire format for distributing changes and provenance across the network. When you push, redb exports to <code>.change</code> files; when you pull, received files are imported into redb. It's a two-way sync — neither side is disposable.</div>
     </div>
   </div>
 </div>
