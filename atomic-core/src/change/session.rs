@@ -20,9 +20,10 @@
 //! | `SESSION_PHASES` | `(provenance_id, phase_hash): [u8; 16]` | `PhaseTimingEntry` |
 //! | `SESSION_EVENTS` | `(provenance_id, seq): [u8; 16]` | `SessionEvent` |
 //!
-//! Composite keys are 16-byte arrays following the same pattern as
-//! `STACK_CHANGES`: first 8 bytes = discriminant (u64 LE), second 8 bytes =
-//! secondary key (u64 LE or first-8-bytes-of-blake3).
+//! Composite keys are 16-byte arrays where:
+//! first 8 bytes = discriminant (`u64` BE, for correct numeric ordering in
+//! lexicographic range scans), second 8 bytes = secondary key (`u64` BE or
+//! first 8 bytes of a BLAKE3 hash).
 
 use serde::{Deserialize, Serialize};
 
