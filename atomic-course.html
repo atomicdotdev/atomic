@@ -1,0 +1,1244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Atomic — How It Works: An Interactive Course</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg-primary: #FAF7F2;
+  --bg-secondary: #F2EDE6;
+  --bg-tertiary: #EAE3D8;
+  --accent: #D4622A;
+  --accent-hover: #B8501F;
+  --accent-light: rgba(212,98,42,0.1);
+  --text-primary: #2C2C2C;
+  --text-secondary: #6B6560;
+  --text-muted: #A09890;
+  --code-bg: #1E1E2E;
+  --code-text: #CDD6F4;
+  --code-comment: #6C7086;
+  --code-keyword: #CBA6F7;
+  --code-string: #A6E3A1;
+  --code-number: #FAB387;
+  --code-type: #89DCEB;
+  --code-fn: #89B4FA;
+  --border: rgba(44,44,44,0.09);
+  --border-accent: rgba(212,98,42,0.3);
+  --shadow-sm: 0 1px 3px rgba(44,44,44,0.06),0 2px 8px rgba(44,44,44,0.04);
+  --shadow-md: 0 4px 16px rgba(44,44,44,0.08),0 1px 4px rgba(44,44,44,0.06);
+  --shadow-lg: 0 8px 32px rgba(44,44,44,0.14);
+  --r-sm: 6px; --r-md: 12px; --r-lg: 20px;
+  --font-display: 'Bricolage Grotesque',system-ui,sans-serif;
+  --font-body: 'DM Sans',system-ui,sans-serif;
+  --font-mono: 'JetBrains Mono',monospace;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-snap-type:y proximity;scroll-behavior:smooth}
+body{font-family:var(--font-body);font-size:16px;line-height:1.6;color:var(--text-primary);background:var(--bg-primary);-webkit-font-smoothing:antialiased}
+
+/* NAV */
+.nav{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(250,247,242,0.92);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--border);padding:10px 24px;display:flex;align-items:center;gap:16px}
+.nav-logo{font-family:var(--font-display);font-size:15px;font-weight:800;color:var(--text-primary);text-decoration:none;display:flex;align-items:center;gap:8px;white-space:nowrap}
+.nav-dot{width:8px;height:8px;background:var(--accent);border-radius:50%;flex-shrink:0}
+.nav-mods{display:flex;gap:4px;flex:1;overflow-x:auto;scrollbar-width:none}
+.nav-mods::-webkit-scrollbar{display:none}
+.nav-mod{font-size:12px;font-weight:500;color:var(--text-muted);text-decoration:none;padding:4px 12px;border-radius:100px;white-space:nowrap;transition:all .2s;cursor:pointer;border:none;background:none}
+.nav-mod:hover{color:var(--text-primary);background:var(--accent-light)}
+.nav-mod.active{color:var(--accent);background:var(--accent-light);font-weight:600}
+.progress-bar{height:2px;background:var(--accent);position:fixed;top:0;left:0;width:0%;z-index:101;transition:width .3s ease}
+
+/* MODULES */
+.module{min-height:100dvh;min-height:100vh;scroll-snap-align:start;padding:80px 24px 64px;display:flex;flex-direction:column;align-items:center}
+.module:nth-child(odd){background:var(--bg-primary)}
+.module:nth-child(even){background:var(--bg-secondary)}
+.mod-inner{width:100%;max-width:860px;padding-top:32px}
+
+/* ANIMATED ENTRIES */
+.fade-up{opacity:0;transform:translateY(14px);transition:opacity .5s ease,transform .5s ease}
+.fade-in{opacity:0;transition:opacity .5s ease}
+.slide-in{opacity:0;transform:translateX(-16px);transition:opacity .4s ease,transform .4s ease}
+.module.vis .fade-up,.module.vis .fade-in,.module.vis .slide-in{opacity:1;transform:none}
+.d1{transition-delay:.1s}.d2{transition-delay:.2s}.d3{transition-delay:.3s}.d4{transition-delay:.4s}.d5{transition-delay:.5s}.d6{transition-delay:.6s}.d7{transition-delay:.7s}
+
+/* HERO */
+.hero{min-height:100dvh;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:80px 24px;background:var(--bg-primary);scroll-snap-align:start;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;top:-150px;right:-150px;width:500px;height:500px;background:radial-gradient(circle,rgba(212,98,42,.07) 0%,transparent 70%);pointer-events:none}
+.hero-eye{font-size:.75rem;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--accent);margin-bottom:20px;opacity:0;animation:fadeUp .6s ease .2s forwards}
+.hero-title{font-family:var(--font-display);font-size:clamp(2.8rem,8vw,5.2rem);font-weight:800;line-height:1.06;color:var(--text-primary);margin-bottom:20px;opacity:0;animation:fadeUp .6s ease .4s forwards}
+.hero-title span{color:var(--accent)}
+.hero-desc{font-size:1.1rem;color:var(--text-secondary);max-width:500px;margin:0 auto 32px;line-height:1.65;opacity:0;animation:fadeUp .6s ease .6s forwards}
+.hero-pills{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-top:40px;opacity:0;animation:fadeUp .6s ease .9s forwards}
+.hero-pill{font-size:.76rem;font-weight:500;color:var(--text-secondary);padding:6px 14px;background:white;border:1px solid var(--border);border-radius:100px;display:flex;align-items:center;gap:7px;box-shadow:var(--shadow-sm);cursor:pointer;transition:all .2s;text-decoration:none}
+.hero-pill:hover{border-color:var(--accent);color:var(--accent);box-shadow:var(--shadow-md)}
+.pill-n{width:17px;height:17px;background:var(--accent);color:white;border-radius:50%;font-size:.62rem;font-weight:700;display:flex;align-items:center;justify-content:center}
+@keyframes fadeUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+
+/* MOD HEADER */
+.mod-label{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin-bottom:12px}
+.mod-title{font-family:var(--font-display);font-size:clamp(1.8rem,4.5vw,2.9rem);font-weight:800;line-height:1.12;color:var(--text-primary);margin-bottom:16px}
+.mod-sub{font-size:1.05rem;color:var(--text-secondary);max-width:580px;margin-bottom:40px;line-height:1.6}
+
+/* CARDS */
+.grid{display:grid;gap:16px;margin-bottom:32px}
+.g2{grid-template-columns:1fr 1fr}.g3{grid-template-columns:1fr 1fr 1fr}.ga{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+.card{background:white;border:1px solid var(--border);border-radius:var(--r-md);padding:24px;box-shadow:var(--shadow-sm);transition:box-shadow .2s}
+.card:hover{box-shadow:var(--shadow-md)}
+.card.accent-bg{background:var(--accent-light);border-color:var(--border-accent)}
+.card.dark-bg{background:var(--code-bg);color:var(--code-text);border-color:transparent}
+.card-icon{font-size:1.7rem;margin-bottom:12px}
+.card-title{font-family:var(--font-display);font-size:.95rem;font-weight:700;margin-bottom:8px}
+.card-body{font-size:.84rem;color:var(--text-secondary);line-height:1.55}
+.card.dark-bg .card-body{color:#BAC2DE}
+
+/* TABLE */
+.cmp-table{width:100%;border-collapse:collapse;background:white;border-radius:var(--r-md);overflow:hidden;box-shadow:var(--shadow-sm);border:1px solid var(--border);margin-bottom:32px}
+.cmp-table th{background:var(--bg-tertiary);font-family:var(--font-display);font-size:.75rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:12px 20px;text-align:left;color:var(--text-secondary);border-bottom:1px solid var(--border)}
+.cmp-table th:last-child{color:var(--accent)}
+.cmp-table td{padding:11px 20px;font-size:.84rem;border-bottom:1px solid var(--border);vertical-align:top;line-height:1.5}
+.cmp-table tr:last-child td{border-bottom:none}
+.cmp-table td:first-child{font-weight:600;color:var(--text-secondary);width:32%}
+.cmp-table td:nth-child(2){color:var(--text-muted)}
+.good{color:#2D8653!important;font-weight:600}.bad{color:#C1351A!important}
+
+/* CODE TRANSLATION */
+.xlat{display:grid;grid-template-columns:1fr 1fr;gap:0;border-radius:var(--r-md);overflow:visible;border:1px solid var(--border);box-shadow:var(--shadow-md);margin-bottom:32px}
+.xlat-code{background:var(--code-bg);padding:24px;border-radius:var(--r-md) 0 0 var(--r-md);overflow:visible}
+.xlat-code pre{font-family:var(--font-mono);font-size:.78rem;line-height:1.7;color:var(--code-text);white-space:pre-wrap;word-break:break-word}
+.xlat-en{background:white;padding:24px;border-radius:0 var(--r-md) var(--r-md) 0;border-left:1px solid var(--border);overflow:visible}
+.xlat-label{font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-muted);margin-bottom:16px}
+.xl{display:flex;gap:10px;margin-bottom:10px;align-items:flex-start;font-size:.8rem;line-height:1.5}
+.xl-n{font-family:var(--font-mono);font-size:.68rem;color:var(--text-muted);min-width:18px;padding-top:2px;flex-shrink:0}
+.xl-t{color:var(--text-primary)}
+
+/* SYNTAX */
+.kw{color:#CBA6F7}.st{color:#A6E3A1}.nm{color:#FAB387}.ty{color:#89DCEB}.fn{color:#89B4FA}.cm{color:#6C7086}
+
+/* FLOW STEPS */
+.flow{display:flex;flex-direction:column;gap:2px;margin-bottom:32px}
+.flow-step{display:flex;align-items:flex-start;gap:16px;padding:14px 18px;background:white;border:1px solid var(--border);border-radius:var(--r-sm);transition:box-shadow .2s}
+.flow-step:hover{box-shadow:var(--shadow-sm)}
+.flow-n{width:26px;height:26px;background:var(--accent);color:white;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:.72rem;font-weight:700;flex-shrink:0;margin-top:2px}
+.flow-body{flex:1}
+.flow-title{font-weight:600;font-size:.88rem;color:var(--text-primary)}
+.flow-desc{font-size:.79rem;color:var(--text-secondary);margin-top:2px}
+.flow-tag{font-family:var(--font-mono);font-size:.72rem;background:var(--bg-secondary);padding:2px 8px;border-radius:4px;color:var(--accent);white-space:nowrap;flex-shrink:0;align-self:center}
+.flow-arrow{text-align:center;color:var(--text-muted);font-size:.7rem;padding:1px 0;padding-left:42px}
+
+/* CALLOUT */
+.callout{background:var(--accent-light);border:1px solid var(--border-accent);border-left:4px solid var(--accent);border-radius:var(--r-sm);padding:18px 22px;margin-bottom:32px}
+.callout-title{font-family:var(--font-display);font-size:.82rem;font-weight:700;color:var(--accent);margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.callout-body{font-size:.85rem;color:var(--text-primary);line-height:1.6}
+
+/* ARCH LAYERS */
+.arch{margin-bottom:32px}
+.arch-layer{margin-bottom:12px}
+.arch-label{font-size:.68rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin-bottom:8px}
+.arch-boxes{display:flex;gap:10px;flex-wrap:wrap}
+.arch-box{background:white;border:1px solid var(--border);border-radius:var(--r-sm);padding:10px 16px;font-size:.82rem;font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:8px;box-shadow:var(--shadow-sm);flex:1;min-width:110px;cursor:default;transition:box-shadow .2s,background .2s}
+.arch-box:hover{box-shadow:var(--shadow-md);background:var(--accent-light)}
+.arch-box.hi{background:var(--accent);color:white;border-color:var(--accent)}
+.arch-con{text-align:center;color:var(--text-muted);padding:4px 0;font-size:1rem}
+
+/* TERMINAL */
+.term{background:#0F0F1A;border-radius:var(--r-md);overflow:hidden;margin-bottom:24px;box-shadow:var(--shadow-md)}
+.term-bar{background:#1C1C2E;padding:8px 16px;display:flex;align-items:center;gap:7px;border-bottom:1px solid rgba(255,255,255,.05)}
+.term-dot{width:10px;height:10px;border-radius:50%}
+.term-code{padding:20px 24px;font-family:var(--font-mono);font-size:.78rem;line-height:1.85;color:#CDD6F4;white-space:pre-wrap;word-break:break-word}
+.tp{color:#A6E3A1}.tc{color:#6C7086}.to{color:#BAC2DE}.th{color:#FAB387}
+
+/* QUIZ */
+.quiz{background:white;border:1px solid var(--border);border-radius:var(--r-lg);padding:32px;box-shadow:var(--shadow-md);margin-bottom:32px}
+.quiz-head{display:flex;align-items:center;gap:12px;margin-bottom:24px}
+.quiz-badge{background:var(--accent);color:white;font-size:.68rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:3px 10px;border-radius:100px}
+.quiz-title{font-family:var(--font-display);font-size:1.05rem;font-weight:700}
+.qblock{margin-bottom:20px;padding-bottom:20px;border-bottom:1px solid var(--border)}
+.qblock:last-of-type{border-bottom:none;margin-bottom:0;padding-bottom:0}
+.q-text{font-size:.92rem;font-weight:600;color:var(--text-primary);margin-bottom:14px;line-height:1.5}
+.q-opts{display:flex;flex-direction:column;gap:8px}
+.q-opt{display:flex;align-items:flex-start;gap:12px;padding:11px 14px;border:1.5px solid var(--border);border-radius:var(--r-sm);cursor:pointer;transition:all .15s;font-size:.84rem;background:var(--bg-primary);user-select:none}
+.q-opt:hover:not(.answered){border-color:var(--accent);background:var(--accent-light)}
+.q-opt.correct{border-color:#2D8653;background:rgba(45,134,83,.08)}
+.q-opt.wrong{border-color:#C1351A;background:rgba(193,53,26,.06)}
+.q-opt.reveal{border-color:#2D8653;background:rgba(45,134,83,.04);opacity:.6}
+.q-let{width:20px;height:20px;border-radius:50%;border:1.5px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:.68rem;font-weight:700;color:var(--text-muted);flex-shrink:0;margin-top:1px}
+.q-opt.correct .q-let{background:#2D8653;border-color:#2D8653;color:white}
+.q-opt.wrong .q-let{background:#C1351A;border-color:#C1351A;color:white}
+.q-fb{margin-top:12px;padding:12px 16px;border-radius:var(--r-sm);font-size:.83rem;line-height:1.55;display:none}
+.q-fb.show{display:block}
+.q-fb.correct{background:rgba(45,134,83,.08);color:#1B6B3A;border:1px solid rgba(45,134,83,.2)}
+.q-fb.wrong{background:rgba(193,53,26,.06);color:#8B2500;border:1px solid rgba(193,53,26,.15)}
+.btn{background:var(--accent);color:white;border:none;border-radius:var(--r-sm);padding:8px 20px;font-family:var(--font-body);font-size:.84rem;font-weight:600;cursor:pointer;transition:background .15s}
+.btn:hover{background:var(--accent-hover)}
+
+/* TOOLTIPS */
+.tt{text-decoration:underline;text-decoration-style:dashed;text-underline-offset:3px;text-decoration-color:var(--accent);cursor:pointer;color:inherit}
+#tt-el{position:fixed;background:var(--text-primary);color:white;font-family:var(--font-body);font-size:.76rem;line-height:1.55;padding:10px 14px;border-radius:var(--r-sm);max-width:250px;z-index:9999;pointer-events:none;opacity:0;transition:opacity .15s;box-shadow:var(--shadow-lg)}
+#tt-el.show{opacity:1}
+#tt-el strong{color:#FAB387}
+
+/* SECTION TITLE */
+.sec-title{font-family:var(--font-display);font-size:1.2rem;font-weight:700;color:var(--text-primary);margin:40px 0 20px;display:flex;align-items:center;gap:12px}
+.sec-title::after{content:'';flex:1;height:1px;background:var(--border)}
+
+/* BADGES */
+.badge{display:inline-flex;align-items:center;gap:4px;font-size:.7rem;font-weight:700;padding:3px 9px;border-radius:100px;border:1px solid}
+.bo{background:rgba(212,98,42,.1);color:var(--accent);border-color:rgba(212,98,42,.3)}
+.bg{background:rgba(45,134,83,.08);color:#2D8653;border-color:rgba(45,134,83,.3)}
+.bb{background:rgba(137,180,250,.1);color:#5B8CF0;border-color:rgba(137,180,250,.3)}
+.bk{background:var(--bg-tertiary);color:var(--text-muted);border-color:var(--border)}
+
+/* GRAPH VIZ */
+.gviz{background:var(--code-bg);border-radius:var(--r-md);padding:32px 24px;margin-bottom:32px;display:flex;flex-direction:column;align-items:center}
+.gviz svg{max-width:100%;overflow:visible}
+
+/* RESPONSIVE */
+@media(max-width:768px){
+  .g2,.g3{grid-template-columns:1fr}
+  .xlat{grid-template-columns:1fr}
+  .xlat-code{border-radius:var(--r-md) var(--r-md) 0 0}
+  .xlat-en{border-radius:0 0 var(--r-md) var(--r-md);border-left:none;border-top:1px solid var(--border)}
+  .nav-mods{display:none}
+  .module{padding:70px 16px 48px}
+}
+
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+</style>
+</head>
+<body>
+
+<div class="progress-bar" id="prog"></div>
+
+<nav class="nav">
+  <a href="#hero" class="nav-logo"><span class="nav-dot"></span>Atomic</a>
+  <div class="nav-mods">
+    <a href="#m1" class="nav-mod" data-mod="m1">1 · The Problem</a>
+    <a href="#m2" class="nav-mod" data-mod="m2">2 · The Crew</a>
+    <a href="#m3" class="nav-mod" data-mod="m3">3 · Graphs</a>
+    <a href="#m4" class="nav-mod" data-mod="m4">4 · Recording</a>
+    <a href="#m5" class="nav-mod" data-mod="m5">5 · AI DNA</a>
+    <a href="#m6" class="nav-mod" data-mod="m6">6 · Stacks</a>
+  </div>
+</nav>
+
+<!-- HERO -->
+<section class="hero" id="hero">
+  <div class="hero-eye">Interactive Course</div>
+  <h1 class="hero-title">Version control<br>for the <span>age of AI</span></h1>
+  <p class="hero-desc">Atomic is a new kind of version control — built from scratch for AI-assisted development. This course explains how it works, starting from the problem it solves.</p>
+  <div class="hero-pills">
+    <a href="#m1" class="hero-pill"><span class="pill-n">1</span>The Problem Git Has</a>
+    <a href="#m2" class="hero-pill"><span class="pill-n">2</span>Meet the 7 Crates</a>
+    <a href="#m3" class="hero-pill"><span class="pill-n">3</span>Files as Graphs</a>
+    <a href="#m4" class="hero-pill"><span class="pill-n">4</span>The Record Pipeline</a>
+    <a href="#m5" class="hero-pill"><span class="pill-n">5</span>AI DNA in Every Change</a>
+    <a href="#m6" class="hero-pill"><span class="pill-n">6</span>Stacks &amp; Storage</a>
+  </div>
+</section>
+
+<!-- MODULE 1 -->
+<section class="module" id="m1">
+<div class="mod-inner">
+  <div class="mod-label fade-up">Module 1</div>
+  <h2 class="mod-title fade-up d1">The problem Git didn't see coming</h2>
+  <p class="mod-sub fade-up d2">Imagine you ask Claude to fix a bug. It edits three files. How do you know which model wrote what? How much did it cost? If two agents edited the same line — who wins? Git was designed before these questions existed.</p>
+
+  <div class="sec-title fade-up d2">Git's mental model</div>
+
+  <div class="grid g2 fade-up d3">
+    <div class="card">
+      <div class="card-icon">📜</div>
+      <div class="card-title">A necklace of snapshots</div>
+      <div class="card-body"><span class="tt" data-tip="<strong>Git</strong> is the most popular version control system in the world. It tracks changes to files over time, letting you go back to any previous version. Think of it like an infinite undo button for your entire project.">Git</span> stores your project's history as a chain of <span class="tt" data-tip="<strong>Commits</strong> are snapshots of your entire project at a moment in time. Each one has a message, an author, and a timestamp. Like saving a checkpoint in a video game — you can always return to any checkpoint.">commits</span>. Each commit is a snapshot of every file. To find what changed, Git compares two snapshots line by line.</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">🔢</div>
+      <div class="card-title">Lines are the atom</div>
+      <div class="card-body">In Git, the smallest unit of change is a line of text. If two people edit the same line — even different words on that line — Git sees a <span class="tt" data-tip="<strong>Merge conflict</strong>: when two separate changes touch the same piece of code, Git can't automatically decide which version is correct. It marks the file with conflict markers and makes you choose manually.">merge conflict</span> and makes you resolve it by hand.</div>
+    </div>
+  </div>
+
+  <div class="callout fade-up d3">
+    <div class="callout-title">⚡ Why this worked for 20 years</div>
+    <div class="callout-body">When humans write code, they rarely edit the exact same line at the same time. Git's line-based model was good enough. AI changed the math — multiple agents can touch the same files in the same session, simultaneously, at high speed.</div>
+  </div>
+
+  <div class="sec-title fade-up d3">Where Git breaks with AI</div>
+
+  <table class="cmp-table fade-up d4">
+    <thead>
+      <tr><th>Question</th><th>Git's answer</th><th>What you actually need</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Which model wrote this?</td>
+        <td class="bad">Nothing — a human has to add a "Co-authored-by" note by hand</td>
+        <td class="good">Model name, vendor, session ID embedded in the change itself</td>
+      </tr>
+      <tr>
+        <td>How much did this session cost?</td>
+        <td class="bad">Not tracked — you need an external dashboard</td>
+        <td class="good">Token counts and USD cost stored in every change</td>
+      </tr>
+      <tr>
+        <td>Two agents edit the same line</td>
+        <td class="bad">Merge conflict — someone resolves it manually</td>
+        <td class="good">If they touched different tokens, it merges automatically</td>
+      </tr>
+      <tr>
+        <td>Agent isolation</td>
+        <td class="bad">Branches diverge — messy history, orphaned commits</td>
+        <td class="good">Stacks: lightweight views of the same graph, zero cleanup needed</td>
+      </tr>
+      <tr>
+        <td>File renamed + history</td>
+        <td class="bad">Heuristic guessing — can break history</td>
+        <td class="good">Inode tracking — renames are always exact, history is unbroken</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="sec-title fade-up d4">Enter Atomic</div>
+
+  <div class="grid ga fade-up d4">
+    <div class="card accent-bg">
+      <div class="card-icon">🧮</div>
+      <div class="card-title">Graph, not lines</div>
+      <div class="card-body">Files are stored as a <span class="tt" data-tip="<strong>DAG</strong> (Directed Acyclic Graph): a network of nodes connected by arrows, where you can never loop back to a previous node. Like a family tree — parents connect to children, but children never become their own ancestors.">DAG</span> of content chunks. Two agents editing different parts of a file create independent nodes — no conflict possible.</div>
+    </div>
+    <div class="card accent-bg">
+      <div class="card-icon">🔏</div>
+      <div class="card-title">AI attribution is structural</div>
+      <div class="card-body">Every change carries vendor, model, <span class="tt" data-tip="<strong>Session</strong>: one complete conversation with an AI agent. A session contains multiple turns — each back-and-forth exchange is one turn.">session</span>, turn number, token count, and cost. It's part of the change's <span class="tt" data-tip="<strong>Cryptographic hash</strong>: a fingerprint of data. Change anything — even one character — and the fingerprint completely changes. Used to verify data hasn't been tampered with.">cryptographic hash</span>, so it can't be tampered with.</div>
+    </div>
+    <div class="card accent-bg">
+      <div class="card-icon">📐</div>
+      <div class="card-title">Mathematically correct merges</div>
+      <div class="card-body">Independent changes always merge cleanly — not by heuristic guessing, but by proof. If change A and change B touch different nodes, applying A then B gives the same result as B then A. <span class="tt" data-tip="<strong>Commutative</strong>: the order doesn't matter. 2+3 and 3+2 both equal 5 — addition is commutative. Atomic's change model has this property for independent edits.">Commutative</span> by design.</div>
+    </div>
+  </div>
+
+  <!-- QUIZ 1 -->
+  <div class="sec-title fade-up d5">Check your understanding</div>
+  <div class="quiz fade-up d5">
+    <div class="quiz-head">
+      <span class="quiz-badge">Quiz</span>
+      <span class="quiz-title">The Problem Git Has</span>
+    </div>
+
+    <div class="qblock" id="q1a">
+      <div class="q-text">You ask Claude to fix a bug. It edits two files and the session finishes. You want to know exactly which model it used and how much the session cost. Using plain Git, what would you do?</div>
+      <div class="q-opts">
+        <div class="q-opt" onclick="answer(this,'q1a',false)"><span class="q-let">A</span>Run <code>git log --stats</code> — it shows model and cost</div>
+        <div class="q-opt" onclick="answer(this,'q1a',false)"><span class="q-let">B</span>Check <code>git blame</code> — AI attribution appears there</div>
+        <div class="q-opt" onclick="answer(this,'q1a',true)"><span class="q-let">C</span>Git doesn't track this — you'd need an external tool or manual notes</div>
+        <div class="q-opt" onclick="answer(this,'q1a',false)"><span class="q-let">D</span>Look in the commit message if the AI added a summary</div>
+      </div>
+      <div class="q-fb correct" id="q1a-fb-c">Exactly! Git predates AI agents entirely. It has no concept of token costs, model names, or session IDs. Teams building with AI today bolt these on with external spreadsheets, custom commit formats, or separate dashboards. Atomic bakes it in natively — no external tools needed.</div>
+      <div class="q-fb wrong" id="q1a-fb-w">Not quite — Git was designed before AI agents existed. It has no fields for model name, token count, or cost. The only way to track this in Git is manually adding it to commit messages, which is error-prone and unsearchable. Atomic embeds this data structurally.</div>
+    </div>
+
+    <div class="qblock" id="q1b">
+      <div class="q-text">Your teammate edits the word "validate" on line 12 of auth.rs. At the same time, Claude edits the word "token" on the same line 12. In Git this is a conflict. What does Atomic do?</div>
+      <div class="q-opts">
+        <div class="q-opt" onclick="answer(this,'q1b',false)"><span class="q-let">A</span>Picks the most recent change automatically</div>
+        <div class="q-opt" onclick="answer(this,'q1b',true)"><span class="q-let">B</span>Recognizes they edited different tokens and merges cleanly</div>
+        <div class="q-opt" onclick="answer(this,'q1b',false)"><span class="q-let">C</span>Asks you to resolve it the same way as Git</div>
+        <div class="q-opt" onclick="answer(this,'q1b',false)"><span class="q-let">D</span>Keeps both versions as duplicate lines</div>
+      </div>
+      <div class="q-fb correct" id="q1b-fb-c">Exactly! Atomic tracks changes at the token level — individual words, not entire lines. Since your teammate and Claude touched different tokens on the same line, these are truly independent changes. Independent changes always merge cleanly in Atomic's mathematical model. No conflict, no manual intervention.</div>
+      <div class="q-fb wrong" id="q1b-fb-w">Not quite. Because Atomic tracks content at the token level (individual words), editing "validate" and editing "token" on the same line are independent operations in the graph. Independent operations always commute — applying them in either order gives the same result. No conflict needed.</div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- MODULE 2 -->
+<section class="module" id="m2">
+<div class="mod-inner">
+  <div class="mod-label fade-up">Module 2</div>
+  <h2 class="mod-title fade-up d1">Meet the crew — seven crates</h2>
+  <p class="mod-sub fade-up d2">Atomic is a <span class="tt" data-tip="<strong>Monorepo</strong>: a single repository that contains multiple related projects or packages. Instead of separate repos for each component, everything lives together. Makes it easy to share code and make coordinated changes.">monorepo</span> of seven specialized <span class="tt" data-tip="<strong>Crate</strong>: Rust's term for a package or library. Think of it like a module or plugin — a self-contained chunk of code that does one job and can be used by other crates. Named after shipping crates, because packages are meant to be shipped.">crates</span>. Each does one job. Together they form the complete system.</p>
+
+  <div class="sec-title fade-up d2">The layered architecture</div>
+
+  <div class="arch fade-up d3">
+    <div class="arch-layer">
+      <div class="arch-label">You interact here</div>
+      <div class="arch-boxes">
+        <div class="arch-box hi"><span>⌨️</span> atomic-cli</div>
+      </div>
+    </div>
+    <div class="arch-con">↓</div>
+    <div class="arch-layer">
+      <div class="arch-label">High-level operations</div>
+      <div class="arch-boxes">
+        <div class="arch-box"><span>📦</span> atomic-repository</div>
+        <div class="arch-box"><span>🤖</span> atomic-agent</div>
+      </div>
+    </div>
+    <div class="arch-con">↓</div>
+    <div class="arch-layer">
+      <div class="arch-label">The engine</div>
+      <div class="arch-boxes">
+        <div class="arch-box"><span>⚙️</span> atomic-core</div>
+      </div>
+    </div>
+    <div class="arch-con">↓</div>
+    <div class="arch-layer">
+      <div class="arch-label">Support services</div>
+      <div class="arch-boxes">
+        <div class="arch-box"><span>🔑</span> atomic-identity</div>
+        <div class="arch-box"><span>⚙️</span> atomic-config</div>
+        <div class="arch-box"><span>🌐</span> atomic-remote</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="sec-title fade-up d3">What each one does</div>
+
+  <div class="grid ga fade-up d3">
+    <div class="card">
+      <div class="card-icon">⌨️</div>
+      <div class="card-title">atomic-cli</div>
+      <div class="card-body">The commands you type. <code>atomic init</code>, <code>atomic record</code>, <code>atomic push</code>. Parses your input, calls the right high-level operation, formats the output for humans.</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">📦</div>
+      <div class="card-title">atomic-repository</div>
+      <div class="card-body">The orchestrator. Knows how to do things like "record changes" or "switch stacks" — coordinates between the engine, storage, and tracking layers.</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">🤖</div>
+      <div class="card-title">atomic-agent</div>
+      <div class="card-body">AI integration. Listens for <span class="tt" data-tip="<strong>Hook</strong>: a piece of code that runs automatically when a specific event occurs. Like a doorbell — when the event (someone at the door) happens, the hook (the bell rings) fires.">hooks</span> from Claude Code, Gemini CLI, and others. Captures session/turn data, builds provenance, and auto-records every agent turn.</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">⚙️</div>
+      <div class="card-title">atomic-core</div>
+      <div class="card-body">The engine room. The graph database, the <span class="tt" data-tip="<strong>Diff algorithm</strong>: a method for finding what changed between two versions of a file. Myers and Patience are two popular algorithms — each takes a different approach to finding the smallest set of changes.">diff algorithms</span>, the change format, apply logic, and <span class="tt" data-tip="<strong>CRDT</strong> (Conflict-free Replicated Data Type): a data structure mathematically designed so that changes from different sources can always be merged without conflicts. The math guarantees consistency.">CRDT</span> layer. Everything else is built on top of this.</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">🔑</div>
+      <div class="card-title">atomic-identity</div>
+      <div class="card-body">Cryptographic identity. Creates and stores your <span class="tt" data-tip="<strong>Ed25519</strong>: a modern digital signature algorithm. Like a wax seal on a letter — anyone can verify it's from you, but only you can create it. Much faster and more secure than older algorithms like RSA.">Ed25519</span> keypair. Signs changes with your private key so others can verify authorship.</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">⚙️</div>
+      <div class="card-title">atomic-config</div>
+      <div class="card-body">Settings management. Stores your global preferences (name, email, remotes) and per-repository config (current stack, remote URLs). Uses <span class="tt" data-tip="<strong>TOML</strong>: a configuration file format designed to be easy for humans to read and write. Like .ini files but more expressive. Used by Rust's Cargo.toml, Python's pyproject.toml, and many other tools.">TOML</span> files.</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">🌐</div>
+      <div class="card-title">atomic-remote</div>
+      <div class="card-body">Network operations. Handles push, pull, and clone over HTTP. Compares <span class="tt" data-tip="<strong>Merkle state</strong>: a cryptographic fingerprint of the entire history, built by hashing changes together in sequence. If any change in the history differs, the Merkle state differs — enabling fast sync checks.">Merkle states</span> to find missing changes, then uploads or downloads them.</div>
+    </div>
+  </div>
+
+  <div class="callout fade-up d4">
+    <div class="callout-title">💡 Why split into 7 crates?</div>
+    <div class="callout-body">Each crate can be used independently. A tool that only needs to read change files can depend on <code>atomic-core</code> without pulling in the full CLI. This modularity also means the engine can be embedded in editors, IDEs, or AI coding tools that want native Atomic support.</div>
+  </div>
+
+  <!-- QUIZ 2 -->
+  <div class="sec-title fade-up d5">Check your understanding</div>
+  <div class="quiz fade-up d5">
+    <div class="quiz-head">
+      <span class="quiz-badge">Quiz</span>
+      <span class="quiz-title">The Cast of Characters</span>
+    </div>
+
+    <div class="qblock" id="q2a">
+      <div class="q-text">You want to add a new command to Atomic — say, <code>atomic export</code>. Which crate would you modify?</div>
+      <div class="q-opts">
+        <div class="q-opt" onclick="answer(this,'q2a',false)"><span class="q-let">A</span>atomic-core — that's where all the main logic lives</div>
+        <div class="q-opt" onclick="answer(this,'q2a',true)"><span class="q-let">B</span>atomic-cli — it owns the commands users type</div>
+        <div class="q-opt" onclick="answer(this,'q2a',false)"><span class="q-let">C</span>atomic-repository — it orchestrates operations</div>
+        <div class="q-opt" onclick="answer(this,'q2a',false)"><span class="q-let">D</span>atomic-config — it manages settings</div>
+      </div>
+      <div class="q-fb correct" id="q2a-fb-c">Exactly! atomic-cli is the crate that defines what commands exist and how they're parsed. Adding a new command means adding a new subcommand there. The actual work the command does would likely be implemented in atomic-repository (coordination) or atomic-core (engine logic).</div>
+      <div class="q-fb wrong" id="q2a-fb-w">Not quite. atomic-cli is the crate responsible for defining commands — it's the user-facing layer. atomic-core is the engine (graph, storage, diff), not where new commands live. Think of it like a restaurant: the CLI is the menu, the core is the kitchen.</div>
+    </div>
+
+    <div class="qblock" id="q2b">
+      <div class="q-text">You're writing a custom tool that just needs to read Atomic change files and extract provenance data — no CLI, no pushing. Which crate(s) do you really need?</div>
+      <div class="q-opts">
+        <div class="q-opt" onclick="answer(this,'q2b',false)"><span class="q-let">A</span>All 7 crates — they're all interconnected</div>
+        <div class="q-opt" onclick="answer(this,'q2b',false)"><span class="q-let">B</span>atomic-cli and atomic-repository</div>
+        <div class="q-opt" onclick="answer(this,'q2b',true)"><span class="q-let">C</span>Just atomic-core — it has the change format and types</div>
+        <div class="q-opt" onclick="answer(this,'q2b',false)"><span class="q-let">D</span>atomic-agent — it handles provenance data</div>
+      </div>
+      <div class="q-fb correct" id="q2b-fb-c">Exactly! This is exactly why the codebase is split into independent crates. atomic-core contains the change format, the Provenance struct, and all the serialization logic. A read-only tool only needs that one crate — no need to pull in the full CLI, agent hooks, or remote sync code.</div>
+      <div class="q-fb wrong" id="q2b-fb-w">Not quite. The modular design means you can pick just what you need. atomic-core contains the change file format, the Provenance struct, and deserialization logic. That's all a read-only analysis tool requires — no CLI, no agent hooks, no network code.</div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- MODULE 3 -->
+<section class="module" id="m3">
+<div class="mod-inner">
+  <div class="mod-label fade-up">Module 3</div>
+  <h2 class="mod-title fade-up d1">Files as graphs — the big idea</h2>
+  <p class="mod-sub fade-up d2">This is the central insight that makes everything else possible. Git sees a file as a list of lines. Atomic sees it as a web of connected content chunks. That one difference changes everything about how conflicts, history, and merges work.</p>
+
+  <div class="sec-title fade-up d2">The metaphor: a Wikipedia article</div>
+
+  <div class="grid g2 fade-up d3">
+    <div class="card">
+      <div class="card-icon">📋</div>
+      <div class="card-title">Git's view: a numbered list</div>
+      <div class="card-body">Imagine a Wikipedia article as a numbered list of sentences. Line 42 is always "sentence 42". To change it, you rewrite that line. If two people edit line 42, there's a conflict — even if they changed different words in the sentence.</div>
+    </div>
+    <div class="card accent-bg">
+      <div class="card-icon">🕸️</div>
+      <div class="card-title">Atomic's view: a web of nodes</div>
+      <div class="card-body">Now imagine the article as a web of connected passages. Each passage has a unique identity — not a line number, but an ID. To add a new sentence, you insert a new node and connect it between existing nodes. The order emerges from the connections.</div>
+    </div>
+  </div>
+
+  <div class="callout fade-up d3">
+    <div class="callout-title">⚡ Why this is powerful</div>
+    <div class="callout-body">When content has a unique identity (not just a position), you can move it, delete it, and reference it from anywhere — and history always knows exactly what happened to it. Two changes inserting different nodes never conflict because they're creating new independent things, not competing to own the same position.</div>
+  </div>
+
+  <div class="sec-title fade-up d3">Vertices: the nodes</div>
+
+  <div class="xlat fade-up d4">
+    <div class="xlat-code">
+      <pre><span class="kw">pub struct</span> <span class="ty">GraphNode</span>&lt;<span class="ty">H</span>&gt; {
+    <span class="cm">/// The change that introduced this node</span>
+    <span class="kw">pub</span> change: <span class="ty">H</span>,
+    <span class="cm">/// Start position in the change's content</span>
+    <span class="kw">pub</span> start: <span class="ty">ChangePosition</span>,
+    <span class="cm">/// End position (exclusive)</span>
+    <span class="kw">pub</span> end: <span class="ty">ChangePosition</span>,
+}</pre>
+    </div>
+    <div class="xlat-en">
+      <div class="xlat-label">Plain English</div>
+      <div class="xl"><span class="xl-n">1</span><span class="xl-t">Define a node in the content graph. The <code>&lt;H&gt;</code> means it can hold either an internal ID or an external hash — same shape, different uses.</span></div>
+      <div class="xl"><span class="xl-n">3</span><span class="xl-t"><strong>change</strong> — which recorded change first introduced this piece of content. Every node knows its origin.</span></div>
+      <div class="xl"><span class="xl-n">5</span><span class="xl-t"><strong>start</strong> — where in that change's byte buffer this content begins (inclusive).</span></div>
+      <div class="xl"><span class="xl-n">7</span><span class="xl-t"><strong>end</strong> — where the content ends (exclusive). Together, start+end slice out the exact bytes from the change file.</span></div>
+    </div>
+  </div>
+
+  <div class="sec-title fade-up d4">Edges: the connections</div>
+
+  <div class="xlat fade-up d4">
+    <div class="xlat-code">
+      <pre><span class="kw">pub struct</span> <span class="ty">EdgeFlags</span>: <span class="ty">u8</span> {
+    <span class="cm">/// Connects sequential content in a file</span>
+    <span class="kw">const</span> BLOCK   = <span class="nm">0b0000_0001</span>;
+    <span class="cm">/// Computed edge (not stored in changes)</span>
+    <span class="kw">const</span> PSEUDO  = <span class="nm">0b0000_0100</span>;
+    <span class="cm">/// Connects directories to their children</span>
+    <span class="kw">const</span> FOLDER  = <span class="nm">0b0001_0000</span>;
+    <span class="cm">/// Reverse direction of another edge</span>
+    <span class="kw">const</span> PARENT  = <span class="nm">0b0010_0000</span>;
+    <span class="cm">/// Content removed — stays in graph</span>
+    <span class="kw">const</span> DELETED = <span class="nm">0b1000_0000</span>;
+}</pre>
+    </div>
+    <div class="xlat-en">
+      <div class="xlat-label">Plain English</div>
+      <div class="xl"><span class="xl-n">1</span><span class="xl-t">Each edge has a set of flags — like tags that describe what the edge means. Multiple flags can be combined (e.g., a deleted folder edge).</span></div>
+      <div class="xl"><span class="xl-n">3</span><span class="xl-t"><strong>BLOCK</strong> — "this content comes right after that content in the file." The most common edge type.</span></div>
+      <div class="xl"><span class="xl-n">5</span><span class="xl-t"><strong>PSEUDO</strong> — a helper edge the system computes to maintain graph structure. Not written by users or agents.</span></div>
+      <div class="xl"><span class="xl-n">7</span><span class="xl-t"><strong>FOLDER</strong> — represents directory structure. A folder node connects to all files it contains.</span></div>
+      <div class="xl"><span class="xl-n">9</span><span class="xl-t"><strong>PARENT</strong> — the reverse direction. Every forward edge has a corresponding parent edge, enabling fast backwards traversal.</span></div>
+      <div class="xl"><span class="xl-n">11</span><span class="xl-t"><strong>DELETED</strong> — marks removed content. The node stays in the graph — only the edge is flagged. This is how history is preserved forever.</span></div>
+    </div>
+  </div>
+
+  <div class="sec-title fade-up d4">Visualizing the graph</div>
+
+  <div class="gviz fade-up d5">
+    <svg viewBox="0 0 580 200" style="width:100%;max-width:580px">
+      <!-- Nodes -->
+      <rect x="10" y="80" width="80" height="36" rx="6" fill="#313244" stroke="#CBA6F7" stroke-width="1.5"/>
+      <text x="50" y="103" text-anchor="middle" fill="#CDD6F4" font-family="JetBrains Mono,monospace" font-size="11">ROOT</text>
+
+      <rect x="140" y="60" width="100" height="36" rx="6" fill="#313244" stroke="#89B4FA" stroke-width="1.5"/>
+      <text x="190" y="83" text-anchor="middle" fill="#CDD6F4" font-family="JetBrains Mono,monospace" font-size="11">fn hello()</text>
+
+      <rect x="140" y="110" width="100" height="36" rx="6" fill="#313244" stroke="#89B4FA" stroke-width="1.5"/>
+      <text x="190" y="133" text-anchor="middle" fill="#CDD6F4" font-family="JetBrains Mono,monospace" font-size="11">fn world()</text>
+
+      <rect x="300" y="60" width="120" height="36" rx="6" fill="#313244" stroke="#A6E3A1" stroke-width="1.5"/>
+      <text x="360" y="83" text-anchor="middle" fill="#CDD6F4" font-family="JetBrains Mono,monospace" font-size="11">fn validate()</text>
+
+      <rect x="300" y="110" width="120" height="36" rx="6" fill="#45475A" stroke="#FAB387" stroke-width="1.5" stroke-dasharray="4,2"/>
+      <text x="360" y="133" text-anchor="middle" fill="#6C7086" font-family="JetBrains Mono,monospace" font-size="11">fn old_fn()</text>
+      <text x="360" y="155" text-anchor="middle" fill="#FAB387" font-family="JetBrains Mono,monospace" font-size="9">DELETED</text>
+
+      <rect x="480" y="80" width="90" height="36" rx="6" fill="#313244" stroke="#89B4FA" stroke-width="1.5"/>
+      <text x="525" y="103" text-anchor="middle" fill="#CDD6F4" font-family="JetBrains Mono,monospace" font-size="11">BOTTOM</text>
+
+      <!-- Edges -->
+      <path d="M90 98 L140 78" stroke="#CBA6F7" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+      <path d="M90 98 L140 128" stroke="#CBA6F7" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+      <path d="M240 78 L300 78" stroke="#89B4FA" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+      <path d="M240 128 L300 128" stroke="#6C7086" stroke-width="1.5" stroke-dasharray="4,2" fill="none" marker-end="url(#arr-del)"/>
+      <path d="M420 78 L480 98" stroke="#89B4FA" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+      <path d="M420 128 L480 108" stroke="#6C7086" stroke-width="1.5" stroke-dasharray="4,2" fill="none" marker-end="url(#arr-del)"/>
+
+      <!-- Labels -->
+      <text x="113" y="70" text-anchor="middle" fill="#CBA6F7" font-family="DM Sans,sans-serif" font-size="9">BLOCK</text>
+      <text x="113" y="130" text-anchor="middle" fill="#CBA6F7" font-family="DM Sans,sans-serif" font-size="9">BLOCK</text>
+      <text x="270" y="70" text-anchor="middle" fill="#89B4FA" font-family="DM Sans,sans-serif" font-size="9">BLOCK</text>
+      <text x="270" y="122" text-anchor="middle" fill="#6C7086" font-family="DM Sans,sans-serif" font-size="9">DELETED</text>
+
+      <defs>
+        <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L0,6 L8,3 z" fill="#89B4FA"/>
+        </marker>
+        <marker id="arr-del" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L0,6 L8,3 z" fill="#6C7086"/>
+        </marker>
+      </defs>
+    </svg>
+    <div style="font-size:.76rem;color:#6C7086;text-align:center;margin-top:8px">Blue nodes = alive content &nbsp;·&nbsp; Dashed orange = DELETED (stays in graph) &nbsp;·&nbsp; Arrows = BLOCK edges (ordering)</div>
+  </div>
+
+  <!-- QUIZ 3 -->
+  <div class="sec-title fade-up d5">Check your understanding</div>
+  <div class="quiz fade-up d5">
+    <div class="quiz-head">
+      <span class="quiz-badge">Quiz</span>
+      <span class="quiz-title">Files as Graphs</span>
+    </div>
+
+    <div class="qblock" id="q3a">
+      <div class="q-text">Two AI agents each insert a new function into the same file, but in different locations. In Atomic's graph model, what happens when you try to combine their changes?</div>
+      <div class="q-opts">
+        <div class="q-opt" onclick="answer(this,'q3a',false)"><span class="q-let">A</span>The second insertion fails — you can only insert at one place at a time</div>
+        <div class="q-opt" onclick="answer(this,'q3a',true)"><span class="q-let">B</span>Both insertions create independent nodes — they merge cleanly with no conflict</div>
+        <div class="q-opt" onclick="answer(this,'q3a',false)"><span class="q-let">C</span>Atomic asks you to pick which insertion to keep</div>
+        <div class="q-opt" onclick="answer(this,'q3a',false)"><span class="q-let">D</span>Both functions appear but are marked as conflicting</div>
+      </div>
+      <div class="q-fb correct" id="q3a-fb-c">Exactly! Each insertion creates a new node in the graph with unique edges connecting it to its neighbors. Since the two agents inserted into different locations, their new nodes have different neighbors — completely independent. The graph just gains two new nodes. This is the core advantage of the graph model over line-based diffs.</div>
+      <div class="q-fb wrong" id="q3a-fb-w">Not quite. In the graph model, each insertion creates a brand-new node at a specific position. Two insertions at different positions don't compete for the same space — they each add to the graph independently. Since they're independent, they always merge cleanly. This is exactly why the graph model was chosen over Git's line-based approach.</div>
+    </div>
+
+    <div class="qblock" id="q3b">
+      <div class="q-text">A function gets deleted from a file. What actually happens to the content in Atomic's graph?</div>
+      <div class="q-opts">
+        <div class="q-opt" onclick="answer(this,'q3b',false)"><span class="q-let">A</span>The content bytes are immediately removed from storage</div>
+        <div class="q-opt" onclick="answer(this,'q3b',false)"><span class="q-let">B</span>The node is removed from the graph entirely</div>
+        <div class="q-opt" onclick="answer(this,'q3b',true)"><span class="q-let">C</span>The node stays; the edge pointing to it gets the DELETED flag</div>
+        <div class="q-opt" onclick="answer(this,'q3b',false)"><span class="q-let">D</span>The change file is rewritten to exclude that content</div>
+      </div>
+      <div class="q-fb correct" id="q3b-fb-c">Exactly! Deleted content stays in the graph — only the edges are flagged DELETED. This is what enables features like "undelete," full history, and blame at any point in time. The data is never destroyed, just made invisible to normal traversal. When you view the current file, the graph traversal skips nodes whose edges are flagged DELETED.</div>
+      <div class="q-fb wrong" id="q3b-fb-w">Not quite. The graph's immutability is key to its power. When content is "deleted," the node stays exactly where it is. The edge connecting it gets the DELETED flag added, so traversals that only follow alive edges skip it. But the data is still there — enabling history, blame, and recovery.</div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- MODULE 4 -->
+<section class="module" id="m4">
+<div class="mod-inner">
+  <div class="mod-label fade-up">Module 4</div>
+  <h2 class="mod-title fade-up d1">The recording pipeline</h2>
+  <p class="mod-sub fade-up d2">Imagine you just edited a file and run <code>atomic record -m "fix the bug"</code>. What actually happens? The system goes through six steps — from detecting the change on disk to updating the graph in the database. Let's trace each one.</p>
+
+  <div class="sec-title fade-up d2">Step by step</div>
+
+  <div class="flow fade-up d3">
+    <div class="flow-step slide-in d1">
+      <div class="flow-n">1</div>
+      <div class="flow-body">
+        <div class="flow-title">Detect</div>
+        <div class="flow-desc">Scan the working copy. Compare file <span class="tt" data-tip="<strong>inode</strong>: a unique number the operating system assigns to each file. Even if you rename a file, its inode stays the same. Atomic uses inodes to track files through renames without losing history.">inodes</span> and modification times against the tracked list. Output: a list of modified, added, and deleted files.</div>
+      </div>
+      <div class="flow-tag">detect.rs</div>
+    </div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-step slide-in d2">
+      <div class="flow-n">2</div>
+      <div class="flow-body">
+        <div class="flow-title">Load pristine content</div>
+        <div class="flow-desc">For each modified file, traverse the graph to reconstruct what the file looked like at the last recorded state. This is the "before" side of the diff.</div>
+      </div>
+      <div class="flow-tag">output.rs</div>
+    </div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-step slide-in d3">
+      <div class="flow-n">3</div>
+      <div class="flow-body">
+        <div class="flow-title">Diff</div>
+        <div class="flow-desc">Compare pristine content (before) with working copy content (after). Uses the <span class="tt" data-tip="<strong>Myers algorithm</strong>: a classic algorithm for finding the minimum number of insertions and deletions to transform one text into another. Like finding the shortest possible edit script. Used in Git too.">Myers</span> or <span class="tt" data-tip="<strong>Patience diff</strong>: a diff algorithm that first anchors on lines that appear exactly once in both versions. This tends to produce more readable diffs for code, especially when functions are rearranged.">Patience</span> algorithm (your choice). Output: a sequence of operations — "keep lines 1-5, replace line 6, keep lines 7-20."</div>
+      </div>
+      <div class="flow-tag">diff/</div>
+    </div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-step slide-in d4">
+      <div class="flow-n">4</div>
+      <div class="flow-body">
+        <div class="flow-title">Build atoms</div>
+        <div class="flow-desc">Convert diff operations into graph operations. New content becomes <strong>Insertion</strong> atoms (new nodes + edges). Removed content becomes <strong>EdgeUpdate</strong> atoms (add DELETED flag to existing edges). Each atom targets specific vertices in the graph.</div>
+      </div>
+      <div class="flow-tag">builder.rs</div>
+    </div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-step slide-in d5">
+      <div class="flow-n">5</div>
+      <div class="flow-body">
+        <div class="flow-title">Hash &amp; store</div>
+        <div class="flow-desc">Serialize the change to binary (Format v3). Run <span class="tt" data-tip="<strong>Blake3</strong>: a very fast cryptographic hash function. Produces a 32-byte fingerprint of any data. Faster than SHA-256 or MD5 while being equally secure. Used by Atomic for change IDs.">Blake3</span> over the bytes to produce a hash. Store the file at <code>.atomic/changes/{first2}/{rest}</code> — the path is derived from the hash.</div>
+      </div>
+      <div class="flow-tag">changestore.rs</div>
+    </div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-step slide-in d6">
+      <div class="flow-n">6</div>
+      <div class="flow-body">
+        <div class="flow-title">Apply to graph</div>
+        <div class="flow-desc">Write the change's operations into the <span class="tt" data-tip="<strong>redb</strong>: a pure-Rust embedded database using B-tree storage. Like SQLite but simpler and faster for key-value access patterns. Atomic uses it to store the graph, stack state, and file tracking data.">redb</span> database. New nodes are added. Edges are updated. The stack's <span class="tt" data-tip="<strong>Merkle state</strong>: computed by hashing: new_state = Hash(old_state + this_change_hash). The final state is a fingerprint of the entire history. Two repos with the same Merkle state have identical histories.">Merkle state</span> is updated.</div>
+      </div>
+      <div class="flow-tag">apply/</div>
+    </div>
+  </div>
+
+  <div class="sec-title fade-up d4">What a change looks like</div>
+
+  <div class="grid g2 fade-up d4">
+    <div class="card">
+      <div class="card-title">Two kinds of atoms</div>
+      <div class="card-body" style="margin-bottom:0">
+        <p style="margin-bottom:10px"><strong>Insertion</strong> — new content enters the graph. Contains: the bytes of new content, pointers to neighboring nodes (predecessors and successors), and the inode of the file.</p>
+        <p><strong>EdgeUpdate</strong> — existing edges get new flags. Mainly used for deletions: find the edges pointing to removed content, add the DELETED flag.</p>
+      </div>
+    </div>
+    <div class="card dark-bg">
+      <div class="card-title" style="color:#CDD6F4">Content-addressed storage</div>
+      <div class="card-body">
+        <pre style="font-family:var(--font-mono);font-size:.75rem;line-height:1.7;white-space:pre-wrap;word-break:break-word;color:#BAC2DE">.atomic/
+  changes/
+    AB/
+      CDEF1234...
+    RI/
+      E62WWC2WXH
+    CD/
+      EFGHIJKL...</pre>
+        <p style="margin-top:10px;font-size:.78rem">The first 2 chars of the hash become a directory — like a filing cabinet with 256 drawers. Two identical changes always land in the same file.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="callout fade-up d5">
+    <div class="callout-title">💡 Why store by hash?</div>
+    <div class="callout-body">If two different repositories independently produce the same change (e.g., both add the same empty file), they get the same hash — and could share storage. More importantly: the hash is the change's identity. Any corruption or tampering changes the hash, making it immediately detectable.</div>
+  </div>
+
+  <!-- QUIZ 4 -->
+  <div class="sec-title fade-up d5">Check your understanding</div>
+  <div class="quiz fade-up d5">
+    <div class="quiz-head">
+      <span class="quiz-badge">Quiz</span>
+      <span class="quiz-title">The Recording Pipeline</span>
+    </div>
+
+    <div class="qblock" id="q4a">
+      <div class="q-text">You're debugging why a file change didn't get recorded. The file was definitely edited, but it doesn't appear in the modified list when you run <code>atomic status</code>. Which pipeline step is most likely the issue?</div>
+      <div class="q-opts">
+        <div class="q-opt" onclick="answer(this,'q4a',false)"><span class="q-let">A</span>The Hash step — the hash isn't being computed correctly</div>
+        <div class="q-opt" onclick="answer(this,'q4a',false)"><span class="q-let">B</span>The Diff step — the algorithm isn't finding the changes</div>
+        <div class="q-opt" onclick="answer(this,'q4a',true)"><span class="q-let">C</span>The Detect step — the file isn't appearing as modified at all</div>
+        <div class="q-opt" onclick="answer(this,'q4a',false)"><span class="q-let">D</span>The Apply step — the graph isn't being updated</div>
+      </div>
+      <div class="q-fb correct" id="q4a-fb-c">Exactly! The Detect step is what discovers which files have changed — by comparing inode metadata and modification times against the tracked list. If a file isn't showing up as modified there, the diff, hash, and apply steps never even run. Common causes: the file matches an .atomicignore pattern, or the file's metadata hasn't been flushed to disk yet.</div>
+      <div class="q-fb wrong" id="q4a-fb-w">Not quite. The key symptom is that the file doesn't appear in the modified list at all — meaning the pipeline hasn't gotten past step 1. The Detect step is where files are discovered as modified. If detection misses it, nothing downstream can help. The diff, hash, and apply steps only run on files that Detect flagged.</div>
+    </div>
+
+    <div class="qblock" id="q4b">
+      <div class="q-text">After recording, you realize you accidentally deleted the change file from <code>.atomic/changes/</code>. What does this break, and what survives?</div>
+      <div class="q-opts">
+        <div class="q-opt" onclick="answer(this,'q4b',false)"><span class="q-let">A</span>Nothing — the graph has a full copy of all content</div>
+        <div class="q-opt" onclick="answer(this,'q4b',false)"><span class="q-let">B</span>Everything — the graph and change file are the same thing</div>
+        <div class="q-opt" onclick="answer(this,'q4b',true)"><span class="q-let">C</span>The change file has the content bytes; the graph has the structure — both are needed</div>
+        <div class="q-opt" onclick="answer(this,'q4b',false)"><span class="q-let">D</span>Only the commit message is lost — the diff can be reconstructed</div>
+      </div>
+      <div class="q-fb correct" id="q4b-fb-c">Exactly! The graph (in the redb database) stores the structure — which nodes exist, how they connect, which change introduced each one. But the actual content bytes live in the change file. If the change file is missing, the graph knows "there's a node from change XYZ bytes 10-50" but can't read those bytes. Both pieces are essential.</div>
+      <div class="q-fb wrong" id="q4b-fb-w">Not quite. The system has two complementary stores: the graph database holds the structure (nodes, edges, ordering), and the change files hold the actual content bytes. The graph says "node from change XYZ at bytes 10-50." The change file has those bytes. Delete the change file and the content becomes unreachable — the graph structure survives but the content is gone.</div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- MODULE 5 -->
+<section class="module" id="m5">
+<div class="mod-inner">
+  <div class="mod-label fade-up">Module 5</div>
+  <h2 class="mod-title fade-up d1">AI DNA — provenance in every change</h2>
+  <p class="mod-sub fade-up d2">Every change Atomic records can carry a complete chain of custody: which AI model, which vendor, which session, which turn, how many tokens, what it cost. This data is embedded in the change's <span class="tt" data-tip="<strong>Cryptographic hash</strong>: a mathematical fingerprint. Any change to the data — even one bit — produces a completely different hash. This makes it impossible to alter the AI attribution data without detection.">cryptographic hash</span>, making it tamper-evident.</p>
+
+  <div class="sec-title fade-up d2">The chain of custody metaphor</div>
+
+  <div class="grid g3 fade-up d3">
+    <div class="card">
+      <div class="card-icon">🔗</div>
+      <div class="card-title">Who did it</div>
+      <div class="card-body">Vendor (Anthropic, OpenAI, Google) + model name + session ID. Unambiguous attribution, verified by the change hash.</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">🕐</div>
+      <div class="card-title">When &amp; how long</div>
+      <div class="card-body">Session start/end timestamps, turn number, and duration in milliseconds. Reconstruct the exact timeline of an AI session.</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">💰</div>
+      <div class="card-title">What it cost</div>
+      <div class="card-body">Input tokens, output tokens, cache tokens, and cost in USD. Audit any team's AI spending change by change.</div>
+    </div>
+  </div>
+
+  <div class="sec-title fade-up d3">The Provenance struct</div>
+
+  <div class="xlat fade-up d4">
+    <div class="xlat-code">
+      <pre><span class="kw">let</span> provenance = <span class="ty">Provenance</span>::<span class="fn">builder</span>()
+    .<span class="fn">vendor</span>(<span class="ty">AIVendor</span>::Anthropic)
+    .<span class="fn">model</span>(<span class="st">"claude-sonnet-4-20250514"</span>)
+    .<span class="fn">tool</span>(<span class="ty">AITool</span>::<span class="ty">Editor</span>(<span class="st">"zed"</span>.<span class="fn">to_string</span>()))
+    .<span class="fn">suggestion_type</span>(<span class="ty">SuggestionType</span>::Collaborative)
+    .<span class="fn">prompt_hash</span>(<span class="st">"ABCDEF..."</span>)
+    .<span class="fn">input_tokens</span>(<span class="nm">1500</span>)
+    .<span class="fn">output_tokens</span>(<span class="nm">500</span>)
+    .<span class="fn">cost_usd</span>(<span class="nm">0.015</span>)
+    .<span class="fn">build</span>();</pre>
+    </div>
+    <div class="xlat-en">
+      <div class="xlat-label">Plain English</div>
+      <div class="xl"><span class="xl-n">1</span><span class="xl-t">Start building a provenance record. Uses the "builder pattern" — set each field, then build at the end.</span></div>
+      <div class="xl"><span class="xl-n">2</span><span class="xl-t"><strong>vendor</strong> — the AI company. An enum so names are consistent: Anthropic, OpenAI, Google, Meta, etc.</span></div>
+      <div class="xl"><span class="xl-n">3</span><span class="xl-t"><strong>model</strong> — the specific model version. Exact string, so history shows "claude-sonnet-4-20250514" not just "Claude."</span></div>
+      <div class="xl"><span class="xl-n">4</span><span class="xl-t"><strong>tool</strong> — how the AI was invoked. Was it a CLI tool, an editor plugin, a direct API call?</span></div>
+      <div class="xl"><span class="xl-n">5</span><span class="xl-t"><strong>suggestion_type</strong> — collaborative (AI + human) vs autonomous (AI alone).</span></div>
+      <div class="xl"><span class="xl-n">6</span><span class="xl-t"><strong>prompt_hash</strong> — a fingerprint of the prompt, not the prompt itself. Preserves privacy while still allowing verification.</span></div>
+      <div class="xl"><span class="xl-n">7–8</span><span class="xl-t"><strong>input/output_tokens</strong> — exact token counts for cost accounting and capacity planning.</span></div>
+      <div class="xl"><span class="xl-n">9</span><span class="xl-t"><strong>cost_usd</strong> — what this specific change cost in dollars. Sum across all changes to audit spending.</span></div>
+    </div>
+  </div>
+
+  <div class="sec-title fade-up d4">The session envelope</div>
+
+  <p class="fade-up d4" style="color:var(--text-secondary);font-size:.9rem;margin-bottom:20px">Provenance tracks per-turn metrics. The <strong>SessionEnvelope</strong> adds the session-level context — linking individual turns into a coherent session timeline.</p>
+
+  <div class="xlat fade-up d4">
+    <div class="xlat-code">
+      <pre><span class="kw">let</span> envelope = <span class="ty">SessionEnvelope</span>::<span class="fn">builder</span>(
+    <span class="st">"session-abc"</span>, <span class="st">"claude-code"</span>
+)
+.<span class="fn">turn_number</span>(<span class="nm">3</span>)
+.<span class="fn">agent_display_name</span>(<span class="st">"Claude Code"</span>)
+.<span class="fn">prompt_summary</span>(<span class="st">"Fix the auth bug"</span>)
+.<span class="fn">files_in_turn</span>(<span class="fn">vec!</span>[
+    <span class="st">"src/auth.rs"</span>.<span class="fn">to_string</span>(),
+    <span class="st">"src/auth_test.rs"</span>.<span class="fn">to_string</span>()
+])
+.<span class="fn">turn_duration_ms</span>(<span class="nm">12400</span>)
+.<span class="fn">build</span>();</pre>
+    </div>
+    <div class="xlat-en">
+      <div class="xlat-label">Plain English</div>
+      <div class="xl"><span class="xl-n">1–3</span><span class="xl-t">Create a new session envelope. Takes the session ID and agent identifier — the two pieces needed to group turns together.</span></div>
+      <div class="xl"><span class="xl-n">4</span><span class="xl-t"><strong>turn_number</strong> — this is the 3rd turn in this session. Lets you reconstruct the chronological sequence of what the AI did.</span></div>
+      <div class="xl"><span class="xl-n">5</span><span class="xl-t"><strong>agent_display_name</strong> — human-readable name for audit logs and dashboards.</span></div>
+      <div class="xl"><span class="xl-n">6</span><span class="xl-t"><strong>prompt_summary</strong> — a short description of what the user asked for in this turn.</span></div>
+      <div class="xl"><span class="xl-n">7–10</span><span class="xl-t"><strong>files_in_turn</strong> — which files the agent touched during this turn. Links changes back to specific files.</span></div>
+      <div class="xl"><span class="xl-n">11</span><span class="xl-t"><strong>turn_duration_ms</strong> — how long this turn took. 12,400ms = 12.4 seconds. Useful for performance analysis.</span></div>
+    </div>
+  </div>
+
+  <div class="callout fade-up d5">
+    <div class="callout-title">🔏 Why it can't be faked</div>
+    <div class="callout-body">The Provenance struct and SessionEnvelope both live in the <em>hashed</em> portion of the change. That means they're included in the input to the Blake3 hash function. Change vendor from "anthropic" to "openai" after recording — the hash changes. Since the hash is the change's identity and storage path, a tampered change is a completely different change. The original, untampered change still exists at the original hash.</div>
+  </div>
+
+  <div class="sec-title fade-up d5">How agent hooks work</div>
+
+  <div class="flow fade-up d5">
+    <div class="flow-step slide-in d1">
+      <div class="flow-n">1</div>
+      <div class="flow-body">
+        <div class="flow-title">One-time setup</div>
+        <div class="flow-desc">Run <code>atomic agent enable</code>. Atomic installs 7 hooks into your agent's config file (e.g., <code>.claude/settings.json</code>). Hooks fire at: session-start, turn-start, turn-end, session-end, and more.</div>
+      </div>
+    </div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-step slide-in d2">
+      <div class="flow-n">2</div>
+      <div class="flow-body">
+        <div class="flow-title">Agent fires turn-end hook</div>
+        <div class="flow-desc">When Claude Code finishes a turn, it sends a JSON payload to stdin of the hook command: <code>atomic agent hooks claude-code turn-end</code>.</div>
+      </div>
+    </div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-step slide-in d3">
+      <div class="flow-n">3</div>
+      <div class="flow-body">
+        <div class="flow-title">Snapshot file changes</div>
+        <div class="flow-desc">A file watcher compares the directory state before and after the turn. Output: which files were modified, added, or deleted during this turn.</div>
+      </div>
+    </div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-step slide-in d4">
+      <div class="flow-n">4</div>
+      <div class="flow-body">
+        <div class="flow-title">Auto-record the turn</div>
+        <div class="flow-desc">Runs the full recording pipeline (detect → diff → atoms → hash → apply) with the session's Provenance and SessionEnvelope attached. One change per agent turn, automatically.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- QUIZ 5 -->
+  <div class="sec-title fade-up d5">Check your understanding</div>
+  <div class="quiz fade-up d5">
+    <div class="quiz-head">
+      <span class="quiz-badge">Quiz</span>
+      <span class="quiz-title">AI DNA — Provenance</span>
+    </div>
+
+    <div class="qblock" id="q5a">
+      <div class="q-text">Your team wants to audit total AI spending across all Claude sessions last month. Where is this data stored in Atomic, and how would you access it?</div>
+      <div class="q-opts">
+        <div class="q-opt" onclick="answer(this,'q5a',false)"><span class="q-let">A</span>In a separate cost-tracking database at .atomic/costs.json</div>
+        <div class="q-opt" onclick="answer(this,'q5a',true)"><span class="q-let">B</span>In the Provenance struct embedded inside each change — query them all</div>
+        <div class="q-opt" onclick="answer(this,'q5a',false)"><span class="q-let">C</span>In the git commit messages if the AI added cost annotations</div>
+        <div class="q-opt" onclick="answer(this,'q5a',false)"><span class="q-let">D</span>Atomic doesn't track cost — you need an external billing dashboard</div>
+      </div>
+      <div class="q-fb correct" id="q5a-fb-c">Exactly! Every change with AI provenance has <code>cost_usd</code>, <code>input_tokens</code>, and <code>output_tokens</code> embedded in its Provenance struct. To get last month's total, you'd iterate over all changes in the relevant date range and sum <code>cost_usd</code>. No external tool needed — the data lives in the change history itself.</div>
+      <div class="q-fb wrong" id="q5a-fb-w">Not quite. The Provenance struct inside each change contains <code>cost_usd</code>, <code>input_tokens</code>, and <code>output_tokens</code>. Cost data travels with the changes themselves — when you push to a remote, the cost data comes along automatically. To audit spending, you query the change history and sum the provenance fields.</div>
+    </div>
+
+    <div class="qblock" id="q5b">
+      <div class="q-text">A security auditor asks: "Can someone change the AI attribution after a change is recorded — for example, making it look like GPT-4 wrote something Claude wrote?" What's the correct answer?</div>
+      <div class="q-opts">
+        <div class="q-opt" onclick="answer(this,'q5b',false)"><span class="q-let">A</span>Yes — the provenance fields can be edited directly in the change file</div>
+        <div class="q-opt" onclick="answer(this,'q5b',true)"><span class="q-let">B</span>No — changing any provenance field changes the Blake3 hash, which is the change's identity</div>
+        <div class="q-opt" onclick="answer(this,'q5b',false)"><span class="q-let">C</span>Only the model name can be changed — the session ID is separately verified</div>
+        <div class="q-opt" onclick="answer(this,'q5b',false)"><span class="q-let">D</span>The data is encrypted so you can't read it, but it can still be replaced</div>
+      </div>
+      <div class="q-fb correct" id="q5b-fb-c">Exactly! The Provenance and SessionEnvelope are in the hashed portion of the change — included in the Blake3 input. Edit the vendor field from "anthropic" to "openai" and you get a completely different hash. Since changes are stored by their hash, the modified version is a different file at a different path. The original, unmodified change still exists and its hash still matches. Tampering is detectable by anyone.</div>
+      <div class="q-fb wrong" id="q5b-fb-w">Not quite. Because Provenance lives in the hashed section of the change, any edit changes the Blake3 hash. And since the hash IS the change's identity and storage path, a modified change is simply a different change — it would live at a different path. Anyone verifying the original hash would find it still exists, unmodified. This is the power of content-addressed storage with tamper-evident provenance.</div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- MODULE 6 -->
+<section class="module" id="m6">
+<div class="mod-inner">
+  <div class="mod-label fade-up">Module 6</div>
+  <h2 class="mod-title fade-up d1">Stacks, storage &amp; identity</h2>
+  <p class="mod-sub fade-up d2">The last pieces: how Atomic organizes parallel work without branches, how it syncs with remotes efficiently, and how your identity is cryptographically tied to your changes.</p>
+
+  <div class="sec-title fade-up d2">Stacks vs branches</div>
+
+  <div class="grid g2 fade-up d3">
+    <div class="card">
+      <div class="card-icon">🌿</div>
+      <div class="card-title">Git branches: diverging timelines</div>
+      <div class="card-body">When you branch in Git, you create a separate copy of the change history. Work diverges. To reconcile, you need a merge commit — often with conflicts. Orphaned commits can accumulate.</div>
+    </div>
+    <div class="card accent-bg">
+      <div class="card-icon">📚</div>
+      <div class="card-title">Atomic stacks: shared graph, separate logs</div>
+      <div class="card-body">All stacks point to the <strong>same</strong> underlying graph. Creating a stack just adds a new entry in a table: "stack name → list of changes + Merkle state." Zero data duplication. When you delete a stack, it cascade-deletes its edges — no orphaned history.</div>
+    </div>
+  </div>
+
+  <div class="term fade-up d3">
+    <div class="term-bar">
+      <div class="term-dot red"></div><div class="term-dot yellow"></div><div class="term-dot green"></div>
+    </div>
+    <div class="term-code"><span class="tp">$</span> atomic stack new experiment --from main
+<span class="to">Stack 'experiment' created (parent: main)</span>
+<span class="tc"># No files copied. No data duplicated.</span>
+<span class="tc"># Just a new pointer to the same graph.</span>
+
+<span class="tp">$</span> atomic stack list
+<span class="to">  main        [42 changes] state: 8f3a2c...</span>
+<span class="th">* experiment  [42 changes] state: 8f3a2c...</span>
+<span class="tc"># Same state hash — they start identical.</span>
+
+<span class="tp">$</span> atomic stack delete experiment
+<span class="to">Stack 'experiment' deleted. 0 orphaned nodes.</span>
+<span class="tc"># Cascade-deleted experiment's edges. Graph stays clean.</span></div>
+  </div>
+
+  <div class="callout fade-up d4">
+    <div class="callout-title">💡 Why agents love stacks</div>
+    <div class="callout-body">When an AI agent starts a session, Atomic automatically creates an isolated stack for it. The agent works freely on its stack without touching main. When done, changes are applied to the parent stack — or discarded. No merge commits. No branch cleanup. No orphaned history from abandoned sessions.</div>
+  </div>
+
+  <div class="sec-title fade-up d4">Merkle states for fast sync</div>
+
+  <div class="grid g2 fade-up d4">
+    <div class="card">
+      <div class="card-icon">🔢</div>
+      <div class="card-title">How Merkle state works</div>
+      <div class="card-body">
+        <p style="font-size:.84rem;margin-bottom:8px">After each change, the stack's state is updated:</p>
+        <pre style="font-family:var(--font-mono);font-size:.76rem;line-height:1.7;white-space:pre-wrap;background:var(--bg-secondary);padding:10px;border-radius:6px">new_state = Hash(
+  old_state || change_hash
+)</pre>
+        <p style="font-size:.84rem;margin-top:8px;color:var(--text-secondary)">The final state is a fingerprint of the entire history. Two stacks with the same Merkle state have identical histories.</p>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-icon">⚡</div>
+      <div class="card-title">Fast sync protocol</div>
+      <div class="card-body">
+        <p style="font-size:.84rem;margin-bottom:8px">On <code>atomic push</code>:</p>
+        <ol style="font-size:.82rem;color:var(--text-secondary);line-height:1.8;padding-left:16px">
+          <li>Compare local Merkle state with remote</li>
+          <li>Same state? Already in sync, done</li>
+          <li>Different? Walk back until common ancestor</li>
+          <li>Upload only the changes the remote is missing</li>
+        </ol>
+        <p style="font-size:.82rem;margin-top:8px;color:var(--text-secondary)">No need to compare every file — one hash comparison tells you if sync is needed.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="sec-title fade-up d4">Cryptographic identity</div>
+
+  <div class="grid ga fade-up d5">
+    <div class="card">
+      <div class="card-icon">🗝️</div>
+      <div class="card-title">Your keypair</div>
+      <div class="card-body">When you first run Atomic, it generates an <span class="tt" data-tip="<strong>Ed25519 keypair</strong>: two mathematically linked keys. The private key (secret, never shared) signs data. The public key (shared freely) lets others verify those signatures. Like a lock and key — you keep the key, anyone can have the lock.">Ed25519 keypair</span>. Your private key signs every change you record. Your public key travels with the change, so anyone can verify it was really you.</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">🤖</div>
+      <div class="card-title">Agent identity</div>
+      <div class="card-body">AI agents get a delegated identity derived from your keypair. The author tag format is <code>agentname+sessionhash &lt;you@email.com&gt;</code> — so changes are attributed to both the agent and you. You remain the root of trust.</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">🔎</div>
+      <div class="card-title">Attestations</div>
+      <div class="card-body">When a session ends, Atomic creates an <span class="tt" data-tip="<strong>Attestation</strong>: a signed statement that something happened. Like a notarized document — a third party (or the system itself) certifies that this session, with these changes, cost this much, by this model.">attestation</span> — a graph-level audit node covering the entire session: total cost, tokens, models used, and which changes it covers.</div>
+    </div>
+  </div>
+
+  <div class="term fade-up d5">
+    <div class="term-bar">
+      <div class="term-dot red"></div><div class="term-dot yellow"></div><div class="term-dot green"></div>
+    </div>
+    <div class="term-code"><span class="tp">$</span> atomic agent attest
+
+<span class="to">  XMJZ3IPF  Claude Code · claude-sonnet-4-5</span>
+<span class="to">            12.4k tokens · 3m 42s · 2 changes</span>
+<span class="to">  R3KQP7YN  Claude Code · claude-sonnet-4-5</span>
+<span class="to">            8.1k tokens · 1m 15s · 1 change</span>
+<span class="to">  ────────────────────────────────────</span>
+<span class="th">  Total: $0.12 · 3 changes · 20.5k tokens</span></div>
+  </div>
+
+  <!-- QUIZ 6 -->
+  <div class="sec-title fade-up d5">Check your understanding</div>
+  <div class="quiz fade-up d5">
+    <div class="quiz-head">
+      <span class="quiz-badge">Quiz</span>
+      <span class="quiz-title">Stacks, Storage &amp; Identity</span>
+    </div>
+
+    <div class="qblock" id="q6a">
+      <div class="q-text">You create a new stack called 'experiment' branching from 'main' which has 200 changes. How much extra storage does creating this stack initially require?</div>
+      <div class="q-opts">
+        <div class="q-opt" onclick="answer(this,'q6a',false)"><span class="q-let">A</span>A full copy of all 200 changes and their content — doubles storage</div>
+        <div class="q-opt" onclick="answer(this,'q6a',false)"><span class="q-let">B</span>A compressed snapshot of the current working directory</div>
+        <div class="q-opt" onclick="answer(this,'q6a',true)"><span class="q-let">C</span>Almost nothing — just a new table entry pointing to the same 200 changes</div>
+        <div class="q-opt" onclick="answer(this,'q6a',false)"><span class="q-let">D</span>A copy of the database but with shared change files</div>
+      </div>
+      <div class="q-fb correct" id="q6a-fb-c">Exactly! A stack is just metadata — a name, a list of change references, and a Merkle state hash. The underlying change files and graph data are shared across all stacks that reference them. Creating 100 stacks from main costs 100 small table entries, not 100 copies of the data.</div>
+      <div class="q-fb wrong" id="q6a-fb-w">Not quite. Stacks are designed to be practically free to create. They're just a new row in the stacks table: a name, a list of change IDs (not the changes themselves), and a Merkle state hash. The change files on disk and the graph data in the database are shared — no duplication.</div>
+    </div>
+
+    <div class="qblock" id="q6b">
+      <div class="q-text">Two completely separate repositories, developed by different teams, both independently add a new empty README.md. What happens in their content-addressed storage?</div>
+      <div class="q-opts">
+        <div class="q-opt" onclick="answer(this,'q6b',false)"><span class="q-let">A</span>Each repo stores a separate copy at a different hash</div>
+        <div class="q-opt" onclick="answer(this,'q6b',true)"><span class="q-let">B</span>The change that adds the file produces the same hash — stored at the same path</div>
+        <div class="q-opt" onclick="answer(this,'q6b',false)"><span class="q-let">C</span>A conflict is raised since the hashes match</div>
+        <div class="q-opt" onclick="answer(this,'q6b',false)"><span class="q-let">D</span>The second repo rejects the change as already existing</div>
+      </div>
+      <div class="q-fb correct" id="q6b-fb-c">Exactly! Content-addressed storage means identical content always produces identical hashes. If two teams independently create the same file with the same content, their change hashes will match and the change file will live at the same path. This enables deduplication across repositories — and it's exactly what makes distributed version control systems efficient at scale.</div>
+      <div class="q-fb wrong" id="q6b-fb-w">Not quite. Blake3 is deterministic — same input always produces same output. Two identical files produce identical change bytes, which produce an identical hash. The file would live at the same storage path in both repos. This is content-addressed storage: the address IS the fingerprint of the content.</div>
+    </div>
+  </div>
+
+  <!-- FINAL CALLOUT -->
+  <div class="callout fade-up d5" style="margin-top:48px">
+    <div class="callout-title">🎉 You've completed the course</div>
+    <div class="callout-body">
+      You now understand the core ideas behind Atomic: why the graph model beats line-based diffs, how the recording pipeline turns file edits into cryptographic change objects, why AI provenance is tamper-evident, and how stacks give agents isolation without the mess of branches.<br><br>
+      Explore the actual code: <strong>atomic-core/src/</strong> is the engine, <strong>atomic-agent/src/</strong> is the AI integration layer, and <strong>docs/ARCHITECTURE.md</strong> has the full design deep-dive.
+    </div>
+  </div>
+</div>
+</section>
+
+<div id="tt-el"></div>
+
+<script>
+(function() {
+  'use strict';
+
+  // ── SCROLL PROGRESS & MODULE ACTIVATION ──────────────────────
+  const prog = document.getElementById('prog');
+  const modules = Array.from(document.querySelectorAll('.module, .hero'));
+  const navMods = document.querySelectorAll('.nav-mod');
+  let ticking = false;
+
+  function onScroll() {
+    if (ticking) return;
+    ticking = true;
+    requestAnimationFrame(function() {
+      const scrollTop = window.scrollY;
+      const docH = document.documentElement.scrollHeight - window.innerHeight;
+      prog.style.width = (scrollTop / docH * 100) + '%';
+
+      // Activate modules in view
+      modules.forEach(function(m) {
+        const r = m.getBoundingClientRect();
+        if (r.top < window.innerHeight * 0.75 && r.bottom > 0) {
+          m.classList.add('vis');
+        }
+      });
+
+      // Active nav module
+      const center = window.innerHeight * 0.4;
+      let activeId = '';
+      modules.forEach(function(m) {
+        const r = m.getBoundingClientRect();
+        if (r.top <= center && r.bottom >= center) activeId = m.id;
+      });
+      navMods.forEach(function(n) {
+        n.classList.toggle('active', n.dataset.mod === activeId);
+      });
+
+      ticking = false;
+    });
+  }
+
+  window.addEventListener('scroll', onScroll, { passive: true });
+  onScroll(); // run once on load
+
+  // ── KEYBOARD NAVIGATION ─────────────────────────────────────
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'ArrowDown' || e.key === 'PageDown') {
+      const cur = modules.findIndex(function(m) {
+        return m.getBoundingClientRect().top > -10 && m.getBoundingClientRect().top < window.innerHeight * 0.5;
+      });
+      const next = modules[cur + 1];
+      if (next) next.scrollIntoView({ behavior: 'smooth' });
+    }
+    if (e.key === 'ArrowUp' || e.key === 'PageUp') {
+      const cur = modules.findIndex(function(m) {
+        return m.getBoundingClientRect().top > 0;
+      });
+      const prev = modules[Math.max(0, cur - 1)];
+      if (prev) prev.scrollIntoView({ behavior: 'smooth' });
+    }
+  });
+
+  // ── QUIZ LOGIC ───────────────────────────────────────────────
+  window.answer = function(el, qId, correct) {
+    const block = document.getElementById(qId);
+    if (block.dataset.answered) return;
+    block.dataset.answered = '1';
+
+    const opts = block.querySelectorAll('.q-opt');
+    opts.forEach(function(o) { o.classList.add('answered'); });
+
+    if (correct) {
+      el.classList.add('correct');
+      const fb = document.getElementById(qId + '-fb-c');
+      if (fb) { fb.classList.add('show', 'correct'); }
+    } else {
+      el.classList.add('wrong');
+      const fb = document.getElementById(qId + '-fb-w');
+      if (fb) { fb.classList.add('show', 'wrong'); }
+      // reveal correct
+      opts.forEach(function(o) {
+        if (o.onclick && o.onclick.toString().includes('true')) {
+          o.classList.add('reveal');
+        }
+      });
+    }
+  };
+
+  // ── TOOLTIPS ─────────────────────────────────────────────────
+  const ttEl = document.getElementById('tt-el');
+  let ttVisible = false;
+
+  function showTip(el) {
+    const tip = el.dataset.tip;
+    if (!tip) return;
+    ttEl.innerHTML = tip;
+    ttEl.classList.add('show');
+    ttVisible = true;
+    positionTip(el);
+  }
+
+  function hideTip() {
+    ttEl.classList.remove('show');
+    ttVisible = false;
+  }
+
+  function positionTip(el) {
+    const r = el.getBoundingClientRect();
+    const tw = 260;
+    const th = ttEl.offsetHeight || 80;
+    let left = r.left + r.width / 2 - tw / 2;
+    let top = r.top - th - 10;
+
+    // Clamp horizontally
+    if (left < 8) left = 8;
+    if (left + tw > window.innerWidth - 8) left = window.innerWidth - tw - 8;
+    // Flip below if no room above
+    if (top < 8) top = r.bottom + 10;
+
+    ttEl.style.left = left + 'px';
+    ttEl.style.top = top + 'px';
+    ttEl.style.width = tw + 'px';
+  }
+
+  document.querySelectorAll('.tt').forEach(function(el) {
+    el.addEventListener('mouseenter', function() { showTip(el); });
+    el.addEventListener('mouseleave', hideTip);
+    el.addEventListener('focus', function() { showTip(el); });
+    el.addEventListener('blur', hideTip);
+    el.addEventListener('click', function(e) {
+      e.stopPropagation();
+      if (ttVisible) { hideTip(); } else { showTip(el); }
+    });
+    el.setAttribute('tabindex', '0');
+    el.setAttribute('role', 'button');
+  });
+
+  document.addEventListener('click', hideTip);
+
+  // Touch support for tooltips
+  document.querySelectorAll('.tt').forEach(function(el) {
+    el.addEventListener('touchstart', function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (ttVisible) { hideTip(); } else { showTip(el); }
+    }, { passive: false });
+  });
+
+})();
+</script>
+</body>
+</html>
