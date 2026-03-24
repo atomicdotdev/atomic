@@ -39,7 +39,7 @@ use std::fmt;
 /// The `identity` field can contain a reference to a cryptographic identity
 /// (e.g., an Ed25519 public key in base32). This allows verifying that a
 /// change was actually created by the claimed author.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Author {
     /// Display name of the author (required)
     pub name: String,
@@ -129,16 +129,6 @@ impl Author {
         match &self.email {
             Some(email) => format!("{} <{}>", self.name, email),
             None => self.name.clone(),
-        }
-    }
-}
-
-impl Default for Author {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            email: None,
-            identity: None,
         }
     }
 }

@@ -42,8 +42,10 @@ use console::{style, StyledObject};
 
 /// Controls when colors should be used in output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ColorMode {
     /// Automatically detect whether to use colors (based on terminal support).
+    #[default]
     Auto,
     /// Always use colors, even when output is not a terminal.
     Always,
@@ -51,11 +53,6 @@ pub enum ColorMode {
     Never,
 }
 
-impl Default for ColorMode {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
 
 impl ColorMode {
     /// Check if colors should be used based on this mode.

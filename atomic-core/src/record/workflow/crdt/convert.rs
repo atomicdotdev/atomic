@@ -489,6 +489,7 @@ impl ConvertedOps {
     }
 
     /// Consumes the result and returns the operations.
+    #[allow(clippy::type_complexity)]
     pub fn into_parts(
         self,
     ) -> (

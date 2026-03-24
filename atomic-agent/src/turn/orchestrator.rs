@@ -1203,7 +1203,7 @@ impl TurnOrchestrator {
         let change_hash_base32 = outcome.hash.to_base32();
         acc.append_patch_proposal(
             &change_hash_base32,
-            &outcome.recorded_file_list().to_vec(),
+            outcome.recorded_file_list(),
             event.timestamp.timestamp(),
         );
 

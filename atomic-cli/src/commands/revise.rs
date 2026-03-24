@@ -91,8 +91,10 @@ use crate::output::{print_hint, print_success, print_warning};
 
 /// A parsed change reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ChangeRef {
     /// The last change (`@` or no argument)
+    #[default]
     Last,
     /// N changes back from the last (`@~N`)
     Relative(u64),
@@ -100,11 +102,6 @@ pub enum ChangeRef {
     Hash(String),
 }
 
-impl Default for ChangeRef {
-    fn default() -> Self {
-        Self::Last
-    }
-}
 
 impl ChangeRef {
     /// Parse a change reference string.

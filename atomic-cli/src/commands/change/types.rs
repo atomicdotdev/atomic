@@ -273,7 +273,7 @@ impl JsonChange {
                 .hashed
                 .hunks
                 .iter()
-                .map(|h| hunk_to_summary(h))
+                .map(hunk_to_summary)
                 .collect(),
             has_provenance: change.has_provenance(),
             provenance: None,

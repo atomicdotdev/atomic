@@ -91,7 +91,7 @@ pub fn classify_tool_call(
     let normalized = tool_name.to_lowercase();
     let normalized = normalized.trim();
 
-    match normalized.as_ref() {
+    match normalized {
         // Read-family tools → Exploration
         "read" | "read_file" | "readfile" | "view" | "cat" => NodeKind::Exploration,
 
@@ -172,7 +172,7 @@ pub fn summarize_tool_call(
         NodeKind::Commitment => summarize_commitment(tool_name, tool_input),
         NodeKind::Verification => summarize_verification(tool_input, tool_output),
         NodeKind::Execution => summarize_execution(tool_name, tool_input),
-        _ => format!("{}", tool_name),
+        _ => tool_name.to_string(),
     }
 }
 
@@ -448,7 +448,7 @@ fn summarize_exploration(tool_name: &str, tool_input: Option<&serde_json::Value>
                     let target = rest
                         .split_whitespace()
                         .filter(|s| !s.starts_with('-'))
-                        .last()
+                        .next_back()
                         .unwrap_or(".");
                     return format!("directory {}", shorten_explore_path(target));
                 }

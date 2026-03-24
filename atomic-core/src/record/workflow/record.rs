@@ -398,7 +398,7 @@ impl RecordingOptions {
     /// Check if a file size exceeds the maximum.
     #[must_use]
     pub fn exceeds_max_size(&self, size: usize) -> bool {
-        self.max_file_size.map_or(false, |max| size > max)
+        self.max_file_size.is_some_and(|max| size > max)
     }
 
     /// Convert to graph_op build options.
@@ -1229,6 +1229,7 @@ fn build_crdt_ops_for_deleted_file(path: &str) -> (FileOps, CrdtBuildStats) {
 /// let options = RecordingOptions::new();
 /// let recorded = record_modified_file(&working_copy, &detected_file, &old_content, &options)?;
 /// ```
+#[allow(clippy::type_complexity)]
 pub fn record_modified_file<W>(
     working_copy: &W,
     detected: &DetectedFile,
@@ -1732,8 +1733,8 @@ fn build_crdt_ops_for_modified_file(
                 }
 
                 // Unpaired deletes first (old lines that have no match)
-                for oi in 0..*old_len {
-                    if paired[oi].is_some() {
+                for (oi, paired_item) in paired.iter().enumerate().take(*old_len) {
+                    if paired_item.is_some() {
                         continue;
                     }
                     let old_line_idx = old_pos + oi;
@@ -1746,10 +1747,10 @@ fn build_crdt_ops_for_modified_file(
                 }
 
                 // Walk new lines in order
-                for ni in 0..*new_len {
+                for (ni, new_to_old_entry) in new_to_old.iter().enumerate().take(*new_len) {
                     let new_line_idx = new_pos + ni;
 
-                    if let Some(oi) = new_to_old[ni] {
+                    if let Some(oi) = *new_to_old_entry {
                         // Paired → emit BranchOp::Modify
                         let old_line_idx = old_pos + oi;
                         let branch_id = alloc_branch();
@@ -1833,7 +1834,9 @@ fn build_crdt_ops_for_modified_file(
         };
 
         // ── Collect Delete indices and their text ──────────────────────
+        #[allow(clippy::type_complexity)]
         let mut del_entries: Vec<(usize, String, std::collections::HashSet<(u8, u8)>)> = Vec::new();
+        #[allow(clippy::type_complexity)]
         let mut ins_entries: Vec<(usize, String, std::collections::HashSet<(u8, u8)>)> = Vec::new();
 
         for (idx, op) in collected_line_ops.iter().enumerate() {

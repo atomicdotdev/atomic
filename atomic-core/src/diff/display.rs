@@ -162,11 +162,7 @@ impl<'a> DisplayLine<'a> {
         };
 
         // Try to interpret as UTF-8, fall back to lossy conversion
-        let content = std::str::from_utf8(content_bytes).unwrap_or_else(|_| {
-            // For binary content, we can't easily create a &str without allocation
-            // Return empty for now; callers should use `raw` for binary
-            ""
-        });
+        let content = std::str::from_utf8(content_bytes).unwrap_or("");
 
         Self {
             status,
@@ -460,23 +456,17 @@ impl<'a> Iterator for UnifiedDiffIter<'a> {
                         }
                     }
 
-                    if !self.in_delete_phase {
-                        if self.pos_in_op < *new_len {
-                            let line_idx = new_pos + self.pos_in_op;
-                            let raw = self.diff.new_lines.get(line_idx)?.content();
+                    if !self.in_delete_phase && self.pos_in_op < *new_len {
+                        let line_idx = new_pos + self.pos_in_op;
+                        let raw = self.diff.new_lines.get(line_idx)?.content();
 
-                            let display_line = DisplayLine::new(
-                                LineStatus::Added,
-                                raw,
-                                None,
-                                Some(self.new_line_num),
-                            );
+                        let display_line =
+                            DisplayLine::new(LineStatus::Added, raw, None, Some(self.new_line_num));
 
-                            self.pos_in_op += 1;
-                            self.new_line_num += 1;
+                        self.pos_in_op += 1;
+                        self.new_line_num += 1;
 
-                            return Some(display_line);
-                        }
+                        return Some(display_line);
                     }
                 }
             }

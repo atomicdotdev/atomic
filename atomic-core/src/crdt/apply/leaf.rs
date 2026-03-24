@@ -146,6 +146,7 @@ pub fn apply_leaf_op<T: MutCrdtTxnT>(
 /// - `LeafAlreadyExists` - The leaf ID is already in use
 /// - `BranchNotFound` - The parent branch doesn't exist
 /// - `ContentOutOfBounds` - The content range is invalid
+#[allow(clippy::too_many_arguments)]
 fn apply_insert<T: MutCrdtTxnT>(
     txn: &mut T,
     context: &mut ApplyContext,
@@ -169,13 +170,12 @@ fn apply_insert<T: MutCrdtTxnT>(
     }
 
     // Validate branch exists (optional based on validation settings)
-    if context.options().validate_references() {
-        if !txn
+    if context.options().validate_references()
+        && !txn
             .has_branch(branch_id)
             .map_err(|e| storage_err(e, "checking branch exists"))?
-        {
-            return Err(ApplyError::branch_not_found(branch_id));
-        }
+    {
+        return Err(ApplyError::branch_not_found(branch_id));
     }
 
     // Validate "after" reference if provided

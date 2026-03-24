@@ -1202,11 +1202,10 @@ fn infer_repo_name(url: &Url) -> Option<String> {
 
     for (i, segment) in segments.iter().enumerate() {
         // Pattern: project/{name}/code or project/{name}/.atomic
-        if *segment == "code" || *segment == ".atomic" {
-            if i > 0 {
+        if (*segment == "code" || *segment == ".atomic")
+            && i > 0 {
                 return Some(segments[i - 1].to_string());
             }
-        }
     }
 
     // Fallback: use the last meaningful segment

@@ -232,8 +232,10 @@ impl GoalDetail {
 /// Who produced the file changes for a given todo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Contributor {
     /// All changes written autonomously by the agent.
+    #[default]
     Ai,
     /// All changes written by the human in guide mode.
     Human,
@@ -241,11 +243,6 @@ pub enum Contributor {
     Mixed,
 }
 
-impl Default for Contributor {
-    fn default() -> Self {
-        Self::Ai
-    }
-}
 
 impl std::fmt::Display for Contributor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -357,8 +354,10 @@ pub struct ExecutionDetail {
 /// The high-level outcome of a Sherpa turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TurnOutcome {
     /// All todos completed successfully.
+    #[default]
     Completed,
     /// Some todos completed, others did not.
     Partial,
@@ -366,11 +365,6 @@ pub enum TurnOutcome {
     Failed,
 }
 
-impl Default for TurnOutcome {
-    fn default() -> Self {
-        Self::Completed
-    }
-}
 
 impl std::fmt::Display for TurnOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

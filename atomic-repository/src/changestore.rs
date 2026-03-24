@@ -782,8 +782,7 @@ impl ChangeStore {
         let temp_file = tempfile::NamedTempFile::new_in(&self.changes_dir)?;
         temp_file.as_file().write_all(&data)?;
         temp_file.persist(&path).map_err(|e| {
-            ChangeStoreError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            ChangeStoreError::Io(std::io::Error::other(
                 format!("Failed to persist attestation: {}", e),
             ))
         })?;
@@ -913,8 +912,7 @@ impl ChangeStore {
         let temp_file = tempfile::NamedTempFile::new_in(&self.changes_dir)?;
         temp_file.as_file().write_all(&data)?;
         temp_file.persist(&path).map_err(|e| {
-            ChangeStoreError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            ChangeStoreError::Io(std::io::Error::other(
                 format!("Failed to persist provenance graph: {}", e),
             ))
         })?;
@@ -1016,7 +1014,7 @@ impl<'a> AttestationIterator<'a> {
                         }
                         if path
                             .extension()
-                            .map_or(true, |e| e != atomic_core::change::ATTESTATION_EXTENSION)
+                            .is_none_or(|e| e != atomic_core::change::ATTESTATION_EXTENSION)
                         {
                             continue;
                         }
@@ -1100,7 +1098,7 @@ impl ProvenanceIterator {
                         if !path.is_file() {
                             continue;
                         }
-                        if path.extension().map_or(true, |e| {
+                        if path.extension().is_none_or(|e| {
                             e != atomic_core::change::PROVENANCE_GRAPH_EXTENSION
                         }) {
                             continue;
@@ -1318,7 +1316,7 @@ impl ChangeIterator {
                     }
 
                     // Check for .change extension
-                    if path.extension().map_or(true, |e| e != CHANGE_EXTENSION) {
+                    if path.extension().is_none_or(|e| e != CHANGE_EXTENSION) {
                         continue;
                     }
 

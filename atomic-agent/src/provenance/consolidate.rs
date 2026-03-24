@@ -314,7 +314,7 @@ fn detect_test_driven_iteration(
 
     let file_display = edited_file
         .as_deref()
-        .map(|f| short_path(f))
+        .map(short_path)
         .unwrap_or_else(|| "file".to_string());
 
     let summary = format!("Test-driven fix for {}", file_display);
@@ -380,7 +380,7 @@ fn detect_full_cycle(
 
     let file_display = committed_file
         .as_deref()
-        .map(|f| short_path(f))
+        .map(short_path)
         .unwrap_or_else(|| "file".to_string());
 
     let cmd_display = verify_cmd
@@ -449,7 +449,7 @@ fn detect_commit_and_verify(
 
     let file_display = committed_file
         .as_deref()
-        .map(|f| short_path(f))
+        .map(short_path)
         .unwrap_or_else(|| "file".to_string());
 
     let cmd_display = verify_cmd
@@ -509,7 +509,7 @@ fn detect_informed_commit(
 
     let file_display = committed_file
         .as_deref()
-        .map(|f| short_path(f))
+        .map(short_path)
         .unwrap_or_else(|| "file".to_string());
 
     let summary = format!(

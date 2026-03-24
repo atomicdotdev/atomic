@@ -116,10 +116,8 @@ impl Pristine {
         let next_node_id = {
             let table = read_txn.open_table(EXTERNAL)?;
             let mut max_id = 0u64;
-            for result in table.iter()? {
-                if let Ok((k, _)) = result {
-                    max_id = max_id.max(k.value());
-                }
+            for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
+                max_id = max_id.max(k.value());
             }
             AtomicU64::new(max_id + 1)
         };
@@ -136,10 +134,8 @@ impl Pristine {
         let next_inode = {
             let table = read_txn.open_table(INODES)?;
             let mut max_id = 0u64;
-            for result in table.iter()? {
-                if let Ok((k, _)) = result {
-                    max_id = max_id.max(k.value());
-                }
+            for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
+                max_id = max_id.max(k.value());
             }
             AtomicU64::new(max_id + 1)
         };
@@ -182,10 +178,8 @@ impl Pristine {
         let next_node_id = {
             let table = read_txn.open_table(EXTERNAL)?;
             let mut max_id = 0u64;
-            for result in table.iter()? {
-                if let Ok((k, _)) = result {
-                    max_id = max_id.max(k.value());
-                }
+            for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
+                max_id = max_id.max(k.value());
             }
             AtomicU64::new(max_id + 1)
         };
@@ -202,10 +196,8 @@ impl Pristine {
         let next_inode = {
             let table = read_txn.open_table(INODES)?;
             let mut max_id = 0u64;
-            for result in table.iter()? {
-                if let Ok((k, _)) = result {
-                    max_id = max_id.max(k.value());
-                }
+            for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
+                max_id = max_id.max(k.value());
             }
             AtomicU64::new(max_id + 1)
         };

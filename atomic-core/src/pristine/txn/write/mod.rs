@@ -81,9 +81,8 @@ impl<'a> WriteTxn<'a> {
         let mut phases_table = self.txn.open_table(SESSION_PHASES)?;
         let mut intents_table = self.txn.open_table(SESSION_INTENTS)?;
 
-        let mut seq: u64 = 0;
-
-        for node in &graph.nodes {
+        for (seq, node) in graph.nodes.iter().enumerate() {
+            let seq = seq as u64;
             let detail: Option<serde_json::Value> = if let Some(s) = node.detail.as_deref() {
                 match serde_json::from_str(s) {
                     Ok(v) => Some(v),
@@ -135,7 +134,6 @@ impl<'a> WriteTxn<'a> {
             let event_key = encode_session_event_key(provenance_id, seq);
             let event_bytes = event.to_bytes();
             events_table.insert(&event_key, event_bytes.as_slice())?;
-            seq += 1;
 
             // Extract structured data by node kind.
             match node.kind {
@@ -1020,10 +1018,7 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         let inode = {
             let mut table = self.txn.open_table(TREE)?;
             let removed = table.remove(path)?;
-            match removed {
-                Some(value) => Some(Inode::new(value.value())),
-                None => None,
-            }
+            removed.map(|value| Inode::new(value.value()))
         };
 
         if let Some(inode) = inode {

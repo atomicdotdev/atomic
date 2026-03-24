@@ -575,7 +575,7 @@ fn build_turn_provenance(options: &TurnRecordOptions<'_>) -> Provenance {
     let vendor = if options.session.agent_vendor.is_empty() {
         vendor_from_agent_name(&options.session.agent_name)
     } else {
-        AIVendor::from_str(&options.session.agent_vendor)
+        AIVendor::parse(&options.session.agent_vendor)
     };
 
     let model = if options.session.model.is_empty() {

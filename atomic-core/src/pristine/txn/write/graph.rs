@@ -36,14 +36,12 @@ impl<'a> GraphTxnT for WriteTxn<'a> {
         let key = encode_vertex(node.change.get(), node.start.get(), node.end.get());
 
         let mut edges = Vec::new();
-        for result in table.get(&key)? {
-            if let Ok(v) = result {
-                let bytes: &[u8; 24] = v.value();
-                let edge = deserialize_edge(bytes);
-                let flag = edge.flag();
-                if flag >= min_flag && flag <= max_flag {
-                    edges.push(edge);
-                }
+        for v in table.get(&key)?.filter_map(|r| r.ok()) {
+            let bytes: &[u8; 24] = v.value();
+            let edge = deserialize_edge(bytes);
+            let flag = edge.flag();
+            if flag >= min_flag && flag <= max_flag {
+                edges.push(edge);
             }
         }
 

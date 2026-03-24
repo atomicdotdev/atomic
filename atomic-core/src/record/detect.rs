@@ -777,7 +777,7 @@ pub fn is_binary_content(content: &[u8]) -> bool {
         .count();
 
     // If more than 30% non-printable, consider binary
-    if content.len() > 0 && non_printable * 100 / content.len() > 30 {
+    if !content.is_empty() && non_printable * 100 / content.len() > 30 {
         return true;
     }
 

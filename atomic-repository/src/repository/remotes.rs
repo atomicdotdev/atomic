@@ -86,7 +86,7 @@ impl Repository {
         config
             .get_default()
             .map(|(name, entry)| (name.to_string(), entry.clone()))
-            .ok_or_else(|| RepositoryError::NoRemotesConfigured)
+            .ok_or(RepositoryError::NoRemotesConfigured)
     }
 
     /// Add a new remote.
@@ -113,7 +113,7 @@ impl Repository {
         let mut config = self.load_remotes()?;
         config
             .add(name, RemoteEntry::new(url))
-            .map_err(|e| RepositoryError::Remote(e))?;
+            .map_err(RepositoryError::Remote)?;
         self.save_remotes(&config)
     }
 
@@ -127,7 +127,7 @@ impl Repository {
         let mut config = self.load_remotes()?;
         config
             .add(name, RemoteEntry::new_default(url))
-            .map_err(|e| RepositoryError::Remote(e))?;
+            .map_err(RepositoryError::Remote)?;
         self.save_remotes(&config)
     }
 
@@ -144,7 +144,7 @@ impl Repository {
         let mut config = self.load_remotes()?;
         config
             .remove(name)
-            .map_err(|e| RepositoryError::Remote(e))?;
+            .map_err(RepositoryError::Remote)?;
         self.save_remotes(&config)
     }
 
@@ -162,7 +162,7 @@ impl Repository {
         let mut config = self.load_remotes()?;
         config
             .set_url(name, url)
-            .map_err(|e| RepositoryError::Remote(e))?;
+            .map_err(RepositoryError::Remote)?;
         self.save_remotes(&config)
     }
 
@@ -179,7 +179,7 @@ impl Repository {
         let mut config = self.load_remotes()?;
         config
             .set_default(name)
-            .map_err(|e| RepositoryError::Remote(e))?;
+            .map_err(RepositoryError::Remote)?;
         self.save_remotes(&config)
     }
 
@@ -193,7 +193,7 @@ impl Repository {
         let mut config = self.load_remotes()?;
         config
             .rename(old_name, new_name)
-            .map_err(|e| RepositoryError::Remote(e))?;
+            .map_err(RepositoryError::Remote)?;
         self.save_remotes(&config)
     }
 

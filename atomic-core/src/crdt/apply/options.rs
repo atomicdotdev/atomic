@@ -353,7 +353,7 @@ impl ApplyOptions {
     /// Returns `true` if there is a limit and it has been exceeded.
     #[inline]
     pub fn exceeds_limit(&self, count: usize) -> bool {
-        self.max_operations.map_or(false, |max| count >= max)
+        self.max_operations.is_some_and(|max| count >= max)
     }
 }
 

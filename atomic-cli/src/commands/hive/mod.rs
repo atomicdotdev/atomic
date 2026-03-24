@@ -823,7 +823,7 @@ impl PullIdentities {
 
             // Build the Identity object
             let identity = atomic_identity::Identity {
-                id: identity_id.clone(),
+                id: identity_id,
                 name: id.name.clone(),
                 email: id.email.clone(),
                 public_key,

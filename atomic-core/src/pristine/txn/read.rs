@@ -67,14 +67,12 @@ impl GraphTxnT for ReadTxn {
         let key = encode_vertex(node.change.get(), node.start.get(), node.end.get());
 
         let mut edges = Vec::new();
-        for result in table.get(&key)? {
-            if let Ok(v) = result {
-                let bytes: &[u8; 24] = v.value();
-                let edge = deserialize_edge(bytes);
-                let flag = edge.flag();
-                if flag >= min_flag && flag <= max_flag {
-                    edges.push(edge);
-                }
+        for v in table.get(&key)?.filter_map(|r| r.ok()) {
+            let bytes: &[u8; 24] = v.value();
+            let edge = deserialize_edge(bytes);
+            let flag = edge.flag();
+            if flag >= min_flag && flag <= max_flag {
+                edges.push(edge);
             }
         }
 
@@ -274,14 +272,12 @@ impl StackTxnT for ReadTxn {
         );
 
         let mut edges = Vec::new();
-        for result in table.get(&key)? {
-            if let Ok(v) = result {
-                let bytes: &[u8; 24] = v.value();
-                let edge = deserialize_edge(bytes);
-                let flag = edge.flag();
-                if flag >= min_flag && flag <= max_flag {
-                    edges.push(edge);
-                }
+        for v in table.get(&key)?.filter_map(|r| r.ok()) {
+            let bytes: &[u8; 24] = v.value();
+            let edge = deserialize_edge(bytes);
+            let flag = edge.flag();
+            if flag >= min_flag && flag <= max_flag {
+                edges.push(edge);
             }
         }
 
@@ -332,10 +328,8 @@ impl StackTxnT for ReadTxn {
     fn list_stacks(&self) -> PristineResult<Vec<String>> {
         let table = self.txn.open_table(STACKS)?;
         let mut names = Vec::new();
-        for result in table.iter()? {
-            if let Ok((k, _)) = result {
-                names.push(k.value().to_string());
-            }
+        for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
+            names.push(k.value().to_string());
         }
         Ok(names)
     }
@@ -497,11 +491,9 @@ impl TreeTxnT for ReadTxn {
                         end: ChangePosition::new(end),
                     };
 
-                    for v in values {
-                        if let Ok(v) = v {
-                            let edge = deserialize_edge(v.value());
-                            results.push(Ok((node, edge)));
-                        }
+                    for v in values.filter_map(|r| r.ok()) {
+                        let edge = deserialize_edge(v.value());
+                        results.push(Ok((node, edge)));
                     }
                 }
                 Err(e) => {

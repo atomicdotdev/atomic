@@ -96,11 +96,9 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
                         end: ChangePosition::new(end),
                     };
 
-                    for v in values {
-                        if let Ok(v) = v {
-                            let edge = deserialize_edge(v.value());
-                            results.push(Ok((node, edge)));
-                        }
+                    for v in values.filter_map(|r| r.ok()) {
+                        let edge = deserialize_edge(v.value());
+                        results.push(Ok((node, edge)));
                     }
                 }
                 Err(e) => {

@@ -785,19 +785,16 @@ fn matches_glob(path: &str, pattern: &str) -> bool {
         return path.contains(inner);
     }
 
-    if pattern.starts_with('*') {
-        let suffix = &pattern[1..];
+    if let Some(suffix) = pattern.strip_prefix('*') {
         return path.ends_with(suffix);
     }
 
-    if pattern.ends_with('*') {
-        let prefix = &pattern[..pattern.len() - 1];
+    if let Some(prefix) = pattern.strip_suffix('*') {
         return path.starts_with(prefix);
     }
 
-    if pattern.ends_with('/') {
+    if let Some(prefix) = pattern.strip_suffix('/') {
         // Directory pattern
-        let prefix = &pattern[..pattern.len() - 1];
         return path.starts_with(prefix)
             && (path.len() == prefix.len() || path[prefix.len()..].starts_with('/'));
     }

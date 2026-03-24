@@ -419,7 +419,7 @@ pub trait GraphTxnT {
 /// assert_eq!(kind as u8, 1);
 /// assert!(kind.is_shared());
 /// ```
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
 #[repr(u8)]
 pub enum StackKind {
     /// Ephemeral staging area (feature, bug, experiment).
@@ -432,6 +432,7 @@ pub enum StackKind {
     ///
     /// Edges are stored in the global `GRAPH[vertex]`.
     /// Deletion is restricted; these stacks are the canonical record.
+    #[default]
     Shared = 1,
 }
 
@@ -457,12 +458,6 @@ impl StackKind {
             1 => Some(Self::Shared),
             _ => None,
         }
-    }
-}
-
-impl Default for StackKind {
-    fn default() -> Self {
-        Self::Shared
     }
 }
 
@@ -906,6 +901,7 @@ pub trait StackTxnT: GraphTxnT {
     ///     println!("Change #{}: {:?} (state: {})", seq, change_id, state);
     /// }
     /// ```
+    #[allow(clippy::type_complexity)]
     fn iter_changes(
         &self,
         stack: &StackState,
@@ -1097,6 +1093,7 @@ pub trait TreeTxnT: GraphTxnT {
     /// # Note
     ///
     /// The order of iteration is not guaranteed.
+    #[allow(clippy::type_complexity)]
     fn iter_tree(
         &self,
     ) -> Result<Box<dyn Iterator<Item = Result<(String, Inode), PristineError>> + '_>, PristineError>;
@@ -1120,6 +1117,7 @@ pub trait TreeTxnT: GraphTxnT {
     /// This uses the INODE_GRAPH secondary index, providing O(m) complexity
     /// where m is the number of vertices in the file, rather than O(N) where
     /// N is the total graph size.
+    #[allow(clippy::type_complexity)]
     fn iter_inode_vertices(
         &self,
         inode: Inode,
@@ -1977,6 +1975,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// Iterate over all branches (lines) belonging to a trunk (file).
     ///
     /// Returns branch IDs in CRDT ordering (by BranchId).
+    #[allow(clippy::type_complexity)]
     fn iter_trunk_branches(
         &mut self,
         trunk_key: &[u8; 12],
@@ -1985,6 +1984,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// Iterate over all leaves (tokens) belonging to a branch (line).
     ///
     /// Returns leaf IDs in CRDT ordering (by LeafId).
+    #[allow(clippy::type_complexity)]
     fn iter_branch_leaves(
         &mut self,
         branch_key: &[u8; 12],

@@ -225,7 +225,7 @@ impl FileOutputOptions {
     }
 
     /// Convert to retrieve options for the alive graph module.
-    fn to_retrieve_options(&self) -> RetrieveOptions {
+    fn to_retrieve_options(self) -> RetrieveOptions {
         let mut opts = RetrieveOptions::default();
         if self.include_deleted {
             opts = opts.include_deleted(true);
@@ -599,6 +599,7 @@ where
 /// # Returns
 ///
 /// A `FileOutputResult` containing statistics and any conflicts.
+#[allow(clippy::too_many_arguments)]
 pub fn output_file_with_filter<T, C, W>(
     txn: &T,
     changes: &C,
@@ -747,7 +748,7 @@ where
     // Retrieve the alive graph
     let retrieve_opts = options.to_retrieve_options();
     let retrieve_result =
-        retrieve_graph(txn, position, retrieve_opts).map_err(|e| OutputError::Pristine(e))?;
+        retrieve_graph(txn, position, retrieve_opts).map_err(OutputError::Pristine)?;
 
     // Handle empty graph
     if retrieve_result.graph.is_empty() {
@@ -883,7 +884,7 @@ where
 {
     // Retrieve the alive graph with the provided options (including change filter)
     let retrieve_result =
-        retrieve_graph(txn, position, retrieve_options).map_err(|e| OutputError::Pristine(e))?;
+        retrieve_graph(txn, position, retrieve_options).map_err(OutputError::Pristine)?;
 
     // Handle empty graph (no content at this state)
     if retrieve_result.graph.is_empty() {

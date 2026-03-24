@@ -151,7 +151,7 @@ impl Command for Enable {
                 // Multiple agents detected — ask user to be specific or use --all
                 println!(
                     "Multiple agents detected: {}",
-                    detected.iter().copied().collect::<Vec<_>>().join(", ")
+                    detected.to_vec().join(", ")
                 );
                 println!("Use --agent <name> to choose one, or --all to install for all.");
                 return Ok(());
@@ -176,8 +176,7 @@ impl Command for Enable {
             // Check if already installed (and not forcing)
             if !self.force && agent.is_installed(&repo_root) {
                 println!(
-                    "  {} hooks already installed for {}. Use --force to reinstall.",
-                    "✓",
+                    "  ✓ hooks already installed for {}. Use --force to reinstall.",
                     agent.display_name(),
                 );
                 continue;
@@ -207,8 +206,7 @@ impl Command for Enable {
                         total_installed += count;
                     } else {
                         println!(
-                            "  {} hooks already up to date for {}.",
-                            "✓",
+                            "  ✓ hooks already up to date for {}.",
                             agent.display_name(),
                         );
                     }

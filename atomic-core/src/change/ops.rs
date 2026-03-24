@@ -733,9 +733,8 @@ impl FileOpsStats {
                             }
                         }
                         for leaf_op in old_content {
-                            match leaf_op {
-                                LeafOp::Delete { .. } => stats.tokens_deleted += 1,
-                                _ => {}
+                            if let LeafOp::Delete { .. } = leaf_op {
+                                stats.tokens_deleted += 1;
                             }
                         }
                     }

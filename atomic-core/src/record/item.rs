@@ -469,9 +469,7 @@ impl FileMetadata {
         let is_directory = (byte & 0b01) != 0;
         let is_executable = (byte & 0b10) != 0;
 
-        let permissions = if is_directory {
-            0o755
-        } else if is_executable {
+        let permissions = if is_directory || is_executable {
             0o755
         } else {
             0o644

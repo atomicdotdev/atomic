@@ -665,11 +665,10 @@ default = "{}"
         let mut removed_paths: Vec<String> = Vec::new();
         for path in old_files.difference(&new_files) {
             let abs_path = self.root.join(path);
-            if abs_path.exists() && !abs_path.is_dir() {
-                if working_copy.remove_path(path, false).is_ok() {
+            if abs_path.exists() && !abs_path.is_dir()
+                && working_copy.remove_path(path, false).is_ok() {
                     removed_paths.push(path.clone());
                 }
-            }
         }
 
         // ── Phase 3: Clean up empty ancestor directories ────────────────

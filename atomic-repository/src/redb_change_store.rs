@@ -374,7 +374,7 @@ impl RedbChangeStore {
         let mut cursor = Cursor::new(data);
         let mut reader = ChangeReader::open(&mut cursor)?;
 
-        let _file_header = reader.file_header().clone();
+        let _file_header = *reader.file_header();
         let hash_table = reader.hash_table().clone();
 
         // Read all sections

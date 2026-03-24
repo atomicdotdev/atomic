@@ -58,7 +58,7 @@ use super::super::error::{RecordError, RecordResult};
 /// Options for content retrieval.
 ///
 /// Controls how content is retrieved from the pristine graph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RetrieveContentOptions {
     /// Include deleted content in retrieval.
     ///
@@ -95,7 +95,7 @@ impl RetrieveContentOptions {
     }
 
     /// Convert to file output options.
-    fn to_file_output_options(&self) -> FileOutputOptions {
+    fn to_file_output_options(self) -> FileOutputOptions {
         let mut opts = FileOutputOptions::new();
         if self.include_deleted {
             opts = opts.include_deleted(true);
@@ -104,15 +104,6 @@ impl RetrieveContentOptions {
             opts = opts.max_vertices(max);
         }
         opts
-    }
-}
-
-impl Default for RetrieveContentOptions {
-    fn default() -> Self {
-        Self {
-            include_deleted: false,
-            max_vertices: None,
-        }
     }
 }
 
@@ -259,10 +250,10 @@ where
         Ok(result) => result,
         Err(e) => {
             // Convert output error to record error
-            return Err(RecordError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to retrieve content: {}", e),
-            )));
+            return Err(RecordError::Io(std::io::Error::other(format!(
+                "Failed to retrieve content: {}",
+                e
+            ))));
         }
     };
 
@@ -401,10 +392,10 @@ where
             Ok(result) => result,
             Err(e) => {
                 // Convert output error to record error
-                return Err(RecordError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to retrieve content with filter: {}", e),
-                )));
+                return Err(RecordError::Io(std::io::Error::other(format!(
+                    "Failed to retrieve content with filter: {}",
+                    e
+                ))));
             }
         };
 

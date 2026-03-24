@@ -215,7 +215,7 @@ impl Trunk {
     /// Returns `true` if this is a text file.
     #[inline]
     pub fn is_text(&self) -> bool {
-        self.encoding.map_or(false, |e| e.is_text())
+        self.encoding.is_some_and(|e| e.is_text())
     }
 
     /// Returns `true` if this is a binary file.

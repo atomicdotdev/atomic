@@ -169,7 +169,7 @@ impl<H: Base32> Base32 for Position<H> {
         } else {
             // Find the number of 5-bit groups needed
             let bits_needed = 64 - pos_value.leading_zeros();
-            let groups = (bits_needed as usize + 4) / 5;
+            let groups = (bits_needed as usize).div_ceil(5);
 
             for i in (0..groups).rev() {
                 let idx = ((pos_value >> (i * 5)) & 0x1F) as usize;

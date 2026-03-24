@@ -638,15 +638,13 @@ fn matches_pattern(name: &str, pattern: &str) -> bool {
         return name.contains(inner);
     }
 
-    if pattern.starts_with('*') {
+    if let Some(suffix) = pattern.strip_prefix('*') {
         // Ends with
-        let suffix = &pattern[1..];
         return name.ends_with(suffix);
     }
 
-    if pattern.ends_with('*') {
+    if let Some(prefix) = pattern.strip_suffix('*') {
         // Starts with
-        let prefix = &pattern[..pattern.len() - 1];
         return name.starts_with(prefix);
     }
 
@@ -889,7 +887,7 @@ pub fn list_tags(tags_dir: &Path, stack: &str) -> TagResult<Vec<Tag>> {
         let entry = entry?;
         let path = entry.path();
 
-        if path.extension().map_or(false, |ext| ext == "tag") {
+        if path.extension().is_some_and(|ext| ext == "tag") {
             let contents = std::fs::read_to_string(&path)?;
             if let Ok(tag) = serde_json::from_str::<Tag>(&contents) {
                 tags.push(tag);
@@ -1021,7 +1019,7 @@ pub fn count_tags(tags_dir: &Path, stack: &str) -> TagResult<usize> {
 
     let count = std::fs::read_dir(&stack_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "tag"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "tag"))
         .count();
 
     Ok(count)

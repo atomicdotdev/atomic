@@ -376,7 +376,7 @@ impl Log {
     pub(crate) fn format_json(&self, entries: &[HistoryEntry]) -> String {
         let json_entries: Vec<JsonLogEntry> = entries
             .iter()
-            .map(|e| JsonLogEntry::from_entry(e))
+            .map(JsonLogEntry::from_entry)
             .collect();
 
         serde_json::to_string_pretty(&json_entries)

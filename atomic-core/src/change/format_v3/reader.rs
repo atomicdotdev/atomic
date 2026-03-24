@@ -554,10 +554,8 @@ impl<'r, R: Read> ChangeReader<'r, R> {
     /// ```
     pub fn next_section(&mut self) -> FormatResult<Option<ReadSection>> {
         // Ensure we have a peeked header (reads from source if needed)
-        if self.peeked.is_none() {
-            if self.peek_section_type()?.is_none() {
-                return Ok(None);
-            }
+        if self.peeked.is_none() && self.peek_section_type()?.is_none() {
+            return Ok(None);
         }
 
         let peeked = self.peeked.take().unwrap();
@@ -629,10 +627,8 @@ impl<'r, R: Read> ChangeReader<'r, R> {
     /// - I/O errors from the underlying reader.
     pub fn skip_section(&mut self) -> FormatResult<bool> {
         // Ensure we have a peeked header
-        if self.peeked.is_none() {
-            if self.peek_section_type()?.is_none() {
-                return Ok(false);
-            }
+        if self.peeked.is_none() && self.peek_section_type()?.is_none() {
+            return Ok(false);
         }
 
         let peeked = self.peeked.take().unwrap();

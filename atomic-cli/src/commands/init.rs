@@ -384,7 +384,7 @@ impl Init {
             return Ok(false);
         }
 
-        std::fs::write(&ignore_path, template).map_err(|e| CliError::Io(e))?;
+        std::fs::write(&ignore_path, template).map_err(CliError::Io)?;
 
         Ok(true)
     }
@@ -481,11 +481,11 @@ impl Command for Init {
         if self.stack != atomic_repository::DEFAULT_STACK {
             // Create the requested stack
             repo.create_stack(&self.stack)
-                .map_err(|e| CliError::Repository(e))?;
+                .map_err(CliError::Repository)?;
 
             // Set it as the current stack
             repo.set_current_stack(&self.stack)
-                .map_err(|e| CliError::Repository(e))?;
+                .map_err(CliError::Repository)?;
         }
 
         // Print success message

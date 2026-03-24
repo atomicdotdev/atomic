@@ -555,7 +555,7 @@ pub fn apply_change_to_graph<T: MutTxnT + StackTxnT>(
             ApplyTarget::Local { .. } => {
                 // Check if the stack has a Shared ancestor by looking at
                 // the parent chain.  If so, the overlay reaches GRAPH.
-                !stack.parent.is_some()
+                stack.parent.is_none()
             }
         }
     } else {

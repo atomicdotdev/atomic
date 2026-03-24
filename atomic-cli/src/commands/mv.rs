@@ -78,6 +78,7 @@ use crate::output::{print_hint, print_success, print_warning};
 /// - `--force` / `-f`: Force move even if destination exists (overwrite tracking)
 #[derive(Parser, Debug, Clone)]
 #[command(name = "move")]
+#[derive(Default)]
 pub struct Move {
     /// Source file or directory to move.
     ///
@@ -177,16 +178,6 @@ impl Move {
     }
 }
 
-impl Default for Move {
-    fn default() -> Self {
-        Self {
-            source: String::new(),
-            destination: String::new(),
-            dry_run: false,
-            force: false,
-        }
-    }
-}
 
 impl Command for Move {
     /// Execute the move command.

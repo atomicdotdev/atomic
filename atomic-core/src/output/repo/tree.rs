@@ -826,13 +826,14 @@ pub fn collect_tree<T: TreeTxnT + GraphTxnT>(
                 }
 
                 // Check if we should include this directory
-                if !seen_directories.contains(&current) && options.should_include(&current) {
-                    if !options.exceeds_depth(&current) {
-                        seen_directories.insert(current.clone());
-                        // We don't have the inode for intermediate directories
-                        // In a full implementation, we'd look this up
-                        result.add_directory(TreeItem::directory(&current, Inode::ROOT));
-                    }
+                if !seen_directories.contains(&current)
+                    && options.should_include(&current)
+                    && !options.exceeds_depth(&current)
+                {
+                    seen_directories.insert(current.clone());
+                    // We don't have the inode for intermediate directories
+                    // In a full implementation, we'd look this up
+                    result.add_directory(TreeItem::directory(&current, Inode::ROOT));
                 }
             }
         }

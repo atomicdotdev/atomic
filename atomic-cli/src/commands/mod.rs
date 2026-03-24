@@ -210,7 +210,7 @@ pub const DOT_DIR: &str = ".atomic";
 /// println!("Repository found at: {}", repo_root.display());
 /// ```
 pub fn find_repository_root() -> CliResult<PathBuf> {
-    let cwd = std::env::current_dir().map_err(|e| CliError::Io(e))?;
+    let cwd = std::env::current_dir().map_err(CliError::Io)?;
     find_repository_root_from(&cwd)
 }
 

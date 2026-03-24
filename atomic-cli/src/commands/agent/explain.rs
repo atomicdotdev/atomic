@@ -525,7 +525,7 @@ fn save_reasoning_to_change(
     // so this overwrites the same file at the same content-addressed path.
     let _ = hash; // same hash — save_change recomputes and writes to the same path
     repo.save_change(&updated_change)
-        .map_err(|e| CliError::Repository(e))?;
+        .map_err(CliError::Repository)?;
 
     Ok(())
 }

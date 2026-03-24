@@ -307,8 +307,8 @@ pub(super) fn convert_word_diff_to_token_changes<'a>(
                 for (old_idx, new_idx) in old_range.clone().zip(new_range.clone()) {
                     if old_idx < old_tokens.len() && new_idx < new_tokens.len() {
                         let token = old_tokens[old_idx].clone();
-                        let old_byte_range = token_byte_range(&old_tokens, old_idx);
-                        let new_byte_range = token_byte_range(&new_tokens, new_idx);
+                        let old_byte_range = token_byte_range(old_tokens, old_idx);
+                        let new_byte_range = token_byte_range(new_tokens, new_idx);
 
                         changes.push(TokenChange::Unchanged {
                             token,
@@ -327,7 +327,7 @@ pub(super) fn convert_word_diff_to_token_changes<'a>(
                 for new_idx in new_range.clone() {
                     if new_idx < new_tokens.len() {
                         let token = new_tokens[new_idx].clone();
-                        let new_byte_range = token_byte_range(&new_tokens, new_idx);
+                        let new_byte_range = token_byte_range(new_tokens, new_idx);
 
                         changes.push(TokenChange::Inserted {
                             token,
@@ -345,7 +345,7 @@ pub(super) fn convert_word_diff_to_token_changes<'a>(
                 for old_idx in old_range.clone() {
                     if old_idx < old_tokens.len() {
                         let token = old_tokens[old_idx].clone();
-                        let old_byte_range = token_byte_range(&old_tokens, old_idx);
+                        let old_byte_range = token_byte_range(old_tokens, old_idx);
 
                         changes.push(TokenChange::Deleted {
                             token,
@@ -371,8 +371,8 @@ pub(super) fn convert_word_diff_to_token_changes<'a>(
                         if old_idx < old_tokens.len() && new_idx < new_tokens.len() {
                             let old_token = old_tokens[old_idx].clone();
                             let new_token = new_tokens[new_idx].clone();
-                            let old_byte_range = token_byte_range(&old_tokens, old_idx);
-                            let new_byte_range = token_byte_range(&new_tokens, new_idx);
+                            let old_byte_range = token_byte_range(old_tokens, old_idx);
+                            let new_byte_range = token_byte_range(new_tokens, new_idx);
 
                             changes.push(TokenChange::Replaced {
                                 old_token,
@@ -387,7 +387,7 @@ pub(super) fn convert_word_diff_to_token_changes<'a>(
                     for old_idx in old_range.clone() {
                         if old_idx < old_tokens.len() {
                             let token = old_tokens[old_idx].clone();
-                            let old_byte_range = token_byte_range(&old_tokens, old_idx);
+                            let old_byte_range = token_byte_range(old_tokens, old_idx);
 
                             changes.push(TokenChange::Deleted {
                                 token,
@@ -399,7 +399,7 @@ pub(super) fn convert_word_diff_to_token_changes<'a>(
                     for new_idx in new_range.clone() {
                         if new_idx < new_tokens.len() {
                             let token = new_tokens[new_idx].clone();
-                            let new_byte_range = token_byte_range(&new_tokens, new_idx);
+                            let new_byte_range = token_byte_range(new_tokens, new_idx);
 
                             changes.push(TokenChange::Inserted {
                                 token,

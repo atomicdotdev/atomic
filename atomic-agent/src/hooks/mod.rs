@@ -289,7 +289,7 @@ impl AgentRegistry {
     pub fn require(&self, name: &str) -> AgentResult<&dyn AgentHook> {
         self.get(name).ok_or_else(|| AgentError::AgentNotFound {
             name: name.to_string(),
-            available: self.list().iter().copied().collect::<Vec<_>>().join(", "),
+            available: self.list().to_vec().join(", "),
         })
     }
 

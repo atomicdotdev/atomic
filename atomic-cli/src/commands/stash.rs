@@ -315,7 +315,7 @@ impl Stash {
                 };
 
                 let created_at =
-                    DateTime::from_timestamp_millis(timestamp).unwrap_or_else(|| Utc::now());
+                    DateTime::from_timestamp_millis(timestamp).unwrap_or_else(Utc::now);
 
                 Some(StashEntry {
                     index: 0, // Will be set after sorting

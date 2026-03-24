@@ -90,6 +90,7 @@
 
 mod atom;
 pub mod attestation;
+#[allow(clippy::module_inception)]
 mod change;
 mod credit;
 mod encoding;

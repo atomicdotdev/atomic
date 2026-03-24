@@ -220,8 +220,8 @@ where
                     kind: built.kind,
                     new_start: built.new_start,
                     new_len: built.new_len,
-                    content_start: ChangePosition::new(content_pos_before as u64),
-                    content_end: ChangePosition::new(content_pos_after as u64),
+                    content_start: ChangePosition::new(content_pos_before),
+                    content_end: ChangePosition::new(content_pos_after),
                     // For Replace hunks, we use full_content, so track that
                     uses_full_content: matches!(
                         built.kind,
@@ -325,7 +325,7 @@ where
             let graph_op = GraphOp::FileAdd {
                 add_name: Insertion {
                     // Parent context - ROOT for top-level files
-                    predecessors: vec![parent_context_pos.clone()],
+                    predecessors: vec![parent_context_pos],
                     successors: vec![],
                     flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
                     start: name_start,
@@ -341,11 +341,11 @@ where
                     start: inode_start,
                     end: inode_end,
                     // The inode field points to itself (this is the file's root)
-                    inode: inode_pos.clone(),
+                    inode: inode_pos,
                 },
                 contents: Some(Insertion {
                     // Content's parent is the inode span
-                    predecessors: vec![inode_pos.clone()],
+                    predecessors: vec![inode_pos],
                     successors: vec![],
                     flag: EdgeFlags::BLOCK,
                     start: content_start,
@@ -362,7 +362,7 @@ where
             // Empty file - still create the FileAdd but with no content span
             let graph_op = GraphOp::FileAdd {
                 add_name: Insertion {
-                    predecessors: vec![parent_context_pos.clone()],
+                    predecessors: vec![parent_context_pos],
                     successors: vec![],
                     flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
                     start: name_start,
@@ -375,7 +375,7 @@ where
                     flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
                     start: inode_start,
                     end: inode_end,
-                    inode: inode_pos.clone(),
+                    inode: inode_pos,
                 },
                 contents: None,
                 path: path.to_string(),

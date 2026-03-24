@@ -354,7 +354,7 @@ impl ParallelImporter {
             .map(|(idx, oid)| {
                 // Progress reporting (every 100 commits)
                 let count = progress.fetch_add(1, Ordering::Relaxed);
-                if total > 100 && count % 100 == 0 {
+                if total > 100 && count.is_multiple_of(100) {
                     print_info(&format!("  Parsed {}/{} commits...", count, total));
                 }
 
