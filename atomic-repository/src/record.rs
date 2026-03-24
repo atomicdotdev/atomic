@@ -792,6 +792,42 @@ impl fmt::Display for RecordStats {
     }
 }
 
+// DIRECT FILE CHANGES
+
+/// A file change with content already provided (no filesystem access needed).
+///
+/// Used by [`Repository::record_direct()`] to bypass the filesystem entirely.
+/// Content is provided directly from an external source (e.g., git's object store).
+#[derive(Debug, Clone)]
+pub struct DirectFileChange {
+    /// Path relative to repository root.
+    pub path: String,
+    /// The type of change and associated content.
+    pub operation: DirectFileOp,
+}
+
+/// The type of direct file operation.
+#[derive(Debug, Clone)]
+pub enum DirectFileOp {
+    /// File was added. Content is the full file bytes.
+    Added {
+        /// Full content of the new file.
+        content: Vec<u8>,
+    },
+    /// File was modified. Content is the new full file bytes.
+    Modified {
+        /// Full content of the modified file.
+        content: Vec<u8>,
+        /// Old content from the previous version.
+        /// When provided, skips the expensive `get_file_content_via_overlay()` call.
+        /// For sequential imports (e.g., git), the caller can provide this from the
+        /// parent commit's tree, which is much faster than reconstructing from the graph.
+        old_content: Option<Vec<u8>>,
+    },
+    /// File was deleted.
+    Deleted,
+}
+
 // RESULT
 
 /// Result of recording changes.

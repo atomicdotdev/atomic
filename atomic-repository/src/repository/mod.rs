@@ -63,7 +63,8 @@ use crate::changestore::{ChangeStore, ChangeStoreError, DEFAULT_CACHE_CAPACITY};
 use crate::history::{HistoryOptions, HistorySummary};
 use crate::ignore::IgnoreRules;
 use crate::record::{
-    build_header, filter_files, RecordError, RecordOptions, RecordOutcome, RecordStats,
+    build_header, filter_files, DirectFileChange, DirectFileOp, RecordError, RecordOptions,
+    RecordOutcome, RecordStats,
 };
 use crate::remote::{RemoteConfig, RemoteEntry};
 use crate::status::{

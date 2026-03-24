@@ -178,8 +178,8 @@ pub use remote::{RemoteConfig, RemoteEntry, RemoteError, RemoteResult};
 
 // Record exports
 pub use record::{
-    build_header, filter_files, RecordError, RecordOptions, RecordOutcome, RecordResult,
-    RecordStats,
+    build_header, filter_files, DirectFileChange, DirectFileOp, RecordError, RecordOptions,
+    RecordOutcome, RecordResult, RecordStats,
 };
 
 // Archive exports

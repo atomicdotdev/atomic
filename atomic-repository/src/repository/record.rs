@@ -624,6 +624,361 @@ impl Repository {
         Ok(outcome)
     }
 
+    /// Record pre-computed file changes without filesystem access.
+    ///
+    /// This method accepts file changes with content already provided (e.g., from
+    /// git's object store), bypassing `status()` and `std::fs::read()` entirely.
+    /// This is dramatically faster for bulk imports where the caller already knows
+    /// what changed and has the content in memory.
+    ///
+    /// # Arguments
+    ///
+    /// * `header` - Change metadata (author, message, timestamp)
+    /// * `changes` - Pre-computed file changes with content
+    /// * `options` - Recording options (save_to_store and apply_after_record are ignored;
+    ///               the caller handles persistence)
+    pub fn record_direct(
+        &self,
+        header: ChangeHeader,
+        changes: &[DirectFileChange],
+        options: RecordOptions,
+    ) -> Result<RecordOutcome, RecordError> {
+        use atomic_core::output::Memory;
+        use atomic_core::record::workflow::{
+            assemble_change, record_added_file, record_deleted_file, record_modified_file,
+            DetectedFile, RecordedFile,
+        };
+
+        if changes.is_empty() {
+            return Err(RecordError::NothingToRecord);
+        }
+
+        let final_header = build_header(header, &options);
+        let core_options = options.to_core_options();
+
+        // Create in-memory working copy (no filesystem access)
+        let memory_wc = Memory::new();
+
+        let mut stats = RecordStats::new();
+        let mut recorded_files: Vec<RecordedFile> = Vec::new();
+        let mut recorded_paths: Vec<String> = Vec::new();
+        let mut deleted_paths: Vec<String> = Vec::new();
+        let mut errors: Vec<(String, String)> = Vec::new();
+
+        for change in changes {
+            let path = &change.path;
+            stats.files_processed += 1;
+
+            match &change.operation {
+                DirectFileOp::Added { content } => {
+                    // Populate memory working copy with content
+                    memory_wc.add_file(path, content);
+
+                    let detected = DetectedFile::added(path);
+
+                    match record_added_file(&memory_wc, &detected, &core_options) {
+                        Ok(recorded) => {
+                            if !recorded.is_empty() {
+                                stats.files_recorded += 1;
+                                stats.hunks_created += recorded.hunk_count();
+                                stats.content_bytes += recorded.content_len() as u64;
+                                stats.vertices_added += 3;
+
+                                if let Some(crdt_stats) = recorded.crdt_stats() {
+                                    stats.lines_added += crdt_stats.lines_added;
+                                    stats.lines_deleted += crdt_stats.lines_deleted;
+                                    stats.lines_modified += crdt_stats.lines_modified;
+                                    stats.tokens_added += crdt_stats.tokens_added;
+                                    stats.tokens_deleted += crdt_stats.tokens_deleted;
+                                    stats.tokens_replaced += crdt_stats.tokens_replaced;
+                                }
+
+                                recorded_paths.push(path.clone());
+                                recorded_files.push(recorded);
+                            } else {
+                                stats.files_skipped += 1;
+                            }
+                        }
+                        Err(e) => {
+                            errors.push((path.clone(), format!("{:?}", e)));
+                            stats.errors += 1;
+                        }
+                    }
+                }
+
+                DirectFileOp::Modified { content, old_content } => {
+                    // Look up inode and position from pristine
+                    let (file_inode, file_position) = {
+                        let txn = self
+                            .pristine
+                            .read_txn()
+                            .map_err(|e| RecordError::Database(e.to_string()))?;
+
+                        let inode = match txn.get_inode(path) {
+                            Ok(Some(inode)) => inode,
+                            Ok(None) => {
+                                // File not tracked yet — treat as Added
+                                memory_wc.add_file(path, content);
+                                let detected = DetectedFile::added(path);
+                                match record_added_file(&memory_wc, &detected, &core_options) {
+                                    Ok(recorded) => {
+                                        if !recorded.is_empty() {
+                                            stats.files_recorded += 1;
+                                            stats.hunks_created += recorded.hunk_count();
+                                            stats.content_bytes += recorded.content_len() as u64;
+                                            stats.vertices_added += 3;
+                                            recorded_paths.push(path.clone());
+                                            recorded_files.push(recorded);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        errors.push((path.clone(), format!("{:?}", e)));
+                                        stats.errors += 1;
+                                    }
+                                }
+                                continue;
+                            }
+                            Err(e) => {
+                                errors.push((path.clone(), format!("Failed to get inode: {}", e)));
+                                stats.errors += 1;
+                                continue;
+                            }
+                        };
+
+                        let position = match txn.inode_position(inode) {
+                            Ok(Some(pos)) => pos,
+                            Ok(None) => {
+                                errors.push((
+                                    path.clone(),
+                                    "File position not found in pristine".to_string(),
+                                ));
+                                stats.errors += 1;
+                                continue;
+                            }
+                            Err(e) => {
+                                errors.push((
+                                    path.clone(),
+                                    format!("Failed to get position: {}", e),
+                                ));
+                                stats.errors += 1;
+                                continue;
+                            }
+                        };
+
+                        (inode, position)
+                    };
+
+                    // Use caller-provided old content if available (fast path),
+                    // otherwise reconstruct from the pristine graph (slow path).
+                    let resolved_old_content = if let Some(ref provided) = old_content {
+                        provided.clone()
+                    } else {
+                        match self
+                            .get_file_content_via_overlay(path, &self.current_stack)
+                        {
+                            Ok(Some(content)) => content,
+                            Ok(None) => Vec::new(),
+                            Err(e) => {
+                                errors.push((
+                                    path.clone(),
+                                    format!("Failed to retrieve old content: {}", e),
+                                ));
+                                stats.errors += 1;
+                                continue;
+                            }
+                        }
+                    };
+
+                    // Skip if content unchanged
+                    if resolved_old_content == content.as_slice() {
+                        stats.files_skipped += 1;
+                        continue;
+                    }
+
+                    // Populate memory working copy
+                    memory_wc.add_file(path, content);
+
+                    let mut detected = DetectedFile::modified(path);
+                    detected.inode = Some(file_inode);
+                    detected.position = Some(file_position);
+
+                    match record_modified_file(&memory_wc, &detected, &resolved_old_content, &core_options) {
+                        Ok(recorded) => {
+                            if !recorded.is_empty() {
+                                stats.files_recorded += 1;
+                                stats.hunks_created += recorded.hunk_count();
+                                stats.content_bytes += recorded.content_len() as u64;
+
+                                for graph_op in recorded.hunks() {
+                                    if graph_op.is_edit() {
+                                        stats.vertices_added += 1;
+                                    } else if graph_op.is_replace() {
+                                        stats.vertices_added += 1;
+                                        stats.edges_modified += 1;
+                                    } else if graph_op.is_delete() {
+                                        stats.edges_modified += 1;
+                                    }
+                                }
+
+                                if let Some(crdt_stats) = recorded.crdt_stats() {
+                                    stats.lines_added += crdt_stats.lines_added;
+                                    stats.lines_deleted += crdt_stats.lines_deleted;
+                                    stats.lines_modified += crdt_stats.lines_modified;
+                                    stats.tokens_added += crdt_stats.tokens_added;
+                                    stats.tokens_deleted += crdt_stats.tokens_deleted;
+                                    stats.tokens_replaced += crdt_stats.tokens_replaced;
+                                }
+
+                                recorded_paths.push(path.clone());
+                                recorded_files.push(recorded);
+                            } else {
+                                stats.files_skipped += 1;
+                            }
+                        }
+                        Err(e) => {
+                            errors.push((path.clone(), format!("{:?}", e)));
+                            stats.errors += 1;
+                        }
+                    }
+                }
+
+                DirectFileOp::Deleted => {
+                    // Look up inode and position from pristine
+                    let (file_inode, file_position) = {
+                        let txn = self
+                            .pristine
+                            .read_txn()
+                            .map_err(|e| RecordError::Database(e.to_string()))?;
+
+                        let inode = match txn.get_inode(path) {
+                            Ok(Some(inode)) => inode,
+                            Ok(None) => {
+                                // File was never tracked — skip silently
+                                continue;
+                            }
+                            Err(e) => {
+                                errors.push((path.clone(), format!("Failed to get inode: {}", e)));
+                                stats.errors += 1;
+                                continue;
+                            }
+                        };
+
+                        let position = match txn.inode_position(inode) {
+                            Ok(Some(pos)) => pos,
+                            Ok(None) => {
+                                errors.push((
+                                    path.clone(),
+                                    "File position not found in pristine".to_string(),
+                                ));
+                                stats.errors += 1;
+                                continue;
+                            }
+                            Err(e) => {
+                                errors.push((
+                                    path.clone(),
+                                    format!("Failed to get position: {}", e),
+                                ));
+                                stats.errors += 1;
+                                continue;
+                            }
+                        };
+
+                        (inode, position)
+                    };
+
+                    let mut detected = DetectedFile::deleted(path);
+                    detected.inode = Some(file_inode);
+                    detected.position = Some(file_position);
+
+                    match record_deleted_file(&detected, &core_options) {
+                        Ok(recorded) => {
+                            stats.files_recorded += 1;
+                            stats.hunks_created += recorded.hunk_count();
+                            stats.edges_modified += 1;
+
+                            if let Some(crdt_stats) = recorded.crdt_stats() {
+                                stats.lines_added += crdt_stats.lines_added;
+                                stats.lines_deleted += crdt_stats.lines_deleted;
+                                stats.lines_modified += crdt_stats.lines_modified;
+                                stats.tokens_added += crdt_stats.tokens_added;
+                                stats.tokens_deleted += crdt_stats.tokens_deleted;
+                                stats.tokens_replaced += crdt_stats.tokens_replaced;
+                            }
+
+                            deleted_paths.push(path.clone());
+                            recorded_paths.push(path.clone());
+                            recorded_files.push(recorded);
+                        }
+                        Err(e) => {
+                            errors.push((path.clone(), format!("{:?}", e)));
+                            stats.errors += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if recorded_files.is_empty() {
+            return Err(RecordError::NothingToRecord);
+        }
+
+        // Assemble the change using OverlayTxn (same as record())
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RecordError::Database(e.to_string()))?;
+
+        let stack = txn
+            .get_stack(&self.current_stack)
+            .map_err(|e| RecordError::Database(e.to_string()))?
+            .ok_or_else(|| {
+                RecordError::Database(format!(
+                    "Stack '{}' not found during record assembly",
+                    self.current_stack
+                ))
+            })?;
+
+        let overlay_txn = OverlayTxn::from_stack(&txn, &stack)
+            .map_err(|e| RecordError::Database(e.to_string()))?;
+
+        let assembly_options = options.to_assembly_options();
+
+        let assembly_result = assemble_change(
+            &overlay_txn,
+            &recorded_files,
+            final_header,
+            &assembly_options,
+        )?;
+
+        let change = assembly_result.into_change();
+        stats.dependency_count = change.dependencies().len();
+
+        // Serialize to V3 format
+        let mut v3_bytes = Vec::new();
+        let computed_hash = change
+            .serialize(&mut v3_bytes)
+            .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+
+        let (final_change, verified_hash) = Change::deserialize(&mut v3_bytes.as_slice())
+            .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+        debug_assert_eq!(computed_hash, verified_hash);
+
+        let mut outcome = RecordOutcome::new(final_change, computed_hash, stats);
+        outcome.set_v3_bytes(v3_bytes);
+
+        for path in recorded_paths {
+            outcome.add_recorded_file(path);
+        }
+        for path in deleted_paths {
+            outcome.add_deleted_file(path);
+        }
+        for (path, error) in errors {
+            outcome.add_error(path, error);
+        }
+
+        Ok(outcome)
+    }
+
     /// Record changes with a simple message.
     ///
     /// This is a convenience method that creates a change header with just

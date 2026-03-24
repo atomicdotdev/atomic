@@ -93,17 +93,15 @@ init_git_repo
 git_commit "Initial commit" "main.txt" "main content"
 git_commit "Second commit" "main.txt" "updated main"
 
+# Capture main branch name before switching away
+main_branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo "main")"
+
 # Create feature branch with additional commits
 git checkout -b feature --quiet
 git_commit "Feature commit" "feature.txt" "feature content"
 
-# Switch back to main (or master, depending on git version)
-main_branch="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|origin/||')"
-# For local repos without origin, fall back to the currently checked-out branch
-if [ -z "$main_branch" ]; then
-    main_branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo "main")"
-fi
-git checkout "$main_branch" --quiet 2>/dev/null || true
+# Switch back to main
+git checkout "$main_branch" --quiet
 
 # Import main branch
 atomic init >/dev/null 2>&1
@@ -240,8 +238,7 @@ make_temp_repo "git-import-errors"
 atomic init >/dev/null 2>&1
 
 # Should fail with clear error about not being a git repo
-out="$(atomic git import 2>&1)"
-status=$?
+out="$(atomic git import 2>&1)" && status=0 || status=$?
 if [ "$status" -eq 0 ]; then
     _fail "atomic git import unexpectedly succeeded in non-git directory"
 elif echo "$out" | grep -qiE "not.*git|no.*repository|git.*not found"; then
@@ -253,8 +250,7 @@ fi
 # Now make it a git repo and test invalid branch
 init_git_repo
 git_commit "test" "test.txt" "test"
-out="$(atomic git import --branch nonexistent 2>&1)"
-status=$?
+out="$(atomic git import --branch nonexistent 2>&1)" && status=0 || status=$?
 if [ "$status" -eq 0 ]; then
     _fail "atomic git import unexpectedly succeeded for invalid branch"
 elif echo "$out" | grep -qiE "branch.*not found|no.*branch|invalid.*branch|unknown.*branch"; then

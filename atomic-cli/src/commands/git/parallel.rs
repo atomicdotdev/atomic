@@ -54,16 +54,16 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, TimeZone, Utc};
-use git2::{Delta, Diff, DiffOptions, ObjectType, Oid, Repository as GitRepository, Tree};
+use git2::{Delta, Diff, DiffOptions, Oid, Repository as GitRepository};
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use atomic_core::change::{Author, Change, ChangeHeader};
-use atomic_repository::Repository;
+use atomic_repository::{DirectFileChange, DirectFileOp, RecordOptions, Repository};
 
 use crate::error::{CliError, CliResult};
 use crate::output::{print_info, print_warning};
@@ -134,8 +134,6 @@ pub struct ParsedFile {
     pub path: String,
     /// Type of change.
     pub operation: FileOperation,
-    /// New content (for added/modified files).
-    pub new_content: Option<Vec<u8>>,
     /// Old path (for renames).
     pub old_path: Option<String>,
 }
@@ -164,6 +162,8 @@ pub struct ParallelImportOptions {
     pub imported_shas: HashSet<String>,
     /// Repository name (from remote URL or directory).
     pub repo_name: String,
+    /// Number of commits to process per batch.
+    pub batch_size: usize,
 }
 
 impl Default for ParallelImportOptions {
@@ -172,7 +172,55 @@ impl Default for ParallelImportOptions {
             incremental: false,
             imported_shas: HashSet::new(),
             repo_name: "unknown".to_string(),
+            batch_size: 5000,
         }
+    }
+}
+
+/// Checkpoint for resumable imports.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImportCheckpoint {
+    /// Branch being imported.
+    pub branch: String,
+    /// Index of the last imported commit in the OID list.
+    pub last_imported_index: usize,
+    /// Git SHA of the last imported commit.
+    pub last_imported_sha: String,
+    /// Total number of OIDs collected for this import.
+    pub total_oids: usize,
+    /// Cumulative number of commits written so far.
+    pub commits_written: usize,
+}
+
+impl ImportCheckpoint {
+    /// Path to the checkpoint file within an Atomic repository.
+    fn path(repo_root: &Path) -> PathBuf {
+        repo_root.join(".atomic").join("git-import-checkpoint.json")
+    }
+
+    /// Load a checkpoint from disk, if one exists and is valid JSON.
+    pub fn load(repo_root: &Path) -> Option<Self> {
+        let data = std::fs::read_to_string(Self::path(repo_root)).ok()?;
+        serde_json::from_str(&data).ok()
+    }
+
+    /// Save the checkpoint to disk.
+    pub fn save(&self, repo_root: &Path) -> CliResult<()> {
+        let path = Self::path(repo_root);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CliError::Internal(e.into()))?;
+        }
+        let data = serde_json::to_string_pretty(self)
+            .map_err(|e| CliError::Internal(e.into()))?;
+        std::fs::write(&path, data)
+            .map_err(|e| CliError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    /// Remove the checkpoint file.
+    pub fn remove(repo_root: &Path) {
+        let _ = std::fs::remove_file(Self::path(repo_root));
     }
 }
 
@@ -213,67 +261,144 @@ impl ParallelImporter {
 
     /// Import commits from a branch into an Atomic repository.
     ///
-    /// This is the main entry point for the three-phase import.
+    /// Uses a batched pipeline: commits are split into chunks of `batch_size`,
+    /// and each chunk is parsed in parallel (Phase 1) then written sequentially
+    /// (Phase 2). This keeps memory bounded regardless of repository size.
+    ///
+    /// A checkpoint file is written after each batch so the import can resume
+    /// from where it left off if interrupted.
     pub fn import_branch(
         &self,
         branch_name: &str,
         repo: &mut Repository,
+        repo_root: &Path,
     ) -> CliResult<ImportStats> {
         let mut stats = ImportStats::default();
 
-        // Open git repo for this thread
+        // Open git repo
         let git_repo = self.open_git_repo()?;
 
-        // Collect commit OIDs in topological order
-        let commit_oids = self.collect_commit_oids(&git_repo, branch_name)?;
+        // Collect commit OIDs in topological order (shows spinner for large repos)
+        let collect_spinner = ProgressBar::new_spinner();
+        collect_spinner.set_style(
+            ProgressStyle::with_template("{spinner:.green} {msg}")
+                .unwrap(),
+        );
+        collect_spinner.set_message("Collecting commits...");
+        collect_spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
+        let commit_oids = self.collect_commit_oids(&git_repo, branch_name, &collect_spinner)?;
         stats.commits_found = commit_oids.len();
+
+        collect_spinner.finish_and_clear();
 
         if commit_oids.is_empty() {
             return Ok(stats);
         }
 
-        print_info(&format!(
-            "Phase 1: Parsing {} commits in parallel...",
-            commit_oids.len()
-        ));
+        // Determine resume point from checkpoint
+        let start_index = if let Some(checkpoint) = ImportCheckpoint::load(repo_root) {
+            if checkpoint.branch == branch_name && checkpoint.total_oids == commit_oids.len() {
+                // Validate the SHA matches at the checkpoint index
+                if commit_oids
+                    .get(checkpoint.last_imported_index)
+                    .map(|oid| oid.to_string() == checkpoint.last_imported_sha)
+                    .unwrap_or(false)
+                {
+                    let resume_from = checkpoint.last_imported_index + 1;
+                    print_info(&format!(
+                        "Resuming from checkpoint: {}/{} commits already imported",
+                        resume_from, commit_oids.len()
+                    ));
+                    stats.changes_written = checkpoint.commits_written;
+                    resume_from
+                } else {
+                    print_warning("Checkpoint SHA mismatch, starting from beginning");
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
 
-        // Phase 1: Parallel git parsing
-        let phase1_start = Instant::now();
-        let parsed_commits = self.phase1_parse(&commit_oids)?;
-        stats.phase1_duration = phase1_start.elapsed();
-        stats.commits_parsed = parsed_commits.len();
-
-        print_info(&format!(
-            "Phase 1 complete: {} commits parsed in {:.2}s",
-            stats.commits_parsed,
-            stats.phase1_duration.as_secs_f64()
-        ));
-
-        if parsed_commits.is_empty() {
+        let remaining_oids = &commit_oids[start_index..];
+        if remaining_oids.is_empty() {
+            ImportCheckpoint::remove(repo_root);
             return Ok(stats);
         }
 
-        print_info(&format!(
-            "Phase 2: Writing {} changes sequentially...",
-            parsed_commits.len()
-        ));
-
-        // Phase 2: Sequential write with hash chaining
-        let phase2_start = Instant::now();
-        let write_stats = self.phase2_write(repo, &parsed_commits)?;
-        stats.phase2_duration = phase2_start.elapsed();
-        stats.changes_written = write_stats.changes_written;
-        stats.empty_commits = write_stats.empty_commits;
-        stats.merge_commits = write_stats.merge_commits;
-        stats.files_processed = write_stats.files_processed;
+        let total_remaining = remaining_oids.len();
+        let batch_size = self.options.batch_size;
+        let total_batches = (total_remaining + batch_size - 1) / batch_size;
 
         print_info(&format!(
-            "Phase 2 complete: {} changes written in {:.2}s",
-            stats.changes_written,
-            stats.phase2_duration.as_secs_f64()
+            "Importing {} commits in {} batches of {}",
+            total_remaining, total_batches, batch_size
         ));
 
-        // Phase 3: Finalization (just verification for now)
+        // Set up progress bar
+        let pb = ProgressBar::new(commit_oids.len() as u64);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, ETA: {eta}) {msg}"
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+        );
+        pb.set_position(start_index as u64);
+
+        // Process in batches
+        let overall_start = Instant::now();
+
+        for (batch_idx, batch_oids) in remaining_oids.chunks(batch_size).enumerate() {
+            let batch_start = start_index + batch_idx * batch_size;
+
+            // Phase 1: parallel parse (metadata only, no file content)
+            pb.set_message(format!("batch {}/{} — parsing", batch_idx + 1, total_batches));
+            let phase1_start = Instant::now();
+            let parsed_commits = self.phase1_parse(batch_oids, &pb)?;
+            stats.phase1_duration += phase1_start.elapsed();
+            stats.commits_parsed += parsed_commits.len();
+
+            // Phase 2: sequential write
+            pb.set_message(format!("batch {}/{} — writing", batch_idx + 1, total_batches));
+            let phase2_start = Instant::now();
+            let write_stats = self.phase2_write(repo, &parsed_commits, &pb)?;
+            stats.phase2_duration += phase2_start.elapsed();
+            stats.changes_written += write_stats.changes_written;
+            stats.empty_commits += write_stats.empty_commits;
+            stats.merge_commits += write_stats.merge_commits;
+            stats.files_processed += write_stats.files_processed;
+
+            // Write checkpoint
+            let last_idx = batch_start + batch_oids.len() - 1;
+            let checkpoint = ImportCheckpoint {
+                branch: branch_name.to_string(),
+                last_imported_index: last_idx,
+                last_imported_sha: commit_oids[last_idx].to_string(),
+                total_oids: commit_oids.len(),
+                commits_written: stats.changes_written + stats.empty_commits + stats.merge_commits,
+            };
+            checkpoint.save(repo_root)?;
+        }
+
+        pb.finish_with_message("Import complete");
+
+        let total_elapsed = overall_start.elapsed();
+        print_info(&format!(
+            "Imported {} commits in {:.1}s (parse: {:.1}s, write: {:.1}s)",
+            stats.changes_written + stats.empty_commits + stats.merge_commits,
+            total_elapsed.as_secs_f64(),
+            stats.phase1_duration.as_secs_f64(),
+            stats.phase2_duration.as_secs_f64(),
+        ));
+
+        // Clean up checkpoint on success
+        ImportCheckpoint::remove(repo_root);
+
+        // Phase 3: verification
         self.phase3_finalize(&stats)?;
 
         Ok(stats)
@@ -284,6 +409,7 @@ impl ParallelImporter {
         &self,
         git_repo: &GitRepository,
         branch_name: &str,
+        spinner: &ProgressBar,
     ) -> CliResult<Vec<Oid>> {
         let reference = git_repo
             .find_branch(branch_name, git2::BranchType::Local)
@@ -322,7 +448,14 @@ impl ParallelImporter {
             }
 
             oids.push(oid);
+
+            // Update spinner every 10K commits
+            if oids.len() % 10_000 == 0 {
+                spinner.set_message(format!("Collecting commits... {}", oids.len()));
+            }
         }
+
+        spinner.set_message(format!("Collected {} commits", oids.len()));
 
         Ok(oids)
     }
@@ -331,8 +464,12 @@ impl ParallelImporter {
     // Phase 1: Parallel Git Parsing
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Phase 1: Parse all commits in parallel using rayon.
-    fn phase1_parse(&self, commit_oids: &[Oid]) -> CliResult<Vec<ParsedCommit>> {
+    /// Phase 1: Parse a batch of commits in parallel using rayon.
+    fn phase1_parse(
+        &self,
+        commit_oids: &[Oid],
+        _pb: &ProgressBar,
+    ) -> CliResult<Vec<ParsedCommit>> {
         // Build a map from OID to index for parent lookups
         let oid_to_index: std::collections::HashMap<Oid, usize> = commit_oids
             .iter()
@@ -340,38 +477,48 @@ impl ParallelImporter {
             .map(|(i, oid)| (*oid, i))
             .collect();
 
-        // Progress counter for large repos
-        let progress = Arc::new(AtomicUsize::new(0));
-        let total = commit_oids.len();
-
         // Share the repo path for thread-local repo opening
         let repo_path = self.git_repo_path.clone();
 
-        // Parse commits in parallel - each thread opens its own git repo
-        let results: Vec<CliResult<ParsedCommit>> = commit_oids
+        // Thread-local counter for repo reuse
+        use std::cell::RefCell;
+        thread_local! {
+            static THREAD_GIT_REPO: RefCell<Option<(PathBuf, GitRepository)>> = const { RefCell::new(None) };
+        }
+
+        // Parse commits in parallel - each thread reuses its git repo
+        let results: Vec<(usize, CliResult<ParsedCommit>)> = commit_oids
             .par_iter()
             .enumerate()
             .map(|(idx, oid)| {
-                // Progress reporting (every 100 commits)
-                let count = progress.fetch_add(1, Ordering::Relaxed);
-                if total > 100 && count % 100 == 0 {
-                    print_info(&format!("  Parsed {}/{} commits...", count, total));
-                }
-
-                // Open a thread-local git repo
-                let git_repo = GitRepository::open(&repo_path).map_err(|e| CliError::GitError {
-                    message: format!("Failed to open git repository: {}", e),
-                })?;
-
-                parse_commit(&git_repo, *oid, idx, &oid_to_index)
+                let result = THREAD_GIT_REPO.with(|cell| {
+                    let mut slot = cell.borrow_mut();
+                    // Reuse repo if path matches, otherwise open a new one
+                    let git_repo = match slot.as_ref() {
+                        Some((path, _)) if path == &repo_path => {
+                            &slot.as_ref().unwrap().1
+                        }
+                        _ => {
+                            let repo = GitRepository::open(&repo_path).map_err(|e| {
+                                CliError::GitError {
+                                    message: format!("Failed to open git repository: {}", e),
+                                }
+                            })?;
+                            *slot = Some((repo_path.clone(), repo));
+                            &slot.as_ref().unwrap().1
+                        }
+                    };
+                    parse_commit(git_repo, *oid, idx, &oid_to_index)
+                });
+                (idx, result)
             })
             .collect();
 
-        // Collect results, filtering out errors (with warnings)
-        let mut parsed = Vec::with_capacity(results.len());
-        for (idx, result) in results.into_iter().enumerate() {
+        // Collect results in original order, filtering out errors
+        let mut parsed: Vec<(usize, ParsedCommit)> = Vec::with_capacity(results.len());
+        for (idx, result) in results {
             match result {
-                Ok(commit) => parsed.push(commit),
+                Ok(commit) => parsed.push((idx, commit)),
                 Err(e) => {
                     print_warning(&format!("Skipping commit {}: {}", idx, e));
                 }
@@ -379,15 +526,9 @@ impl ParallelImporter {
         }
 
         // Sort by original index to restore topological order
-        // (rayon may have processed them out of order)
-        parsed.sort_by_key(|c| {
-            commit_oids
-                .iter()
-                .position(|oid| oid.to_string() == c.git_sha)
-                .unwrap_or(usize::MAX)
-        });
+        parsed.sort_by_key(|(idx, _)| *idx);
 
-        Ok(parsed)
+        Ok(parsed.into_iter().map(|(_, c)| c).collect())
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -399,17 +540,23 @@ impl ParallelImporter {
         &self,
         repo: &mut Repository,
         commits: &[ParsedCommit],
+        pb: &ProgressBar,
     ) -> CliResult<WriteStats> {
         let mut stats = WriteStats::default();
-        let total = commits.len();
 
         // Open git repo for Phase 2 (single-threaded, so one instance is fine)
         let git_repo = self.open_git_repo()?;
 
-        for (idx, parsed) in commits.iter().enumerate() {
-            // Progress reporting
-            if total > 100 && idx % 100 == 0 {
-                print_info(&format!("  Writing {}/{}...", idx, total));
+        for parsed in commits.iter() {
+            // Log large commits so the user knows why it's slow
+            if parsed.files.len() > 1000 {
+                pb.suspend(|| {
+                    print_info(&format!(
+                        "Processing large commit {} ({} files)...",
+                        parsed.short_sha,
+                        parsed.files.len()
+                    ));
+                });
             }
 
             // Write the change
@@ -428,12 +575,19 @@ impl ParallelImporter {
                     print_warning(&format!("Failed to write {}: {}", parsed.short_sha, e));
                 }
             }
+            pb.inc(1);
         }
 
         Ok(stats)
     }
 
     /// Write a single commit to the repository.
+    ///
+    /// Write a single commit using direct recording (zero filesystem I/O).
+    ///
+    /// Content is read from git's object store (compressed packfiles) and fed
+    /// directly to `record_direct()`, bypassing the working directory entirely.
+    /// No `checkout_tree`, no `status()`, no `std::fs::read()`.
     fn write_commit(
         &self,
         git_repo: &GitRepository,
@@ -460,7 +614,7 @@ impl ParallelImporter {
             return self.write_empty_commit(repo, parsed, header);
         }
 
-        // Checkout the commit's tree to set working copy state
+        // Get the commit's tree (for reading blob content from git object store)
         let commit = git_repo
             .find_commit(
                 Oid::from_str(&parsed.git_sha).map_err(|e| CliError::GitError {
@@ -475,32 +629,69 @@ impl ParallelImporter {
             message: format!("Failed to get tree: {}", e),
         })?;
 
-        git_repo
-            .checkout_tree(
-                tree.as_object(),
-                Some(git2::build::CheckoutBuilder::new().force()),
-            )
-            .map_err(|e| CliError::GitError {
-                message: format!("Failed to checkout tree: {}", e),
-            })?;
+        // Get parent tree for reading old content of modified files.
+        // This avoids the expensive get_file_content_via_overlay() graph traversal.
+        let parent_tree = if commit.parent_count() > 0 {
+            commit.parent(0).ok().and_then(|p| p.tree().ok())
+        } else {
+            None
+        };
 
-        // Track new files
+        // Build DirectFileChange list from git blobs — no filesystem writes
+        let mut changes = Vec::with_capacity(parsed.files.len());
         for file in &parsed.files {
-            if file.operation == FileOperation::Added
-                || file.operation == FileOperation::Renamed
-                || file.operation == FileOperation::Copied
-            {
-                let _ = repo.add(&file.path, atomic_repository::TrackingOptions::default());
+            match file.operation {
+                FileOperation::Added | FileOperation::Copied => {
+                    let content = read_blob_from_tree(git_repo, &tree, &file.path)
+                        .unwrap_or_default();
+                    changes.push(DirectFileChange {
+                        path: file.path.clone(),
+                        operation: DirectFileOp::Added { content },
+                    });
+                }
+                FileOperation::Modified => {
+                    let content = read_blob_from_tree(git_repo, &tree, &file.path)
+                        .unwrap_or_default();
+                    // Read old content from git parent tree (fast mmap read)
+                    // instead of reconstructing from the pristine graph (slow traversal)
+                    let old_content = parent_tree.as_ref()
+                        .and_then(|pt| read_blob_from_tree(git_repo, pt, &file.path));
+                    changes.push(DirectFileChange {
+                        path: file.path.clone(),
+                        operation: DirectFileOp::Modified { content, old_content },
+                    });
+                }
+                FileOperation::Deleted => {
+                    changes.push(DirectFileChange {
+                        path: file.path.clone(),
+                        operation: DirectFileOp::Deleted,
+                    });
+                }
+                FileOperation::Renamed => {
+                    // Decompose rename into delete + add
+                    if let Some(ref old_path) = file.old_path {
+                        changes.push(DirectFileChange {
+                            path: old_path.clone(),
+                            operation: DirectFileOp::Deleted,
+                        });
+                    }
+                    let content = read_blob_from_tree(git_repo, &tree, &file.path)
+                        .unwrap_or_default();
+                    changes.push(DirectFileChange {
+                        path: file.path.clone(),
+                        operation: DirectFileOp::Added { content },
+                    });
+                }
             }
         }
 
-        // Record the change
-        let options = atomic_repository::RecordOptions::new()
+        // Record directly — no filesystem writes, no status() walk, no repo.add()
+        let options = RecordOptions::new()
             .with_all(true)
             .save_to_store(false)
             .apply_after_record(false);
 
-        let (change, hash) = match repo.record(header.clone(), options) {
+        let (change, hash) = match repo.record_direct(header.clone(), &changes, options) {
             Ok(mut result) => {
                 let hash = *result.hash();
                 result.change_mut().unhashed = Some(self.build_git_metadata(parsed, false, false));
@@ -678,7 +869,7 @@ fn parse_commit(
     let is_empty = stats.files_changed() == 0;
 
     // Parse files
-    let files = parse_diff_files(git_repo, &diff, &tree)?;
+    let files = parse_diff_files(&diff)?;
 
     Ok(ParsedCommit {
         git_sha: sha,
@@ -717,9 +908,7 @@ fn extract_commit_metadata(commit: &git2::Commit) -> CliResult<CommitMetadata> {
 
 /// Parse files from a git diff.
 fn parse_diff_files(
-    git_repo: &GitRepository,
     diff: &Diff,
-    tree: &Tree,
 ) -> CliResult<Vec<ParsedFile>> {
     let mut files = Vec::new();
 
@@ -753,49 +942,14 @@ fn parse_diff_files(
             None
         };
 
-        // Get new content for added/modified files
-        let new_content = if operation == FileOperation::Added
-            || operation == FileOperation::Modified
-            || operation == FileOperation::Renamed
-            || operation == FileOperation::Copied
-        {
-            get_file_content(git_repo, tree, &path).ok()
-        } else {
-            None
-        };
-
         files.push(ParsedFile {
             path,
             operation,
-            new_content,
             old_path,
         });
     }
 
     Ok(files)
-}
-
-/// Get file content from a git tree.
-fn get_file_content(git_repo: &GitRepository, tree: &Tree, path: &str) -> CliResult<Vec<u8>> {
-    let entry = tree
-        .get_path(Path::new(path))
-        .map_err(|e| CliError::GitError {
-            message: format!("Path not found in tree: {}", e),
-        })?;
-
-    if entry.kind() != Some(ObjectType::Blob) {
-        return Err(CliError::GitError {
-            message: "Not a file".to_string(),
-        });
-    }
-
-    let blob = git_repo
-        .find_blob(entry.id())
-        .map_err(|e| CliError::GitError {
-            message: format!("Failed to find blob: {}", e),
-        })?;
-
-    Ok(blob.content().to_vec())
 }
 
 /// Parse a git commit message into subject and description.
@@ -822,6 +976,20 @@ fn parse_commit_message(message: &str) -> (String, Option<String>) {
     };
 
     (subject, description)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Incremental Working Directory Helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Read a file's content directly from git's object store (no filesystem checkout).
+///
+/// This reads from packed objects / loose objects, which is much faster than
+/// checking out the entire tree to disk.
+fn read_blob_from_tree(git_repo: &GitRepository, tree: &git2::Tree, path: &str) -> Option<Vec<u8>> {
+    let entry = tree.get_path(Path::new(path)).ok()?;
+    let blob = git_repo.find_blob(entry.id()).ok()?;
+    Some(blob.content().to_vec())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -67,6 +67,13 @@ pub struct Import {
     /// Compares Git commit SHAs with existing change metadata to skip already-imported commits.
     #[arg(long)]
     pub incremental: bool,
+
+    /// Number of commits to process per batch.
+    ///
+    /// Larger batches use slightly more memory but reduce checkpoint overhead.
+    /// The default works well for most repositories including very large ones.
+    #[arg(long, default_value = "5000")]
+    pub batch_size: usize,
 }
 
 impl Import {
@@ -77,6 +84,7 @@ impl Import {
         branch_name: &str,
         repo: &mut Repository,
         imported_shas: &HashSet<String>,
+        repo_root: &std::path::Path,
     ) -> CliResult<usize> {
         // Get repository name from remote URL or working directory
         let repo_name = self.get_repo_name(git_repo);
@@ -86,12 +94,13 @@ impl Import {
             incremental: self.incremental,
             imported_shas: imported_shas.clone(),
             repo_name,
+            batch_size: self.batch_size,
         };
 
         let importer = ParallelImporter::new(git_repo, options);
 
-        // Run the three-phase parallel import
-        let stats = importer.import_branch(branch_name, repo)?;
+        // Run the batched parallel import
+        let stats = importer.import_branch(branch_name, repo, repo_root)?;
 
         // Return total changes created (written + empty + merge)
         Ok(stats.changes_written + stats.empty_commits + stats.merge_commits)
@@ -307,7 +316,7 @@ impl Command for Import {
 
                 // Import the branch
                 let count =
-                    self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas)?;
+                    self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas, workdir)?;
                 total_imported += count;
             }
 
@@ -340,7 +349,7 @@ impl Command for Import {
                 .map_err(|e| CliError::Internal(e.into()))?;
 
             // Import
-            let count = self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas)?;
+            let count = self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas, workdir)?;
 
             print_success(&format!(
                 "Imported {} changes from branch '{}'",
@@ -363,5 +372,6 @@ mod tests {
         assert!(!import.all_branches);
         assert!(!import.incremental);
         assert!(import.branch.is_none());
+        assert_eq!(import.batch_size, 0);
     }
 }
