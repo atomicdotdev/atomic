@@ -149,10 +149,7 @@ impl Command for Enable {
                 detected
             } else {
                 // Multiple agents detected — ask user to be specific or use --all
-                println!(
-                    "Multiple agents detected: {}",
-                    detected.to_vec().join(", ")
-                );
+                println!("Multiple agents detected: {}", detected.to_vec().join(", "));
                 println!("Use --agent <name> to choose one, or --all to install for all.");
                 return Ok(());
             }
@@ -205,10 +202,7 @@ impl Command for Enable {
                         ));
                         total_installed += count;
                     } else {
-                        println!(
-                            "  ✓ hooks already up to date for {}.",
-                            agent.display_name(),
-                        );
+                        println!("  ✓ hooks already up to date for {}.", agent.display_name(),);
                     }
                 }
                 Err(e) => {

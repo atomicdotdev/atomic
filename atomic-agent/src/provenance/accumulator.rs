@@ -4,7 +4,7 @@
 //!
 //! The accumulator maintains the graph using `atomic-agent` types (JSON-serialized,
 //! `String` change hashes). When a turn is recorded, [`ProvenanceAccumulator::to_provenance_graph`]
-//! converts the accumulated state to the `atomic-core` [`ProvenanceGraph`] type
+//! converts the accumulated state to the `atomic-core` [`atomic_core::change::provenance_graph::ProvenanceGraph`] type
 //! (postcard-serialized, `Hash` change hashes) for content-addressed storage.
 //!
 //! The [`ProvenanceAccumulator`] maintains the provenance graph for a single
@@ -676,7 +676,7 @@ impl ProvenanceAccumulator {
     ///
     /// The `previous` field is automatically set from `last_provenance_hash`
     /// if a prior graph was saved for this session. Call
-    /// [`set_last_provenance_hash`] after saving to maintain the chain.
+    /// [`Self::set_last_provenance_hash`] after saving to maintain the chain.
     pub fn to_provenance_graph(
         &mut self,
         agent_name: &str,
@@ -759,7 +759,7 @@ impl ProvenanceAccumulator {
     /// graphs chain to it via `previous`.
     ///
     /// Call this after `Repository::save_provenance_graph()` succeeds,
-    /// then call [`save`] to persist the updated state.
+    /// then call [`Self::save`] to persist the updated state.
     pub fn set_last_provenance_hash(&mut self, hash_base32: impl Into<String>) {
         self.last_provenance_hash = Some(hash_base32.into());
     }

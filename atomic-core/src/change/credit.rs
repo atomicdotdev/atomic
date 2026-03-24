@@ -313,7 +313,7 @@ impl Credit {
         }
     }
 
-    /// Get a short attribution string (e.g., "alice [H]" or "bob [A:claude]").
+    /// Get a short attribution string (e.g., "alice `[H]`" or "bob `[A:claude]`").
     pub fn short_attribution(&self) -> String {
         let type_code = self.credit_type.short_code();
         match (&self.ai_vendor, &self.ai_model) {

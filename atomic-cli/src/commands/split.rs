@@ -152,7 +152,6 @@ impl Split {
     }
 }
 
-
 impl Command for Split {
     fn run(&self) -> CliResult<()> {
         // Validate the new stack name

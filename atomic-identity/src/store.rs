@@ -394,8 +394,9 @@ impl IdentityStore {
     ///
     /// The default location is `~/.atomic/identities/` in the user's home directory.
     fn default_store_path() -> Result<PathBuf, IdentityError> {
-        let home_dir = dirs::home_dir()
-            .ok_or(IdentityError::Config(atomic_config::ConfigError::NoConfigDir))?;
+        let home_dir = dirs::home_dir().ok_or(IdentityError::Config(
+            atomic_config::ConfigError::NoConfigDir,
+        ))?;
 
         Ok(home_dir.join(".atomic").join("identities"))
     }

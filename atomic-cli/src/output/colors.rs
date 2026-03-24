@@ -33,7 +33,7 @@
 //! # Color Support Detection
 //!
 //! The module respects the `NO_COLOR` environment variable and terminal
-//! capabilities. Use [`should_colorize`] to check if colors should be used,
+//! capabilities. Use [`ColorMode::should_colorize`] to check if colors should be used,
 //! or use the [`ColorMode`] enum to explicitly control color output.
 
 use console::{style, StyledObject};
@@ -41,8 +41,7 @@ use console::{style, StyledObject};
 // Color Mode
 
 /// Controls when colors should be used in output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColorMode {
     /// Automatically detect whether to use colors (based on terminal support).
     #[default]
@@ -52,7 +51,6 @@ pub enum ColorMode {
     /// Never use colors.
     Never,
 }
-
 
 impl ColorMode {
     /// Check if colors should be used based on this mode.

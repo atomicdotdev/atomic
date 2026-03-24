@@ -124,8 +124,8 @@ pub enum PristineError {
 
     /// A stack with this name already exists
     ///
-    /// Returned by [`MutTxnT::create_stack`] when attempting to create a
-    /// stack whose name is already taken. Use [`MutTxnT::open_or_create_stack`]
+    /// Returned by `MutTxnT::create_stack` when attempting to create a
+    /// stack whose name is already taken. Use `MutTxnT::open_or_create_stack`
     /// if "get or create" semantics are desired.
     StackAlreadyExists {
         /// The name of the stack that already exists

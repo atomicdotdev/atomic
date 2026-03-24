@@ -162,7 +162,6 @@ impl Phase {
     }
 }
 
-
 impl fmt::Display for Phase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())

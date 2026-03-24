@@ -11,12 +11,12 @@
 //!
 //! | Module | Description |
 //! |--------|-------------|
-//! | [`options`] | Configuration for output operations |
-//! | [`outcome`] | Results and statistics tracking |
-//! | [`conflict`] | Conflict types and tracking |
-//! | [`error`] | Error types for output operations |
-//! | [`writer`] | Conflict-aware writer implementation |
-//! | [`content`] | Graph content output function |
+//! | `options` | Configuration for output operations |
+//! | `outcome` | Results and statistics tracking |
+//! | `conflict` | Conflict types and tracking |
+//! | `error` | Error types for output operations |
+//! | `writer` | Conflict-aware writer implementation |
+//! | `content` | Graph content output function |
 //!
 //! # Overview
 //!
@@ -90,7 +90,7 @@
 //! <<<<<<< 1
 //! ```
 //!
-//! See the [`conflict`] module for details on conflict types.
+//! See the `conflict` module for details on conflict types.
 //!
 //! # Conflict Markers
 //!

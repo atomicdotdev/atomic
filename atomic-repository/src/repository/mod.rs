@@ -24,7 +24,7 @@
 //!
 //! Changes are stored in a content-addressed manner under `.atomic/changes/`.
 //! The repository provides convenient methods for saving and loading changes
-//! that integrate with the underlying [`ChangeStore`](crate::ChangeStore).
+//! that integrate with the underlying [`ChangeStore`].
 //!
 //! ```rust,ignore
 //! // Save a change

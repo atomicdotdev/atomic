@@ -154,7 +154,7 @@ impl Repository {
 
     /// Get file content via overlay, excluding a specific change.
     ///
-    /// This is identical to [`get_file_content_via_overlay`] but removes
+    /// This is identical to [`Self::get_file_content_via_overlay`] but removes
     /// `exclude_hash` from the change filter. Use this to get the file
     /// content as it was **before** a specific change was applied — pass
     /// the change's hash as `exclude_hash` and you get the prior state.
@@ -629,7 +629,7 @@ impl Repository {
     ///
     /// The first call for a specific state involves iterating over the change
     /// log up to that point. For multiple files at the same state, consider
-    /// using [`get_file_content_at_sequence`] with a cached change set.
+    /// using [`Self::get_file_content_at_sequence`] with a cached change set.
     pub fn get_file_content_before_change<P: AsRef<Path>>(
         &self,
         path: P,
@@ -679,7 +679,7 @@ impl Repository {
     /// Get file content as it was AFTER a specific change was applied.
     ///
     /// This method retrieves the content of a file at the state immediately
-    /// after a change was applied. Combined with [`get_file_content_before_change`],
+    /// after a change was applied. Combined with [`Self::get_file_content_before_change`],
     /// this enables showing exactly what a specific change modified.
     ///
     /// # Arguments

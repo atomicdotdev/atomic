@@ -13,7 +13,7 @@
 //! # Command Structure
 //!
 //! Commands are organized into modules under `commands/`, with each command
-//! implementing the [`Command`](commands::Command) trait. This provides:
+//! implementing the [`Command`] trait. This provides:
 //!
 //! - Consistent error handling across all commands
 //! - Testable command implementations

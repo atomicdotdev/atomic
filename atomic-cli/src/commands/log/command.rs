@@ -538,7 +538,7 @@ pub fn truncate_string(s: &str, max_len: usize) -> String {
 
 /// Format an author for display from an `Author` struct.
 ///
-/// Combines name and optional email into a standard "Name <email>" format.
+/// Combines name and optional email into a standard `"Name <email>"` format.
 ///
 /// # Arguments
 ///

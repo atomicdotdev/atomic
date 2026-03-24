@@ -58,7 +58,7 @@
 //! - [`edge`]: EdgeUpdate atom application (modifying existing edges)
 //! - [`conflict`]: Conflict detection and tracking (zombies, missing context)
 //! - [`workspace`]: Temporary state during application
-//! - [`error`]: Error types for application failures
+//! - `error`: Error types for application failures
 //!
 //! # Key Components
 //!

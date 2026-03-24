@@ -45,8 +45,8 @@
 //!
 //! # Module Structure
 //!
-//! - [`error`]: Error types for output operations
-//! - [`traits`]: Working copy abstraction traits (`WorkingCopy`, `VertexBuffer`)
+//! - `error`: Error types for output operations
+//! - `traits`: Working copy abstraction traits (`WorkingCopy`, `VertexBuffer`)
 //! - [`memory`]: In-memory working copy for testing
 //! - [`crdt`]: CRDT-based content retrieval (line-by-line with token granularity)
 //!

@@ -57,7 +57,7 @@
 //!
 //! # Thread Safety
 //!
-//! The [`ChangeStore`] uses interior mutability ([`RefCell`]) for the cache,
+//! The [`ChangeStore`] uses interior mutability ([`std::cell::RefCell`]) for the cache,
 //! making it `!Sync`. For concurrent access, wrap it in a `Mutex` or use
 //! separate instances per thread.
 
@@ -782,9 +782,10 @@ impl ChangeStore {
         let temp_file = tempfile::NamedTempFile::new_in(&self.changes_dir)?;
         temp_file.as_file().write_all(&data)?;
         temp_file.persist(&path).map_err(|e| {
-            ChangeStoreError::Io(std::io::Error::other(
-                format!("Failed to persist attestation: {}", e),
-            ))
+            ChangeStoreError::Io(std::io::Error::other(format!(
+                "Failed to persist attestation: {}",
+                e
+            )))
         })?;
 
         log::debug!(
@@ -912,9 +913,10 @@ impl ChangeStore {
         let temp_file = tempfile::NamedTempFile::new_in(&self.changes_dir)?;
         temp_file.as_file().write_all(&data)?;
         temp_file.persist(&path).map_err(|e| {
-            ChangeStoreError::Io(std::io::Error::other(
-                format!("Failed to persist provenance graph: {}", e),
-            ))
+            ChangeStoreError::Io(std::io::Error::other(format!(
+                "Failed to persist provenance graph: {}",
+                e
+            )))
         })?;
 
         log::debug!(
@@ -1098,9 +1100,10 @@ impl ProvenanceIterator {
                         if !path.is_file() {
                             continue;
                         }
-                        if path.extension().is_none_or(|e| {
-                            e != atomic_core::change::PROVENANCE_GRAPH_EXTENSION
-                        }) {
+                        if path
+                            .extension()
+                            .is_none_or(|e| e != atomic_core::change::PROVENANCE_GRAPH_EXTENSION)
+                        {
                             continue;
                         }
                         // Extract hash from filename (strip extension)

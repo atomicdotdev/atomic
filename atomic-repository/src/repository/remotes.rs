@@ -142,9 +142,7 @@ impl Repository {
     /// Returns an error if the remote doesn't exist.
     pub fn remove_remote(&self, name: &str) -> Result<(), RepositoryError> {
         let mut config = self.load_remotes()?;
-        config
-            .remove(name)
-            .map_err(RepositoryError::Remote)?;
+        config.remove(name).map_err(RepositoryError::Remote)?;
         self.save_remotes(&config)
     }
 
@@ -160,9 +158,7 @@ impl Repository {
     /// Returns an error if the remote doesn't exist or the URL is invalid.
     pub fn set_remote_url(&self, name: &str, url: &str) -> Result<(), RepositoryError> {
         let mut config = self.load_remotes()?;
-        config
-            .set_url(name, url)
-            .map_err(RepositoryError::Remote)?;
+        config.set_url(name, url).map_err(RepositoryError::Remote)?;
         self.save_remotes(&config)
     }
 
@@ -177,9 +173,7 @@ impl Repository {
     /// Returns an error if the remote doesn't exist.
     pub fn set_default_remote(&self, name: &str) -> Result<(), RepositoryError> {
         let mut config = self.load_remotes()?;
-        config
-            .set_default(name)
-            .map_err(RepositoryError::Remote)?;
+        config.set_default(name).map_err(RepositoryError::Remote)?;
         self.save_remotes(&config)
     }
 

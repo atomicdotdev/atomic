@@ -3,7 +3,7 @@
 //! This module defines the [`AgentHook`] trait that each agent adapter implements,
 //! and the [`AgentRegistry`] that manages available adapters. The trait normalizes
 //! agent-specific hook formats (Claude Code, Gemini CLI, Codex, OpenCode) into
-//! the common [`TurnEvent`](crate::event::TurnEvent) type.
+//! the common [`TurnEvent`] type.
 //!
 //! # Architecture
 //!

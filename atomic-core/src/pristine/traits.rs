@@ -653,7 +653,7 @@ pub trait StackTxnT: GraphTxnT {
     /// Look up a stack by its internal ID.
     ///
     /// This is used to resolve parent references when walking the overlay
-    /// chain. Unlike [`get_stack`] which looks up by name, this looks up
+    /// chain. Unlike [`Self::get_stack`] which looks up by name, this looks up
     /// by the internal numeric ID stored in `StackState::id`.
     ///
     /// # Arguments
@@ -780,7 +780,7 @@ pub trait StackTxnT: GraphTxnT {
     ///
     /// This performs a range scan on the `STACK_GRAPH` table to find all
     /// vertices belonging to a specific change in a specific stack. It is
-    /// used by [`OverlayTxn`] to implement `find_block` and `find_block_end`
+    /// used by [`crate::pristine::OverlayTxn`] to implement `find_block` and `find_block_end`
     /// against the `STACK_GRAPH`.
     ///
     /// # Arguments
@@ -1291,7 +1291,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
 
     /// Register a provenance graph and get its internal ID.
     ///
-    /// Similar to [`register_change`] and [`register_attestation`], but
+    /// Similar to [`Self::register_change`] and [`Self::register_attestation`], but
     /// for provenance graph artifacts. Uses `node_type::PROVENANCE`.
     ///
     /// # Arguments
@@ -1485,7 +1485,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// Create a new stack with explicit kind and parent.
     ///
     /// If a stack with the given name already exists, returns an error.
-    /// Use [`open_or_create_stack`] for the backward-compatible "get or create"
+    /// Use [`Self::open_or_create_stack`] for the backward-compatible "get or create"
     /// behavior (which defaults to Shared, no parent).
     ///
     /// # Arguments

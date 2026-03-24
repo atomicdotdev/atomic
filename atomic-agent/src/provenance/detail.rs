@@ -243,7 +243,6 @@ pub enum Contributor {
     Mixed,
 }
 
-
 impl std::fmt::Display for Contributor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -364,7 +363,6 @@ pub enum TurnOutcome {
     /// The turn failed without completing its goal.
     Failed,
 }
-
 
 impl std::fmt::Display for TurnOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

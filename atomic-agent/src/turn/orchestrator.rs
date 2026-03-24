@@ -3,7 +3,7 @@
 //! The `TurnOrchestrator` is the central coordinator that connects:
 //!
 //! - **Agent hooks** (via [`TurnEvent`]) — lifecycle events from the agent
-//! - **State machine** (via [`transition`]) — determines what actions to take
+//! - **State machine** (via [`crate::turn::phase::transition`]) — determines what actions to take
 //! - **File watcher** (via [`FileWatcher`]) — optional real-time file tracking
 //! - **Recording** (via [`record_turn`]) — status → add → record workflow
 //! - **Session store** (via [`SessionStore`]) — persists session state

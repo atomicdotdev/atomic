@@ -386,7 +386,7 @@ impl fmt::Display for ApplyStats {
 ///
 /// # Lifecycle
 ///
-/// 1. Create with [`ApplyContext::new`] or [`ApplyContext::with_content`]
+/// 1. Create with [`ApplyContext::new`] or `ApplyContext::with_content`
 /// 2. Use during apply operations to record stats and conflicts
 /// 3. Call [`ApplyContext::finish`] to get the final [`ApplyOutcome`]
 ///

@@ -108,10 +108,10 @@
 //!
 //! # Module Organization
 //!
-//! - [`error`] - Error types (`PristineError`, `PristineResult`)
+//! - `error` - Error types (`PristineError`, `PristineResult`)
 //! - [`tables`] - redb table definitions and key encoding helpers
-//! - [`traits`] - Database trait abstractions (`GraphTxnT`, `StackTxnT`, `TreeTxnT`, `MutTxnT`)
-//! - [`txn`] - Transaction implementations (`Pristine`, `ReadTxn`, `WriteTxn`)
+//! - `traits` - Database trait abstractions (`GraphTxnT`, `StackTxnT`, `TreeTxnT`, `MutTxnT`)
+//! - `txn` - Transaction implementations (`Pristine`, `ReadTxn`, `WriteTxn`)
 //!
 //! # Table Reference
 //!
@@ -120,8 +120,8 @@
 //! | `EXTERNAL` | NodeId | Hash | Internal → external ID mapping |
 //! | `INTERNAL` | Hash | NodeId | External → internal ID mapping |
 //! | `NODE_TYPES` | NodeId | u8 | Type of node (change, tag) |
-//! | `GRAPH` | Span | [Edge] | Main graph (multimap) |
-//! | `INODE_GRAPH` | (Inode, Span) | [Edge] | File-scoped graph index |
+//! | `GRAPH` | Span | `Edge` | Main graph (multimap) |
+//! | `INODE_GRAPH` | (Inode, Span) | `Edge` | File-scoped graph index |
 //! | `STACKS` | name | StackState | Stack metadata |
 //! | `STACK_CHANGES` | (stack_id, seq) | change_id | Change log |
 //! | `REV_STACK_CHANGES` | (stack_id, change_id) | seq | Reverse change log |
@@ -129,8 +129,8 @@
 //! | `REV_TREE` | inode | path | Inode → path mapping |
 //! | `INODES` | inode | Position | Inode → graph position |
 //! | `REV_INODES` | Position | inode | Graph position → inode |
-//! | `DEPS` | change_id | [dep_id] | Dependencies (multimap) |
-//! | `REV_DEPS` | dep_id | [change_id] | Reverse dependencies |
+//! | `DEPS` | change_id | `dep_id` | Dependencies (multimap) |
+//! | `REV_DEPS` | dep_id | `change_id` | Reverse dependencies |
 //! | `STATES` | (stack_id, merkle) | seq | State → sequence lookup |
 //! | `TAGS` | (stack_id, seq) | merkle | Tagged states |
 //!

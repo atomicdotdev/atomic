@@ -56,10 +56,10 @@
 //!
 //! # Module Structure
 //!
-//! - [`graph`]: The `AliveGraph` data structure and accessors
-//! - [`span`]: `AliveVertex` and span classification
-//! - [`retrieve`]: Graph retrieval from the pristine database
-//! - [`order`]: Topological ordering with conflict detection
+//! - `graph`: The `AliveGraph` data structure and accessors
+//! - `span`: `AliveVertex` and span classification
+//! - `retrieve`: Graph retrieval from the pristine database
+//! - `order`: Topological ordering with conflict detection
 //!
 //! # Example
 //!

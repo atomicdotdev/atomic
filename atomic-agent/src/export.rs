@@ -31,7 +31,7 @@
 //! When `graph.profile == "sherpa-trace/1.0.0"` the record's
 //! `metadata["dev.atomic"]` object is populated with:
 //!
-//! - `profile`       — [`TraceProfile`] discriminator
+//! - `profile`       — `TraceProfile` discriminator
 //! - `intent`        — parsed [`GoalDetail`] from the `Goal` node
 //! - `todos`         — list of parsed [`CommitmentDetail`] from `Commitment` nodes
 //! - `verification`  — parsed [`VerificationDetail`] from the `Verification` node

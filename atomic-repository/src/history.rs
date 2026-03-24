@@ -271,8 +271,7 @@ impl fmt::Display for HistoryEntry {
 ///     .limit(50)
 ///     .load_headers(true);
 /// ```
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct HistoryOptions {
     /// Starting sequence number (inclusive).
     pub from_sequence: u64,
@@ -289,7 +288,6 @@ pub struct HistoryOptions {
     /// Only include tagged changes.
     pub tagged_only: bool,
 }
-
 
 impl HistoryOptions {
     /// Create new history options with defaults.

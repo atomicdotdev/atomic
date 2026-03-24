@@ -124,7 +124,7 @@ impl Author {
 
     /// Get a short display string for this author.
     ///
-    /// Returns "Name <email>" if email is present, otherwise just "Name".
+    /// Returns "Name \<email\>" if email is present, otherwise just "Name".
     pub fn display_short(&self) -> String {
         match &self.email {
             Some(email) => format!("{} <{}>", self.name, email),
@@ -140,7 +140,7 @@ impl fmt::Display for Author {
 }
 
 impl From<&str> for Author {
-    /// Parse an author from a string like "Name <email>".
+    /// Parse an author from a string like "Name \<email\>".
     ///
     /// If no email is found, the entire string is used as the name.
     fn from(s: &str) -> Self {

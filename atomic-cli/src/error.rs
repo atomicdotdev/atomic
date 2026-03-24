@@ -298,7 +298,7 @@ pub enum CliError {
     /// An unexpected internal error occurred.
     ///
     /// This indicates a bug in Atomic. If you encounter this error,
-    /// please report it at: https://github.com/atomic-vcs/atomic/issues
+    /// please report it at: <https://github.com/atomic-vcs/atomic/issues>
     #[error("Internal error: {0}")]
     Internal(#[from] anyhow::Error),
 

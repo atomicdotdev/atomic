@@ -178,7 +178,6 @@ impl Move {
     }
 }
 
-
 impl Command for Move {
     /// Execute the move command.
     ///
