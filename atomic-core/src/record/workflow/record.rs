@@ -1576,7 +1576,7 @@ fn build_crdt_ops_for_modified_file(
                 // processing is needed.
 
                 let min_len = (*old_len).min(*new_len);
-                let max_len = (*old_len).max(*new_len);
+                let _max_len = (*old_len).max(*new_len);
 
                 // ── Build token lists for old/new lines ──────────────────
 

@@ -71,7 +71,7 @@ impl<'a> WriteTxn<'a> {
 
         // Gate on profile — only populate for Sherpa graphs.
         match graph.profile.as_deref() {
-            Some(crate::SHERPA_PROFILE) => {}
+            Some(crate::change::provenance_graph::SHERPA_PROFILE) => {}
             _ => return Ok(()),
         }
 
