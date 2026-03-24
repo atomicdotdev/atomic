@@ -100,6 +100,9 @@ pub mod identity;
 // Phase 5: Hive Agent Social Platform
 pub mod hive;
 
+// Git Interoperability
+pub mod git;
+
 // Re-export command structs for convenience
 pub use add::Add;
 pub use agent::Agent;
@@ -107,6 +110,7 @@ pub use apply::Apply;
 pub use change::ChangeCmd;
 pub use clone::Clone;
 pub use diff::Diff;
+pub use git::Git;
 pub use hive::Hive;
 pub use identity::Identity;
 pub use init::Init;

@@ -96,6 +96,22 @@ impl ChangeIdentifier {
             Some(s) => s.trim(),
         };
 
+        // Check for @ syntax (latest change or relative reference)
+        if s == "@" {
+            return Ok(ChangeIdentifier::Latest);
+        }
+
+        // Check for @~N syntax (N changes before latest)
+        if let Some(offset_str) = s.strip_prefix("@~") {
+            // This would need special handling in the resolve step
+            // For now, we'll treat it as a relative sequence lookup
+            // which requires the stack's length
+            return Err(format!(
+                "Relative reference '@~N' is not yet supported: {}",
+                s
+            ));
+        }
+
         // Check for sequence number with # prefix
         if let Some(num_str) = s.strip_prefix('#') {
             return num_str

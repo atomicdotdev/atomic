@@ -454,6 +454,163 @@ assert_log_count() {
     fi
 }
 
+# ── Git Helpers ─────────────────────────────────────────────────────────────
+
+# Check if git is available
+require_git() {
+    if ! command -v git &>/dev/null; then
+        echo "${YELLOW}SKIPPING: git not installed${RESET}"
+        exit 0
+    fi
+}
+
+# Check if network is available (can reach github.com)
+require_network() {
+    if ! curl --silent --head --max-time 5 https://github.com &>/dev/null; then
+        echo "${YELLOW}SKIPPING: network unavailable${RESET}"
+        exit 0
+    fi
+}
+
+# Clone a git repo to a temp directory
+# Usage: clone_git_repo <url> [ref]
+# Sets: GIT_REPO_DIR
+clone_git_repo() {
+    local url="$1"
+    local ref="${2:-HEAD}"
+    GIT_REPO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/atomic-git-test-XXXXXX")"
+    _HARNESS_TMPDIRS+=("$GIT_REPO_DIR")
+    if ! git clone --quiet "$url" "$GIT_REPO_DIR"; then
+        echo "${YELLOW}SKIPPING: failed to clone git repo '$url'${RESET}"
+        exit 0
+    fi
+    if [[ "$ref" != "HEAD" ]]; then
+        if ! (cd "$GIT_REPO_DIR" && git checkout --quiet "$ref"); then
+            echo "${YELLOW}SKIPPING: failed to checkout ref '$ref' in git repo '$url'${RESET}"
+            exit 0
+        fi
+    fi
+}
+
+# Initialize a fresh git repo in current directory
+init_git_repo() {
+    git init --quiet
+    git config user.email "test@atomic.dev"
+    git config user.name "Test User"
+}
+
+# Create a git commit
+# Usage: git_commit <message> [file] [content]
+git_commit() {
+    local msg="$1"
+    local file="${2:-file.txt}"
+    local content="${3:-content for $msg}"
+    
+    mkdir -p "$(dirname "$file")"
+    printf '%s' "$content" > "$file"
+    git add "$file"
+    git commit --quiet -m "$msg"
+}
+
+# Get git commit count on current branch
+git_commit_count() {
+    git rev-list --count HEAD 2>/dev/null || echo "0"
+}
+
+# Get current git branch name
+git_current_branch() {
+    git branch --show-current 2>/dev/null || git rev-parse --abbrev-ref HEAD
+}
+
+# Get the default branch name (what a fresh clone checks out)
+git_default_branch() {
+    # After a fresh clone, the current branch is the default
+    # This also works for repos with main vs master
+    git symbolic-ref --short HEAD 2>/dev/null || git branch --show-current 2>/dev/null || echo "main"
+}
+
+# Get git commit SHA (short)
+git_head_sha() {
+    git rev-parse --short HEAD
+}
+
+# Get git commit SHA (full)
+git_head_sha_full() {
+    git rev-parse HEAD
+}
+
+# Create a merge commit
+# Usage: git_merge_branch <branch_name>
+git_merge_branch() {
+    local branch="$1"
+    git merge --no-ff --quiet "$branch" -m "Merge branch '$branch'"
+}
+
+# Add a submodule
+# Usage: git_add_submodule <url> <path>
+git_add_submodule() {
+    local url="$1"
+    local path="$2"
+    git submodule add --quiet "$url" "$path" 2>/dev/null
+    git commit --quiet -m "Add submodule $path"
+}
+
+# Assert atomic log entry count
+# Usage: assert_atomic_log_count <description> <expected_count>
+assert_atomic_log_count() {
+    local desc="$1"
+    local expected="$2"
+    local actual
+    local log_output
+    # Capture log output, count lines that look like change entries
+    log_output="$(atomic log 2>/dev/null || true)"
+    if [[ -z "$log_output" ]]; then
+        actual=0
+    else
+        # Count lines matching change entry patterns (# followed by number, or hash-like strings)
+        actual="$(echo "$log_output" | grep -cE '^\s*#[0-9]+|^[0-9a-f]{8,}' || true)"
+        # Ensure we have a valid number
+        actual="${actual:-0}"
+        # Remove any whitespace/newlines
+        actual="$(echo "$actual" | tr -d '[:space:]')"
+    fi
+    if [[ "$actual" -eq "$expected" ]]; then
+        _pass "$desc"
+    else
+        _fail "$desc" "expected $expected changes, got $actual"
+    fi
+}
+
+# Assert change has author containing string
+# Usage: assert_change_author <description> <change_ref> <author_substring>
+assert_change_author() {
+    local desc="$1"
+    local ref="$2"
+    local expected="$3"
+    local out
+    out="$(atomic change "$ref" 2>/dev/null || true)"
+    if echo "$out" | grep -qiE "author.*$expected"; then
+        _pass "$desc"
+    else
+        _fail "$desc" "author did not contain '$expected'"
+    fi
+}
+
+# Assert change message contains string
+# Usage: assert_change_message <description> <change_ref> <message_substring>
+assert_change_message() {
+    local desc="$1"
+    local ref="$2"
+    local expected="$3"
+    local out
+    out="$(atomic change "$ref" 2>/dev/null || true)"
+    if echo "$out" | grep -qF "$expected"; then
+        _pass "$desc"
+    else
+        _fail "$desc" "message did not contain '$expected'"
+    fi
+}
+
 # ── Section headers ─────────────────────────────────────────────────────────
 
 begin_section() {

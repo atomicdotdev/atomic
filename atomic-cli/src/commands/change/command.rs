@@ -392,6 +392,34 @@ impl ChangeCmd {
             }
         }
 
+        // Git import metadata (if present)
+        if let Some(ref unhashed) = change.unhashed {
+            if let Some(git) = unhashed.get("git") {
+                output.push('\n');
+                output.push_str("Git Import:\n");
+                if let Some(repo) = git.get("repository").and_then(|v| v.as_str()) {
+                    output.push_str(&format!("  Repository: {}\n", repo));
+                }
+                if let Some(sha) = git.get("sha").and_then(|v| v.as_str()) {
+                    output.push_str(&format!("  Commit: {}\n", &sha[..12.min(sha.len())]));
+                }
+                if git
+                    .get("empty_commit")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    output.push_str(&format!("  {}\n", hint("(empty commit)")));
+                }
+                if git
+                    .get("empty_merge")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    output.push_str(&format!("  {}\n", hint("(merge commit)")));
+                }
+            }
+        }
+
         // Graph statistics
         output.push('\n');
         let (vertices, edges) = count_atoms(&change.hashed.hunks);

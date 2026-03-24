@@ -85,6 +85,9 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # Diff algorithms
 similar = "2.4"
 
+# Git interop
+git2 = "0.19"
+
 # Testing
 quickcheck = "1.0"
 quickcheck_macros = "1.0"
