@@ -71,7 +71,7 @@ impl<'a> WriteTxn<'a> {
 
         // Gate on profile — only populate for Sherpa graphs.
         match graph.profile.as_deref() {
-            Some(p) if p.starts_with("sherpa-trace") => {}
+            Some("sherpa-trace/1.0.0") => {}
             _ => return Ok(()),
         }
 
