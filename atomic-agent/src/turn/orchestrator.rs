@@ -1133,10 +1133,7 @@ impl TurnOrchestrator {
                 ),
                 "llm_response" => (
                     NodeKind::LlmResponse,
-                    dev_atomic["reply"]
-                        .as_str()
-                        .unwrap_or("llm response")
-                        .to_string(),
+                    truncate_prompt(dev_atomic["reply"].as_str().unwrap_or("llm response"), 200),
                 ),
                 "verification" => (
                     NodeKind::Verification,
@@ -1535,6 +1532,25 @@ fn vendor_from_agent_name(agent_name: &str) -> &'static str {
         "opencode" => "openai",
         _ => "unknown",
     }
+}
+
+/// Truncate a string to `max_len` bytes, breaking at a word boundary where
+/// possible and appending `"..."`.  Mirrors the same helper in sibling modules.
+fn truncate_prompt(prompt: &str, max_len: usize) -> String {
+    let trimmed = prompt.trim();
+    if trimmed.len() <= max_len {
+        return trimmed.to_string();
+    }
+
+    // Try to break at a word boundary in the first `max_len - 3` bytes.
+    let truncated = &trimmed[..max_len.saturating_sub(3)];
+    if let Some(last_space) = truncated.rfind(' ') {
+        if last_space > max_len / 2 {
+            return format!("{}...", &truncated[..last_space]);
+        }
+    }
+
+    format!("{}...", truncated)
 }
 
 impl std::fmt::Debug for TurnOrchestrator {

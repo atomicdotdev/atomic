@@ -184,22 +184,23 @@ impl SessionEvent {
 
 /// Encode a `(provenance_id, seq)` pair as 16 bytes for `SESSION_EVENTS`.
 ///
-/// Layout: `[provenance_id: u64 LE][seq: u64 LE]`
+/// Layout: `[provenance_id: u64 BE][seq: u64 BE]`
 ///
-/// This follows the same pattern as [`encode_stack_seq`](crate::pristine::tables::encode_stack_seq).
+/// Big-endian encoding is required so that lexicographic byte order (used by
+/// the B-tree) matches numeric order, enabling correct prefix range scans.
 #[inline]
 pub fn encode_session_event_key(provenance_id: u64, seq: u64) -> [u8; 16] {
     let mut key = [0u8; 16];
-    key[0..8].copy_from_slice(&provenance_id.to_le_bytes());
-    key[8..16].copy_from_slice(&seq.to_le_bytes());
+    key[0..8].copy_from_slice(&provenance_id.to_be_bytes());
+    key[8..16].copy_from_slice(&seq.to_be_bytes());
     key
 }
 
 /// Decode a `(provenance_id, seq)` pair from 16 bytes.
 #[inline]
 pub fn decode_session_event_key(key: &[u8; 16]) -> (u64, u64) {
-    let provenance_id = u64::from_le_bytes(key[0..8].try_into().unwrap());
-    let seq = u64::from_le_bytes(key[8..16].try_into().unwrap());
+    let provenance_id = u64::from_be_bytes(key[0..8].try_into().unwrap());
+    let seq = u64::from_be_bytes(key[8..16].try_into().unwrap());
     (provenance_id, seq)
 }
 
@@ -208,13 +209,16 @@ pub fn decode_session_event_key(key: &[u8; 16]) -> (u64, u64) {
 /// The `todo_id` string is hashed with Blake3 and the first 8 bytes are used
 /// as a fixed-size discriminant.
 ///
-/// Layout: `[provenance_id: u64 LE][blake3(todo_id)[0..8]]`
+/// Layout: `[provenance_id: u64 BE][blake3(todo_id)[0..8]]`
+///
+/// Big-endian encoding is required so that lexicographic byte order (used by
+/// the B-tree) matches numeric order, enabling correct prefix range scans.
 #[inline]
 pub fn encode_session_todo_key(provenance_id: u64, todo_id: &str) -> [u8; 16] {
     let hash = blake3::hash(todo_id.as_bytes());
     let hash_bytes = hash.as_bytes();
     let mut key = [0u8; 16];
-    key[0..8].copy_from_slice(&provenance_id.to_le_bytes());
+    key[0..8].copy_from_slice(&provenance_id.to_be_bytes());
     key[8..16].copy_from_slice(&hash_bytes[0..8]);
     key
 }
@@ -225,7 +229,7 @@ pub fn encode_session_todo_key(provenance_id: u64, todo_id: &str) -> [u8; 16] {
 /// string is stored inside the [`TodoSnapshot`] value.
 #[inline]
 pub fn decode_session_todo_key_provenance_id(key: &[u8; 16]) -> u64 {
-    u64::from_le_bytes(key[0..8].try_into().unwrap())
+    u64::from_be_bytes(key[0..8].try_into().unwrap())
 }
 
 /// Encode a `(provenance_id, phase_hash)` pair as 16 bytes for `SESSION_PHASES`.
@@ -233,13 +237,16 @@ pub fn decode_session_todo_key_provenance_id(key: &[u8; 16]) -> u64 {
 /// The `phase_name` string is hashed with Blake3 and the first 8 bytes are
 /// used as a fixed-size discriminant.
 ///
-/// Layout: `[provenance_id: u64 LE][blake3(phase_name)[0..8]]`
+/// Layout: `[provenance_id: u64 BE][blake3(phase_name)[0..8]]`
+///
+/// Big-endian encoding is required so that lexicographic byte order (used by
+/// the B-tree) matches numeric order, enabling correct prefix range scans.
 #[inline]
 pub fn encode_session_phase_key(provenance_id: u64, phase_name: &str) -> [u8; 16] {
     let hash = blake3::hash(phase_name.as_bytes());
     let hash_bytes = hash.as_bytes();
     let mut key = [0u8; 16];
-    key[0..8].copy_from_slice(&provenance_id.to_le_bytes());
+    key[0..8].copy_from_slice(&provenance_id.to_be_bytes());
     key[8..16].copy_from_slice(&hash_bytes[0..8]);
     key
 }
@@ -250,18 +257,22 @@ pub fn encode_session_phase_key(provenance_id: u64, phase_name: &str) -> [u8; 16
 /// is stored inside the [`PhaseTimingEntry`] value.
 #[inline]
 pub fn decode_session_phase_key_provenance_id(key: &[u8; 16]) -> u64 {
-    u64::from_le_bytes(key[0..8].try_into().unwrap())
+    u64::from_be_bytes(key[0..8].try_into().unwrap())
 }
 
 /// Encode a provenance-id prefix for range scans on any session table
 /// that uses `[u8; 16]` composite keys.
 ///
-/// Returns a 16-byte key with only `provenance_id` set and the secondary
-/// component zeroed. Used as the start bound for prefix scans.
+/// Returns a 16-byte key with `provenance_id` in the high bytes and the
+/// secondary component zeroed. Used as the start bound for prefix scans:
+/// all keys for a given `provenance_id` lie in `[prefix(id), prefix(id+1))`.
+///
+/// Big-endian encoding ensures this half-open range is correct across all
+/// numeric values of `provenance_id`.
 #[inline]
 pub fn encode_session_prefix(provenance_id: u64) -> [u8; 16] {
     let mut key = [0u8; 16];
-    key[0..8].copy_from_slice(&provenance_id.to_le_bytes());
+    key[0..8].copy_from_slice(&provenance_id.to_be_bytes());
     key
 }
 
@@ -525,7 +536,10 @@ mod tests {
 
     #[test]
     fn test_session_event_key_ordering() {
-        // Keys for the same provenance_id should sort by seq
+        // Keys for the same provenance_id must sort by seq in lexicographic
+        // (B-tree) order across the full u64 range.  Big-endian encoding
+        // guarantees this: the most-significant byte comes first, so byte-wise
+        // comparison matches numeric comparison for all values.
         let k1 = encode_session_event_key(5, 0);
         let k2 = encode_session_event_key(5, 1);
         let k3 = encode_session_event_key(5, 100);
@@ -534,6 +548,21 @@ mod tests {
         assert!(k1 < k2);
         assert!(k2 < k3);
         assert!(k3 < k4, "different provenance_id sorts after");
+
+        // Boundary: seq=255 (single-byte max) vs seq=256 (spills into second byte).
+        // With big-endian encoding this must sort correctly.
+        let k_255 = encode_session_event_key(5, 255);
+        let k_256 = encode_session_event_key(5, 256);
+        assert!(
+            k_255 < k_256,
+            "seq=255 must sort before seq=256 (byte-spill boundary)"
+        );
+
+        // seq=256 on provenance_id=5 must still sort before provenance_id=6.
+        assert!(
+            k_256 < k4,
+            "seq=256 on provenance_id=5 must sort before provenance_id=6"
+        );
     }
 
     #[test]

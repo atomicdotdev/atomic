@@ -536,17 +536,17 @@ impl ReadTxn {
         &self,
         provenance_id: u64,
     ) -> PristineResult<Vec<crate::change::session::SessionEvent>> {
-        use crate::change::session::{decode_session_event_key, SessionEvent};
+        use crate::change::session::{encode_session_prefix, SessionEvent};
 
         let table = self.txn.open_table(SESSION_EVENTS)?;
         let mut events = Vec::new();
 
-        for result in table.iter()? {
-            let (key, value) = result?;
-            let (prov_id, _seq) = decode_session_event_key(key.value());
-            if prov_id != provenance_id {
-                continue;
-            }
+        // Use a bounded prefix range instead of a full-table scan.
+        // All keys for `provenance_id` lie in [prefix(id), prefix(id+1)).
+        let start = encode_session_prefix(provenance_id);
+        let end = encode_session_prefix(provenance_id.saturating_add(1));
+        for result in table.range::<&[u8; 16]>(&start..&end)? {
+            let (_key, value) = result?;
             match SessionEvent::from_bytes(value.value()) {
                 Ok(event) => events.push(event),
                 Err(e) => {
@@ -555,6 +555,8 @@ impl ReadTxn {
             }
         }
 
+        // Events are already in seq order because keys encode (provenance_id,
+        // seq) with the same byte layout, but sort explicitly to be safe.
         events.sort_by_key(|e| e.seq);
         Ok(events)
     }
@@ -567,17 +569,17 @@ impl ReadTxn {
         &self,
         provenance_id: u64,
     ) -> PristineResult<Vec<crate::change::session::TodoSnapshot>> {
-        use crate::change::session::{decode_session_todo_key_provenance_id, TodoSnapshot};
+        use crate::change::session::{encode_session_prefix, TodoSnapshot};
 
         let table = self.txn.open_table(SESSION_TODOS)?;
         let mut todos = Vec::new();
 
-        for result in table.iter()? {
-            let (key, value) = result?;
-            let prov_id = decode_session_todo_key_provenance_id(key.value());
-            if prov_id != provenance_id {
-                continue;
-            }
+        // Bounded prefix scan: all todo keys for this provenance_id lie in
+        // [prefix(id), prefix(id+1)).
+        let start = encode_session_prefix(provenance_id);
+        let end = encode_session_prefix(provenance_id.saturating_add(1));
+        for result in table.range::<&[u8; 16]>(&start..&end)? {
+            let (_key, value) = result?;
             match TodoSnapshot::from_bytes(value.value()) {
                 Ok(snapshot) => todos.push(snapshot),
                 Err(e) => {
@@ -597,17 +599,17 @@ impl ReadTxn {
         &self,
         provenance_id: u64,
     ) -> PristineResult<Vec<crate::change::session::PhaseTimingEntry>> {
-        use crate::change::session::{decode_session_phase_key_provenance_id, PhaseTimingEntry};
+        use crate::change::session::{encode_session_prefix, PhaseTimingEntry};
 
         let table = self.txn.open_table(SESSION_PHASES)?;
         let mut phases = Vec::new();
 
-        for result in table.iter()? {
-            let (key, value) = result?;
-            let prov_id = decode_session_phase_key_provenance_id(key.value());
-            if prov_id != provenance_id {
-                continue;
-            }
+        // Bounded prefix scan: all phase keys for this provenance_id lie in
+        // [prefix(id), prefix(id+1)).
+        let start = encode_session_prefix(provenance_id);
+        let end = encode_session_prefix(provenance_id.saturating_add(1));
+        for result in table.range::<&[u8; 16]>(&start..&end)? {
+            let (_key, value) = result?;
             match PhaseTimingEntry::from_bytes(value.value()) {
                 Ok(entry) => phases.push(entry),
                 Err(e) => {

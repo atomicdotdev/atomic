@@ -90,10 +90,23 @@ impl<'a> WriteTxn<'a> {
                 .and_then(|s| serde_json::from_str(s).ok());
 
             // Write every node as a SessionEvent regardless of kind.
+            //
+            // `event_kind` and `record_type` are populated from the original
+            // Sherpa/agent-trace `record_type` field stored in the detail JSON
+            // (e.g. "intent", "todo_status", "phase_transition").  We fall back
+            // to `node.kind.label()` only when no such field is present so that
+            // non-Sherpa nodes still get a meaningful discriminant.
+            let sherpa_record_type = detail
+                .as_ref()
+                .and_then(|d| d["record_type"].as_str())
+                .map(|s| s.to_string());
+            let event_kind = sherpa_record_type
+                .clone()
+                .unwrap_or_else(|| node.kind.label().to_string());
             let event = SessionEvent {
                 seq,
                 timestamp: format_timestamp_ms(node.timestamp),
-                event_kind: node.kind.label().to_string(),
+                event_kind,
                 place: None,
                 transition: None,
                 token_id: node.id.clone(),
@@ -102,7 +115,9 @@ impl<'a> WriteTxn<'a> {
                     _ => "todo".to_string(),
                 },
                 token_data: node.detail.clone().unwrap_or_default(),
-                record_type: Some(node.kind.label().to_string()),
+                record_type: Some(
+                    sherpa_record_type.unwrap_or_else(|| node.kind.label().to_string()),
+                ),
             };
 
             let event_key = encode_session_event_key(provenance_id, seq);
