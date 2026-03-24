@@ -71,7 +71,7 @@ impl<'a> WriteTxn<'a> {
 
         // Gate on profile — only populate for Sherpa graphs.
         match graph.profile.as_deref() {
-            Some(p) if p.starts_with("sherpa-trace") => {}
+            Some("sherpa-trace/1.0.0") => {}
             _ => return Ok(()),
         }
 
@@ -84,10 +84,22 @@ impl<'a> WriteTxn<'a> {
         let mut seq: u64 = 0;
 
         for node in &graph.nodes {
-            let detail: Option<serde_json::Value> = node
-                .detail
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok());
+            let detail: Option<serde_json::Value> = if let Some(s) = node.detail.as_deref() {
+                match serde_json::from_str(s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: failed to parse provenance node detail JSON (node id={}, kind={}): {}",
+                            node.id,
+                            node.kind.label(),
+                            e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
 
             // Write every node as a SessionEvent regardless of kind.
             //
@@ -105,8 +117,8 @@ impl<'a> WriteTxn<'a> {
                 .unwrap_or_else(|| node.kind.label().to_string());
             let event = SessionEvent {
                 seq,
-                timestamp: format_timestamp_ms(node.timestamp),
-                event_kind,
+                timestamp: format_timestamp_ms(node.timestamp * 1000),
+                event_kind: node.kind.label().to_string(),
                 place: None,
                 transition: None,
                 token_id: node.id.clone(),

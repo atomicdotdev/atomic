@@ -453,8 +453,11 @@ pub const CHANGE_UNHASHED: TableDefinition<&[u8; 32], &[u8]> =
 /// Session events: (provenance_id, seq) → SessionEvent
 ///
 /// The full ordered Petri net replay log for a turn. Each row is one
-/// NetEvent from the JSONL trace file. Keys sort by `(provenance_id, seq)`
-/// in little-endian byte order, enabling prefix scans per provenance graph.
+/// NetEvent from the JSONL trace file. Keys are composite `[u8; 16]`
+/// values `(provenance_id_le, seq_le)` and are ordered lexicographically
+/// by their little-endian byte representation. This groups events by
+/// `provenance_id` for efficient prefix scans, but does *not* guarantee
+/// numeric ordering by `seq` within a provenance.
 pub const SESSION_EVENTS: TableDefinition<&[u8; 16], &[u8]> =
     TableDefinition::new("session_events");
 
