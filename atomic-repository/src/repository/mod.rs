@@ -185,6 +185,70 @@ pub fn collect_stack_change_ids<T: StackTxnT>(
     Ok(ids)
 }
 
+/// Collect all change `NodeId`s visible from a stack, including parent stacks.
+///
+/// For **local** stacks this walks the full overlay chain (other local
+/// ancestors) and then the shared ancestor chain, collecting every change
+/// that contributes to the stack's effective view.  This mirrors the filter
+/// built inside `get_file_content_via_overlay` and must be used wherever
+/// `output_working_copy` needs to decide which vertices are alive.
+///
+/// For **shared** stacks this is identical to `collect_stack_change_ids`.
+///
+/// # Why this is needed
+///
+/// The `change_filter` passed to `output_repository` controls which graph
+/// vertices are considered "alive".  If the filter only contains the local
+/// stack's own changes, vertices introduced by the shared `dev` stack (the
+/// base content) fail the filter and are excluded — producing empty or
+/// incomplete file output.
+pub fn collect_visible_change_ids<T: StackTxnT>(
+    txn: &T,
+    stack: &atomic_core::pristine::StackState,
+) -> Result<HashSet<NodeId>, RepositoryError> {
+    // Start with the current stack's own changes.
+    let mut ids = collect_stack_change_ids(txn, stack)?;
+
+    if stack.kind.is_local() {
+        // Include changes from every local ancestor in the overlay chain.
+        let chain = txn
+            .resolve_overlay_chain(stack)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        for &ancestor_id in &chain {
+            if ancestor_id == stack.id {
+                continue; // already included above
+            }
+            if let Some(ancestor) = txn
+                .get_stack_by_id(ancestor_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                let ancestor_ids = collect_stack_change_ids(txn, &ancestor)?;
+                ids.extend(ancestor_ids);
+            }
+        }
+
+        // Walk the parent chain past all local ancestors to find the nearest
+        // shared stack and include its changes (the global graph base).
+        let mut cursor = stack.parent;
+        while let Some(pid) = cursor {
+            let parent = txn
+                .get_stack_by_id(pid)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            match parent {
+                Some(p) if p.kind.is_shared() => {
+                    let shared_ids = collect_stack_change_ids(txn, &p)?;
+                    ids.extend(shared_ids);
+                    break;
+                }
+                Some(p) => cursor = p.parent,
+                None => break,
+            }
+        }
+    }
+
+    Ok(ids)
+}
+
 /// Information about a stack.
 ///
 /// This struct provides metadata about a stack including its current
@@ -927,11 +991,15 @@ default = "{}"
         let overlay = OverlayTxn::from_stack(&txn, &stack)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Collect all change NodeIds in the current stack for the
-        // change_filter.  Even though the overlay isolates edges, we
-        // still need the filter so that `output_repository` can skip
-        // TREE entries whose creating change is not on this stack.
-        let change_filter = collect_stack_change_ids(&txn, &stack)?;
+        // Collect all change NodeIds visible from the current stack for the
+        // change_filter.  For local stacks this includes the current stack's
+        // own changes PLUS all changes from the overlay chain (other local
+        // ancestors) and the nearest shared ancestor (e.g. dev).
+        //
+        // Without the parent-chain changes, vertices introduced by dev (the
+        // base content) fail the filter and output_repository skips them,
+        // producing empty or duplicated file content on the local stack.
+        let change_filter = collect_visible_change_ids(&txn, &stack)?;
 
         let working_copy = FileSystem::from_root(&self.root);
         let options = RepositoryOutputOptions::new().with_change_filter(change_filter);
