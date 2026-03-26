@@ -41,6 +41,7 @@
 pub mod delete;
 pub mod list;
 pub mod new;
+pub mod register;
 pub mod show;
 pub mod whoami;
 
@@ -48,6 +49,7 @@ pub mod whoami;
 pub use delete::Delete;
 pub use list::List;
 pub use new::New;
+pub use register::Register;
 pub use show::Show;
 pub use whoami::WhoAmI;
 
@@ -178,6 +180,23 @@ pub enum IdentityCommands {
     /// ```
     #[command(name = "whoami")]
     WhoAmI(WhoAmI),
+
+    /// Register an identity with a remote atomic-storage server.
+    ///
+    /// Pushes the local identity to a server, creating a tenant whose
+    /// slug is derived from the username. Authentication is Ed25519
+    /// signature-based — no passwords required.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Register with the default identity
+    /// atomic identity register https://atomic.storage
+    ///
+    /// # Register a specific identity
+    /// atomic identity register https://atomic.storage --identity alice-work
+    /// ```
+    Register(Register),
 }
 
 impl Command for Identity {
@@ -189,6 +208,7 @@ impl Command for Identity {
             IdentityCommands::Default(cmd) => cmd.run(),
             IdentityCommands::Delete(cmd) => cmd.run(),
             IdentityCommands::WhoAmI(cmd) => cmd.run(),
+            IdentityCommands::Register(cmd) => cmd.run(),
         }
     }
 }
