@@ -249,10 +249,12 @@ impl Push {
     }
 
     /// Build the HTTP remote configuration.
-    fn build_remote_config(&self) -> HttpRemoteConfig {
-        HttpRemoteConfig::new()
+    fn build_remote_config(&self, remote_url: &str) -> HttpRemoteConfig {
+        let config = HttpRemoteConfig::new()
             .with_timeout(Duration::from_secs(self.timeout))
-            .danger_accept_invalid_certs(self.insecure)
+            .danger_accept_invalid_certs(self.insecure);
+
+        crate::commands::auth::attach_identity(config, remote_url)
     }
 
     /// Display the dry run preview.
@@ -310,7 +312,7 @@ impl Push {
 
         // Connect to remote
         let spinner = create_spinner("Connecting to remote...");
-        let config = self.build_remote_config();
+        let config = self.build_remote_config(&remote_url);
         let remote = HttpRemote::with_config(&remote_url, config).map_err(|e| {
             finish_error(&spinner, "Failed to connect");
             convert_remote_error(e, &remote_url)
@@ -871,7 +873,7 @@ mod tests {
     #[test]
     fn test_build_remote_config_default() {
         let push = Push::new();
-        let config = push.build_remote_config();
+        let config = push.build_remote_config("http://test.localhost:8080/code");
 
         assert_eq!(config.timeout, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
         assert!(!config.danger_accept_invalid_certs);
@@ -880,7 +882,7 @@ mod tests {
     #[test]
     fn test_build_remote_config_custom_timeout() {
         let push = Push::new().with_timeout(120);
-        let config = push.build_remote_config();
+        let config = push.build_remote_config("http://test.localhost:8080/code");
 
         assert_eq!(config.timeout, Duration::from_secs(120));
     }
@@ -888,7 +890,7 @@ mod tests {
     #[test]
     fn test_build_remote_config_insecure() {
         let push = Push::new().with_insecure(true);
-        let config = push.build_remote_config();
+        let config = push.build_remote_config("http://test.localhost:8080/code");
 
         assert!(config.danger_accept_invalid_certs);
     }

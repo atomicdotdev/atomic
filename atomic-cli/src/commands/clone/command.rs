@@ -201,9 +201,11 @@ impl Clone {
     /// Creates an `HttpRemoteConfig` with the timeout and security settings
     /// specified by the user.
     fn build_remote_config(&self) -> HttpRemoteConfig {
-        HttpRemoteConfig::new()
+        let config = HttpRemoteConfig::new()
             .with_timeout(Duration::from_secs(self.timeout))
-            .danger_accept_invalid_certs(self.insecure)
+            .danger_accept_invalid_certs(self.insecure);
+
+        crate::commands::auth::attach_identity(config, &self.url)
     }
 
     /// Get the display name for the repository.

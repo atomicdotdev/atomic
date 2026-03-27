@@ -89,6 +89,7 @@ pub mod unrecord;
 pub mod agent;
 
 // Phase 3: Remote Commands
+pub mod auth;
 pub mod clone;
 pub mod pull;
 pub mod push;

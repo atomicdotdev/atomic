@@ -174,6 +174,10 @@ impl Register {
             // The server wraps the response in ApiResponse { success, data, ... }
             let data = result.get("data").unwrap_or(&result);
 
+            let tenant_id = data
+                .get("tenant_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
             let slug = data
                 .get("slug")
                 .and_then(|v| v.as_str())
@@ -185,9 +189,10 @@ impl Register {
 
             print_success(&format!("Registered as {slug}"));
             println!();
-            println!("  Tenant:   {slug}");
-            println!("  URL:      {base_url}");
-            println!("  Identity: {} ({})", identity.name, identity.id.short());
+            println!("  Tenant ID: {tenant_id}");
+            println!("  Slug:      {slug}");
+            println!("  URL:       {base_url}");
+            println!("  Identity:  {} ({})", identity.name, identity.id.short());
 
             if slug != username {
                 println!();
