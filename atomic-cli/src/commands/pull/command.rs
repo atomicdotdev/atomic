@@ -275,10 +275,12 @@ impl Pull {
     ///
     /// Creates an `HttpRemoteConfig` with the timeout and security settings
     /// specified by the user.
-    fn build_remote_config(&self) -> HttpRemoteConfig {
-        HttpRemoteConfig::new()
+    fn build_remote_config(&self, remote_url: &str) -> HttpRemoteConfig {
+        let config = HttpRemoteConfig::new()
             .with_timeout(Duration::from_secs(self.timeout))
-            .danger_accept_invalid_certs(self.insecure)
+            .danger_accept_invalid_certs(self.insecure);
+
+        crate::commands::auth::attach_identity(config, remote_url)
     }
 
     /// Display the dry run preview.
@@ -366,7 +368,7 @@ impl Pull {
 
         // Connect to remote
         let spinner = create_spinner("Connecting to remote...");
-        let config = self.build_remote_config();
+        let config = self.build_remote_config(&remote_url);
         let remote = HttpRemote::with_config(&remote_url, config).map_err(|e| {
             finish_error(&spinner, "Failed to connect");
             convert_remote_error(e, &remote_url)
@@ -756,7 +758,7 @@ mod tests {
     #[test]
     fn test_build_remote_config_default() {
         let pull = Pull::new();
-        let config = pull.build_remote_config();
+        let config = pull.build_remote_config("http://test.localhost:8080/code");
 
         // HttpRemoteConfig doesn't expose fields directly, so we just verify
         // it doesn't panic and returns something
@@ -767,7 +769,7 @@ mod tests {
     #[test]
     fn test_build_remote_config_custom_timeout() {
         let pull = Pull::new().with_timeout(120);
-        let config = pull.build_remote_config();
+        let config = pull.build_remote_config("http://test.localhost:8080/code");
         assert!(std::mem::size_of_val(&config) > 0);
     }
 
@@ -775,7 +777,7 @@ mod tests {
     #[test]
     fn test_build_remote_config_insecure() {
         let pull = Pull::new().with_insecure(true);
-        let config = pull.build_remote_config();
+        let config = pull.build_remote_config("http://test.localhost:8080/code");
         assert!(std::mem::size_of_val(&config) > 0);
     }
 
