@@ -68,8 +68,8 @@ pub struct Register {
     /// will be called automatically.
     ///
     /// Examples:
-    ///   https://atomic.storage
-    ///   http://localhost:8080
+    ///   <https://atomic.storage>
+    ///   <http://localhost:8080>
     #[arg(required = true)]
     pub server_url: String,
 
