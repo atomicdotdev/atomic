@@ -849,3 +849,192 @@ fn main() {
     assert_content_after_change(&repo, "bench.rs", &h3, v3);
     assert_content_after_change(&repo, "bench.rs", &h4, v4);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test: Single-line middle insertion
+//
+// Reproduces the "All recorded files are empty (no hunks)" bug triggered
+// by hyperfine commit 2ab118dd ("Close stdin for child-processes").
+//
+// A single line is inserted in the middle of a file. The diff produces
+// one Insert hunk with old_start > 0 and old_start < old_line_count
+// (a "middle insertion"). The upstream consolidation in record_modified_file
+// only fires when nuclear_hunk_count > 1 or when a nuclear hunk coexists
+// with other hunks. A lone middle Insert slips through unconsolidated,
+// reaches globalization, and is rejected because the globalize pipeline
+// no longer handles middle insertions directly.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_single_line_middle_insertion() {
+    let (repo, _temp, repo_path) = create_test_repo();
+
+    let v1 = "\
+fn run_command(cmd: &str) -> Result<()> {
+    let status = Command::new(\"sh\")
+        .arg(\"-c\")
+        .arg(cmd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+
+    Ok(status)
+}
+
+fn main() {
+    let cmd = get_cmd();
+    let result = run_command(cmd);
+    println!(\"{:?}\", result);
+}
+";
+
+    // Version 2: single line added in the middle (.stdin(Stdio::null()))
+    let v2 = "\
+fn run_command(cmd: &str) -> Result<()> {
+    let status = Command::new(\"sh\")
+        .arg(\"-c\")
+        .arg(cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+
+    Ok(status)
+}
+
+fn main() {
+    let cmd = get_cmd();
+    let result = run_command(cmd);
+    println!(\"{:?}\", result);
+}
+";
+
+    write_file(&repo_path, "src/main.rs", v1);
+    repo.add("src/main.rs", Default::default()).unwrap();
+    let _h1 = record_change(&repo, "initial");
+    assert_content_matches(&repo, "src/main.rs", v1);
+
+    // This is the critical step — a single-line middle insertion must
+    // successfully record and produce correct content.
+    write_file(&repo_path, "src/main.rs", v2);
+    let _h2 = record_change(&repo, "add stdin null");
+    assert_content_matches(&repo, "src/main.rs", v2);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test: Single-line middle insertion after multiple prior modifications
+//
+// Same bug but with more history — the file has been modified several
+// times before the single-line insertion. This matches the exact
+// hyperfine scenario: 16 commits modify src/main.rs, then commit 17
+// adds a single line in the middle.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_single_line_middle_insertion_after_multiple_edits() {
+    let (repo, _temp, repo_path) = create_test_repo();
+
+    let v1 = "\
+use std::process::Command;
+
+fn run(cmd: &str) {
+    Command::new(\"sh\")
+        .arg(\"-c\")
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect(\"failed\");
+}
+
+fn main() {
+    run(\"echo hello\");
+}
+";
+
+    let v2 = "\
+use std::process::{Command, Stdio};
+
+fn run(cmd: &str) {
+    Command::new(\"sh\")
+        .arg(\"-c\")
+        .arg(cmd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect(\"failed\");
+}
+
+fn main() {
+    let cmd = \"echo hello\";
+    run(cmd);
+}
+";
+
+    let v3 = "\
+use std::process::{Command, Stdio};
+use std::io;
+
+fn run(cmd: &str) -> io::Result<()> {
+    let status = Command::new(\"sh\")
+        .arg(\"-c\")
+        .arg(cmd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+
+    if !status.success() {
+        eprintln!(\"Command failed\");
+    }
+
+    Ok(())
+}
+
+fn main() {
+    let cmd = \"echo hello\";
+    run(cmd).expect(\"run failed\");
+}
+";
+
+    // v4: single line inserted in the middle — .stdin(Stdio::null())
+    let v4 = "\
+use std::process::{Command, Stdio};
+use std::io;
+
+fn run(cmd: &str) -> io::Result<()> {
+    let status = Command::new(\"sh\")
+        .arg(\"-c\")
+        .arg(cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+
+    if !status.success() {
+        eprintln!(\"Command failed\");
+    }
+
+    Ok(())
+}
+
+fn main() {
+    let cmd = \"echo hello\";
+    run(cmd).expect(\"run failed\");
+}
+";
+
+    write_file(&repo_path, "src/main.rs", v1);
+    repo.add("src/main.rs", Default::default()).unwrap();
+    let _h1 = record_change(&repo, "initial");
+
+    write_file(&repo_path, "src/main.rs", v2);
+    let _h2 = record_change(&repo, "refactor imports");
+
+    write_file(&repo_path, "src/main.rs", v3);
+    let _h3 = record_change(&repo, "add error handling");
+
+    // The critical single-line middle insertion
+    write_file(&repo_path, "src/main.rs", v4);
+    let _h4 = record_change(&repo, "close stdin for child processes");
+    assert_content_matches(&repo, "src/main.rs", v4);
+}
