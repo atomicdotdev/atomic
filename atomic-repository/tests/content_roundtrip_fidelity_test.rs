@@ -396,6 +396,256 @@ fn test_hyperfine_content_duplication_bug() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Test: Hyperfine commits 1-7 (through error handling refactor)
+//
+// Stepping stone: replays 7 commits instead of 4. Commits 5-7 add a README
+// (no src/main.rs change), a major refactor extracting run_benchmark() and
+// HyperfineOptions (94 insertions, 73 deletions, 2 hunks), and then the
+// error handling commit (29 insertions, 7 deletions, 7 hunks with a new
+// function + return-type propagation across call sites).
+//
+// This catches regressions where medium-complexity multi-hunk patterns
+// (code extraction + call-site updates) trigger duplication even after
+// the consolidation fix.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_hyperfine_extended_commit_sequence() {
+    use std::process::Command;
+
+    let git_temp = TempDir::new().expect("Failed to create temp dir for git");
+    let git_path = git_temp.path().to_path_buf();
+    let clone_status = Command::new("git")
+        .args([
+            "clone",
+            "--quiet",
+            "https://github.com/sharkdp/hyperfine.git",
+        ])
+        .arg(&git_path)
+        .status();
+
+    match clone_status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("Skipping test: git clone failed (no network?)");
+            return;
+        }
+    }
+
+    // Commits that touch src/main.rs in the first 15 commits.
+    // We skip commits that don't change src/main.rs (README, licenses, metadata).
+    let commits: Vec<&str> = vec![
+        "a658ab8c", // 1: Initial commit
+        "d4ebdd7b", // 2: Add a progress bar (10 hunks, +52/-12)
+        "197f9fb",  // 3: Code style update (15 hunks, +22/-17)
+        "68fdc2c",  // 4: Add --warmup option (6 hunks, +44/-10) — previously failing
+        "9ba7ada",  // 5: Refactoring — extract run_benchmark (2 hunks, +94/-73)
+        "5cdf013",  // 6: Modify clap settings (7 hunks, +8/-9)
+        "dab3f94",  // 7: Add --min-runs (2 hunks, +18/-3)
+        "219bb1e",  // 8: Error handling (7 hunks, +29/-7)
+    ];
+
+    // Collect file contents at each commit (skip commits where file doesn't exist)
+    let mut versions: Vec<(String, Vec<u8>)> = Vec::new();
+    for sha in &commits {
+        let output = Command::new("git")
+            .args(["show", &format!("{}:src/main.rs", sha)])
+            .current_dir(&git_path)
+            .output()
+            .expect("Failed to run git show");
+        if !output.status.success() {
+            // File doesn't exist at this commit — skip
+            continue;
+        }
+        versions.push((sha.to_string(), output.stdout));
+    }
+
+    assert!(
+        versions.len() >= 4,
+        "Expected at least 4 versions, got {}",
+        versions.len()
+    );
+
+    // Replay all versions into an atomic repo
+    let (repo, _temp, repo_path) = create_test_repo();
+
+    // First version: add file
+    write_file(
+        &repo_path,
+        "src/main.rs",
+        &String::from_utf8_lossy(&versions[0].1),
+    );
+    repo.add("src/main.rs", Default::default()).unwrap();
+    let _ = record_change(&repo, &format!("Commit 1 ({})", versions[0].0));
+
+    let content = repo
+        .get_file_content_via_overlay("src/main.rs", repo.current_stack())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        content, versions[0].1,
+        "Content mismatch after commit 1 ({})",
+        versions[0].0
+    );
+
+    // Subsequent versions: modify file
+    for (i, (sha, version)) in versions[1..].iter().enumerate() {
+        write_file(&repo_path, "src/main.rs", &String::from_utf8_lossy(version));
+        let _ = record_change(&repo, &format!("Commit {} ({})", i + 2, sha));
+
+        let content = repo
+            .get_file_content_via_overlay("src/main.rs", repo.current_stack())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            content.len(),
+            version.len(),
+            "Content length mismatch after commit {} ({}): got {} bytes, expected {} bytes.\n\
+             This indicates content duplication in the change graph.",
+            i + 2,
+            sha,
+            content.len(),
+            version.len(),
+        );
+
+        assert_eq!(
+            content,
+            *version,
+            "Content mismatch after commit {} ({})",
+            i + 2,
+            sha,
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test: Isolated pairwise commit diffs at increasing complexity
+//
+// Rather than replaying the full sequence, this tests individual commit
+// transitions in isolation (fresh repo each time). This isolates whether
+// the bug is in a specific diff shape vs accumulated graph state.
+//
+// Tier 1: dab3f94 (2 hunks, +18/-3) — pure multi-site inserts
+// Tier 2: 219bb1e (7 hunks, +29/-7) — new function + call-site changes
+// Tier 3: 68fdc2c (6 hunks, +44/-10) — extract + warmup + replace
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_hyperfine_pairwise_transitions() {
+    use std::process::Command;
+
+    let git_temp = TempDir::new().expect("Failed to create temp dir for git");
+    let git_path = git_temp.path().to_path_buf();
+    let clone_status = Command::new("git")
+        .args([
+            "clone",
+            "--quiet",
+            "https://github.com/sharkdp/hyperfine.git",
+        ])
+        .arg(&git_path)
+        .status();
+
+    match clone_status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("Skipping test: git clone failed (no network?)");
+            return;
+        }
+    }
+
+    // Each pair is (before_sha, after_sha, description, expected_hunk_complexity)
+    let pairs: Vec<(&str, &str, &str)> = vec![
+        // Tier 1: Simple multi-site insert (2 hunks)
+        ("5cdf013", "dab3f94", "add --min-runs (2 hunks)"),
+        // Tier 2: Medium — new function + return type propagation (7 hunks)
+        ("dab3f94", "219bb1e", "error handling (7 hunks)"),
+        // Tier 3: Complex — extract function + warmup + inline replace (6 hunks)
+        ("197f9fb", "68fdc2c", "add --warmup (6 hunks)"),
+        // Tier 4: Major refactor — extract run_benchmark + HyperfineOptions (2 big hunks)
+        ("68fdc2c", "9ba7ada", "refactoring (2 hunks, +94/-73)"),
+    ];
+
+    for (before_sha, after_sha, description) in &pairs {
+        // Get file at before and after
+        let before_output = Command::new("git")
+            .args(["show", &format!("{}:src/main.rs", before_sha)])
+            .current_dir(&git_path)
+            .output()
+            .expect("Failed to run git show");
+        assert!(
+            before_output.status.success(),
+            "git show failed for {}",
+            before_sha
+        );
+
+        let after_output = Command::new("git")
+            .args(["show", &format!("{}:src/main.rs", after_sha)])
+            .current_dir(&git_path)
+            .output()
+            .expect("Failed to run git show");
+        assert!(
+            after_output.status.success(),
+            "git show failed for {}",
+            after_sha
+        );
+
+        // Fresh repo for each pair
+        let (repo, _temp, repo_path) = create_test_repo();
+
+        // Add the "before" version
+        write_file(
+            &repo_path,
+            "src/main.rs",
+            &String::from_utf8_lossy(&before_output.stdout),
+        );
+        repo.add("src/main.rs", Default::default()).unwrap();
+        let _ = record_change(&repo, &format!("before: {}", before_sha));
+
+        let content = repo
+            .get_file_content_via_overlay("src/main.rs", repo.current_stack())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            content, before_output.stdout,
+            "[{}] Content mismatch after initial add ({})",
+            description, before_sha
+        );
+
+        // Apply the "after" version
+        write_file(
+            &repo_path,
+            "src/main.rs",
+            &String::from_utf8_lossy(&after_output.stdout),
+        );
+        let _ = record_change(&repo, &format!("after: {}", after_sha));
+
+        let content = repo
+            .get_file_content_via_overlay("src/main.rs", repo.current_stack())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            content.len(),
+            after_output.stdout.len(),
+            "[{}] Content length mismatch ({} → {}): got {} bytes, expected {} bytes.\n\
+             This indicates content duplication in the change graph.",
+            description,
+            before_sha,
+            after_sha,
+            content.len(),
+            after_output.stdout.len(),
+        );
+
+        assert_eq!(
+            content, after_output.stdout,
+            "[{}] Content mismatch ({} → {})",
+            description, before_sha, after_sha,
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Test: Four sequential modifications matching the hyperfine pattern
 //
 // Reproduces the exact commit sequence that triggers duplication:

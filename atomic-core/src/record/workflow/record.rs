@@ -1295,61 +1295,75 @@ where
     let new_line_offsets = calculate_line_offsets(&new_content);
 
     // Add all built hunks to the recorded file, updating content positions
-    // ── Consolidate multiple Replace hunks into a single whole-file Replace ──
+    // ── Consolidate hunks into a single whole-file Replace ──
     //
-    // The diff may produce multiple Replace hunks when changes are in
-    // non-contiguous regions of the file. In the graph layer, each Replace
-    // hunk does delete-ALL-content + insert-full-content. With N Replace
-    // hunks this creates N copies (duplication bug).
+    // In the globalize pipeline, every hunk kind that isn't a clean
+    // Prepend or Append ends up doing the same thing: delete ALL content
+    // vertices for the file, then insert full_content (the entire new
+    // file). Specifically:
     //
-    // Fix: merge all Replace hunks into ONE Replace that covers the entire
-    // file. Insert and Delete hunks are kept as-is — they're additive
-    // operations that don't conflict.
+    //   Replace  → always does delete-all + insert-full_content
+    //   Delete   → always does delete-all (every content vertex)
+    //   Insert with 0 < old_start < old_line_count
+    //            → escalates to NeedsReplace → delete-all + insert-full_content
+    //
+    // When multiple hunks hit these paths, each one independently
+    // inserts a full copy of the file, causing N× content duplication.
+    //
+    // Fix: detect when ANY combination of hunks would trigger whole-file
+    // behavior, and collapse them all into a single Replace that covers
+    // the entire file. This guarantees exactly one delete-all +
+    // insert-full_content in the globalizer, regardless of diff shape.
+    //
+    // Insert hunks that are clean Prepend (old_start == 0) or Append
+    // (old_start >= old_line_count) are safe — they only insert their
+    // own content slice, not full_content. Those are kept as-is.
     //
     // The semantic layer (CRDT line_ops) is unaffected — it's built
     // separately from the raw diff and retains per-line granularity.
     let mut hunks: Vec<BuiltHunk> = hunk_result.into_hunks();
-    let replace_count = hunks
+
+    // Count hunks that will trigger whole-file operations in globalize.
+    // An Insert is "nuclear" if it will hit NeedsReplace (middle insertion).
+    let nuclear_hunk_count = hunks
         .iter()
-        .filter(|h| h.kind == BuiltHunkKind::Replace)
+        .filter(|h| match h.kind {
+            BuiltHunkKind::Replace => true,
+            BuiltHunkKind::Delete => true,
+            BuiltHunkKind::Insert => {
+                // Prepend (old_start == 0) and Append (old_start >= old_line_count)
+                // are handled cleanly in globalize. Everything else escalates to
+                // NeedsReplace, which does delete-all + insert-full_content.
+                h.old_start != 0 && h.old_start < old_line_count
+            }
+        })
         .count();
 
-    if replace_count > 1 {
-        // Merge all Replace hunks: union their deleted_lines, span the
-        // full new content range (0..new_content.len()).
+    if nuclear_hunk_count > 1 || (nuclear_hunk_count == 1 && hunks.len() > 1) {
+        // Multiple hunks where at least one is nuclear, OR a single nuclear
+        // hunk coexisting with other hunks. Collapse everything into one
+        // Replace to prevent duplication.
+        //
+        // Collect deleted lines from all hunks that delete old content.
         let mut all_deleted: Vec<usize> = Vec::new();
-        let mut min_old_start = usize::MAX;
-
-        // Collect deleted lines from all Replace hunks
         for h in &hunks {
-            if h.kind == BuiltHunkKind::Replace {
-                all_deleted.extend_from_slice(&h.deleted_lines);
-                if h.old_start < min_old_start {
-                    min_old_start = h.old_start;
-                }
-            }
+            all_deleted.extend_from_slice(&h.deleted_lines);
         }
         all_deleted.sort_unstable();
         all_deleted.dedup();
 
-        if min_old_start == usize::MAX {
-            min_old_start = 0;
-        }
-
-        // Build the merged Replace covering the entire new file
         let new_line_count = new_content.split(|&b| b == b'\n').count();
         let merged_replace = BuiltHunk::new_replace_with_lines(
-            Local::new(&detected.path, (min_old_start + 1) as u64),
+            Local::new(&detected.path, 1),
             Some(encoding),
             all_deleted,
-            min_old_start,
+            0,              // old_start: beginning of old content
             0,              // new_start: beginning of new content
             new_line_count, // new_len: all lines in the new file
         );
 
-        // Remove all Replace hunks, keep Insert/Delete hunks
-        hunks.retain(|h| h.kind != BuiltHunkKind::Replace);
-        // Add the single merged Replace
+        // Replace all hunks with the single merged Replace
+        hunks.clear();
         hunks.push(merged_replace);
     }
 

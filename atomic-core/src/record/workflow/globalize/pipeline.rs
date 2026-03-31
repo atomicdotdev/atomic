@@ -184,19 +184,34 @@ where
 
         // Process each graph_op for modification
         for built in recorded.hunks() {
-            // Get the content slice for this graph_op
-            let hunk_content =
-                if let (Some(start), Some(end)) = (built.content_start, built.content_end) {
-                    let start = start as usize;
-                    let end = end as usize;
-                    if end <= content.len() {
-                        &content[start..end]
+            // Determine the content slice for this hunk.
+            //
+            // Replace hunks need the full file content because they delete
+            // all existing vertices and re-insert the complete new file.
+            //
+            // Insert hunks only need their own slice — they are guaranteed
+            // (by the upstream consolidation in record_modified_file) to be
+            // clean Prepend or Append operations that wire in their own
+            // bytes without touching anything else.
+            //
+            // Delete hunks carry no content.
+            let hunk_content = match built.kind {
+                crate::record::workflow::graph_op::BuiltHunkKind::Replace => content,
+                crate::record::workflow::graph_op::BuiltHunkKind::Insert => {
+                    if let (Some(start), Some(end)) = (built.content_start, built.content_end) {
+                        let start = start as usize;
+                        let end = end as usize;
+                        if end <= content.len() {
+                            &content[start..end]
+                        } else {
+                            &[]
+                        }
                     } else {
                         &[]
                     }
-                } else {
-                    &[]
-                };
+                }
+                crate::record::workflow::graph_op::BuiltHunkKind::Delete => &[],
+            };
 
             // Track content position before globalization
             let content_pos_before = ctx.content_len();
@@ -207,7 +222,6 @@ where
                 inode,
                 inode_pos,
                 hunk_content,
-                content,
                 recorded.old_line_count(),
             )?;
 
@@ -216,20 +230,17 @@ where
 
             // Record the content range for this hunk
             if content_pos_after > content_pos_before {
+                let uses_full = matches!(
+                    built.kind,
+                    crate::record::workflow::graph_op::BuiltHunkKind::Replace
+                );
                 hunk_content_ranges.push(HunkContentRange {
                     kind: built.kind,
                     new_start: built.new_start,
                     new_len: built.new_len,
                     content_start: ChangePosition::new(content_pos_before),
                     content_end: ChangePosition::new(content_pos_after),
-                    // For Replace hunks, we use full_content, so track that
-                    uses_full_content: matches!(
-                        built.kind,
-                        crate::record::workflow::graph_op::BuiltHunkKind::Replace
-                    ) || matches!(
-                        built.kind,
-                        crate::record::workflow::graph_op::BuiltHunkKind::Insert
-                    ),
+                    uses_full_content: uses_full,
                 });
             }
 

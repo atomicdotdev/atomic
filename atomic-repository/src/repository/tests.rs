@@ -2144,11 +2144,11 @@ mod tests {
     /// Test modifying the FIRST line of a file.
     ///
     /// This is a regression test for a bug where modifying the first line of a
-    /// file caused the unchanged lines to be lost. The bug was in `globalize_hunk`
-    /// which used `content` (graph_op content) instead of `full_content` (full file)
-    /// for Replace hunks.
-    ///
-    /// See: https://github.com/atomic-vcs/atomic/issues/XXX
+    /// file caused the unchanged lines to be lost. The bug was in the globalize
+    /// pipeline which passed only the hunk-specific content slice to Replace
+    /// hunks instead of the full file. The pipeline now routes the full file
+    /// content to Replace hunks and hunk-specific slices to Insert hunks at the
+    /// call site in `globalize_recorded_file`.
     #[test]
     fn test_modify_first_line_content_retrieval() {
         use crate::record::RecordOptions;

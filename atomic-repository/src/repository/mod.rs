@@ -991,15 +991,23 @@ default = "{}"
         let overlay = OverlayTxn::from_stack(&txn, &stack)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Collect all change NodeIds visible from the current stack for the
-        // change_filter.  For local stacks this includes the current stack's
-        // own changes PLUS all changes from the overlay chain (other local
-        // ancestors) and the nearest shared ancestor (e.g. dev).
+        // Collect the change NodeIds from the stack's OWN change log for the
+        // change_filter.  This controls which files are materialised on disk.
         //
-        // Without the parent-chain changes, vertices introduced by dev (the
-        // base content) fail the filter and output_repository skips them,
-        // producing empty or duplicated file content on the local stack.
-        let change_filter = collect_visible_change_ids(&txn, &stack)?;
+        // For stacks created with `create_stack_from`, the source's changes
+        // are copied into the new stack's log, so they pass the filter and
+        // their files are output correctly.
+        //
+        // For stacks created with `create_stack` (empty), the log is empty,
+        // so NO files are materialised — matching the documented contract:
+        //   "empty workspace, no files until `apply`"
+        //
+        // The overlay (`OverlayTxn`) still reads through the parent chain
+        // for graph traversal (edge resolution, diff computation), but the
+        // change_filter gates which vertices are considered alive for output.
+        // This is the same set used by `visible_file_paths`, keeping the two
+        // in sync so `switch_stack` removes exactly the right files.
+        let change_filter = collect_stack_change_ids(&txn, &stack)?;
 
         let working_copy = FileSystem::from_root(&self.root);
         let options = RepositoryOutputOptions::new().with_change_filter(change_filter);
