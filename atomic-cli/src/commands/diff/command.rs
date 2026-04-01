@@ -251,7 +251,7 @@ impl Diff {
             color: !self.no_color,
             format: self.get_format(),
             stat_width: 80,
-            show_line_numbers: true,
+            show_line_numbers: !self.no_color,
             show_path_prefix: true,
             word_diff: self.word_diff,
         }
@@ -782,7 +782,6 @@ impl Diff {
 
         // Check if change has semantic layer (file_ops)
         if change.has_file_ops() {
-            // Use the semantic layer for human-readable diff
             return self.show_change_diff_from_file_ops(&change, &hash, config);
         }
 
@@ -791,9 +790,11 @@ impl Diff {
     }
 
     /// Show diff using the semantic layer (FileOps).
+    /// Show diff using the semantic layer (FileOps / BranchOps).
     ///
-    /// This is the preferred path - it displays line-level and token-level
-    /// changes directly from the stored CRDT operations, without recomputing.
+    /// Reads Insert / Delete / Modify operations directly from the stored
+    /// CRDT operations.  This is the authoritative diff path — it does NOT
+    /// re-compute a diff from file content.
     fn show_change_diff_from_file_ops(
         &self,
         change: &Change,
@@ -837,16 +838,13 @@ impl Diff {
             let mut new_line_num = 1usize;
             let mut old_line_num = 1usize;
 
-            // Group consecutive operations into hunks
             if !line_ops.is_empty() {
                 let mut current_hunk = DiffHunk::new(old_line_num, 0, new_line_num, 0);
 
                 for line_op in line_ops {
                     match line_op.operation() {
                         BranchOp::Insert { content, .. } => {
-                            // Reconstruct line content from leaf operations
                             let line_content = Self::reconstruct_line_from_leaf_ops(content);
-                            // Use stored line number if available, otherwise use counter
                             let line_num = line_op.new_line_num().unwrap_or(new_line_num);
                             current_hunk.add_line(HunkLine::added(line_content, line_num));
                             new_line_num = line_num + 1;
@@ -854,13 +852,11 @@ impl Diff {
                             current_hunk.new_count += 1;
                         }
                         BranchOp::Delete { content, .. } => {
-                            // Reconstruct deleted line content from stored leaf operations
                             let line_content = if content.is_empty() {
                                 String::from("<deleted line>")
                             } else {
                                 Self::reconstruct_line_from_leaf_ops(content)
                             };
-                            // Use stored line number if available, otherwise use counter
                             let line_num = line_op.old_line_num().unwrap_or(old_line_num);
                             current_hunk.add_line(HunkLine::removed(line_content, line_num));
                             old_line_num = line_num + 1;
@@ -872,10 +868,6 @@ impl Diff {
                             new_content,
                             ..
                         } => {
-                            // A Modify carries both old and new content.
-                            // Emit them as adjacent removed + added lines
-                            // so print_unified can pair them for word-level
-                            // highlighting.
                             let old_line_content = if old_content.is_empty() {
                                 String::from("<modified line>")
                             } else {
@@ -898,7 +890,6 @@ impl Diff {
                             current_hunk.new_count += 1;
                         }
                         BranchOp::Restore { .. } => {
-                            // Restore is like an add for display purposes
                             let line_num = line_op.new_line_num().unwrap_or(new_line_num);
                             current_hunk.add_line(HunkLine::added(
                                 String::from("<restored line>"),
@@ -916,7 +907,6 @@ impl Diff {
                 }
             }
 
-            // Set stats based on change type
             file_diff.stats = match change_status {
                 FileChangeStatus::Added => FileDiffStats::added(file_path, insertions),
                 FileChangeStatus::Deleted => FileDiffStats::deleted(file_path, deletions),
@@ -932,12 +922,10 @@ impl Diff {
             return Ok(());
         }
 
-        // Print change header information
         if config.format == DiffFormat::Unified {
             self.print_change_header(change, change_hash, config);
         }
 
-        // Print in the appropriate format
         match config.format {
             DiffFormat::Unified => self.print_unified(&file_diffs, config),
             DiffFormat::Stat => self.print_stat(&stats, config),

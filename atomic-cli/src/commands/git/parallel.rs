@@ -59,10 +59,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, TimeZone, Utc};
-use git2::{Delta, Diff, DiffOptions, ObjectType, Oid, Repository as GitRepository, Tree};
+use git2::{
+    Delta, Diff, DiffFindOptions, DiffOptions, ObjectType, Oid, Repository as GitRepository, Tree,
+};
 use rayon::prelude::*;
+use std::process::Command as ProcessCommand;
 
 use atomic_core::change::{Author, Change, ChangeHeader};
+use atomic_core::record::workflow::GitDiffLine;
 use atomic_repository::Repository;
 
 use crate::error::{CliError, CliResult};
@@ -136,6 +140,14 @@ pub struct ParsedFile {
     pub operation: FileOperation,
     /// New content (for added/modified files).
     pub new_content: Option<Vec<u8>>,
+    /// Old content at the parent commit (for modified/deleted files).
+    pub old_content: Option<Vec<u8>>,
+    /// Git diff lines for this file (populated in Phase 1).
+    ///
+    /// When `Some`, Phase 2 builds BranchOps directly from these lines
+    /// using git's own diff algorithm, rather than re-diffing with ours.
+    /// This guarantees that `atomic diff -c` output matches `git diff`.
+    pub diff_lines: Option<Vec<GitDiffLine>>,
     /// Old path (for renames).
     pub old_path: Option<String>,
 }
@@ -440,6 +452,12 @@ impl ParallelImporter {
         repo: &mut Repository,
         parsed: &ParsedCommit,
     ) -> CliResult<bool> {
+        use atomic_core::output::memory::Memory;
+        use atomic_core::record::workflow::{
+            assemble_change, record_added_file, record_deleted_file, record_modified_file,
+            DetectedFile, RecordedFile,
+        };
+
         // Build change header
         let mut header_builder = ChangeHeader::builder()
             .message(&parsed.metadata.message)
@@ -460,31 +478,7 @@ impl ParallelImporter {
             return self.write_empty_commit(repo, parsed, header);
         }
 
-        // Checkout the commit's tree to set working copy state
-        let commit = git_repo
-            .find_commit(
-                Oid::from_str(&parsed.git_sha).map_err(|e| CliError::GitError {
-                    message: format!("Invalid SHA: {}", e),
-                })?,
-            )
-            .map_err(|e| CliError::GitError {
-                message: format!("Failed to find commit: {}", e),
-            })?;
-
-        let tree = commit.tree().map_err(|e| CliError::GitError {
-            message: format!("Failed to get tree: {}", e),
-        })?;
-
-        git_repo
-            .checkout_tree(
-                tree.as_object(),
-                Some(git2::build::CheckoutBuilder::new().force()),
-            )
-            .map_err(|e| CliError::GitError {
-                message: format!("Failed to checkout tree: {}", e),
-            })?;
-
-        // Track new files
+        // Track new files so the pristine knows about them before we record.
         for file in &parsed.files {
             if file.operation == FileOperation::Added
                 || file.operation == FileOperation::Renamed
@@ -494,27 +488,214 @@ impl ParallelImporter {
             }
         }
 
-        // Record the change
-        let options = atomic_repository::RecordOptions::new()
-            .with_all(true)
-            .save_to_store(false)
-            .apply_after_record(false);
+        // ── Fast path: build RecordedFiles directly from parsed content ──
+        //
+        // Instead of checking out the git tree to disk and running the
+        // full record() pipeline (which does a filesystem scan + status),
+        // we feed the already-parsed content into record_added_file /
+        // record_modified_file via in-memory working copies.  This
+        // eliminates all filesystem I/O for Phase 2.
 
-        let (change, hash) = match repo.record(header.clone(), options) {
-            Ok(mut result) => {
-                let hash = *result.hash();
-                result.change_mut().unhashed = Some(self.build_git_metadata(parsed, false, false));
-                (result.into_change(), hash)
+        // Use patience diff for both the CRDT line-op generation and the
+        // git2 capture (see parse_commit).  Both implementations produce the
+        // same output for patience, so `atomic diff -c` matches `git diff
+        // --patience` exactly.
+        let core_options = atomic_core::record::workflow::RecordingOptions::new()
+            .algorithm(atomic_core::diff::Algorithm::Patience);
+        let mut recorded_files: Vec<RecordedFile> = Vec::new();
+
+        for file in &parsed.files {
+            let memory_wc = Memory::new();
+
+            match file.operation {
+                FileOperation::Added | FileOperation::Copied => {
+                    let content = match &file.new_content {
+                        Some(c) => c.as_slice(),
+                        None => continue,
+                    };
+                    memory_wc.add_file(&file.path, content);
+                    let detected = DetectedFile::added(&file.path);
+                    match record_added_file(&memory_wc, &detected, &core_options) {
+                        Ok(rec) if !rec.is_empty() => recorded_files.push(rec),
+                        _ => {}
+                    }
+                }
+
+                FileOperation::Renamed => {
+                    // A rename in atomic is a file move: update the TREE
+                    // mapping from old_path → inode to new_path → inode,
+                    // keeping the inode (and its graph content) intact.
+                    let old_path = file.old_path.as_deref().unwrap_or(&file.path);
+
+                    // Update tracking: old path → new path.
+                    let _ = repo.move_file(old_path, &file.path);
+
+                    let new_content = match &file.new_content {
+                        Some(c) => c.as_slice(),
+                        None => continue,
+                    };
+
+                    // Old content is still accessible via old_path in the
+                    // pristine graph (the inode is the same, just remapped).
+                    let old_content = repo
+                        .get_file_content(std::path::Path::new(&file.path))
+                        .unwrap_or(None)
+                        .unwrap_or_default();
+
+                    // If the content also changed during the rename, record
+                    // the modification on the new path.
+                    if old_content != new_content {
+                        memory_wc.add_file(&file.path, new_content);
+
+                        let mut detected = DetectedFile::modified(&file.path);
+                        if let Ok(Some((inode, pos))) = repo.get_inode_and_position(&file.path) {
+                            detected.inode = Some(inode);
+                            detected.position = Some(pos);
+                        }
+
+                        match record_modified_file(
+                            &memory_wc,
+                            &detected,
+                            &old_content,
+                            &core_options,
+                        ) {
+                            Ok(mut rec) if !rec.is_empty() => {
+                                if let Some(ref diff_lines) = file.diff_lines {
+                                    use atomic_core::record::workflow::build_crdt_ops_from_git_diff;
+                                    let (git_file_ops, _) =
+                                        build_crdt_ops_from_git_diff(&file.path, diff_lines);
+                                    rec.set_crdt_ops(git_file_ops);
+                                }
+                                recorded_files.push(rec);
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Content unchanged — move tracking update is sufficient.
+                }
+
+                FileOperation::Modified => {
+                    let new_content = match &file.new_content {
+                        Some(c) => c.as_slice(),
+                        None => continue,
+                    };
+                    memory_wc.add_file(&file.path, new_content);
+
+                    // Look up old content from the pristine graph
+                    let old_content = repo
+                        .get_file_content(std::path::Path::new(&file.path))
+                        .unwrap_or(None)
+                        .unwrap_or_default();
+
+                    // Look up inode + position for this file
+                    let mut detected = DetectedFile::modified(&file.path);
+                    if let Ok(Some((inode, pos))) = repo.get_inode_and_position(&file.path) {
+                        detected.inode = Some(inode);
+                        detected.position = Some(pos);
+                    }
+
+                    match record_modified_file(&memory_wc, &detected, &old_content, &core_options) {
+                        Ok(mut rec) if !rec.is_empty() => {
+                            // Override CRDT ops with git's exact diff lines when available.
+                            // This guarantees `atomic diff -c` matches `git diff` line-for-line
+                            // instead of re-running our Myers algorithm which may differ.
+                            if let Some(ref diff_lines) = file.diff_lines {
+                                use atomic_core::record::workflow::build_crdt_ops_from_git_diff;
+                                let (git_file_ops, _) =
+                                    build_crdt_ops_from_git_diff(&file.path, diff_lines);
+                                rec.set_crdt_ops(git_file_ops);
+                            }
+                            recorded_files.push(rec);
+                        }
+                        _ => {}
+                    }
+                }
+
+                FileOperation::Deleted => {
+                    // Get old content from graph so the diff can show deleted lines.
+                    // The file is still in the graph at this point (apply hasn't run yet).
+                    let old_content = repo
+                        .get_file_content(std::path::Path::new(&file.path))
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+
+                    if !old_content.is_empty() {
+                        // Record as a modification that removes all content:
+                        // old_content = the file's current bytes, new_content = empty.
+                        // This produces proper BranchOp::Delete entries with line content
+                        // so that `atomic diff -c` can show what was deleted.
+                        let memory_wc = Memory::new();
+                        // Empty new content — the file is being deleted.
+                        memory_wc.add_file(&file.path, b"");
+
+                        if let Ok(Some((inode, pos))) = repo.get_inode_and_position(&file.path) {
+                            let mut detected = DetectedFile::modified(&file.path);
+                            detected.inode = Some(inode);
+                            detected.position = Some(pos);
+                            match record_modified_file(
+                                &memory_wc,
+                                &detected,
+                                &old_content,
+                                &core_options,
+                            ) {
+                                Ok(mut rec) if !rec.is_empty() => {
+                                    // Override CRDT ops with git's exact diff lines
+                                    // so `atomic diff -c` shows what git shows.
+                                    if let Some(ref diff_lines) = file.diff_lines {
+                                        use atomic_core::record::workflow::build_crdt_ops_from_git_diff;
+                                        let (git_file_ops, _) =
+                                            build_crdt_ops_from_git_diff(&file.path, diff_lines);
+                                        rec.set_crdt_ops(git_file_ops);
+                                    }
+                                    recorded_files.push(rec);
+                                }
+                                _ => {
+                                    // Fall back to simple delete if modified recording fails
+                                    let mut det = DetectedFile::deleted(&file.path);
+                                    det.inode = Some(inode);
+                                    det.position = Some(pos);
+                                    if let Ok(rec) = record_deleted_file(&det, &core_options) {
+                                        if !rec.is_empty() {
+                                            recorded_files.push(rec);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let mut detected = DetectedFile::deleted(&file.path);
+                        if let Ok(Some((inode, pos))) = repo.get_inode_and_position(&file.path) {
+                            detected.inode = Some(inode);
+                            detected.position = Some(pos);
+                        }
+                        if let Ok(rec) = record_deleted_file(&detected, &core_options) {
+                            if !rec.is_empty() {
+                                recorded_files.push(rec);
+                            }
+                        }
+                    }
+                }
             }
-            Err(atomic_repository::RecordError::NothingToRecord) => {
-                // This can happen with merge commits where content was already imported
-                let mut change = Change::empty(header);
-                change.unhashed = Some(self.build_git_metadata(parsed, false, true));
-                let hash = change.hash().map_err(|e| CliError::Internal(e.into()))?;
-                (change, hash)
-            }
-            Err(e) => return Err(CliError::Internal(e.into())),
-        };
+        }
+
+        // Assemble the change from recorded files
+        if recorded_files.is_empty() {
+            let mut change = Change::empty(header);
+            change.unhashed = Some(self.build_git_metadata(parsed, false, true));
+            let hash = change.hash().map_err(|e| CliError::Internal(e.into()))?;
+            repo.save_change(&change)
+                .map_err(|e| CliError::Internal(e.into()))?;
+            repo.apply_change(&hash, Default::default())
+                .map_err(|e| CliError::Internal(e.into()))?;
+            return Ok(true);
+        }
+
+        let (mut change, hash) = repo
+            .assemble_and_hash(header, &recorded_files)
+            .map_err(|e| CliError::Internal(e.into()))?;
+
+        change.unhashed = Some(self.build_git_metadata(parsed, false, false));
 
         // Save and apply
         repo.save_change(&change)
@@ -661,15 +842,32 @@ fn parse_commit(
         None
     };
 
-    // Compute diff
+    // Use patience diff for the git2 line capture.  We use patience for
+    // the atomic RecordingOptions too (see write_commit), so both produce
+    // the same line classification for the same file content.
     let mut diff_opts = DiffOptions::new();
     diff_opts.include_untracked(false);
+    diff_opts.patience(true);
 
-    let diff = git_repo
+    let mut diff = git_repo
         .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut diff_opts))
         .map_err(|e| CliError::GitError {
             message: format!("Failed to compute diff: {}", e),
         })?;
+
+    // Apply rename detection — mirrors what git CLI does after computing
+    // the initial diff.  This correctly classifies renamed files as R deltas
+    // so write_commit can call repo.move_file() instead of treating them as
+    // plain modifications.
+    //
+    // We do NOT enable rewrites(true) here: that option marks files as
+    // completely rewritten (delta Deleted + Added) when >60% of lines
+    // changed, which collapses the diff lines to empty for the remaining
+    // shared content.  git CLI uses rewrites for display only (--find-renames)
+    // but does not change how diff lines are classified.
+    let mut find_opts = DiffFindOptions::new();
+    find_opts.renames(true).renames_from_rewrites(true);
+    let _ = diff.find_similar(Some(&mut find_opts));
 
     let stats = diff.stats().map_err(|e| CliError::GitError {
         message: format!("Failed to get diff stats: {}", e),
@@ -678,7 +876,7 @@ fn parse_commit(
     let is_empty = stats.files_changed() == 0;
 
     // Parse files
-    let files = parse_diff_files(git_repo, &diff, &tree)?;
+    let files = parse_diff_files(git_repo, &diff, &tree, parent_tree.as_ref())?;
 
     Ok(ParsedCommit {
         git_sha: sha,
@@ -716,11 +914,59 @@ fn extract_commit_metadata(commit: &git2::Commit) -> CliResult<CommitMetadata> {
 }
 
 /// Parse files from a git diff.
+///
+/// For each changed file we capture:
+///   - The operation type (Added / Modified / Deleted / Renamed / Copied)
+///   - The new file content (for adds/modifies)
+///   - The old file content (for modifies/deletes)
+///   - The exact diff lines that git computed, so Phase 2 can build
+///     BranchOps directly from git's diff rather than re-diffing.
 fn parse_diff_files(
     git_repo: &GitRepository,
     diff: &Diff,
     tree: &Tree,
+    parent_tree: Option<&Tree>,
 ) -> CliResult<Vec<ParsedFile>> {
+    use std::collections::HashMap;
+
+    // ── Step 1: collect per-file diff lines via diff.foreach ────────────
+    //
+    // git2::Diff::foreach gives us each DiffLine with its origin (`+`/`-`/` `),
+    // raw bytes, and old/new line numbers — exactly what `git diff` outputs.
+    // We key by file path so we can attach them to the ParsedFile below.
+
+    // Map from file path → accumulated diff lines for that file.
+    let mut lines_by_path: HashMap<String, Vec<GitDiffLine>> = HashMap::new();
+
+    let _ = diff.foreach(
+        &mut |_delta, _progress| true, // file_cb  (no-op)
+        None,                          // binary_cb
+        None,                          // hunk_cb
+        Some(&mut |delta, _hunk, line| {
+            let origin = line.origin();
+            // We only keep `+`, `-`, and context (` `) lines.
+            if origin != '+' && origin != '-' && origin != ' ' {
+                return true;
+            }
+            let path = delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            lines_by_path.entry(path).or_default().push(GitDiffLine {
+                origin,
+                content: line.content().to_vec(),
+                old_lineno: line.old_lineno(),
+                new_lineno: line.new_lineno(),
+            });
+            true
+        }),
+    );
+
+    // ── Step 2: build ParsedFile entries from the delta list ─────────────
+
     let mut files = Vec::new();
 
     for delta in diff.deltas() {
@@ -753,7 +999,7 @@ fn parse_diff_files(
             None
         };
 
-        // Get new content for added/modified files
+        // New content from the commit's tree
         let new_content = if operation == FileOperation::Added
             || operation == FileOperation::Modified
             || operation == FileOperation::Renamed
@@ -764,10 +1010,28 @@ fn parse_diff_files(
             None
         };
 
+        // Old content from the parent commit's tree (for modifies/deletes)
+        let old_content = if (operation == FileOperation::Modified
+            || operation == FileOperation::Deleted
+            || operation == FileOperation::Renamed)
+        {
+            parent_tree.and_then(|pt| {
+                let lookup_path = old_path.as_deref().unwrap_or(&path);
+                get_file_content(git_repo, pt, lookup_path).ok()
+            })
+        } else {
+            None
+        };
+
+        // Diff lines captured above
+        let diff_lines = lines_by_path.remove(&path);
+
         files.push(ParsedFile {
             path,
             operation,
             new_content,
+            old_content,
+            diff_lines,
             old_path,
         });
     }

@@ -416,7 +416,7 @@ impl Repository {
         let change_filter = collect_stack_change_ids(&txn, &stack)?;
 
         // Use the filtered retrieval method
-        self.get_file_content_with_filter(&txn, &normalized, change_filter)
+        self.get_file_content_with_filter(&txn, &normalized, change_filter, true)
     }
 
     /// Get the recorded content for a tracked file on a specific stack.
@@ -458,7 +458,7 @@ impl Repository {
         let change_filter = collect_stack_change_ids(&txn, &stack)?;
 
         // Use the filtered retrieval method
-        self.get_file_content_with_filter(&txn, &normalized, change_filter)
+        self.get_file_content_with_filter(&txn, &normalized, change_filter, true)
     }
 
     /// Get the recorded content for a tracked file with options.
@@ -672,8 +672,10 @@ impl Repository {
             get_changes_up_to_sequence(&txn, &stack, state_info.parent_max_sequence_exclusive())
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Retrieve content with the change filter
-        self.get_file_content_with_filter(&txn, &normalized, change_set)
+        // Retrieve content with the change filter.
+        // Pass require_tracked=false: the file may have been deleted after
+        // this point, but we want its content as it existed before the change.
+        self.get_file_content_with_filter(&txn, &normalized, change_set, false)
     }
 
     /// Get file content as it was AFTER a specific change was applied.
@@ -739,8 +741,10 @@ impl Repository {
             None => return Ok(None), // Change not in this stack
         };
 
-        // Retrieve content with the change filter
-        self.get_file_content_with_filter(&txn, &normalized, change_set)
+        // Retrieve content with the change filter.
+        // require_tracked=true: if the file was deleted before this point,
+        // there is no "after" content to return.
+        self.get_file_content_with_filter(&txn, &normalized, change_set, true)
     }
 
     /// Get file content at a specific sequence number.
@@ -796,8 +800,8 @@ impl Repository {
         let change_set = get_changes_up_to_sequence(&txn, &stack, max_sequence)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Retrieve content with the change filter
-        self.get_file_content_with_filter(&txn, &normalized, change_set)
+        // Retrieve content with the change filter.
+        self.get_file_content_with_filter(&txn, &normalized, change_set, true)
     }
 
     /// Internal helper to retrieve file content with a change filter.
@@ -811,16 +815,22 @@ impl Repository {
         txn: &T,
         normalized_path: &str,
         change_set: std::collections::HashSet<NodeId>,
+        require_tracked: bool,
     ) -> Result<Option<Vec<u8>>, RepositoryError>
     where
-        T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::TreeTxnT,
+        T: atomic_core::pristine::GraphTxnT
+            + atomic_core::pristine::TreeTxnT
+            + atomic_core::pristine::StackTxnT,
     {
         use atomic_core::output::alive::RetrieveOptions;
+        use atomic_core::pristine::overlay::OverlayTxn;
         use atomic_core::record::workflow::retrieve::retrieve_content_with_filter;
 
-        // Check if file is tracked
-        if !is_tracked(txn, normalized_path)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        // Check if file is tracked (skip for deleted files — they are no
+        // longer in the TREE but their inode/content is still in the graph).
+        if require_tracked
+            && !is_tracked(txn, normalized_path)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
             return Ok(None);
         }
@@ -842,8 +852,21 @@ impl Repository {
         // Create options with the change filter
         let options = RetrieveOptions::new().with_change_filter(change_set.clone());
 
-        // Retrieve content from the graph with the filter
-        let content = retrieve_content_with_filter(txn, &self.change_store, position, options)
+        // Build an OverlayTxn so that Local stacks can see their
+        // STACK_GRAPH edges.  For Shared stacks the overlay is a
+        // pass-through to the global GRAPH — no behaviour change.
+        let stack = txn
+            .get_stack(&self.current_stack)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::StackNotFound {
+                name: self.current_stack.clone(),
+            })?;
+
+        let overlay = OverlayTxn::from_stack(txn, &stack)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Retrieve content using the overlay (sees STACK_GRAPH for Local stacks)
+        let content = retrieve_content_with_filter(&overlay, &self.change_store, position, options)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if content.is_empty() {

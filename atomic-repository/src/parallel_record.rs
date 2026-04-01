@@ -128,6 +128,13 @@ pub struct FileRecordInput {
     /// Empty for added files, irrelevant for deleted files.
     pub old_content: Vec<u8>,
 
+    /// New content provided directly by the caller.
+    ///
+    /// When `Some`, the worker uses this instead of reading from
+    /// `full_path`.  This is the fast path for git import where
+    /// the content is already in memory from `git show`.
+    pub new_content: Option<Vec<u8>>,
+
     /// The file's inode in the pristine (if known).
     /// Required for modified and deleted files; `None` for added files.
     pub inode: Option<Inode>,
@@ -160,6 +167,20 @@ impl FileRecordInput {
             full_path,
             kind: FileRecordKind::Added,
             old_content: Vec::new(),
+            new_content: None,
+            inode: None,
+            position: None,
+        }
+    }
+
+    /// Create an input for a newly added file with content already in memory.
+    pub fn added_with_content(path: String, content: Vec<u8>) -> Self {
+        Self {
+            path,
+            full_path: PathBuf::new(),
+            kind: FileRecordKind::Added,
+            old_content: Vec::new(),
+            new_content: Some(content),
             inode: None,
             position: None,
         }
@@ -178,6 +199,26 @@ impl FileRecordInput {
             full_path,
             kind: FileRecordKind::Modified,
             old_content,
+            new_content: None,
+            inode: Some(inode),
+            position: Some(position),
+        }
+    }
+
+    /// Create an input for a modified file with new content already in memory.
+    pub fn modified_with_content(
+        path: String,
+        old_content: Vec<u8>,
+        new_content: Vec<u8>,
+        inode: Inode,
+        position: Position<NodeId>,
+    ) -> Self {
+        Self {
+            path,
+            full_path: PathBuf::new(),
+            kind: FileRecordKind::Modified,
+            old_content,
+            new_content: Some(new_content),
             inode: Some(inode),
             position: Some(position),
         }
@@ -190,6 +231,7 @@ impl FileRecordInput {
             full_path: PathBuf::new(),
             kind: FileRecordKind::Deleted,
             old_content: Vec::new(),
+            new_content: None,
             inode: Some(inode),
             position: Some(position),
         }
@@ -202,6 +244,7 @@ impl FileRecordInput {
             full_path: PathBuf::new(),
             kind: FileRecordKind::DirectoryAdded,
             old_content: Vec::new(),
+            new_content: None,
             inode: None,
             position: None,
         }
@@ -214,6 +257,7 @@ impl FileRecordInput {
             full_path: PathBuf::new(),
             kind: FileRecordKind::DirectoryDeleted,
             old_content: Vec::new(),
+            new_content: None,
             inode: Some(inode),
             position: Some(position),
         }
@@ -634,9 +678,13 @@ fn process_added_file(
     input: &FileRecordInput,
     options: &RecordingOptions,
 ) -> Result<FileRecordOutput, String> {
-    // Read the file content from disk
-    let content = std::fs::read(&input.full_path)
-        .map_err(|e| format!("Failed to read {}: {}", input.path, e))?;
+    // Use in-memory content if provided, otherwise read from disk.
+    let content = if let Some(ref c) = input.new_content {
+        c.clone()
+    } else {
+        std::fs::read(&input.full_path)
+            .map_err(|e| format!("Failed to read {}: {}", input.path, e))?
+    };
 
     // Check size limits
     if options.exceeds_max_size(content.len()) {
@@ -700,9 +748,13 @@ fn process_modified_file(
     input: &FileRecordInput,
     options: &RecordingOptions,
 ) -> Result<FileRecordOutput, String> {
-    // Read the new content from disk
-    let new_content = std::fs::read(&input.full_path)
-        .map_err(|e| format!("Failed to read {}: {}", input.path, e))?;
+    // Use in-memory content if provided, otherwise read from disk.
+    let new_content = if let Some(ref c) = input.new_content {
+        c.clone()
+    } else {
+        std::fs::read(&input.full_path)
+            .map_err(|e| format!("Failed to read {}: {}", input.path, e))?
+    };
 
     // Check if content actually changed
     if input.old_content == new_content {

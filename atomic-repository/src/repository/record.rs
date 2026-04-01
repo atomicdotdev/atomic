@@ -648,6 +648,88 @@ impl Repository {
         self.record(header, options)
     }
 
+    /// Assemble a change from pre-built `RecordedFile`s and compute its hash.
+    ///
+    /// This is the fast path for git import: the caller has already built
+    /// `RecordedFile`s (via `record_added_file` / `record_modified_file`)
+    /// and just needs globalization + assembly + hashing.
+    ///
+    /// Returns `(Change, Hash)`.
+    pub fn assemble_and_hash(
+        &self,
+        header: ChangeHeader,
+        recorded_files: &[atomic_core::record::workflow::RecordedFile],
+    ) -> Result<(Change, Hash), RecordError> {
+        use atomic_core::pristine::overlay::OverlayTxn;
+        use atomic_core::record::workflow::assemble_change;
+        use atomic_core::record::workflow::assembly::AssemblyOptions;
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RecordError::Database(e.to_string()))?;
+
+        let stack = txn
+            .get_stack(&self.current_stack)
+            .map_err(|e| RecordError::Database(e.to_string()))?
+            .ok_or_else(|| {
+                RecordError::Database(format!("Stack '{}' not found", self.current_stack))
+            })?;
+
+        let overlay_txn = OverlayTxn::from_stack(&txn, &stack)
+            .map_err(|e| RecordError::Database(e.to_string()))?;
+
+        let assembly_options = AssemblyOptions::default();
+
+        let assembly_result =
+            assemble_change(&overlay_txn, recorded_files, header, &assembly_options)?;
+
+        let change = assembly_result.into_change();
+
+        let mut v3_bytes = Vec::new();
+        let hash = change
+            .serialize(&mut v3_bytes)
+            .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+
+        let (final_change, _) = Change::deserialize(&mut v3_bytes.as_slice())
+            .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+
+        Ok((final_change, hash))
+    }
+
+    /// Look up a file's inode and graph position from the pristine.
+    ///
+    /// Returns `None` if the file is not tracked or has no graph position.
+    pub fn get_inode_and_position(
+        &self,
+        path: &str,
+    ) -> Result<Option<(Inode, Position<NodeId>)>, RepositoryError> {
+        use atomic_core::pristine::{GraphTxnT, TreeTxnT};
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let inode = match txn
+            .get_inode(path)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+
+        let position = match txn
+            .inode_position(inode)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        Ok(Some((inode, position)))
+    }
+
     /// Record all changes with a message.
     ///
     /// This is a convenience method that records all modified files.
