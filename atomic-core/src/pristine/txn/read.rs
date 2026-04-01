@@ -93,12 +93,12 @@ impl GraphTxnT for ReadTxn {
         let target_pos = pos.pos.get();
 
         let start_key = encode_vertex(change_id, 0, 0);
-        let end_key = encode_vertex(change_id + 1, 0, 0);
+        let end_key = encode_vertex(change_id, u64::MAX, u64::MAX);
 
         // Track empty span match as fallback
         let mut empty_vertex_match: Option<GraphNode<NodeId>> = None;
 
-        for result in table.range::<&[u8; 24]>(&start_key..&end_key)? {
+        for result in table.range::<&[u8; 24]>(&start_key..=&end_key)? {
             let (key, _values) = result?;
             let (v_change, v_start, v_end) = decode_vertex(key.value());
 
@@ -168,10 +168,10 @@ impl GraphTxnT for ReadTxn {
 
         // SECOND: Fall back to iteration to find vertices that end at this position
         let start_key = encode_vertex(change_id, 0, 0);
-        let end_key = encode_vertex(change_id + 1, 0, 0);
+        let end_key = encode_vertex(change_id, u64::MAX, u64::MAX);
 
         // Look for a span that ends at this position or contains it
-        for result in table.range::<&[u8; 24]>(&start_key..&end_key)? {
+        for result in table.range::<&[u8; 24]>(&start_key..=&end_key)? {
             let (key, _values) = result?;
             let (v_change, v_start, v_end) = decode_vertex(key.value());
 
@@ -231,9 +231,9 @@ impl GraphTxnT for ReadTxn {
     fn has_change_in_graph(&self, change_id: NodeId) -> PristineResult<bool> {
         let table = self.txn.open_multimap_table(GRAPH)?;
         let start_key = encode_vertex(change_id.get(), 0, 0);
-        let end_key = encode_vertex(change_id.get() + 1, 0, 0);
+        let end_key = encode_vertex(change_id.get(), u64::MAX, u64::MAX);
         let has = table
-            .range::<&[u8; 24]>(&start_key..&end_key)?
+            .range::<&[u8; 24]>(&start_key..=&end_key)?
             .next()
             .is_some();
         Ok(has)
@@ -291,14 +291,14 @@ impl StackTxnT for ReadTxn {
     ) -> PristineResult<Vec<(u64, u64)>> {
         let table = self.txn.open_multimap_table(STACK_GRAPH)?;
 
-        // Range scan: (stack_id, change_id, 0, 0) .. (stack_id, change_id+1, 0, 0)
+        // Range scan: all vertices for (stack_id, change_id)
         let start_key = encode_stack_graph_key(stack_id, change_id, 0, 0);
-        let end_key = encode_stack_graph_key(stack_id, change_id + 1, 0, 0);
+        let end_key = encode_stack_graph_key(stack_id, change_id, u64::MAX, u64::MAX);
 
         let mut vertices: Vec<(u64, u64)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
-        for result in table.range::<&[u8; 32]>(&start_key..&end_key)? {
+        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
             let (key, _values) = result?;
             let (_, v_change, v_start, v_end) = decode_stack_graph_key(key.value());
             if v_change != change_id {
@@ -365,11 +365,11 @@ impl StackTxnT for ReadTxn {
 
         let stack_id = stack.id;
         let start_key = encode_stack_seq(stack_id, from_seq);
-        let end_key = encode_stack_seq(stack_id + 1, 0);
+        let end_key = encode_stack_seq(stack_id, u64::MAX);
 
         // Collect into a Vec to avoid lifetime issues
         let mut results = Vec::new();
-        for result in changes_table.range::<&[u8; 16]>(&start_key..&end_key)? {
+        for result in changes_table.range::<&[u8; 16]>(&start_key..=&end_key)? {
             match result {
                 Ok((key, value)) => {
                     let (_, seq) = decode_stack_seq(key.value());
@@ -477,11 +477,11 @@ impl TreeTxnT for ReadTxn {
 
         let inode_id = inode.get();
         let start_key = encode_inode_vertex(inode_id, 0, 0, 0);
-        let end_key = encode_inode_vertex(inode_id + 1, 0, 0, 0);
+        let end_key = encode_inode_vertex(inode_id, u64::MAX, u64::MAX, u64::MAX);
 
         // Collect to avoid lifetime issues
         let mut results = Vec::new();
-        for result in table.range::<&[u8; 32]>(&start_key..&end_key)? {
+        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
             match result {
                 Ok((key, values)) => {
                     let (_, change_id, start, end) = decode_inode_vertex(key.value());

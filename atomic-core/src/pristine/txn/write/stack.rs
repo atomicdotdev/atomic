@@ -54,12 +54,12 @@ impl<'a> StackTxnT for WriteTxn<'a> {
 
         // Range scan: (stack_id, change_id, 0, 0) .. (stack_id, change_id+1, 0, 0)
         let start_key = encode_stack_graph_key(stack_id, change_id, 0, 0);
-        let end_key = encode_stack_graph_key(stack_id, change_id + 1, 0, 0);
+        let end_key = encode_stack_graph_key(stack_id, change_id, u64::MAX, u64::MAX);
 
         let mut vertices: Vec<(u64, u64)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
-        for result in table.range::<&[u8; 32]>(&start_key..&end_key)? {
+        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
             let (key, _values) = result?;
             let (_, v_change, v_start, v_end) = decode_stack_graph_key(key.value());
             if v_change != change_id {
@@ -126,10 +126,10 @@ impl<'a> StackTxnT for WriteTxn<'a> {
 
         let stack_id = stack.id;
         let start_key = encode_stack_seq(stack_id, from_seq);
-        let end_key = encode_stack_seq(stack_id + 1, 0);
+        let end_key = encode_stack_seq(stack_id, u64::MAX);
 
         let mut results = Vec::new();
-        for result in changes_table.range::<&[u8; 16]>(&start_key..&end_key)? {
+        for result in changes_table.range::<&[u8; 16]>(&start_key..=&end_key)? {
             match result {
                 Ok((key, value)) => {
                     let (_, seq) = decode_stack_seq(key.value());

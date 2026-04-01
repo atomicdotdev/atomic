@@ -83,10 +83,10 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
 
         let inode_id = inode.get();
         let start_key = encode_inode_vertex(inode_id, 0, 0, 0);
-        let end_key = encode_inode_vertex(inode_id + 1, 0, 0, 0);
+        let end_key = encode_inode_vertex(inode_id, u64::MAX, u64::MAX, u64::MAX);
 
         let mut results = Vec::new();
-        for result in table.range::<&[u8; 32]>(&start_key..&end_key)? {
+        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
             match result {
                 Ok((key, values)) => {
                     let (_, change_id, start, end) = decode_inode_vertex(key.value());

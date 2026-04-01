@@ -519,11 +519,11 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         let mut table = self.txn.open_multimap_table(STACK_GRAPH)?;
 
         let start_key = encode_stack_graph_prefix(stack_id);
-        let end_key = encode_stack_graph_prefix(stack_id + 1);
+        let end_key = encode_stack_graph_key(stack_id, u64::MAX, u64::MAX, u64::MAX);
 
         // Collect keys to delete (can't mutate while iterating)
         let mut keys_to_delete: Vec<([u8; 32], Vec<[u8; 24]>)> = Vec::new();
-        for result in table.range::<&[u8; 32]>(&start_key..&end_key)? {
+        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
             let (key, values) = result?;
             let key_bytes: [u8; 32] = *key.value();
             let mut edge_bytes = Vec::new();
