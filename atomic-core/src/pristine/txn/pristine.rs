@@ -27,6 +27,7 @@ use redb::{Database, ReadableTable};
 use crate::pristine::error::PristineResult;
 use crate::pristine::tables::*;
 
+use super::helpers::deserialize_stack_state;
 use super::read::ReadTxn;
 use super::write::WriteTxn;
 
@@ -124,11 +125,14 @@ impl Pristine {
 
         let next_stack_id = {
             let table = read_txn.open_table(STACKS)?;
-            let mut count = 0u64;
-            for _ in table.iter()? {
-                count += 1;
+            let mut max_id = 0u64;
+            for result in table.iter()?.filter_map(|r| r.ok()) {
+                let (_, value) = result;
+                if let Ok(state) = deserialize_stack_state(value.value()) {
+                    max_id = max_id.max(state.id);
+                }
             }
-            AtomicU64::new(count + 1)
+            AtomicU64::new(max_id + 1)
         };
 
         let next_inode = {
@@ -186,11 +190,14 @@ impl Pristine {
 
         let next_stack_id = {
             let table = read_txn.open_table(STACKS)?;
-            let mut count = 0u64;
-            for _ in table.iter()? {
-                count += 1;
+            let mut max_id = 0u64;
+            for result in table.iter()?.filter_map(|r| r.ok()) {
+                let (_, value) = result;
+                if let Ok(state) = deserialize_stack_state(value.value()) {
+                    max_id = max_id.max(state.id);
+                }
             }
-            AtomicU64::new(count + 1)
+            AtomicU64::new(max_id + 1)
         };
 
         let next_inode = {
