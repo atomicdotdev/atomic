@@ -480,10 +480,7 @@ impl ParallelImporter {
 
         // Track new files so the pristine knows about them before we record.
         for file in &parsed.files {
-            if file.operation == FileOperation::Added
-                || file.operation == FileOperation::Renamed
-                || file.operation == FileOperation::Copied
-            {
+            if file.operation == FileOperation::Added || file.operation == FileOperation::Copied {
                 let _ = repo.add(&file.path, atomic_repository::TrackingOptions::default());
             }
         }
@@ -522,56 +519,86 @@ impl ParallelImporter {
                 }
 
                 FileOperation::Renamed => {
-                    // A rename in atomic is a file move: update the TREE
-                    // mapping from old_path → inode to new_path → inode,
-                    // keeping the inode (and its graph content) intact.
+                    // A rename is recorded as a GraphOp::FileMove, which:
+                    //   1. Marks the old name edge DELETED in the graph
+                    //   2. Inserts a new name edge pointing to the SAME inode
+                    //
+                    // We do NOT call repo.move_file() here — the TREE update
+                    // happens later when apply_change processes the FileMove op.
                     let old_path = file.old_path.as_deref().unwrap_or(&file.path);
 
-                    // Update tracking: old path → new path.
-                    let _ = repo.move_file(old_path, &file.path);
+                    // Look up the inode and position for the old path.
+                    // If the old file isn't tracked at all, fall back to
+                    // treating the rename as a plain addition.
+                    match repo.get_inode_and_position(old_path) {
+                        Ok(Some((inode, pos))) => {
+                            // Build the move RecordedFile. Globalization will
+                            // produce a GraphOp::FileMove from this.
+                            let mut move_rec = RecordedFile::new(&file.path);
+                            move_rec.set_kind(
+                                atomic_core::record::workflow::detect::DetectionKind::Moved,
+                            );
+                            move_rec.set_old_path(old_path.to_string());
+                            move_rec.set_inode(inode);
+                            move_rec.set_position(pos);
+                            recorded_files.push(move_rec);
 
-                    let new_content = match &file.new_content {
-                        Some(c) => c.as_slice(),
-                        None => continue,
-                    };
+                            // If the content also changed during the rename,
+                            // record the modification on the new path separately.
+                            let new_content = match &file.new_content {
+                                Some(c) => c.as_slice(),
+                                None => &[],
+                            };
 
-                    // Old content is still accessible via old_path in the
-                    // pristine graph (the inode is the same, just remapped).
-                    let old_content = repo
-                        .get_file_content(std::path::Path::new(&file.path))
-                        .unwrap_or(None)
-                        .unwrap_or_default();
+                            // Read the old content via old_path (still in TREE
+                            // until apply_change runs the FileMove op).
+                            let old_content = repo
+                                .get_file_content(std::path::Path::new(old_path))
+                                .unwrap_or(None)
+                                .unwrap_or_default();
 
-                    // If the content also changed during the rename, record
-                    // the modification on the new path.
-                    if old_content != new_content {
-                        memory_wc.add_file(&file.path, new_content);
+                            if !new_content.is_empty() && old_content != new_content {
+                                let memory_wc2 = atomic_core::output::memory::Memory::new();
+                                memory_wc2.add_file(&file.path, new_content);
 
-                        let mut detected = DetectedFile::modified(&file.path);
-                        if let Ok(Some((inode, pos))) = repo.get_inode_and_position(&file.path) {
-                            detected.inode = Some(inode);
-                            detected.position = Some(pos);
-                        }
+                                let mut detected = DetectedFile::modified(&file.path);
+                                detected.inode = Some(inode);
+                                detected.position = Some(pos);
 
-                        match record_modified_file(
-                            &memory_wc,
-                            &detected,
-                            &old_content,
-                            &core_options,
-                        ) {
-                            Ok(mut rec) if !rec.is_empty() => {
-                                if let Some(ref diff_lines) = file.diff_lines {
-                                    use atomic_core::record::workflow::build_crdt_ops_from_git_diff;
-                                    let (git_file_ops, _) =
-                                        build_crdt_ops_from_git_diff(&file.path, diff_lines);
-                                    rec.set_crdt_ops(git_file_ops);
+                                match record_modified_file(
+                                    &memory_wc2,
+                                    &detected,
+                                    &old_content,
+                                    &core_options,
+                                ) {
+                                    Ok(mut rec) if !rec.is_empty() => {
+                                        if let Some(ref diff_lines) = file.diff_lines {
+                                            use atomic_core::record::workflow::build_crdt_ops_from_git_diff;
+                                            let (git_file_ops, _) = build_crdt_ops_from_git_diff(
+                                                &file.path, diff_lines,
+                                            );
+                                            rec.set_crdt_ops(git_file_ops);
+                                        }
+                                        recorded_files.push(rec);
+                                    }
+                                    _ => {}
                                 }
-                                recorded_files.push(rec);
                             }
-                            _ => {}
+                        }
+                        _ => {
+                            // Old path not tracked — treat rename as a plain addition.
+                            let content = match &file.new_content {
+                                Some(c) => c.as_slice(),
+                                None => continue,
+                            };
+                            memory_wc.add_file(&file.path, content);
+                            let detected = DetectedFile::added(&file.path);
+                            match record_added_file(&memory_wc, &detected, &core_options) {
+                                Ok(rec) if !rec.is_empty() => recorded_files.push(rec),
+                                _ => {}
+                            }
                         }
                     }
-                    // Content unchanged — move tracking update is sufficient.
                 }
 
                 FileOperation::Modified => {

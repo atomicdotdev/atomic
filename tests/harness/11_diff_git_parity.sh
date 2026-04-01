@@ -571,6 +571,260 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
+begin_section "Parity: Pure rename (no content change)"
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A pure rename produces ZERO +/- lines in both git diff and atomic diff.
+# git diff --follow sees no content change; atomic treats the rename as a
+# TrunkOp::Move which has no associated line operations.
+# Both sides must produce an empty set of change lines.
+
+make_temp_repo "parity-rename-pure"
+GIT_REPO="$REPO_DIR"
+
+git -C "$GIT_REPO" init --quiet 2>/dev/null
+git -C "$GIT_REPO" config user.email "test@test.com" 2>/dev/null
+git -C "$GIT_REPO" config user.name "Test" 2>/dev/null
+
+# v1: create a file
+printf 'line1\nline2\nline3\n' > "$GIT_REPO/old_name.txt"
+git -C "$GIT_REPO" add -A >/dev/null 2>&1
+git -C "$GIT_REPO" commit -m "v1" --quiet 2>/dev/null
+SHA1=$(git -C "$GIT_REPO" rev-parse HEAD 2>/dev/null)
+
+# v2: rename the file only (no content change)
+git -C "$GIT_REPO" mv old_name.txt new_name.txt 2>/dev/null
+git -C "$GIT_REPO" commit -m "v2: rename" --quiet 2>/dev/null
+SHA2=$(git -C "$GIT_REPO" rev-parse HEAD 2>/dev/null)
+
+GIT_SHAS=("$SHA1" "$SHA2")
+
+(cd "$GIT_REPO" && atomic git import 2>/dev/null) || true
+
+ATOMIC_HASHES=()
+_log=$( (cd "$GIT_REPO" && atomic log --format short --no-color --full-hash 2>/dev/null) || true )
+if [[ -n "${_log:-}" ]]; then
+    _tmp=()
+    while IFS= read -r line; do
+        _h=$(echo "$line" | awk '{print $1}')
+        [[ -n "$_h" ]] && _tmp+=("$_h")
+    done <<< "$_log"
+    for (( _i=${#_tmp[@]}-1 ; _i>=0 ; _i-- )); do
+        ATOMIC_HASHES+=("${_tmp[$_i]}")
+    done
+fi
+
+# For a pure rename git diff produces zero +/- lines (no content changed).
+# atomic diff -c likewise produces zero +/- lines for a TrunkOp::Move with
+# no associated BranchOp edits.  Compare both sides; both must be empty.
+_rename_atomic_hash=""
+if [[ ${#ATOMIC_HASHES[@]} -ge 2 ]]; then
+    _rename_atomic_hash="${ATOMIC_HASHES[1]}"
+fi
+
+_git_lines_rename=$(git -C "$GIT_REPO" --no-pager diff "$SHA1" "$SHA2" \
+    2>/dev/null | grep -E '^\+[^+]|^-[^-]' || true)
+
+_atomic_lines_rename=""
+if [[ -n "$_rename_atomic_hash" ]]; then
+    _atomic_raw=$( (cd "$GIT_REPO" && atomic diff -c "$_rename_atomic_hash" --no-color 2>/dev/null) || true )
+    _atomic_lines_rename=$(printf '%s\n' "$_atomic_raw" | grep -E '^\+[^+]|^-[^-]' || true)
+fi
+
+if [[ -z "$_git_lines_rename" && -z "$_atomic_lines_rename" ]]; then
+    _pass "pure rename: both sides have zero change lines (correct)"
+elif [[ "$_git_lines_rename" == "$_atomic_lines_rename" ]]; then
+    _pass "pure rename: change lines match"
+else
+    _git_n=$(printf '%s\n' "$_git_lines_rename" | grep -c '.' 2>/dev/null || echo 0)
+    _atomic_n=$(printf '%s\n' "$_atomic_lines_rename" | grep -c '.' 2>/dev/null || echo 0)
+    _fail "pure rename: change lines" "git=$_git_n lines, atomic=$_atomic_n lines"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+begin_section "Parity: Rename + content change"
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# When a file is renamed AND its content changes in the same commit, atomic
+# imports this as a TrunkOp::Move (the rename) plus BranchOp edits (the
+# content change) — shown under the new filename as the delta only.
+#
+# Comparison strategy:
+#   git side  : `git diff -M PARENT HEAD` with rename detection enabled,
+#               then extract only the lines belonging to renamed.txt.
+#               -M causes git to detect the rename and show only the content
+#               delta (same as what atomic produces), rather than treating
+#               the new file as freshly created.
+#   atomic side: extract +/- lines from the renamed.txt section of
+#               `atomic diff -c <hash>`
+
+make_temp_repo "parity-rename-modify"
+GIT_REPO="$REPO_DIR"
+
+git -C "$GIT_REPO" init --quiet 2>/dev/null
+git -C "$GIT_REPO" config user.email "test@test.com" 2>/dev/null
+git -C "$GIT_REPO" config user.name "Test" 2>/dev/null
+
+# v1: create original file
+printf 'alpha\nbeta\ngamma\ndelta\n' > "$GIT_REPO/original.txt"
+git -C "$GIT_REPO" add -A >/dev/null 2>&1
+git -C "$GIT_REPO" commit -m "v1" --quiet 2>/dev/null
+SHA1=$(git -C "$GIT_REPO" rev-parse HEAD 2>/dev/null)
+
+# v2: rename AND modify content
+git -C "$GIT_REPO" mv original.txt renamed.txt 2>/dev/null
+printf 'alpha\nbeta\nGAMMA-MODIFIED\ndelta\nepsilon\n' > "$GIT_REPO/renamed.txt"
+git -C "$GIT_REPO" add -A >/dev/null 2>&1
+git -C "$GIT_REPO" commit -m "v2: rename+modify" --quiet 2>/dev/null
+SHA2=$(git -C "$GIT_REPO" rev-parse HEAD 2>/dev/null)
+
+GIT_SHAS=("$SHA1" "$SHA2")
+
+(cd "$GIT_REPO" && atomic git import 2>/dev/null) || true
+
+ATOMIC_HASHES=()
+_log=$( (cd "$GIT_REPO" && atomic log --format short --no-color --full-hash 2>/dev/null) || true )
+if [[ -n "${_log:-}" ]]; then
+    _tmp=()
+    while IFS= read -r line; do
+        _h=$(echo "$line" | awk '{print $1}')
+        [[ -n "$_h" ]] && _tmp+=("$_h")
+    done <<< "$_log"
+    for (( _i=${#_tmp[@]}-1 ; _i>=0 ; _i-- )); do
+        ATOMIC_HASHES+=("${_tmp[$_i]}")
+    done
+fi
+
+_rename_mod_hash=""
+if [[ ${#ATOMIC_HASHES[@]} -ge 2 ]]; then
+    _rename_mod_hash="${ATOMIC_HASHES[1]}"
+fi
+
+# Git: use -M10% (rename detection with a low similarity threshold) so git
+# recognises the rename even for files with significant content changes.
+# When git detects the rename the header becomes:
+#   diff --git a/original.txt b/renamed.txt
+#   rename from original.txt
+#   rename to renamed.txt
+# and the diff shows only the content delta.
+# We extract only the +/- lines from that section.
+_git_full_rmod=$(git -C "$GIT_REPO" --no-pager diff -M10% "$SHA1" "$SHA2" \
+    2>/dev/null || true)
+_git_lines_rmod=$(printf '%s\n' "$_git_full_rmod" | awk -v pat="renamed.txt" '
+    /^diff --git/ {
+        # A rename section header looks like: diff --git a/old b/new
+        # Match on " b/<pat>" at end of line (1-based substr index).
+        n = length($0)
+        plen = length(pat)
+        in_sec = (index($0, " b/" pat) > 0 && \
+                  (index($0, " b/" pat " ") > 0 || \
+                   substr($0, n - plen + 1) == pat)) ? 1 : 0
+        next
+    }
+    in_sec { print }
+' | grep -E '^\+[^+]|^-[^-]' || true)
+
+# Atomic: extract +/- lines from the "renamed.txt" section.
+_atomic_lines_rmod=""
+if [[ -n "$_rename_mod_hash" ]]; then
+    _raw=$( (cd "$GIT_REPO" && atomic diff -c "$_rename_mod_hash" --no-color 2>/dev/null) || true )
+    _atomic_lines_rmod=$(printf '%s\n' "$_raw" | awk -v pat="renamed.txt" '
+        /^diff --atomic/ {
+            in_sec = (index($0, " b/" pat) > 0 && \
+                      (index($0, " b/" pat " ") > 0 || \
+                       substr($0, length($0) - length(pat)) == pat)) ? 1 : 0
+            next
+        }
+        in_sec { print }
+    ' | grep -E '^\+[^+]|^-[^-]' || true)
+fi
+
+# Sort both sides before comparing (hunk-ordering may differ).
+_sorted_git=$(printf '%s\n' "$_git_lines_rmod" | sort)
+_sorted_atomic=$(printf '%s\n' "$_atomic_lines_rmod" | sort)
+
+if [[ "$_sorted_git" == "$_sorted_atomic" ]]; then
+    _n=$(printf '%s\n' "$_git_lines_rmod" | grep -c '.' 2>/dev/null || echo 0)
+    _pass "rename+modify: change lines match ($_n lines)"
+else
+    _gn=$(printf '%s\n' "$_git_lines_rmod" | grep -c '.' 2>/dev/null || echo 0)
+    _an=$(printf '%s\n' "$_atomic_lines_rmod" | grep -c '.' 2>/dev/null || echo 0)
+    _first=$(diff \
+        <(printf '%s\n' "$_git_lines_rmod" | sort) \
+        <(printf '%s\n' "$_atomic_lines_rmod" | sort) \
+        2>/dev/null | head -4) || true
+    _fail "rename+modify: change lines" \
+        "git=$_gn lines, atomic=$_an lines. Diff: $_first"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+begin_section "Parity: Rename across directories"
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Validates that moving a file from one subdirectory to another is handled
+# correctly — the atomic diff should show zero +/- lines (no content change)
+# and match git exactly.
+
+make_temp_repo "parity-rename-dirs"
+GIT_REPO="$REPO_DIR"
+
+git -C "$GIT_REPO" init --quiet 2>/dev/null
+git -C "$GIT_REPO" config user.email "test@test.com" 2>/dev/null
+git -C "$GIT_REPO" config user.name "Test" 2>/dev/null
+
+mkdir -p "$GIT_REPO/src" "$GIT_REPO/lib"
+printf 'fn helper() {}\n' > "$GIT_REPO/src/helper.rs"
+git -C "$GIT_REPO" add -A >/dev/null 2>&1
+git -C "$GIT_REPO" commit -m "v1" --quiet 2>/dev/null
+SHA1=$(git -C "$GIT_REPO" rev-parse HEAD 2>/dev/null)
+
+# Move src/helper.rs → lib/helper.rs (no content change)
+git -C "$GIT_REPO" mv src/helper.rs lib/helper.rs 2>/dev/null
+git -C "$GIT_REPO" commit -m "v2: move to lib/" --quiet 2>/dev/null
+SHA2=$(git -C "$GIT_REPO" rev-parse HEAD 2>/dev/null)
+
+GIT_SHAS=("$SHA1" "$SHA2")
+
+(cd "$GIT_REPO" && atomic git import 2>/dev/null) || true
+
+ATOMIC_HASHES=()
+_log=$( (cd "$GIT_REPO" && atomic log --format short --no-color --full-hash 2>/dev/null) || true )
+if [[ -n "${_log:-}" ]]; then
+    _tmp=()
+    while IFS= read -r line; do
+        _h=$(echo "$line" | awk '{print $1}')
+        [[ -n "$_h" ]] && _tmp+=("$_h")
+    done <<< "$_log"
+    for (( _i=${#_tmp[@]}-1 ; _i>=0 ; _i-- )); do
+        ATOMIC_HASHES+=("${_tmp[$_i]}")
+    done
+fi
+
+_dir_rename_hash=""
+if [[ ${#ATOMIC_HASHES[@]} -ge 2 ]]; then
+    _dir_rename_hash="${ATOMIC_HASHES[1]}"
+fi
+
+_git_lines_dir=$(git -C "$GIT_REPO" --no-pager diff "$SHA1" "$SHA2" \
+    2>/dev/null | grep -E '^\+[^+]|^-[^-]' || true)
+
+_atomic_lines_dir=""
+if [[ -n "$_dir_rename_hash" ]]; then
+    _raw=$( (cd "$GIT_REPO" && atomic diff -c "$_dir_rename_hash" --no-color 2>/dev/null) || true )
+    _atomic_lines_dir=$(printf '%s\n' "$_raw" | grep -E '^\+[^+]|^-[^-]' || true)
+fi
+
+if [[ -z "$_git_lines_dir" && -z "$_atomic_lines_dir" ]]; then
+    _pass "cross-dir rename: both sides have zero change lines (correct)"
+elif [[ "$_git_lines_dir" == "$_atomic_lines_dir" ]]; then
+    _pass "cross-dir rename: change lines match"
+else
+    _gn=$(printf '%s\n' "$_git_lines_dir" | grep -c '.' 2>/dev/null || echo 0)
+    _an=$(printf '%s\n' "$_atomic_lines_dir" | grep -c '.' 2>/dev/null || echo 0)
+    _fail "cross-dir rename: change lines" "git=$_gn lines, atomic=$_an lines"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 

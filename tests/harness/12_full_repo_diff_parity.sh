@@ -97,12 +97,71 @@ atomic_diff_for_path() {
     ' | extract_atomic_change_lines
 }
 
-# Check if a commit is a rename/move (git2 and git CLI handle these differently,
-# producing different diff lines — skip them in parity tests).
+# Check if a commit contains any rename/move operations.
+# Returns 0 (true) if at least one renamed file is found.
 commit_has_rename() {
     local repo="$1"
     local sha="$2"
     git -C "$repo" diff --name-status "${sha}^" "$sha" 2>/dev/null | grep -q '^R'
+}
+
+# For a given file path in a commit, detect whether it was renamed (i.e., it is
+# the NEW path of a rename operation).  If so, echo the OLD path; otherwise echo
+# nothing.
+# Usage: get_rename_old_path <repo> <sha> <new_path>
+get_rename_old_path() {
+    local repo="$1"
+    local sha="$2"
+    local new_path="$3"
+    # --diff-filter=R limits output to renamed files.
+    # --name-status lines look like: R100<TAB>old/path<TAB>new/path
+    git -C "$repo" diff --diff-filter=R --name-status "${sha}^" "$sha" \
+        2>/dev/null \
+        | awk -v np="$new_path" -F'\t' '$3 == np { print $2 }'
+}
+
+# Extract +/- change lines for a file in a commit, rename-aware.
+#
+# For normal modifications:   git diff PARENT HEAD -- path
+# For renamed files:          git diff -M PARENT HEAD, then extract the section
+#                             for new_path.
+#
+#   -M enables rename detection so git shows only the content delta for a
+#   renamed file rather than treating it as a brand-new file (which would
+#   show all lines as additions).  This matches what `atomic diff -c` produces:
+#   zero lines for a pure rename, or just the changed lines for rename+modify.
+#
+# Usage: git_change_lines_for_file <repo> <parent> <sha> <path> <is_rename>
+git_change_lines_for_file() {
+    local repo="$1"
+    local parent="$2"
+    local sha="$3"
+    local path="$4"
+    local is_rename="$5"   # "1" if this file was renamed, "0" otherwise
+
+    if [[ "$is_rename" == "1" ]]; then
+        # -M10% enables rename detection with a low similarity threshold so
+        # git recognises renames even when content changed significantly.
+        # We then extract only the section of the diff that belongs to our
+        # file (matched on the "b/<path>" side of the diff --git header),
+        # and filter to +/- lines.
+        git -C "$repo" --no-pager diff -M10% "$parent" "$sha" \
+            2>/dev/null \
+            | awk -v pat="$path" '
+                /^diff --git/ {
+                    n = length($0)
+                    plen = length(pat)
+                    in_sec = (index($0, " b/" pat) > 0 && \
+                              (index($0, " b/" pat " ") > 0 || \
+                               substr($0, n - plen + 1) == pat)) ? 1 : 0
+                    next
+                }
+                in_sec { print }
+            ' | extract_git_change_lines || true
+    else
+        git -C "$repo" --no-pager diff "$parent" "$sha" -- "$path" \
+            2>/dev/null | extract_git_change_lines || true
+    fi
 }
 
 # Compare two sets of change lines for parity.
@@ -290,24 +349,36 @@ for curr_sha in "${SAMPLED_COMMITS[@]}"; do
         continue
     fi
 
-    # Skip commits that contain renames/moves — git and git2 handle rename
-    # detection differently (git CLI uses similarity heuristics that git2's
-    # diff_tree_to_tree doesn't apply by default), producing different diff
-    # lines for the moved files.
-    if commit_has_rename "$CLONE_DIR" "$curr_sha"; then
-        COMMITS_SKIP=$((COMMITS_SKIP + 1))
-        FILES_SKIP=$((FILES_SKIP + ${#changed_files[@]}))
-        continue
-    fi
+    # Determine which files in this commit are renames (new path → old path).
+    # We handle renames inline rather than skipping the whole commit:
+    #   - Pure rename  : git --follow produces 0 +/- lines; atomic also produces 0.
+    #   - Rename+modify: git --follow produces the content delta; atomic shows the
+    #                    same lines under the new path.
+    # git diff --diff-filter=R --name-status gives lines like:
+    #   R100<TAB>old/path<TAB>new/path
+    # We build a set of new-paths that are renames so we can switch to --follow.
+    declare -A _rename_new_paths
+    _rename_new_paths=()
+    while IFS=$'\t' read -r _status _old _new; do
+        [[ -z "$_new" ]] && continue
+        _rename_new_paths["$_new"]="$_old"
+    done < <(git -C "$CLONE_DIR" diff --diff-filter=R --name-status \
+                 "$parent" "$curr_sha" 2>/dev/null || true)
 
     # Get the full atomic diff output once per commit (amortised cost).
     atomic_raw=$( (cd "$CLONE_DIR" && atomic diff -c "$atomic_hash" --no-color 2>/dev/null) || true )
 
     commit_ok=1
     for fpath in "${changed_files[@]}"; do
-        # Git change lines for this file
-        git_lines=$(git -C "$CLONE_DIR" --no-pager diff "$parent" "$curr_sha" -- "$fpath" \
-            2>/dev/null | extract_git_change_lines) || true
+        # Detect whether this file is the new path of a rename.
+        _is_rename=0
+        if [[ -n "${_rename_new_paths[$fpath]+x}" ]]; then
+            _is_rename=1
+        fi
+
+        # Git change lines for this file (rename-aware).
+        git_lines=$(git_change_lines_for_file \
+            "$CLONE_DIR" "$parent" "$curr_sha" "$fpath" "$_is_rename") || true
 
         # Atomic change lines for this file
         atomic_lines=$(atomic_diff_for_path "$atomic_raw" "$fpath") || true
@@ -322,12 +393,15 @@ for curr_sha in "${SAMPLED_COMMITS[@]}"; do
                 <(printf '%s\n' "$git_lines" | sort) \
                 <(printf '%s\n' "$atomic_lines" | sort) \
                 2>/dev/null | head -4) || true
-            _fail "commit $short: $fpath" \
+            _rename_note=""
+            [[ "$_is_rename" == "1" ]] && _rename_note=" (renamed)"
+            _fail "commit $short: $fpath${_rename_note}" \
                 "git=$git_count lines, atomic=$atomic_count lines. Diff: $first_diff"
             FILES_FAIL=$((FILES_FAIL + 1))
             commit_ok=0
         fi
     done
+    unset _rename_new_paths
 
     if [[ $commit_ok -eq 1 ]]; then
         COMMITS_PASS=$((COMMITS_PASS + 1))
