@@ -1324,6 +1324,30 @@ where
     // Compare content and build hunks
     let comparison = compare_content(old_content, &new_content, options.get_algorithm());
 
+    // Handle binary files: compare_content returns is_binary=true with zero
+    // diff_ops when either old or new content contains null bytes.  Since we
+    // know the content differs (identical content returns early above), create
+    // a single Replace hunk that swaps the entire file content.  Without this,
+    // binary modifications are silently dropped (zero hunks → empty RecordedFile
+    // → the graph never receives the new content, and `atomic status` reports
+    // the file as modified forever).
+    if comparison.is_binary && old_content != &new_content[..] {
+        let mut replace_hunk = BuiltHunk::new_replace_with_lines(
+            Local::new(&detected.path, 1),
+            Some(encoding),
+            Vec::new(), // no per-line deletion tracking for binary
+            0,          // old_start
+            0,          // new_start
+            1,          // new_len: treat entire binary blob as one unit
+        );
+        replace_hunk.content_start = Some(0);
+        replace_hunk.content_end = Some(new_content.len() as u64);
+        recorded.add_hunk(replace_hunk);
+        recorded.set_content(new_content);
+
+        return Ok(recorded);
+    }
+
     // Build hunks from diff ops using HunkBuilder
     let hunk_options = options.to_hunk_options().encoding(encoding);
     let mut builder = HunkBuilder::with_options(&detected.path, hunk_options);

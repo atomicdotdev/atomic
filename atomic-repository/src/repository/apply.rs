@@ -202,7 +202,16 @@ impl Repository {
                         if let Ok(Some(inode)) = txn.position_inode(inode_pos) {
                             // Remove the old TREE entry (old path → inode)
                             if let Ok(Some(old_path)) = txn.get_path(inode) {
-                                let _ = txn.del_tree(&old_path);
+                                // Guard: only delete the old path if it differs
+                                // from the new path.  When multiple files share
+                                // the same inode position (a rare data-integrity
+                                // edge case), position_inode may resolve to an
+                                // inode whose current path was already updated
+                                // by a prior FileMove in this same change.
+                                // Deleting it would undo that earlier rename.
+                                if old_path != *path {
+                                    let _ = txn.del_tree(&old_path);
+                                }
                             }
                             // Insert the new TREE entry (new path → inode)
                             let _ = txn.put_tree(path, inode);
@@ -497,7 +506,16 @@ impl Repository {
                     if let Ok(Some(inode)) = txn.position_inode(inode_pos) {
                         // Remove the old TREE entry (old path → inode)
                         if let Ok(Some(old_path)) = txn.get_path(inode) {
-                            let _ = txn.del_tree(&old_path);
+                            // Guard: only delete the old path if it differs
+                            // from the new path.  When multiple files share
+                            // the same inode position (a rare data-integrity
+                            // edge case), position_inode may resolve to an
+                            // inode whose current path was already updated
+                            // by a prior FileMove in this same change.
+                            // Deleting it would undo that earlier rename.
+                            if old_path != *path {
+                                let _ = txn.del_tree(&old_path);
+                            }
                         }
                         // Insert the new TREE entry (new path → inode)
                         let _ = txn.put_tree(path, inode);

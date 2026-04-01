@@ -479,9 +479,14 @@ impl ParallelImporter {
         }
 
         // Track new files so the pristine knows about them before we record.
+        // Also collect deleted paths so we can remove them from TREE after apply.
+        let mut deleted_paths: Vec<String> = Vec::new();
         for file in &parsed.files {
             if file.operation == FileOperation::Added || file.operation == FileOperation::Copied {
                 let _ = repo.add(&file.path, atomic_repository::TrackingOptions::default());
+            }
+            if file.operation == FileOperation::Deleted {
+                deleted_paths.push(file.path.clone());
             }
         }
 
@@ -731,6 +736,14 @@ impl ParallelImporter {
         repo.apply_change(&hash, Default::default())
             .map_err(|e| CliError::Internal(e.into()))?;
 
+        // Files deleted via record_modified_file (the "show diff lines" path)
+        // produce GraphOp::Replacement, not GraphOp::FileDel, so apply_change
+        // never removes their TREE entries.  Explicitly untrack them now so that
+        // `atomic status` after import matches the git working copy.
+        for del_path in &deleted_paths {
+            let _ = repo.remove(del_path, atomic_repository::TrackingOptions::forced());
+        }
+
         Ok(true)
     }
 
@@ -884,16 +897,20 @@ fn parse_commit(
 
     // Apply rename detection — mirrors what git CLI does after computing
     // the initial diff.  This correctly classifies renamed files as R deltas
-    // so write_commit can call repo.move_file() instead of treating them as
-    // plain modifications.
+    // so write_commit can produce GraphOp::FileMove instead of treating them
+    // as plain modifications.
     //
-    // We do NOT enable rewrites(true) here: that option marks files as
-    // completely rewritten (delta Deleted + Added) when >60% of lines
-    // changed, which collapses the diff lines to empty for the remaining
-    // shared content.  git CLI uses rewrites for display only (--find-renames)
-    // but does not change how diff lines are classified.
+    // We enable renames(true) only — NOT renames_from_rewrites(true).
+    // renames_from_rewrites tells git2 to consider heavily-modified files
+    // as potential rename *sources*, which causes false positives: when a
+    // file is modified AND a new file is added with similar content, git2
+    // converts the (Modified + Added) pair into a Renamed delta — even
+    // though the original file still exists.  Example: modifying
+    // src/export/markdown.rs while adding src/export/tests.rs (52%
+    // similar) would be misclassified as a rename of markdown→tests,
+    // orphaning markdown.rs from the TREE.
     let mut find_opts = DiffFindOptions::new();
-    find_opts.renames(true).renames_from_rewrites(true);
+    find_opts.renames(true);
     let _ = diff.find_similar(Some(&mut find_opts));
 
     let stats = diff.stats().map_err(|e| CliError::GitError {
