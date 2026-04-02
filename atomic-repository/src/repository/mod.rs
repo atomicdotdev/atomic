@@ -1109,6 +1109,41 @@ default = "{}"
         Ok(())
     }
 
+    /// Create a new Shared stack with no parent.
+    ///
+    /// Edges written to a Shared stack go into the global `GRAPH` table and
+    /// are permanently visible to all stacks. This is the correct kind to use
+    /// for server-side push targets, where changes must be universally visible
+    /// regardless of which run or request applies them.
+    ///
+    /// Returns `StackAlreadyExists` if the stack already exists.
+    pub fn create_shared_stack(&mut self, name: &str) -> Result<(), RepositoryError> {
+        ensure_workspace_dir(&self.dot_dir, name)?;
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if txn
+            .get_stack(name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .is_some()
+        {
+            return Err(RepositoryError::StackAlreadyExists {
+                name: name.to_string(),
+            });
+        }
+
+        txn.create_stack(name, StackKind::Shared, None)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Walk the parent chain from `stack_name` and return the name of the
     /// first Shared stack encountered.  If `stack_name` is itself Shared,
     /// it is returned immediately.  This is used to determine the correct
