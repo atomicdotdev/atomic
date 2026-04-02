@@ -563,6 +563,11 @@ pub fn apply_change_to_graph<T: MutTxnT + StackTxnT>(
         true
     };
 
+    log::debug!(
+        "apply_change_to_graph: change_id={:?} hash={} should_apply_hunks={} target={:?} stack_kind={:?}",
+        change_id, change_hash.to_base32(), should_apply_hunks, apply_target, stack.kind
+    );
+
     if should_apply_hunks {
         // Process each graph_op (graph layer)
         for graph_op in change.hunks() {
