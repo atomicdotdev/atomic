@@ -1320,10 +1320,7 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         let mut inodes_table = self.txn.open_table(INODES)?;
         let mut rev_inodes_table = self.txn.open_table(REV_INODES)?;
 
-        // Encode position as 16 bytes: change_id (8) + pos (8)
-        let mut pos_bytes = [0u8; 16];
-        pos_bytes[0..8].copy_from_slice(&pos.change.get().to_le_bytes());
-        pos_bytes[8..16].copy_from_slice(&pos.pos.get().to_le_bytes());
+        let pos_bytes = encode_position(pos.change.get(), pos.pos.get());
 
         inodes_table.insert(inode, &pos_bytes)?;
         rev_inodes_table.insert(&pos_bytes, inode)?;
