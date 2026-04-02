@@ -327,9 +327,13 @@ pub struct Repository {
     dot_dir: PathBuf,
     /// Current stack name
     current_stack: String,
-    /// The pristine database handle (shared via Arc so that multiple
-    /// `Repository` instances for the same project reuse the same redb
-    /// `Database`, avoiding stale-snapshot bugs).
+    /// The pristine database handle.
+    ///
+    /// Wrapped in `Arc` so that multiple `Repository` instances _can_
+    /// share the same underlying redb `Database` and avoid stale-snapshot
+    /// bugs. In practice, sharing only happens when constructing via
+    /// `open_with_pristine`; `open` / `open_readonly` create a fresh
+    /// `Pristine` for each `Repository`.
     pristine: Arc<Pristine>,
     /// The change store for persisting changes
     change_store: ChangeStore,
@@ -529,6 +533,14 @@ default = "{}"
     /// the same project.  Sharing the handle ensures every write transaction
     /// sees the committed state of prior transactions — opening a fresh
     /// `Database` per request can see stale snapshots.
+    ///
+    /// # Requirements
+    ///
+    /// The provided `pristine` **must** have been opened from
+    /// `<path>/.atomic/pristine.redb` (i.e. the same repository that
+    /// `path` resolves to). Passing a `Pristine` from a different
+    /// repository will silently couple one repo's configuration and
+    /// change store with another repo's database, leading to corruption.
     pub fn open_with_pristine<P: AsRef<Path>>(
         path: P,
         pristine: Arc<Pristine>,
