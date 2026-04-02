@@ -52,7 +52,7 @@ impl<'a> StackTxnT for WriteTxn<'a> {
     ) -> PristineResult<Vec<(u64, u64)>> {
         let table = self.txn.open_multimap_table(STACK_GRAPH)?;
 
-        // Range scan: (stack_id, change_id, 0, 0) .. (stack_id, change_id+1, 0, 0)
+        // Inclusive range scan: (stack_id, change_id, 0, 0) ..= (stack_id, change_id, MAX, MAX)
         let start_key = encode_stack_graph_key(stack_id, change_id, 0, 0);
         let end_key = encode_stack_graph_key(stack_id, change_id, u64::MAX, u64::MAX);
 

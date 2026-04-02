@@ -111,37 +111,41 @@ impl Pristine {
         }
         write_txn.commit()?;
 
-        // Determine the next available IDs by scanning existing data
+        // Determine the next available IDs by scanning existing data.
+        // Errors are propagated (not silently skipped) so that open()
+        // fails fast on corrupted data rather than underestimating the
+        // max ID and reusing an already-allocated slot.
         let read_txn = db.begin_read()?;
 
         let next_node_id = {
             let table = read_txn.open_table(EXTERNAL)?;
             let mut max_id = 0u64;
-            for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
+            for result in table.iter()? {
+                let (k, _) = result?;
                 max_id = max_id.max(k.value());
             }
-            AtomicU64::new(max_id + 1)
+            AtomicU64::new(max_id.saturating_add(1))
         };
 
         let next_stack_id = {
             let table = read_txn.open_table(STACKS)?;
             let mut max_id = 0u64;
-            for result in table.iter()?.filter_map(|r| r.ok()) {
-                let (_, value) = result;
-                if let Ok(state) = deserialize_stack_state(value.value()) {
-                    max_id = max_id.max(state.id);
-                }
+            for result in table.iter()? {
+                let (_, value) = result?;
+                let state = deserialize_stack_state(value.value())?;
+                max_id = max_id.max(state.id);
             }
-            AtomicU64::new(max_id + 1)
+            AtomicU64::new(max_id.saturating_add(1))
         };
 
         let next_inode = {
             let table = read_txn.open_table(INODES)?;
             let mut max_id = 0u64;
-            for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
+            for result in table.iter()? {
+                let (k, _) = result?;
                 max_id = max_id.max(k.value());
             }
-            AtomicU64::new(max_id + 1)
+            AtomicU64::new(max_id.saturating_add(1))
         };
 
         Ok(Self {
@@ -176,37 +180,41 @@ impl Pristine {
         // Open database without creating (read-only mode)
         let db = Database::open(path)?;
 
-        // Determine the next available IDs by scanning existing data
+        // Determine the next available IDs by scanning existing data.
+        // Errors are propagated (not silently skipped) so that open()
+        // fails fast on corrupted data rather than underestimating the
+        // max ID and reusing an already-allocated slot.
         let read_txn = db.begin_read()?;
 
         let next_node_id = {
             let table = read_txn.open_table(EXTERNAL)?;
             let mut max_id = 0u64;
-            for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
+            for result in table.iter()? {
+                let (k, _) = result?;
                 max_id = max_id.max(k.value());
             }
-            AtomicU64::new(max_id + 1)
+            AtomicU64::new(max_id.saturating_add(1))
         };
 
         let next_stack_id = {
             let table = read_txn.open_table(STACKS)?;
             let mut max_id = 0u64;
-            for result in table.iter()?.filter_map(|r| r.ok()) {
-                let (_, value) = result;
-                if let Ok(state) = deserialize_stack_state(value.value()) {
-                    max_id = max_id.max(state.id);
-                }
+            for result in table.iter()? {
+                let (_, value) = result?;
+                let state = deserialize_stack_state(value.value())?;
+                max_id = max_id.max(state.id);
             }
-            AtomicU64::new(max_id + 1)
+            AtomicU64::new(max_id.saturating_add(1))
         };
 
         let next_inode = {
             let table = read_txn.open_table(INODES)?;
             let mut max_id = 0u64;
-            for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
+            for result in table.iter()? {
+                let (k, _) = result?;
                 max_id = max_id.max(k.value());
             }
-            AtomicU64::new(max_id + 1)
+            AtomicU64::new(max_id.saturating_add(1))
         };
 
         Ok(Self {
