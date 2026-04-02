@@ -24,12 +24,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use redb::{Database, ReadableTable};
 
-use crate::pristine::error::PristineResult;
+use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
 
 use super::helpers::deserialize_stack_state;
 use super::read::ReadTxn;
 use super::write::WriteTxn;
+
+/// Return `max_id + 1`, or error if the ID space is exhausted.
+fn next_id(max_id: u64) -> PristineResult<u64> {
+    max_id.checked_add(1).ok_or(PristineError::IdSpaceExhausted)
+}
 
 /// The pristine database handle
 ///
@@ -124,7 +129,7 @@ impl Pristine {
                 let (k, _) = result?;
                 max_id = max_id.max(k.value());
             }
-            AtomicU64::new(max_id.saturating_add(1))
+            AtomicU64::new(next_id(max_id)?)
         };
 
         let next_stack_id = {
@@ -135,7 +140,7 @@ impl Pristine {
                 let state = deserialize_stack_state(value.value())?;
                 max_id = max_id.max(state.id);
             }
-            AtomicU64::new(max_id.saturating_add(1))
+            AtomicU64::new(next_id(max_id)?)
         };
 
         let next_inode = {
@@ -145,7 +150,7 @@ impl Pristine {
                 let (k, _) = result?;
                 max_id = max_id.max(k.value());
             }
-            AtomicU64::new(max_id.saturating_add(1))
+            AtomicU64::new(next_id(max_id)?)
         };
 
         Ok(Self {
@@ -193,7 +198,7 @@ impl Pristine {
                 let (k, _) = result?;
                 max_id = max_id.max(k.value());
             }
-            AtomicU64::new(max_id.saturating_add(1))
+            AtomicU64::new(next_id(max_id)?)
         };
 
         let next_stack_id = {
@@ -204,7 +209,7 @@ impl Pristine {
                 let state = deserialize_stack_state(value.value())?;
                 max_id = max_id.max(state.id);
             }
-            AtomicU64::new(max_id.saturating_add(1))
+            AtomicU64::new(next_id(max_id)?)
         };
 
         let next_inode = {
@@ -214,7 +219,7 @@ impl Pristine {
                 let (k, _) = result?;
                 max_id = max_id.max(k.value());
             }
-            AtomicU64::new(max_id.saturating_add(1))
+            AtomicU64::new(next_id(max_id)?)
         };
 
         Ok(Self {
