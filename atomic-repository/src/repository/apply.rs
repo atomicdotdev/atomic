@@ -125,9 +125,21 @@ impl Repository {
             .get_internal(hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
-            txn.has_change_in_graph(node_id)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            let in_graph = txn
+                .has_change_in_graph(node_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            log::debug!(
+                "apply_change: hash={} node_id={:?} already_in_graph={}",
+                hash.to_base32(),
+                node_id,
+                in_graph
+            );
+            in_graph
         } else {
+            log::debug!(
+                "apply_change: hash={} not in INTERNAL (new change)",
+                hash.to_base32()
+            );
             false
         };
 
@@ -140,6 +152,13 @@ impl Repository {
 
         // Determine which stack to use
         let stack_name = options.stack.as_deref().unwrap_or(&self.current_stack);
+        log::debug!(
+            "apply_change: change_id={:?} stack={} already_in_graph={} hunks={}",
+            change_id,
+            stack_name,
+            already_in_graph,
+            change.hunks().len()
+        );
 
         // Populate tree tables for FileAdd/DirAdd/FileDel hunks.
         // This creates the path→inode→position mappings that output_working_copy

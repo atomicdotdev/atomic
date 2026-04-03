@@ -39,6 +39,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use atomic_core::change::{Author, Change, ChangeHeader, GraphOp};
 use atomic_core::output::repo::{
@@ -326,8 +327,14 @@ pub struct Repository {
     dot_dir: PathBuf,
     /// Current stack name
     current_stack: String,
-    /// The pristine database handle
-    pristine: Pristine,
+    /// The pristine database handle.
+    ///
+    /// Wrapped in `Arc` so that multiple `Repository` instances _can_
+    /// share the same underlying redb `Database` and avoid stale-snapshot
+    /// bugs. In practice, sharing only happens when constructing via
+    /// `open_with_pristine`; `open` / `open_readonly` create a fresh
+    /// `Pristine` for each `Repository`.
+    pristine: Arc<Pristine>,
     /// The change store for persisting changes
     change_store: ChangeStore,
 }
@@ -393,8 +400,10 @@ default = "{}"
         std::fs::write(&wc_id_path, "")?;
 
         // Initialize the pristine database (redb creates the file)
-        let pristine = Pristine::open(dot_dir.join("pristine.redb"))
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let pristine = Arc::new(
+            Pristine::open(dot_dir.join("pristine.redb"))
+                .map_err(|e| RepositoryError::Database(e.to_string()))?,
+        );
 
         // Create the default stack and its workspace directory
         {
@@ -438,8 +447,10 @@ default = "{}"
         let dot_dir = root.join(DOT_DIR);
 
         // Open the pristine database
-        let pristine = Pristine::open(dot_dir.join("pristine.redb"))
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let pristine = Arc::new(
+            Pristine::open(dot_dir.join("pristine.redb"))
+                .map_err(|e| RepositoryError::Database(e.to_string()))?,
+        );
 
         // Read current stack from config or use default
         let current_stack =
@@ -493,14 +504,53 @@ default = "{}"
         let dot_dir = root.join(DOT_DIR);
 
         // Open the pristine database in read-only mode
-        let pristine = Pristine::open_readonly(dot_dir.join("pristine.redb"))
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let pristine = Arc::new(
+            Pristine::open_readonly(dot_dir.join("pristine.redb"))
+                .map_err(|e| RepositoryError::Database(e.to_string()))?,
+        );
 
         // Read current stack from config or use default
         let current_stack =
             Self::read_current_stack(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
 
         // Open the change store
+        let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(Self {
+            root,
+            dot_dir,
+            current_stack,
+            pristine,
+            change_store,
+        })
+    }
+
+    /// Open an existing repository using a pre-opened `Pristine`.
+    ///
+    /// This constructor is used by the storage server to share a single
+    /// `Pristine` (redb `Database`) handle across concurrent requests to
+    /// the same project.  Sharing the handle ensures every write transaction
+    /// sees the committed state of prior transactions — opening a fresh
+    /// `Database` per request can see stale snapshots.
+    ///
+    /// # Requirements
+    ///
+    /// The provided `pristine` **must** have been opened from
+    /// `<path>/.atomic/pristine.redb` (i.e. the same repository that
+    /// `path` resolves to). Passing a `Pristine` from a different
+    /// repository will silently couple one repo's configuration and
+    /// change store with another repo's database, leading to corruption.
+    pub fn open_with_pristine<P: AsRef<Path>>(
+        path: P,
+        pristine: Arc<Pristine>,
+    ) -> Result<Self, RepositoryError> {
+        let root = Self::find_root(path.as_ref())?;
+        let dot_dir = root.join(DOT_DIR);
+
+        let current_stack =
+            Self::read_current_stack(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
+
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
@@ -1101,6 +1151,41 @@ default = "{}"
             })?;
 
         txn.create_stack(name, StackKind::Local, Some(parent_stack.id))
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Create a new Shared stack with no parent.
+    ///
+    /// Edges written to a Shared stack go into the global `GRAPH` table and
+    /// are permanently visible to all stacks. This is the correct kind to use
+    /// for server-side push targets, where changes must be universally visible
+    /// regardless of which run or request applies them.
+    ///
+    /// Returns `StackAlreadyExists` if the stack already exists.
+    pub fn create_shared_stack(&mut self, name: &str) -> Result<(), RepositoryError> {
+        ensure_workspace_dir(&self.dot_dir, name)?;
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if txn
+            .get_stack(name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .is_some()
+        {
+            return Err(RepositoryError::StackAlreadyExists {
+                name: name.to_string(),
+            });
+        }
+
+        txn.create_stack(name, StackKind::Shared, None)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         txn.commit()
