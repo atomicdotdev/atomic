@@ -24,11 +24,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use redb::{Database, ReadableTable};
 
-use crate::pristine::error::PristineResult;
+use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
 
+use super::helpers::deserialize_stack_state;
 use super::read::ReadTxn;
 use super::write::WriteTxn;
+
+/// Return `max_id + 1`, or error if the ID space is exhausted.
+fn next_id(max_id: u64) -> PristineResult<u64> {
+    max_id.checked_add(1).ok_or(PristineError::IdSpaceExhausted)
+}
 
 /// The pristine database handle
 ///
@@ -110,34 +116,41 @@ impl Pristine {
         }
         write_txn.commit()?;
 
-        // Determine the next available IDs by scanning existing data
+        // Determine the next available IDs by scanning existing data.
+        // Errors are propagated (not silently skipped) so that open()
+        // fails fast on corrupted data rather than underestimating the
+        // max ID and reusing an already-allocated slot.
         let read_txn = db.begin_read()?;
 
         let next_node_id = {
             let table = read_txn.open_table(EXTERNAL)?;
             let mut max_id = 0u64;
-            for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
+            for result in table.iter()? {
+                let (k, _) = result?;
                 max_id = max_id.max(k.value());
             }
-            AtomicU64::new(max_id + 1)
+            AtomicU64::new(next_id(max_id)?)
         };
 
         let next_stack_id = {
             let table = read_txn.open_table(STACKS)?;
-            let mut count = 0u64;
-            for _ in table.iter()? {
-                count += 1;
+            let mut max_id = 0u64;
+            for result in table.iter()? {
+                let (_, value) = result?;
+                let state = deserialize_stack_state(value.value())?;
+                max_id = max_id.max(state.id);
             }
-            AtomicU64::new(count + 1)
+            AtomicU64::new(next_id(max_id)?)
         };
 
         let next_inode = {
             let table = read_txn.open_table(INODES)?;
             let mut max_id = 0u64;
-            for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
+            for result in table.iter()? {
+                let (k, _) = result?;
                 max_id = max_id.max(k.value());
             }
-            AtomicU64::new(max_id + 1)
+            AtomicU64::new(next_id(max_id)?)
         };
 
         Ok(Self {
@@ -172,34 +185,41 @@ impl Pristine {
         // Open database without creating (read-only mode)
         let db = Database::open(path)?;
 
-        // Determine the next available IDs by scanning existing data
+        // Determine the next available IDs by scanning existing data.
+        // Errors are propagated (not silently skipped) so that open()
+        // fails fast on corrupted data rather than underestimating the
+        // max ID and reusing an already-allocated slot.
         let read_txn = db.begin_read()?;
 
         let next_node_id = {
             let table = read_txn.open_table(EXTERNAL)?;
             let mut max_id = 0u64;
-            for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
+            for result in table.iter()? {
+                let (k, _) = result?;
                 max_id = max_id.max(k.value());
             }
-            AtomicU64::new(max_id + 1)
+            AtomicU64::new(next_id(max_id)?)
         };
 
         let next_stack_id = {
             let table = read_txn.open_table(STACKS)?;
-            let mut count = 0u64;
-            for _ in table.iter()? {
-                count += 1;
+            let mut max_id = 0u64;
+            for result in table.iter()? {
+                let (_, value) = result?;
+                let state = deserialize_stack_state(value.value())?;
+                max_id = max_id.max(state.id);
             }
-            AtomicU64::new(count + 1)
+            AtomicU64::new(next_id(max_id)?)
         };
 
         let next_inode = {
             let table = read_txn.open_table(INODES)?;
             let mut max_id = 0u64;
-            for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
+            for result in table.iter()? {
+                let (k, _) = result?;
                 max_id = max_id.max(k.value());
             }
-            AtomicU64::new(max_id + 1)
+            AtomicU64::new(next_id(max_id)?)
         };
 
         Ok(Self {

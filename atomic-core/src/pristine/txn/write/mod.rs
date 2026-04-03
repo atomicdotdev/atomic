@@ -519,11 +519,11 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         let mut table = self.txn.open_multimap_table(STACK_GRAPH)?;
 
         let start_key = encode_stack_graph_prefix(stack_id);
-        let end_key = encode_stack_graph_prefix(stack_id + 1);
+        let end_key = encode_stack_graph_key(stack_id, u64::MAX, u64::MAX, u64::MAX);
 
         // Collect keys to delete (can't mutate while iterating)
         let mut keys_to_delete: Vec<([u8; 32], Vec<[u8; 24]>)> = Vec::new();
-        for result in table.range::<&[u8; 32]>(&start_key..&end_key)? {
+        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
             let (key, values) = result?;
             let key_bytes: [u8; 32] = *key.value();
             let mut edge_bytes = Vec::new();
@@ -1320,10 +1320,7 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         let mut inodes_table = self.txn.open_table(INODES)?;
         let mut rev_inodes_table = self.txn.open_table(REV_INODES)?;
 
-        // Encode position as 16 bytes: change_id (8) + pos (8)
-        let mut pos_bytes = [0u8; 16];
-        pos_bytes[0..8].copy_from_slice(&pos.change.get().to_le_bytes());
-        pos_bytes[8..16].copy_from_slice(&pos.pos.get().to_le_bytes());
+        let pos_bytes = encode_position(pos.change.get(), pos.pos.get());
 
         inodes_table.insert(inode, &pos_bytes)?;
         rev_inodes_table.insert(&pos_bytes, inode)?;

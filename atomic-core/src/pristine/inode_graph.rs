@@ -978,9 +978,9 @@ impl InodeGraphOps for ReadTxn {
         let target_pos = pos.pos.get();
 
         let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
-        let end_key = encode_inode_vertex(inode_id, change_id + 1, 0, 0);
+        let end_key = encode_inode_vertex(inode_id, change_id, u64::MAX, u64::MAX);
 
-        for result in table.range::<&[u8; 32]>(&start_key..&end_key)? {
+        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
             let (key, _values) = result?;
             let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
 
@@ -1001,12 +1001,12 @@ impl InodeGraphOps for ReadTxn {
 
         let inode_id = inode.get();
         let start_key = encode_inode_vertex(inode_id, 0, 0, 0);
-        let end_key = encode_inode_vertex(inode_id + 1, 0, 0, 0);
+        let end_key = encode_inode_vertex(inode_id, u64::MAX, u64::MAX, u64::MAX);
 
         let mut count = 0;
         let mut last_vertex: Option<(u64, u64, u64)> = None;
 
-        for result in table.range::<&[u8; 32]>(&start_key..&end_key)? {
+        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
             let (key, _values) = result?;
             let (_, change_id, start, end) = decode_inode_vertex(key.value());
 
@@ -1110,9 +1110,9 @@ impl<'a> InodeGraphOps for WriteTxn<'a> {
         let target_pos = pos.pos.get();
 
         let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
-        let end_key = encode_inode_vertex(inode_id, change_id + 1, 0, 0);
+        let end_key = encode_inode_vertex(inode_id, change_id, u64::MAX, u64::MAX);
 
-        for result in table.range::<&[u8; 32]>(&start_key..&end_key)? {
+        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
             let (key, _values) = result?;
             let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
 
@@ -1133,12 +1133,12 @@ impl<'a> InodeGraphOps for WriteTxn<'a> {
 
         let inode_id = inode.get();
         let start_key = encode_inode_vertex(inode_id, 0, 0, 0);
-        let end_key = encode_inode_vertex(inode_id + 1, 0, 0, 0);
+        let end_key = encode_inode_vertex(inode_id, u64::MAX, u64::MAX, u64::MAX);
 
         let mut count = 0;
         let mut last_vertex: Option<(u64, u64, u64)> = None;
 
-        for result in table.range::<&[u8; 32]>(&start_key..&end_key)? {
+        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
             let (key, _values) = result?;
             let (_, change_id, start, end) = decode_inode_vertex(key.value());
 

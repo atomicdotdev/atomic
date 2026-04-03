@@ -62,12 +62,12 @@ impl<'a> GraphTxnT for WriteTxn<'a> {
         let target_pos = pos.pos.get();
 
         let start_key = encode_vertex(change_id, 0, 0);
-        let end_key = encode_vertex(change_id + 1, 0, 0);
+        let end_key = encode_vertex(change_id, u64::MAX, u64::MAX);
 
         // Track empty span match as fallback
         let mut empty_vertex_match: Option<GraphNode<NodeId>> = None;
 
-        for result in table.range::<&[u8; 24]>(&start_key..&end_key)? {
+        for result in table.range::<&[u8; 24]>(&start_key..=&end_key)? {
             let (key, _values) = result?;
             let (v_change, v_start, v_end) = decode_vertex(key.value());
 
@@ -156,10 +156,10 @@ impl<'a> GraphTxnT for WriteTxn<'a> {
 
         // SECOND: Fall back to iteration to find vertices that end at this position
         let start_key = encode_vertex(change_id, 0, 0);
-        let end_key = encode_vertex(change_id + 1, 0, 0);
+        let end_key = encode_vertex(change_id, u64::MAX, u64::MAX);
 
         // Look for a span that ends at this position
-        for result in table.range::<&[u8; 24]>(&start_key..&end_key)? {
+        for result in table.range::<&[u8; 24]>(&start_key..=&end_key)? {
             let (key, _values) = result?;
             let (v_change, v_start, v_end) = decode_vertex(key.value());
 
@@ -221,9 +221,9 @@ impl<'a> GraphTxnT for WriteTxn<'a> {
     fn has_change_in_graph(&self, change_id: NodeId) -> PristineResult<bool> {
         let table = self.txn.open_multimap_table(GRAPH)?;
         let start_key = encode_vertex(change_id.get(), 0, 0);
-        let end_key = encode_vertex(change_id.get() + 1, 0, 0);
+        let end_key = encode_vertex(change_id.get(), u64::MAX, u64::MAX);
         let has = table
-            .range::<&[u8; 24]>(&start_key..&end_key)?
+            .range::<&[u8; 24]>(&start_key..=&end_key)?
             .next()
             .is_some();
         Ok(has)

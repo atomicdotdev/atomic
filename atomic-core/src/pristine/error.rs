@@ -181,6 +181,13 @@ pub enum PristineError {
         hash: String,
     },
 
+    /// Internal ID space exhausted
+    ///
+    /// The maximum u64 ID has been allocated so no new IDs can be issued
+    /// without wrapping to 0 and reusing an existing slot. In practice
+    /// this is unreachable (requires 2^64 allocations).
+    IdSpaceExhausted,
+
     // Data Errors
     /// Invalid span structure
     ///
@@ -266,6 +273,7 @@ impl fmt::Display for PristineError {
                     name, parent_name
                 )
             }
+            Self::IdSpaceExhausted => write!(f, "internal ID space exhausted (u64::MAX reached)"),
             Self::ChangeNotFound { id } => write!(f, "change not found: {}", id),
             Self::HashNotFound { hash } => write!(f, "hash not found: {}", hash),
 

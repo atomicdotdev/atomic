@@ -510,18 +510,18 @@ pub fn decode_change_file_key(key: &[u8; 36]) -> ([u8; 32], u32) {
 #[inline]
 pub fn encode_vertex(change_id: u64, start: u64, end: u64) -> [u8; 24] {
     let mut key = [0u8; 24];
-    key[0..8].copy_from_slice(&change_id.to_le_bytes());
-    key[8..16].copy_from_slice(&start.to_le_bytes());
-    key[16..24].copy_from_slice(&end.to_le_bytes());
+    key[0..8].copy_from_slice(&change_id.to_be_bytes());
+    key[8..16].copy_from_slice(&start.to_be_bytes());
+    key[16..24].copy_from_slice(&end.to_be_bytes());
     key
 }
 
 /// Decode a span from 24 bytes
 #[inline]
 pub fn decode_vertex(key: &[u8; 24]) -> (u64, u64, u64) {
-    let change_id = u64::from_le_bytes(key[0..8].try_into().unwrap());
-    let start = u64::from_le_bytes(key[8..16].try_into().unwrap());
-    let end = u64::from_le_bytes(key[16..24].try_into().unwrap());
+    let change_id = u64::from_be_bytes(key[0..8].try_into().unwrap());
+    let start = u64::from_be_bytes(key[8..16].try_into().unwrap());
+    let end = u64::from_be_bytes(key[16..24].try_into().unwrap());
     (change_id, start, end)
 }
 
@@ -529,10 +529,10 @@ pub fn decode_vertex(key: &[u8; 24]) -> (u64, u64, u64) {
 #[inline]
 pub fn encode_inode_vertex(inode: u64, change_id: u64, start: u64, end: u64) -> [u8; 32] {
     let mut bytes = [0u8; 32];
-    bytes[0..8].copy_from_slice(&inode.to_le_bytes());
-    bytes[8..16].copy_from_slice(&change_id.to_le_bytes());
-    bytes[16..24].copy_from_slice(&start.to_le_bytes());
-    bytes[24..32].copy_from_slice(&end.to_le_bytes());
+    bytes[0..8].copy_from_slice(&inode.to_be_bytes());
+    bytes[8..16].copy_from_slice(&change_id.to_be_bytes());
+    bytes[16..24].copy_from_slice(&start.to_be_bytes());
+    bytes[24..32].copy_from_slice(&end.to_be_bytes());
     bytes
 }
 
@@ -543,19 +543,19 @@ pub fn encode_inode_vertex(inode: u64, change_id: u64, start: u64, end: u64) -> 
 /// for cascade deletion when an local workspace is removed.
 pub fn encode_stack_graph_key(stack_id: u64, change_id: u64, start: u64, end: u64) -> [u8; 32] {
     let mut bytes = [0u8; 32];
-    bytes[0..8].copy_from_slice(&stack_id.to_le_bytes());
-    bytes[8..16].copy_from_slice(&change_id.to_le_bytes());
-    bytes[16..24].copy_from_slice(&start.to_le_bytes());
-    bytes[24..32].copy_from_slice(&end.to_le_bytes());
+    bytes[0..8].copy_from_slice(&stack_id.to_be_bytes());
+    bytes[8..16].copy_from_slice(&change_id.to_be_bytes());
+    bytes[16..24].copy_from_slice(&start.to_be_bytes());
+    bytes[24..32].copy_from_slice(&end.to_be_bytes());
     bytes
 }
 
 /// Decode a stack-scoped graph key: 32 bytes → (stack_id, change_id, start, end)
 pub fn decode_stack_graph_key(bytes: &[u8; 32]) -> (u64, u64, u64, u64) {
-    let stack_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let change_id = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-    let start = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    let end = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+    let stack_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+    let change_id = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+    let start = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
+    let end = u64::from_be_bytes(bytes[24..32].try_into().unwrap());
     (stack_id, change_id, start, end)
 }
 
@@ -565,17 +565,17 @@ pub fn decode_stack_graph_key(bytes: &[u8; 32]) -> (u64, u64, u64, u64) {
 /// zeroed. Used as the start bound for prefix range scans on `STACK_GRAPH`.
 pub fn encode_stack_graph_prefix(stack_id: u64) -> [u8; 32] {
     let mut bytes = [0u8; 32];
-    bytes[0..8].copy_from_slice(&stack_id.to_le_bytes());
+    bytes[0..8].copy_from_slice(&stack_id.to_be_bytes());
     bytes
 }
 
 /// Decode an inode-span from 32 bytes
 #[inline]
 pub fn decode_inode_vertex(key: &[u8; 32]) -> (u64, u64, u64, u64) {
-    let inode = u64::from_le_bytes(key[0..8].try_into().unwrap());
-    let change_id = u64::from_le_bytes(key[8..16].try_into().unwrap());
-    let start = u64::from_le_bytes(key[16..24].try_into().unwrap());
-    let end = u64::from_le_bytes(key[24..32].try_into().unwrap());
+    let inode = u64::from_be_bytes(key[0..8].try_into().unwrap());
+    let change_id = u64::from_be_bytes(key[8..16].try_into().unwrap());
+    let start = u64::from_be_bytes(key[16..24].try_into().unwrap());
+    let end = u64::from_be_bytes(key[24..32].try_into().unwrap());
     (inode, change_id, start, end)
 }
 
@@ -583,16 +583,16 @@ pub fn decode_inode_vertex(key: &[u8; 32]) -> (u64, u64, u64, u64) {
 #[inline]
 pub fn encode_position(change_id: u64, pos: u64) -> [u8; 16] {
     let mut key = [0u8; 16];
-    key[0..8].copy_from_slice(&change_id.to_le_bytes());
-    key[8..16].copy_from_slice(&pos.to_le_bytes());
+    key[0..8].copy_from_slice(&change_id.to_be_bytes());
+    key[8..16].copy_from_slice(&pos.to_be_bytes());
     key
 }
 
 /// Decode a position from 16 bytes
 #[inline]
 pub fn decode_position(key: &[u8; 16]) -> (u64, u64) {
-    let change_id = u64::from_le_bytes(key[0..8].try_into().unwrap());
-    let pos = u64::from_le_bytes(key[8..16].try_into().unwrap());
+    let change_id = u64::from_be_bytes(key[0..8].try_into().unwrap());
+    let pos = u64::from_be_bytes(key[8..16].try_into().unwrap());
     (change_id, pos)
 }
 
@@ -600,16 +600,16 @@ pub fn decode_position(key: &[u8; 16]) -> (u64, u64) {
 #[inline]
 pub fn encode_stack_seq(stack_id: u64, seq: u64) -> [u8; 16] {
     let mut key = [0u8; 16];
-    key[0..8].copy_from_slice(&stack_id.to_le_bytes());
-    key[8..16].copy_from_slice(&seq.to_le_bytes());
+    key[0..8].copy_from_slice(&stack_id.to_be_bytes());
+    key[8..16].copy_from_slice(&seq.to_be_bytes());
     key
 }
 
 /// Decode a stack-sequence pair from 16 bytes
 #[inline]
 pub fn decode_stack_seq(key: &[u8; 16]) -> (u64, u64) {
-    let stack_id = u64::from_le_bytes(key[0..8].try_into().unwrap());
-    let seq = u64::from_le_bytes(key[8..16].try_into().unwrap());
+    let stack_id = u64::from_be_bytes(key[0..8].try_into().unwrap());
+    let seq = u64::from_be_bytes(key[8..16].try_into().unwrap());
     (stack_id, seq)
 }
 
@@ -617,7 +617,7 @@ pub fn decode_stack_seq(key: &[u8; 16]) -> (u64, u64) {
 #[inline]
 pub fn encode_stack_merkle(stack_id: u64, merkle: &[u8; 32]) -> [u8; 40] {
     let mut key = [0u8; 40];
-    key[0..8].copy_from_slice(&stack_id.to_le_bytes());
+    key[0..8].copy_from_slice(&stack_id.to_be_bytes());
     key[8..40].copy_from_slice(merkle);
     key
 }
@@ -625,7 +625,7 @@ pub fn encode_stack_merkle(stack_id: u64, merkle: &[u8; 32]) -> [u8; 40] {
 /// Decode a stack-merkle pair from 40 bytes
 #[inline]
 pub fn decode_stack_merkle(key: &[u8; 40]) -> (u64, [u8; 32]) {
-    let stack_id = u64::from_le_bytes(key[0..8].try_into().unwrap());
+    let stack_id = u64::from_be_bytes(key[0..8].try_into().unwrap());
     let mut merkle = [0u8; 32];
     merkle.copy_from_slice(&key[8..40]);
     (stack_id, merkle)
@@ -766,12 +766,69 @@ mod tests {
     }
 
     #[test]
+    fn test_vertex_encoding_ordering_across_byte_boundary() {
+        // Verify ordering is correct across the 256-boundary where LE encoding
+        // would produce inverted lexicographic order (the original bug).
+        // NodeId 255 = 0xFF in the low byte; 256 = 0x00 0x01 in LE which
+        // sorts *before* 0xFF 0x00 lexicographically. BE encoding fixes this.
+        let v255 = encode_vertex(255, 0, 10);
+        let v256 = encode_vertex(256, 0, 10);
+        assert!(v255 < v256, "change 255 should sort before change 256");
+
+        let v511 = encode_vertex(511, 0, 10);
+        let v512 = encode_vertex(512, 0, 10);
+        assert!(v511 < v512, "change 511 should sort before change 512");
+
+        // Also verify range scan would work: start < end
+        let range_start = encode_vertex(255, 0, 0);
+        let range_end = encode_vertex(256, 0, 0);
+        assert!(range_start < range_end, "range scan bounds must be ordered");
+
+        // Test start/end fields crossing byte boundaries too
+        let va = encode_vertex(1, 255, 256);
+        let vb = encode_vertex(1, 256, 257);
+        assert!(
+            va < vb,
+            "start=255 should sort before start=256 within same change"
+        );
+    }
+
+    #[test]
     fn test_inode_vertex_encoding_ordering() {
         // Verify that inode-vertices sort by inode first
         let v1 = encode_inode_vertex(1, 2, 0, 10);
         let v2 = encode_inode_vertex(2, 1, 0, 10);
 
         assert!(v1 < v2, "inode 1 should sort before inode 2");
+    }
+
+    #[test]
+    fn test_inode_vertex_encoding_ordering_across_byte_boundary() {
+        let v255 = encode_inode_vertex(255, 1, 0, 10);
+        let v256 = encode_inode_vertex(256, 1, 0, 10);
+        assert!(v255 < v256, "inode 255 should sort before inode 256");
+    }
+
+    #[test]
+    fn test_stack_graph_key_ordering_across_byte_boundary() {
+        let k255 = encode_stack_graph_key(255, 1, 0, 10);
+        let k256 = encode_stack_graph_key(256, 1, 0, 10);
+        assert!(k255 < k256, "stack 255 should sort before stack 256");
+
+        // Prefix scan bounds
+        let prefix_255 = encode_stack_graph_prefix(255);
+        let prefix_256 = encode_stack_graph_prefix(256);
+        assert!(
+            prefix_255 < prefix_256,
+            "prefix 255 should sort before prefix 256"
+        );
+    }
+
+    #[test]
+    fn test_stack_seq_ordering_across_byte_boundary() {
+        let s255 = encode_stack_seq(1, 255);
+        let s256 = encode_stack_seq(1, 256);
+        assert!(s255 < s256, "seq 255 should sort before seq 256");
     }
 
     // Directory Flag Tests
