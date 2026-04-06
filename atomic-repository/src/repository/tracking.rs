@@ -83,6 +83,17 @@ impl Repository {
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        // Build the set of change NodeIds visible on the current stack so we
+        // can apply the same stack-aware filter that `status` uses.  A file
+        // that lives in the global TREE table but whose creating change belongs
+        // to a *different* stack is invisible here and should be re-addable.
+        let current_stack_change_ids: std::collections::HashSet<atomic_core::types::NodeId> =
+            if let Ok(Some(stack)) = txn.get_stack(&self.current_stack) {
+                collect_stack_change_ids(&txn, &stack).unwrap_or_default()
+            } else {
+                std::collections::HashSet::new()
+            };
+
         for file_path in files {
             // Normalize path with repo root to handle absolute paths correctly
             // (e.g., on macOS where /tmp -> /private/tmp)
@@ -94,12 +105,41 @@ impl Repository {
                 continue;
             }
 
-            // Check if already tracked
+            // Check if already tracked — with stack-aware filtering.
+            //
+            // A file is considered "tracked on this stack" only if:
+            //   (a) it exists in the global TREE table, AND
+            //   (b) either it hasn't been recorded yet (no INODES position),
+            //       OR its creating change belongs to the current stack.
+            //
+            // If (a) is true but (b) is false, the file was recorded on a
+            // different stack (e.g. an agent stack).  `status` shows it as
+            // untracked here, so `add` must also treat it as untracked and
+            // allow re-adding it.
             if is_tracked(&txn, &normalized)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?
             {
-                stats.skip(file_path, "already tracked");
-                continue;
+                // File is in TREE — now check if it belongs to this stack.
+                let on_current_stack = if let Ok(Some(inode)) = txn.get_inode(&normalized) {
+                    match txn.inode_position(inode) {
+                        Ok(Some(position)) => {
+                            // Recorded: check if the creating change is on this stack.
+                            position.change.is_root()
+                                || current_stack_change_ids.contains(&position.change)
+                        }
+                        Ok(None) => true, // Added but not yet recorded — belongs here.
+                        Err(_) => true,   // Can't determine — be conservative, keep as tracked.
+                    }
+                } else {
+                    true // Can't look up inode — be conservative.
+                };
+
+                if on_current_stack {
+                    stats.skip(file_path, "already tracked");
+                    continue;
+                }
+                // Falls through: file is in TREE but on a different stack.
+                // Treat as untracked on this stack and allow re-adding.
             }
 
             // Add to tree (only files, not directories)
