@@ -70,7 +70,7 @@
 //! - Is fully reversible (just re-apply the change)
 //! - Works with the graph model, not commit trees
 
-use atomic_core::pristine::{StackState, StackTxnT};
+use atomic_core::pristine::{ViewState, ViewTxnT};
 use atomic_core::types::{Base32, Hash, Merkle};
 use std::collections::HashSet;
 use std::fmt;
@@ -91,13 +91,13 @@ pub enum UnrecordError {
         hash: String,
     },
 
-    /// The change is not in the specified stack.
-    #[error("Change {} is not in stack '{stack}'", hash)]
-    NotInStack {
+    /// The change is not in the specified view.
+    #[error("Change {} is not in view '{view}'", hash)]
+    NotInView {
         /// Hash of the change.
         hash: String,
-        /// Name of the stack.
-        stack: String,
+        /// Name of the view.
+        view: String,
     },
 
     /// The change cannot be unrecorded because other changes depend on it.
@@ -109,17 +109,17 @@ pub enum UnrecordError {
         dependents: Vec<String>,
     },
 
-    /// The stack was not found.
-    #[error("Stack not found: {name}")]
-    StackNotFound {
-        /// Name of the missing stack.
+    /// The view was not found.
+    #[error("View not found: {name}")]
+    ViewNotFound {
+        /// Name of the missing view.
         name: String,
     },
 
-    /// The stack is empty (no changes to unrecord).
-    #[error("Stack '{name}' is empty")]
-    StackEmpty {
-        /// Name of the empty stack.
+    /// The view is empty (no changes to unrecord).
+    #[error("View '{name}' is empty")]
+    ViewEmpty {
+        /// Name of the empty view.
         name: String,
     },
 
@@ -152,8 +152,8 @@ pub enum UnrecordError {
 /// ```
 #[derive(Debug, Clone)]
 pub struct UnrecordOptions {
-    /// Stack to unrecord from (None = current stack).
-    pub stack: Option<String>,
+    /// View to unrecord from (None = current view).
+    pub view: Option<String>,
 
     /// Whether to cascade and also unrecord dependent changes.
     pub cascade: bool,
@@ -175,7 +175,7 @@ pub struct UnrecordOptions {
 impl Default for UnrecordOptions {
     fn default() -> Self {
         Self {
-            stack: None,
+            view: None,
             cascade: false,
             update_working_copy: true,
             dry_run: false,
@@ -191,9 +191,9 @@ impl UnrecordOptions {
         Self::default()
     }
 
-    /// Set the stack to unrecord from.
-    pub fn stack(mut self, name: impl Into<String>) -> Self {
-        self.stack = Some(name.into());
+    /// Set the view to unrecord from.
+    pub fn view(mut self, name: impl Into<String>) -> Self {
+        self.view = Some(name.into());
         self
     }
 
@@ -418,25 +418,25 @@ impl UnrecordDependencyInfo {
 
 // Core Functions
 
-/// Check if a change can be unrecorded from a stack.
+/// Check if a change can be unrecorded from a view.
 ///
 /// This verifies that:
-/// 1. The change is in the stack
-/// 2. No other changes in the stack depend on it (unless cascade is enabled)
+/// 1. The change is in the view
+/// 2. No other changes in the view depend on it (unless cascade is enabled)
 ///
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - Stack to check
+/// * `view` - View to check
 /// * `hash` - Hash of the change to check
 /// * `options` - Unrecord options
 ///
 /// # Returns
 ///
 /// `UnrecordDependencyInfo` with details about dependencies.
-pub fn check_can_unrecord<T: StackTxnT>(
+pub fn check_can_unrecord<T: ViewTxnT>(
     txn: &T,
-    stack: &StackState,
+    view: &ViewState,
     hash: &Hash,
     options: &UnrecordOptions,
 ) -> UnrecordResult<UnrecordDependencyInfo> {
@@ -448,21 +448,21 @@ pub fn check_can_unrecord<T: StackTxnT>(
             hash: hash.to_base32(),
         })?;
 
-    // Check if change is in stack
+    // Check if change is in view
     let _seq = txn
-        .get_change_seq(stack, node_id)
+        .get_change_seq(view, node_id)
         .map_err(|e| UnrecordError::Database(e.to_string()))?
-        .ok_or_else(|| UnrecordError::NotInStack {
+        .ok_or_else(|| UnrecordError::NotInView {
             hash: hash.to_base32(),
-            stack: stack.name.clone(),
+            view: view.name.clone(),
         })?;
 
     let mut info = UnrecordDependencyInfo::new(*hash);
 
-    // Find dependents in the stack
+    // Find dependents in the view
     // This requires checking all changes after this one to see if they depend on it
     let iter = txn
-        .iter_changes(stack, 0)
+        .iter_changes(view, 0)
         .map_err(|e| UnrecordError::Database(e.to_string()))?;
 
     for result in iter {
@@ -494,16 +494,16 @@ pub fn check_can_unrecord<T: StackTxnT>(
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - Stack to analyze
+/// * `view` - View to analyze
 /// * `hash` - Hash of the change to unrecord
 /// * `max_depth` - Maximum cascade depth
 ///
 /// # Returns
 ///
 /// A vector of hashes in the order they should be unrecorded (dependents first).
-pub fn find_unrecord_set<T: StackTxnT>(
+pub fn find_unrecord_set<T: ViewTxnT>(
     txn: &T,
-    stack: &StackState,
+    view: &ViewState,
     hash: &Hash,
     max_depth: Option<usize>,
 ) -> UnrecordResult<Vec<Hash>> {
@@ -531,9 +531,9 @@ pub fn find_unrecord_set<T: StackTxnT>(
             Err(e) => return Err(UnrecordError::Database(e.to_string())),
         };
 
-        // Check if in stack
+        // Check if in view
         if txn
-            .get_change_seq(stack, node_id)
+            .get_change_seq(view, node_id)
             .map_err(|e| UnrecordError::Database(e.to_string()))?
             .is_none()
         {
@@ -559,22 +559,22 @@ pub fn find_unrecord_set<T: StackTxnT>(
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - Stack being modified
+/// * `view` - View being modified
 /// * `removed` - Set of change hashes being removed
 ///
 /// # Returns
 ///
 /// The new Merkle state after removal.
-pub fn compute_state_after_unrecord<T: StackTxnT>(
+pub fn compute_state_after_unrecord<T: ViewTxnT>(
     txn: &T,
-    stack: &StackState,
+    view: &ViewState,
     removed: &HashSet<Hash>,
 ) -> UnrecordResult<Merkle> {
     let mut state = Merkle::ZERO;
 
     // Iterate through all changes and recompute state without the removed ones
     let iter = txn
-        .iter_changes(stack, 0)
+        .iter_changes(view, 0)
         .map_err(|e| UnrecordError::Database(e.to_string()))?;
 
     for result in iter {
@@ -605,16 +605,16 @@ pub fn compute_state_after_unrecord<T: StackTxnT>(
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - Stack to preview
+/// * `view` - View to preview
 /// * `hashes` - Hashes of changes to unrecord
 /// * `options` - Unrecord options
 ///
 /// # Returns
 ///
 /// An `UnrecordOutcome` describing what would happen.
-pub fn preview_unrecord<T: StackTxnT>(
+pub fn preview_unrecord<T: ViewTxnT>(
     txn: &T,
-    stack: &StackState,
+    view: &ViewState,
     hashes: &[Hash],
     options: &UnrecordOptions,
 ) -> UnrecordResult<UnrecordOutcome> {
@@ -622,7 +622,7 @@ pub fn preview_unrecord<T: StackTxnT>(
 
     for hash in hashes {
         if options.cascade {
-            let set = find_unrecord_set(txn, stack, hash, options.max_cascade)?;
+            let set = find_unrecord_set(txn, view, hash, options.max_cascade)?;
             for h in set {
                 if !all_unrecords.contains(&h) {
                     all_unrecords.push(h);
@@ -630,7 +630,7 @@ pub fn preview_unrecord<T: StackTxnT>(
             }
         } else {
             // Check if can unrecord without cascade
-            let info = check_can_unrecord(txn, stack, hash, options)?;
+            let info = check_can_unrecord(txn, view, hash, options)?;
             if !info.can_unrecord {
                 return Err(UnrecordError::HasDependents {
                     hash: hash.to_base32(),
@@ -645,8 +645,8 @@ pub fn preview_unrecord<T: StackTxnT>(
 
     // Compute new state
     let removed_set: HashSet<Hash> = all_unrecords.iter().copied().collect();
-    let new_state = compute_state_after_unrecord(txn, stack, &removed_set)?;
-    let new_count = stack.change_count - all_unrecords.len() as u64;
+    let new_state = compute_state_after_unrecord(txn, view, &removed_set)?;
+    let new_count = view.change_count - all_unrecords.len() as u64;
 
     let mut stats = UnrecordStats::new();
     stats.direct_unrecords = hashes.len();
@@ -657,44 +657,41 @@ pub fn preview_unrecord<T: StackTxnT>(
         .with_stats(stats))
 }
 
-/// Get the sequence number of the last change in a stack.
+/// Get the sequence number of the last change in a view.
 ///
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - Stack to query
+/// * `view` - View to query
 ///
 /// # Returns
 ///
-/// The last sequence number, or None if stack is empty.
-pub fn get_last_sequence<T: StackTxnT>(
-    _txn: &T,
-    stack: &StackState,
-) -> UnrecordResult<Option<u64>> {
-    if stack.change_count == 0 {
+/// The last sequence number, or None if view is empty.
+pub fn get_last_sequence<T: ViewTxnT>(_txn: &T, view: &ViewState) -> UnrecordResult<Option<u64>> {
+    if view.change_count == 0 {
         return Ok(None);
     }
-    Ok(Some(stack.change_count - 1))
+    Ok(Some(view.change_count - 1))
 }
 
-/// Get the hash of the last change in a stack.
+/// Get the hash of the last change in a view.
 ///
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - Stack to query
+/// * `view` - View to query
 ///
 /// # Returns
 ///
-/// The hash of the last change, or None if stack is empty.
-pub fn get_last_change<T: StackTxnT>(_txn: &T, stack: &StackState) -> UnrecordResult<Option<Hash>> {
-    if stack.change_count == 0 {
+/// The hash of the last change, or None if view is empty.
+pub fn get_last_change<T: ViewTxnT>(_txn: &T, view: &ViewState) -> UnrecordResult<Option<Hash>> {
+    if view.change_count == 0 {
         return Ok(None);
     }
 
-    let last_seq = stack.change_count - 1;
+    let last_seq = view.change_count - 1;
     let node_id = _txn
-        .get_change_at_seq(stack, last_seq)
+        .get_change_at_seq(view, last_seq)
         .map_err(|e| UnrecordError::Database(e.to_string()))?
         .ok_or_else(|| UnrecordError::Inconsistent {
             reason: format!("No change at sequence {}", last_seq),
@@ -722,7 +719,7 @@ mod tests {
     fn test_unrecord_options_default() {
         let options = UnrecordOptions::default();
 
-        assert!(options.stack.is_none());
+        assert!(options.view.is_none());
         assert!(!options.cascade);
         assert!(options.update_working_copy);
         assert!(!options.dry_run);
@@ -733,13 +730,13 @@ mod tests {
     #[test]
     fn test_unrecord_options_builder() {
         let options = UnrecordOptions::new()
-            .stack("feature")
+            .view("feature")
             .cascade(true)
             .update_working_copy(false)
             .max_cascade(50)
             .keep_change(false);
 
-        assert_eq!(options.stack, Some("feature".to_string()));
+        assert_eq!(options.view, Some("feature".to_string()));
         assert!(options.cascade);
         assert!(!options.update_working_copy);
         assert_eq!(options.max_cascade, Some(50));
@@ -910,10 +907,10 @@ mod tests {
     }
 
     #[test]
-    fn test_unrecord_error_not_in_stack() {
-        let error = UnrecordError::NotInStack {
+    fn test_unrecord_error_not_in_view() {
+        let error = UnrecordError::NotInView {
             hash: "ABC123".to_string(),
-            stack: "main".to_string(),
+            view: "main".to_string(),
         };
         let msg = format!("{}", error);
         assert!(msg.contains("ABC123"));
@@ -932,8 +929,8 @@ mod tests {
     }
 
     #[test]
-    fn test_unrecord_error_stack_not_found() {
-        let error = UnrecordError::StackNotFound {
+    fn test_unrecord_error_view_not_found() {
+        let error = UnrecordError::ViewNotFound {
             name: "missing".to_string(),
         };
         let msg = format!("{}", error);
@@ -941,8 +938,8 @@ mod tests {
     }
 
     #[test]
-    fn test_unrecord_error_stack_empty() {
-        let error = UnrecordError::StackEmpty {
+    fn test_unrecord_error_view_empty() {
+        let error = UnrecordError::ViewEmpty {
             name: "empty".to_string(),
         };
         let msg = format!("{}", error);

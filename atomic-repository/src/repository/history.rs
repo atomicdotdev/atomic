@@ -33,12 +33,12 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let stack_name = options.stack.as_deref().unwrap_or(&self.current_stack);
+        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
         let stack = txn
-            .get_stack(stack_name)
+            .get_view(view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: stack_name.to_string(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
             })?;
 
         let iter = crate::history::log(&txn, &stack, &options)
@@ -80,12 +80,12 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let stack_name = options.stack.as_deref().unwrap_or(&self.current_stack);
+        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
         let stack = txn
-            .get_stack(stack_name)
+            .get_view(view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: stack_name.to_string(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
             })?;
 
         let mut entries = crate::history::reverse_log(&txn, &stack, &options)
@@ -115,10 +115,10 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let stack = txn
-            .get_stack(&self.current_stack)
+            .get_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: self.current_stack.clone(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: self.current_view.clone(),
             })?;
 
         crate::history::history_summary(&txn, &stack)
@@ -166,11 +166,11 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Determine which stack to use
-        let stack_name = options.stack.as_deref().unwrap_or(&self.current_stack);
+        let stack_name = options.view.as_deref().unwrap_or(&self.current_view);
 
         // Get the stack
         let mut stack = txn
-            .open_or_create_stack(stack_name)
+            .open_or_create_view(stack_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Get internal ID
@@ -203,7 +203,7 @@ impl Repository {
         }
 
         // Update the stack
-        txn.update_stack(&stack)
+        txn.update_view(&stack)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Commit the transaction
@@ -245,11 +245,11 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let stack_name = options.stack.as_deref().unwrap_or(&self.current_stack);
+        let stack_name = options.view.as_deref().unwrap_or(&self.current_view);
         let stack = txn
-            .get_stack(stack_name)
+            .get_view(stack_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
+            .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: stack_name.to_string(),
             })?;
 
@@ -297,7 +297,7 @@ impl Repository {
 
         // Get the stack
         let mut stack = txn
-            .open_or_create_stack(&self.current_stack)
+            .open_or_create_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Get internal ID (must already be registered)
@@ -316,7 +316,7 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Update the stack
-        txn.update_stack(&stack)
+        txn.update_view(&stack)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Commit the transaction
@@ -349,10 +349,10 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let stack = txn
-            .get_stack(&self.current_stack)
+            .get_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: self.current_stack.clone(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: self.current_view.clone(),
             })?;
 
         crate::unrecord::check_can_unrecord(&txn, &stack, hash, &UnrecordOptions::default())

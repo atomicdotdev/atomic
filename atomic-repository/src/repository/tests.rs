@@ -2,6 +2,7 @@ use super::*;
 
 mod tests {
     use super::*;
+    use crate::InsertOptions;
     use atomic_core::change::{Author, Change, ChangeHeader};
     use atomic_core::types::Base32;
 
@@ -42,7 +43,7 @@ mod tests {
 
         let opened = Repository::open(temp_dir.path()).unwrap();
         assert_eq!(opened.root(), root);
-        assert_eq!(opened.current_stack(), DEFAULT_STACK);
+        assert_eq!(opened.current_view(), DEFAULT_STACK);
     }
 
     #[test]
@@ -121,173 +122,173 @@ mod tests {
     }
 
     #[test]
-    fn test_set_current_stack() {
+    fn test_set_current_view() {
         let (_temp_dir, mut repo) = create_temp_repo();
 
-        // First create the stack
-        repo.create_stack("feature-stack").unwrap();
+        // First create the view
+        repo.create_view("feature-view").unwrap();
 
         // Then switch to it
-        repo.set_current_stack("feature-stack").unwrap();
-        assert_eq!(repo.current_stack(), "feature-stack");
+        repo.set_current_view("feature-view").unwrap();
+        assert_eq!(repo.current_view(), "feature-view");
 
         // Verify it persists - drop repo first to release lock
         let root = repo.root().to_path_buf();
         drop(repo);
 
         let reopened = Repository::open(&root).unwrap();
-        assert_eq!(reopened.current_stack(), "feature-stack");
+        assert_eq!(reopened.current_view(), "feature-view");
     }
 
     #[test]
-    fn test_set_current_stack_nonexistent() {
+    fn test_set_current_view_nonexistent() {
         let (_temp_dir, mut repo) = create_temp_repo();
 
-        // Trying to switch to a nonexistent stack should fail
-        let result = repo.set_current_stack("nonexistent");
-        assert!(matches!(result, Err(RepositoryError::StackNotFound { .. })));
+        // Trying to switch to a nonexistent view should fail
+        let result = repo.set_current_view("nonexistent");
+        assert!(matches!(result, Err(RepositoryError::ViewNotFound { .. })));
     }
 
     #[test]
-    fn test_create_stack() {
+    fn test_create_view() {
         let (_temp_dir, mut repo) = create_temp_repo();
 
-        // Create a new stack
-        repo.create_stack("feature").unwrap();
+        // Create a new view
+        repo.create_view("feature").unwrap();
 
         // Verify it exists
-        assert!(repo.stack_exists("feature").unwrap());
+        assert!(repo.view_exists("feature").unwrap());
 
-        // Creating the same stack again should fail
-        let result = repo.create_stack("feature");
+        // Creating the same view again should fail
+        let result = repo.create_view("feature");
         assert!(matches!(
             result,
-            Err(RepositoryError::StackAlreadyExists { .. })
+            Err(RepositoryError::ViewAlreadyExists { .. })
         ));
     }
 
     #[test]
-    fn test_list_stacks() {
+    fn test_list_views() {
         let (_temp_dir, mut repo) = create_temp_repo();
 
-        // Should have default "dev" stack
-        let stacks = repo.list_stacks().unwrap();
-        assert!(stacks.contains(&"dev".to_string()));
+        // Should have default "dev" view
+        let views = repo.list_views().unwrap();
+        assert!(views.contains(&"dev".to_string()));
 
-        // Create additional stacks
-        repo.create_stack("feature-a").unwrap();
-        repo.create_stack("feature-b").unwrap();
+        // Create additional views
+        repo.create_view("feature-a").unwrap();
+        repo.create_view("feature-b").unwrap();
 
-        let stacks = repo.list_stacks().unwrap();
-        assert_eq!(stacks.len(), 3);
-        assert!(stacks.contains(&"dev".to_string()));
-        assert!(stacks.contains(&"feature-a".to_string()));
-        assert!(stacks.contains(&"feature-b".to_string()));
+        let views = repo.list_views().unwrap();
+        assert_eq!(views.len(), 3);
+        assert!(views.contains(&"dev".to_string()));
+        assert!(views.contains(&"feature-a".to_string()));
+        assert!(views.contains(&"feature-b".to_string()));
     }
 
     #[test]
-    fn test_default_stack_name() {
+    fn test_default_view_name() {
         let (_temp_dir, repo) = create_temp_repo();
-        assert_eq!(repo.current_stack(), "dev");
+        assert_eq!(repo.current_view(), "dev");
         assert_eq!(DEFAULT_STACK, "dev");
     }
 
     #[test]
-    fn test_delete_stack() {
-        use atomic_core::pristine::{MutTxnT, StackKind, StackTxnT};
+    fn test_delete_view() {
+        use atomic_core::pristine::{MutTxnT, ViewScope, ViewTxnT};
         let (_temp_dir, mut repo) = create_temp_repo();
 
-        // Create an local workspace (only local workspaces can be deleted)
+        // Create a draft view (only draft views can be deleted)
         {
             let mut txn = repo.pristine.write_txn().unwrap();
-            let dev = txn.get_stack("dev").unwrap().unwrap();
-            txn.create_stack("to-delete", StackKind::Local, Some(dev.id))
+            let dev = txn.get_view("dev").unwrap().unwrap();
+            txn.create_view("to-delete", ViewScope::Draft, Some(dev.id))
                 .unwrap();
             txn.commit().unwrap();
         }
-        assert!(repo.stack_exists("to-delete").unwrap());
+        assert!(repo.view_exists("to-delete").unwrap());
 
-        // Delete the stack
-        repo.delete_stack("to-delete").unwrap();
+        // Delete the view
+        repo.delete_view("to-delete").unwrap();
 
         // Verify it's gone
-        assert!(!repo.stack_exists("to-delete").unwrap());
+        assert!(!repo.view_exists("to-delete").unwrap());
     }
 
     #[test]
-    fn test_delete_stack_nonexistent() {
+    fn test_delete_view_nonexistent() {
         let (_temp_dir, mut repo) = create_temp_repo();
 
-        // Trying to delete a nonexistent stack should fail
-        let result = repo.delete_stack("nonexistent");
-        assert!(matches!(result, Err(RepositoryError::StackNotFound { .. })));
+        // Trying to delete a nonexistent view should fail
+        let result = repo.delete_view("nonexistent");
+        assert!(matches!(result, Err(RepositoryError::ViewNotFound { .. })));
     }
 
     #[test]
-    fn test_delete_current_stack_fails() {
+    fn test_delete_current_view_fails() {
         let (_temp_dir, mut repo) = create_temp_repo();
 
-        // Trying to delete the current stack should fail
-        let result = repo.delete_stack("dev");
+        // Trying to delete the current view should fail
+        let result = repo.delete_view("dev");
         assert!(matches!(
             result,
-            Err(RepositoryError::CannotDeleteCurrentStack { .. })
+            Err(RepositoryError::CannotDeleteCurrentView { .. })
         ));
     }
 
     #[test]
-    fn test_delete_stack_preserves_others() {
-        use atomic_core::pristine::{MutTxnT, StackKind, StackTxnT};
+    fn test_delete_view_preserves_others() {
+        use atomic_core::pristine::{MutTxnT, ViewScope, ViewTxnT};
         let (_temp_dir, mut repo) = create_temp_repo();
 
-        // Create two local workspaces (only local workspaces can be deleted)
+        // Create two draft views (only draft views can be deleted)
         {
             let mut txn = repo.pristine.write_txn().unwrap();
-            let dev = txn.get_stack("dev").unwrap().unwrap();
-            txn.create_stack("keep-me", StackKind::Local, Some(dev.id))
+            let dev = txn.get_view("dev").unwrap().unwrap();
+            txn.create_view("keep-me", ViewScope::Draft, Some(dev.id))
                 .unwrap();
-            txn.create_stack("delete-me", StackKind::Local, Some(dev.id))
+            txn.create_view("delete-me", ViewScope::Draft, Some(dev.id))
                 .unwrap();
             txn.commit().unwrap();
         }
 
         // Delete one
-        repo.delete_stack("delete-me").unwrap();
+        repo.delete_view("delete-me").unwrap();
 
         // Verify the other still exists
-        assert!(repo.stack_exists("keep-me").unwrap());
-        assert!(!repo.stack_exists("delete-me").unwrap());
+        assert!(repo.view_exists("keep-me").unwrap());
+        assert!(!repo.view_exists("delete-me").unwrap());
     }
 
     #[test]
-    fn test_get_stack_info() {
+    fn test_get_view_info() {
         let (_temp_dir, mut repo) = create_temp_repo();
 
-        // Create a stack
-        repo.create_stack("info-test").unwrap();
+        // Create a view
+        repo.create_view("info-test").unwrap();
 
         // Get info
-        let info = repo.get_stack_info("info-test").unwrap();
+        let info = repo.get_view_info("info-test").unwrap();
         assert_eq!(info.name, "info-test");
         assert_eq!(info.change_count, 0);
         assert!(info.is_empty());
     }
 
     #[test]
-    fn test_get_stack_info_nonexistent() {
+    fn test_get_view_info_nonexistent() {
         let (_temp_dir, repo) = create_temp_repo();
 
-        // Trying to get info for a nonexistent stack should fail
-        let result = repo.get_stack_info("nonexistent");
-        assert!(matches!(result, Err(RepositoryError::StackNotFound { .. })));
+        // Trying to get info for a nonexistent view should fail
+        let result = repo.get_view_info("nonexistent");
+        assert!(matches!(result, Err(RepositoryError::ViewNotFound { .. })));
     }
 
     #[test]
-    fn test_stack_info_state_methods() {
+    fn test_view_info_state_methods() {
         let (_temp_dir, mut repo) = create_temp_repo();
 
-        repo.create_stack("state-test").unwrap();
-        let info = repo.get_stack_info("state-test").unwrap();
+        repo.create_view("state-test").unwrap();
+        let info = repo.get_view_info("state-test").unwrap();
 
         // Test state methods
         let base32 = info.state_base32();
@@ -296,7 +297,7 @@ mod tests {
         let short = info.state_short();
         assert!(short.len() <= 12);
 
-        // For an empty stack
+        // For an empty view
         assert!(info.is_empty());
     }
 
@@ -1174,43 +1175,43 @@ mod tests {
     }
 
     #[test]
-    fn test_repo_get_tag_from_stack() {
+    fn test_repo_get_tag_from_view() {
         let (_temp_dir, repo) = create_temp_repo();
 
-        // Create tag in current stack
+        // Create tag in current view
         repo.create_tag("v1.0.0", TagOptions::default()).unwrap();
 
-        // Get from current stack (default behavior)
+        // Get from current view (default behavior)
         let tag = repo.get_tag("v1.0.0").unwrap();
         assert!(tag.is_some());
 
-        // Get from specific stack
-        let tag = repo.get_tag_from_stack("v1.0.0", DEFAULT_STACK).unwrap();
+        // Get from specific view
+        let tag = repo.get_tag_from_view("v1.0.0", DEFAULT_STACK).unwrap();
         assert!(tag.is_some());
 
-        // Get from different stack (should not exist)
-        let tag = repo.get_tag_from_stack("v1.0.0", "other").unwrap();
+        // Get from different view (should not exist)
+        let tag = repo.get_tag_from_view("v1.0.0", "other").unwrap();
         assert!(tag.is_none());
     }
 
     #[test]
-    fn test_repo_list_tags_for_stack() {
+    fn test_repo_list_tags_for_view() {
         let (_temp_dir, repo) = create_temp_repo();
 
-        // Create tags in current stack
+        // Create tags in current view
         repo.create_tag("v1.0.0", TagOptions::default()).unwrap();
         repo.create_tag("v2.0.0", TagOptions::default()).unwrap();
 
-        // list_tags returns current stack only
+        // list_tags returns current view only
         let tags = repo.list_tags().unwrap();
         assert_eq!(tags.len(), 2);
 
-        // list_tags_for_stack with current stack
-        let tags = repo.list_tags_for_stack(DEFAULT_STACK).unwrap();
+        // list_tags_for_view with current view
+        let tags = repo.list_tags_for_view(DEFAULT_STACK).unwrap();
         assert_eq!(tags.len(), 2);
 
-        // list_tags_for_stack with other stack (empty)
-        let tags = repo.list_tags_for_stack("other").unwrap();
+        // list_tags_for_view with other view (empty)
+        let tags = repo.list_tags_for_view("other").unwrap();
         assert!(tags.is_empty());
     }
 
@@ -1218,65 +1219,65 @@ mod tests {
     fn test_repo_list_all_tags() {
         let (_temp_dir, repo) = create_temp_repo();
 
-        // Create tags (all go to current stack since we can't easily switch)
+        // Create tags (all go to current view since we can't easily switch)
         repo.create_tag("v1.0.0", TagOptions::default()).unwrap();
         repo.create_tag("v2.0.0", TagOptions::default()).unwrap();
 
-        // list_all_tags includes all stacks
+        // list_all_tags includes all views
         let all_tags = repo.list_all_tags().unwrap();
         assert_eq!(all_tags.len(), 2);
     }
 
     #[test]
-    fn test_repo_tag_count_for_stack() {
+    fn test_repo_tag_count_for_view() {
         let (_temp_dir, repo) = create_temp_repo();
 
         repo.create_tag("v1.0.0", TagOptions::default()).unwrap();
         repo.create_tag("v2.0.0", TagOptions::default()).unwrap();
 
-        // tag_count returns count for current stack
+        // tag_count returns count for current view
         assert_eq!(repo.tag_count().unwrap(), 2);
 
-        // tag_count_for_stack with specific stack
-        assert_eq!(repo.tag_count_for_stack(DEFAULT_STACK).unwrap(), 2);
-        assert_eq!(repo.tag_count_for_stack("other").unwrap(), 0);
+        // tag_count_for_view with specific view
+        assert_eq!(repo.tag_count_for_view(DEFAULT_STACK).unwrap(), 2);
+        assert_eq!(repo.tag_count_for_view("other").unwrap(), 0);
 
-        // tag_count_all returns total across all stacks
+        // tag_count_all returns total across all views
         assert_eq!(repo.tag_count_all().unwrap(), 2);
     }
 
     #[test]
-    fn test_repo_delete_tag_from_stack() {
+    fn test_repo_delete_tag_from_view() {
         let (_temp_dir, repo) = create_temp_repo();
 
         repo.create_tag("v1.0.0", TagOptions::default()).unwrap();
 
-        // Delete from wrong stack should return false
-        assert!(!repo.delete_tag_from_stack("v1.0.0", "other").unwrap());
+        // Delete from wrong view should return false
+        assert!(!repo.delete_tag_from_view("v1.0.0", "other").unwrap());
 
         // Tag should still exist
         assert!(repo.get_tag("v1.0.0").unwrap().is_some());
 
-        // Delete from correct stack should succeed
-        assert!(repo.delete_tag_from_stack("v1.0.0", DEFAULT_STACK).unwrap());
+        // Delete from correct view should succeed
+        assert!(repo.delete_tag_from_view("v1.0.0", DEFAULT_STACK).unwrap());
         assert!(repo.get_tag("v1.0.0").unwrap().is_none());
     }
 
     #[test]
-    fn test_repo_list_tag_stacks() {
+    fn test_repo_list_tag_views() {
         let (_temp_dir, repo) = create_temp_repo();
 
-        // Initially no stacks have tags
-        let stacks = repo.list_tag_stacks().unwrap();
-        assert!(stacks.is_empty());
+        // Initially no views have tags
+        let views = repo.list_tag_views().unwrap();
+        assert!(views.is_empty());
 
         // Create a tag
         repo.create_tag("v1.0.0", TagOptions::default()).unwrap();
 
-        // Now current stack should be listed
-        let stacks = repo.list_tag_stacks().unwrap();
-        assert_eq!(stacks.len(), 1);
-        assert!(stacks.contains(&DEFAULT_STACK.to_string()));
+        // Now current view should be listed
+        let views = repo.list_tag_views().unwrap();
+        assert_eq!(views.len(), 1);
+        assert!(views.contains(&DEFAULT_STACK.to_string()));
     }
 
     // History Method Tests
@@ -1400,26 +1401,26 @@ mod tests {
         assert!(matches!(result, Err(RepositoryError::TagNotFound { .. })));
     }
 
-    // Apply Method Tests (basic tests - full integration needs changes)
+    // Insert Method Tests (basic tests - full integration needs changes)
 
     #[test]
-    fn test_apply_options_default() {
-        let options = ApplyOptions::default();
-        assert!(options.stack.is_none());
+    fn test_insert_options_default() {
+        let options = InsertOptions::default();
+        assert!(options.view.is_none());
         assert!(!options.apply_dependencies);
         assert!(options.allow_conflicts);
     }
 
     #[test]
-    fn test_apply_options_with_stack() {
-        let options = ApplyOptions::default().stack("feature");
-        assert_eq!(options.stack, Some("feature".to_string()));
+    fn test_insert_options_with_view() {
+        let options = InsertOptions::default().view("feature");
+        assert_eq!(options.view, Some("feature".to_string()));
     }
 
-    // Apply Recorded Tests
+    // Write Recorded Tests
 
     #[test]
-    fn test_apply_recorded_creates_tree_entries() {
+    fn test_write_recorded_creates_tree_entries() {
         use crate::record::RecordOptions;
 
         let (temp_dir, repo) = create_temp_repo();
@@ -1436,7 +1437,7 @@ mod tests {
         let options = RecordOptions::new()
             .with_all(true)
             .save_to_store(true)
-            .apply_after_record(false); // Don't auto-apply, we'll test apply_recorded
+            .apply_after_record(false); // Don't auto-apply, we'll test write_recorded
 
         let record_outcome = repo.record(header, options).unwrap();
 
@@ -1444,9 +1445,9 @@ mod tests {
         assert!(record_outcome.was_saved());
         assert!(!record_outcome.was_applied());
 
-        // Now apply using apply_recorded
+        // Now apply using write_recorded
         let apply_outcome = repo
-            .apply_recorded(&record_outcome, ApplyOptions::default())
+            .write_recorded(&record_outcome, InsertOptions::default())
             .unwrap();
 
         // Verify the apply succeeded
@@ -1471,7 +1472,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_recorded_updates_stack_state() {
+    fn test_write_recorded_updates_view_state() {
         use crate::record::RecordOptions;
 
         let (temp_dir, repo) = create_temp_repo();
@@ -1489,40 +1490,40 @@ mod tests {
 
         let record_outcome = repo.record(header, options).unwrap();
 
-        // Get initial stack state
+        // Get initial view state
         let initial_state = {
             let txn = repo.pristine.read_txn().unwrap();
-            let stack = txn.get_stack("dev").unwrap().unwrap();
-            stack.state
+            let view = txn.get_view("dev").unwrap().unwrap();
+            view.state
         };
         assert_eq!(initial_state, Merkle::ZERO);
 
         // Apply the change
         let apply_outcome = repo
-            .apply_recorded(&record_outcome, ApplyOptions::default())
+            .write_recorded(&record_outcome, InsertOptions::default())
             .unwrap();
 
         // Verify state was updated
         assert_ne!(apply_outcome.new_state, Merkle::ZERO);
         assert_eq!(apply_outcome.sequence, 1);
 
-        // Verify stack in database reflects the change
+        // Verify view in database reflects the change
         let final_state = {
             let txn = repo.pristine.read_txn().unwrap();
-            let stack = txn.get_stack("dev").unwrap().unwrap();
-            stack.state
+            let view = txn.get_view("dev").unwrap().unwrap();
+            view.state
         };
         assert_eq!(final_state, apply_outcome.new_state);
     }
 
     #[test]
-    fn test_apply_recorded_with_specific_stack() {
+    fn test_write_recorded_with_specific_view() {
         use crate::record::RecordOptions;
 
         let (temp_dir, mut repo) = create_temp_repo();
 
-        // Create another stack
-        repo.create_stack("feature").unwrap();
+        // Create another view
+        repo.create_view("feature").unwrap();
 
         // Create and track a file
         std::fs::write(temp_dir.path().join("feature.txt"), b"feature content").unwrap();
@@ -1537,23 +1538,23 @@ mod tests {
 
         let record_outcome = repo.record(header, options).unwrap();
 
-        // Apply to the "feature" stack specifically
-        let apply_options = ApplyOptions::default().stack("feature");
-        let apply_outcome = repo.apply_recorded(&record_outcome, apply_options).unwrap();
+        // Apply to the "feature" view specifically
+        let apply_options = InsertOptions::default().view("feature");
+        let apply_outcome = repo.write_recorded(&record_outcome, apply_options).unwrap();
 
-        // Verify "feature" stack was updated
+        // Verify "feature" view was updated
         let feature_state = {
             let txn = repo.pristine.read_txn().unwrap();
-            let stack = txn.get_stack("feature").unwrap().unwrap();
-            stack.state
+            let view = txn.get_view("feature").unwrap().unwrap();
+            view.state
         };
         assert_eq!(feature_state, apply_outcome.new_state);
 
-        // Verify "dev" stack is still at zero
+        // Verify "dev" view is still at zero
         let dev_state = {
             let txn = repo.pristine.read_txn().unwrap();
-            let stack = txn.get_stack("dev").unwrap().unwrap();
-            stack.state
+            let view = txn.get_view("dev").unwrap().unwrap();
+            view.state
         };
         assert_eq!(dev_state, Merkle::ZERO);
     }
@@ -2289,7 +2290,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_recorded_hash_matches() {
+    fn test_write_recorded_hash_matches() {
         use crate::record::RecordOptions;
 
         let (temp_dir, repo) = create_temp_repo();
@@ -2310,58 +2311,58 @@ mod tests {
         let expected_hash = *record_outcome.hash();
 
         let apply_outcome = repo
-            .apply_recorded(&record_outcome, ApplyOptions::default())
+            .write_recorded(&record_outcome, InsertOptions::default())
             .unwrap();
 
         // Verify the hash is in the applied hashes
         assert!(apply_outcome.stats.applied_hashes.contains(&expected_hash));
     }
 
-    /// Test that switching stacks correctly outputs file content.
+    /// Test that switching views correctly outputs file content.
     ///
-    /// This test verifies that when switching between stacks that share
-    /// the same changes, the file content is preserved. A stack created
-    /// with create_stack_from inherits the source stack's changes.
+    /// This test verifies that when switching between views that share
+    /// the same changes, the file content is preserved. A view created
+    /// with create_view_from inherits the source view's changes.
     #[test]
-    fn test_switch_stack_outputs_content() {
+    fn test_switch_view_outputs_content() {
         use crate::record::RecordOptions;
 
         let (temp_dir, mut repo) = create_temp_repo();
 
-        // Step 1: Create and record a file on the default stack
+        // Step 1: Create and record a file on the default view
         let file_path = temp_dir.path().join("switch_test.txt");
-        let content = b"Content for stack switch test\n";
+        let content = b"Content for view switch test\n";
         std::fs::write(&file_path, content).unwrap();
 
         repo.add("switch_test.txt", TrackingOptions::default())
             .unwrap();
 
-        let header = ChangeHeader::new("Add file on dev stack");
+        let header = ChangeHeader::new("Add file on dev view");
         let options = RecordOptions::new()
             .with_all(true)
             .save_to_store(true)
             .apply_after_record(true);
         repo.record(header, options).unwrap();
 
-        // Step 2: Create a new stack FROM dev (inherits dev's changes)
-        repo.create_stack_from("feature", "dev").unwrap();
+        // Step 2: Create a new view FROM dev (inherits dev's changes)
+        repo.create_view_from("feature", "dev").unwrap();
 
-        // Step 3: Switch to the new stack
-        let _switch_result = repo.switch_stack("feature").unwrap();
+        // Step 3: Switch to the new view
+        let _switch_result = repo.switch_view("feature").unwrap();
 
         // The switch should succeed
-        assert_eq!(repo.current_stack(), "feature");
+        assert_eq!(repo.current_view(), "feature");
 
         // Step 4: Verify the file content is still present in working copy
         let file_content = std::fs::read(&file_path).unwrap();
         assert_eq!(
             file_content, content,
-            "File content should be preserved after stack switch"
+            "File content should be preserved after view switch"
         );
 
         // Step 5: Switch back to dev and verify content again
-        let _switch_back_result = repo.switch_stack("dev").unwrap();
-        assert_eq!(repo.current_stack(), "dev");
+        let _switch_back_result = repo.switch_view("dev").unwrap();
+        assert_eq!(repo.current_view(), "dev");
 
         let file_content_after = std::fs::read(&file_path).unwrap();
         assert_eq!(
@@ -2370,28 +2371,28 @@ mod tests {
         );
     }
 
-    /// Test correct stack switching behavior with content isolation.
+    /// Test correct view switching behavior with content isolation.
     ///
-    /// This is the TDD test for how stack switching SHOULD work:
-    /// 1. Record content on dev stack
-    /// 2. Create feature stack FROM dev (inherits dev's changes)
+    /// This is the TDD test for how view switching SHOULD work:
+    /// 1. Record content on dev view
+    /// 2. Create feature view FROM dev (inherits dev's changes)
     /// 3. Record different content on feature
-    /// 4. Switching between stacks shows each stack's content
+    /// 4. Switching between views shows each view's content
     ///
-    /// Key insight: When creating a new stack, it should inherit the current
-    /// stack's changes so that switching to it preserves the working copy state.
+    /// Key insight: When creating a new view, it should inherit the current
+    /// view's changes so that switching to it preserves the working copy state.
     #[test]
-    fn test_switch_stack_shows_stack_content() {
+    fn test_switch_view_shows_view_content() {
         use crate::record::RecordOptions;
 
         let (temp_dir, mut repo) = create_temp_repo();
 
-        // Step 1: Create and record a file on dev stack
-        let file_path = temp_dir.path().join("stack_test.txt");
-        let dev_content = b"Content on dev stack\n";
+        // Step 1: Create and record a file on dev view
+        let file_path = temp_dir.path().join("view_test.txt");
+        let dev_content = b"Content on dev view\n";
         std::fs::write(&file_path, dev_content).unwrap();
 
-        repo.add("stack_test.txt", TrackingOptions::default())
+        repo.add("view_test.txt", TrackingOptions::default())
             .unwrap();
 
         let header = ChangeHeader::new("Add file on dev");
@@ -2402,21 +2403,21 @@ mod tests {
         repo.record(header, options).unwrap();
 
         // Verify dev has 1 change
-        let dev_info = repo.get_stack_info("dev").unwrap();
+        let dev_info = repo.get_view_info("dev").unwrap();
         assert_eq!(dev_info.change_count, 1, "Dev should have 1 change");
 
-        // Step 2: Create feature stack FROM dev (should inherit dev's changes)
-        repo.create_stack_from("feature", "dev").unwrap();
+        // Step 2: Create feature view FROM dev (should inherit dev's changes)
+        repo.create_view_from("feature", "dev").unwrap();
 
         // Feature should now have the same changes as dev
-        let feature_info = repo.get_stack_info("feature").unwrap();
+        let feature_info = repo.get_view_info("feature").unwrap();
         assert_eq!(
             feature_info.change_count, 1,
             "Feature should inherit dev's 1 change"
         );
 
         // Step 3: Switch to feature - content should still be present
-        repo.switch_stack("feature").unwrap();
+        repo.switch_view("feature").unwrap();
 
         let content_on_feature = std::fs::read(&file_path).unwrap();
         assert_eq!(
@@ -2424,8 +2425,8 @@ mod tests {
             "Content should be preserved when switching to feature (inherited from dev)"
         );
 
-        // Step 4: Modify the file on feature stack
-        let feature_content = b"Modified content on feature stack\n";
+        // Step 4: Modify the file on feature view
+        let feature_content = b"Modified content on feature view\n";
         std::fs::write(&file_path, feature_content).unwrap();
 
         let header = ChangeHeader::new("Modify file on feature");
@@ -2436,7 +2437,7 @@ mod tests {
         repo.record(header, options).unwrap();
 
         // Feature now has 2 changes (inherited + its own)
-        let feature_info = repo.get_stack_info("feature").unwrap();
+        let feature_info = repo.get_view_info("feature").unwrap();
         assert_eq!(
             feature_info.change_count, 2,
             "Feature should have 2 changes (inherited + modification)"
@@ -2447,7 +2448,7 @@ mod tests {
         assert_eq!(current_content, feature_content);
 
         // Step 5: Switch back to dev - content should revert to dev version
-        repo.switch_stack("dev").unwrap();
+        repo.switch_view("dev").unwrap();
 
         let content_after_switch = std::fs::read(&file_path).unwrap();
         assert_eq!(
@@ -2456,11 +2457,11 @@ mod tests {
         );
 
         // Dev still has only 1 change
-        let dev_info = repo.get_stack_info("dev").unwrap();
+        let dev_info = repo.get_view_info("dev").unwrap();
         assert_eq!(dev_info.change_count, 1, "Dev should still have 1 change");
 
         // Step 6: Switch to feature again - content should be feature version
-        repo.switch_stack("feature").unwrap();
+        repo.switch_view("feature").unwrap();
 
         let feature_content_after_switch = std::fs::read(&file_path).unwrap();
         assert_eq!(

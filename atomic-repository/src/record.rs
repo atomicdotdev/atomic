@@ -207,8 +207,8 @@ pub struct RecordOptions {
     /// Number of context lines for display.
     context_lines: usize,
 
-    /// Stack to record to (None = current stack).
-    stack: Option<String>,
+    /// View to record to (None = current view).
+    view: Option<String>,
 
     /// Change message (can also be set in header).
     message: Option<String>,
@@ -374,16 +374,16 @@ impl RecordOptions {
         self
     }
 
-    /// Set the target stack.
+    /// Set the target view.
     ///
-    /// If not set, uses the current stack.
+    /// If not set, uses the current view.
     ///
     /// # Arguments
     ///
-    /// * `stack` - Stack name
+    /// * `view` - View name
     #[must_use]
-    pub fn stack(mut self, stack: impl Into<String>) -> Self {
-        self.stack = Some(stack.into());
+    pub fn view(mut self, view: impl Into<String>) -> Self {
+        self.view = Some(view.into());
         self
     }
 
@@ -551,10 +551,10 @@ impl RecordOptions {
         self.context_lines
     }
 
-    /// Get the target stack.
+    /// Get the target view.
     #[must_use]
-    pub fn get_stack(&self) -> Option<&str> {
-        self.stack.as_deref()
+    pub fn get_view(&self) -> Option<&str> {
+        self.view.as_deref()
     }
 
     /// Get the change message.
@@ -645,7 +645,7 @@ impl Default for RecordOptions {
             skip_binary: false,
             record_empty_files: false,
             context_lines: Self::DEFAULT_CONTEXT_LINES,
-            stack: None,
+            view: None,
             message: None,
             apply_after_record: true,
             save_to_store: true,
@@ -1062,7 +1062,7 @@ mod tests {
             opts.get_context_lines(),
             RecordOptions::DEFAULT_CONTEXT_LINES
         );
-        assert!(opts.get_stack().is_none());
+        assert!(opts.get_view().is_none());
         assert!(opts.get_message().is_none());
         assert!(opts.get_apply_after_record());
         assert!(opts.get_save_to_store());
@@ -1133,9 +1133,9 @@ mod tests {
     }
 
     #[test]
-    fn test_options_stack() {
-        let opts = RecordOptions::new().stack("feature");
-        assert_eq!(opts.get_stack(), Some("feature"));
+    fn test_options_view() {
+        let opts = RecordOptions::new().view("feature");
+        assert_eq!(opts.get_view(), Some("feature"));
     }
 
     #[test]
@@ -1165,14 +1165,14 @@ mod tests {
             .with_max_file_size(1024 * 1024)
             .with_skip_binary(true)
             .message("Test change")
-            .stack("feature");
+            .view("feature");
 
         assert_eq!(opts.get_paths().len(), 1);
         assert!(!opts.all());
         assert_eq!(opts.algorithm(), Algorithm::Patience);
         assert!(opts.skip_binary());
         assert_eq!(opts.get_message(), Some("Test change"));
-        assert_eq!(opts.get_stack(), Some("feature"));
+        assert_eq!(opts.get_view(), Some("feature"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # REFACTOR-VIEWS.md — Ambient Graph + View Filters
 
-> **Status**: In Progress — Phase 3 Complete  
+> **Status**: In Progress — Phase 4 Complete  
 > **Created**: 2025-07-13  
 > **Last Updated**: 2025-07-13  
 > **Tracking Issue**: N/A  
@@ -558,10 +558,11 @@ Recommendation: rename the module.
 
 ---
 
-## Phase 4: Repository Layer
+## Phase 4: Repository Layer ✅ COMPLETE
 
 **Goal**: Rename all repository methods, simplify the insert operation, remove OverlayTxn usage.  
-**Depends on**: Phases 1, 2, 3.
+**Depends on**: Phases 1, 2, 3.  
+**Result**: `cargo test -p atomic-repository` — 16 passed, 0 failed, 103 ignored. `cargo check -p atomic-repository` clean. Zero old `Stack*`, `OverlayTxn`, `ApplyOptions`, or `output_working_copy` references remain.
 
 ### Files to Modify
 
@@ -635,22 +636,24 @@ pub fn materialize(&self) -> Result<MaterializeResult, RepositoryError> {
 
 ### Checklist
 
-- [ ] Rename `atomic-repository/src/apply.rs` → `insert.rs`
-- [ ] Rename `atomic-repository/src/repository/apply.rs` → `insert.rs`
-- [ ] Rename all types: `ApplyOptions` → `InsertOptions`, etc.
-- [ ] Rewrite `insert_from_view` as metadata-only operation
-- [ ] Remove `should_apply_hunks` logic from `write_change_to_graph`
-- [ ] Rewrite `materialize()` without `OverlayTxn`
-- [ ] Replace `get_file_content_via_overlay` with filter-only `get_file_content`
-- [ ] Update `status.rs` to use filter-only approach
-- [ ] Rename all `*_stack*` methods → `*_view*`
-- [ ] Rename `RecordOptions::stack()` → `view()`, `.get_stack()` → `.get_view()`, field `stack` → `view`
-- [ ] Rename `RecordOptions::apply_after_record()` → `write_after_record()`, `.get_apply_after_record()` → `.get_write_after_record()`, field `apply_after_record` → `write_after_record`
-- [ ] Update `lib.rs` module declarations and re-exports
-- [ ] Update all tests in `repository/tests.rs`
-- [ ] Update record tests: `test_options_stack` → `test_options_view`, `test_options_apply_after_record` → `test_options_write_after_record`
-- [ ] Run `cargo check -p atomic-repository`
-- [ ] Run `cargo test -p atomic-repository`
+- [x] Rename `atomic-repository/src/repository/apply.rs` → `insert.rs`
+- [x] Rename all types: `ApplyOptions` → `InsertOptions`, `ApplyOutcome` → `InsertOutcome`, `ApplyStats` → `InsertStats`, `CrossStackApplyOptions` → `CrossViewInsertOptions`, `CrossStackApplyOutcome` → `CrossViewInsertOutcome`
+- [x] Rename functions: `apply_change_to_graph` → `write_change_to_graph`, `apply_hunk` → `write_hunk`, `get_stack_changes` → `get_view_changes`, `filter_missing_in_stack` → `filter_missing_in_view`
+- [x] Simplified `should_apply_hunks` to `!already_in_graph` (done in Phase 2)
+- [x] Rewrite `materialize()` without `OverlayTxn` — uses raw `&txn` + change filter
+- [x] Replace `get_file_content_via_overlay` with filter-only `get_file_content`
+- [x] Update `status.rs` to use filter-only approach
+- [x] Rename all `*_stack*` methods → `*_view*` (switch_view, create_view, delete_view, etc.)
+- [x] Rename `StackInfo` → `ViewInfo` with `scope: ViewScope` field
+- [x] Rename `current_stack` field/methods → `current_view`, disk file `current_stack` → `current_view`
+- [x] Rename `RecordOptions::stack()` → `view()`, `.get_stack()` → `.get_view()`
+- [x] Update `lib.rs` module declarations and re-exports
+- [x] Remove all `OverlayTxn` usage (5 call sites: content.rs ×2, mod.rs ×1, record.rs ×1)
+- [x] Update error variants: `StackNotFound` → `ViewNotFound`, `StackAlreadyExists` → `ViewAlreadyExists`, `CannotDeleteCurrentStack` → `CannotDeleteCurrentView`
+- [x] Update all tests in `repository/tests.rs` (591 lib tests pass)
+- [x] Fix stale doc comments referencing STACK_GRAPH, apply_from_stack
+- [x] Run `cargo check -p atomic-repository` — passes clean
+- [x] Run `cargo test -p atomic-repository` — 16 passed, 0 failed
 
 ---
 

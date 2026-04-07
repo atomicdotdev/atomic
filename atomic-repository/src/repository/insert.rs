@@ -1,22 +1,28 @@
 use super::*;
 
-/// Check whether a file's creating change exists ONLY on the given stack
-/// (and no other stack).  Returns `true` when it is safe to remove the
-/// file's TREE / INODES entries because no other stack needs them.
+use crate::apply::{
+    filter_missing_in_view, get_missing_changes, get_view_changes as get_view_changes_fn,
+    write_change_to_graph, CrossViewInsertOptions, CrossViewInsertOutcome, InsertOptions,
+    InsertOutcome, InsertStats,
+};
+
+/// Check whether a file's creating change exists ONLY on the given view
+/// (and no other view).  Returns `true` when it is safe to remove the
+/// file's TREE / INODES entries because no other view needs them.
 ///
 /// When the inode has no INODES position (not yet recorded) the function
 /// returns `true` — there is nothing to protect.
 ///
 /// # Complexity
 ///
-/// O(S × log C) where S is the number of stacks and C is the number of
-/// changes per stack.  Each stack is checked with a single B-tree lookup
-/// on `REV_STACK_CHANGES` via [`StackTxnT::get_change_seq`], rather than
+/// O(S × log C) where S is the number of views and C is the number of
+/// changes per view.  Each view is checked with a single B-tree lookup
+/// on `REV_STACK_CHANGES` via [`ViewTxnT::get_change_seq`], rather than
 /// linearly scanning the entire change log.
-fn is_file_only_on_stack<T: GraphTxnT + StackTxnT + TreeTxnT>(
+fn is_file_only_on_view<T: GraphTxnT + ViewTxnT + TreeTxnT>(
     txn: &T,
     inode: Inode,
-    current_stack: &str,
+    current_view: &str,
 ) -> bool {
     // Look up the position for this inode.  If there is no position the
     // file was never recorded, so removing from TREE is safe.
@@ -30,73 +36,73 @@ fn is_file_only_on_stack<T: GraphTxnT + StackTxnT + TreeTxnT>(
         return true;
     }
 
-    // Walk every stack and check whether the creating change appears on
-    // any stack OTHER than `current_stack`.
-    let stack_names = match txn.list_stacks() {
+    // Walk every view and check whether the creating change appears on
+    // any view OTHER than `current_view`.
+    let view_names = match txn.list_views() {
         Ok(names) => names,
         Err(_) => return true,
     };
 
-    for name in stack_names {
-        if name == current_stack {
+    for name in view_names {
+        if name == current_view {
             continue;
         }
-        let stack = match txn.get_stack(&name) {
+        let view = match txn.get_view(&name) {
             Ok(Some(s)) => s,
             _ => continue,
         };
         // O(log C) B-tree lookup on REV_STACK_CHANGES instead of
         // iterating the entire change log.
-        if let Ok(Some(_seq)) = txn.get_change_seq(&stack, creating_change) {
-            // Another stack still references this file — not safe to remove.
+        if let Ok(Some(_seq)) = txn.get_change_seq(&view, creating_change) {
+            // Another view still references this file — not safe to remove.
             return false;
         }
     }
 
-    // No other stack references the creating change.
+    // No other view references the creating change.
     true
 }
 
 impl Repository {
-    // Change Application Methods
+    // Change Insertion Methods
 
-    /// Apply a change to the current stack.
+    /// Insert a change into the current view.
     ///
-    /// This is the high-level method for applying a single change to the
+    /// This is the high-level method for inserting a single change into the
     /// repository. It loads the change from the change store, validates
-    /// dependencies, applies atoms to the graph, and updates the stack state.
+    /// dependencies, applies atoms to the graph, and updates the view state.
     ///
     /// # Arguments
     ///
-    /// * `hash` - The hash of the change to apply
-    /// * `options` - Options controlling application behavior
+    /// * `hash` - The hash of the change to insert
+    /// * `options` - Options controlling insertion behavior
     ///
     /// # Returns
     ///
-    /// An `ApplyOutcome` containing the new state and statistics.
+    /// An `InsertOutcome` containing the new state and statistics.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The change is not found in the change store
     /// - Dependencies are missing (unless `apply_dependencies` is set)
-    /// - The change is already applied
+    /// - The change is already inserted
     /// - A conflict occurs (unless `allow_conflicts` is set)
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// use atomic_repository::{Repository, ApplyOptions};
+    /// use atomic_repository::{Repository, InsertOptions};
     ///
     /// let repo = Repository::open(".")?;
-    /// let result = repo.apply_change(&hash, ApplyOptions::default())?;
+    /// let result = repo.insert_change(&hash, InsertOptions::default())?;
     /// println!("New state: {}", result.new_state.to_base32());
     /// ```
-    pub fn apply_change(
+    pub fn insert_change(
         &self,
         hash: &Hash,
-        options: ApplyOptions,
-    ) -> Result<ApplyOutcome, RepositoryError> {
+        options: InsertOptions,
+    ) -> Result<InsertOutcome, RepositoryError> {
         // Load the change from the store
         let change = self.load_change(hash)?;
 
@@ -115,9 +121,9 @@ impl Repository {
         // approach of loading the Change file and probing individual hunks.
         //
         // This correctly handles:
-        //   - Changes recorded on a Local stack (edges in STACK_GRAPH only)
+        //   - Changes recorded on a Draft view (edges in GRAPH only)
         //     → returns false, so hunks are re-applied to the global GRAPH
-        //   - Changes already applied to a Shared stack (edges in GRAPH)
+        //   - Changes already inserted into a Shared view (edges in GRAPH)
         //     → returns true, so redundant hunk application is skipped
         //   - Changes with only EdgeUpdate hunks (no FileAdd/DirAdd)
         //     → correctly detected via the range scan
@@ -129,7 +135,7 @@ impl Repository {
                 .has_change_in_graph(node_id)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             log::debug!(
-                "apply_change: hash={} node_id={:?} already_in_graph={}",
+                "insert_change: hash={} node_id={:?} already_in_graph={}",
                 hash.to_base32(),
                 node_id,
                 in_graph
@@ -137,7 +143,7 @@ impl Repository {
             in_graph
         } else {
             log::debug!(
-                "apply_change: hash={} not in INTERNAL (new change)",
+                "insert_change: hash={} not in INTERNAL (new change)",
                 hash.to_base32()
             );
             false
@@ -150,18 +156,18 @@ impl Repository {
             .register_change(hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Determine which stack to use
-        let stack_name = options.stack.as_deref().unwrap_or(&self.current_stack);
+        // Determine which view to use
+        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
         log::debug!(
-            "apply_change: change_id={:?} stack={} already_in_graph={} hunks={}",
+            "insert_change: change_id={:?} view={} already_in_graph={} hunks={}",
             change_id,
-            stack_name,
+            view_name,
             already_in_graph,
             change.hunks().len()
         );
 
         // Populate tree tables for FileAdd/DirAdd/FileDel hunks.
-        // This creates the path→inode→position mappings that output_working_copy
+        // This creates the path→inode→position mappings that materialize
         // needs to reconstruct files. Without this, server-side repos (which
         // receive changes via push rather than record) would have an empty tree.
         if !already_in_graph {
@@ -195,10 +201,10 @@ impl Repository {
                             .map_err(|e| RepositoryError::Database(e.to_string()))?;
                     }
                     GraphOp::FileDel { path, .. } => {
-                        // Stack-aware: only remove TREE entry when no other
-                        // stack still references the file's creating change.
+                        // View-aware: only remove TREE entry when no other
+                        // view still references the file's creating change.
                         if let Ok(Some(inode)) = txn.get_inode(path) {
-                            let dominated = is_file_only_on_stack(&txn, inode, stack_name);
+                            let dominated = is_file_only_on_view(&txn, inode, view_name);
                             if dominated {
                                 let _ = txn.del_tree(path);
                             }
@@ -210,9 +216,9 @@ impl Repository {
         }
 
         // Apply to the graph (skips hunk application if already_in_graph)
-        let outcome = apply_change_to_graph(
+        let outcome = write_change_to_graph(
             &mut txn,
-            stack_name,
+            view_name,
             change_id,
             hash,
             &change,
@@ -228,20 +234,20 @@ impl Repository {
         Ok(outcome)
     }
 
-    /// Apply a change with automatic dependency resolution.
+    /// Insert a change with automatic dependency resolution.
     ///
-    /// This method attempts to apply a change and all its missing dependencies.
-    /// Dependencies are applied in topological order (dependencies before
+    /// This method attempts to insert a change and all its missing dependencies.
+    /// Dependencies are inserted in topological order (dependencies before
     /// dependents).
     ///
     /// # Arguments
     ///
-    /// * `hash` - The hash of the change to apply
-    /// * `options` - Options controlling application behavior
+    /// * `hash` - The hash of the change to insert
+    /// * `options` - Options controlling insertion behavior
     ///
     /// # Returns
     ///
-    /// An `ApplyOutcome` containing aggregate statistics for all applied changes.
+    /// An `InsertOutcome` containing aggregate statistics for all inserted changes.
     ///
     /// # Errors
     ///
@@ -253,35 +259,35 @@ impl Repository {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let result = repo.apply_change_rec(&hash, ApplyOptions::default())?;
-    /// println!("Applied {} changes", result.stats.changes_applied);
+    /// let result = repo.insert_change_rec(&hash, InsertOptions::default())?;
+    /// println!("Inserted {} changes", result.stats.changes_applied);
     /// ```
-    pub fn apply_change_rec(
+    pub fn insert_change_rec(
         &self,
         hash: &Hash,
-        options: ApplyOptions,
-    ) -> Result<ApplyOutcome, RepositoryError> {
+        options: InsertOptions,
+    ) -> Result<InsertOutcome, RepositoryError> {
         // Load the target change to get its dependencies
         let _change = self.load_change(hash)?;
 
-        // Get the stack name
-        let stack_name = options.stack.as_deref().unwrap_or(&self.current_stack);
+        // Get the view name
+        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
 
-        // Get a read transaction to check what's already applied
+        // Get a read transaction to check what's already inserted
         let read_txn = self
             .pristine
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let stack = read_txn
-            .get_stack(stack_name)
+        let view = read_txn
+            .get_view(view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: stack_name.to_string(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
             })?;
 
         // Collect all needed changes (including the target)
-        let mut to_apply = Vec::new();
+        let mut to_insert = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(*hash);
@@ -292,10 +298,10 @@ impl Repository {
             }
             visited.insert(current_hash);
 
-            // Check if already applied
+            // Check if already inserted
             if let Ok(Some(id)) = read_txn.get_internal(&current_hash) {
-                if read_txn.get_change_seq(&stack, id).ok().flatten().is_some() {
-                    continue; // Already applied
+                if read_txn.get_change_seq(&view, id).ok().flatten().is_some() {
+                    continue; // Already inserted
                 }
             }
 
@@ -307,22 +313,22 @@ impl Repository {
                 }
             }
 
-            to_apply.push(current_hash);
+            to_insert.push(current_hash);
         }
 
         drop(read_txn);
 
         // Reverse to get topological order (dependencies first)
-        to_apply.reverse();
+        to_insert.reverse();
 
-        // Now apply all changes in order
-        let mut aggregate_stats = ApplyStats::new();
+        // Now insert all changes in order
+        let mut aggregate_stats = InsertStats::new();
         let mut final_state = Merkle::ZERO;
         let mut final_sequence = 0u64;
         let mut has_conflicts = false;
 
-        for change_hash in &to_apply {
-            let outcome = self.apply_change(change_hash, options.clone())?;
+        for change_hash in &to_insert {
+            let outcome = self.insert_change(change_hash, options.clone())?;
             aggregate_stats.merge(outcome.stats);
             final_state = outcome.new_state;
             final_sequence = outcome.sequence;
@@ -331,7 +337,7 @@ impl Repository {
             }
         }
 
-        Ok(ApplyOutcome::new(
+        Ok(InsertOutcome::new(
             final_state,
             final_sequence,
             has_conflicts,
@@ -339,13 +345,13 @@ impl Repository {
         ))
     }
 
-    /// Apply a recorded change to the repository.
+    /// Write a recorded change to the repository.
     ///
-    /// This method applies a change that was just recorded, updating both the
+    /// This method inserts a change that was just recorded, updating both the
     /// graph and the tree tables. It's the integration point between recording
-    /// and applying.
+    /// and inserting.
     ///
-    /// Unlike `apply_change`, this method:
+    /// Unlike `insert_change`, this method:
     /// - Takes the change directly (doesn't load from store)
     /// - Updates tree tables for FileAdd hunks
     /// - Assigns new inodes to added files
@@ -353,11 +359,11 @@ impl Repository {
     /// # Arguments
     ///
     /// * `outcome` - The outcome from `record()` containing the change
-    /// * `options` - Options controlling application behavior
+    /// * `options` - Options controlling insertion behavior
     ///
     /// # Returns
     ///
-    /// An `ApplyOutcome` with the new state and statistics.
+    /// An `InsertOutcome` with the new state and statistics.
     ///
     /// # Errors
     ///
@@ -369,14 +375,14 @@ impl Repository {
     ///
     /// ```rust,ignore
     /// let record_outcome = repo.record(header, options)?;
-    /// let apply_outcome = repo.apply_recorded(&record_outcome, ApplyOptions::default())?;
-    /// println!("Applied with state: {}", apply_outcome.new_state.to_base32());
+    /// let apply_outcome = repo.write_recorded(&record_outcome, InsertOptions::default())?;
+    /// println!("Inserted with state: {}", apply_outcome.new_state.to_base32());
     /// ```
-    pub fn apply_recorded(
+    pub fn write_recorded(
         &self,
         outcome: &RecordOutcome,
-        options: ApplyOptions,
-    ) -> Result<ApplyOutcome, RepositoryError> {
+        options: InsertOptions,
+    ) -> Result<InsertOutcome, RepositoryError> {
         let change = outcome.change();
         let hash = outcome.hash();
 
@@ -391,8 +397,8 @@ impl Repository {
             .register_change(hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Determine which stack to use
-        let stack_name = options.stack.as_deref().unwrap_or(&self.current_stack);
+        // Determine which view to use
+        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
 
         // Before applying atoms, set up tree entries for FileAdd hunks.
         // This creates the inode→position and path→inode mappings needed
@@ -448,27 +454,27 @@ impl Repository {
                         .map_err(|e| RepositoryError::Database(e.to_string()))?;
                 }
                 GraphOp::FileDel { path, .. } => {
-                    // Stack-aware deletion: only remove TREE/INODES entries
-                    // when no OTHER stack still references the file's creating
+                    // View-aware deletion: only remove TREE/INODES entries
+                    // when no OTHER view still references the file's creating
                     // change.  The TREE and INODES tables are global — removing
                     // an entry here would make the file invisible on every
-                    // stack, not just the one where the deletion was recorded.
+                    // view, not just the one where the deletion was recorded.
                     if let Ok(Some(inode)) = txn.get_inode(path) {
-                        let dominated = is_file_only_on_stack(&txn, inode, stack_name);
+                        let dominated = is_file_only_on_view(&txn, inode, view_name);
                         if dominated {
                             let _ = txn.del_tree(path);
                             let _ = txn.del_inode(inode);
                         }
-                        // When other stacks still reference the file we leave
+                        // When other views still reference the file we leave
                         // TREE/INODES intact.  The deletion is represented in
                         // the graph via DELETED edges and will be honoured by
-                        // output_working_copy's change_filter / retrieve_graph.
+                        // materialize's change_filter / retrieve_graph.
                     }
                 }
                 GraphOp::DirDel { path, .. } => {
-                    // Same stack-aware logic as FileDel above.
+                    // Same view-aware logic as FileDel above.
                     if let Ok(Some(inode)) = txn.get_inode(path) {
-                        let dominated = is_file_only_on_stack(&txn, inode, stack_name);
+                        let dominated = is_file_only_on_view(&txn, inode, view_name);
                         if dominated {
                             let _ = txn.del_tree(path);
                             let _ = txn.del_inode(inode);
@@ -483,10 +489,10 @@ impl Repository {
         // Handle file deletions tracked in the outcome.
         // Since we use GraphOp::Edit with EdgeUpdate for deletions (not GraphOp::FileDel),
         // we need to explicitly remove deleted files from the tree tables.
-        // Stack-aware: only remove if no other stack still references the file.
+        // View-aware: only remove if no other view still references the file.
         for deleted_path in outcome.deleted_files() {
             if let Ok(Some(inode)) = txn.get_inode(deleted_path) {
-                let dominated = is_file_only_on_stack(&txn, inode, stack_name);
+                let dominated = is_file_only_on_view(&txn, inode, view_name);
                 if dominated {
                     let _ = txn.del_tree(deleted_path);
                     let _ = txn.del_inode(inode);
@@ -495,10 +501,10 @@ impl Repository {
         }
 
         // Apply to the graph
-        // For apply_recorded, the change is always new (just recorded), so
+        // For write_recorded, the change is always new (just recorded), so
         // already_in_graph is always false.
-        let apply_outcome = apply_change_to_graph(
-            &mut txn, stack_name, change_id, hash, change, &options,
+        let apply_outcome = write_change_to_graph(
+            &mut txn, view_name, change_id, hash, change, &options,
             false, // always_in_graph: freshly recorded changes are never in the graph yet
         )
         .map_err(|e| RepositoryError::Apply(e.to_string()))?;
@@ -510,15 +516,15 @@ impl Repository {
         Ok(apply_outcome)
     }
 
-    // Cross-Stack Apply Methods
+    // Cross-View Insert Methods
 
-    /// Get all changes applied to a stack.
+    /// Get all changes inserted into a view.
     ///
     /// Returns changes in order from oldest (sequence 0) to newest.
     ///
     /// # Arguments
     ///
-    /// * `stack_name` - Name of the stack to query (None = current stack)
+    /// * `view_name` - Name of the view to query (None = current view)
     ///
     /// # Returns
     ///
@@ -527,44 +533,44 @@ impl Repository {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let changes = repo.get_stack_changes(None)?;
+    /// let changes = repo.get_view_changes(None)?;
     /// for (seq, hash) in changes {
     ///     println!("#{}: {}", seq, hash.to_base32());
     /// }
     /// ```
-    pub fn get_stack_changes(
+    pub fn get_view_changes(
         &self,
-        stack_name: Option<&str>,
+        view_name: Option<&str>,
     ) -> Result<Vec<(u64, Hash)>, RepositoryError> {
         let txn = self
             .pristine
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let name = stack_name.unwrap_or(&self.current_stack);
-        let stack = txn
-            .get_stack(name)
+        let name = view_name.unwrap_or(&self.current_view);
+        let view = txn
+            .get_view(name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
+            .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: name.to_string(),
             })?;
 
-        get_stack_changes(&txn, &stack).map_err(|e| RepositoryError::Apply(e.to_string()))
+        get_view_changes_fn(&txn, &view).map_err(|e| RepositoryError::Apply(e.to_string()))
     }
 
-    /// Get changes that are in one stack but not another.
+    /// Get changes that are in one view but not another.
     ///
-    /// This is useful for determining what needs to be applied when
-    /// merging or cherry-picking between stacks.
+    /// This is useful for determining what needs to be inserted when
+    /// merging or cherry-picking between views.
     ///
     /// # Arguments
     ///
-    /// * `from_stack` - Source stack name
-    /// * `to_stack` - Target stack name (None = current stack)
+    /// * `from_view` - Source view name
+    /// * `to_view` - Target view name (None = current view)
     ///
     /// # Returns
     ///
-    /// Vector of hashes that are in `from_stack` but not in `to_stack`,
+    /// Vector of hashes that are in `from_view` but not in `to_view`,
     /// in dependency order.
     ///
     /// # Example
@@ -572,12 +578,12 @@ impl Repository {
     /// ```rust,ignore
     /// // Find what's in feature that's not in main
     /// let missing = repo.get_missing_changes_between("feature", Some("main"))?;
-    /// println!("{} changes to apply", missing.len());
+    /// println!("{} changes to insert", missing.len());
     /// ```
     pub fn get_missing_changes_between(
         &self,
-        from_stack: &str,
-        to_stack: Option<&str>,
+        from_view: &str,
+        to_view: Option<&str>,
     ) -> Result<Vec<Hash>, RepositoryError> {
         let txn = self
             .pristine
@@ -585,24 +591,24 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let from = txn
-            .get_stack(from_stack)
+            .get_view(from_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: from_stack.to_string(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: from_view.to_string(),
             })?;
 
-        let to_name = to_stack.unwrap_or(&self.current_stack);
+        let to_name = to_view.unwrap_or(&self.current_view);
         let to = txn
-            .get_stack(to_name)
+            .get_view(to_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
+            .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: to_name.to_string(),
             })?;
 
         get_missing_changes(&txn, &from, &to).map_err(|e| RepositoryError::Apply(e.to_string()))
     }
 
-    /// Get changes up to a specific tag in a stack.
+    /// Get changes up to a specific tag in a view.
     ///
     /// Returns all changes from sequence 0 up to and including the
     /// sequence where the tag was created.
@@ -610,7 +616,7 @@ impl Repository {
     /// # Arguments
     ///
     /// * `tag_name` - Name of the tag
-    /// * `stack_name` - Stack to search (None = use tag's stack)
+    /// * `view_name` - View to search (None = use tag's view)
     ///
     /// # Returns
     ///
@@ -625,15 +631,14 @@ impl Repository {
     pub fn get_changes_up_to_tag(
         &self,
         tag_name: &str,
-        stack_name: Option<&str>,
+        view_name: Option<&str>,
     ) -> Result<Vec<Hash>, RepositoryError> {
         // Get the tag
-        let tag = if let Some(stack) = stack_name {
-            self.get_tag_from_stack(tag_name, stack)?
+        let tag = if let Some(view) = view_name {
+            self.get_tag_from_view(tag_name, view)?
         } else {
-            // Try current stack first, then any stack
-            self.get_tag(tag_name)?
-                .or(self.get_tag_any_stack(tag_name)?)
+            // Try current view first, then any view
+            self.get_tag(tag_name)?.or(self.get_tag_any_view(tag_name)?)
         };
 
         let tag = tag.ok_or_else(|| RepositoryError::TagNotFound {
@@ -645,51 +650,51 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let stack = txn
-            .get_stack(&tag.stack)
+        let view = txn
+            .get_view(&tag.stack)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
+            .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: tag.stack.clone(),
             })?;
 
         // Get changes up to and including the tag's sequence
-        crate::apply::get_changes_up_to_seq(&txn, &stack, tag.sequence)
+        crate::apply::get_changes_up_to_seq(&txn, &view, tag.sequence)
             .map_err(|e| RepositoryError::Apply(e.to_string()))
     }
 
-    /// Apply changes from one stack to another.
+    /// Insert changes from one view into another.
     ///
-    /// This is the main method for cross-stack operations. It can:
-    /// - Apply all missing changes from source to target
-    /// - Apply only changes up to a specific tag
-    /// - Apply only specific changes
+    /// This is the main method for cross-view operations. It can:
+    /// - Insert all missing changes from source to target
+    /// - Insert only changes up to a specific tag
+    /// - Insert only specific changes
     ///
     /// # Arguments
     ///
-    /// * `options` - Options controlling the cross-stack apply
+    /// * `options` - Options controlling the cross-view insert
     ///
     /// # Returns
     ///
-    /// A `CrossStackApplyOutcome` with details about what was applied.
+    /// A `CrossViewInsertOutcome` with details about what was inserted.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// // Apply all changes from feature to main
-    /// let options = CrossStackApplyOptions::new("feature", "main");
-    /// let result = repo.apply_from_stack(options)?;
-    /// println!("Applied {} changes", result.changes_applied);
+    /// // Insert all changes from feature to main
+    /// let options = CrossViewInsertOptions::new("feature", "main");
+    /// let result = repo.insert_from_view(options)?;
+    /// println!("Inserted {} changes", result.changes_applied);
     ///
-    /// // Apply changes up to a tag
-    /// let options = CrossStackApplyOptions::new("feature", "main")
+    /// // Insert changes up to a tag
+    /// let options = CrossViewInsertOptions::new("feature", "main")
     ///     .up_to_tag("v1.0.0");
-    /// let result = repo.apply_from_stack(options)?;
+    /// let result = repo.insert_from_view(options)?;
     /// ```
-    pub fn apply_from_stack(
+    pub fn insert_from_view(
         &self,
-        options: CrossStackApplyOptions,
-    ) -> Result<CrossStackApplyOutcome, RepositoryError> {
-        let mut outcome = CrossStackApplyOutcome::new();
+        options: CrossViewInsertOptions,
+    ) -> Result<CrossViewInsertOutcome, RepositoryError> {
+        let mut outcome = CrossViewInsertOutcome::new();
         outcome.was_dry_run = options.dry_run;
 
         // Determine which changes to consider
@@ -698,10 +703,10 @@ impl Repository {
             options.only_changes.clone()
         } else if let Some(ref tag_name) = options.up_to_tag {
             // Get changes up to the tag
-            self.get_changes_up_to_tag(tag_name, Some(&options.from_stack))?
+            self.get_changes_up_to_tag(tag_name, Some(&options.from_view))?
         } else {
-            // Get all changes from source stack
-            self.get_stack_changes(Some(&options.from_stack))?
+            // Get all changes from source view
+            self.get_view_changes(Some(&options.from_view))?
                 .into_iter()
                 .map(|(_, hash)| hash)
                 .collect()
@@ -713,14 +718,14 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let to_stack = txn
-            .get_stack(&options.to_stack)
+        let to_view = txn
+            .get_view(&options.to_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: options.to_stack.clone(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: options.to_view.clone(),
             })?;
 
-        let missing = filter_missing_in_stack(&txn, &to_stack, &source_changes)
+        let missing = filter_missing_in_view(&txn, &to_view, &source_changes)
             .map_err(|e| RepositoryError::Apply(e.to_string()))?;
 
         // Track skipped changes
@@ -734,55 +739,55 @@ impl Repository {
         drop(txn);
 
         if missing.is_empty() {
-            // Nothing to apply
+            // Nothing to insert
             let txn = self
                 .pristine
                 .read_txn()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            let stack = txn
-                .get_stack(&options.to_stack)
+            let view = txn
+                .get_view(&options.to_view)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?
                 .unwrap();
-            outcome.new_state = stack.state;
-            outcome.sequence = stack.change_count;
+            outcome.new_state = view.state;
+            outcome.sequence = view.change_count;
             return Ok(outcome);
         }
 
-        // If dry run, just return what would be applied
+        // If dry run, just return what would be inserted
         if options.dry_run {
             outcome.applied_hashes = missing;
             outcome.changes_applied = outcome.applied_hashes.len();
             return Ok(outcome);
         }
 
-        // Apply each change in order.
+        // Insert each change in order.
         //
-        // When the source stack is Local, its changes were recorded against
-        // the overlay view (STACK_GRAPH ∪ GRAPH).  Applying those changes
-        // to a different stack verifies edge context against a different
+        // When the source view is Draft, its changes were recorded against
+        // the view filter (GRAPH).  Inserting those changes
+        // into a different view verifies edge context against a different
         // graph view, which produces spurious "missing context" conflicts.
         // These are architecturally expected — not real data conflicts —
-        // so we automatically allow them for cross-stack apply.
-        let source_is_local = {
+        // so we automatically allow them for cross-view insert.
+        let source_is_draft = {
             let txn = self
                 .pristine
                 .read_txn()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            txn.get_stack(&options.from_stack)
+            txn.get_view(&options.from_view)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?
-                .map(|s| s.kind.is_local())
+                .map(|s| s.kind.is_draft())
                 .unwrap_or(false)
         };
 
-        let apply_opts = ApplyOptions::default()
-            .stack(&options.to_stack)
-            .allow_conflict(options.allow_conflicts || source_is_local);
+        let apply_opts = InsertOptions::default()
+            .view(&options.to_view)
+            .allow_conflict(options.allow_conflicts || source_is_draft);
 
         for hash in &missing {
             let result = if options.apply_dependencies {
-                self.apply_change_rec(hash, apply_opts.clone())
+                self.insert_change_rec(hash, apply_opts.clone())
             } else {
-                self.apply_change(hash, apply_opts.clone())
+                self.insert_change(hash, apply_opts.clone())
             };
 
             match result {
@@ -804,53 +809,53 @@ impl Repository {
         Ok(outcome)
     }
 
-    /// Apply changes up to a tag from one stack to another.
+    /// Insert changes up to a tag from one view into another.
     ///
     /// This is a convenience method that combines `get_changes_up_to_tag`
-    /// and `apply_from_stack`.
+    /// and `insert_from_view`.
     ///
     /// # Arguments
     ///
-    /// * `tag_name` - Name of the tag to apply up to
-    /// * `from_stack` - Source stack containing the tag
-    /// * `to_stack` - Target stack (None = current stack)
+    /// * `tag_name` - Name of the tag to insert up to
+    /// * `from_view` - Source view containing the tag
+    /// * `to_view` - Target view (None = current view)
     ///
     /// # Returns
     ///
-    /// A `CrossStackApplyOutcome` with details about what was applied.
+    /// A `CrossViewInsertOutcome` with details about what was inserted.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// // Apply release-1.0.0 from feature to main
-    /// let result = repo.apply_tag_to_stack("release-1.0.0", "feature", Some("main"))?;
+    /// // Insert release-1.0.0 from feature to main
+    /// let result = repo.insert_tag_to_view("release-1.0.0", "feature", Some("main"))?;
     /// ```
-    pub fn apply_tag_to_stack(
+    pub fn insert_tag_to_view(
         &self,
         tag_name: &str,
-        from_stack: &str,
-        to_stack: Option<&str>,
-    ) -> Result<CrossStackApplyOutcome, RepositoryError> {
-        let target = to_stack.unwrap_or(&self.current_stack);
+        from_view: &str,
+        to_view: Option<&str>,
+    ) -> Result<CrossViewInsertOutcome, RepositoryError> {
+        let target = to_view.unwrap_or(&self.current_view);
 
-        let options = CrossStackApplyOptions::new(from_stack, target)
+        let options = CrossViewInsertOptions::new(from_view, target)
             .up_to_tag(tag_name)
             .with_dependencies(true);
 
-        self.apply_from_stack(options)
+        self.insert_from_view(options)
     }
 
-    /// Cherry-pick specific changes from one stack to another.
+    /// Cherry-pick specific changes from one view into another.
     ///
     /// # Arguments
     ///
-    /// * `changes` - Hashes of changes to apply
-    /// * `from_stack` - Source stack (for validation)
-    /// * `to_stack` - Target stack (None = current stack)
+    /// * `changes` - Hashes of changes to insert
+    /// * `from_view` - Source view (for validation)
+    /// * `to_view` - Target view (None = current view)
     ///
     /// # Returns
     ///
-    /// A `CrossStackApplyOutcome` with details about what was applied.
+    /// A `CrossViewInsertOutcome` with details about what was inserted.
     ///
     /// # Example
     ///
@@ -860,16 +865,16 @@ impl Repository {
     pub fn cherry_pick(
         &self,
         changes: &[Hash],
-        _from_stack: &str,
-        to_stack: Option<&str>,
-    ) -> Result<CrossStackApplyOutcome, RepositoryError> {
-        let target = to_stack.unwrap_or(&self.current_stack);
+        _from_view: &str,
+        to_view: Option<&str>,
+    ) -> Result<CrossViewInsertOutcome, RepositoryError> {
+        let target = to_view.unwrap_or(&self.current_view);
 
-        // For cherry-pick, we apply specific changes with dependencies
-        let options = CrossStackApplyOptions::new("", target)
+        // For cherry-pick, we insert specific changes with dependencies
+        let options = CrossViewInsertOptions::new("", target)
             .only_changes(changes.to_vec())
             .with_dependencies(true);
 
-        self.apply_from_stack(options)
+        self.insert_from_view(options)
     }
 }

@@ -1,53 +1,53 @@
-//! Change application for Atomic VCS
+//! Change insertion for Atomic VCS
 //!
-//! This module provides high-level functions for applying changes to the
-//! repository graph. Application is the process of taking a recorded change
+//! This module provides high-level functions for inserting changes into the
+//! repository graph. Insertion is the process of taking a recorded change
 //! and modifying the repository's internal graph to reflect its contents.
 //!
 //! # Overview
 //!
-//! Applying a change involves several steps:
+//! Inserting a change involves several steps:
 //!
 //! 1. **Load**: Read the change from the change store
 //! 2. **Validate**: Verify dependencies are present and change isn't already applied
 //! 3. **Register**: Get an internal ID for the change
 //! 4. **Apply Atoms**: Process each graph_op's atoms (vertices and edges)
-//! 5. **Update Stack**: Add to change log and update Merkle state
+//! 5. **Update View**: Add to change log and update Merkle state
 //! 6. **Handle Conflicts**: Track zombies and missing contexts
 //!
-//! # Cross-Stack Operations
+//! # Cross-View Operations
 //!
-//! Atomic supports applying changes between stacks, enabling:
+//! Atomic supports inserting changes between views, enabling:
 //!
-//! - **Cherry-picking**: Apply specific changes from one stack to another
-//! - **Stack merging**: Apply all changes from one stack to another
-//! - **Tag-based apply**: Apply changes up to a tagged state
+//! - **Cherry-picking**: Insert specific changes from one view to another
+//! - **View merging**: Insert all changes from one view to another
+//! - **Tag-based insert**: Insert changes up to a tagged state
 //!
 //! ```rust,ignore
-//! // Apply changes from feature stack to main stack
-//! let options = CrossStackApplyOptions::new("feature", "main");
-//! let result = repo.apply_from_stack(options)?;
+//! // Insert changes from feature view to main view
+//! let options = CrossViewInsertOptions::new("feature", "main");
+//! let result = repo.insert_from_view(options)?;
 //!
-//! // Apply changes up to a tag
-//! let options = CrossStackApplyOptions::new("feature", "main")
+//! // Insert changes up to a tag
+//! let options = CrossViewInsertOptions::new("feature", "main")
 //!     .up_to_tag("v1.0.0");
-//! let result = repo.apply_from_stack(options)?;
+//! let result = repo.insert_from_view(options)?;
 //! ```
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────────────┐
-//! │                      Change Application Flow                            │
+//! │                      Change Insertion Flow                              │
 //! ├─────────────────────────────────────────────────────────────────────────┤
 //! │                                                                         │
 //! │  Change Store           Pristine              Graph                     │
 //! │  ┌──────────┐         ┌───────────┐        ┌─────────────────┐         │
-//! │  │ load_    │ verify  │ register  │ apply  │  Add Vertices   │         │
+//! │  │ load_    │ verify  │ register  │ insert │  Add Vertices   │         │
 //! │  │ change() │ ──────▶ │ _change() │──────▶ │  Update Edges   │         │
 //! │  └──────────┘         └───────────┘        └─────────────────┘         │
 //! │       │                    │                       │                   │
 //! │       │                    ▼                       ▼                   │
 //! │       │            ┌───────────────┐       ┌─────────────────┐         │
-//! │       │            │   NodeId      │       │  Updated Stack  │         │
+//! │       │            │   NodeId      │       │  Updated View   │         │
 //! │       └───────────▶│   Assigned    │       │  New State      │         │
 //! │                    └───────────────┘       └─────────────────┘         │
 //! │                                                                         │
@@ -57,16 +57,16 @@
 //! # Dependency Resolution
 //!
 //! Changes in Atomic have explicit dependencies. Before a change can be
-//! applied, all its dependencies must already be present in the repository.
+//! inserted, all its dependencies must already be present in the repository.
 //! This module provides functions to:
 //!
 //! - Check if all dependencies are present
-//! - Apply dependencies recursively if available
+//! - Insert dependencies recursively if available
 //! - Report missing dependencies for the user to resolve
 //!
 //! # Conflict Handling
 //!
-//! During application, conflicts can arise:
+//! During insertion, conflicts can arise:
 //!
 //! - **Zombie vertices**: Content deleted by one change but modified by another
 //! - **Missing context**: Context vertices that don't exist
@@ -77,16 +77,16 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use atomic_repository::{Repository, ApplyOptions};
+//! use atomic_repository::{Repository, InsertOptions};
 //!
 //! let repo = Repository::open(".")?;
 //!
-//! // Apply a single change
-//! let result = repo.apply_change(&hash, ApplyOptions::default())?;
-//! println!("Applied change, new state: {}", result.new_state);
+//! // Insert a single change
+//! let result = repo.apply_change(&hash, InsertOptions::default())?;
+//! println!("Inserted change, new state: {}", result.new_state);
 //!
-//! // Apply with dependencies
-//! let result = repo.apply_change_with_deps(&hash, ApplyOptions::default())?;
+//! // Insert with dependencies
+//! let result = repo.apply_change_with_deps(&hash, InsertOptions::default())?;
 //! if result.has_conflicts {
 //!     println!("Warning: conflicts detected");
 //! }
@@ -98,19 +98,19 @@ use atomic_core::apply::{
     Workspace, ZombieConflict,
 };
 use atomic_core::change::{Atom, AtomRef, Change, GraphOp};
-use atomic_core::pristine::{GraphTxnT, MutTxnT, StackState, StackTxnT};
+use atomic_core::pristine::{GraphTxnT, MutTxnT, ViewState, ViewTxnT};
 use atomic_core::types::{Base32, Hash, Merkle, NodeId};
 use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
 // Error Types
 
-/// Result type for apply operations.
-pub type ApplyResult<T> = Result<T, ApplyError>;
+/// Result type for insert operations.
+pub type InsertResult<T> = Result<T, InsertError>;
 
-/// Errors that can occur during change application.
+/// Errors that can occur during change insertion.
 #[derive(Debug, Error)]
-pub enum ApplyError {
+pub enum InsertError {
     /// The change was not found in the change store.
     #[error("Change not found: {hash}")]
     ChangeNotFound {
@@ -125,15 +125,15 @@ pub enum ApplyError {
         missing: Vec<Hash>,
     },
 
-    /// The change is already applied to the stack.
+    /// The change is already applied to the view.
     #[error("Change already applied: {hash}")]
     AlreadyApplied {
         /// The hash of the already-applied change
         hash: String,
     },
 
-    /// A conflict was detected during application.
-    #[error("Conflict during application: {message}")]
+    /// A conflict was detected during insertion.
+    #[error("Conflict during insertion: {message}")]
     Conflict {
         /// Description of the conflict
         message: String,
@@ -166,25 +166,25 @@ pub enum ApplyError {
     Io(#[from] std::io::Error),
 }
 
-impl From<LocalApplyError> for ApplyError {
+impl From<LocalApplyError> for InsertError {
     fn from(e: LocalApplyError) -> Self {
         match e {
-            LocalApplyError::DependencyMissing { hash } => ApplyError::MissingDependencies {
+            LocalApplyError::DependencyMissing { hash } => InsertError::MissingDependencies {
                 missing: vec![hash],
             },
-            LocalApplyError::ChangeAlreadyApplied { hash } => ApplyError::AlreadyApplied {
+            LocalApplyError::ChangeAlreadyApplied { hash } => InsertError::AlreadyApplied {
                 hash: hash.to_base32(),
             },
             LocalApplyError::CyclicDependency { message } => {
-                ApplyError::CyclicDependency { message }
+                InsertError::CyclicDependency { message }
             }
-            LocalApplyError::InvalidChange => ApplyError::InvalidChange {
+            LocalApplyError::InvalidChange => InsertError::InvalidChange {
                 message: "Change format is invalid".to_string(),
             },
-            LocalApplyError::Corruption => ApplyError::InvalidChange {
+            LocalApplyError::Corruption => InsertError::InvalidChange {
                 message: "Change data is corrupted".to_string(),
             },
-            other => ApplyError::Internal(other.to_string()),
+            other => InsertError::Internal(other.to_string()),
         }
     }
 }
@@ -198,28 +198,28 @@ fn format_hashes(hashes: &[Hash]) -> String {
         .join(", ")
 }
 
-// ApplyOptions
+// InsertOptions
 
-/// Options for controlling change application.
+/// Options for controlling change insertion.
 #[derive(Debug, Clone)]
-pub struct ApplyOptions {
-    /// Stack to apply to (None = current stack).
+pub struct InsertOptions {
+    /// View to insert to (None = current view).
     ///
-    /// When `None`, the change is applied to the repository's current stack.
+    /// When `None`, the change is inserted into the repository's current view.
     /// Default: `None`
-    pub stack: Option<String>,
+    pub view: Option<String>,
 
-    /// Automatically apply missing dependencies if available.
+    /// Automatically insert missing dependencies if available.
     ///
     /// When `true`, if a change's dependencies are missing but available
-    /// in the change store, they will be applied first.
+    /// in the change store, they will be inserted first.
     /// Default: `false`
     pub apply_dependencies: bool,
 
-    /// Allow applying even if conflicts are detected.
+    /// Allow inserting even if conflicts are detected.
     ///
-    /// When `false`, application stops on the first conflict.
-    /// When `true`, conflicts are tracked but application continues.
+    /// When `false`, insertion stops on the first conflict.
+    /// When `true`, conflicts are tracked but insertion continues.
     /// Default: `true`
     pub allow_conflicts: bool,
 
@@ -239,15 +239,15 @@ pub struct ApplyOptions {
     ///
     /// When `true`, `validate_can_apply` is bypassed.  This is used by
     /// `rebuild_change_graph` which intentionally re-applies a change
-    /// that is already in the stack log (same NodeId, new hunks).
+    /// that is already in the view log (same NodeId, new hunks).
     /// Default: `false`
     pub skip_validation: bool,
 }
 
-impl Default for ApplyOptions {
+impl Default for InsertOptions {
     fn default() -> Self {
         Self {
-            stack: None,
+            view: None,
             apply_dependencies: false,
             allow_conflicts: true,
             max_depth: 100,
@@ -257,14 +257,14 @@ impl Default for ApplyOptions {
     }
 }
 
-impl ApplyOptions {
-    /// Set the stack to apply to.
-    pub fn stack(mut self, name: impl Into<String>) -> Self {
-        self.stack = Some(name.into());
+impl InsertOptions {
+    /// Set the view to insert to.
+    pub fn view(mut self, name: impl Into<String>) -> Self {
+        self.view = Some(name.into());
         self
     }
 
-    /// Create options that will apply dependencies automatically.
+    /// Create options that will insert dependencies automatically.
     pub fn with_dependencies() -> Self {
         Self {
             apply_dependencies: true,
@@ -280,7 +280,7 @@ impl ApplyOptions {
         }
     }
 
-    /// Set whether to apply dependencies automatically.
+    /// Set whether to insert dependencies automatically.
     pub fn apply_deps(mut self, apply: bool) -> Self {
         self.apply_dependencies = apply;
         self
@@ -295,7 +295,7 @@ impl ApplyOptions {
     /// Skip the "already applied" validation check.
     ///
     /// Used by `rebuild_change_graph` which re-applies a change that is
-    /// already in the stack log (same NodeId, new hunks after revise).
+    /// already in the view log (same NodeId, new hunks after revise).
     pub fn skip_validation(mut self, skip: bool) -> Self {
         self.skip_validation = skip;
         self
@@ -308,12 +308,12 @@ impl ApplyOptions {
     }
 }
 
-// ApplyStats
+// InsertStats
 
-/// Statistics from a change application operation.
+/// Statistics from a change insertion operation.
 #[derive(Debug, Clone, Default)]
-pub struct ApplyStats {
-    /// Number of changes applied.
+pub struct InsertStats {
+    /// Number of changes inserted.
     pub changes_applied: usize,
 
     /// Number of atoms (vertices + edges) processed.
@@ -322,23 +322,23 @@ pub struct ApplyStats {
     /// Number of conflicts detected.
     pub conflicts_detected: usize,
 
-    /// Number of dependencies that were automatically applied.
+    /// Number of dependencies that were automatically inserted.
     pub dependencies_applied: usize,
 
-    /// Hashes of changes that were applied.
+    /// Hashes of changes that were inserted.
     pub applied_hashes: Vec<Hash>,
 
     /// Conflict summary if any conflicts were detected.
     pub conflict_summary: Option<ConflictSummary>,
 }
 
-impl ApplyStats {
+impl InsertStats {
     /// Create empty stats.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Check if any changes were applied.
+    /// Check if any changes were inserted.
     pub fn has_applied(&self) -> bool {
         self.changes_applied > 0
     }
@@ -349,7 +349,7 @@ impl ApplyStats {
     }
 
     /// Merge stats from another operation.
-    pub fn merge(&mut self, other: ApplyStats) {
+    pub fn merge(&mut self, other: InsertStats) {
         self.changes_applied += other.changes_applied;
         self.atoms_processed += other.atoms_processed;
         self.conflicts_detected += other.conflicts_detected;
@@ -361,27 +361,27 @@ impl ApplyStats {
     }
 }
 
-// ApplyOutcome
+// InsertOutcome
 
-/// The result of applying a change.
+/// The result of inserting a change.
 #[derive(Debug, Clone)]
-pub struct ApplyOutcome {
-    /// The new Merkle state of the stack after application.
+pub struct InsertOutcome {
+    /// The new Merkle state of the view after insertion.
     pub new_state: Merkle,
 
-    /// The sequence number of the applied change on the stack.
+    /// The sequence number of the inserted change on the view.
     pub sequence: u64,
 
-    /// Whether any conflicts were detected during application.
+    /// Whether any conflicts were detected during insertion.
     pub has_conflicts: bool,
 
-    /// Statistics about the application.
-    pub stats: ApplyStats,
+    /// Statistics about the insertion.
+    pub stats: InsertStats,
 }
 
-impl ApplyOutcome {
+impl InsertOutcome {
     /// Create a new outcome.
-    pub fn new(new_state: Merkle, sequence: u64, has_conflicts: bool, stats: ApplyStats) -> Self {
+    pub fn new(new_state: Merkle, sequence: u64, has_conflicts: bool, stats: InsertStats) -> Self {
         Self {
             new_state,
             sequence,
@@ -391,12 +391,12 @@ impl ApplyOutcome {
     }
 }
 
-// Core Application Functions
+// Core Insertion Functions
 
 /// Check what dependencies are missing for a change.
 ///
 /// This is useful for determining what needs to be fetched from a remote
-/// before a change can be applied.
+/// before a change can be inserted.
 ///
 /// # Arguments
 ///
@@ -409,11 +409,11 @@ impl ApplyOutcome {
 pub fn check_missing_dependencies<T: GraphTxnT>(
     txn: &T,
     change: &Change,
-) -> ApplyResult<Vec<Hash>> {
-    verify_dependencies(txn, change).map_err(|e| ApplyError::Database(e.to_string()))
+) -> InsertResult<Vec<Hash>> {
+    verify_dependencies(txn, change).map_err(|e| InsertError::Database(e.to_string()))
 }
 
-/// Determine the order to apply a set of changes respecting dependencies.
+/// Determine the order to insert a set of changes respecting dependencies.
 ///
 /// This performs a topological sort of the changes based on their
 /// dependency relationships.
@@ -424,10 +424,10 @@ pub fn check_missing_dependencies<T: GraphTxnT>(
 ///
 /// # Returns
 ///
-/// Ordered list of hashes to apply (dependencies first).
-pub fn compute_apply_order(
+/// Ordered list of hashes to insert (dependencies first).
+pub fn compute_insert_order(
     changes: &std::collections::HashMap<Hash, Change>,
-) -> ApplyResult<Vec<Hash>> {
+) -> InsertResult<Vec<Hash>> {
     let mut order = Vec::new();
     let mut visited = HashSet::new();
     let mut in_progress = HashSet::new();
@@ -438,12 +438,12 @@ pub fn compute_apply_order(
         visited: &mut HashSet<Hash>,
         in_progress: &mut HashSet<Hash>,
         order: &mut Vec<Hash>,
-    ) -> ApplyResult<()> {
+    ) -> InsertResult<()> {
         if visited.contains(hash) {
             return Ok(());
         }
         if in_progress.contains(hash) {
-            return Err(ApplyError::CyclicDependency {
+            return Err(InsertError::CyclicDependency {
                 message: format!("Cycle detected involving {}", hash.to_base32()),
             });
         }
@@ -472,56 +472,56 @@ pub fn compute_apply_order(
     Ok(order)
 }
 
-/// Apply a single change to a stack (low-level).
+/// Write a single change to a view (low-level).
 ///
-/// This is the core application function that modifies the graph.
+/// This is the core insertion function that modifies the graph.
 /// It assumes all validation has been done.
 ///
 /// # Arguments
 ///
 /// * `txn` - Write transaction
-/// * `stack_name` - Name of the stack to apply to
+/// * `view_name` - Name of the view to insert to
 /// * `change_id` - Internal ID of the change
 /// * `change_hash` - Hash of the change
-/// * `change` - The change to apply
-/// * `options` - Application options
+/// * `change` - The change to insert
+/// * `options` - Insertion options
 ///
 /// # Returns
 ///
-/// The result of the application including new state and conflict info.
-/// Apply a change to the graph and add it to a stack's change log.
+/// The result of the insertion including new state and conflict info.
+/// Write a change to the graph and add it to a view's change log.
 ///
 /// This function handles two cases:
 /// 1. **New change**: The change hasn't been applied to the graph yet.
-///    We apply all hunks and add it to the stack's change log.
-/// 2. **Existing change**: The change is already in the graph (applied via another stack).
-///    We skip hunk application and just add it to the stack's change log.
+///    We apply all hunks and add it to the view's change log.
+/// 2. **Existing change**: The change is already in the graph (applied via another view).
+///    We skip hunk application and just add it to the view's change log.
 ///
 /// This distinction is crucial because Atomic uses a shared graph model where
-/// all stacks share the same underlying graph. When applying a change from one
-/// stack to another, the graph already contains the change's vertices and edges.
-pub fn apply_change_to_graph<T: MutTxnT + StackTxnT>(
+/// all views share the same underlying graph. When inserting a change from one
+/// view to another, the graph already contains the change's vertices and edges.
+pub fn write_change_to_graph<T: MutTxnT + ViewTxnT>(
     txn: &mut T,
-    stack_name: &str,
+    view_name: &str,
     change_id: NodeId,
     change_hash: &Hash,
     change: &Change,
-    options: &ApplyOptions,
+    options: &InsertOptions,
     already_in_graph: bool,
-) -> ApplyResult<ApplyOutcome> {
+) -> InsertResult<InsertOutcome> {
     let mut workspace = Workspace::new();
     let mut conflict_tracker = ConflictTracker::new();
-    let mut stats = ApplyStats::new();
+    let mut stats = InsertStats::new();
 
-    // Get the current stack
-    let mut stack = txn
-        .open_or_create_stack(stack_name)
-        .map_err(|e| ApplyError::Database(e.to_string()))?;
+    // Get the current view
+    let mut view = txn
+        .open_or_create_view(view_name)
+        .map_err(|e| InsertError::Database(e.to_string()))?;
 
     // Validate we can apply (unless caller explicitly skipped validation,
     // e.g. rebuild_change_graph re-applying an existing change with new hunks).
     if !options.skip_validation {
-        validate_can_apply(txn, &stack, change_id, change_hash, change)?;
+        validate_can_apply(txn, &view, change_id, change_hash, change)?;
     }
 
     // Only apply hunks if the change isn't already in the graph.
@@ -529,17 +529,17 @@ pub fn apply_change_to_graph<T: MutTxnT + StackTxnT>(
     let should_apply_hunks = !already_in_graph;
 
     log::debug!(
-        "apply_change_to_graph: change_id={:?} hash={} should_apply_hunks={} stack_kind={:?}",
+        "write_change_to_graph: change_id={:?} hash={} should_apply_hunks={} view_kind={:?}",
         change_id,
         change_hash.to_base32(),
         should_apply_hunks,
-        stack.kind
+        view.kind
     );
 
     if should_apply_hunks {
         // Process each graph_op (graph layer)
         for graph_op in change.hunks() {
-            apply_hunk(
+            write_hunk(
                 txn,
                 &mut workspace,
                 &mut conflict_tracker,
@@ -555,23 +555,23 @@ pub fn apply_change_to_graph<T: MutTxnT + StackTxnT>(
         // This enables human-readable diffs and token-level blame
         if change.has_file_ops() {
             let _crdt_stats = apply_file_ops(txn, change_id, change.file_ops())
-                .map_err(|e| ApplyError::Database(e.to_string()))?;
+                .map_err(|e| InsertError::Database(e.to_string()))?;
         }
     }
 
     // Compute new state
-    let new_state = compute_new_state(&stack.state, change_hash);
+    let new_state = compute_new_state(&view.state, change_hash);
 
-    // Update the stack
-    let sequence = stack.change_count + 1;
-    txn.put_change(&mut stack, change_id, change_hash)
-        .map_err(|e| ApplyError::Database(e.to_string()))?;
+    // Update the view
+    let sequence = view.change_count + 1;
+    txn.put_change(&mut view, change_id, change_hash)
+        .map_err(|e| InsertError::Database(e.to_string()))?;
 
-    // Update stack state
-    stack.state = new_state;
-    stack.change_count = sequence;
-    txn.update_stack(&stack)
-        .map_err(|e| ApplyError::Database(e.to_string()))?;
+    // Update view state
+    view.state = new_state;
+    view.change_count = sequence;
+    txn.update_view(&view)
+        .map_err(|e| InsertError::Database(e.to_string()))?;
 
     // Build conflict summary
     let has_conflicts = conflict_tracker.has_conflicts();
@@ -583,21 +583,26 @@ pub fn apply_change_to_graph<T: MutTxnT + StackTxnT>(
     stats.changes_applied = 1;
     stats.applied_hashes.push(*change_hash);
 
-    Ok(ApplyOutcome::new(new_state, sequence, has_conflicts, stats))
+    Ok(InsertOutcome::new(
+        new_state,
+        sequence,
+        has_conflicts,
+        stats,
+    ))
 }
 
-/// Apply a single graph_op to the graph.
+/// Write a single graph_op to the graph.
 #[allow(clippy::too_many_arguments)]
-fn apply_hunk<T: MutTxnT>(
+fn write_hunk<T: MutTxnT>(
     txn: &mut T,
     workspace: &mut Workspace,
     conflict_tracker: &mut ConflictTracker,
     change_id: NodeId,
     graph_op: &GraphOp<Option<Hash>>,
     change: &Change,
-    options: &ApplyOptions,
-    stats: &mut ApplyStats,
-) -> ApplyResult<()> {
+    options: &InsertOptions,
+    stats: &mut InsertStats,
+) -> InsertResult<()> {
     // Process atoms in the graph_op
     for atom_ref in graph_op.atoms() {
         match atom_ref {
@@ -640,7 +645,7 @@ fn apply_hunk<T: MutTxnT>(
             }
 
             if !options.allow_conflicts {
-                return Err(ApplyError::Conflict {
+                return Err(InsertError::Conflict {
                     message: "Conflict detected during atom application".to_string(),
                 });
             }
@@ -650,7 +655,7 @@ fn apply_hunk<T: MutTxnT>(
     Ok(())
 }
 
-/// Collect all dependencies needed to apply a change.
+/// Collect all dependencies needed to insert a change.
 ///
 /// This recursively collects all transitive dependencies.
 ///
@@ -669,7 +674,7 @@ pub fn collect_all_dependencies<T: GraphTxnT>(
     change: &Change,
     available: &HashSet<Hash>,
     max_depth: usize,
-) -> ApplyResult<HashSet<Hash>> {
+) -> InsertResult<HashSet<Hash>> {
     let mut needed = HashSet::new();
     let mut queue: VecDeque<(Hash, usize)> = VecDeque::new();
     let mut visited = HashSet::new();
@@ -684,7 +689,7 @@ pub fn collect_all_dependencies<T: GraphTxnT>(
 
     while let Some((hash, depth)) = queue.pop_front() {
         if depth > max_depth {
-            return Err(ApplyError::CyclicDependency {
+            return Err(InsertError::CyclicDependency {
                 message: format!("Maximum dependency depth {} exceeded", max_depth),
             });
         }
@@ -692,7 +697,7 @@ pub fn collect_all_dependencies<T: GraphTxnT>(
         // Check if already in repository
         if txn
             .get_internal(&hash)
-            .map_err(|e| ApplyError::Database(e.to_string()))?
+            .map_err(|e| InsertError::Database(e.to_string()))?
             .is_some()
         {
             continue;
@@ -711,63 +716,63 @@ pub fn collect_all_dependencies<T: GraphTxnT>(
     Ok(needed)
 }
 
-// Cross-Stack Apply Operations
+// Cross-View Insert Operations
 
-/// Options for applying changes between stacks.
+/// Options for inserting changes between views.
 ///
-/// This struct configures how changes are copied from a source stack
-/// to a target stack.
+/// This struct configures how changes are copied from a source view
+/// to a target view.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// // Apply all changes from feature to main
-/// let options = CrossStackApplyOptions::new("feature", "main");
+/// // Insert all changes from feature to main
+/// let options = CrossViewInsertOptions::new("feature", "main");
 ///
-/// // Apply only up to a specific tag
-/// let options = CrossStackApplyOptions::new("feature", "main")
+/// // Insert only up to a specific tag
+/// let options = CrossViewInsertOptions::new("feature", "main")
 ///     .up_to_tag("v1.0.0");
 ///
-/// // Apply specific changes only
-/// let options = CrossStackApplyOptions::new("feature", "main")
+/// // Insert specific changes only
+/// let options = CrossViewInsertOptions::new("feature", "main")
 ///     .only_changes(vec![hash1, hash2]);
 /// ```
 #[derive(Debug, Clone)]
-pub struct CrossStackApplyOptions {
-    /// Source stack to copy changes from.
-    pub from_stack: String,
+pub struct CrossViewInsertOptions {
+    /// Source view to copy changes from.
+    pub from_view: String,
 
-    /// Target stack to apply changes to.
-    pub to_stack: String,
+    /// Target view to insert changes to.
+    pub to_view: String,
 
     /// Optional tag to limit changes up to (inclusive).
-    /// Only changes up to and including this tag's state will be applied.
+    /// Only changes up to and including this tag's state will be inserted.
     pub up_to_tag: Option<String>,
 
-    /// Optional specific changes to apply (if empty, apply all missing).
+    /// Optional specific changes to insert (if empty, insert all missing).
     pub only_changes: Vec<Hash>,
 
-    /// Whether to apply dependencies automatically.
+    /// Whether to insert dependencies automatically.
     pub apply_dependencies: bool,
 
     /// Whether to allow conflicts.
     pub allow_conflicts: bool,
 
-    /// Whether to do a dry run (don't actually apply).
+    /// Whether to do a dry run (don't actually insert).
     pub dry_run: bool,
 }
 
-impl CrossStackApplyOptions {
-    /// Create new cross-stack apply options.
+impl CrossViewInsertOptions {
+    /// Create new cross-view insert options.
     ///
     /// # Arguments
     ///
-    /// * `from_stack` - Source stack name
-    /// * `to_stack` - Target stack name
-    pub fn new(from_stack: impl Into<String>, to_stack: impl Into<String>) -> Self {
+    /// * `from_view` - Source view name
+    /// * `to_view` - Target view name
+    pub fn new(from_view: impl Into<String>, to_view: impl Into<String>) -> Self {
         Self {
-            from_stack: from_stack.into(),
-            to_stack: to_stack.into(),
+            from_view: from_view.into(),
+            to_view: to_view.into(),
             up_to_tag: None,
             only_changes: Vec::new(),
             apply_dependencies: true,
@@ -782,13 +787,13 @@ impl CrossStackApplyOptions {
         self
     }
 
-    /// Apply only specific changes.
+    /// Insert only specific changes.
     pub fn only_changes(mut self, changes: Vec<Hash>) -> Self {
         self.only_changes = changes;
         self
     }
 
-    /// Set whether to apply dependencies automatically.
+    /// Set whether to insert dependencies automatically.
     pub fn with_dependencies(mut self, apply: bool) -> Self {
         self.apply_dependencies = apply;
         self
@@ -807,22 +812,22 @@ impl CrossStackApplyOptions {
     }
 }
 
-/// Result of a cross-stack apply operation.
+/// Result of a cross-view insert operation.
 #[derive(Debug, Clone)]
-pub struct CrossStackApplyOutcome {
-    /// Number of changes applied.
+pub struct CrossViewInsertOutcome {
+    /// Number of changes inserted.
     pub changes_applied: usize,
 
-    /// Hashes of changes that were applied.
+    /// Hashes of changes that were inserted.
     pub applied_hashes: Vec<Hash>,
 
     /// Hashes of changes that were skipped (already in target).
     pub skipped_hashes: Vec<Hash>,
 
-    /// New state of the target stack.
+    /// New state of the target view.
     pub new_state: Merkle,
 
-    /// New sequence number of the target stack.
+    /// New sequence number of the target view.
     pub sequence: u64,
 
     /// Whether any conflicts were detected.
@@ -832,7 +837,7 @@ pub struct CrossStackApplyOutcome {
     pub was_dry_run: bool,
 }
 
-impl CrossStackApplyOutcome {
+impl CrossViewInsertOutcome {
     /// Create a new outcome.
     pub fn new() -> Self {
         Self {
@@ -846,7 +851,7 @@ impl CrossStackApplyOutcome {
         }
     }
 
-    /// Check if any changes were applied.
+    /// Check if any changes were inserted.
     pub fn has_applied(&self) -> bool {
         self.changes_applied > 0
     }
@@ -857,43 +862,40 @@ impl CrossStackApplyOutcome {
     }
 }
 
-impl Default for CrossStackApplyOutcome {
+impl Default for CrossViewInsertOutcome {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Get all change hashes in a stack.
+/// Get all change hashes in a view.
 ///
 /// Returns the hashes in order from oldest (sequence 0) to newest.
 ///
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - The stack to get changes from
+/// * `view` - The view to get changes from
 ///
 /// # Returns
 ///
 /// Ordered vector of (sequence, hash) pairs.
-pub fn get_stack_changes<T: StackTxnT>(
-    txn: &T,
-    stack: &StackState,
-) -> ApplyResult<Vec<(u64, Hash)>> {
+pub fn get_view_changes<T: ViewTxnT>(txn: &T, view: &ViewState) -> InsertResult<Vec<(u64, Hash)>> {
     let mut changes = Vec::new();
 
     let iter = txn
-        .iter_changes(stack, 0)
-        .map_err(|e| ApplyError::Database(e.to_string()))?;
+        .iter_changes(view, 0)
+        .map_err(|e| InsertError::Database(e.to_string()))?;
 
     for result in iter {
-        let (seq, node_id, _merkle) = result.map_err(|e| ApplyError::Database(e.to_string()))?;
+        let (seq, node_id, _merkle) = result.map_err(|e| InsertError::Database(e.to_string()))?;
 
         // Get external hash
         let hash = txn
             .get_external(node_id)
-            .map_err(|e| ApplyError::Database(e.to_string()))?
+            .map_err(|e| InsertError::Database(e.to_string()))?
             .ok_or_else(|| {
-                ApplyError::Internal(format!("Change {} has no external hash", node_id.0))
+                InsertError::Internal(format!("Change {} has no external hash", node_id.0))
             })?;
 
         changes.push((seq, hash));
@@ -902,27 +904,27 @@ pub fn get_stack_changes<T: StackTxnT>(
     Ok(changes)
 }
 
-/// Get changes that are in the source stack but not in the target stack.
+/// Get changes that are in the source view but not in the target view.
 ///
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `from_stack` - Source stack
-/// * `to_stack` - Target stack
+/// * `from_view` - Source view
+/// * `to_view` - Target view
 ///
 /// # Returns
 ///
-/// Vector of hashes that need to be applied, in dependency order.
-pub fn get_missing_changes<T: StackTxnT>(
+/// Vector of hashes that need to be inserted, in dependency order.
+pub fn get_missing_changes<T: ViewTxnT>(
     txn: &T,
-    from_stack: &StackState,
-    to_stack: &StackState,
-) -> ApplyResult<Vec<Hash>> {
+    from_view: &ViewState,
+    to_view: &ViewState,
+) -> InsertResult<Vec<Hash>> {
     // Get all changes in source
-    let source_changes = get_stack_changes(txn, from_stack)?;
+    let source_changes = get_view_changes(txn, from_view)?;
 
     // Build set of changes in target
-    let target_set: HashSet<Hash> = get_stack_changes(txn, to_stack)?
+    let target_set: HashSet<Hash> = get_view_changes(txn, to_view)?
         .into_iter()
         .map(|(_, hash)| hash)
         .collect();
@@ -942,25 +944,25 @@ pub fn get_missing_changes<T: StackTxnT>(
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - The stack to query
+/// * `view` - The view to query
 /// * `max_sequence` - Maximum sequence (inclusive)
 ///
 /// # Returns
 ///
 /// Vector of hashes up to and including the specified sequence.
-pub fn get_changes_up_to_seq<T: StackTxnT>(
+pub fn get_changes_up_to_seq<T: ViewTxnT>(
     txn: &T,
-    stack: &StackState,
+    view: &ViewState,
     max_sequence: u64,
-) -> ApplyResult<Vec<Hash>> {
+) -> InsertResult<Vec<Hash>> {
     let mut changes = Vec::new();
 
     let iter = txn
-        .iter_changes(stack, 0)
-        .map_err(|e| ApplyError::Database(e.to_string()))?;
+        .iter_changes(view, 0)
+        .map_err(|e| InsertError::Database(e.to_string()))?;
 
     for result in iter {
-        let (seq, node_id, _merkle) = result.map_err(|e| ApplyError::Database(e.to_string()))?;
+        let (seq, node_id, _merkle) = result.map_err(|e| InsertError::Database(e.to_string()))?;
 
         if seq > max_sequence {
             break;
@@ -968,9 +970,9 @@ pub fn get_changes_up_to_seq<T: StackTxnT>(
 
         let hash = txn
             .get_external(node_id)
-            .map_err(|e| ApplyError::Database(e.to_string()))?
+            .map_err(|e| InsertError::Database(e.to_string()))?
             .ok_or_else(|| {
-                ApplyError::Internal(format!("Change {} has no external hash", node_id.0))
+                InsertError::Internal(format!("Change {} has no external hash", node_id.0))
             })?;
 
         changes.push(hash);
@@ -979,38 +981,38 @@ pub fn get_changes_up_to_seq<T: StackTxnT>(
     Ok(changes)
 }
 
-/// Find which changes from a list are missing in a stack.
+/// Find which changes from a list are missing in a view.
 ///
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - The stack to check against
+/// * `view` - The view to check against
 /// * `changes` - List of change hashes to check
 ///
 /// # Returns
 ///
-/// Vector of hashes that are not in the stack.
-pub fn filter_missing_in_stack<T: StackTxnT>(
+/// Vector of hashes that are not in the view.
+pub fn filter_missing_in_view<T: ViewTxnT>(
     txn: &T,
-    stack: &StackState,
+    view: &ViewState,
     changes: &[Hash],
-) -> ApplyResult<Vec<Hash>> {
+) -> InsertResult<Vec<Hash>> {
     let mut missing = Vec::new();
 
     for hash in changes {
         // Get internal ID if it exists
         let internal = txn
             .get_internal(hash)
-            .map_err(|e| ApplyError::Database(e.to_string()))?;
+            .map_err(|e| InsertError::Database(e.to_string()))?;
 
         if let Some(node_id) = internal {
-            // Check if it's in the stack
-            let in_stack = txn
-                .get_change_seq(stack, node_id)
-                .map_err(|e| ApplyError::Database(e.to_string()))?
+            // Check if it's in the view
+            let in_view = txn
+                .get_change_seq(view, node_id)
+                .map_err(|e| InsertError::Database(e.to_string()))?
                 .is_some();
 
-            if !in_stack {
+            if !in_view {
                 missing.push(*hash);
             }
         } else {
@@ -1022,9 +1024,9 @@ pub fn filter_missing_in_stack<T: StackTxnT>(
     Ok(missing)
 }
 
-/// Build a dependency-ordered list of changes to apply.
+/// Build a dependency-ordered list of changes to insert.
 ///
-/// Given a set of changes to apply, this function determines the correct
+/// Given a set of changes to insert, this function determines the correct
 /// order based on their dependencies.
 ///
 /// # Arguments
@@ -1034,8 +1036,8 @@ pub fn filter_missing_in_stack<T: StackTxnT>(
 /// # Returns
 ///
 /// Ordered vector of hashes (dependencies first).
-pub fn order_changes_by_deps(changes: &HashMap<Hash, Change>) -> ApplyResult<Vec<Hash>> {
-    compute_apply_order(changes)
+pub fn order_changes_by_deps(changes: &HashMap<Hash, Change>) -> InsertResult<Vec<Hash>> {
+    compute_insert_order(changes)
 }
 
 // Tests
@@ -1044,11 +1046,11 @@ pub fn order_changes_by_deps(changes: &HashMap<Hash, Change>) -> ApplyResult<Vec
 mod tests {
     use super::*;
 
-    // ApplyOptions Tests
+    // InsertOptions Tests
 
     #[test]
-    fn test_apply_options_default() {
-        let opts = ApplyOptions::default();
+    fn test_insert_options_default() {
+        let opts = InsertOptions::default();
         assert!(!opts.apply_dependencies);
         assert!(opts.allow_conflicts);
         assert_eq!(opts.max_depth, 100);
@@ -1056,20 +1058,20 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_options_with_dependencies() {
-        let opts = ApplyOptions::with_dependencies();
+    fn test_insert_options_with_dependencies() {
+        let opts = InsertOptions::with_dependencies();
         assert!(opts.apply_dependencies);
     }
 
     #[test]
-    fn test_apply_options_strict() {
-        let opts = ApplyOptions::strict();
+    fn test_insert_options_strict() {
+        let opts = InsertOptions::strict();
         assert!(!opts.allow_conflicts);
     }
 
     #[test]
-    fn test_apply_options_builder() {
-        let opts = ApplyOptions::default()
+    fn test_insert_options_builder() {
+        let opts = InsertOptions::default()
             .apply_deps(true)
             .allow_conflict(false)
             .max_recursion(50);
@@ -1079,11 +1081,11 @@ mod tests {
         assert_eq!(opts.max_depth, 50);
     }
 
-    // ApplyStats Tests
+    // InsertStats Tests
 
     #[test]
-    fn test_apply_stats_new() {
-        let stats = ApplyStats::new();
+    fn test_insert_stats_new() {
+        let stats = InsertStats::new();
         assert_eq!(stats.changes_applied, 0);
         assert_eq!(stats.atoms_processed, 0);
         assert!(!stats.has_applied());
@@ -1091,8 +1093,8 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_stats_has_applied() {
-        let mut stats = ApplyStats::new();
+    fn test_insert_stats_has_applied() {
+        let mut stats = InsertStats::new();
         assert!(!stats.has_applied());
 
         stats.changes_applied = 1;
@@ -1100,8 +1102,8 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_stats_has_conflicts() {
-        let mut stats = ApplyStats::new();
+    fn test_insert_stats_has_conflicts() {
+        let mut stats = InsertStats::new();
         assert!(!stats.has_conflicts());
 
         stats.conflicts_detected = 1;
@@ -1109,12 +1111,12 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_stats_merge() {
-        let mut stats1 = ApplyStats::new();
+    fn test_insert_stats_merge() {
+        let mut stats1 = InsertStats::new();
         stats1.changes_applied = 2;
         stats1.atoms_processed = 10;
 
-        let mut stats2 = ApplyStats::new();
+        let mut stats2 = InsertStats::new();
         stats2.changes_applied = 1;
         stats2.atoms_processed = 5;
         stats2.conflicts_detected = 1;
@@ -1126,13 +1128,13 @@ mod tests {
         assert_eq!(stats1.conflicts_detected, 1);
     }
 
-    // ApplyOutcome Tests
+    // InsertOutcome Tests
 
     #[test]
-    fn test_apply_outcome_new() {
+    fn test_insert_outcome_new() {
         let state = Merkle::of(b"test");
-        let stats = ApplyStats::new();
-        let outcome = ApplyOutcome::new(state, 1, false, stats);
+        let stats = InsertStats::new();
+        let outcome = InsertOutcome::new(state, 1, false, stats);
 
         assert_eq!(outcome.new_state, state);
         assert_eq!(outcome.sequence, 1);
@@ -1142,46 +1144,49 @@ mod tests {
     // Error Tests
 
     #[test]
-    fn test_apply_error_display() {
-        let err = ApplyError::ChangeNotFound {
+    fn test_insert_error_display() {
+        let err = InsertError::ChangeNotFound {
             hash: "ABC123".to_string(),
         };
         assert!(err.to_string().contains("ABC123"));
 
         let hash1 = Hash::of(b"dep1");
-        let err = ApplyError::MissingDependencies {
+        let err = InsertError::MissingDependencies {
             missing: vec![hash1],
         };
         let msg = err.to_string();
         assert!(msg.contains("Missing dependencies"));
 
-        let err = ApplyError::AlreadyApplied {
+        let err = InsertError::AlreadyApplied {
             hash: "XYZ789".to_string(),
         };
         assert!(err.to_string().contains("already applied"));
     }
 
     #[test]
-    fn test_apply_error_from_local() {
+    fn test_insert_error_from_local() {
         let local_err = LocalApplyError::ChangeAlreadyApplied {
             hash: Hash::of(b"test"),
         };
-        let apply_err: ApplyError = local_err.into();
-        assert!(matches!(apply_err, ApplyError::AlreadyApplied { .. }));
+        let insert_err: InsertError = local_err.into();
+        assert!(matches!(insert_err, InsertError::AlreadyApplied { .. }));
 
         let local_err = LocalApplyError::DependencyMissing {
             hash: Hash::of(b"dep"),
         };
-        let apply_err: ApplyError = local_err.into();
-        assert!(matches!(apply_err, ApplyError::MissingDependencies { .. }));
+        let insert_err: InsertError = local_err.into();
+        assert!(matches!(
+            insert_err,
+            InsertError::MissingDependencies { .. }
+        ));
     }
 
-    // Compute Apply Order Tests
+    // Compute Insert Order Tests
 
     #[test]
-    fn test_compute_apply_order_empty() {
+    fn test_compute_insert_order_empty() {
         let changes = std::collections::HashMap::new();
-        let order = compute_apply_order(&changes).unwrap();
+        let order = compute_insert_order(&changes).unwrap();
         assert!(order.is_empty());
     }
 
@@ -1207,13 +1212,13 @@ mod tests {
         assert!(!formatted.is_empty());
     }
 
-    // CrossStackApplyOptions Tests
+    // CrossViewInsertOptions Tests
 
     #[test]
-    fn test_cross_stack_options_new() {
-        let opts = CrossStackApplyOptions::new("feature", "main");
-        assert_eq!(opts.from_stack, "feature");
-        assert_eq!(opts.to_stack, "main");
+    fn test_cross_view_options_new() {
+        let opts = CrossViewInsertOptions::new("feature", "main");
+        assert_eq!(opts.from_view, "feature");
+        assert_eq!(opts.to_view, "main");
         assert!(opts.up_to_tag.is_none());
         assert!(opts.only_changes.is_empty());
         assert!(opts.apply_dependencies);
@@ -1222,22 +1227,22 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_stack_options_up_to_tag() {
-        let opts = CrossStackApplyOptions::new("feature", "main").up_to_tag("v1.0.0");
+    fn test_cross_view_options_up_to_tag() {
+        let opts = CrossViewInsertOptions::new("feature", "main").up_to_tag("v1.0.0");
         assert_eq!(opts.up_to_tag, Some("v1.0.0".to_string()));
     }
 
     #[test]
-    fn test_cross_stack_options_only_changes() {
+    fn test_cross_view_options_only_changes() {
         let hash1 = Hash::of(b"change1");
         let hash2 = Hash::of(b"change2");
-        let opts = CrossStackApplyOptions::new("feature", "main").only_changes(vec![hash1, hash2]);
+        let opts = CrossViewInsertOptions::new("feature", "main").only_changes(vec![hash1, hash2]);
         assert_eq!(opts.only_changes.len(), 2);
     }
 
     #[test]
-    fn test_cross_stack_options_builder() {
-        let opts = CrossStackApplyOptions::new("feature", "main")
+    fn test_cross_view_options_builder() {
+        let opts = CrossViewInsertOptions::new("feature", "main")
             .with_dependencies(false)
             .allow_conflicts(true)
             .dry_run(true);
@@ -1247,11 +1252,11 @@ mod tests {
         assert!(opts.dry_run);
     }
 
-    // CrossStackApplyOutcome Tests
+    // CrossViewInsertOutcome Tests
 
     #[test]
-    fn test_cross_stack_outcome_new() {
-        let outcome = CrossStackApplyOutcome::new();
+    fn test_cross_view_outcome_new() {
+        let outcome = CrossViewInsertOutcome::new();
         assert_eq!(outcome.changes_applied, 0);
         assert!(outcome.applied_hashes.is_empty());
         assert!(outcome.skipped_hashes.is_empty());
@@ -1262,15 +1267,15 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_stack_outcome_default() {
-        let outcome = CrossStackApplyOutcome::default();
+    fn test_cross_view_outcome_default() {
+        let outcome = CrossViewInsertOutcome::default();
         assert!(!outcome.has_applied());
         assert_eq!(outcome.total_processed(), 0);
     }
 
     #[test]
-    fn test_cross_stack_outcome_has_applied() {
-        let mut outcome = CrossStackApplyOutcome::new();
+    fn test_cross_view_outcome_has_applied() {
+        let mut outcome = CrossViewInsertOutcome::new();
         assert!(!outcome.has_applied());
 
         outcome.changes_applied = 1;
@@ -1278,8 +1283,8 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_stack_outcome_total_processed() {
-        let mut outcome = CrossStackApplyOutcome::new();
+    fn test_cross_view_outcome_total_processed() {
+        let mut outcome = CrossViewInsertOutcome::new();
         outcome.applied_hashes.push(Hash::of(b"a"));
         outcome.applied_hashes.push(Hash::of(b"b"));
         outcome.skipped_hashes.push(Hash::of(b"c"));

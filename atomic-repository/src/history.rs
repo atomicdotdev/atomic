@@ -63,7 +63,7 @@
 //! iteration without loading the entire history into memory.
 
 use atomic_core::change::{Change, ChangeHeader};
-use atomic_core::pristine::{StackState, StackTxnT};
+use atomic_core::pristine::{ViewState, ViewTxnT};
 use atomic_core::types::{Base32, Hash, Inode, Merkle, NodeId};
 use std::fmt;
 use thiserror::Error;
@@ -76,10 +76,10 @@ pub type HistoryResult<T> = Result<T, HistoryError>;
 /// Errors that can occur during history operations.
 #[derive(Debug, Error)]
 pub enum HistoryError {
-    /// The specified stack was not found.
-    #[error("Stack not found: {name}")]
-    StackNotFound {
-        /// Name of the missing stack.
+    /// The specified view was not found.
+    #[error("View not found: {name}")]
+    ViewNotFound {
+        /// Name of the missing view.
         name: String,
     },
 
@@ -135,13 +135,13 @@ pub enum HistoryError {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryEntry {
-    /// The sequence number of this change in the stack (0-indexed).
+    /// The sequence number of this change in the view (0-indexed).
     pub sequence: u64,
 
     /// The content-addressed hash of the change.
     pub hash: Hash,
 
-    /// The Merkle state of the stack after this change was applied.
+    /// The Merkle state of the view after this change was applied.
     pub state: Merkle,
 
     /// The internal node ID (repository-local identifier).
@@ -159,7 +159,7 @@ impl HistoryEntry {
     ///
     /// # Arguments
     ///
-    /// * `sequence` - The sequence number in the stack log
+    /// * `sequence` - The sequence number in the view log
     /// * `node_id` - The internal node ID
     /// * `hash` - The content hash of the change
     /// * `state` - The Merkle state after this change
@@ -182,7 +182,7 @@ impl HistoryEntry {
     ///
     /// # Arguments
     ///
-    /// * `sequence` - The sequence number in the stack log
+    /// * `sequence` - The sequence number in the view log
     /// * `node_id` - The internal node ID
     /// * `hash` - The content hash of the change
     /// * `state` - The Merkle state after this change
@@ -282,8 +282,8 @@ pub struct HistoryOptions {
     /// Whether to load change headers (slower but more info).
     pub load_headers: bool,
 
-    /// Specific stack to query (None = current stack).
-    pub stack: Option<String>,
+    /// Specific view to query (None = current view).
+    pub view: Option<String>,
 
     /// Only include tagged changes.
     pub tagged_only: bool,
@@ -323,13 +323,13 @@ impl HistoryOptions {
         self
     }
 
-    /// Set the stack to query.
+    /// Set the view to query.
     ///
     /// # Arguments
     ///
-    /// * `name` - Stack name (None = current stack)
-    pub fn stack(mut self, name: impl Into<String>) -> Self {
-        self.stack = Some(name.into());
+    /// * `name` - View name (None = current view)
+    pub fn view(mut self, name: impl Into<String>) -> Self {
+        self.view = Some(name.into());
         self
     }
 
@@ -356,16 +356,16 @@ impl HistoryOptions {
 
 // History Summary
 
-/// Summary statistics about a stack's history.
+/// Summary statistics about a view's history.
 ///
 /// Provides quick access to aggregate information without
 /// iterating through all entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistorySummary {
-    /// Total number of changes in the stack.
+    /// Total number of changes in the view.
     pub change_count: u64,
 
-    /// Current Merkle state of the stack.
+    /// Current Merkle state of the view.
     pub current_state: Merkle,
 
     /// Hash of the first change (if any).
@@ -377,24 +377,24 @@ pub struct HistorySummary {
     /// Number of tagged changes.
     pub tagged_count: u64,
 
-    /// Stack name.
-    pub stack_name: String,
+    /// View name.
+    pub view_name: String,
 }
 
 impl HistorySummary {
     /// Create a new history summary.
-    pub fn new(stack_name: impl Into<String>, stack_state: &StackState) -> Self {
+    pub fn new(view_name: impl Into<String>, view_state: &ViewState) -> Self {
         Self {
-            change_count: stack_state.change_count,
-            current_state: stack_state.state,
+            change_count: view_state.change_count,
+            current_state: view_state.state,
             first_change: None,
             last_change: None,
             tagged_count: 0,
-            stack_name: stack_name.into(),
+            view_name: view_name.into(),
         }
     }
 
-    /// Check if the stack has any changes.
+    /// Check if the view has any changes.
     pub fn is_empty(&self) -> bool {
         self.change_count == 0
     }
@@ -417,8 +417,8 @@ impl fmt::Display for HistorySummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Stack '{}': {} changes (state: {}, {} tagged)",
-            self.stack_name,
+            "View '{}': {} changes (state: {}, {} tagged)",
+            self.view_name,
             self.change_count,
             &self.current_state.to_base32()[..8],
             self.tagged_count
@@ -517,9 +517,9 @@ impl fmt::Display for PathModificationType {
 /// This iterator is lazy - it fetches entries as needed from the
 /// underlying database cursor.
 #[allow(dead_code)]
-pub struct HistoryIter<'a, T: StackTxnT> {
+pub struct HistoryIter<'a, T: ViewTxnT> {
     txn: &'a T,
-    stack: StackState,
+    view: ViewState,
     inner: Box<
         dyn Iterator<Item = Result<(u64, NodeId, Merkle), atomic_core::pristine::PristineError>>
             + 'a,
@@ -529,11 +529,11 @@ pub struct HistoryIter<'a, T: StackTxnT> {
     load_headers: bool,
 }
 
-impl<'a, T: StackTxnT> HistoryIter<'a, T> {
+impl<'a, T: ViewTxnT> HistoryIter<'a, T> {
     /// Create a new history iterator.
     pub(crate) fn new(
         txn: &'a T,
-        stack: StackState,
+        view: ViewState,
         inner: Box<
             dyn Iterator<Item = Result<(u64, NodeId, Merkle), atomic_core::pristine::PristineError>>
                 + 'a,
@@ -542,7 +542,7 @@ impl<'a, T: StackTxnT> HistoryIter<'a, T> {
     ) -> Self {
         Self {
             txn,
-            stack,
+            view,
             inner,
             limit: options.limit,
             count: 0,
@@ -550,9 +550,9 @@ impl<'a, T: StackTxnT> HistoryIter<'a, T> {
         }
     }
 
-    /// Get the stack being iterated.
-    pub fn stack(&self) -> &StackState {
-        &self.stack
+    /// Get the view being iterated.
+    pub fn view(&self) -> &ViewState {
+        &self.view
     }
 
     /// Get the number of entries yielded so far.
@@ -561,7 +561,7 @@ impl<'a, T: StackTxnT> HistoryIter<'a, T> {
     }
 }
 
-impl<'a, T: StackTxnT> Iterator for HistoryIter<'a, T> {
+impl<'a, T: ViewTxnT> Iterator for HistoryIter<'a, T> {
     type Item = HistoryResult<HistoryEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -606,7 +606,7 @@ impl<'a, T: StackTxnT> Iterator for HistoryIter<'a, T> {
 
 // Log Functions
 
-/// Get forward history log from a stack.
+/// Get forward history log from a view.
 ///
 /// Returns an iterator over history entries starting from the given
 /// sequence number and proceeding forward (oldest to newest).
@@ -614,7 +614,7 @@ impl<'a, T: StackTxnT> Iterator for HistoryIter<'a, T> {
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - Stack to query
+/// * `view` - View to query
 /// * `options` - Query options
 ///
 /// # Returns
@@ -624,25 +624,25 @@ impl<'a, T: StackTxnT> Iterator for HistoryIter<'a, T> {
 /// # Example
 ///
 /// ```rust,ignore
-/// let iter = log(&txn, &stack, &HistoryOptions::default())?;
+/// let iter = log(&txn, &view, &HistoryOptions::default())?;
 /// for entry in iter {
 ///     let entry = entry?;
 ///     println!("{}", entry);
 /// }
 /// ```
-pub fn log<'a, T: StackTxnT>(
+pub fn log<'a, T: ViewTxnT>(
     txn: &'a T,
-    stack: &StackState,
+    view: &ViewState,
     options: &HistoryOptions,
 ) -> HistoryResult<HistoryIter<'a, T>> {
     let inner = txn
-        .iter_changes(stack, options.from_sequence)
+        .iter_changes(view, options.from_sequence)
         .map_err(|e| HistoryError::Database(e.to_string()))?;
 
-    Ok(HistoryIter::new(txn, stack.clone(), inner, options))
+    Ok(HistoryIter::new(txn, view.clone(), inner, options))
 }
 
-/// Get reverse history log from a stack.
+/// Get reverse history log from a view.
 ///
 /// Returns entries in reverse order (newest to oldest), starting from
 /// either the most recent change or a specified sequence number.
@@ -650,7 +650,7 @@ pub fn log<'a, T: StackTxnT>(
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - Stack to query
+/// * `view` - View to query
 /// * `options` - Query options (from_sequence is the upper bound)
 ///
 /// # Returns
@@ -662,16 +662,16 @@ pub fn log<'a, T: StackTxnT>(
 /// This function collects entries into a vector and reverses them,
 /// as the underlying iterator only supports forward iteration.
 /// For large histories, consider using `log()` with pagination.
-pub fn reverse_log<T: StackTxnT>(
+pub fn reverse_log<T: ViewTxnT>(
     txn: &T,
-    stack: &StackState,
+    view: &ViewState,
     options: &HistoryOptions,
 ) -> HistoryResult<Vec<HistoryEntry>> {
     // Determine the range to query
     let end_seq = if options.from_sequence > 0 {
         options.from_sequence
     } else {
-        stack.change_count
+        view.change_count
     };
 
     let start_seq = if let Some(limit) = options.limit {
@@ -685,40 +685,40 @@ pub fn reverse_log<T: StackTxnT>(
         from_sequence: start_seq,
         limit: options.limit,
         load_headers: options.load_headers,
-        stack: options.stack.clone(),
+        view: options.view.clone(),
         tagged_only: options.tagged_only,
     };
 
-    let iter = log(txn, stack, &forward_options)?;
+    let iter = log(txn, view, &forward_options)?;
     let mut entries: Vec<HistoryEntry> = iter.filter_map(|r| r.ok()).collect();
     entries.reverse();
 
     Ok(entries)
 }
 
-/// Get a summary of the stack's history.
+/// Get a summary of the view's history.
 ///
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - Stack to summarize
+/// * `view` - View to summarize
 ///
 /// # Returns
 ///
 /// A `HistorySummary` with aggregate statistics.
-pub fn history_summary<T: StackTxnT>(txn: &T, stack: &StackState) -> HistoryResult<HistorySummary> {
-    let mut summary = HistorySummary::new(&stack.name, stack);
+pub fn history_summary<T: ViewTxnT>(txn: &T, view: &ViewState) -> HistoryResult<HistorySummary> {
+    let mut summary = HistorySummary::new(&view.name, view);
 
     // Get first change
-    if stack.change_count > 0 {
-        if let Ok(Some(first_id)) = txn.get_change_at_seq(stack, 0) {
+    if view.change_count > 0 {
+        if let Ok(Some(first_id)) = txn.get_change_at_seq(view, 0) {
             if let Ok(Some(hash)) = txn.get_external(first_id) {
                 summary.first_change = Some(hash);
             }
         }
 
         // Get last change
-        if let Ok(Some(last_id)) = txn.get_change_at_seq(stack, stack.change_count - 1) {
+        if let Ok(Some(last_id)) = txn.get_change_at_seq(view, view.change_count - 1) {
             if let Ok(Some(hash)) = txn.get_external(last_id) {
                 summary.last_change = Some(hash);
             }
@@ -736,30 +736,30 @@ pub fn history_summary<T: StackTxnT>(txn: &T, stack: &StackState) -> HistoryResu
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - Stack to query
+/// * `view` - View to query
 /// * `sequence` - Sequence number to retrieve
 ///
 /// # Returns
 ///
 /// The history entry at the given sequence, or an error if out of range.
-pub fn get_change_at_sequence<T: StackTxnT>(
+pub fn get_change_at_sequence<T: ViewTxnT>(
     txn: &T,
-    stack: &StackState,
+    view: &ViewState,
     sequence: u64,
 ) -> HistoryResult<HistoryEntry> {
-    if sequence >= stack.change_count {
+    if sequence >= view.change_count {
         return Err(HistoryError::SequenceOutOfRange {
             sequence,
-            max: stack.change_count.saturating_sub(1),
+            max: view.change_count.saturating_sub(1),
         });
     }
 
     let node_id = txn
-        .get_change_at_seq(stack, sequence)
+        .get_change_at_seq(view, sequence)
         .map_err(|e| HistoryError::Database(e.to_string()))?
         .ok_or_else(|| HistoryError::SequenceOutOfRange {
             sequence,
-            max: stack.change_count.saturating_sub(1),
+            max: view.change_count.saturating_sub(1),
         })?;
 
     let hash = txn
@@ -772,7 +772,7 @@ pub fn get_change_at_sequence<T: StackTxnT>(
     // Get the Merkle state - we need to iterate to find it
     // This is a bit inefficient but maintains correctness
     let iter = txn
-        .iter_changes(stack, sequence)
+        .iter_changes(view, sequence)
         .map_err(|e| HistoryError::Database(e.to_string()))?;
 
     for result in iter {
@@ -795,15 +795,15 @@ pub fn get_change_at_sequence<T: StackTxnT>(
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - Stack to search
+/// * `view` - View to search
 /// * `hash` - Hash of the change to find
 ///
 /// # Returns
 ///
-/// The sequence number if found, or None if the change is not in the stack.
-pub fn find_change_sequence<T: StackTxnT>(
+/// The sequence number if found, or None if the change is not in the view.
+pub fn find_change_sequence<T: ViewTxnT>(
     txn: &T,
-    stack: &StackState,
+    view: &ViewState,
     hash: &Hash,
 ) -> HistoryResult<Option<u64>> {
     // First get the internal ID
@@ -814,29 +814,29 @@ pub fn find_change_sequence<T: StackTxnT>(
     };
 
     // Then look up the sequence
-    match txn.get_change_seq(stack, node_id) {
+    match txn.get_change_seq(view, node_id) {
         Ok(seq) => Ok(seq),
         Err(e) => Err(HistoryError::Database(e.to_string())),
     }
 }
 
-/// Check if a change is in the stack's history.
+/// Check if a change is in the view's history.
 ///
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - Stack to search
+/// * `view` - View to search
 /// * `hash` - Hash of the change to check
 ///
 /// # Returns
 ///
-/// `true` if the change is in the stack's history.
-pub fn is_change_in_history<T: StackTxnT>(
+/// `true` if the change is in the view's history.
+pub fn is_change_in_history<T: ViewTxnT>(
     txn: &T,
-    stack: &StackState,
+    view: &ViewState,
     hash: &Hash,
 ) -> HistoryResult<bool> {
-    find_change_sequence(txn, stack, hash).map(|seq| seq.is_some())
+    find_change_sequence(txn, view, hash).map(|seq| seq.is_some())
 }
 
 // STATE-BASED CONTENT RETRIEVAL
@@ -844,7 +844,7 @@ pub fn is_change_in_history<T: StackTxnT>(
 /// Information about the state before a change was applied.
 ///
 /// This struct contains all the information needed to retrieve file content
-/// at the state immediately before a specific change was applied to the stack.
+/// at the state immediately before a specific change was applied to the view.
 ///
 /// # Use Case
 ///
@@ -883,7 +883,7 @@ impl StateBeforeChange {
     ///
     /// # Arguments
     ///
-    /// * `parent_sequence` - Sequence of parent state, or None if first change
+    /// * `parent_sequence` - Sequence of parent state, or `None` if first change
     /// * `parent_state` - Merkle hash of parent state
     /// * `change_sequence` - Sequence of the change
     /// * `change_state` - Merkle hash after the change
@@ -901,7 +901,7 @@ impl StateBeforeChange {
         }
     }
 
-    /// Check if this is the first change in the stack.
+    /// Check if this is the first change in the view.
     ///
     /// If true, the parent state is empty (no content existed before).
     pub fn is_first_change(&self) -> bool {
@@ -948,20 +948,20 @@ impl std::fmt::Display for StateBeforeChange {
 
 /// Get the state immediately before a change was applied.
 ///
-/// This function finds the Merkle state of the stack as it was just before
+/// This function finds the Merkle state of the view as it was just before
 /// the specified change was applied. This is essential for showing what
 /// a specific change actually modified.
 ///
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - The stack containing the change
+/// * `view` - The view containing the change
 /// * `change_hash` - Hash of the change to find the parent state for
 ///
 /// # Returns
 ///
 /// * `Ok(Some(state))` - The state information before the change
-/// * `Ok(None)` - The change is not in this stack's history
+/// * `Ok(None)` - The change is not in this view's history
 /// * `Err(_)` - Database error
 ///
 /// # Example
@@ -969,7 +969,7 @@ impl std::fmt::Display for StateBeforeChange {
 /// ```rust,ignore
 /// use atomic_repository::history::{get_state_before_change, StateBeforeChange};
 ///
-/// let state_info = get_state_before_change(&txn, &stack, &change_hash)?;
+/// let state_info = get_state_before_change(&txn, &view, &change_hash)?;
 /// if let Some(info) = state_info {
 ///     println!("Change at sequence {}", info.change_sequence);
 ///     if info.is_first_change() {
@@ -987,20 +987,20 @@ impl std::fmt::Display for StateBeforeChange {
 /// - One sequence lookup
 /// - One or two iterations over the change log (to find parent and current states)
 ///
-/// Total: O(log n) where n is the number of changes in the stack.
-pub fn get_state_before_change<T: StackTxnT>(
+/// Total: O(log n) where n is the number of changes in the view.
+pub fn get_state_before_change<T: ViewTxnT>(
     txn: &T,
-    stack: &StackState,
+    view: &ViewState,
     change_hash: &Hash,
 ) -> HistoryResult<Option<StateBeforeChange>> {
     // First, find the sequence number for this change
-    let change_sequence = match find_change_sequence(txn, stack, change_hash)? {
+    let change_sequence = match find_change_sequence(txn, view, change_hash)? {
         Some(seq) => seq,
-        None => return Ok(None), // Change not in this stack
+        None => return Ok(None), // Change not in this view
     };
 
     // Get the change's own state (state after it was applied)
-    let change_entry = get_change_at_sequence(txn, stack, change_sequence)?;
+    let change_entry = get_change_at_sequence(txn, view, change_sequence)?;
     let change_state = change_entry.state;
 
     // If this is the first change (sequence 0), there's no parent state
@@ -1015,7 +1015,7 @@ pub fn get_state_before_change<T: StackTxnT>(
 
     // Get the parent state (state at sequence - 1)
     let parent_sequence = change_sequence - 1;
-    let parent_entry = get_change_at_sequence(txn, stack, parent_sequence)?;
+    let parent_entry = get_change_at_sequence(txn, view, parent_sequence)?;
     let parent_state = parent_entry.state;
 
     Ok(Some(StateBeforeChange::new(
@@ -1029,13 +1029,13 @@ pub fn get_state_before_change<T: StackTxnT>(
 /// Get all change NodeIds applied up to (but not including) a given sequence.
 ///
 /// This function returns a set of internal NodeIds for all changes that were
-/// applied to the stack before the specified sequence number. This set can
+/// applied to the view before the specified sequence number. This set can
 /// be used to filter graph retrieval to only include content from those changes.
 ///
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - The stack to query
+/// * `view` - The view to query
 /// * `max_sequence` - Exclusive upper bound (changes with seq < max_sequence are included)
 ///
 /// # Returns
@@ -1050,7 +1050,7 @@ pub fn get_state_before_change<T: StackTxnT>(
 /// use std::collections::HashSet;
 ///
 /// // Get all changes applied before sequence 5
-/// let change_set = get_changes_up_to_sequence(&txn, &stack, 5)?;
+/// let change_set = get_changes_up_to_sequence(&txn, &view, 5)?;
 /// println!("Found {} changes before sequence 5", change_set.len());
 ///
 /// // Use this set to filter graph retrieval
@@ -1065,9 +1065,9 @@ pub fn get_state_before_change<T: StackTxnT>(
 ///
 /// For large repositories, consider caching the result if you need to retrieve
 /// content for multiple files at the same state.
-pub fn get_changes_up_to_sequence<T: StackTxnT>(
+pub fn get_changes_up_to_sequence<T: ViewTxnT>(
     txn: &T,
-    stack: &StackState,
+    view: &ViewState,
     max_sequence: u64,
 ) -> HistoryResult<std::collections::HashSet<NodeId>> {
     use std::collections::HashSet;
@@ -1081,7 +1081,7 @@ pub fn get_changes_up_to_sequence<T: StackTxnT>(
 
     // Iterate from sequence 0 up to (but not including) max_sequence
     let iter = txn
-        .iter_changes(stack, 0)
+        .iter_changes(view, 0)
         .map_err(|e| HistoryError::Database(e.to_string()))?;
 
     for result in iter {
@@ -1106,36 +1106,36 @@ pub fn get_changes_up_to_sequence<T: StackTxnT>(
 /// # Arguments
 ///
 /// * `txn` - Read transaction
-/// * `stack` - The stack to query
+/// * `view` - The view to query
 /// * `change_hash` - Hash of the change to include (and all before it)
 ///
 /// # Returns
 ///
 /// * `Ok(Some(set))` - Set of changes including the specified change and all before it
-/// * `Ok(None)` - The change is not in this stack's history
+/// * `Ok(None)` - The change is not in this view's history
 /// * `Err(_)` - Database error
 ///
 /// # Example
 ///
 /// ```rust,ignore
 /// // Get all changes up to and including a specific change
-/// if let Some(change_set) = get_changes_up_to_change(&txn, &stack, &change_hash)? {
+/// if let Some(change_set) = get_changes_up_to_change(&txn, &view, &change_hash)? {
 ///     println!("State includes {} changes", change_set.len());
 /// }
 /// ```
-pub fn get_changes_up_to_change<T: StackTxnT>(
+pub fn get_changes_up_to_change<T: ViewTxnT>(
     txn: &T,
-    stack: &StackState,
+    view: &ViewState,
     change_hash: &Hash,
 ) -> HistoryResult<Option<std::collections::HashSet<NodeId>>> {
     // Find the sequence number for this change
-    let sequence = match find_change_sequence(txn, stack, change_hash)? {
+    let sequence = match find_change_sequence(txn, view, change_hash)? {
         Some(seq) => seq,
         None => return Ok(None),
     };
 
     // Get all changes up to and including this sequence
-    let change_set = get_changes_up_to_sequence(txn, stack, sequence + 1)?;
+    let change_set = get_changes_up_to_sequence(txn, view, sequence + 1)?;
 
     Ok(Some(change_set))
 }
@@ -1396,7 +1396,7 @@ mod tests {
         assert_eq!(options.from_sequence, 0);
         assert!(options.limit.is_none());
         assert!(!options.load_headers);
-        assert!(options.stack.is_none());
+        assert!(options.view.is_none());
         assert!(!options.tagged_only);
     }
 
@@ -1406,13 +1406,13 @@ mod tests {
             .from_sequence(10)
             .limit(50)
             .load_headers(true)
-            .stack("feature")
+            .view("feature")
             .tagged_only(true);
 
         assert_eq!(options.from_sequence, 10);
         assert_eq!(options.limit, Some(50));
         assert!(options.load_headers);
-        assert_eq!(options.stack, Some("feature".to_string()));
+        assert_eq!(options.view, Some("feature".to_string()));
         assert!(options.tagged_only);
     }
 
@@ -1435,10 +1435,10 @@ mod tests {
 
     #[test]
     fn test_history_summary_new() {
-        let stack_state = StackState::new(1, "main".to_string());
-        let summary = HistorySummary::new("main", &stack_state);
+        let view_state = ViewState::new(1, "main".to_string());
+        let summary = HistorySummary::new("main", &view_state);
 
-        assert_eq!(summary.stack_name, "main");
+        assert_eq!(summary.view_name, "main");
         assert_eq!(summary.change_count, 0);
         assert!(summary.first_change.is_none());
         assert!(summary.last_change.is_none());
@@ -1446,20 +1446,19 @@ mod tests {
 
     #[test]
     fn test_history_summary_is_empty() {
-        let stack_state = StackState::new(1, "main".to_string());
-        let summary = HistorySummary::new("main", &stack_state);
+        let view_state = ViewState::new(1, "main".to_string());
+        let summary = HistorySummary::new("main", &view_state);
 
         assert!(summary.is_empty());
     }
 
     #[test]
     fn test_history_summary_with_bounds() {
-        let stack_state = StackState::new(1, "main".to_string());
+        let view_state = ViewState::new(1, "main".to_string());
         let first = Hash::of(b"first");
         let last = Hash::of(b"last");
 
-        let summary =
-            HistorySummary::new("main", &stack_state).with_bounds(Some(first), Some(last));
+        let summary = HistorySummary::new("main", &view_state).with_bounds(Some(first), Some(last));
 
         assert_eq!(summary.first_change, Some(first));
         assert_eq!(summary.last_change, Some(last));
@@ -1467,16 +1466,16 @@ mod tests {
 
     #[test]
     fn test_history_summary_with_tagged_count() {
-        let stack_state = StackState::new(1, "main".to_string());
-        let summary = HistorySummary::new("main", &stack_state).with_tagged_count(5);
+        let view_state = ViewState::new(1, "main".to_string());
+        let summary = HistorySummary::new("main", &view_state).with_tagged_count(5);
 
         assert_eq!(summary.tagged_count, 5);
     }
 
     #[test]
     fn test_history_summary_display() {
-        let stack_state = StackState::new(1, "main".to_string());
-        let summary = HistorySummary::new("main", &stack_state).with_tagged_count(3);
+        let view_state = ViewState::new(1, "main".to_string());
+        let summary = HistorySummary::new("main", &view_state).with_tagged_count(3);
 
         let display = format!("{}", summary);
         assert!(display.contains("main"));
@@ -1545,8 +1544,8 @@ mod tests {
     // HistoryError Tests
 
     #[test]
-    fn test_history_error_stack_not_found() {
-        let error = HistoryError::StackNotFound {
+    fn test_history_error_view_not_found() {
+        let error = HistoryError::ViewNotFound {
             name: "missing".to_string(),
         };
         let msg = format!("{}", error);
