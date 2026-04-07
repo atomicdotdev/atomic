@@ -96,8 +96,7 @@ pub fn apply_new_vertex<T: MutTxnT>(
     // the shared `overlay::find_block_in_stack_graph` — the canonical
     // STACK_GRAPH lookup — so there is a single source of truth for
     // vertex resolution across both the apply pipeline and OverlayTxn.
-    use super::edge::resolve_vertex_for_target;
-    use crate::pristine::overlay::FindBlockMode;
+    use super::edge::{resolve_vertex_for_target, FindBlockMode};
 
     // Create the new span
     let node = GraphNode {
@@ -262,17 +261,31 @@ pub fn add_edge_with_reverse<T: MutTxnT>(
                     })?;
             }
         }
-        ApplyTarget::Local { stack_id } => {
-            // Local workspace: write to STACK_GRAPH[(stack_id, vertex)]
-            txn.put_stack_graph(*stack_id, source, forward_edge)
+        ApplyTarget::Local { view_id: _ } => {
+            // TODO: Phase 2 - Draft views will use a filtered view model.
+            // For now, all edges go to the global GRAPH + INODE_GRAPH,
+            // same as Shared views (STACK_GRAPH table has been removed).
+            txn.put_graph(source, forward_edge)
                 .map_err(|e| LocalApplyError::Internal {
-                    message: format!("Failed to add forward stack graph edge: {}", e),
+                    message: format!("Failed to add forward edge: {}", e),
                 })?;
 
-            txn.put_stack_graph(*stack_id, dest, reverse_edge)
+            txn.put_graph(dest, reverse_edge)
                 .map_err(|e| LocalApplyError::Internal {
-                    message: format!("Failed to add reverse stack graph edge: {}", e),
+                    message: format!("Failed to add reverse edge: {}", e),
                 })?;
+
+            if let Some(inode_val) = inode {
+                txn.put_inode_graph(inode_val, source, forward_edge)
+                    .map_err(|e| LocalApplyError::Internal {
+                        message: format!("Failed to add forward inode edge: {}", e),
+                    })?;
+
+                txn.put_inode_graph(inode_val, dest, reverse_edge)
+                    .map_err(|e| LocalApplyError::Internal {
+                        message: format!("Failed to add reverse inode edge: {}", e),
+                    })?;
+            }
         }
     }
 

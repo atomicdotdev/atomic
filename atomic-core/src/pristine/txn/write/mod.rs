@@ -20,10 +20,10 @@ use crate::types::{
 
 use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
-use crate::pristine::traits::{GraphTxnT, MutTxnT, StackKind, StackState, StackTxnT, TreeTxnT};
+use crate::pristine::traits::{GraphTxnT, MutTxnT, TreeTxnT, ViewScope, ViewState, ViewTxnT};
 
 use super::helpers::{
-    deserialize_edge, deserialize_stack_state, serialize_edge, serialize_stack_state, AdjIterator,
+    deserialize_edge, deserialize_view_state, serialize_edge, serialize_view_state, AdjIterator,
 };
 
 /// Read-write transaction
@@ -33,7 +33,7 @@ use super::helpers::{
 pub struct WriteTxn<'a> {
     pub(crate) txn: WriteTransaction,
     pub(crate) next_node_id: &'a AtomicU64,
-    pub(crate) next_stack_id: &'a AtomicU64,
+    pub(crate) next_view_id: &'a AtomicU64,
     pub(crate) next_inode: &'a AtomicU64,
 }
 
@@ -42,13 +42,13 @@ impl<'a> WriteTxn<'a> {
     pub(crate) fn new(
         txn: WriteTransaction,
         next_node_id: &'a AtomicU64,
-        next_stack_id: &'a AtomicU64,
+        next_view_id: &'a AtomicU64,
         next_inode: &'a AtomicU64,
     ) -> Self {
         Self {
             txn,
             next_node_id,
-            next_stack_id,
+            next_view_id,
             next_inode,
         }
     }
@@ -286,8 +286,8 @@ fn format_timestamp_ms(epoch_ms: i64) -> String {
 }
 
 mod graph;
-mod stack;
 mod tree;
+mod view;
 
 #[cfg(test)]
 mod tests;
@@ -479,107 +479,41 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         Ok(removed)
     }
 
-    fn put_stack_graph(
-        &mut self,
-        stack_id: u64,
-        node: GraphNode<NodeId>,
-        edge: SerializedGraphEdge,
-    ) -> PristineResult<bool> {
-        let mut table = self.txn.open_multimap_table(STACK_GRAPH)?;
-        let key = encode_stack_graph_key(
-            stack_id,
-            node.change.get(),
-            node.start.get(),
-            node.end.get(),
-        );
-        let value = serialize_edge(&edge);
-        let inserted = table.insert(&key, &value)?;
-        Ok(inserted)
-    }
-
-    fn del_stack_graph(
-        &mut self,
-        stack_id: u64,
-        node: GraphNode<NodeId>,
-        edge: SerializedGraphEdge,
-    ) -> PristineResult<bool> {
-        let mut table = self.txn.open_multimap_table(STACK_GRAPH)?;
-        let key = encode_stack_graph_key(
-            stack_id,
-            node.change.get(),
-            node.start.get(),
-            node.end.get(),
-        );
-        let value = serialize_edge(&edge);
-        let removed = table.remove(&key, &value)?;
-        Ok(removed)
-    }
-
-    fn del_stack_graph_prefix(&mut self, stack_id: u64) -> PristineResult<u64> {
-        let mut table = self.txn.open_multimap_table(STACK_GRAPH)?;
-
-        let start_key = encode_stack_graph_prefix(stack_id);
-        let end_key = encode_stack_graph_key(stack_id, u64::MAX, u64::MAX, u64::MAX);
-
-        // Collect keys to delete (can't mutate while iterating)
-        let mut keys_to_delete: Vec<([u8; 32], Vec<[u8; 24]>)> = Vec::new();
-        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
-            let (key, values) = result?;
-            let key_bytes: [u8; 32] = *key.value();
-            let mut edge_bytes = Vec::new();
-            for v in values {
-                let v = v?;
-                edge_bytes.push(*v.value());
-            }
-            keys_to_delete.push((key_bytes, edge_bytes));
-        }
-
-        let mut count = 0u64;
-        for (key, edges) in &keys_to_delete {
-            for edge in edges {
-                table.remove(key, edge)?;
-                count += 1;
-            }
-        }
-
-        Ok(count)
-    }
-
-    fn open_or_create_stack(&mut self, name: &str) -> PristineResult<StackState> {
-        // Check if stack exists
+    fn open_or_create_view(&mut self, name: &str) -> PristineResult<ViewState> {
+        // Check if view exists
         {
-            let table = self.txn.open_table(STACKS)?;
+            let table = self.txn.open_table(VIEWS)?;
             let result = table.get(name)?;
             if let Some(value) = result {
-                return deserialize_stack_state(value.value());
+                return deserialize_view_state(value.value());
             }
         }
 
-        // Create new stack (defaults to Shared, no parent for backward compat)
-        let id = self.next_stack_id.fetch_add(1, Ordering::SeqCst);
-        let state = StackState::new(id, name.to_string());
+        // Create new view (defaults to Shared, no parent for backward compat)
+        let id = self.next_view_id.fetch_add(1, Ordering::SeqCst);
+        let state = ViewState::new(id, name.to_string());
 
         // Save it
         {
-            let mut table = self.txn.open_table(STACKS)?;
-            let bytes = serialize_stack_state(&state);
+            let mut table = self.txn.open_table(VIEWS)?;
+            let bytes = serialize_view_state(&state);
             table.insert(name, bytes.as_slice())?;
         }
 
         Ok(state)
     }
 
-    fn create_stack(
+    fn create_view(
         &mut self,
         name: &str,
-        kind: StackKind,
+        kind: ViewScope,
         parent: Option<u64>,
-    ) -> PristineResult<StackState> {
-        // Check if stack already exists
+    ) -> PristineResult<ViewState> {
+        // Check if view already exists
         {
-            let table = self.txn.open_table(STACKS)?;
+            let table = self.txn.open_table(VIEWS)?;
             if table.get(name)?.is_some() {
-                return Err(PristineError::StackAlreadyExists {
+                return Err(PristineError::ViewAlreadyExists {
                     name: name.to_string(),
                 });
             }
@@ -587,15 +521,15 @@ impl<'a> MutTxnT for WriteTxn<'a> {
 
         // Validate parent exists if specified, and detect cycles
         if let Some(parent_id) = parent {
-            let parent_stack = StackTxnT::get_stack_by_id(self, parent_id)?.ok_or_else(|| {
-                PristineError::StackNotFound {
-                    name: format!("parent stack id={}", parent_id),
+            let parent_view = ViewTxnT::get_view_by_id(self, parent_id)?.ok_or_else(|| {
+                PristineError::ViewNotFound {
+                    name: format!("parent view id={}", parent_id),
                 }
             })?;
 
             // Cycle detection: walk the parent chain from the proposed parent
             // upward. If we ever encounter our own (not-yet-allocated) name,
-            // there's a cycle. Since the stack doesn't exist yet, we only need
+            // there's a cycle. Since the view doesn't exist yet, we only need
             // to check that the parent chain terminates without revisiting
             // `parent_id` — which is guaranteed as long as the existing graph
             // is acyclic and we're adding a leaf.
@@ -607,16 +541,16 @@ impl<'a> MutTxnT for WriteTxn<'a> {
             // walk as a safety check.
             let mut visited = std::collections::HashSet::new();
             visited.insert(parent_id);
-            let mut cursor = parent_stack.parent;
+            let mut cursor = parent_view.parent;
             while let Some(ancestor_id) = cursor {
                 if !visited.insert(ancestor_id) {
                     // We've seen this ID before — cycle detected in existing chain
-                    return Err(PristineError::StackCycleDetected {
+                    return Err(PristineError::ViewCycleDetected {
                         name: name.to_string(),
-                        parent_name: parent_stack.name.clone(),
+                        parent_name: parent_view.name.clone(),
                     });
                 }
-                match StackTxnT::get_stack_by_id(self, ancestor_id)? {
+                match ViewTxnT::get_view_by_id(self, ancestor_id)? {
                     Some(ancestor) => cursor = ancestor.parent,
                     None => break, // Broken chain — parent doesn't exist (shouldn't happen)
                 }
@@ -624,13 +558,13 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         }
 
         // Allocate ID and create state
-        let id = self.next_stack_id.fetch_add(1, Ordering::SeqCst);
-        let state = StackState::with_kind(id, name.to_string(), kind, parent);
+        let id = self.next_view_id.fetch_add(1, Ordering::SeqCst);
+        let state = ViewState::with_scope(id, name.to_string(), kind, parent);
 
         // Save it
         {
-            let mut table = self.txn.open_table(STACKS)?;
-            let bytes = serialize_stack_state(&state);
+            let mut table = self.txn.open_table(VIEWS)?;
+            let bytes = serialize_view_state(&state);
             table.insert(name, bytes.as_slice())?;
         }
 
@@ -639,41 +573,41 @@ impl<'a> MutTxnT for WriteTxn<'a> {
 
     fn put_change(
         &mut self,
-        stack: &mut StackState,
+        view: &mut ViewState,
         change_id: NodeId,
         change_hash: &Hash,
     ) -> PristineResult<u64> {
-        let seq = stack.change_count;
+        let seq = view.change_count;
 
         // Add to change log
         {
-            let mut table = self.txn.open_table(STACK_CHANGES)?;
-            let key = encode_stack_seq(stack.id, seq);
+            let mut table = self.txn.open_table(VIEW_CHANGES)?;
+            let key = encode_view_seq(view.id, seq);
             table.insert(&key, change_id.get())?;
         }
 
         // Add reverse mapping
         {
-            let mut table = self.txn.open_table(REV_STACK_CHANGES)?;
-            let key = encode_stack_seq(stack.id, change_id.get());
+            let mut table = self.txn.open_table(REV_VIEW_CHANGES)?;
+            let key = encode_view_seq(view.id, change_id.get());
             table.insert(&key, seq)?;
         }
 
         // Update merkle state
-        stack.state = stack.state.next(change_hash);
-        stack.change_count += 1;
+        view.state = view.state.next(change_hash);
+        view.change_count += 1;
 
         // Store the merkle state at this sequence
         {
             let mut table = self.txn.open_table(TAGS)?;
-            let key = encode_stack_seq(stack.id, seq);
-            table.insert(&key, stack.state.as_bytes())?;
+            let key = encode_view_seq(view.id, seq);
+            table.insert(&key, view.state.as_bytes())?;
         }
 
         // Store state -> sequence mapping
         {
             let mut table = self.txn.open_table(STATES)?;
-            let key = encode_stack_merkle(stack.id, stack.state.as_bytes());
+            let key = encode_view_merkle(view.id, view.state.as_bytes());
             table.insert(&key, seq)?;
         }
 
@@ -682,14 +616,14 @@ impl<'a> MutTxnT for WriteTxn<'a> {
 
     fn del_change(
         &mut self,
-        stack: &mut StackState,
+        view: &mut ViewState,
         change_id: NodeId,
         _change_hash: &Hash,
     ) -> PristineResult<Option<u64>> {
         // Find the sequence number for this change
         let seq = {
-            let table = self.txn.open_table(REV_STACK_CHANGES)?;
-            let key = encode_stack_seq(stack.id, change_id.get());
+            let table = self.txn.open_table(REV_VIEW_CHANGES)?;
+            let key = encode_view_seq(view.id, change_id.get());
             let result = table.get(&key)?;
             match result {
                 Some(value) => {
@@ -697,39 +631,39 @@ impl<'a> MutTxnT for WriteTxn<'a> {
                     drop(value);
                     v
                 }
-                None => return Ok(None), // Change not in this stack
+                None => return Ok(None), // Change not in this view
             }
         };
 
-        // Remove from STACK_CHANGES
+        // Remove from VIEW_CHANGES
         {
-            let mut table = self.txn.open_table(STACK_CHANGES)?;
-            let key = encode_stack_seq(stack.id, seq);
+            let mut table = self.txn.open_table(VIEW_CHANGES)?;
+            let key = encode_view_seq(view.id, seq);
             table.remove(&key)?;
         }
 
-        // Remove from REV_STACK_CHANGES
+        // Remove from REV_VIEW_CHANGES
         {
-            let mut table = self.txn.open_table(REV_STACK_CHANGES)?;
-            let key = encode_stack_seq(stack.id, change_id.get());
+            let mut table = self.txn.open_table(REV_VIEW_CHANGES)?;
+            let key = encode_view_seq(view.id, change_id.get());
             table.remove(&key)?;
         }
 
         // Remove from TAGS (the merkle state at this sequence)
         {
             let mut table = self.txn.open_table(TAGS)?;
-            let key = encode_stack_seq(stack.id, seq);
+            let key = encode_view_seq(view.id, seq);
             table.remove(&key)?;
         }
 
         // Shift all subsequent changes down by 1
         // We need to update sequences from seq+1 to change_count-1
-        let original_count = stack.change_count;
+        let original_count = view.change_count;
         for s in (seq + 1)..original_count {
             // Get the change_id at this sequence
             let cid = {
-                let table = self.txn.open_table(STACK_CHANGES)?;
-                let key = encode_stack_seq(stack.id, s);
+                let table = self.txn.open_table(VIEW_CHANGES)?;
+                let key = encode_view_seq(view.id, s);
                 let result = table.get(&key)?;
                 match result {
                     Some(v) => {
@@ -743,35 +677,35 @@ impl<'a> MutTxnT for WriteTxn<'a> {
 
             // Remove old entry
             {
-                let mut table = self.txn.open_table(STACK_CHANGES)?;
-                let key = encode_stack_seq(stack.id, s);
+                let mut table = self.txn.open_table(VIEW_CHANGES)?;
+                let key = encode_view_seq(view.id, s);
                 table.remove(&key)?;
             }
 
             // Insert at new sequence (s - 1)
             {
-                let mut table = self.txn.open_table(STACK_CHANGES)?;
-                let key = encode_stack_seq(stack.id, s - 1);
+                let mut table = self.txn.open_table(VIEW_CHANGES)?;
+                let key = encode_view_seq(view.id, s - 1);
                 table.insert(&key, cid.get())?;
             }
 
             // Update reverse mapping
             {
-                let mut table = self.txn.open_table(REV_STACK_CHANGES)?;
-                let key = encode_stack_seq(stack.id, cid.get());
+                let mut table = self.txn.open_table(REV_VIEW_CHANGES)?;
+                let key = encode_view_seq(view.id, cid.get());
                 table.insert(&key, s - 1)?;
             }
         }
 
         // Decrement change count
-        stack.change_count -= 1;
+        view.change_count -= 1;
 
         // Recompute merkle state from scratch
-        stack.state = Merkle::ZERO;
-        for s in 0..stack.change_count {
+        view.state = Merkle::ZERO;
+        for s in 0..view.change_count {
             let cid = {
-                let table = self.txn.open_table(STACK_CHANGES)?;
-                let key = encode_stack_seq(stack.id, s);
+                let table = self.txn.open_table(VIEW_CHANGES)?;
+                let key = encode_view_seq(view.id, s);
                 let result = table.get(&key)?;
                 match result {
                     Some(v) => {
@@ -787,19 +721,19 @@ impl<'a> MutTxnT for WriteTxn<'a> {
                 .get_external(cid)?
                 .ok_or_else(|| PristineError::ChangeNotFound { id: cid.get() })?;
 
-            stack.state = stack.state.next(&hash);
+            view.state = view.state.next(&hash);
 
             // Update TAGS with the new merkle state at this sequence
             {
                 let mut table = self.txn.open_table(TAGS)?;
-                let key = encode_stack_seq(stack.id, s);
-                table.insert(&key, stack.state.as_bytes())?;
+                let key = encode_view_seq(view.id, s);
+                table.insert(&key, view.state.as_bytes())?;
             }
 
             // Update STATES mapping
             {
                 let mut table = self.txn.open_table(STATES)?;
-                let key = encode_stack_merkle(stack.id, stack.state.as_bytes());
+                let key = encode_view_merkle(view.id, view.state.as_bytes());
                 table.insert(&key, s)?;
             }
         }
@@ -809,21 +743,21 @@ impl<'a> MutTxnT for WriteTxn<'a> {
 
     fn reinsert_change(
         &mut self,
-        stack: &mut StackState,
+        view: &mut ViewState,
         change_id: NodeId,
         change_hash: &Hash,
         at_sequence: u64,
     ) -> PristineResult<()> {
         // Clamp sequence to valid range
-        let insert_at = at_sequence.min(stack.change_count);
+        let insert_at = at_sequence.min(view.change_count);
 
         // Shift all changes from insert_at onwards up by 1
         // Work backwards to avoid overwriting
-        for s in (insert_at..stack.change_count).rev() {
+        for s in (insert_at..view.change_count).rev() {
             // Get the change_id at this sequence
             let cid = {
-                let table = self.txn.open_table(STACK_CHANGES)?;
-                let key = encode_stack_seq(stack.id, s);
+                let table = self.txn.open_table(VIEW_CHANGES)?;
+                let key = encode_view_seq(view.id, s);
                 let result = table.get(&key)?;
                 match result {
                     Some(v) => {
@@ -837,49 +771,49 @@ impl<'a> MutTxnT for WriteTxn<'a> {
 
             // Remove old entry
             {
-                let mut table = self.txn.open_table(STACK_CHANGES)?;
-                let key = encode_stack_seq(stack.id, s);
+                let mut table = self.txn.open_table(VIEW_CHANGES)?;
+                let key = encode_view_seq(view.id, s);
                 table.remove(&key)?;
             }
 
             // Insert at new sequence (s + 1)
             {
-                let mut table = self.txn.open_table(STACK_CHANGES)?;
-                let key = encode_stack_seq(stack.id, s + 1);
+                let mut table = self.txn.open_table(VIEW_CHANGES)?;
+                let key = encode_view_seq(view.id, s + 1);
                 table.insert(&key, cid.get())?;
             }
 
             // Update reverse mapping
             {
-                let mut table = self.txn.open_table(REV_STACK_CHANGES)?;
-                let key = encode_stack_seq(stack.id, cid.get());
+                let mut table = self.txn.open_table(REV_VIEW_CHANGES)?;
+                let key = encode_view_seq(view.id, cid.get());
                 table.insert(&key, s + 1)?;
             }
         }
 
         // Insert the new change at the specified position
         {
-            let mut table = self.txn.open_table(STACK_CHANGES)?;
-            let key = encode_stack_seq(stack.id, insert_at);
+            let mut table = self.txn.open_table(VIEW_CHANGES)?;
+            let key = encode_view_seq(view.id, insert_at);
             table.insert(&key, change_id.get())?;
         }
 
         // Add reverse mapping
         {
-            let mut table = self.txn.open_table(REV_STACK_CHANGES)?;
-            let key = encode_stack_seq(stack.id, change_id.get());
+            let mut table = self.txn.open_table(REV_VIEW_CHANGES)?;
+            let key = encode_view_seq(view.id, change_id.get());
             table.insert(&key, insert_at)?;
         }
 
         // Increment change count
-        stack.change_count += 1;
+        view.change_count += 1;
 
         // Recompute merkle state from scratch
-        stack.state = Merkle::ZERO;
-        for s in 0..stack.change_count {
+        view.state = Merkle::ZERO;
+        for s in 0..view.change_count {
             let cid = {
-                let table = self.txn.open_table(STACK_CHANGES)?;
-                let key = encode_stack_seq(stack.id, s);
+                let table = self.txn.open_table(VIEW_CHANGES)?;
+                let key = encode_view_seq(view.id, s);
                 let result = table.get(&key)?;
                 match result {
                     Some(v) => {
@@ -898,19 +832,19 @@ impl<'a> MutTxnT for WriteTxn<'a> {
                     .ok_or_else(|| PristineError::ChangeNotFound { id: cid.get() })?
             };
 
-            stack.state = stack.state.next(&hash);
+            view.state = view.state.next(&hash);
 
             // Update TAGS with the new merkle state at this sequence
             {
                 let mut table = self.txn.open_table(TAGS)?;
-                let key = encode_stack_seq(stack.id, s);
-                table.insert(&key, stack.state.as_bytes())?;
+                let key = encode_view_seq(view.id, s);
+                table.insert(&key, view.state.as_bytes())?;
             }
 
             // Update STATES mapping
             {
                 let mut table = self.txn.open_table(STATES)?;
-                let key = encode_stack_merkle(stack.id, stack.state.as_bytes());
+                let key = encode_view_merkle(view.id, view.state.as_bytes());
                 table.insert(&key, s)?;
             }
         }
@@ -918,59 +852,55 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         Ok(())
     }
 
-    fn update_stack(&mut self, stack: &StackState) -> PristineResult<()> {
-        let mut table = self.txn.open_table(STACKS)?;
-        let bytes = serialize_stack_state(stack);
-        table.insert(stack.name.as_str(), bytes.as_slice())?;
+    fn update_view(&mut self, view: &ViewState) -> PristineResult<()> {
+        let mut table = self.txn.open_table(VIEWS)?;
+        let bytes = serialize_view_state(view);
+        table.insert(view.name.as_str(), bytes.as_slice())?;
         Ok(())
     }
 
-    fn del_stack(&mut self, stack: &StackState) -> PristineResult<()> {
-        // Guard: Shared stacks cannot be deleted (they own global GRAPH edges).
-        if stack.kind.is_shared() {
-            return Err(PristineError::CannotDeleteSharedStack {
-                name: stack.name.clone(),
+    fn del_view(&mut self, view: &ViewState) -> PristineResult<()> {
+        // Guard: Shared views cannot be deleted (they own global GRAPH edges).
+        if view.kind.is_shared() {
+            return Err(PristineError::CannotDeleteSharedView {
+                name: view.name.clone(),
             });
         }
 
-        // Guard: Check for child stacks that reference this stack as parent.
+        // Guard: Check for child views that reference this view as parent.
         // Deleting a parent would leave children with a dangling parent pointer.
-        let children = StackTxnT::get_children_stacks(self, stack.id)?;
+        let children = ViewTxnT::get_children_views(self, view.id)?;
         if !children.is_empty() {
             let child_names: Vec<String> = children.iter().map(|c| c.name.clone()).collect();
-            return Err(PristineError::StackHasChildren {
-                name: stack.name.clone(),
+            return Err(PristineError::ViewHasChildren {
+                name: view.name.clone(),
                 children: child_names,
             });
         }
 
-        // Cascade-delete all STACK_GRAPH edges for this local workspace.
-        // This is the key operation that ensures zero orphaned edges.
-        self.del_stack_graph_prefix(stack.id)?;
-
-        // Remove from STACKS table
+        // Remove from VIEWS table
         {
-            let mut table = self.txn.open_table(STACKS)?;
-            table.remove(stack.name.as_str())?;
+            let mut table = self.txn.open_table(VIEWS)?;
+            table.remove(view.name.as_str())?;
         }
 
-        // Remove all change log entries for this stack
+        // Remove all change log entries for this view
         {
-            let mut table = self.txn.open_table(STACK_CHANGES)?;
-            for seq in 0..stack.change_count {
-                let key = encode_stack_seq(stack.id, seq);
+            let mut table = self.txn.open_table(VIEW_CHANGES)?;
+            for seq in 0..view.change_count {
+                let key = encode_view_seq(view.id, seq);
                 table.remove(&key)?;
             }
         }
 
         // Remove all reverse change log entries
         {
-            let mut rev_table = self.txn.open_table(REV_STACK_CHANGES)?;
-            let table = self.txn.open_table(STACK_CHANGES)?;
-            for seq in 0..stack.change_count {
-                let key = encode_stack_seq(stack.id, seq);
+            let mut rev_table = self.txn.open_table(REV_VIEW_CHANGES)?;
+            let table = self.txn.open_table(VIEW_CHANGES)?;
+            for seq in 0..view.change_count {
+                let key = encode_view_seq(view.id, seq);
                 if let Some(change_id) = table.get(&key)? {
-                    let rev_key = encode_stack_seq(stack.id, change_id.value());
+                    let rev_key = encode_view_seq(view.id, change_id.value());
                     rev_table.remove(&rev_key)?;
                 }
             }
@@ -980,11 +910,11 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         {
             let mut table = self.txn.open_table(STATES)?;
             let tags_table = self.txn.open_table(TAGS)?;
-            for seq in 0..stack.change_count {
-                let key = encode_stack_seq(stack.id, seq);
+            for seq in 0..view.change_count {
+                let key = encode_view_seq(view.id, seq);
                 if let Some(merkle_bytes) = tags_table.get(&key)? {
                     let merkle = merkle_bytes.value();
-                    let state_key = encode_stack_merkle(stack.id, merkle);
+                    let state_key = encode_view_merkle(view.id, merkle);
                     table.remove(&state_key)?;
                 }
             }
@@ -993,8 +923,8 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         // Remove all tag entries from TAGS table
         {
             let mut table = self.txn.open_table(TAGS)?;
-            for seq in 0..stack.change_count {
-                let key = encode_stack_seq(stack.id, seq);
+            for seq in 0..view.change_count {
+                let key = encode_view_seq(view.id, seq);
                 table.remove(&key)?;
             }
         }

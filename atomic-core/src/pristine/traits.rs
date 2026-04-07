@@ -23,8 +23,8 @@
 //!          ┌────────────────────┼────────────────────┐
 //!          ▼                    ▼                    ▼
 //! ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-//! │   StackTxnT     │  │    TreeTxnT     │  │   GraphTxnT     │
-//! │ (Stack/view     │  │ (File tree      │  │ (Base trait:    │
+//! │   ViewTxnT      │  │    TreeTxnT     │  │   GraphTxnT     │
+//! │ (View           │  │ (File tree      │  │ (Base trait:    │
 //! │  operations)    │  │  operations)    │  │  graph queries) │
 //! └─────────────────┘  └─────────────────┘  └─────────────────┘
 //!          │                    │                    │
@@ -39,26 +39,26 @@
 //!                      └─────────────────┘
 //! ```
 //!
-//! # Stacks: A Different Mental Model
+//! # Views: A Different Mental Model
 //!
-//! Unlike Git branches which fork history, Atomic **Stacks** are views of the
+//! Unlike Git branches which fork history, Atomic **Views** are perspectives of the
 //! same underlying graph. Think of them like database views or saved queries:
 //!
-//! | Property | Git Branch | Atomic Stack |
-//! |----------|------------|--------------|
+//! | Property | Git Branch | Atomic View |
+//! |----------|------------|-------------|
 //! | Data model | Pointer to commit | Sequence of applied changes |
 //! | State tracking | HEAD commit hash | Merkle hash of change sequence |
 //! | Switching | Checkout (changes files) | Just changes view context |
 //! | "Merging" | 3-way merge of histories | Apply missing changes |
 //! | Storage cost | Full history per branch | Shared graph, only metadata differs |
 //!
-//! When you create a new stack, you're not forking data—you're creating a new
+//! When you create a new view, you're not forking data—you're creating a new
 //! perspective on the same repository graph.
 //!
 //! # Usage Example
 //!
 //! ```ignore
-//! use atomic_core::pristine::{GraphTxnT, StackTxnT, TreeTxnT, MutTxnT};
+//! use atomic_core::pristine::{GraphTxnT, ViewTxnT, TreeTxnT, MutTxnT};
 //!
 //! // Reading from the database (any transaction type)
 //! fn count_files<T: TreeTxnT>(txn: &T) -> PristineResult<usize> {
@@ -71,8 +71,8 @@
 //! }
 //!
 //! // Writing to the database (requires MutTxnT)
-//! fn create_stack<T: MutTxnT>(txn: &mut T, name: &str) -> PristineResult<StackState> {
-//!     txn.open_or_create_stack(name)
+//! fn create_view<T: MutTxnT>(txn: &mut T, name: &str) -> PristineResult<ViewState> {
+//!     txn.open_or_create_view(name)
 //! }
 //! ```
 //!
@@ -327,7 +327,7 @@ pub trait GraphTxnT {
     ///
     /// # Use Case
     ///
-    /// When applying a change to a stack, we need to know whether the
+    /// When applying a change to a view, we need to know whether the
     /// change's edges already exist in the global GRAPH (so we can skip
     /// redundant hunk application).  Previously this was done by loading
     /// the change file and probing individual vertices — fragile and
@@ -342,20 +342,20 @@ pub trait GraphTxnT {
     fn has_change_in_graph(&self, change_id: NodeId) -> Result<bool, PristineError>;
 }
 
-// StackState - Stack Metadata
+// ViewState - View Metadata
 
-/// Stack state information
+/// View state information
 ///
-/// A Stack represents a **view** of the repository graph. Unlike Git branches
-/// which point to a commit and represent a fork of history, a Stack is an
+/// A View represents a **perspective** of the repository graph. Unlike Git branches
+/// which point to a commit and represent a fork of history, a View is an
 /// ordered sequence of changes applied to the same shared graph.
 ///
 /// # Key Properties
 ///
-/// - **id**: Repository-local identifier for the stack
+/// - **id**: Repository-local identifier for the view
 /// - **name**: Human-readable name (like "main", "feature-x")
 /// - **state**: Merkle hash representing the cumulative state
-/// - **change_count**: Number of changes applied to this stack
+/// - **change_count**: Number of changes applied to this view
 ///
 /// # Merkle State
 ///
@@ -366,192 +366,191 @@ pub trait GraphTxnT {
 /// state_n = Hash(state_{n-1} || change_hash_n)
 /// ```
 ///
-/// This allows efficient comparison of stack states:
-/// - Same state → stacks have identical changes in identical order
-/// - Different state → stacks differ somehow
+/// This allows efficient comparison of view states:
+/// - Same state → views have identical changes in identical order
+/// - Different state → views differ somehow
 ///
 /// # Example
 ///
 /// ```
-/// use atomic_core::pristine::StackState;
+/// use atomic_core::pristine::ViewState;
 /// use atomic_core::types::Merkle;
 ///
-/// let stack = StackState::new(1, "feature-login".to_string());
-/// assert_eq!(stack.name, "feature-login");
-/// assert_eq!(stack.change_count, 0);
-/// assert_eq!(stack.state, Merkle::ZERO);
+/// let view = ViewState::new(1, "feature-login".to_string());
+/// assert_eq!(view.name, "feature-login");
+/// assert_eq!(view.change_count, 0);
+/// assert_eq!(view.state, Merkle::ZERO);
 /// ```
-/// Controls the lifecycle and edge-storage strategy for a stack.
+/// Controls the lifecycle and change-filter strategy for a view.
 ///
-/// # Two-Tier Graph Model
+/// # View Scopes
 ///
-/// Atomic uses a two-tier graph model where edges live in different storage
-/// locations depending on the stack kind:
+/// Atomic uses view scopes to control change visibility:
 ///
-/// - **Shared** stacks (dev, release, main) write edges to the global `GRAPH`
-///   table. These edges are visible to all stacks and persist permanently.
-/// - **Local** stacks (feature, bug, experiment) write edges to the
-///   per-stack `STACK_GRAPH` table. These edges are only visible through the
-///   overlay chain and are cascade-deleted when the stack is deleted.
+/// - **Shared** views (dev, release, main) write edges to the global `GRAPH`
+///   table. These edges are visible to all views and persist permanently.
+/// - **Draft** views (feature, bug, experiment) record changes to `GRAPH`
+///   immediately but only expose them through this view's filter.
+///   Can be deleted freely.
 ///
-/// # Overlay Chain
+/// # View Chain
 ///
-/// An local workspace's effective view is the union of its own `STACK_GRAPH`,
-/// its parent's effective view (recursively), down to the global `GRAPH`:
+/// A draft view's effective content is determined by its own changes plus
+/// those of its ancestor views:
 ///
 /// ```text
-/// feature-login view = STACK_GRAPH[feature-login]
-///                     ∪ STACK_GRAPH[service-auth]   (parent)
-///                     ∪ GRAPH                        (dev is Shared → stop)
+/// feature-login view = changes[feature-login]
+///                     ∪ changes[service-auth]   (parent)
+///                     ∪ GRAPH                    (dev is Shared → stop)
 /// ```
 ///
 /// # Example
 ///
 /// ```
-/// use atomic_core::pristine::StackKind;
+/// use atomic_core::pristine::ViewScope;
 ///
-/// let kind = StackKind::Local;
-/// assert_eq!(kind as u8, 0);
-/// assert!(!kind.is_shared());
-/// assert!(kind.is_local());
+/// let scope = ViewScope::Draft;
+/// assert_eq!(scope as u8, 0);
+/// assert!(!scope.is_shared());
+/// assert!(scope.is_draft());
 ///
-/// let kind = StackKind::Shared;
-/// assert_eq!(kind as u8, 1);
-/// assert!(kind.is_shared());
+/// let scope = ViewScope::Shared;
+/// assert_eq!(scope as u8, 1);
+/// assert!(scope.is_shared());
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
 #[repr(u8)]
-pub enum StackKind {
-    /// Ephemeral staging area (feature, bug, experiment).
+pub enum ViewScope {
+    /// Personal workspace (feature, bug, experiment).
     ///
-    /// Edges are stored in `STACK_GRAPH[(stack_id, vertex)]`.
-    /// Can be deleted cleanly at any time via cascade.
-    Local = 0,
+    /// Changes are recorded to GRAPH immediately but only visible through
+    /// this view's filter. Can be deleted freely.
+    Draft = 0,
 
-    /// Permanent promoted history (dev, release, main).
+    /// Collaborative view (dev, release, main).
     ///
-    /// Edges are stored in the global `GRAPH[vertex]`.
-    /// Deletion is restricted; these stacks are the canonical record.
+    /// Changes inserted here become part of the base filter.
+    /// Deletion is restricted.
     #[default]
     Shared = 1,
 }
 
-impl StackKind {
-    /// Check if this is a shared stack.
+impl ViewScope {
+    /// Check if this is a shared view.
     #[inline]
     pub fn is_shared(self) -> bool {
         self == Self::Shared
     }
 
-    /// Check if this is an local workspace.
+    /// Check if this is a draft view.
     #[inline]
-    pub fn is_local(self) -> bool {
-        self == Self::Local
+    pub fn is_draft(self) -> bool {
+        self == Self::Draft
     }
 
     /// Convert from a raw u8 value.
     ///
-    /// Returns `None` if the value is not a valid `StackKind`.
+    /// Returns `None` if the value is not a valid `ViewScope`.
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
-            0 => Some(Self::Local),
+            0 => Some(Self::Draft),
             1 => Some(Self::Shared),
             _ => None,
         }
     }
 }
 
-impl std::fmt::Display for StackKind {
+impl std::fmt::Display for ViewScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Local => write!(f, "local"),
+            Self::Draft => write!(f, "draft"),
             Self::Shared => write!(f, "shared"),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StackState {
-    /// Stack ID (internal, repository-local)
+pub struct ViewState {
+    /// View ID (internal, repository-local)
     ///
-    /// This is an auto-incrementing identifier assigned when the stack is created.
+    /// This is an auto-incrementing identifier assigned when the view is created.
     /// It's used as part of the key in various tables.
     pub id: u64,
 
-    /// Stack name (human-readable)
+    /// View name (human-readable)
     ///
     /// This is the user-facing name like "main", "develop", or "feature-x".
-    /// Stack names must be unique within a repository.
+    /// View names must be unique within a repository.
     pub name: String,
 
     /// Current Merkle state (cumulative hash of applied changes)
     ///
-    /// This hash uniquely identifies the state of the stack. Two stacks with
+    /// This hash uniquely identifies the state of the view. Two views with
     /// the same Merkle state have the exact same changes in the exact same order.
     pub state: Merkle,
 
-    /// Number of changes applied to this stack
+    /// Number of changes applied to this view
     ///
     /// This is the sequence number of the next change to be applied.
     /// If change_count is 5, changes 0-4 have been applied.
     pub change_count: u64,
 
-    /// Stack kind (Local or Shared)
+    /// View scope (Draft or Shared)
     ///
-    /// Controls where edges are stored when changes are applied:
-    /// - `Shared`: edges go to the global `GRAPH` table (permanent)
-    /// - `Local`: edges go to `STACK_GRAPH[(stack_id, vertex)]` (ephemeral)
-    pub kind: StackKind,
+    /// Controls change visibility:
+    /// - `Shared`: changes become part of the base filter (permanent)
+    /// - `Draft`: changes are recorded to GRAPH but only visible through this view's filter
+    pub kind: ViewScope,
 
-    /// Parent stack ID
+    /// Parent view ID
     ///
-    /// The stack this one was branched from. Used to build the overlay chain
-    /// for graph traversal. Every stack except the root has a parent.
+    /// The view this one was created from. Used to build the view chain
+    /// for change filtering. Every view except the root has a parent.
     ///
-    /// - `None`: This is the root stack (e.g., "main"). Only one stack should
+    /// - `None`: This is the root view (e.g., "main"). Only one view should
     ///   have `parent = None` — the root of the hierarchy.
-    /// - `Some(id)`: The parent stack's internal ID. The parent can be either
-    ///   Shared or Local. For example, `feature-login` might have
+    /// - `Some(id)`: The parent view's internal ID. The parent can be either
+    ///   Shared or Draft. For example, `feature-login` might have
     ///   `parent = Some(service_auth_id)` which itself has
     ///   `parent = Some(dev_id)`.
     pub parent: Option<u64>,
 }
 
-impl Default for StackState {
+impl Default for ViewState {
     fn default() -> Self {
         Self {
             id: 0,
             name: String::new(),
             state: Merkle::ZERO,
             change_count: 0,
-            kind: StackKind::Shared,
+            kind: ViewScope::Shared,
             parent: None,
         }
     }
 }
 
-impl StackState {
-    /// Create a new shared stack state with the given name and no parent.
+impl ViewState {
+    /// Create a new shared view state with the given name and no parent.
     ///
     /// This is the default constructor for backward compatibility. New code
-    /// should prefer [`StackState::with_kind`] for explicit kind/parent.
+    /// should prefer [`ViewState::with_scope`] for explicit scope/parent.
     ///
     /// # Arguments
     ///
-    /// * `id` - The internal stack identifier
-    /// * `name` - The human-readable stack name
+    /// * `id` - The internal view identifier
+    /// * `name` - The human-readable view name
     ///
     /// # Example
     ///
     /// ```
-    /// use atomic_core::pristine::StackState;
+    /// use atomic_core::pristine::ViewState;
     ///
-    /// let stack = StackState::new(1, "main".to_string());
-    /// assert_eq!(stack.id, 1);
-    /// assert_eq!(stack.name, "main");
-    /// assert_eq!(stack.change_count, 0);
-    /// assert!(stack.kind.is_shared());
-    /// assert!(stack.parent.is_none());
+    /// let view = ViewState::new(1, "main".to_string());
+    /// assert_eq!(view.id, 1);
+    /// assert_eq!(view.name, "main");
+    /// assert_eq!(view.change_count, 0);
+    /// assert!(view.kind.is_shared());
+    /// assert!(view.parent.is_none());
     /// ```
     pub fn new(id: u64, name: String) -> Self {
         Self {
@@ -559,36 +558,36 @@ impl StackState {
             name,
             state: Merkle::ZERO,
             change_count: 0,
-            kind: StackKind::Shared,
+            kind: ViewScope::Shared,
             parent: None,
         }
     }
 
-    /// Create a new stack with explicit kind and parent.
+    /// Create a new view with explicit scope and parent.
     ///
     /// # Arguments
     ///
-    /// * `id` - The internal stack identifier
-    /// * `name` - The human-readable stack name
-    /// * `kind` - Whether this stack is Local or Shared
-    /// * `parent` - The parent stack's ID (`None` for the root stack)
+    /// * `id` - The internal view identifier
+    /// * `name` - The human-readable view name
+    /// * `kind` - Whether this view is Draft or Shared
+    /// * `parent` - The parent view's ID (`None` for the root view)
     ///
     /// # Example
     ///
     /// ```
-    /// use atomic_core::pristine::{StackState, StackKind};
+    /// use atomic_core::pristine::{ViewState, ViewScope};
     ///
-    /// // Create a shared "dev" stack parented on "main" (id=1)
-    /// let dev = StackState::with_kind(2, "dev".to_string(), StackKind::Shared, Some(1));
+    /// // Create a shared "dev" view parented on "main" (id=1)
+    /// let dev = ViewState::with_scope(2, "dev".to_string(), ViewScope::Shared, Some(1));
     /// assert!(dev.kind.is_shared());
     /// assert_eq!(dev.parent, Some(1));
     ///
-    /// // Create a local "feature" stack parented on "dev" (id=2)
-    /// let feature = StackState::with_kind(3, "feature".to_string(), StackKind::Local, Some(2));
-    /// assert!(feature.kind.is_local());
+    /// // Create a draft "feature" view parented on "dev" (id=2)
+    /// let feature = ViewState::with_scope(3, "feature".to_string(), ViewScope::Draft, Some(2));
+    /// assert!(feature.kind.is_draft());
     /// assert_eq!(feature.parent, Some(2));
     /// ```
-    pub fn with_kind(id: u64, name: String, kind: StackKind, parent: Option<u64>) -> Self {
+    pub fn with_scope(id: u64, name: String, kind: ViewScope, parent: Option<u64>) -> Self {
         Self {
             id,
             name,
@@ -599,33 +598,33 @@ impl StackState {
         }
     }
 
-    /// Check if the stack has any changes
+    /// Check if the view has any changes
     ///
     /// # Returns
     ///
-    /// `true` if the stack has no changes applied.
+    /// `true` if the view has no changes applied.
     pub fn is_empty(&self) -> bool {
         self.change_count == 0
     }
 
-    /// Check if this is the root stack (no parent).
+    /// Check if this is the root view (no parent).
     #[inline]
     pub fn is_root(&self) -> bool {
         self.parent.is_none()
     }
 }
 
-// StackTxnT - Stack Operations
+// ViewTxnT - View Operations
 
-/// Stack operations
+/// View operations
 ///
-/// This trait provides read access to stack metadata and change logs.
-/// Stacks are views of the graph that track which changes have been applied
+/// This trait provides read access to view metadata and change logs.
+/// Views are perspectives of the graph that track which changes have been applied
 /// and in what order.
 ///
-/// # Stack vs Branch Conceptual Model
+/// # View vs Branch Conceptual Model
 ///
-/// Think of a Stack like a playlist of songs (changes) from a shared music
+/// Think of a View like a playlist of songs (changes) from a shared music
 /// library (the graph). Different playlists can contain different songs in
 /// different orders, but they all reference the same library. "Merging"
 /// playlists means adding songs from one playlist that the other doesn't have.
@@ -633,14 +632,14 @@ impl StackState {
 /// # Example
 ///
 /// ```ignore
-/// fn print_stack_info<T: StackTxnT>(txn: &T, name: &str) -> PristineResult<()> {
-///     if let Some(stack) = txn.get_stack(name)? {
-///         println!("Stack: {}", stack.name);
-///         println!("Changes: {}", stack.change_count);
-///         println!("State: {}", stack.state);
+/// fn print_view_info<T: ViewTxnT>(txn: &T, name: &str) -> PristineResult<()> {
+///     if let Some(view) = txn.get_view(name)? {
+///         println!("View: {}", view.name);
+///         println!("Changes: {}", view.change_count);
+///         println!("State: {}", view.state);
 ///
 ///         // List recent changes
-///         for result in txn.iter_changes(&stack, 0)? {
+///         for result in txn.iter_changes(&view, 0)? {
 ///             let (seq, change_id, merkle) = result?;
 ///             let hash = txn.get_external(change_id)?.unwrap();
 ///             println!("  #{}: {}", seq, hash);
@@ -649,67 +648,67 @@ impl StackState {
 ///     Ok(())
 /// }
 /// ```
-pub trait StackTxnT: GraphTxnT {
-    /// Look up a stack by its internal ID.
+pub trait ViewTxnT: GraphTxnT {
+    /// Look up a view by its internal ID.
     ///
-    /// This is used to resolve parent references when walking the overlay
-    /// chain. Unlike [`Self::get_stack`] which looks up by name, this looks up
-    /// by the internal numeric ID stored in `StackState::id`.
+    /// This is used to resolve parent references when walking the view
+    /// chain. Unlike [`Self::get_view`] which looks up by name, this looks up
+    /// by the internal numeric ID stored in `ViewState::id`.
     ///
     /// # Arguments
     ///
-    /// * `id` - The internal stack identifier
+    /// * `id` - The internal view identifier
     ///
     /// # Returns
     ///
-    /// * `Ok(Some(state))` - The stack with this ID
-    /// * `Ok(None)` - No stack with this ID
+    /// * `Ok(Some(state))` - The view with this ID
+    /// * `Ok(None)` - No view with this ID
     /// * `Err(_)` - Database error
-    fn get_stack_by_id(&self, id: u64) -> Result<Option<StackState>, PristineError>;
+    fn get_view_by_id(&self, id: u64) -> Result<Option<ViewState>, PristineError>;
 
-    /// Resolve the overlay chain for an local workspace.
+    /// Resolve the view chain for a draft view.
     ///
-    /// Walks the `parent` links from the given stack upward, collecting
-    /// the IDs of each **Local** ancestor. Stops when a **Shared**
-    /// ancestor (or the root) is reached, since Shared stacks read from
-    /// the global `GRAPH`.
+    /// Walks the `parent` links from the given view upward, collecting
+    /// the IDs of each **Draft** ancestor. Stops when a **Shared**
+    /// ancestor (or the root) is reached. Returns the chain of Draft
+    /// ancestor view IDs whose changes should be included in the filter.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The stack to resolve the chain for
+    /// * `view` - The view to resolve the chain for
     ///
     /// # Returns
     ///
-    /// A vector of stack IDs representing the overlay chain, ordered from
-    /// the given stack (most specific) to the last Local ancestor.
+    /// A vector of view IDs representing the view chain, ordered from
+    /// the given view (most specific) to the last Draft ancestor.
     /// The global `GRAPH` is implicitly the base and is not included.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// // feature-login (Local, parent=service-auth)
-    /// // service-auth  (Local, parent=dev)
-    /// // dev           (Shared,   parent=main)
+    /// // feature-login (Draft, parent=service-auth)
+    /// // service-auth  (Draft, parent=dev)
+    /// // dev           (Shared,  parent=main)
     ///
-    /// let chain = txn.resolve_overlay_chain(&feature_login)?;
+    /// let chain = txn.resolve_view_chain(&feature_login)?;
     /// // chain = [feature_login.id, service_auth.id]
     /// // GRAPH is the implicit base (dev is Shared → stop)
     /// ```
-    fn resolve_overlay_chain(&self, stack: &StackState) -> Result<Vec<u64>, PristineError> {
+    fn resolve_view_chain(&self, view: &ViewState) -> Result<Vec<u64>, PristineError> {
         let mut chain: Vec<u64> = Vec::new();
 
-        if stack.kind.is_shared() {
-            // Shared stacks read directly from GRAPH, no overlay needed
+        if view.kind.is_shared() {
+            // Shared views read directly from GRAPH, no chain needed
             return Ok(chain);
         }
 
-        chain.push(stack.id);
+        chain.push(view.id);
 
-        let mut cursor = stack.parent;
+        let mut cursor = view.parent;
         while let Some(parent_id) = cursor {
-            let parent = self.get_stack_by_id(parent_id)?;
+            let parent = self.get_view_by_id(parent_id)?;
             match parent {
-                Some(p) if p.kind.is_local() => {
+                Some(p) if p.kind.is_draft() => {
                     chain.push(p.id);
                     cursor = p.parent;
                 }
@@ -720,151 +719,101 @@ pub trait StackTxnT: GraphTxnT {
         Ok(chain)
     }
 
-    /// Iterate over edges in the stack-scoped graph for a given vertex.
+    /// Find all views that have the given view as their parent.
     ///
-    /// Returns edges from `STACK_GRAPH[(stack_id, vertex)]` that have flags
-    /// within the specified range. This is the per-stack equivalent of
-    /// [`GraphTxnT::iter_adjacent`] which reads from the global `GRAPH`.
-    ///
-    /// # Arguments
-    ///
-    /// * `stack_id` - The local workspace's internal ID
-    /// * `node` - The source vertex
-    /// * `min_flag` - Minimum edge flags (inclusive)
-    /// * `max_flag` - Maximum edge flags (inclusive)
-    ///
-    /// # Returns
-    ///
-    /// An iterator yielding edges that match the flag criteria.
-    fn iter_stack_graph_adjacent(
-        &self,
-        stack_id: u64,
-        node: GraphNode<NodeId>,
-        min_flag: EdgeFlags,
-        max_flag: EdgeFlags,
-    ) -> Result<
-        Box<dyn Iterator<Item = Result<SerializedGraphEdge, PristineError>> + '_>,
-        PristineError,
-    >;
-
-    /// Find all stacks that have the given stack as their parent.
-    ///
-    /// This is used during stack deletion to check for child stacks that
-    /// would be orphaned. A stack with children cannot be deleted without
+    /// This is used during view deletion to check for child views that
+    /// would be orphaned. A view with children cannot be deleted without
     /// first reparenting or deleting its children (unless `--force` is used).
     ///
     /// # Arguments
     ///
-    /// * `parent_id` - The internal ID of the parent stack
+    /// * `parent_id` - The internal ID of the parent view
     ///
     /// # Returns
     ///
-    /// A vector of `StackState` for all stacks whose `parent == Some(parent_id)`.
-    fn get_children_stacks(&self, parent_id: u64) -> Result<Vec<StackState>, PristineError> {
-        // Default implementation: scan all stacks and filter by parent.
-        // Stack counts are typically small (<100), so this is fine.
-        let names = self.list_stacks()?;
+    /// A vector of `ViewState` for all views whose `parent == Some(parent_id)`.
+    fn get_children_views(&self, parent_id: u64) -> Result<Vec<ViewState>, PristineError> {
+        // Default implementation: scan all views and filter by parent.
+        // View counts are typically small (<100), so this is fine.
+        let names = self.list_views()?;
         let mut children = Vec::new();
         for name in names {
-            if let Some(stack) = self.get_stack(&name)? {
-                if stack.parent == Some(parent_id) {
-                    children.push(stack);
+            if let Some(view) = self.get_view(&name)? {
+                if view.parent == Some(parent_id) {
+                    children.push(view);
                 }
             }
         }
         Ok(children)
     }
 
-    /// Collect all unique vertex `(start, end)` positions for a given change
-    /// within a stack's `STACK_GRAPH`.
+    /// Get a view by name
     ///
-    /// This performs a range scan on the `STACK_GRAPH` table to find all
-    /// vertices belonging to a specific change in a specific stack. It is
-    /// used by [`crate::pristine::OverlayTxn`] to implement `find_block` and `find_block_end`
-    /// against the `STACK_GRAPH`.
+    /// Looks up a view by its human-readable name.
     ///
     /// # Arguments
     ///
-    /// * `stack_id` - The local workspace's internal ID
-    /// * `change_id` - The change whose vertices to collect
+    /// * `name` - The view name to look up
     ///
     /// # Returns
     ///
-    /// A vector of `(start, end)` pairs representing vertex byte ranges.
-    /// The pairs are deduplicated but not sorted in any guaranteed order.
-    fn iter_stack_graph_vertices_for_change(
-        &self,
-        stack_id: u64,
-        change_id: u64,
-    ) -> Result<Vec<(u64, u64)>, PristineError>;
-
-    /// Get a stack by name
-    ///
-    /// Looks up a stack by its human-readable name.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The stack name to look up
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Some(state))` - The stack exists
-    /// * `Ok(None)` - No stack with this name
+    /// * `Ok(Some(state))` - The view exists
+    /// * `Ok(None)` - No view with this name
     /// * `Err(_)` - Database error
-    fn get_stack(&self, name: &str) -> Result<Option<StackState>, PristineError>;
+    fn get_view(&self, name: &str) -> Result<Option<ViewState>, PristineError>;
 
-    /// List all stack names
+    /// List all view names
     ///
-    /// Returns a vector of all stack names in the repository.
+    /// Returns a vector of all view names in the repository.
     /// The order is not guaranteed.
     ///
     /// # Returns
     ///
-    /// A vector of stack names, or an empty vector if no stacks exist.
-    fn list_stacks(&self) -> Result<Vec<String>, PristineError>;
+    /// A vector of view names, or an empty vector if no views exist.
+    fn list_views(&self) -> Result<Vec<String>, PristineError>;
 
-    /// Get the current Merkle state for a stack
+    /// Get the current Merkle state for a view
     ///
-    /// This is a convenience method that extracts the state from a StackState.
+    /// This is a convenience method that extracts the state from a ViewState.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The stack to get the state of
+    /// * `view` - The view to get the state of
     ///
     /// # Returns
     ///
     /// The current Merkle state hash.
-    fn stack_state(&self, stack: &StackState) -> Merkle {
-        stack.state
+    fn view_state(&self, view: &ViewState) -> Merkle {
+        view.state
     }
 
-    /// Get the sequence number for a change in a stack
+    /// Get the sequence number for a change in a view
     ///
-    /// Looks up when (at what sequence number) a change was applied to this stack.
+    /// Looks up when (at what sequence number) a change was applied to this view.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The stack to search
+    /// * `view` - The view to search
     /// * `change_id` - The change to look up
     ///
     /// # Returns
     ///
-    /// * `Ok(Some(seq))` - The change is in the stack at this sequence
-    /// * `Ok(None)` - The change is not in this stack
+    /// * `Ok(Some(seq))` - The change is in the view at this sequence
+    /// * `Ok(None)` - The change is not in this view
     /// * `Err(_)` - Database error
     fn get_change_seq(
         &self,
-        stack: &StackState,
+        view: &ViewState,
         change_id: NodeId,
     ) -> Result<Option<u64>, PristineError>;
 
-    /// Get the change at a sequence number in a stack
+    /// Get the change at a sequence number in a view
     ///
     /// Returns the change that was applied at a specific sequence number.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The stack to search
+    /// * `view` - The view to search
     /// * `seq` - The sequence number (0-indexed)
     ///
     /// # Returns
@@ -874,18 +823,18 @@ pub trait StackTxnT: GraphTxnT {
     /// * `Err(_)` - Database error
     fn get_change_at_seq(
         &self,
-        stack: &StackState,
+        view: &ViewState,
         seq: u64,
     ) -> Result<Option<NodeId>, PristineError>;
 
-    /// Iterate over changes in a stack
+    /// Iterate over changes in a view
     ///
     /// Returns an iterator over (sequence, change_id, merkle_state) tuples,
     /// starting from the given sequence number.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The stack to iterate
+    /// * `view` - The view to iterate
     /// * `from_seq` - Starting sequence number (inclusive)
     ///
     /// # Returns
@@ -896,7 +845,7 @@ pub trait StackTxnT: GraphTxnT {
     ///
     /// ```ignore
     /// // Get all changes after sequence 10
-    /// for result in txn.iter_changes(&stack, 10)? {
+    /// for result in txn.iter_changes(&view, 10)? {
     ///     let (seq, change_id, state) = result?;
     ///     println!("Change #{}: {:?} (state: {})", seq, change_id, state);
     /// }
@@ -904,7 +853,7 @@ pub trait StackTxnT: GraphTxnT {
     #[allow(clippy::type_complexity)]
     fn iter_changes(
         &self,
-        stack: &StackState,
+        view: &ViewState,
         from_seq: u64,
     ) -> Result<
         Box<dyn Iterator<Item = Result<(u64, NodeId, Merkle), PristineError>> + '_>,
@@ -1162,7 +1111,7 @@ pub trait TreeTxnT: GraphTxnT {
 /// let mut txn = pristine.write_txn()?;
 ///
 /// // Make changes...
-/// txn.open_or_create_stack("feature")?;
+/// txn.open_or_create_view("feature")?;
 ///
 /// // Either commit:
 /// txn.commit()?;
@@ -1185,7 +1134,7 @@ pub trait TreeTxnT: GraphTxnT {
 /// ```ignore
 /// fn add_file<T: MutTxnT>(
 ///     txn: &mut T,
-///     stack: &mut StackState,
+///     view: &mut ViewState,
 ///     path: &str,
 ///     content: &[u8],
 /// ) -> PristineResult<()> {
@@ -1204,7 +1153,7 @@ pub trait TreeTxnT: GraphTxnT {
 ///     Ok(())
 /// }
 /// ```
-pub trait MutTxnT: StackTxnT + TreeTxnT {
+pub trait MutTxnT: ViewTxnT + TreeTxnT {
     // Change Registration
 
     /// Register a new internal ID for an external hash
@@ -1266,7 +1215,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// content-addressed like changes and tags but produce zero hunks —
     /// they don't modify the content graph.
     ///
-    /// Attestations are NOT added to any stack's changelog. They live in
+    /// Attestations are NOT added to any view's changelog. They live in
     /// the graph as standalone nodes with dependencies (DEPS) pointing to
     /// the changes they cover.
     ///
@@ -1390,175 +1339,106 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
         edge: SerializedGraphEdge,
     ) -> Result<bool, PristineError>;
 
-    // Stack Graph Operations (Local Workspace Edge Storage)
+    // View Operations
 
-    /// Add an edge to the stack-scoped graph.
+    /// Open or create a view
     ///
-    /// This stores edges for **Local** stacks in the `STACK_GRAPH` table,
-    /// keyed by `(stack_id, vertex)`. These edges are only visible through
-    /// the overlay chain and are cascade-deleted when the stack is removed.
+    /// If a view with the given name exists, returns it. Otherwise creates
+    /// a new view with zero changes.
     ///
     /// # Arguments
     ///
-    /// * `stack_id` - The local workspace's internal ID
-    /// * `node` - The source vertex
-    /// * `edge` - The edge to add
+    /// * `name` - The view name
     ///
     /// # Returns
     ///
-    /// * `Ok(true)` - The edge was newly inserted
-    /// * `Ok(false)` - The edge already existed
-    /// * `Err(_)` - Database error
-    fn put_stack_graph(
-        &mut self,
-        stack_id: u64,
-        node: GraphNode<NodeId>,
-        edge: SerializedGraphEdge,
-    ) -> Result<bool, PristineError>;
-
-    /// Remove an edge from the stack-scoped graph.
-    ///
-    /// # Arguments
-    ///
-    /// * `stack_id` - The local workspace's internal ID
-    /// * `node` - The source vertex
-    /// * `edge` - The edge to remove
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(true)` - The edge was removed
-    /// * `Ok(false)` - The edge didn't exist
-    /// * `Err(_)` - Database error
-    fn del_stack_graph(
-        &mut self,
-        stack_id: u64,
-        node: GraphNode<NodeId>,
-        edge: SerializedGraphEdge,
-    ) -> Result<bool, PristineError>;
-
-    /// Cascade-delete all edges for an local workspace.
-    ///
-    /// Removes every entry in `STACK_GRAPH` whose key starts with `stack_id`.
-    /// This is called during `del_stack` for Local workspaces to ensure zero
-    /// orphaned edges remain in the graph.
-    ///
-    /// # Arguments
-    ///
-    /// * `stack_id` - The local workspace's internal ID
-    ///
-    /// # Returns
-    ///
-    /// The number of edges deleted.
+    /// The view state (existing or newly created).
     ///
     /// # Example
     ///
     /// ```ignore
-    /// // Delete all pending edges for the feature stack
-    /// let count = txn.del_stack_graph_prefix(feature_stack.id)?;
-    /// println!("Removed {} orphaned edges", count);
+    /// let view = txn.open_or_create_view("feature-x")?;
+    /// println!("View has {} changes", view.change_count);
     /// ```
-    fn del_stack_graph_prefix(&mut self, stack_id: u64) -> Result<u64, PristineError>;
+    fn open_or_create_view(&mut self, name: &str) -> Result<ViewState, PristineError>;
 
-    // Stack Operations
-
-    /// Open or create a stack
+    /// Create a new view with explicit scope and parent.
     ///
-    /// If a stack with the given name exists, returns it. Otherwise creates
-    /// a new stack with zero changes.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The stack name
-    ///
-    /// # Returns
-    ///
-    /// The stack state (existing or newly created).
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let stack = txn.open_or_create_stack("feature-x")?;
-    /// println!("Stack has {} changes", stack.change_count);
-    /// ```
-    fn open_or_create_stack(&mut self, name: &str) -> Result<StackState, PristineError>;
-
-    /// Create a new stack with explicit kind and parent.
-    ///
-    /// If a stack with the given name already exists, returns an error.
-    /// Use [`Self::open_or_create_stack`] for the backward-compatible "get or create"
+    /// If a view with the given name already exists, returns an error.
+    /// Use [`Self::open_or_create_view`] for the backward-compatible "get or create"
     /// behavior (which defaults to Shared, no parent).
     ///
     /// # Arguments
     ///
-    /// * `name` - The stack name (must be unique)
-    /// * `kind` - Whether this stack is Local or Shared
-    /// * `parent` - The parent stack's ID (`None` only for the root stack)
+    /// * `name` - The view name (must be unique)
+    /// * `kind` - Whether this view is Draft or Shared
+    /// * `parent` - The parent view's ID (`None` only for the root view)
     ///
     /// # Errors
     ///
-    /// - `PristineError::StackAlreadyExists` if a stack with this name exists
-    /// - `PristineError::StackNotFound` if `parent` references a non-existent stack
+    /// - `PristineError::ViewAlreadyExists` if a view with this name exists
+    /// - `PristineError::ViewNotFound` if `parent` references a non-existent view
     ///
     /// # Example
     ///
     /// ```ignore
-    /// // Create a shared "dev" stack parented on "main" (id=1)
-    /// let dev = txn.create_stack("dev", StackKind::Shared, Some(1))?;
+    /// // Create a shared "dev" view parented on "main" (id=1)
+    /// let dev = txn.create_view("dev", ViewScope::Shared, Some(1))?;
     ///
-    /// // Create a local "feature" stack parented on "dev"
-    /// let feature = txn.create_stack("feature", StackKind::Local, Some(dev.id))?;
+    /// // Create a draft "feature" view parented on "dev"
+    /// let feature = txn.create_view("feature", ViewScope::Draft, Some(dev.id))?;
     /// ```
-    fn create_stack(
+    fn create_view(
         &mut self,
         name: &str,
-        kind: StackKind,
+        kind: ViewScope,
         parent: Option<u64>,
-    ) -> Result<StackState, PristineError>;
+    ) -> Result<ViewState, PristineError>;
 
-    /// Look up a stack by its internal ID.
+    /// Look up a view by its internal ID.
     ///
-    /// This is used to resolve parent references when walking the overlay
-    /// chain. Unlike [`StackTxnT::get_stack`] which looks up by name, this
-    /// looks up by the internal numeric ID stored in `StackState::id`.
+    /// This is used to resolve parent references when walking the view
+    /// chain. Unlike [`ViewTxnT::get_view`] which looks up by name, this
+    /// looks up by the internal numeric ID stored in `ViewState::id`.
     ///
     /// # Arguments
     ///
-    /// * `id` - The internal stack identifier
+    /// * `id` - The internal view identifier
     ///
     /// # Returns
     ///
-    /// * `Ok(Some(state))` - The stack with this ID
-    /// * `Ok(None)` - No stack with this ID
+    /// * `Ok(Some(state))` - The view with this ID
+    /// * `Ok(None)` - No view with this ID
     /// * `Err(_)` - Database error
     ///
     /// # Note
     ///
-    /// This method also exists on [`StackTxnT`] for read-only access.
-    /// The `MutTxnT` version delegates to the `StackTxnT` implementation.
-    fn get_stack_by_id(&self, id: u64) -> Result<Option<StackState>, PristineError> {
-        // Default implementation delegates to StackTxnT (which MutTxnT: StackTxnT)
-        StackTxnT::get_stack_by_id(self, id)
+    /// This method also exists on [`ViewTxnT`] for read-only access.
+    /// The `MutTxnT` version delegates to the `ViewTxnT` implementation.
+    fn get_view_by_id(&self, id: u64) -> Result<Option<ViewState>, PristineError> {
+        // Default implementation delegates to ViewTxnT (which MutTxnT: ViewTxnT)
+        ViewTxnT::get_view_by_id(self, id)
     }
 
-    /// Record a change in a stack
+    /// Record a change in a view
     ///
-    /// Appends the change to the stack's log and updates the Merkle state.
-    /// This is how changes are "applied" to a stack.
+    /// Appends the change to the view's log and updates the Merkle state.
+    /// This is how changes are "applied" to a view.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The stack to modify (will be updated in place)
+    /// * `view` - The view to modify (will be updated in place)
     /// * `change_id` - The internal ID of the change
     /// * `change_hash` - The content hash of the change
     ///
     /// # Returns
     ///
-    /// The sequence number assigned to this change in the stack.
+    /// The sequence number assigned to this change in the view.
     ///
     /// # Side Effects
     ///
-    /// - Updates `stack.state` with the new Merkle hash
-    /// - Increments `stack.change_count`
+    /// - Updates `view.state` with the new Merkle hash
+    /// - Increments `view.change_count`
     /// - Records the state in the TAGS table
     /// - Records state→sequence mapping in STATES table
     ///
@@ -1567,53 +1447,53 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// ```ignore
     /// let hash = Hash::of(b"change content");
     /// let change_id = txn.register_change(&hash)?;
-    /// let seq = txn.put_change(&mut stack, change_id, &hash)?;
+    /// let seq = txn.put_change(&mut view, change_id, &hash)?;
     /// println!("Change applied at sequence {}", seq);
     /// ```
     fn put_change(
         &mut self,
-        stack: &mut StackState,
+        view: &mut ViewState,
         change_id: NodeId,
         change_hash: &Hash,
     ) -> Result<u64, PristineError>;
 
-    /// Remove a change from a stack (unrecord).
+    /// Remove a change from a view (unrecord).
     ///
-    /// This removes a change from the stack's view without deleting the change
+    /// This removes a change from the view's perspective without deleting the change
     /// itself. The change remains in the graph and can be re-applied later.
     /// This is similar to Gerrit's workflow where a patch can be removed from
     /// a change set, modified, and re-inserted.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The stack to remove the change from
+    /// * `view` - The view to remove the change from
     /// * `change_id` - Internal ID of the change to remove
     /// * `change_hash` - Hash of the change (for merkle recomputation)
     ///
     /// # Returns
     ///
     /// * `Ok(Some(seq))` - The sequence number where the change was removed from
-    /// * `Ok(None)` - The change was not in this stack
+    /// * `Ok(None)` - The change was not in this view
     /// * `Err(_)` - Database error
     ///
     /// # Notes
     ///
-    /// After calling this method, you must call `update_stack` to persist the
-    /// changes. The stack's merkle state will be recomputed to exclude this
+    /// After calling this method, you must call `update_view` to persist the
+    /// changes. The view's merkle state will be recomputed to exclude this
     /// change.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// // Remove the last change from the stack
-    /// if let Some(seq) = txn.del_change(&mut stack, change_id, &hash)? {
+    /// // Remove the last change from the view
+    /// if let Some(seq) = txn.del_change(&mut view, change_id, &hash)? {
     ///     println!("Removed change from sequence {}", seq);
-    ///     txn.update_stack(&stack)?;
+    ///     txn.update_view(&view)?;
     /// }
     /// ```
     fn del_change(
         &mut self,
-        stack: &mut StackState,
+        view: &mut ViewState,
         change_id: NodeId,
         change_hash: &Hash,
     ) -> Result<Option<u64>, PristineError>;
@@ -1625,7 +1505,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     ///
     /// # Arguments
     ///
-    /// * `stack` - The stack to insert the change into
+    /// * `view` - The view to insert the change into
     /// * `change_id` - Internal ID of the change to insert
     /// * `change_hash` - Hash of the change
     /// * `at_sequence` - The sequence position to insert at (shifts later changes)
@@ -1640,79 +1520,77 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     /// - If `at_sequence` is beyond the current change count, the change is
     ///   appended to the end.
     /// - Changes after the insertion point have their sequence numbers shifted.
-    /// - The stack's merkle state is recomputed from scratch.
+    /// - The view's merkle state is recomputed from scratch.
     ///
     /// # Example
     ///
     /// ```ignore
     /// // Re-insert a change at its original position
-    /// txn.reinsert_change(&mut stack, change_id, &hash, original_seq)?;
-    /// txn.update_stack(&stack)?;
+    /// txn.reinsert_change(&mut view, change_id, &hash, original_seq)?;
+    /// txn.update_view(&view)?;
     /// ```
     fn reinsert_change(
         &mut self,
-        stack: &mut StackState,
+        view: &mut ViewState,
         change_id: NodeId,
         change_hash: &Hash,
         at_sequence: u64,
     ) -> Result<(), PristineError>;
 
-    /// Update the stack state after modifications
+    /// Update the view state after modifications
     ///
-    /// Persists the stack's current state to the database. Call this after
-    /// modifying a stack with `put_change`.
+    /// Persists the view's current state to the database. Call this after
+    /// modifying a view with `put_change`.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The stack to persist
+    /// * `view` - The view to persist
     ///
     /// # Example
     ///
     /// ```ignore
-    /// txn.put_change(&mut stack, change_id, &hash)?;
-    /// txn.update_stack(&stack)?;  // Persist the changes
+    /// txn.put_change(&mut view, change_id, &hash)?;
+    /// txn.update_view(&view)?;  // Persist the changes
     /// ```
-    fn update_stack(&mut self, stack: &StackState) -> Result<(), PristineError>;
+    fn update_view(&mut self, view: &ViewState) -> Result<(), PristineError>;
 
-    /// Delete a stack from the database.
+    /// Delete a view from the database.
     ///
-    /// For **Local** stacks, this cascade-deletes all edges from
-    /// `STACK_GRAPH[(stack_id, *)]` and then removes all metadata:
-    /// - `STACK_GRAPH` edges (cascade prefix delete — zero orphans)
-    /// - Stack metadata from `STACKS` table
+    /// For **Draft** views, this removes all metadata:
+    /// - View metadata from `STACKS` table
     /// - Change log entries from `STACK_CHANGES` table
     /// - Reverse change log entries from `REV_STACK_CHANGES` table
     /// - State/sequence mappings from `STATES` table
     /// - Tag entries from `TAGS` table
     ///
-    /// **Shared** stacks cannot be deleted because their edges live in the
-    /// global `GRAPH` table and are depended on by all stacks. Attempting
-    /// to delete a Shared stack returns `PristineError::CannotDeleteSharedStack`.
+    /// **Shared** views cannot be deleted because their changes are part of the
+    /// base filter and are depended on by all views. Attempting
+    /// to delete a Shared view returns `PristineError::CannotDeleteSharedView`.
     ///
-    /// A stack that has **child stacks** (other stacks with `parent == this.id`)
-    /// cannot be deleted — returns `PristineError::StackHasChildren`. Delete
+    /// A view that has **child views** (other views with `parent == this.id`)
+    /// cannot be deleted — returns `PristineError::ViewHasChildren`. Delete
     /// or reparent children first.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The stack to delete (must be Local, with no children)
+    /// * `view` - The view to delete (must be Draft, with no children)
     ///
     /// # Returns
     ///
-    /// * `Ok(())` - Stack and all its STACK_GRAPH edges were deleted
-    /// * `Err(CannotDeleteSharedStack)` - Stack is Shared
-    /// * `Err(StackHasChildren)` - Stack has child stacks
+    /// * `Ok(())` - View and all its metadata were deleted
+    /// * `Err(CannotDeleteSharedView)` - View is Shared
+    /// * `Err(ViewHasChildren)` - View has child views
     /// * `Err(_)` - Database error
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let stack = txn.get_stack("feature-branch")?.unwrap();
-    /// // Only works for Local workspaces with no children
-    /// txn.del_stack(&stack)?;
+    /// let view = txn.get_view("feature-branch")?.unwrap();
+    /// // Only works for Draft views with no children
+    /// txn.del_view(&view)?;
     /// txn.commit()?;
     /// ```
-    fn del_stack(&mut self, stack: &StackState) -> Result<(), PristineError>;
+    fn del_view(&mut self, view: &ViewState) -> Result<(), PristineError>;
 
     // Tree Operations
 
@@ -2034,7 +1912,7 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     ///
     /// ```ignore
     /// let mut txn = pristine.write_txn()?;
-    /// txn.open_or_create_stack("main")?;
+    /// txn.open_or_create_view("main")?;
     /// txn.commit()?;  // Persist changes
     /// ```
     fn commit(self) -> Result<(), PristineError>;
@@ -2048,9 +1926,9 @@ pub trait MutTxnT: StackTxnT + TreeTxnT {
     ///
     /// ```ignore
     /// let mut txn = pristine.write_txn()?;
-    /// txn.open_or_create_stack("main")?;
+    /// txn.open_or_create_view("main")?;
     /// txn.abort()?;  // Discard changes
-    /// // Stack "main" was not created
+    /// // View "main" was not created
     /// ```
     fn abort(self) -> Result<(), PristineError>;
 }
@@ -2101,80 +1979,80 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_stack_state_default() {
-        let state = StackState::default();
+    fn test_view_state_default() {
+        let state = ViewState::default();
         assert_eq!(state.id, 0);
         assert_eq!(state.name, "");
         assert_eq!(state.state, Merkle::ZERO);
         assert_eq!(state.change_count, 0);
-        assert_eq!(state.kind, StackKind::Shared);
+        assert_eq!(state.kind, ViewScope::Shared);
         assert_eq!(state.parent, None);
     }
 
     #[test]
-    fn test_stack_state_new() {
-        let state = StackState::new(42, "test".to_string());
+    fn test_view_state_new() {
+        let state = ViewState::new(42, "test".to_string());
         assert_eq!(state.id, 42);
         assert_eq!(state.name, "test");
         assert_eq!(state.state, Merkle::ZERO);
         assert_eq!(state.change_count, 0);
-        assert_eq!(state.kind, StackKind::Shared);
+        assert_eq!(state.kind, ViewScope::Shared);
         assert_eq!(state.parent, None);
     }
 
     #[test]
-    fn test_stack_state_with_kind() {
-        let state = StackState::with_kind(3, "feature".to_string(), StackKind::Local, Some(2));
+    fn test_view_state_with_scope() {
+        let state = ViewState::with_scope(3, "feature".to_string(), ViewScope::Draft, Some(2));
         assert_eq!(state.id, 3);
         assert_eq!(state.name, "feature");
-        assert_eq!(state.kind, StackKind::Local);
+        assert_eq!(state.kind, ViewScope::Draft);
         assert_eq!(state.parent, Some(2));
         assert!(state.is_empty());
         assert!(!state.is_root());
     }
 
     #[test]
-    fn test_stack_state_is_empty() {
-        let mut state = StackState::new(1, "test".to_string());
+    fn test_view_state_is_empty() {
+        let mut state = ViewState::new(1, "test".to_string());
         assert!(state.is_empty());
         state.change_count = 1;
         assert!(!state.is_empty());
     }
 
     #[test]
-    fn test_stack_state_is_root() {
-        let root = StackState::new(1, "main".to_string());
+    fn test_view_state_is_root() {
+        let root = ViewState::new(1, "main".to_string());
         assert!(root.is_root());
 
-        let child = StackState::with_kind(2, "dev".to_string(), StackKind::Shared, Some(1));
+        let child = ViewState::with_scope(2, "dev".to_string(), ViewScope::Shared, Some(1));
         assert!(!child.is_root());
     }
 
     #[test]
-    fn test_stack_kind_from_u8() {
-        assert_eq!(StackKind::from_u8(0), Some(StackKind::Local));
-        assert_eq!(StackKind::from_u8(1), Some(StackKind::Shared));
-        assert_eq!(StackKind::from_u8(2), None);
-        assert_eq!(StackKind::from_u8(255), None);
+    fn test_view_scope_from_u8() {
+        assert_eq!(ViewScope::from_u8(0), Some(ViewScope::Draft));
+        assert_eq!(ViewScope::from_u8(1), Some(ViewScope::Shared));
+        assert_eq!(ViewScope::from_u8(2), None);
+        assert_eq!(ViewScope::from_u8(255), None);
     }
 
     #[test]
-    fn test_stack_kind_display() {
-        assert_eq!(format!("{}", StackKind::Local), "local");
-        assert_eq!(format!("{}", StackKind::Shared), "shared");
+    fn test_view_scope_display() {
+        assert_eq!(format!("{}", ViewScope::Draft), "draft");
+        assert_eq!(format!("{}", ViewScope::Shared), "shared");
     }
 
     #[test]
-    fn test_stack_kind_default() {
-        assert_eq!(StackKind::default(), StackKind::Shared);
+    fn test_view_scope_default() {
+        assert_eq!(ViewScope::default(), ViewScope::Shared);
     }
 
     #[test]
-    fn test_stack_kind_predicates() {
-        assert!(StackKind::Shared.is_shared());
-        assert!(!StackKind::Shared.is_local());
-        assert!(StackKind::Local.is_local());
-        assert!(!StackKind::Local.is_shared());
+    fn test_view_scope_predicates() {
+        assert!(ViewScope::Shared.is_shared());
+        assert!(!ViewScope::Shared.is_draft());
+        assert!(ViewScope::Draft.is_draft());
+        assert!(!ViewScope::Draft.is_shared());
     }
 
     #[test]

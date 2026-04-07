@@ -98,59 +98,43 @@ pub fn apply_edge_map<T: MutTxnT>(
 }
 
 // ---------------------------------------------------------------------------
-// Overlay-aware vertex resolution for Local stacks
+// Vertex resolution helpers for the apply pipeline
 // ---------------------------------------------------------------------------
-//
-// When applying to a Local stack, newly created vertices live in
-// STACK_GRAPH (written by `apply_new_vertex` via `put_stack_graph`).
-// Subsequent edge operations in the SAME change need to reference those
-// vertices, but the standard `find_block` / `find_block_end` on a
-// `WriteTxn` only searches the global GRAPH table.
-//
-// The single entry point is `resolve_vertex_for_target`, which delegates to
-// the shared `overlay::find_block_in_stack_graph` (the canonical STACK_GRAPH
-// lookup) before falling back to the global GRAPH.  For Shared (Global)
-// targets it skips the STACK_GRAPH probe entirely.
 
-use crate::pristine::overlay::{find_block_in_stack_graph, FindBlockMode};
-
-/// Resolve a vertex for an edge operation, consulting STACK_GRAPH first
-/// when targeting a Local stack.
+/// Selects the lookup strategy when resolving a vertex from a position.
 ///
-/// This is the single overlay-aware vertex finder used by the apply
-/// pipeline.  It reuses the shared `find_block_in_stack_graph` from the
-/// overlay module — the same function that powers `OverlayTxn::find_block`
-/// and `OverlayTxn::find_block_end` — ensuring a single source of truth
-/// for STACK_GRAPH vertex matching.
+/// This was previously in the overlay module. Now that all edges live in
+/// the global GRAPH, it is defined locally for the apply pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FindBlockMode {
+    /// Match vertex whose range *contains* the position (`start <= pos < end`).
+    ContainingPosition,
+    /// Match vertex whose range *ends at* the position (`end == pos`).
+    EndingAtPosition,
+}
+
+/// Resolve a vertex for an edge operation.
+///
+/// All edges now live in the global GRAPH, so this simply delegates to
+/// `find_block` or `find_block_end` on the transaction.
 ///
 /// # Arguments
 ///
-/// * `txn` - Transaction providing `GraphTxnT + StackTxnT` access
+/// * `txn` - Transaction providing `GraphTxnT` access
 /// * `pos` - The position to resolve
-/// * `target` - Routing target (Global or Local)
+/// * `_target` - Routing target (retained for API compatibility)
 /// * `mode` - Whether to match containing-position or ending-at-position
 pub(super) fn resolve_vertex_for_target<T: MutTxnT>(
     txn: &T,
     pos: Position<NodeId>,
-    target: &ApplyTarget,
+    _target: &ApplyTarget,
     mode: FindBlockMode,
 ) -> Result<GraphNode<NodeId>, LocalApplyError> {
     if pos.change.is_root() {
         return Ok(GraphNode::root());
     }
 
-    // For Local targets, probe STACK_GRAPH first (vertices written
-    // earlier in this same transaction).
-    if let ApplyTarget::Local { stack_id } = target {
-        if let Some(v) =
-            find_block_in_stack_graph(txn, *stack_id, pos.change.get(), pos.pos.get(), mode)
-                .map_err(|e| LocalApplyError::internal(e.to_string()))?
-        {
-            return Ok(v);
-        }
-    }
-
-    // Fall back to global GRAPH (works for both Global and Local targets).
+    // All edges are now in the global GRAPH.
     match mode {
         FindBlockMode::ContainingPosition => txn.find_block(pos),
         FindBlockMode::EndingAtPosition => txn.find_block_end(pos),
@@ -384,17 +368,31 @@ fn add_edge_with_reverse<T: MutTxnT>(
                     })?;
             }
         }
-        ApplyTarget::Local { stack_id } => {
-            // Local workspace: write to STACK_GRAPH[(stack_id, vertex)]
-            txn.put_stack_graph(*stack_id, source, forward_edge)
+        ApplyTarget::Local { view_id: _ } => {
+            // TODO: Phase 2 - Draft views will use a filtered view model.
+            // For now, all edges go to the global GRAPH + INODE_GRAPH,
+            // same as Shared views (STACK_GRAPH table has been removed).
+            txn.put_graph(source, forward_edge)
                 .map_err(|e| LocalApplyError::Internal {
-                    message: format!("Failed to add forward stack graph edge: {}", e),
+                    message: format!("Failed to add forward edge: {}", e),
                 })?;
 
-            txn.put_stack_graph(*stack_id, dest, reverse_edge)
+            txn.put_graph(dest, reverse_edge)
                 .map_err(|e| LocalApplyError::Internal {
-                    message: format!("Failed to add reverse stack graph edge: {}", e),
+                    message: format!("Failed to add reverse edge: {}", e),
                 })?;
+
+            if let Some(inode_val) = inode {
+                txn.put_inode_graph(inode_val, source, forward_edge)
+                    .map_err(|e| LocalApplyError::Internal {
+                        message: format!("Failed to add forward inode edge: {}", e),
+                    })?;
+
+                txn.put_inode_graph(inode_val, dest, reverse_edge)
+                    .map_err(|e| LocalApplyError::Internal {
+                        message: format!("Failed to add reverse inode edge: {}", e),
+                    })?;
+            }
         }
     }
 
@@ -446,10 +444,17 @@ fn del_edge_with_reverse<T: MutTxnT>(
                 let _ = txn.del_inode_graph(inode_val, dest, reverse_edge);
             }
         }
-        ApplyTarget::Local { stack_id } => {
-            // Local workspace: remove from STACK_GRAPH[(stack_id, vertex)]
-            let _ = txn.del_stack_graph(*stack_id, source, forward_edge);
-            let _ = txn.del_stack_graph(*stack_id, dest, reverse_edge);
+        ApplyTarget::Local { view_id: _ } => {
+            // TODO: Phase 2 - Draft views will use a filtered view model.
+            // For now, all edges live in the global GRAPH + INODE_GRAPH
+            // (STACK_GRAPH table has been removed).
+            let _ = txn.del_graph(source, forward_edge);
+            let _ = txn.del_graph(dest, reverse_edge);
+
+            if let Some(inode_val) = inode {
+                let _ = txn.del_inode_graph(inode_val, source, forward_edge);
+                let _ = txn.del_inode_graph(inode_val, dest, reverse_edge);
+            }
         }
     }
 

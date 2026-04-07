@@ -28,8 +28,9 @@
 //! let found = txn.find_block(internal_pos)?;
 //! ```
 
-use crate::pristine::overlay::FindBlockMode;
 use crate::pristine::{GraphTxnT, MutTxnT, TreeTxnT};
+
+use super::edge::FindBlockMode;
 use crate::types::{GraphNode, Hash, Inode, NodeId, Position};
 
 use super::error::LocalApplyError;

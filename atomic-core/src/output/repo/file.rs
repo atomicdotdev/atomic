@@ -1226,7 +1226,7 @@ mod tests {
     #[test]
     fn test_error_display_graph() {
         let err: FileOutputError<std::io::Error> =
-            FileOutputError::Graph(crate::pristine::PristineError::StackNotFound {
+            FileOutputError::Graph(crate::pristine::PristineError::ViewNotFound {
                 name: "test".to_string(),
             });
         let display = format!("{}", err);
@@ -1292,7 +1292,7 @@ mod tests {
 
     #[test]
     fn test_error_from_pristine() {
-        let pristine_err = crate::pristine::PristineError::StackNotFound {
+        let pristine_err = crate::pristine::PristineError::ViewNotFound {
             name: "test".to_string(),
         };
         let err: FileOutputError<std::io::Error> = pristine_err.into();
@@ -1341,7 +1341,7 @@ mod tests {
         use std::error::Error;
 
         let err: FileOutputError<std::io::Error> =
-            FileOutputError::Graph(crate::pristine::PristineError::StackNotFound {
+            FileOutputError::Graph(crate::pristine::PristineError::ViewNotFound {
                 name: "test".to_string(),
             });
 

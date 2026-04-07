@@ -171,9 +171,9 @@
 //! };
 //! use atomic_core::change::{Change, Atom};
 //!
-//! fn apply_to_stack(
+//! fn apply_to_view(
 //!     txn: &mut impl MutTxnT,
-//!     stack: &mut StackState,
+//!     view: &mut ViewState,
 //!     change: &Change,
 //!     change_hash: &Hash,
 //! ) -> Result<(), ApplyError> {
@@ -181,7 +181,7 @@
 //!     let change_id = txn.register_change(change_hash)?;
 //!
 //!     // Validate the change can be applied
-//!     validate_can_apply(txn, stack, change_id, change_hash, change)?;
+//!     validate_can_apply(txn, view, change_id, change_hash, change)?;
 //!
 //!     // Create workspace for tracking state
 //!     let mut workspace = Workspace::new();
@@ -244,7 +244,7 @@ mod workspace;
 
 /// Controls where edges are written during change application.
 ///
-/// This is the bridge between the stack model (`StackKind`) and the apply
+/// This is the bridge between the view model (`ViewScope`) and the apply
 /// pipeline. The caller constructs the appropriate `ApplyTarget` from the
 /// stack being applied to, and passes it through to `add_edge_with_reverse`
 /// and `del_edge_with_reverse`.
@@ -253,11 +253,11 @@ mod workspace;
 ///
 /// ```rust,ignore
 /// use atomic_core::apply::ApplyTarget;
-/// use atomic_core::pristine::StackKind;
+/// use atomic_core::pristine::ViewScope;
 ///
-/// let target = match stack.kind {
-///     StackKind::Shared   => ApplyTarget::Global,
-///     StackKind::Local => ApplyTarget::Local { stack_id: stack.id },
+/// let target = match view.kind {
+///     ViewScope::Shared => ApplyTarget::Global,
+///     ViewScope::Draft  => ApplyTarget::Local { view_id: view.id },
 /// };
 /// ```
 ///
@@ -285,19 +285,19 @@ pub enum ApplyTarget {
     /// when the stack is removed.
     Local {
         /// The local workspace's internal ID.
-        stack_id: u64,
+        view_id: u64,
     },
 }
 
 impl ApplyTarget {
-    /// Create an `ApplyTarget` from a stack's kind and ID.
+    /// Create an `ApplyTarget` from a view's scope and ID.
     ///
-    /// This is the canonical way to construct the target from stack metadata.
+    /// This is the canonical way to construct the target from view metadata.
     #[inline]
-    pub fn from_stack_kind(kind: crate::pristine::StackKind, stack_id: u64) -> Self {
+    pub fn from_view_scope(kind: crate::pristine::ViewScope, view_id: u64) -> Self {
         match kind {
-            crate::pristine::StackKind::Shared => Self::Global,
-            crate::pristine::StackKind::Local => Self::Local { stack_id },
+            crate::pristine::ViewScope::Shared => Self::Global,
+            crate::pristine::ViewScope::Draft => Self::Local { view_id },
         }
     }
 
@@ -307,7 +307,7 @@ impl ApplyTarget {
         matches!(self, Self::Global)
     }
 
-    /// Check if this targets an local workspace's graph.
+    /// Check if this targets a local workspace's graph.
     #[inline]
     pub fn is_local(&self) -> bool {
         matches!(self, Self::Local { .. })
@@ -316,7 +316,7 @@ impl ApplyTarget {
 
 // Re-export core change application functions
 pub use change::{
-    compute_new_state, is_change_on_stack, validate_can_apply, verify_dependencies,
+    compute_new_state, is_change_on_view, validate_can_apply, verify_dependencies,
     ApplyResult as ApplyChangeResult, ChangeToApply,
 };
 
@@ -346,20 +346,20 @@ pub use file_ops::{apply_file_ops, ApplyFileOpsStats};
 #[cfg(test)]
 mod target_tests {
     use super::*;
-    use crate::pristine::StackKind;
+    use crate::pristine::ViewScope;
 
     #[test]
-    fn apply_target_from_shared_stack() {
-        let target = ApplyTarget::from_stack_kind(StackKind::Shared, 42);
+    fn apply_target_from_shared_view() {
+        let target = ApplyTarget::from_view_scope(ViewScope::Shared, 42);
         assert_eq!(target, ApplyTarget::Global);
         assert!(target.is_global());
         assert!(!target.is_local());
     }
 
     #[test]
-    fn apply_target_from_isolated_stack() {
-        let target = ApplyTarget::from_stack_kind(StackKind::Local, 7);
-        assert_eq!(target, ApplyTarget::Local { stack_id: 7 });
+    fn apply_target_from_draft_view() {
+        let target = ApplyTarget::from_view_scope(ViewScope::Draft, 7);
+        assert_eq!(target, ApplyTarget::Local { view_id: 7 });
         assert!(target.is_local());
         assert!(!target.is_global());
     }

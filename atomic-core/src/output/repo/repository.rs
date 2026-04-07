@@ -1486,7 +1486,7 @@ mod tests {
     #[test]
     fn test_error_display_pristine() {
         let err: RepositoryOutputError<std::io::Error> =
-            RepositoryOutputError::Pristine(crate::pristine::PristineError::StackNotFound {
+            RepositoryOutputError::Pristine(crate::pristine::PristineError::ViewNotFound {
                 name: "test".to_string(),
             });
         let display = format!("{}", err);
@@ -1543,7 +1543,7 @@ mod tests {
 
     #[test]
     fn test_error_from_pristine() {
-        let pristine_err = crate::pristine::PristineError::StackNotFound {
+        let pristine_err = crate::pristine::PristineError::ViewNotFound {
             name: "test".to_string(),
         };
         let err: RepositoryOutputError<std::io::Error> = pristine_err.into();
@@ -1568,7 +1568,7 @@ mod tests {
         use std::error::Error;
 
         let err: RepositoryOutputError<std::io::Error> =
-            RepositoryOutputError::Pristine(crate::pristine::PristineError::StackNotFound {
+            RepositoryOutputError::Pristine(crate::pristine::PristineError::ViewNotFound {
                 name: "test".to_string(),
             });
 

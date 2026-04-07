@@ -56,8 +56,8 @@ pub use change::{
 
 // Re-export pristine types
 pub use pristine::{
-    GraphTxnT, MutTxnT, Pristine, PristineError, PristineResult, ReadTxn, StackState, StackTxnT,
-    TreeTxnT, VertexExt, WriteTxn,
+    GraphTxnT, MutTxnT, Pristine, PristineError, PristineResult, ReadTxn, TreeTxnT, VertexExt,
+    ViewState, ViewTxnT, WriteTxn,
 };
 
 // Re-export diff types
@@ -78,7 +78,7 @@ pub use record::{
 
 // Re-export apply types
 pub use apply::{
-    compute_new_state, is_change_on_stack, validate_can_apply, verify_dependencies,
+    compute_new_state, is_change_on_view, validate_can_apply, verify_dependencies,
     ApplyChangeResult, ApplyError, ApplyResult, ChangeToApply, LocalApplyError, LocalApplyResult,
     MissingContext, PendingEdge, Workspace, WorkspaceStats, Zombie,
 };

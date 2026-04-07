@@ -9,7 +9,7 @@
 //! Errors are broadly categorized into:
 //!
 //! - **Database Errors**: Low-level redb errors (transaction, table, storage, commit)
-//! - **Not Found Errors**: Missing stacks, changes, or hashes
+//! - **Not Found Errors**: Missing views, changes, or hashes
 //! - **Data Errors**: Invalid vertices, blocks, or corrupted data
 //! - **Serialization Errors**: Failed to encode/decode data
 //!
@@ -18,15 +18,15 @@
 //! ```ignore
 //! use atomic_core::pristine::{PristineResult, PristineError};
 //!
-//! fn get_stack_info(pristine: &Pristine, name: &str) -> PristineResult<String> {
+//! fn get_view_info(pristine: &Pristine, name: &str) -> PristineResult<String> {
 //!     let txn = pristine.read_txn()?;  // Propagates database errors
 //!
-//!     let stack = txn.get_stack(name)?
-//!         .ok_or_else(|| PristineError::StackNotFound {
+//!     let view = txn.get_view(name)?
+//!         .ok_or_else(|| PristineError::ViewNotFound {
 //!             name: name.to_string()
 //!         })?;
 //!
-//!     Ok(format!("Stack '{}' has {} changes", stack.name, stack.change_count))
+//!     Ok(format!("View '{}' has {} changes", view.name, view.change_count))
 //! }
 //! ```
 //!
@@ -57,7 +57,7 @@ use std::fmt;
 /// use atomic_core::pristine::PristineError;
 ///
 /// // Create a "not found" error
-/// let err = PristineError::StackNotFound {
+/// let err = PristineError::ViewNotFound {
 ///     name: "feature-branch".to_string(),
 /// };
 /// assert!(err.to_string().contains("feature-branch"));
@@ -111,55 +111,55 @@ pub enum PristineError {
     Io(std::io::Error),
 
     // Not Found Errors
-    /// Stack (view) not found in the database
+    /// View not found in the database
     ///
-    /// The requested stack name doesn't exist. This is common when:
-    /// - Accessing a stack that hasn't been created
-    /// - Typo in stack name
-    /// - Stack was deleted
-    StackNotFound {
-        /// The name of the stack that wasn't found
+    /// The requested view name doesn't exist. This is common when:
+    /// - Accessing a view that hasn't been created
+    /// - Typo in view name
+    /// - View was deleted
+    ViewNotFound {
+        /// The name of the view that wasn't found
         name: String,
     },
 
-    /// A stack with this name already exists
+    /// A view with this name already exists
     ///
-    /// Returned by `MutTxnT::create_stack` when attempting to create a
-    /// stack whose name is already taken. Use `MutTxnT::open_or_create_stack`
+    /// Returned by `MutTxnT::create_view` when attempting to create a
+    /// view whose name is already taken. Use `MutTxnT::open_or_create_view`
     /// if "get or create" semantics are desired.
-    StackAlreadyExists {
-        /// The name of the stack that already exists
+    ViewAlreadyExists {
+        /// The name of the view that already exists
         name: String,
     },
 
-    /// Cannot delete a shared stack
+    /// Cannot delete a shared view
     ///
-    /// Shared stacks (dev, release, main) write edges to the global `GRAPH`
+    /// Shared views (dev, release, main) write edges to the global `GRAPH`
     /// table and are the canonical record of promoted history. Deleting them
     /// would orphan edges in the global graph. Use `--force` with explicit
     /// cleanup if this is intentional.
-    CannotDeleteSharedStack {
-        /// The name of the shared stack
+    CannotDeleteSharedView {
+        /// The name of the shared view
         name: String,
     },
 
-    /// Cannot perform operation because the stack has child stacks
+    /// Cannot perform operation because the view has child views
     ///
-    /// An local workspace that other stacks reference as their parent cannot
+    /// A view that other views reference as their parent cannot
     /// be deleted without first reparenting or deleting its children.
-    StackHasChildren {
-        /// The name of the stack that has children
+    ViewHasChildren {
+        /// The name of the view that has children
         name: String,
-        /// Names of the child stacks
+        /// Names of the child views
         children: Vec<String>,
     },
 
-    /// Parent stack cycle detected
+    /// Parent view cycle detected
     ///
-    /// Setting the given parent would create a cycle in the stack ancestry
-    /// chain (e.g., A → B → C → A). The overlay chain must be acyclic.
-    StackCycleDetected {
-        /// The stack being created or reparented
+    /// Setting the given parent would create a cycle in the view ancestry
+    /// chain (e.g., A → B → C → A). The ancestry chain must be acyclic.
+    ViewCycleDetected {
+        /// The view being created or reparented
         name: String,
         /// The parent that would create a cycle
         parent_name: String,
@@ -247,26 +247,26 @@ impl fmt::Display for PristineError {
             Self::Io(e) => write!(f, "IO error: {}", e),
 
             // Not found errors
-            Self::StackNotFound { name } => write!(f, "stack not found: {}", name),
-            Self::StackAlreadyExists { name } => {
-                write!(f, "stack already exists: {}", name)
+            Self::ViewNotFound { name } => write!(f, "view not found: {}", name),
+            Self::ViewAlreadyExists { name } => {
+                write!(f, "view already exists: {}", name)
             }
-            Self::CannotDeleteSharedStack { name } => {
+            Self::CannotDeleteSharedView { name } => {
                 write!(
                     f,
-                    "cannot delete shared stack '{}': shared stacks are permanent",
+                    "cannot delete shared view '{}': shared views are permanent",
                     name
                 )
             }
-            Self::StackHasChildren { name, children } => {
+            Self::ViewHasChildren { name, children } => {
                 write!(
                     f,
-                    "cannot delete stack '{}': has child stacks: {}",
+                    "cannot delete view '{}': has child views: {}",
                     name,
                     children.join(", ")
                 )
             }
-            Self::StackCycleDetected { name, parent_name } => {
+            Self::ViewCycleDetected { name, parent_name } => {
                 write!(
                     f,
                     "cannot set parent of '{}' to '{}': would create a cycle",
@@ -371,35 +371,35 @@ mod tests {
         // Each variant should surface the data that helps a user diagnose the problem.
         let cases: Vec<(PristineError, &[&str])> = vec![
             (
-                PristineError::StackNotFound {
+                PristineError::ViewNotFound {
                     name: "feature-x".into(),
                 },
-                &["stack not found", "feature-x"],
+                &["view not found", "feature-x"],
             ),
             (
-                PristineError::StackAlreadyExists { name: "dev".into() },
-                &["stack already exists", "dev"],
+                PristineError::ViewAlreadyExists { name: "dev".into() },
+                &["view already exists", "dev"],
             ),
             (
-                PristineError::CannotDeleteSharedStack {
+                PristineError::CannotDeleteSharedView {
                     name: "main".into(),
                 },
-                &["cannot delete shared stack", "main"],
+                &["cannot delete shared view", "main"],
             ),
             (
-                PristineError::StackHasChildren {
+                PristineError::ViewHasChildren {
                     name: "service-auth".into(),
                     children: vec!["feature-login".into(), "bug-fix".into()],
                 },
                 &[
-                    "cannot delete stack",
+                    "cannot delete view",
                     "service-auth",
                     "feature-login",
                     "bug-fix",
                 ],
             ),
             (
-                PristineError::StackCycleDetected {
+                PristineError::ViewCycleDetected {
                     name: "a".into(),
                     parent_name: "b".into(),
                 },
@@ -464,14 +464,14 @@ mod tests {
     fn custom_variants_have_no_source() {
         // Non-wrapper variants shouldn't claim a source error exists.
         let custom_errors: Vec<PristineError> = vec![
-            PristineError::StackNotFound { name: "x".into() },
-            PristineError::StackAlreadyExists { name: "x".into() },
-            PristineError::CannotDeleteSharedStack { name: "x".into() },
-            PristineError::StackHasChildren {
+            PristineError::ViewNotFound { name: "x".into() },
+            PristineError::ViewAlreadyExists { name: "x".into() },
+            PristineError::CannotDeleteSharedView { name: "x".into() },
+            PristineError::ViewHasChildren {
                 name: "x".into(),
                 children: vec!["y".into()],
             },
-            PristineError::StackCycleDetected {
+            PristineError::ViewCycleDetected {
                 name: "a".into(),
                 parent_name: "b".into(),
             },

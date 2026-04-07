@@ -2,7 +2,7 @@
 //!
 //! The pristine is the persistent storage layer that holds the repository's
 //! graph state. It stores vertices, edges, change mappings, file trees, and
-//! stack (view) metadata in a transactional database.
+//! view metadata in a transactional database.
 //!
 //! # Architecture Overview
 //!
@@ -11,11 +11,11 @@
 //! │                        Pristine Database                        │
 //! ├─────────────────────────────────────────────────────────────────┤
 //! │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
-//! │  │ ID Mappings │  │    Graph    │  │        Stacks           │  │
+//! │  │ ID Mappings │  │    Graph    │  │        Views            │  │
 //! │  │             │  │             │  │                         │  │
-//! │  │ EXTERNAL    │  │ GRAPH       │  │ STACKS                  │  │
-//! │  │ INTERNAL    │  │ INODE_GRAPH │  │ STACK_CHANGES           │  │
-//! │  │ NODE_TYPES  │  │             │  │ REV_STACK_CHANGES       │  │
+//! │  │ EXTERNAL    │  │ GRAPH       │  │ VIEWS                   │  │
+//! │  │ INTERNAL    │  │ INODE_GRAPH │  │ VIEW_CHANGES            │  │
+//! │  │ NODE_TYPES  │  │             │  │ REV_VIEW_CHANGES        │  │
 //! │  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
 //! │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
 //! │  │  File Tree  │  │Dependencies │  │         State           │  │
@@ -28,22 +28,22 @@
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! # Stacks vs Branches
+//! # Views vs Branches
 //!
-//! Atomic uses **Stacks** instead of branches. This is a fundamental conceptual
+//! Atomic uses **Views** instead of branches. This is a fundamental conceptual
 //! difference from Git:
 //!
-//! | Concept | Git Branches | Atomic Stacks |
-//! |---------|--------------|---------------|
+//! | Concept | Git Branches | Atomic Views |
+//! |---------|--------------|--------------|
 //! | Nature | Fork of history | View of the graph |
 //! | Data | Duplicates commits | References same changes |
 //! | Merge | Combines divergent histories | Applies missing changes |
 //! | Identity | Pointer to a commit | Ordered sequence + Merkle state |
 //!
-//! Stacks are **views** of the graph - they represent which changes have been
-//! applied and in what order. Multiple stacks can coexist, each showing a
-//! different perspective on the same underlying data. When you "merge" stacks,
-//! you're really just applying changes that one stack has but the other doesn't.
+//! Views are perspectives of the graph - they represent which changes have been
+//! applied and in what order. Multiple views can coexist, each showing a
+//! different perspective on the same underlying data. When you "merge" views,
+//! you're really just applying changes that one view has but the other doesn't.
 //!
 //! # Storage Backend
 //!
@@ -73,7 +73,7 @@
 //! # Usage Example
 //!
 //! ```ignore
-//! use atomic_core::pristine::{Pristine, MutTxnT, StackTxnT, GraphTxnT};
+//! use atomic_core::pristine::{Pristine, MutTxnT, ViewTxnT, GraphTxnT};
 //! use atomic_core::types::{Hash, NodeId, GraphNode, EdgeFlags};
 //!
 //! // Open or create the database
@@ -82,24 +82,24 @@
 //! // Read-only access
 //! {
 //!     let txn = pristine.read_txn()?;
-//!     let stack = txn.get_stack("main")?;
-//!     let stacks = txn.list_stacks()?;
+//!     let view = txn.get_view("main")?;
+//!     let views = txn.list_views()?;
 //! }
 //!
 //! // Write access
 //! {
 //!     let mut txn = pristine.write_txn()?;
 //!
-//!     // Create or open a stack
-//!     let mut stack = txn.open_or_create_stack("feature")?;
+//!     // Create or open a view
+//!     let mut view = txn.open_or_create_view("feature")?;
 //!
 //!     // Register a change
 //!     let hash = Hash::of(b"change content");
 //!     let change_id = txn.register_change(&hash)?;
 //!
-//!     // Record the change in the stack
-//!     txn.put_change(&mut stack, change_id, &hash)?;
-//!     txn.update_stack(&stack)?;
+//!     // Record the change in the view
+//!     txn.put_change(&mut view, change_id, &hash)?;
+//!     txn.update_view(&view)?;
 //!
 //!     // Commit the transaction
 //!     txn.commit()?;
@@ -110,7 +110,7 @@
 //!
 //! - `error` - Error types (`PristineError`, `PristineResult`)
 //! - [`tables`] - redb table definitions and key encoding helpers
-//! - `traits` - Database trait abstractions (`GraphTxnT`, `StackTxnT`, `TreeTxnT`, `MutTxnT`)
+//! - `traits` - Database trait abstractions (`GraphTxnT`, `ViewTxnT`, `TreeTxnT`, `MutTxnT`)
 //! - `txn` - Transaction implementations (`Pristine`, `ReadTxn`, `WriteTxn`)
 //!
 //! # Table Reference
@@ -122,17 +122,17 @@
 //! | `NODE_TYPES` | NodeId | u8 | Type of node (change, tag) |
 //! | `GRAPH` | Span | `Edge` | Main graph (multimap) |
 //! | `INODE_GRAPH` | (Inode, Span) | `Edge` | File-scoped graph index |
-//! | `STACKS` | name | StackState | Stack metadata |
-//! | `STACK_CHANGES` | (stack_id, seq) | change_id | Change log |
-//! | `REV_STACK_CHANGES` | (stack_id, change_id) | seq | Reverse change log |
+//! | `VIEWS` | name | ViewState | View metadata |
+//! | `VIEW_CHANGES` | (view_id, seq) | change_id | Change log |
+//! | `REV_VIEW_CHANGES` | (view_id, change_id) | seq | Reverse change log |
 //! | `TREE` | path | inode | Path → inode mapping |
 //! | `REV_TREE` | inode | path | Inode → path mapping |
 //! | `INODES` | inode | Position | Inode → graph position |
 //! | `REV_INODES` | Position | inode | Graph position → inode |
 //! | `DEPS` | change_id | `dep_id` | Dependencies (multimap) |
 //! | `REV_DEPS` | dep_id | `change_id` | Reverse dependencies |
-//! | `STATES` | (stack_id, merkle) | seq | State → sequence lookup |
-//! | `TAGS` | (stack_id, seq) | merkle | Tagged states |
+//! | `STATES` | (view_id, merkle) | seq | State → sequence lookup |
+//! | `TAGS` | (view_id, seq) | merkle | Tagged states |
 //!
 //! # Performance Characteristics
 //!
@@ -142,14 +142,13 @@
 //! | Find block | O(log n) | Binary search in B-tree |
 //! | Register change | O(log n) | Two table insertions |
 //! | Iterate file | O(m) | m = file size in vertices |
-//! | List stacks | O(s) | s = number of stacks |
+//! | List views | O(s) | s = number of views |
 //!
 //! The `INODE_GRAPH` secondary index enables O(n) file traversal where n is
 //! proportional to file size, rather than O(N) where N is total graph size.
 
 mod error;
 mod inode_graph;
-pub mod overlay;
 pub mod tables;
 mod traits;
 mod txn;
@@ -158,8 +157,7 @@ pub use error::{PristineError, PristineResult};
 pub use inode_graph::{
     InodeAdjState, InodeEdgeIter, InodeGraphOps, InodeGraphStats, InodeVertex, IntoInodeVertex,
 };
-pub use overlay::OverlayTxn;
 pub use tables::directory_flags;
 pub use tables::*;
-pub use traits::{GraphTxnT, MutTxnT, StackKind, StackState, StackTxnT, TreeTxnT, VertexExt};
+pub use traits::{GraphTxnT, MutTxnT, TreeTxnT, VertexExt, ViewScope, ViewState, ViewTxnT};
 pub use txn::{AdjIterator, Pristine, ReadTxn, WriteTxn};

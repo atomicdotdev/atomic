@@ -895,7 +895,7 @@ mod tests {
 
     #[test]
     fn test_storage_error() {
-        let pristine_err = PristineError::StackNotFound {
+        let pristine_err = PristineError::ViewNotFound {
             name: "test".to_string(),
         };
         let err = ApplyError::storage(pristine_err, "testing");
@@ -1014,7 +1014,7 @@ mod tests {
         assert_eq!(ApplyError::circular_reference("test").exit_code(), 65);
 
         // I/O errors get exit code 74
-        let pristine_err = PristineError::StackNotFound {
+        let pristine_err = PristineError::ViewNotFound {
             name: "test".to_string(),
         };
         assert_eq!(ApplyError::storage(pristine_err, "test").exit_code(), 74);
@@ -1050,7 +1050,7 @@ mod tests {
 
     #[test]
     fn test_error_source() {
-        let pristine_err = PristineError::StackNotFound {
+        let pristine_err = PristineError::ViewNotFound {
             name: "test".to_string(),
         };
         let err = ApplyError::storage(pristine_err, "testing");
@@ -1066,7 +1066,7 @@ mod tests {
 
     #[test]
     fn test_from_pristine_error() {
-        let pristine_err = PristineError::StackNotFound {
+        let pristine_err = PristineError::ViewNotFound {
             name: "test".to_string(),
         };
         let err: ApplyError = pristine_err.into();
