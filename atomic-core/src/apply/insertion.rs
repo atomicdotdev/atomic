@@ -48,10 +48,8 @@ use crate::pristine::{GraphTxnT, MutTxnT};
 #[allow(unused_imports)]
 use crate::types::{EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge};
 
-use super::ApplyTarget;
-
 use super::error::LocalApplyError;
-use super::position::{resolve_context_vertex_for_target, resolve_inode, resolve_position};
+use super::position::{resolve_context_vertex, resolve_inode, resolve_position};
 use super::workspace::Workspace;
 
 // Insertion Application
@@ -84,19 +82,14 @@ use super::workspace::Workspace;
 /// - `DependencyMissing`: Referenced change not found
 /// - `BlockNotFound`: Context position not found
 /// - `Internal`: Database error
-pub fn apply_new_vertex<T: MutTxnT>(
+pub fn write_new_vertex<T: MutTxnT>(
     txn: &mut T,
     workspace: &mut Workspace,
     change_id: NodeId,
     insertion: &Insertion<Option<Hash>>,
     change: &Change,
-    target: &ApplyTarget,
 ) -> Result<(), LocalApplyError> {
-    // Import the unified overlay-aware vertex resolver.  This delegates to
-    // the shared `overlay::find_block_in_stack_graph` — the canonical
-    // STACK_GRAPH lookup — so there is a single source of truth for
-    // vertex resolution across both the apply pipeline and OverlayTxn.
-    use super::edge::{resolve_vertex_for_target, FindBlockMode};
+    use super::edge::resolve_vertex;
 
     // Create the new span
     let node = GraphNode {
@@ -113,7 +106,7 @@ pub fn apply_new_vertex<T: MutTxnT>(
     // vertices written to STACK_GRAPH earlier in the same change.
     for up_pos in &insertion.predecessors {
         let internal_pos = resolve_position(txn, up_pos, change_id)?;
-        let up_vertex = resolve_context_vertex_for_target(txn, internal_pos, true, target)?;
+        let up_vertex = resolve_context_vertex(txn, internal_pos, true)?;
         // Store the end position (where new content connects)
         workspace.add_up_context(up_vertex.end_pos());
 
@@ -132,7 +125,7 @@ pub fn apply_new_vertex<T: MutTxnT>(
             });
         }
 
-        let down_vertex = resolve_context_vertex_for_target(txn, internal_pos, false, target)?;
+        let down_vertex = resolve_context_vertex(txn, internal_pos, false)?;
         // Store the start position (where new content connects)
         workspace.add_down_context(down_vertex.start_pos());
 
@@ -151,17 +144,8 @@ pub fn apply_new_vertex<T: MutTxnT>(
     let up_flag = insertion.flag | EdgeFlags::BLOCK;
     for up_pos in workspace.predecessors().to_vec() {
         // Find the span ending at this position to use as edge source.
-        let up_vertex =
-            resolve_vertex_for_target(txn, up_pos, target, FindBlockMode::EndingAtPosition)?;
-        add_edge_with_reverse(
-            txn,
-            resolved_inode,
-            up_flag,
-            up_vertex,
-            node,
-            change_id,
-            target,
-        )?;
+        let up_vertex = resolve_vertex(txn, up_pos, true)?;
+        add_edge_with_reverse(txn, resolved_inode, up_flag, up_vertex, node, change_id)?;
     }
 
     // Create edges from new span to successors
@@ -174,17 +158,8 @@ pub fn apply_new_vertex<T: MutTxnT>(
 
     for down_pos in workspace.successors().to_vec() {
         // Find the span containing this position to use as edge target.
-        let down_vertex =
-            resolve_vertex_for_target(txn, down_pos, target, FindBlockMode::ContainingPosition)?;
-        add_edge_with_reverse(
-            txn,
-            resolved_inode,
-            down_flag,
-            node,
-            down_vertex,
-            change_id,
-            target,
-        )?;
+        let down_vertex = resolve_vertex(txn, down_pos, false)?;
+        add_edge_with_reverse(txn, resolved_inode, down_flag, node, down_vertex, change_id)?;
 
         // Track folder files for missing context detection
         if insertion.flag.is_folder() {
@@ -227,7 +202,6 @@ pub fn add_edge_with_reverse<T: MutTxnT>(
     source: GraphNode<NodeId>,
     dest: GraphNode<NodeId>,
     introduced_by: NodeId,
-    apply_target: &ApplyTarget,
 ) -> Result<(), LocalApplyError> {
     // Create forward edge
     let forward_edge = SerializedGraphEdge::new(flag, dest.start_pos(), introduced_by);
@@ -236,57 +210,28 @@ pub fn add_edge_with_reverse<T: MutTxnT>(
     let reverse_flag = flag | EdgeFlags::PARENT;
     let reverse_edge = SerializedGraphEdge::new(reverse_flag, source.end_pos(), introduced_by);
 
-    match apply_target {
-        ApplyTarget::Global => {
-            // Shared stack: write to global GRAPH + INODE_GRAPH
-            txn.put_graph(source, forward_edge)
-                .map_err(|e| LocalApplyError::Internal {
-                    message: format!("Failed to add forward edge: {}", e),
-                })?;
+    // Write to global GRAPH
+    txn.put_graph(source, forward_edge)
+        .map_err(|e| LocalApplyError::Internal {
+            message: format!("Failed to add forward edge: {}", e),
+        })?;
 
-            txn.put_graph(dest, reverse_edge)
-                .map_err(|e| LocalApplyError::Internal {
-                    message: format!("Failed to add reverse edge: {}", e),
-                })?;
+    txn.put_graph(dest, reverse_edge)
+        .map_err(|e| LocalApplyError::Internal {
+            message: format!("Failed to add reverse edge: {}", e),
+        })?;
 
-            if let Some(inode_val) = inode {
-                txn.put_inode_graph(inode_val, source, forward_edge)
-                    .map_err(|e| LocalApplyError::Internal {
-                        message: format!("Failed to add forward inode edge: {}", e),
-                    })?;
+    // Write to INODE_GRAPH secondary index
+    if let Some(inode_val) = inode {
+        txn.put_inode_graph(inode_val, source, forward_edge)
+            .map_err(|e| LocalApplyError::Internal {
+                message: format!("Failed to add forward inode edge: {}", e),
+            })?;
 
-                txn.put_inode_graph(inode_val, dest, reverse_edge)
-                    .map_err(|e| LocalApplyError::Internal {
-                        message: format!("Failed to add reverse inode edge: {}", e),
-                    })?;
-            }
-        }
-        ApplyTarget::Local { view_id: _ } => {
-            // TODO: Phase 2 - Draft views will use a filtered view model.
-            // For now, all edges go to the global GRAPH + INODE_GRAPH,
-            // same as Shared views (STACK_GRAPH table has been removed).
-            txn.put_graph(source, forward_edge)
-                .map_err(|e| LocalApplyError::Internal {
-                    message: format!("Failed to add forward edge: {}", e),
-                })?;
-
-            txn.put_graph(dest, reverse_edge)
-                .map_err(|e| LocalApplyError::Internal {
-                    message: format!("Failed to add reverse edge: {}", e),
-                })?;
-
-            if let Some(inode_val) = inode {
-                txn.put_inode_graph(inode_val, source, forward_edge)
-                    .map_err(|e| LocalApplyError::Internal {
-                        message: format!("Failed to add forward inode edge: {}", e),
-                    })?;
-
-                txn.put_inode_graph(inode_val, dest, reverse_edge)
-                    .map_err(|e| LocalApplyError::Internal {
-                        message: format!("Failed to add reverse inode edge: {}", e),
-                    })?;
-            }
-        }
+        txn.put_inode_graph(inode_val, dest, reverse_edge)
+            .map_err(|e| LocalApplyError::Internal {
+                message: format!("Failed to add reverse inode edge: {}", e),
+            })?;
     }
 
     Ok(())

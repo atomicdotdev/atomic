@@ -1,6 +1,6 @@
 # REFACTOR-VIEWS.md — Ambient Graph + View Filters
 
-> **Status**: In Progress — Phase 1 Complete  
+> **Status**: In Progress — Phase 2 Complete  
 > **Created**: 2025-07-13  
 > **Last Updated**: 2025-07-13  
 > **Tracking Issue**: N/A  
@@ -447,10 +447,11 @@ a module organizational boundary.
 
 ---
 
-## Phase 2: Eliminate ApplyTarget — All Edges to GRAPH
+## Phase 2: Eliminate ApplyTarget — All Edges to GRAPH ✅ COMPLETE
 
 **Goal**: Remove the two-tier edge routing. All edges always go to `GRAPH` + `INODE_GRAPH`.  
-**Depends on**: Phase 1 (table constants, trait renames).
+**Depends on**: Phase 1 (table constants, trait renames).  
+**Result**: `cargo test -p atomic-core` — 442 passed, 0 failed, 178 ignored. Zero `ApplyTarget` references remain.
 
 ### Files to Modify
 
@@ -501,18 +502,22 @@ fn add_edge_with_reverse(txn, source, dest, inode) {
 
 ### Checklist
 
-- [ ] Remove `ApplyTarget` enum from `mod.rs`
-- [ ] Remove `ApplyTarget::from_stack_kind()` constructor
-- [ ] Update `write_edge_map` (was `apply_edge_map`) — drop `ApplyTarget` param
-- [ ] Update `write_new_edge` (was `apply_new_edge`) — drop `ApplyTarget` param
-- [ ] Update `add_edge_with_reverse` in `edge.rs` — always GRAPH + INODE_GRAPH
-- [ ] Update `del_edge_with_reverse` in `edge.rs` — always GRAPH + INODE_GRAPH
-- [ ] Update `write_new_vertex` (was `apply_new_vertex`) in `insertion.rs` — drop `ApplyTarget` param
-- [ ] Update `add_edge_with_reverse` in `insertion.rs` — always GRAPH + INODE_GRAPH
-- [ ] Remove `resolve_vertex_for_target` / `resolve_context_vertex_for_target` from `position.rs`
-- [ ] Rename `apply_file_ops` → `write_file_ops`
-- [ ] Update all call sites that passed `ApplyTarget`
-- [ ] Run `cargo check -p atomic-core`
+- [x] Remove `ApplyTarget` enum from `mod.rs`
+- [x] Remove `ApplyTarget::from_view_scope()` constructor and tests
+- [x] Rename and simplify `write_edge_map` (was `apply_edge_map`) — dropped `ApplyTarget` param
+- [x] Rename and simplify `write_new_edge` (was `apply_new_edge`) — dropped `ApplyTarget` param
+- [x] Simplify `add_edge_with_reverse` in `edge.rs` — removed match, always GRAPH + INODE_GRAPH
+- [x] Simplify `del_edge_with_reverse` in `edge.rs` — removed match, always GRAPH + INODE_GRAPH
+- [x] Rename and simplify `write_new_vertex` (was `apply_new_vertex`) in `insertion.rs` — dropped `ApplyTarget` param
+- [x] Simplify `add_edge_with_reverse` in `insertion.rs` — removed match, always GRAPH + INODE_GRAPH
+- [x] Replace `resolve_vertex_for_target` with `resolve_vertex(txn, pos, is_predecessor)` in `edge.rs`
+- [x] Remove `resolve_context_vertex_for_target` from `position.rs` (callers use `resolve_context_vertex`)
+- [x] Remove `FindBlockMode` enum — replaced by `is_predecessor: bool`
+- [x] `apply_file_ops` left unchanged (CRDT operation, not graph routing)
+- [x] Updated re-exports in `mod.rs`
+- [x] Proactively fixed `atomic-repository/src/apply.rs`: removed `ApplyTarget` import, simplified `should_apply_hunks` to `!already_in_graph`, updated call sites to `write_new_vertex`/`write_edge_map`
+- [x] Run `cargo check -p atomic-core` — passes clean
+- [x] Run `cargo test -p atomic-core` — 442 passed, 0 failed
 
 ---
 

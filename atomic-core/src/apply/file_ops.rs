@@ -11,7 +11,7 @@
 //! 2. **Semantic layer** (file_ops): CRDT tables for human-readable operations
 //!
 //! This module handles the semantic layer. The graph layer is handled by
-//! the existing `apply_new_vertex` and `apply_edge_map` functions.
+//! the existing `write_new_vertex` and `write_edge_map` functions.
 //!
 //! # Architecture
 //!

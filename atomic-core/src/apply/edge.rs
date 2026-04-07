@@ -1,6 +1,6 @@
-//! EdgeUpdate atom application
+//! Edge writing for the apply pipeline
 //!
-//! This module handles applying `EdgeUpdate` atoms to the repository graph.
+//! This module handles writing `EdgeUpdate` atoms to the repository graph.
 //! An EdgeUpdate modifies existing edges, typically to mark content as deleted
 //! or to change edge properties.
 //!
@@ -14,7 +14,7 @@
 //! After:  [A] ──BLOCK|DELETED──> [B]
 //! ```
 //!
-//! # Application Process
+//! # Writing Process
 //!
 //! For each edge in the EdgeUpdate:
 //!
@@ -25,12 +25,12 @@
 //! 5. **Add New Edge**: Insert edge with updated `flag`
 //! 6. **Handle Deletions**: Collect pseudo-edges, detect zombies
 //!
-//! # Two-Phase Application
+//! # Two-Phase Writing
 //!
-//! Edge maps are typically applied in two phases across all atoms:
+//! Edge maps are typically written in two phases across all atoms:
 //!
-//! 1. **Non-deletion phase**: Apply edges without DELETED flag
-//! 2. **Deletion phase**: Apply edges with DELETED flag
+//! 1. **Non-deletion phase**: Write edges without DELETED flag
+//! 2. **Deletion phase**: Write edges with DELETED flag
 //!
 //! This ensures alive edges exist before deletion processing.
 //!
@@ -49,16 +49,17 @@ use crate::types::{EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, Serializ
 use super::error::LocalApplyError;
 use super::position::{resolve_inode, resolve_introduced_by, resolve_position};
 use super::workspace::Workspace;
-use super::ApplyTarget;
 
-// EdgeUpdate Application
+// EdgeUpdate Writing
 
-/// Apply an EdgeUpdate atom to the graph.
+/// Write an EdgeUpdate atom to the graph.
 ///
 /// Modifies existing edges in the graph. This is primarily used for:
 /// - Marking content as deleted (adding DELETED flag)
 /// - Undeleting content (removing DELETED flag)
 /// - Changing edge properties
+///
+/// Edges are written to the global GRAPH and INODE_GRAPH tables.
 ///
 /// # Arguments
 ///
@@ -73,25 +74,16 @@ use super::ApplyTarget;
 /// - `DependencyMissing`: Referenced change not found
 /// - `BlockNotFound`: Source or target span doesn't exist
 /// - `Internal`: Database error
-pub fn apply_edge_map<T: MutTxnT>(
+pub fn write_edge_map<T: MutTxnT>(
     txn: &mut T,
     workspace: &mut Workspace,
     change_id: NodeId,
     edge_update: &EdgeUpdate<Option<Hash>>,
     change: &Change,
-    target: &ApplyTarget,
 ) -> Result<(), LocalApplyError> {
     // Process each edge in the map
     for edge in &edge_update.edges {
-        apply_new_edge(
-            txn,
-            workspace,
-            change_id,
-            &edge_update.inode,
-            edge,
-            change,
-            target,
-        )?;
+        write_new_edge(txn, workspace, change_id, &edge_update.inode, edge, change)?;
     }
 
     Ok(())
@@ -101,50 +93,33 @@ pub fn apply_edge_map<T: MutTxnT>(
 // Vertex resolution helpers for the apply pipeline
 // ---------------------------------------------------------------------------
 
-/// Selects the lookup strategy when resolving a vertex from a position.
+/// Resolve a position to a vertex in the graph.
 ///
-/// This was previously in the overlay module. Now that all edges live in
-/// the global GRAPH, it is defined locally for the apply pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FindBlockMode {
-    /// Match vertex whose range *contains* the position (`start <= pos < end`).
-    ContainingPosition,
-    /// Match vertex whose range *ends at* the position (`end == pos`).
-    EndingAtPosition,
-}
-
-/// Resolve a vertex for an edge operation.
-///
-/// All edges now live in the global GRAPH, so this simply delegates to
-/// `find_block` or `find_block_end` on the transaction.
-///
-/// # Arguments
-///
-/// * `txn` - Transaction providing `GraphTxnT` access
-/// * `pos` - The position to resolve
-/// * `_target` - Routing target (retained for API compatibility)
-/// * `mode` - Whether to match containing-position or ending-at-position
-pub(super) fn resolve_vertex_for_target<T: MutTxnT>(
+/// Uses `find_block` for forward context (containing position) and
+/// `find_block_end` for predecessor context (ending at position).
+pub(super) fn resolve_vertex<T: MutTxnT>(
     txn: &T,
     pos: Position<NodeId>,
-    _target: &ApplyTarget,
-    mode: FindBlockMode,
+    is_predecessor: bool,
 ) -> Result<GraphNode<NodeId>, LocalApplyError> {
     if pos.change.is_root() {
         return Ok(GraphNode::root());
     }
 
-    // All edges are now in the global GRAPH.
-    match mode {
-        FindBlockMode::ContainingPosition => txn.find_block(pos),
-        FindBlockMode::EndingAtPosition => txn.find_block_end(pos),
+    if is_predecessor {
+        txn.find_block_end(pos)
+    } else {
+        txn.find_block(pos)
     }
     .map_err(|_| LocalApplyError::BlockNotFound { position: pos })
 }
 
-/// Apply a single NewEdge operation.
+/// Write a single NewEdge operation to the graph.
 ///
-/// This handles the actual edge modification in the graph.
+/// This handles the actual edge modification: resolving positions,
+/// removing old edges, adding new edges, and detecting zombie conflicts.
+///
+/// Edges are written to the global GRAPH and INODE_GRAPH tables.
 ///
 /// # Arguments
 ///
@@ -152,38 +127,26 @@ pub(super) fn resolve_vertex_for_target<T: MutTxnT>(
 /// * `workspace` - Workspace for tracking state
 /// * `change_id` - Internal ID of current change
 /// * `inode` - File inode position for indexing
-/// * `edge` - The edge to apply
+/// * `edge` - The edge to write
 /// * `change` - Full change for dependency checking
-fn apply_new_edge<T: MutTxnT>(
+fn write_new_edge<T: MutTxnT>(
     txn: &mut T,
     workspace: &mut Workspace,
     change_id: NodeId,
     inode: &Position<Option<Hash>>,
     edge: &NewEdge<Option<Hash>>,
     change: &Change,
-    apply_target: &ApplyTarget,
 ) -> Result<(), LocalApplyError> {
     // Resolve the introduced_by change
     let introduced_by = resolve_introduced_by(txn, &edge.introduced_by, change_id)?;
 
-    // Find source span — overlay-aware so Local stacks can see vertices
-    // written to STACK_GRAPH earlier in the same change.
+    // Find source span — predecessor context (ending at position).
     let source_pos = resolve_position(txn, &edge.from, change_id)?;
-    let source = resolve_vertex_for_target(
-        txn,
-        source_pos,
-        apply_target,
-        FindBlockMode::EndingAtPosition,
-    )?;
+    let source = resolve_vertex(txn, source_pos, true)?;
 
-    // Find target span — same overlay-aware lookup.
+    // Find target span — forward context (containing position).
     let target_pos = resolve_position(txn, &edge.to.start_pos(), change_id)?;
-    let mut target = resolve_vertex_for_target(
-        txn,
-        target_pos,
-        apply_target,
-        FindBlockMode::ContainingPosition,
-    )?;
+    let mut target = resolve_vertex(txn, target_pos, false)?;
 
     // Resolve inode for indexing
     let resolved_inode = resolve_inode(txn, inode, change_id)?;
@@ -217,19 +180,10 @@ fn apply_new_edge<T: MutTxnT>(
         source,
         target,
         introduced_by,
-        apply_target,
     )?;
 
     // Add the new edge
-    add_edge_with_reverse(
-        txn,
-        resolved_inode,
-        edge.flag,
-        source,
-        target,
-        change_id,
-        apply_target,
-    )?;
+    add_edge_with_reverse(txn, resolved_inode, edge.flag, source, target, change_id)?;
 
     // For deletions, check for zombie context
     if edge.flag.contains(EdgeFlags::DELETED) && !edge.flag.contains(EdgeFlags::FOLDER) {
@@ -313,11 +267,14 @@ pub fn find_target_vertex<T: GraphTxnT>(
 
 // Edge Operations
 
-/// Add an edge and its reverse to the graph.
+/// Write an edge and its reverse to the graph.
 ///
 /// In the Atomic graph model, edges come in pairs:
 /// - Forward edge: `source → target` with base flags
 /// - Reverse edge: `target → source` with PARENT flag added
+///
+/// Writes both edges to the global GRAPH table and, when an inode is
+/// provided, to the INODE_GRAPH secondary index.
 ///
 /// # Arguments
 ///
@@ -325,7 +282,7 @@ pub fn find_target_vertex<T: GraphTxnT>(
 /// * `inode` - Optional inode for inode_graph indexing
 /// * `flag` - Edge flags for the forward edge
 /// * `source` - Source span
-/// * `target` - Target span
+/// * `dest` - Destination span
 /// * `introduced_by` - Change that introduced this edge
 fn add_edge_with_reverse<T: MutTxnT>(
     txn: &mut T,
@@ -334,7 +291,6 @@ fn add_edge_with_reverse<T: MutTxnT>(
     source: GraphNode<NodeId>,
     dest: GraphNode<NodeId>,
     introduced_by: NodeId,
-    apply_target: &ApplyTarget,
 ) -> Result<(), LocalApplyError> {
     // Create forward edge
     let forward_edge = SerializedGraphEdge::new(flag, dest.start_pos(), introduced_by);
@@ -343,57 +299,28 @@ fn add_edge_with_reverse<T: MutTxnT>(
     let reverse_flag = flag | EdgeFlags::PARENT;
     let reverse_edge = SerializedGraphEdge::new(reverse_flag, source.end_pos(), introduced_by);
 
-    match apply_target {
-        ApplyTarget::Global => {
-            // Shared stack: write to global GRAPH + INODE_GRAPH
-            txn.put_graph(source, forward_edge)
-                .map_err(|e| LocalApplyError::Internal {
-                    message: format!("Failed to add forward edge: {}", e),
-                })?;
+    // Write to global GRAPH
+    txn.put_graph(source, forward_edge)
+        .map_err(|e| LocalApplyError::Internal {
+            message: format!("Failed to add forward edge: {}", e),
+        })?;
 
-            txn.put_graph(dest, reverse_edge)
-                .map_err(|e| LocalApplyError::Internal {
-                    message: format!("Failed to add reverse edge: {}", e),
-                })?;
+    txn.put_graph(dest, reverse_edge)
+        .map_err(|e| LocalApplyError::Internal {
+            message: format!("Failed to add reverse edge: {}", e),
+        })?;
 
-            if let Some(inode_val) = inode {
-                txn.put_inode_graph(inode_val, source, forward_edge)
-                    .map_err(|e| LocalApplyError::Internal {
-                        message: format!("Failed to add forward inode edge: {}", e),
-                    })?;
+    // Write to INODE_GRAPH secondary index
+    if let Some(inode_val) = inode {
+        txn.put_inode_graph(inode_val, source, forward_edge)
+            .map_err(|e| LocalApplyError::Internal {
+                message: format!("Failed to add forward inode edge: {}", e),
+            })?;
 
-                txn.put_inode_graph(inode_val, dest, reverse_edge)
-                    .map_err(|e| LocalApplyError::Internal {
-                        message: format!("Failed to add reverse inode edge: {}", e),
-                    })?;
-            }
-        }
-        ApplyTarget::Local { view_id: _ } => {
-            // TODO: Phase 2 - Draft views will use a filtered view model.
-            // For now, all edges go to the global GRAPH + INODE_GRAPH,
-            // same as Shared views (STACK_GRAPH table has been removed).
-            txn.put_graph(source, forward_edge)
-                .map_err(|e| LocalApplyError::Internal {
-                    message: format!("Failed to add forward edge: {}", e),
-                })?;
-
-            txn.put_graph(dest, reverse_edge)
-                .map_err(|e| LocalApplyError::Internal {
-                    message: format!("Failed to add reverse edge: {}", e),
-                })?;
-
-            if let Some(inode_val) = inode {
-                txn.put_inode_graph(inode_val, source, forward_edge)
-                    .map_err(|e| LocalApplyError::Internal {
-                        message: format!("Failed to add forward inode edge: {}", e),
-                    })?;
-
-                txn.put_inode_graph(inode_val, dest, reverse_edge)
-                    .map_err(|e| LocalApplyError::Internal {
-                        message: format!("Failed to add reverse inode edge: {}", e),
-                    })?;
-            }
-        }
+        txn.put_inode_graph(inode_val, dest, reverse_edge)
+            .map_err(|e| LocalApplyError::Internal {
+                message: format!("Failed to add reverse inode edge: {}", e),
+            })?;
     }
 
     Ok(())
@@ -402,7 +329,8 @@ fn add_edge_with_reverse<T: MutTxnT>(
 /// Remove an edge and its reverse from the graph.
 ///
 /// This is the inverse of `add_edge_with_reverse`. Removes both the
-/// forward and reverse edges.
+/// forward and reverse edges from the global GRAPH table and, when an
+/// inode is provided, from the INODE_GRAPH secondary index.
 ///
 /// # Arguments
 ///
@@ -410,7 +338,7 @@ fn add_edge_with_reverse<T: MutTxnT>(
 /// * `inode` - Optional inode for inode_graph cleanup
 /// * `flag` - Edge flags for the forward edge
 /// * `source` - Source span
-/// * `target` - Target span
+/// * `dest` - Destination span
 /// * `introduced_by` - Change that introduced the edge
 ///
 /// # Notes
@@ -424,7 +352,6 @@ fn del_edge_with_reverse<T: MutTxnT>(
     source: GraphNode<NodeId>,
     dest: GraphNode<NodeId>,
     introduced_by: NodeId,
-    apply_target: &ApplyTarget,
 ) -> Result<(), LocalApplyError> {
     // Create forward edge to delete
     let forward_edge = SerializedGraphEdge::new(flag, dest.start_pos(), introduced_by);
@@ -433,29 +360,14 @@ fn del_edge_with_reverse<T: MutTxnT>(
     let reverse_flag = flag | EdgeFlags::PARENT;
     let reverse_edge = SerializedGraphEdge::new(reverse_flag, source.end_pos(), introduced_by);
 
-    match apply_target {
-        ApplyTarget::Global => {
-            // Shared stack: remove from global GRAPH + INODE_GRAPH
-            let _ = txn.del_graph(source, forward_edge);
-            let _ = txn.del_graph(dest, reverse_edge);
+    // Remove from global GRAPH
+    let _ = txn.del_graph(source, forward_edge);
+    let _ = txn.del_graph(dest, reverse_edge);
 
-            if let Some(inode_val) = inode {
-                let _ = txn.del_inode_graph(inode_val, source, forward_edge);
-                let _ = txn.del_inode_graph(inode_val, dest, reverse_edge);
-            }
-        }
-        ApplyTarget::Local { view_id: _ } => {
-            // TODO: Phase 2 - Draft views will use a filtered view model.
-            // For now, all edges live in the global GRAPH + INODE_GRAPH
-            // (STACK_GRAPH table has been removed).
-            let _ = txn.del_graph(source, forward_edge);
-            let _ = txn.del_graph(dest, reverse_edge);
-
-            if let Some(inode_val) = inode {
-                let _ = txn.del_inode_graph(inode_val, source, forward_edge);
-                let _ = txn.del_inode_graph(inode_val, dest, reverse_edge);
-            }
-        }
+    // Remove from INODE_GRAPH secondary index
+    if let Some(inode_val) = inode {
+        let _ = txn.del_inode_graph(inode_val, source, forward_edge);
+        let _ = txn.del_inode_graph(inode_val, dest, reverse_edge);
     }
 
     Ok(())

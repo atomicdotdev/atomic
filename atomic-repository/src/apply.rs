@@ -93,9 +93,9 @@
 //! ```
 
 use atomic_core::apply::{
-    apply_edge_map, apply_file_ops, apply_new_vertex, compute_new_state, validate_can_apply,
-    verify_dependencies, ApplyTarget, ConflictSummary, ConflictTracker, LocalApplyError,
-    MissingContextConflict, Workspace, ZombieConflict,
+    apply_file_ops, compute_new_state, validate_can_apply, verify_dependencies, write_edge_map,
+    write_new_vertex, ConflictSummary, ConflictTracker, LocalApplyError, MissingContextConflict,
+    Workspace, ZombieConflict,
 };
 use atomic_core::change::{Atom, AtomRef, Change, GraphOp};
 use atomic_core::pristine::{GraphTxnT, MutTxnT, StackState, StackTxnT};
@@ -524,48 +524,16 @@ pub fn apply_change_to_graph<T: MutTxnT + StackTxnT>(
         validate_can_apply(txn, &stack, change_id, change_hash, change)?;
     }
 
-    // Determine where edges should be written based on the stack kind.
-    // Shared stacks → global GRAPH; Local workspaces → STACK_GRAPH[(stack_id, vertex)].
-    let apply_target = ApplyTarget::from_stack_kind(stack.kind, stack.id);
-
-    // Only apply hunks if the change isn't already visible through the
-    // target stack's graph view.
-    //
-    // For **Shared** stacks the check is simple: if the change is already
-    // registered in the global GRAPH we skip hunk application.
-    //
-    // For **Local** stacks the situation is nuanced.  A Local stack's
-    // overlay chain is `STACK_GRAPH[self] ∪ ... ∪ GRAPH`.  If the change
-    // is already in the global GRAPH (e.g. it was recorded on a Shared
-    // parent) AND the Local stack's overlay reaches GRAPH (i.e. it has a
-    // Shared ancestor), then the edges are already visible — re-applying
-    // them into STACK_GRAPH would create duplicates that conflict with
-    // future Replacement operations on divergent stacks.
-    //
-    // We only force re-application for Local stacks when the change is
-    // NOT in the global GRAPH (meaning it was recorded on another Local
-    // stack whose STACK_GRAPH is invisible to us).
-    let should_apply_hunks = if already_in_graph {
-        // Change is in global GRAPH.
-        // Shared target: skip (edges are already there).
-        // Local target with Shared parent: skip (overlay sees GRAPH).
-        // Local target with NO parent: must re-apply (overlay doesn't reach GRAPH).
-        match &apply_target {
-            ApplyTarget::Global => false,
-            ApplyTarget::Local { .. } => {
-                // Check if the stack has a Shared ancestor by looking at
-                // the parent chain.  If so, the overlay reaches GRAPH.
-                stack.parent.is_none()
-            }
-        }
-    } else {
-        // Change is not in global GRAPH — must apply hunks.
-        true
-    };
+    // Only apply hunks if the change isn't already in the graph.
+    // All edges go to the global GRAPH + INODE_GRAPH tables.
+    let should_apply_hunks = !already_in_graph;
 
     log::debug!(
-        "apply_change_to_graph: change_id={:?} hash={} should_apply_hunks={} target={:?} stack_kind={:?}",
-        change_id, change_hash.to_base32(), should_apply_hunks, apply_target, stack.kind
+        "apply_change_to_graph: change_id={:?} hash={} should_apply_hunks={} stack_kind={:?}",
+        change_id,
+        change_hash.to_base32(),
+        should_apply_hunks,
+        stack.kind
     );
 
     if should_apply_hunks {
@@ -580,7 +548,6 @@ pub fn apply_change_to_graph<T: MutTxnT + StackTxnT>(
                 change,
                 options,
                 &mut stats,
-                &apply_target,
             )?;
         }
 
@@ -630,28 +597,27 @@ fn apply_hunk<T: MutTxnT>(
     change: &Change,
     options: &ApplyOptions,
     stats: &mut ApplyStats,
-    apply_target: &ApplyTarget,
 ) -> ApplyResult<()> {
     // Process atoms in the graph_op
     for atom_ref in graph_op.atoms() {
         match atom_ref {
             AtomRef::Insertion(insertion) => {
-                apply_new_vertex(txn, workspace, change_id, insertion, change, apply_target)?;
+                write_new_vertex(txn, workspace, change_id, insertion, change)?;
                 stats.atoms_processed += 1;
             }
             AtomRef::EdgeUpdate(edge_update) => {
-                apply_edge_map(txn, workspace, change_id, edge_update, change, apply_target)?;
+                write_edge_map(txn, workspace, change_id, edge_update, change)?;
                 stats.atoms_processed += 1;
             }
             AtomRef::Atom(atom) => {
                 // Full atom - dispatch to appropriate handler
                 match atom {
                     Atom::Insertion(nv) => {
-                        apply_new_vertex(txn, workspace, change_id, nv, change, apply_target)?;
+                        write_new_vertex(txn, workspace, change_id, nv, change)?;
                         stats.atoms_processed += 1;
                     }
                     Atom::EdgeUpdate(em) => {
-                        apply_edge_map(txn, workspace, change_id, em, change, apply_target)?;
+                        write_edge_map(txn, workspace, change_id, em, change)?;
                         stats.atoms_processed += 1;
                     }
                 }
