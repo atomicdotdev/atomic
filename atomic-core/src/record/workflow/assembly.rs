@@ -991,6 +991,8 @@ where
         return Err(AssemblyError::NoFiles);
     }
 
+    log::debug!("assemble_change: {} files", files.len(),);
+
     // Create globalization context
     let mut glob_ctx = GlobalizeContext::new(txn);
     let mut ctx = AssemblyContext::new(header);
@@ -1023,6 +1025,15 @@ where
         match globalize_recorded_file(&mut glob_ctx, file, options.get_globalize_options()) {
             Ok(globalized) => {
                 if globalized.is_empty() {
+                    log::debug!(
+                        "assemble_change: globalized file '{}' is empty (no hunks), skipping. \
+                         is_directory={} is_deleted={} has_content={} has_position={:?}",
+                        file.path(),
+                        file.is_directory(),
+                        file.is_deleted_directory(),
+                        !file.is_empty(),
+                        file.position(),
+                    );
                     stats.record_skip();
                     continue;
                 }
@@ -1036,6 +1047,11 @@ where
                 globalized_files.push(globalized);
             }
             Err(e) => {
+                log::debug!(
+                    "assemble_change: globalize error for '{}': {}",
+                    file.path(),
+                    e,
+                );
                 stats.record_error();
                 globalize_errors.push((file.path().to_string(), e));
             }

@@ -9,7 +9,7 @@ Atomic is a mathematically sound distributed version control system built in Rus
 1. **Mathematical Soundness**: Changes are algebraic operations with well-defined composition rules
 2. **Content-Addressed**: All data is identified by cryptographic hashes (Blake3)
 3. **Graph-Based**: Files are DAGs of vertices and edges, not linear sequences
-4. **Views, Not Forks**: Stacks are perspectives on the same graph, not divergent histories
+4. **Views, Not Forks**: Views are filtered perspectives on the same graph, not divergent histories
 
 ## Architecture
 
@@ -78,37 +78,39 @@ let hash = Hash::of(change_content);
 let node_id = txn.register_change(&hash)?;
 ```
 
-### 3. Stacks (Two-Tier Graph Model)
+### 3. Views (Ambient Graph + View Filters)
 
-**Critical Concept**: Stacks use a **two-tier graph model** where edge storage
-depends on whether a stack is **Shared** or **Local**.
+**Critical Concept**: Views are **change-set filters** on a single canonical
+GRAPH. All edges are always written to the global GRAPH immediately. A view
+determines which subset of the graph is visible by tracking which changes
+belong to it in `VIEW_CHANGES`.
 
-| Aspect | Git Branches | Atomic Stacks |
-|--------|--------------|---------------|
-| Data Model | Pointer to commit | Ordered sequence of applied changes |
-| Storage | Duplicates history | Two-tier: global GRAPH + per-stack STACK_GRAPH |
-| "Merging" | 3-way merge | Apply changes (with dependency closure) |
-| State | HEAD commit hash | Merkle hash of sequence |
-| Cleanup | Manual branch delete + GC | Cascade delete STACK_GRAPH (zero orphans) |
+| Aspect | Git Branches | Atomic Views |
+|--------|--------------|--------------|
+| Data Model | Pointer to commit | Ordered set of change references |
+| Storage | Duplicates history | Single GRAPH, per-view change filters |
+| "Merging" | 3-way merge | Insert change references (with dependency closure) |
+| State | HEAD commit hash | Merkle hash of change sequence |
+| Cleanup | Manual branch delete + GC | Delete VIEW_CHANGES entries; GC orphaned edges |
+| Collaboration | Isolated snapshots | Filtered perspectives, real-time sharing |
 
-#### Stack Kinds
+#### View Scopes
 
 ```rust
-pub enum StackKind {
-    /// Edges stored in STACK_GRAPH[(stack_id, vertex)].
-    /// Cascade-deleted when the stack is removed. Zero orphans.
-    Local,  // feature, bug, service-auth, experiment
+pub enum ViewScope {
+    /// Personal workspace. Changes visible through the view's filter.
+    /// Deletion removes VIEW_CHANGES entries; orphaned edges cleaned by GC.
+    Draft,  // feature, bug, service-auth, experiment
 
-    /// Edges stored in the global GRAPH[vertex].
-    /// Permanent promoted history. Deletion is restricted.
+    /// Collaborative view. Visible to all. Deletion is restricted.
     Shared,    // dev, release, main
 }
 ```
 
-#### Parent Chains and the Overlay Model
+#### Parent Chains and View Filters
 
-Every stack has a parent (except the root). The parent relationship defines
-the **overlay chain** for graph traversal:
+Every view has a parent (except the root). The parent relationship defines
+the **filter chain** for graph traversal:
 
 ```
   main  (Shared, parent=None — the only true root)
@@ -117,69 +119,78 @@ the **overlay chain** for graph traversal:
     │
   dev  (Shared, parent=release)
     │
-    ├── service-auth  (Local, parent=dev)
-    │     ├── feature-login   (Local, parent=service-auth)
-    │     └── feature-logout  (Local, parent=service-auth)
+    ├── service-auth  (Draft, parent=dev)
+    │     ├── feature-login   (Draft, parent=service-auth)
+    │     └── feature-logout  (Draft, parent=service-auth)
     │
-    └── service-payments  (Local, parent=dev)
+    └── service-payments  (Draft, parent=dev)
 ```
 
-An local workspace's **effective view** is the union of its own `STACK_GRAPH`,
-each isolated ancestor's `STACK_GRAPH`, and the global `GRAPH` (reached when
-a Shared ancestor is encountered):
+A view's **effective filter** is the union of its own `VIEW_CHANGES` and
+all ancestor views' `VIEW_CHANGES`, plus the transitive dependency closure:
 
 ```
-feature-login view = STACK_GRAPH[feature-login]
-                   ∪ STACK_GRAPH[service-auth]   (parent, Local)
-                   ∪ GRAPH                        (dev is Shared → stop)
+feature-login filter = VIEW_CHANGES[feature-login]
+                     ∪ VIEW_CHANGES[service-auth]   (parent, Draft)
+                     ∪ VIEW_CHANGES[dev]             (ancestor, Shared)
+                     ∪ VIEW_CHANGES[release]         (ancestor, Shared)
+                     ∪ VIEW_CHANGES[main]            (root)
+                     ∪ dependency closure
 ```
 
-#### Creating Stacks
+During graph traversal, an edge is visible if the change that introduced it
+is in the view's effective filter. All edges live in the single GRAPH table;
+the view just decides which ones to follow.
+
+#### Creating Views
 
 ```rust
 // Backward compatible: defaults to Shared, no parent
-let stack = txn.open_or_create_stack("main")?;
+let view = txn.open_or_create_view("main")?;
 
-// Explicit kind and parent
-let dev = txn.create_stack("dev", StackKind::Shared, Some(main.id))?;
-let feature = txn.create_stack("feature", StackKind::Local, Some(dev.id))?;
+// Explicit scope and parent
+let dev = txn.create_view("dev", ViewScope::Shared, Some(main.id))?;
+let feature = txn.create_view("feature", ViewScope::Draft, Some(dev.id))?;
 
-// Stacked isolated on isolated
-let login = txn.create_stack("feature-login", StackKind::Local, Some(service_auth.id))?;
+// Draft on draft
+let login = txn.create_view("feature-login", ViewScope::Draft, Some(service_auth.id))?;
 ```
 
-#### Apply = Change + Dependency Closure (Not Cherry-Pick)
+#### Insert = Change Reference + Dependency Closure (Not Cherry-Pick)
 
-`apply` moves a change **and all of its transitive dependencies** to the
-target stack. A change cannot be applied without every change it depends on
-already present on the target. The system computes the missing dependency
-closure automatically — the user picks the change, and apply pulls in
-everything required for correctness.
+`insert` adds a change reference **and all of its transitive dependencies**
+to the target view's `VIEW_CHANGES`. A change cannot be inserted without
+every change it depends on already present in the target. The system computes
+the missing dependency closure automatically — the user picks the change, and
+insert pulls in everything required for correctness.
+
+Because all edges are already in GRAPH, insert is an **O(1) metadata
+operation** per change — it only writes entries to `VIEW_CHANGES`. No edge
+copying is needed.
 
 ```rust
-// Apply a change from "feature" to "dev"
+// Insert a change from "feature" into "dev"
 // 1. Compute transitive deps of the change
-// 2. Filter out deps already on the target stack
-// 3. Apply missing deps in dependency order, then the change itself
+// 2. Filter out deps already in the target view
+// 3. Add missing dep refs to VIEW_CHANGES in dependency order, then the change itself
 //
-// Local → Shared target: edges go to GRAPH
-// Local → Local target: edges go to target's STACK_GRAPH
-// Source stack is NOT modified
+// No edge copying — edges are already in GRAPH
+// Source view is NOT modified
 ```
 
-#### Deleting Stacks
+#### Deleting Views
 
 ```rust
-// Local: cascade-delete STACK_GRAPH[stack_id] → zero orphans
-// Changes previously applied to a Shared stack survive in GRAPH
-txn.del_stack_graph_prefix(feature.id)?;
+// Draft: delete VIEW_CHANGES entries for this view.
+// Orphaned edges (not referenced by any other view) cleaned by GC.
+txn.del_view_changes_prefix(feature.id)?;
 
-// Shared: restricted (permanent history)
+// Shared: restricted (permanent collaborative history)
 ```
 
 ### 4. Merkle State
 
-Incremental hash representing the complete state of a stack:
+Incremental hash representing the complete state of a view:
 
 ```
 state_0 = Hash(empty)
@@ -354,32 +365,41 @@ This simplifies the codebase while maintaining semantic clarity.
 ├── changes/               # Content-addressed change files
 │   └── AB/CDEF...         # Two-level directory structure
 ├── config.toml            # Repository configuration
-├── current_stack          # Active stack name
+├── current_view           # Active view name
 └── working_copy_id        # Working copy state
 ```
 
-### Two-Tier Edge Storage
+### Single GRAPH Architecture
+
+All edges live in one canonical GRAPH table. Views determine visibility by
+filtering on which changes are referenced in `VIEW_CHANGES`. The
+`introduced_by` field on each edge identifies which change created it,
+enabling efficient filtering during traversal.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                    Two-Tier Graph Architecture                            │
+│                    Ambient Graph Architecture                            │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│  Global GRAPH (Shared stacks: dev, release, main)                       │
+│  Canonical GRAPH (all edges from all views)                             │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │ Key: GraphNode (24 bytes)  → Value: [SerializedGraphEdge]      │    │
-│  │ Permanent. Visible to ALL stacks. Written by Shared stacks.    │    │
+│  │ All edges written here immediately. Single source of truth.    │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
-│  Per-Stack STACK_GRAPH (Local workspaces: feature, bug, service-*)       │
+│  Secondary Index: INODE_GRAPH (file-local traversal optimization)      │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │ Key: (stack_id, GraphNode) (32 bytes) → Value: [Edge] (24 b)  │    │
-│  │ Ephemeral. Visible only through the overlay chain.             │    │
-│  │ Prefix scan on stack_id → O(n) cascade deletion.              │    │
+│  │ Key: (Inode, GraphNode) (32 bytes) → Value: [GraphEdge]       │    │
+│  │ Same edges, indexed by file for O(m) file-local traversal.    │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
-│  Effective view for Local workspace:                                      │
-│    STACK_GRAPH[this] ∪ STACK_GRAPH[parent] ∪ ... ∪ GRAPH               │
+│  View filter for any view:                                              │
+│    visible_changes = VIEW_CHANGES[this]                                │
+│                    ∪ VIEW_CHANGES[parent]                               │
+│                    ∪ ... (up the ancestor chain)                        │
+│                    ∪ dependency closure                                  │
+│                                                                         │
+│  An edge is visible iff edge.introduced_by ∈ visible_changes           │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -402,11 +422,11 @@ The pristine is the persistent storage layer using [redb](https://docs.rs/redb):
 │                        Pristine Database                        │
 ├─────────────────────────────────────────────────────────────────┤
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
-│  │ ID Mappings │  │    Graph    │  │        Stacks           │  │
+│  │ ID Mappings │  │    Graph    │  │         Views           │  │
 │  │             │  │             │  │                         │  │
-│  │ EXTERNAL    │  │ GRAPH       │  │ STACKS                  │  │
-│  │ INTERNAL    │  │ INODE_GRAPH │  │ STACK_CHANGES           │  │
-│  │ NODE_TYPES  │  │ STACK_GRAPH │  │ REV_STACK_CHANGES       │  │
+│  │ EXTERNAL    │  │ GRAPH       │  │ VIEWS                   │  │
+│  │ INTERNAL    │  │ INODE_GRAPH │  │ VIEW_CHANGES            │  │
+│  │ NODE_TYPES  │  │             │  │ REV_VIEW_CHANGES        │  │
 │  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
 │  │  File Tree  │  │Dependencies │  │         State           │  │
@@ -426,40 +446,39 @@ The pristine is the persistent storage layer using [redb](https://docs.rs/redb):
 | `EXTERNAL` | NodeId (u64) | Hash ([u8; 32]) | Internal → external ID |
 | `INTERNAL` | Hash ([u8; 32]) | NodeId (u64) | External → internal ID |
 | `NODE_TYPES` | NodeId (u64) | u8 | Node type (change=0, tag=1) |
-| `GRAPH` | GraphNode ([u8; 24]) | [GraphEdge] | Main graph — Shared stack edges (multimap) |
+| `GRAPH` | GraphNode ([u8; 24]) | [GraphEdge] | Canonical graph — all edges (multimap) |
 | `INODE_GRAPH` | (Inode, GraphNode) ([u8; 32]) | [GraphEdge] | File-scoped index |
-| `STACK_GRAPH` | (stack_id, GraphNode) ([u8; 32]) | [GraphEdge] | Local workspace edges (multimap) |
-| `STACKS` | name (str) | StackState (var) | Stack metadata (kind, parent, merkle) |
-| `STACK_CHANGES` | (stack_id, seq) ([u8; 16]) | change_id (u64) | Change log |
-| `REV_STACK_CHANGES` | (stack_id, change_id) ([u8; 16]) | seq (u64) | Reverse log |
+| `VIEWS` | name (str) | ViewState (var) | View metadata (scope, parent, merkle) |
+| `VIEW_CHANGES` | (view_id, seq) ([u8; 16]) | change_id (u64) | Change log per view |
+| `REV_VIEW_CHANGES` | (view_id, change_id) ([u8; 16]) | seq (u64) | Reverse log |
 | `TREE` | path (str) | inode (u64) | Path → inode |
 | `REV_TREE` | inode (u64) | path (str) | Inode → path |
 | `INODES` | inode (u64) | Position ([u8; 16]) | Inode → graph |
 | `REV_INODES` | Position ([u8; 16]) | inode (u64) | Graph → inode |
 | `DEPS` | change_id (u64) | [dep_id] (u64) | Dependencies |
 | `REV_DEPS` | dep_id (u64) | [change_id] (u64) | Reverse deps |
-| `STATES` | (stack_id, merkle) ([u8; 40]) | seq (u64) | State → sequence |
-| `TAGS` | (stack_id, seq) ([u8; 16]) | merkle ([u8; 32]) | Tagged states |
+| `STATES` | (view_id, merkle) ([u8; 40]) | seq (u64) | State → sequence |
+| `TAGS` | (view_id, seq) ([u8; 16]) | merkle ([u8; 32]) | Tagged states |
 
 ### Transaction Model
 
 ```rust
 // Read-only (multiple concurrent)
 let txn = pristine.read_txn()?;
-let stack = txn.get_stack("main")?;
+let view = txn.get_view("main")?;
 
 // Read-write (exclusive)
 let mut txn = pristine.write_txn()?;
 
 // Backward-compatible: defaults to Shared, no parent
-let mut stack = txn.open_or_create_stack("feature")?;
+let mut view = txn.open_or_create_view("feature")?;
 
-// Explicit kind and parent
-let dev = txn.create_stack("dev", StackKind::Shared, Some(main.id))?;
-let feature = txn.create_stack("feature", StackKind::Local, Some(dev.id))?;
+// Explicit scope and parent
+let dev = txn.create_view("dev", ViewScope::Shared, Some(main.id))?;
+let feature = txn.create_view("feature", ViewScope::Draft, Some(dev.id))?;
 
-txn.put_change(&mut stack, change_id, &hash)?;
-txn.update_stack(&stack)?;
+txn.put_change(&mut view, change_id, &hash)?;
+txn.update_view(&view)?;
 txn.commit()?;  // or txn.abort()?
 ```
 
@@ -468,16 +487,16 @@ txn.commit()?;  // or txn.abort()?
 ```
                     MutTxnT
         (Full read-write access)
-        (put_stack_graph, del_stack_graph,
-         del_stack_graph_prefix, create_stack)
+        (create_view, put_graph,
+         put_inode_graph)
                      │
         ┌────────────┼────────────┐
         ▼            ▼            ▼
-    StackTxnT    TreeTxnT    GraphTxnT
-   (Stack ops)  (File ops)  (Graph queries)
-   (get_stack_by_id,          │
-    resolve_overlay_chain,    │
-    iter_stack_graph_adjacent)│
+    ViewTxnT     TreeTxnT    GraphTxnT
+   (View ops)   (File ops)  (Graph queries)
+   (get_view_by_id,           │
+    resolve_filter_chain,     │
+    collect_visible_changes)  │
         │            │        │
         └────────────┼────────┘
                      │
@@ -490,7 +509,7 @@ txn.commit()?;  // or txn.abort()?
            ReadTxn, WriteTxn
 ```
 
-### Block Finding Methods (Critical for Apply)
+### Block Finding Methods (Critical for Graph Writes)
 
 The `GraphTxnT` trait provides two methods for finding vertices by position:
 
@@ -565,7 +584,7 @@ start position (9). This creates ambiguity when resolving edge destinations.
 
 #### Bug 1: `find_block_end` Iteration Order
 
-**Symptom**: When applying changes, edges from inode to content weren't created correctly.
+**Symptom**: When writing changes, edges from inode to content weren't created correctly.
 
 **Root Cause**: `find_block_end(9)` iterated through vertices in B-tree order (by start position).
 The name vertex `V[0:9]` was encountered first and matched because `end == 9`.
@@ -668,8 +687,8 @@ if let Some(&existing) = cache.get(&resolved_vertex) {  // Then cache check
 ### Inode Graph Operations (Dual B-Tree Optimization)
 
 The `InodeGraphOps` trait provides efficient file-local graph traversal using a
-dual B-tree indexing strategy. This is critical for performance when outputting
-file contents from the repository graph.
+dual B-tree indexing strategy. This is critical for performance when
+materializing file contents from the repository graph.
 
 **Problem**: Standard graph storage uses `Vertex<NodeId>` as the key, storing all
 vertices from all files in a single B-tree. This leads to O(n × log N) traversal
@@ -699,7 +718,7 @@ vertices across ALL files.
 │                                                                         │
 │  Use for:                           Use for:                            │
 │  - Cross-file queries               - File-local traversal              │
-│  - Global operations                - Output/retrieve operations        │
+│  - Global operations                - Materialize operations            │
 │  - Backward compatibility           - O(m) instead of O(m × log N)     │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -751,7 +770,8 @@ pub trait InodeGraphOps {
 | Find block | O(log n) | B-tree binary search |
 | Register change | O(log n) | Two table insertions |
 | Iterate file | O(m) | m = file vertices (via INODE_GRAPH) |
-| List stacks | O(s) | s = number of stacks |
+| List views | O(v) | v = number of views |
+| Insert change to view | O(1) | Metadata write to VIEW_CHANGES |
 
 The `INODE_GRAPH` secondary index enables **O(n) file traversal** where n is proportional to file size, rather than O(N) where N is total graph size.
 
@@ -827,111 +847,108 @@ verify content retrieval consistency and wire up token-level diff display.
 Relevant code: `atomic-core/src/change/ops.rs`, `atomic-core/src/apply/crdt.rs`,
 `atomic-core/src/record/workflow/crdt/`.
 
-### Two-Tier Stack Graph Model (Phases 1-6 complete)
+### Ambient Graph + View Filter Model (Phases 1-8 complete)
 
-The two-tier graph model enables Local workspaces (feature, bug, service-*)
-to own their edges in `STACK_GRAPH` while Shared stacks (dev, release, main)
-write to the global `GRAPH`. Deleting an Local workspace cascade-deletes its
-edges with zero orphans.
+The ambient graph model stores all edges in a single canonical GRAPH. Views
+are change-set filters that determine which subset of the graph is visible.
+This replaces the earlier two-tier model (STACK_GRAPH + GRAPH) with a simpler,
+more performant architecture.
 
 **Phase 1 (complete)**: Foundation types and storage schema.
-- `StackKind` enum (Local, Shared)
-- `parent: Option<u64>` field on `StackState`
-- `STACK_GRAPH` table with `(stack_id, vertex)` composite key
-- `create_stack(name, kind, parent)` for explicit stack creation
-- `put_stack_graph`, `del_stack_graph`, `del_stack_graph_prefix` on `MutTxnT`
-- `get_stack_by_id`, `resolve_overlay_chain`, `iter_stack_graph_adjacent` on `StackTxnT`
+- `ViewScope` enum (Draft, Shared)
+- `parent: Option<u64>` field on `ViewState`
+- `create_view(name, scope, parent)` for explicit view creation
 - Backward-compatible serialization (v1 data reads as Shared, no parent)
 - 37 integration tests covering all new functionality
 
-**Phase 2 (complete)**: Apply path branching.
-- `ApplyTarget` enum routes edges: `Global` → `put_graph` + `put_inode_graph`,
-  `Local { stack_id }` → `put_stack_graph`
-- `ApplyTarget::from_stack_kind(kind, id)` canonical constructor
-- `add_edge_with_reverse` in both `edge.rs` and `insertion.rs` branches on `ApplyTarget`
-- `del_edge_with_reverse` branches on `ApplyTarget`
-- `apply_new_vertex` takes `&ApplyTarget` and threads it to edge operations
-- `apply_edge_map` takes `&ApplyTarget` and threads it through `apply_new_edge`
-- `apply_change_to_graph` constructs `ApplyTarget` from stack's `StackKind`
-- `should_apply_hunks` logic: local workspaces always apply hunks (even if
-  change exists in global GRAPH) because they need their own STACK_GRAPH edges
-- `output_working_copy` uses `OverlayTxn` so graph traversal sees
-  STACK_GRAPH chain ∪ GRAPH (files from other stacks are invisible)
-- `output_working_copy_prefix` also uses `OverlayTxn` + visible change filter
-- `OverlayTxn::collect_visible_changes(stack)` collects change NodeIds from
-  the full parent chain (current stack + all ancestors, both Local and Shared)
-- `get_file_content`, `get_file_content_on_stack` delegate to
-  `get_file_content_via_overlay` for consistent overlay-aware retrieval
-- `get_file_content_via_overlay` refactored to use `collect_visible_changes`
-  instead of manual parent-chain walking
+**Phase 2 (complete)**: Graph write path.
+- All edges written directly to GRAPH + INODE_GRAPH (no two-tier routing)
+- `write_new_vertex` writes edges to GRAPH unconditionally
+- `write_edge_map` writes edges to GRAPH unconditionally
+- `add_edge_with_reverse` in both `edge.rs` and `insertion.rs` always targets GRAPH
+- `del_edge_with_reverse` always targets GRAPH
+- `write_change_to_graph` writes all edges to canonical GRAPH regardless of view scope
+- `materialize_view` uses view's change filter to determine visible files
+- `materialize_view_prefix` also uses change filter for file visibility
+- `collect_visible_changes(view)` collects change NodeIds from
+  the full parent chain (current view + all ancestors)
+- `get_file_content`, `get_file_content_on_view` use change filter
+  for consistent view-aware retrieval
 
-**Phase 3 (complete)**: Graph traversal overlay.
-- `OverlayTxn` wraps any `GraphTxnT + StackTxnT` transaction
-- `iter_adjacent` unions STACK_GRAPH chain edges with GRAPH, deduplicating
-  by `SerializedGraphEdge` equality (24-byte comparison)
-- `find_block` checks each STACK_GRAPH layer before falling back to GRAPH
-- `find_block_end` checks each STACK_GRAPH layer before falling back to GRAPH
-- `has_vertex` checks STACK_GRAPH layers then GRAPH
-- `OverlayTxn::is_file_alive(pos)` checks whether an inode vertex has at
-  least one alive (non-PARENT, non-DELETED) forward edge through the overlay
-- `OverlayTxn::iter_tree` filters entries by graph aliveness when overlay is
-  active — files whose edges live only in a *different* stack's STACK_GRAPH
-  are excluded. When no overlay (shared stack), delegates directly.
-- `status` method uses `OverlayTxn` for `iter_tree`, `get_inode`,
+**Phase 3 (complete)**: Graph traversal with change filters.
+- `iter_adjacent` filters edges by `introduced_by ∈ visible_changes`
+- `find_block` operates on canonical GRAPH with change filter
+- `find_block_end` operates on canonical GRAPH with change filter
+- `has_vertex` checks GRAPH directly
+- `is_file_alive(pos)` checks whether an inode vertex has at least one alive
+  (non-PARENT, non-DELETED) forward edge whose introducing change is visible
+- `iter_tree` filters entries by graph aliveness through the change filter —
+  files whose edges were introduced by changes not in the view are excluded
+- `status` method uses change filter for `iter_tree`, `get_inode`,
   `is_directory`, and `inode_position` calls, ensuring files from other
-  local stacks do not appear as tracked
-- TREE/INODES tables remain global (they are a superset index); the overlay
-  model determines file visibility at the graph level
+  views do not appear as tracked
+- TREE/INODES tables remain global (they are a superset index); the change
+  filter determines file visibility at the graph level
 
-**Phase 4 (complete)**: Stack lifecycle.
-- `del_stack` cascade-deletes `STACK_GRAPH` prefix for Local workspaces
-  (zero orphaned edges)
-- `del_stack` blocks deletion of Shared stacks (`CannotDeleteSharedStack`)
-- `del_stack` blocks deletion of stacks with children (`StackHasChildren`)
-- `del_stack` cleans up: STACK_CHANGES, REV_STACK_CHANGES, STATES, TAGS
-- Parent cycle detection in `create_stack`: walks proposed parent chain with
-  a visited set; returns `StackCycleDetected` if a cycle is found
-- Parent validation: `create_stack` returns `StackNotFound` if parent ID
-  references a non-existent stack
+**Phase 4 (complete)**: View lifecycle.
+- `del_view` deletes `VIEW_CHANGES` entries for Draft views;
+  orphaned edges cleaned by background GC
+- `del_view` blocks deletion of Shared views (`CannotDeleteSharedView`)
+- `del_view` blocks deletion of views with children (`ViewHasChildren`)
+- `del_view` cleans up: VIEW_CHANGES, REV_VIEW_CHANGES, STATES, TAGS
+- Parent cycle detection in `create_view`: walks proposed parent chain with
+  a visited set; returns `ViewCycleDetected` if a cycle is found
+- Parent validation: `create_view` returns `ViewNotFound` if parent ID
+  references a non-existent view
 
-**Phase 5 (complete)**: Apply between stacks + cross-stack diff.
-- `apply_from_stack`, `cherry_pick`, `apply_change_rec` already work with the
-  two-tier model (Phase 2's `ApplyTarget` routes edges correctly per `StackKind`)
-- `get_file_content_via_overlay`: reads file content through `OverlayTxn` so
-  local workspaces see their `STACK_GRAPH` edges + global `GRAPH`
-- `diff_stacks(a, b)`: change-level diff (only_in_a, only_in_b, common)
-- `OverlayTxn` implements `TreeTxnT` + `StackTxnT` (pass-through to inner)
-  so it can be used anywhere `GraphTxnT + TreeTxnT` is required
+**Phase 5 (complete)**: Insert between views + cross-view diff.
+- `insert_from_view` adds change references to target view's VIEW_CHANGES
+- `insert_change_rec` computes and inserts transitive dependency closure
+- No edge copying needed — edges are already in GRAPH
+- `get_file_content_via_filter`: reads file content using change filter so
+  views see only edges introduced by their visible changes
+- `diff_views(a, b)`: change-level diff (only_in_a, only_in_b, common)
 
 **Phase 6 (complete)**: CLI and UX.
-- `stack new --local --parent dev` creates local workspaces with explicit parent
-- `stack new` without flags preserves backward-compatible behavior (shared, fork from current)
-- `stack list --verbose` shows `[shared]`/`[isolated]` tags and parent name
-- `StackInfo` gains `kind: StackKind` and `parent_name: Option<String>` fields
-- `Repository::get_stack_info` resolves parent ID → name for display
+- `view create --draft --parent dev` creates draft views with explicit parent
+- `view create` without flags preserves backward-compatible behavior (shared, fork from current)
+- `view list --verbose` shows `[shared]`/`[draft]` tags and parent name
+- `ViewInfo` has `scope: ViewScope` and `parent_name: Option<String>` fields
+- `Repository::get_view_info` resolves parent ID → name for display
 
-Relevant code: `atomic-core/src/pristine/traits.rs` (StackKind, StackState),
-`atomic-core/src/pristine/tables.rs` (STACK_GRAPH), `atomic-core/src/pristine/txn/`,
-`atomic-core/src/pristine/overlay.rs` (OverlayTxn, collect_visible_changes, is_file_alive,
-iter_tree filtering), `atomic-core/src/apply/mod.rs` (ApplyTarget),
+**Phase 7 (complete)**: Vocabulary refactoring across codebase.
+- Stack → View, StackKind → ViewScope, Local → Draft
+- Apply → Insert (user-facing cross-view operation)
+- Output working copy → Materialize (write graph state to disk)
+- Eliminated: `ApplyTarget`, `OverlayTxn`, `STACK_GRAPH`
+- All edges always go to GRAPH; views use change filters
+
+**Phase 8 (complete)**: Documentation update.
+- AGENTS.md comprehensively updated to reflect ambient graph + view filter model
+- All code examples, type references, and architectural diagrams updated
+
+Relevant code: `atomic-core/src/pristine/traits.rs` (ViewScope, ViewState),
+`atomic-core/src/pristine/tables.rs` (GRAPH, INODE_GRAPH, VIEWS, VIEW_CHANGES),
+`atomic-core/src/pristine/txn/`,
+`atomic-core/src/apply/mod.rs` (write_change_to_graph),
 `atomic-core/src/apply/edge.rs` (add_edge_with_reverse, del_edge_with_reverse),
-`atomic-core/src/apply/insertion.rs` (apply_new_vertex, add_edge_with_reverse),
-`atomic-repository/src/apply.rs` (apply_change_to_graph, apply_hunk),
-`atomic-repository/src/repository/content.rs` (get_file_content_via_overlay,
-diff_stacks), `atomic-repository/src/repository/mod.rs` (output_working_copy,
-output_working_copy_prefix, switch_stack, StackInfo with kind/parent),
-`atomic-repository/src/repository/status.rs` (overlay-aware status),
-`atomic-cli/src/commands/stack/new.rs` (--local, --parent flags),
-`atomic-cli/src/commands/stack/list.rs` (kind/parent in verbose output).
+`atomic-core/src/apply/insertion.rs` (write_new_vertex, add_edge_with_reverse),
+`atomic-repository/src/apply.rs` (write_change_to_graph),
+`atomic-repository/src/repository/content.rs` (get_file_content_via_filter,
+diff_views), `atomic-repository/src/repository/mod.rs` (materialize_view,
+materialize_view_prefix, switch_view, ViewInfo with scope/parent),
+`atomic-repository/src/repository/status.rs` (change-filter-aware status),
+`atomic-cli/src/commands/view/create.rs` (--draft, --parent flags),
+`atomic-cli/src/commands/view/list.rs` (scope/parent in verbose output).
 
-### Stack Workflow Commands (planned)
+### View Workflow Commands (planned)
 
-Advanced stack manipulation: `unrecord`, `reinsert`, `revise`, cross-stack `apply`,
-per-stack `tag`. These build on the existing `Repository::unrecord()` and
+Advanced view manipulation: `unrecord`, `reinsert`, `revise`, cross-view `insert`,
+per-view `tag`. These build on the existing `Repository::unrecord()` and
 `Repository::reinsert_change()` methods.
 
-Key design: a change reference syntax (`@`, `@~1`, `@~N`, `stack@`) for
-addressing changes within stacks. See the Phase 13 section of the CRDT
+Key design: a change reference syntax (`@`, `@~1`, `@~N`, `view@`) for
+addressing changes within views. See the Phase 13 section of the CRDT
 Semantic Layer design doc for the full spec.
 
 
@@ -1004,6 +1021,7 @@ public APIs serve as both documentation and regression tests.
 3. **Atomic Counters**: Thread-safe ID allocation with AtomicU64
 4. **Key Encoding**: Efficient fixed-size byte arrays for table keys
 5. **Copy-on-Write**: redb uses COW B-trees for efficient updates
+6. **O(1) Insert**: Cross-view insert is metadata-only (no edge copying)
 
 ## File Organization
 
@@ -1020,15 +1038,15 @@ atomic-core/
 │   ├── pristine/           # redb storage layer
 │   │   └── txn/
 │   │       ├── read.rs
-│   │       └── write/      # Split by trait: graph, stack, tree, mutate
+│   │       └── write/      # Split by trait: graph, view, tree, mutate
 │   ├── change/             # Change representation, headers, provenance
 │   ├── record/
 │   │   └── workflow/
 │   │       ├── globalize/  # Position resolution, vertex creation, pipeline
 │   │       ├── crdt/       # CRDT operation generation
 │   │       └── ...
-│   ├── apply/              # Graph application, conflict detection
-│   └── output/             # Working copy output, alive graph traversal
+│   ├── apply/              # Graph writes, conflict detection
+│   └── materialize/        # View materialization, alive graph traversal
 │       ├── repo/
 │       └── alive/
 
@@ -1036,10 +1054,10 @@ atomic-repository/
 ├── src/
 │   ├── repository/         # Split by domain:
 │   │   ├── mod.rs          # Struct, init, open, path helpers
-│   │   ├── stacks.rs       # Stack CRUD
+│   │   ├── views.rs        # View CRUD
 │   │   ├── changes.rs      # Change save/load/delete
 │   │   ├── record.rs       # Record workflow
-│   │   ├── apply.rs        # Apply changes
+│   │   ├── apply.rs        # Write changes to graph
 │   │   ├── status.rs       # Working copy status
 │   │   ├── tracking.rs     # File tracking
 │   │   ├── history.rs      # Log, unrecord, reinsert
@@ -1057,7 +1075,7 @@ atomic-cli/
 │   │   ├── log/            # types, command
 │   │   ├── change/         # types, command
 │   │   ├── record/         # builder, provenance, format, command
-│   │   ├── push/, pull/, clone/, stack/, tag/, ...
+│   │   ├── push/, pull/, clone/, view/, tag/, ...
 │   │   └── ...
 │   └── output/             # colors, progress, table
 ```
@@ -1081,7 +1099,7 @@ cargo test -p atomic
 cargo test -- --nocapture
 
 # Run specific test
-cargo test test_stack_operations
+cargo test test_view_operations
 
 # Check documentation
 cargo doc --open
@@ -1096,28 +1114,31 @@ cargo run -p atomic -- --help
 # Initialize a new repository
 cargo run -p atomic -- init
 
-# Initialize with a specific stack name
-cargo run -p atomic -- init --stack main
+# Initialize with a specific view name
+cargo run -p atomic -- init --view main
 
 # Initialize with project-specific ignore patterns
 cargo run -p atomic -- init --kind rust
 
-# Show status (stub - not yet implemented)
+# Show status
 cargo run -p atomic -- status
 
-# Add files (stub - not yet implemented)
+# Add files
 cargo run -p atomic -- add src/main.rs
 
-# Record changes (stub - not yet implemented)
+# Record changes
 cargo run -p atomic -- record -m "Initial commit"
 
-# View history (stub - not yet implemented)
+# View history
 cargo run -p atomic -- log
 
-# Manage stacks (stub - not yet implemented)
-cargo run -p atomic -- stack list
-cargo run -p atomic -- stack new feature
-cargo run -p atomic -- stack switch main
+# Manage views
+cargo run -p atomic -- view list
+cargo run -p atomic -- view create feature
+cargo run -p atomic -- view switch main
+
+# Insert changes between views
+cargo run -p atomic -- insert from-view feature --to-view dev
 ```
 
 ## License

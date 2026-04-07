@@ -172,17 +172,18 @@ fn write_new_edge<T: MutTxnT>(
         collect_pseudo_edges_for_reconnection(txn, workspace, target)?;
     }
 
-    // Remove the old edge (ignoring not-found errors)
-    del_edge_with_reverse(
-        txn,
-        resolved_inode,
-        edge.previous,
-        source,
-        target,
-        introduced_by,
-    )?;
-
-    // Add the new edge
+    // In the ambient graph model, we NEVER delete edges from GRAPH.
+    // The original edge (introduced by a prior change) stays in place.
+    // We only ADD the new edge alongside it.  The view filter determines
+    // which edge is "active" for any given view:
+    //
+    //   - If the new edge's introducing change is IN the view's filter,
+    //     the new edge (e.g., BLOCK|DELETED) takes precedence.
+    //   - If the new edge's introducing change is OUTSIDE the filter,
+    //     the original edge remains visible.
+    //
+    // This is what makes views work as true projections over a single
+    // graph — no view can destroy information that another view depends on.
     add_edge_with_reverse(txn, resolved_inode, edge.flag, source, target, change_id)?;
 
     // For deletions, check for zombie context
@@ -295,9 +296,16 @@ fn add_edge_with_reverse<T: MutTxnT>(
     // Create forward edge
     let forward_edge = SerializedGraphEdge::new(flag, dest.start_pos(), introduced_by);
 
-    // Create reverse edge (with PARENT flag)
+    // Create reverse edge (same flags + PARENT)
     let reverse_flag = flag | EdgeFlags::PARENT;
     let reverse_edge = SerializedGraphEdge::new(reverse_flag, source.end_pos(), introduced_by);
+
+    log::debug!(
+        "add_edge_with_reverse: flag={:?} source=[{:?} {:?}:{:?}] dest=[{:?} {:?}:{:?}] introduced_by={:?}",
+        flag, source.change, source.start, source.end,
+        dest.change, dest.start, dest.end,
+        introduced_by
+    );
 
     // Write to global GRAPH
     txn.put_graph(source, forward_edge)
@@ -361,8 +369,15 @@ fn del_edge_with_reverse<T: MutTxnT>(
     let reverse_edge = SerializedGraphEdge::new(reverse_flag, source.end_pos(), introduced_by);
 
     // Remove from global GRAPH
-    let _ = txn.del_graph(source, forward_edge);
-    let _ = txn.del_graph(dest, reverse_edge);
+    let del_fwd = txn.del_graph(source, forward_edge);
+    let del_rev = txn.del_graph(dest, reverse_edge);
+
+    log::debug!(
+        "del_edge_with_reverse: flag={:?} source=[{:?} {:?}:{:?}] dest=[{:?} {:?}:{:?}] introduced_by={:?} fwd_ok={} rev_ok={}",
+        flag, source.change, source.start, source.end,
+        dest.change, dest.start, dest.end,
+        introduced_by, del_fwd.is_ok(), del_rev.is_ok()
+    );
 
     // Remove from INODE_GRAPH secondary index
     if let Some(inode_val) = inode {

@@ -38,7 +38,7 @@ pub struct Insert {
     change: Option<String>,
 
     /// View to insert the change into (default: current view).
-    #[arg(short, long)]
+    #[arg(long)]
     view: Option<String>,
 
     /// Insert dependencies automatically.
@@ -82,7 +82,7 @@ pub struct FromViewArgs {
     from_view: String,
 
     /// Target view to insert changes into (default: current view).
-    #[arg(short, long)]
+    #[arg(long)]
     to_view: Option<String>,
 
     /// Insert dependencies automatically.
@@ -106,11 +106,11 @@ pub struct TagArgs {
     tag_name: String,
 
     /// Source view containing the tag.
-    #[arg(short, long)]
+    #[arg(long)]
     from_view: Option<String>,
 
     /// Target view to insert changes into (default: current view).
-    #[arg(short, long)]
+    #[arg(long)]
     to_view: Option<String>,
 
     /// Insert dependencies automatically.
@@ -134,7 +134,7 @@ pub struct PickArgs {
     changes: Vec<String>,
 
     /// Target view to insert changes into (default: current view).
-    #[arg(short, long)]
+    #[arg(long)]
     to_view: Option<String>,
 
     /// Insert dependencies automatically.
@@ -154,7 +154,7 @@ pub struct PreviewArgs {
     from_view: String,
 
     /// Target view (default: current view).
-    #[arg(short, long)]
+    #[arg(long)]
     to_view: Option<String>,
 
     /// Optional tag to limit preview up to.

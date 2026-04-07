@@ -250,8 +250,7 @@ where
     T: GraphTxnT,
 {
     // Retrieve the file's content graph
-    let options = RetrieveOptions::default();
-    let result = match retrieve_graph(txn, inode_pos, options) {
+    let result = match retrieve_graph(txn, inode_pos, RetrieveOptions::default()) {
         Ok(r) => r,
         Err(_) => {
             // Empty file - treat as append (will connect to inode)
@@ -331,8 +330,7 @@ where
     T: GraphTxnT,
 {
     // Retrieve the file's content graph starting from the inode position
-    let options = RetrieveOptions::default();
-    let result = match retrieve_graph(txn, inode_pos, options) {
+    let result = match retrieve_graph(txn, inode_pos, RetrieveOptions::default()) {
         Ok(r) => r,
         Err(_) => {
             // If we can't retrieve the graph, fall back to inode position
@@ -410,8 +408,7 @@ where
 {
     use crate::output::alive::{retrieve_graph, RetrieveOptions};
 
-    let options = RetrieveOptions::default();
-    let result = match retrieve_graph(txn, inode_pos, options) {
+    let result = match retrieve_graph(txn, inode_pos, RetrieveOptions::default()) {
         Ok(r) => r,
         Err(_) => {
             // No graph content - return empty
@@ -513,7 +510,13 @@ fn find_predecessor_end_position<T: GraphTxnT>(
 ) -> GlobalizeResult<Position<NodeId>> {
     use crate::types::EdgeFlags;
 
-    // Look for BLOCK|PARENT edges - these tell us where the edge came from
+    // Look for BLOCK|PARENT edges - these tell us where the edge came from.
+    //
+    // NOTE: No change filter here.  This is a structural lookup — we need
+    // the predecessor vertex regardless of which view introduced the edge.
+    // The `introduced_by` on a parent edge records WHEN the connection was
+    // made, not WHETHER the predecessor exists.  Filtering here would reject
+    // edges introduced by sibling views and leave content vertices orphaned.
     let min_flag = EdgeFlags::BLOCK | EdgeFlags::PARENT;
     let max_flag = EdgeFlags::BLOCK | EdgeFlags::PARENT | EdgeFlags::FOLDER;
 
@@ -521,8 +524,7 @@ fn find_predecessor_end_position<T: GraphTxnT>(
         .iter_adjacent(node, min_flag, max_flag)
         .map_err(|e| GlobalizeError::Pristine(Box::new(e)))?;
 
-    let mut adj_iter = adj;
-    if let Some(edge_result) = adj_iter.next() {
+    for edge_result in adj {
         let edge = edge_result.map_err(|e| GlobalizeError::Pristine(Box::new(e)))?;
 
         // The edge dest() points to where the forward edge came FROM
@@ -546,6 +548,8 @@ fn find_edge_introduced_by<T: GraphTxnT>(
     use crate::types::EdgeFlags;
 
     // Find the span at the from position
+    // (find_block_end resolves a position to a vertex — no filtering needed
+    // since the vertex exists regardless of which view introduced it)
     let from_vertex = match txn.find_block_end(from_pos) {
         Ok(v) => v,
         Err(_) => return None,
@@ -565,6 +569,13 @@ fn find_edge_introduced_by<T: GraphTxnT>(
             Ok(e) => e,
             Err(_) => continue,
         };
+
+        // NOTE: No change filter here.  This is a structural lookup — we
+        // need to find the edge that connects from_vertex to to_vertex
+        // regardless of which view introduced it.  The original edge may
+        // have been replaced by a sibling view (e.g., agent-a deletes
+        // the C1 edge and adds a C2 edge).  We still need to find it so
+        // we can record the correct `introduced_by` in the new change.
 
         // Check if this edge points to our target span
         if edge.dest() == to_vertex.start_pos() {

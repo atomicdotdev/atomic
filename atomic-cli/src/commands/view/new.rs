@@ -153,7 +153,7 @@ pub struct New {
     /// `--from <VIEW>` to fork from a different view instead.
     ///
     /// The new view inherits all changes from the source and gets
-    /// its own isolated edge storage (`STACK_GRAPH`) so that future
+    /// its own view filter on the canonical `GRAPH` so that future
     /// changes recorded on it are invisible to the source.
     #[arg(long, value_name = "VIEW")]
     pub from: Option<String>,
@@ -175,7 +175,7 @@ pub struct New {
 
     /// Create a draft workspace (ephemeral, deletable).
     ///
-    /// Draft workspaces write edges to a per-view graph (`STACK_GRAPH`)
+    /// Draft workspaces write edges to the canonical `GRAPH` (filtered by view)
     /// instead of the global graph. When deleted, all their edges are
     /// cascade-removed with zero orphans.
     ///
@@ -351,7 +351,7 @@ impl Command for New {
         //              with an EMPTY change log (no files until `insert`)
         //
         // The new view is a Draft workspace whose edges go to
-        // STACK_GRAPH (isolated from other views).  The parent link
+        // GRAPH (filtered by this view's change set).  The parent link
         // gives the overlay chain read-access to the shared graph for
         // record-time diff computation.
         //

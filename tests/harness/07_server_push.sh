@@ -6,26 +6,26 @@
 #
 #   1. A "client" repo records changes locally
 #   2. Change files are copied to a "server" repo (simulating upload)
-#   3. The server creates a local stack (simulating agent session auto-creation)
-#   4. The server applies the change to the local stack
-#   5. The server switches to that stack and outputs the working copy
+#   3. The server creates a draft view (simulating agent session auto-creation)
+#   4. The server inserts the change into the draft view
+#   5. The server switches to that view and outputs the working copy
 #   6. The file on disk must have correct content — no duplication
 #
 # This is the exact code path that the API push handler follows.
-# The bug being tested: after applying a change (with dependencies on a
-# shared stack) to a local stack and outputting the working copy, the
+# The bug being tested: after inserting a change (with dependencies on a
+# shared view) into a draft view and outputting the working copy, the
 # file content was duplicated on the server.
 #
 # Key invariants tested:
 #
-#   1. Apply to dev (shared) → output_working_copy produces correct file
-#   2. Create local stack → apply dependent change → switch → output
+#   1. Insert to dev (shared) → output_working_copy produces correct file
+#   2. Create draft view → insert dependent change → switch → output
 #      produces correct file (no duplication)
-#   3. Content after local stack output matches what the client recorded
-#   4. output_working_copy with dev perspective does NOT show local changes
-#   5. Multiple sequential changes to the same file on a local stack
+#   3. Content after draft view output matches what the client recorded
+#   4. output_working_copy with dev perspective does NOT show draft changes
+#   5. Multiple sequential changes to the same file on a draft view
 #      produce correct content (no accumulating duplication)
-#   6. The local stack's file content matches the client's working copy
+#   6. The draft view's file content matches the client's working copy
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
@@ -39,8 +39,8 @@ begin_section "Server Push: Setup client repo with two changes"
 #   Change 2 (on dev): modify src/index.ts — add color codes, change return
 #
 # Change 2 depends on Change 1. Both are recorded on dev (shared).
-# The server will receive both, apply Change 1 to dev, then apply
-# Change 2 to a local (agent) stack.
+# The server will receive both, insert Change 1 into dev, then insert
+# Change 2 into a draft (agent) view.
 
 make_temp_repo "client"
 CLIENT_DIR="$REPO_DIR"
@@ -186,25 +186,25 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Server Push: Apply change 1 to dev (shared stack)"
+begin_section "Server Push: Insert change 1 into dev (shared view)"
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # This simulates the first push to the server — the initial file creation
-# lands on the shared dev stack.
+# lands on the shared dev view.
 
 cd "$SERVER_DIR"
 
-APPLY1_OUT="$(atomic apply "$HASH1" --stack dev 2>&1)" || true
+APPLY1_OUT="$(atomic insert "$HASH1" --view dev 2>&1)" || true
 
 if echo "$APPLY1_OUT" | grep -qiE "applied|success|state"; then
-    _pass "Applied change 1 to dev"
+    _pass "Inserted change 1 into dev"
 else
-    _pass "Apply change 1 to dev completed: $(echo "$APPLY1_OUT" | head -3)"
+    _pass "Insert change 1 into dev completed: $(echo "$APPLY1_OUT" | head -3)"
 fi
 
 # Verify the file exists and has correct content
 assert_file_exists \
-    "src/index.ts exists on server after first apply" \
+    "src/index.ts exists on server after first insert" \
     "src/index.ts"
 
 # The file should contain "function greet" exactly once
@@ -222,51 +222,51 @@ LINES_AFTER_1="$(echo "$CONTENT_AFTER_1" | wc -l | tr -d ' ')"
 _pass "After change 1: file has $LINES_AFTER_1 lines"
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Server Push: Create local stack and apply change 2"
+begin_section "Server Push: Create draft view and insert change 2"
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# This simulates the API creating an agent session stack on first push
-# from that agent, then applying the agent's change to it.
+# This simulates the API creating an agent session view on first push
+# from that agent, then inserting the agent's change into it.
 
-LOCAL_STACK="agent-ses_test-harness"
+LOCAL_VIEW="agent-ses_test-harness"
 
-# Create the local stack (same as what the API push handler does)
-NEW_OUT="$(new_stack "$LOCAL_STACK" 2>&1)" || true
+# Create the draft view (same as what the API push handler does)
+NEW_OUT="$(new_view "$LOCAL_VIEW" 2>&1)" || true
 
-if echo "$NEW_OUT" | grep -qiE "created|stack"; then
-    _pass "Created local stack '$LOCAL_STACK'"
+if echo "$NEW_OUT" | grep -qiE "created|view"; then
+    _pass "Created draft view '$LOCAL_VIEW'"
 else
-    _pass "Local stack creation completed"
+    _pass "Draft view creation completed"
 fi
 
-assert_stack_exists "Local stack exists" "$LOCAL_STACK"
+assert_view_exists "Draft view exists" "$LOCAL_VIEW"
 
-# Apply change 2 to the local stack.
+# Insert change 2 into the draft view.
 # Change 2 depends on change 1, which is on dev (shared).
-# The local stack's overlay should see change 1's edges through GRAPH,
+# The draft view's overlay should see change 1's edges through GRAPH,
 # and change 2's edges should go to STACK_GRAPH.
-APPLY2_OUT="$(atomic apply "$HASH2" --stack "$LOCAL_STACK" 2>&1)" || true
+APPLY2_OUT="$(atomic insert "$HASH2" --view "$LOCAL_VIEW" 2>&1)" || true
 
 if echo "$APPLY2_OUT" | grep -qiE "applied|success|state"; then
-    _pass "Applied change 2 to local stack"
+    _pass "Inserted change 2 into draft view"
 else
-    _pass "Apply change 2 completed: $(echo "$APPLY2_OUT" | head -3)"
+    _pass "Insert change 2 completed: $(echo "$APPLY2_OUT" | head -3)"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Server Push: Switch to local stack and verify output"
+begin_section "Server Push: Switch to draft view and verify output"
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# The critical test: switch to the local stack and verify the working copy.
+# The critical test: switch to the draft view and verify the working copy.
 # This is where the bug manifested — the file was duplicated or showed
 # the wrong content.
 
-switch_stack "$LOCAL_STACK" >/dev/null 2>&1 || true
-assert_current_stack "Switched to local stack" "$LOCAL_STACK"
+switch_view "$LOCAL_VIEW" >/dev/null 2>&1 || true
+assert_current_view "Switched to draft view" "$LOCAL_VIEW"
 
 # The file must exist
 assert_file_exists \
-    "src/index.ts exists after switch to local stack" \
+    "src/index.ts exists after switch to draft view" \
     "src/index.ts"
 
 # Read the content
@@ -278,33 +278,33 @@ LINES_LOCAL="$(echo "$CONTENT_LOCAL" | wc -l | tr -d ' ')"
 GREET_COUNT_LOCAL="$(echo "$CONTENT_LOCAL" | grep -c "function greet" || true)"
 
 if [[ "$GREET_COUNT_LOCAL" -eq 1 ]]; then
-    _pass "Local stack: 'function greet' appears exactly once (no duplication)"
+    _pass "Draft view: 'function greet' appears exactly once (no duplication)"
 else
-    _fail "Local stack: no duplication" \
+    _fail "Draft view: no duplication" \
         "'function greet' appears $GREET_COUNT_LOCAL times (expected 1). Lines: $LINES_LOCAL. Content: $(echo "$CONTENT_LOCAL" | head -30)"
 fi
 
 # ── Invariant 2: Content from change 2 is present ────────────────────────
 # The ANSI color constants should be in the file
 if echo "$CONTENT_LOCAL" | grep -qF "RED"; then
-    _pass "Local stack: contains RED constant from change 2"
+    _pass "Draft view: contains RED constant from change 2"
 else
-    _fail "Local stack: contains RED" \
+    _fail "Draft view: contains RED" \
         "File does not contain 'RED'. Content: $(echo "$CONTENT_LOCAL" | head -20)"
 fi
 
 if echo "$CONTENT_LOCAL" | grep -qF "RESET"; then
-    _pass "Local stack: contains RESET constant from change 2"
+    _pass "Draft view: contains RESET constant from change 2"
 else
-    _fail "Local stack: contains RESET" \
+    _fail "Draft view: contains RESET" \
         "File does not contain 'RESET'. Content: $(echo "$CONTENT_LOCAL" | head -20)"
 fi
 
 # ── Invariant 3: The modified return statement is present ────────────────
 if echo "$CONTENT_LOCAL" | grep -q 'RED.*name.*RESET'; then
-    _pass "Local stack: return statement uses color codes"
+    _pass "Draft view: return statement uses color codes"
 else
-    _fail "Local stack: return uses color codes" \
+    _fail "Draft view: return uses color codes" \
         "Expected return with RED/RESET. Content: $(echo "$CONTENT_LOCAL" | head -20)"
 fi
 
@@ -315,37 +315,37 @@ OLD_RETURN_COUNT="$(echo "$CONTENT_LOCAL" | grep -c 'Hello, \${name}!' | grep -c
 SIMPLE_RETURNS="$(echo "$CONTENT_LOCAL" | grep 'Hello,' | grep -v 'RED' | grep -v 'RESET' || true)"
 
 if [[ -z "$SIMPLE_RETURNS" ]]; then
-    _pass "Local stack: old return statement replaced (not present without colors)"
+    _pass "Draft view: old return statement replaced (not present without colors)"
 else
-    _fail "Local stack: old return removed" \
+    _fail "Draft view: old return removed" \
         "Simple return still present: $SIMPLE_RETURNS"
 fi
 
 # ── Invariant 5: File size is reasonable ─────────────────────────────────
 if [[ "$LINES_LOCAL" -le 15 ]]; then
-    _pass "Local stack: file has $LINES_LOCAL lines (reasonable size)"
+    _pass "Draft view: file has $LINES_LOCAL lines (reasonable size)"
 else
-    _fail "Local stack: file size" \
+    _fail "Draft view: file size" \
         "File has $LINES_LOCAL lines (expected ≤15, likely duplicated). Content: $(echo "$CONTENT_LOCAL" | head -30)"
 fi
 
 # ── Invariant 6: Content matches what the client recorded ────────────────
 if [[ "$CONTENT_LOCAL" == "$CLIENT_CONTENT" ]]; then
-    _pass "Local stack: content matches client's working copy exactly"
+    _pass "Draft view: content matches client's working copy exactly"
 else
-    _fail "Local stack: content matches client" \
+    _fail "Draft view: content matches client" \
         "Server content differs from client. Server ($LINES_LOCAL lines): $(echo "$CONTENT_LOCAL" | head -15) --- Client ($CLIENT_LINES lines): $(echo "$CLIENT_CONTENT" | head -15)"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Server Push: Dev perspective unaffected by local stack"
+begin_section "Server Push: Dev perspective unaffected by draft view"
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # After switching back to dev, the file should show change 1's content
-# (the original without color codes). Change 2 is only on the local stack.
+# (the original without color codes). Change 2 is only on the draft view.
 
-switch_stack "dev" >/dev/null 2>&1 || true
-assert_current_stack "Back on dev" "dev"
+switch_view "dev" >/dev/null 2>&1 || true
+assert_current_view "Back on dev" "dev"
 
 CONTENT_DEV="$(cat src/index.ts 2>/dev/null || echo "")"
 
@@ -360,9 +360,9 @@ fi
 # Dev should NOT have the color constants
 if echo "$CONTENT_DEV" | grep -qF "RED"; then
     _fail "Dev: no color constants" \
-        "Dev should NOT contain RED (that's on the local stack). Content: $(echo "$CONTENT_DEV" | head -15)"
+        "Dev should NOT contain RED (that's on the draft view). Content: $(echo "$CONTENT_DEV" | head -15)"
 else
-    _pass "Dev: does not contain RED (local stack change not visible)"
+    _pass "Dev: does not contain RED (draft view change not visible)"
 fi
 
 # Dev file should not be duplicated either
@@ -375,14 +375,14 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Server Push: Round-trip — local stack still correct"
+begin_section "Server Push: Round-trip — draft view still correct"
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# Switch back to the local stack. The file should still have the correct
-# content — no corruption from the dev→local round trip.
+# Switch back to the draft view. The file should still have the correct
+# content — no corruption from the dev→draft round trip.
 
-switch_stack "$LOCAL_STACK" >/dev/null 2>&1 || true
-assert_current_stack "Back on local stack" "$LOCAL_STACK"
+switch_view "$LOCAL_VIEW" >/dev/null 2>&1 || true
+assert_current_view "Back on draft view" "$LOCAL_VIEW"
 
 CONTENT_ROUNDTRIP="$(cat src/index.ts 2>/dev/null || echo "")"
 GREET_COUNT_RT="$(echo "$CONTENT_ROUNDTRIP" | grep -c "function greet" || true)"
@@ -402,11 +402,11 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Server Push: Multiple changes to same file on local stack"
+begin_section "Server Push: Multiple changes to same file on draft view"
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # Record a THIRD change on the client that further modifies the file,
-# copy it to the server, apply to the local stack, and verify no
+# copy it to the server, insert into the draft view, and verify no
 # accumulating duplication.
 
 cd "$CLIENT_DIR"
@@ -458,19 +458,19 @@ else
     exit 1
 fi
 
-# Make sure we're on the local stack
-switch_stack "$LOCAL_STACK" >/dev/null 2>&1 || true
+# Make sure we're on the draft view
+switch_view "$LOCAL_VIEW" >/dev/null 2>&1 || true
 
-APPLY3_OUT="$(atomic apply "$HASH3" --stack "$LOCAL_STACK" 2>&1)" || true
+APPLY3_OUT="$(atomic insert "$HASH3" --view "$LOCAL_VIEW" 2>&1)" || true
 
 if echo "$APPLY3_OUT" | grep -qiE "applied|success|state"; then
-    _pass "Applied change 3 to local stack"
+    _pass "Inserted change 3 into draft view"
 else
-    _pass "Apply change 3 completed"
+    _pass "Insert change 3 completed"
 fi
 
-# Re-output working copy (switch_stack already did this, but be explicit)
-# In the API, output_working_copy is called after apply.
+# Re-output working copy (switch_view already did this, but be explicit)
+# In the API, output_working_copy is called after insert.
 # Here, the switch already triggers it.
 
 CONTENT_V3="$(cat src/index.ts 2>/dev/null || echo "")"
@@ -507,23 +507,23 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Server Push: Dev still unaffected after 3 local changes"
+begin_section "Server Push: Dev still unaffected after 3 draft changes"
 # ═══════════════════════════════════════════════════════════════════════════
 
-switch_stack "dev" >/dev/null 2>&1 || true
+switch_view "dev" >/dev/null 2>&1 || true
 
 CONTENT_DEV_FINAL="$(cat src/index.ts 2>/dev/null || echo "")"
 
 if echo "$CONTENT_DEV_FINAL" | grep -qF "farewell"; then
     _fail "Dev final: no farewell" \
-        "Dev should NOT have 'farewell' (only on local stack)"
+        "Dev should NOT have 'farewell' (only on draft view)"
 else
     _pass "Dev final: does not contain farewell function"
 fi
 
 if echo "$CONTENT_DEV_FINAL" | grep -qF "RED"; then
     _fail "Dev final: no color constants" \
-        "Dev should NOT have RED (only on local stack)"
+        "Dev should NOT have RED (only on draft view)"
 else
     _pass "Dev final: does not contain color constants"
 fi

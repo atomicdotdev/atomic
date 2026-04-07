@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# 08_local_stack_apply.sh — Local stack apply correctness at scale.
+# 08_draft_view_insert.sh — Draft view insert correctness at scale.
 #
 # Tests the exact code path that the API server push handler follows:
-# changes are recorded on a client repo's local (agent) stack, copied
-# to a server repo, and applied to the same local stack on the server.
+# changes are recorded on a client repo's draft (agent) view, copied
+# to a server repo, and inserted into the same draft view on the server.
 #
-# The critical invariant: after applying N sequential changes that modify
+# The critical invariant: after inserting N sequential changes that modify
 # the same file, the server's working copy must contain ONLY the final
 # state — not a concatenation of all intermediate states.
 #
 # This is the spec for the duplication bug:
-#   When two or more changes are applied to the same local stack via
-#   `atomic apply <hash> --stack <local>`, the second change's EdgeUpdate
+#   When two or more changes are inserted into the same draft view via
+#   `atomic insert <hash> --view <draft>`, the second change's EdgeUpdate
 #   (which replaces old content with new content) must properly delete
 #   the old BLOCK edge in STACK_GRAPH before adding the new one.
 #   Without this, the graph traversal sees BOTH the old and new content
@@ -24,8 +24,8 @@
 #   3. Content matches what the client had at that revision
 #   4. Each change's NEW content is present
 #   5. Each change's OLD content (that was replaced) is absent
-#   6. After switching to dev, the local stack's files are NOT visible
-#   7. After switching back to the local stack, content is still correct
+#   6. After switching to dev, the draft view's files are NOT visible
+#   7. After switching back to the draft view, content is still correct
 #
 # Scale targets:
 #   - 10 sequential changes to the same file
@@ -97,21 +97,21 @@ get_newest_change_hash() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Setup: Client repo with agent stack"
+begin_section "Setup: Client repo with agent view"
 # ═══════════════════════════════════════════════════════════════════════════
 
 make_temp_repo "client-scale"
 CLIENT_DIR="$REPO_DIR"
 init_repo
 
-AGENT_STACK="agent-ses_scale-test"
+AGENT_VIEW="agent-ses_scale-test"
 
-new_stack "$AGENT_STACK" >/dev/null 2>&1 || true
-switch_stack "$AGENT_STACK" >/dev/null 2>&1 || true
-assert_current_stack "Client on agent stack" "$AGENT_STACK"
+new_view "$AGENT_VIEW" >/dev/null 2>&1 || true
+switch_view "$AGENT_VIEW" >/dev/null 2>&1 || true
+assert_current_view "Client on agent view" "$AGENT_VIEW"
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Record 10 sequential changes on agent stack"
+begin_section "Record 10 sequential changes on agent view"
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # Each change modifies src/app.ts:
@@ -441,16 +441,16 @@ for i in $(seq 1 $NUM_CHANGES); do
 done
 _pass "Copied all $NUM_CHANGES change files to server"
 
-# Create the same agent stack on the server
-new_stack "$AGENT_STACK" >/dev/null 2>&1 || true
-assert_stack_exists "Server has agent stack" "$AGENT_STACK"
+# Create the same agent view on the server
+new_view "$AGENT_VIEW" >/dev/null 2>&1 || true
+assert_view_exists "Server has agent view" "$AGENT_VIEW"
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Apply changes 1-${NUM_CHANGES} to local stack, verify after each"
+begin_section "Insert changes 1-${NUM_CHANGES} into draft view, verify after each"
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# This is the critical test loop. After each apply:
-#   - Switch to the local stack
+# This is the critical test loop. After each insert:
+#   - Switch to the draft view
 #   - Read the file
 #   - Verify no duplication
 #   - Verify content matches client snapshot
@@ -461,11 +461,11 @@ for i in $(seq 1 $NUM_CHANGES); do
     HASH="${CHANGE_HASHES[$i]}"
     EXPECTED_LINES="${EXPECTED_LINE_COUNTS[$i]}"
 
-    # Apply
-    APPLY_OUT="$(atomic apply "$HASH" --stack "$AGENT_STACK" 2>&1)" || true
+    # Insert
+    APPLY_OUT="$(atomic insert "$HASH" --view "$AGENT_VIEW" 2>&1)" || true
 
-    # Switch to local stack to trigger output_working_copy
-    switch_stack "$AGENT_STACK" >/dev/null 2>&1 || true
+    # Switch to draft view to trigger output_working_copy
+    switch_view "$AGENT_VIEW" >/dev/null 2>&1 || true
 
     # Read the file
     CONTENT="$(cat src/app.ts 2>/dev/null || echo "")"
@@ -595,22 +595,22 @@ for i in $(seq 1 $NUM_CHANGES); do
             "Server content differs from client at version $i"
     fi
 
-    # Switch back to dev between applies (simulates server staying on dev)
-    switch_stack "dev" >/dev/null 2>&1 || true
+    # Switch back to dev between inserts (simulates server staying on dev)
+    switch_view "dev" >/dev/null 2>&1 || true
 done
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Final verification: dev isolation"
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# After all 10 changes (with adds, modifies, AND deletes) on the local
-# stack, dev should still be empty — the app.ts file should NOT exist on dev.
+# After all 10 changes (with adds, modifies, AND deletes) on the draft
+# view, dev should still be empty — the app.ts file should NOT exist on dev.
 
-switch_stack "dev" >/dev/null 2>&1 || true
-assert_current_stack "On dev for isolation check" "dev"
+switch_view "dev" >/dev/null 2>&1 || true
+assert_current_view "On dev for isolation check" "dev"
 
 if [[ ! -f "src/app.ts" ]]; then
-    _pass "Dev: src/app.ts does not exist (all changes on local stack)"
+    _pass "Dev: src/app.ts does not exist (all changes on draft view)"
 else
     DEV_CONTENT="$(cat src/app.ts)"
     DEV_LINES="$(echo "$DEV_CONTENT" | wc -l | tr -d ' ')"
@@ -619,10 +619,10 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Final verification: local stack round-trip"
+begin_section "Final verification: draft view round-trip"
 # ═══════════════════════════════════════════════════════════════════════════
 
-switch_stack "$AGENT_STACK" >/dev/null 2>&1 || true
+switch_view "$AGENT_VIEW" >/dev/null 2>&1 || true
 
 FINAL_CONTENT="$(cat src/app.ts 2>/dev/null || echo "")"
 FINAL_LINES="$(echo "$FINAL_CONTENT" | wc -l | tr -d ' ')"
@@ -686,7 +686,7 @@ if [[ "$FINAL_LINES" -le "$DOUBLE_EXPECTED" ]]; then
 else
     _fail "Scale: quadratic growth detected" \
         "Final file has $FINAL_LINES lines but expected ~${EXPECTED_FINAL_LINES}. \
-This indicates O(N) duplication — each apply is concatenating instead of merging."
+This indicates O(N) duplication — each insert is concatenating instead of merging."
 fi
 
 # For extra confidence: the sum of ALL intermediate file sizes should be

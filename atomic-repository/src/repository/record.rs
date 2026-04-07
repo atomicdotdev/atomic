@@ -1,5 +1,9 @@
+use std::sync::Arc;
+
 use super::*;
 use crate::apply::InsertOptions;
+use crate::repository::collect_visible_change_ids;
+use atomic_core::pristine::ViewGraph;
 
 impl Repository {
     /// This is the main entry point for creating a change from working copy
@@ -481,24 +485,40 @@ impl Repository {
             return Err(RecordError::NothingToRecord);
         }
 
-        // Assemble the change.
+        // Assemble the change from the recorded files.
         //
-        // The globalization pipeline (find_content_vertices, create_deletion_edges)
-        // needs to see ALL content vertices for the file.
-        //
-        // Since all edges now live in the global GRAPH, a raw ReadTxn sees
-        // everything needed for globalization.
+        // We wrap the transaction in a ViewGraph so that the entire
+        // globalization pipeline (retrieve_graph, iter_adjacent, etc.)
+        // transparently sees only edges introduced by changes visible
+        // on the current view.  No manual filter threading needed.
         let txn = self
             .pristine
             .read_txn()
             .map_err(|e| RecordError::Database(e.to_string()))?;
 
+        let view_name = options.get_view().unwrap_or(&self.current_view);
+        let view_graph = if let Some(view) = txn
+            .get_view(view_name)
+            .map_err(|e| RecordError::Database(e.to_string()))?
+        {
+            let change_filter = collect_visible_change_ids(&txn, &view)
+                .map_err(|e| RecordError::Database(e.to_string()))?;
+            ViewGraph::new(&txn, Arc::new(change_filter))
+        } else {
+            // No view found — use an empty filter (ROOT-only visibility).
+            // In practice this shouldn't happen because the repository
+            // always has at least one view, but we handle it gracefully.
+            ViewGraph::new(&txn, Arc::new(std::collections::HashSet::new()))
+        };
+
         let assembly_options = options.to_assembly_options();
 
-        // Use the assembly module to create the change.
-        // The raw transaction sees all edges in the global GRAPH.
-        let assembly_result =
-            assemble_change(&txn, &recorded_files, final_header, &assembly_options)?;
+        let assembly_result = assemble_change(
+            &view_graph,
+            &recorded_files,
+            final_header,
+            &assembly_options,
+        )?;
 
         let change = assembly_result.into_change();
         stats.dependency_count = change.dependencies().len();

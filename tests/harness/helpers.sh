@@ -154,29 +154,29 @@ unrecord_last() {
     atomic unrecord 2>&1 || true
 }
 
-# Create a new stack.
-new_stack() {
+# Create a new view.
+new_view() {
     local name="$1"; shift
-    atomic stack new "$name" "$@" 2>&1
+    atomic view create "$name" "$@" 2>&1
 }
 
-# Switch to a stack.
-switch_stack() {
+# Switch to a view.
+switch_view() {
     local name="$1"
-    atomic stack switch "$name" 2>&1
+    atomic view switch "$name" 2>&1
 }
 
-# Apply changes from one stack to another.
-apply_from_stack() {
+# Insert changes from one view to another.
+insert_from_view() {
     local from="$1"
     local to="$2"
     shift 2
-    atomic apply from-stack "$from" --to-stack "$to" "$@" 2>&1
+    atomic insert from-view "$from" --to-view "$to" "$@" 2>&1
 }
 
-# List stacks.
-list_stacks() {
-    atomic stack list 2>/dev/null || true
+# List views.
+list_views() {
+    atomic view list 2>/dev/null || true
 }
 
 # ── Assertions ──────────────────────────────────────────────────────────────
@@ -402,40 +402,40 @@ assert_clean() {
     fi
 }
 
-# Assert that the current stack is the expected one.
-assert_current_stack() {
+# Assert that the current view is the expected one.
+assert_current_view() {
     local desc="$1"
     local expected="$2"
     local out
-    out="$(list_stacks)"
-    # The current stack is usually prefixed with * or highlighted
+    out="$(list_views)"
+    # The current view is usually prefixed with * or highlighted
     if echo "$out" | grep -qE "^\*?\s*${expected}(\s|$)"; then
         _pass "$desc"
     else
-        # Fallback: check current_stack file
-        local stack_file=".atomic/current_stack"
-        if [[ -f "$stack_file" ]]; then
+        # Fallback: check current_view file
+        local view_file=".atomic/current_view"
+        if [[ -f "$view_file" ]]; then
             local actual
-            actual="$(cat "$stack_file")"
+            actual="$(cat "$view_file")"
             if [[ "$actual" == "$expected" ]]; then
                 _pass "$desc"
                 return
             fi
         fi
-        _fail "$desc" "expected current stack '$expected'. Stacks: $(echo "$out" | head -5)"
+        _fail "$desc" "expected current view '$expected'. Views: $(echo "$out" | head -5)"
     fi
 }
 
-# Assert that a stack exists.
-assert_stack_exists() {
+# Assert that a view exists.
+assert_view_exists() {
     local desc="$1"
     local name="$2"
     local out
-    out="$(list_stacks)"
+    out="$(list_views)"
     if echo "$out" | grep -qF "$name"; then
         _pass "$desc"
     else
-        _fail "$desc" "stack '$name' not found. Stacks: $(echo "$out" | head -5)"
+        _fail "$desc" "view '$name' not found. Views: $(echo "$out" | head -5)"
     fi
 }
 
@@ -505,7 +505,7 @@ git_commit() {
     local msg="$1"
     local file="${2:-file.txt}"
     local content="${3:-content for $msg}"
-    
+
     mkdir -p "$(dirname "$file")"
     printf '%s' "$content" > "$file"
     git add "$file"

@@ -349,6 +349,7 @@ impl RetrieveOptions {
 
         let mut has_live_parent = false;
         let mut deleted_by_filter_change = false;
+        let mut edge_count = 0u32;
 
         let parent_flags = EdgeFlags::PARENT;
         let max_flags = EdgeFlags::all();
@@ -362,10 +363,18 @@ impl RetrieveOptions {
                 continue;
             }
 
+            edge_count += 1;
             let introduced_by = edge.introduced_by();
+            let in_filter = self.passes_filter(introduced_by);
+
+            log::trace!(
+                "is_vertex_alive_at_target: vertex=[{:?} {:?}:{:?}] edge #{} flag={:?} introduced_by={:?} in_filter={}",
+                vertex.change, vertex.start, vertex.end,
+                edge_count, flag, introduced_by, in_filter
+            );
 
             if flag.contains(EdgeFlags::DELETED) {
-                if self.passes_filter(introduced_by) {
+                if in_filter {
                     // Deletion from a change in our filter → vertex is dead
                     deleted_by_filter_change = true;
                 } else {
@@ -382,10 +391,17 @@ impl RetrieveOptions {
             }
         }
 
+        let alive = has_live_parent && !deleted_by_filter_change;
+        log::trace!(
+            "is_vertex_alive_at_target: vertex=[{:?} {:?}:{:?}] edges={} has_live_parent={} deleted_by_filter={} → alive={}",
+            vertex.change, vertex.start, vertex.end,
+            edge_count, has_live_parent, deleted_by_filter_change, alive
+        );
+
         // Vertex is alive if it has at least one live parent (non-deleted
         // or deleted-by-outside-change) AND was not explicitly deleted by
         // a change in our filter.
-        Ok(has_live_parent && !deleted_by_filter_change)
+        Ok(alive)
     }
 }
 

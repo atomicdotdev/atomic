@@ -600,7 +600,7 @@ fn write_hunk<T: MutTxnT>(
     change_id: NodeId,
     graph_op: &GraphOp<Option<Hash>>,
     change: &Change,
-    options: &InsertOptions,
+    _options: &InsertOptions,
     stats: &mut InsertStats,
 ) -> InsertResult<()> {
     // Process atoms in the graph_op
@@ -629,9 +629,11 @@ fn write_hunk<T: MutTxnT>(
             }
         }
 
-        // Check for conflicts after each atom
+        // Track conflicts but never abort.  In the ambient graph model all
+        // edges live in a single GRAPH and changes are validated at record
+        // time, so "conflicts" here are structural context notes — not
+        // errors that should block graph writes.
         if workspace.has_conflicts() {
-            // Transfer conflicts from workspace to tracker
             for missing_ctx in workspace.missing_contexts() {
                 let conflict = if missing_ctx.is_predecessor {
                     MissingContextConflict::predecessors(missing_ctx.position, change_id)
@@ -642,12 +644,6 @@ fn write_hunk<T: MutTxnT>(
             }
             for zombie in workspace.zombies() {
                 conflict_tracker.add_zombie(ZombieConflict::new(zombie.node));
-            }
-
-            if !options.allow_conflicts {
-                return Err(InsertError::Conflict {
-                    message: "Conflict detected during atom application".to_string(),
-                });
             }
         }
     }

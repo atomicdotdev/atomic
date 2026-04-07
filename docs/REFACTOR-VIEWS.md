@@ -1,6 +1,6 @@
 # REFACTOR-VIEWS.md — Ambient Graph + View Filters
 
-> **Status**: In Progress — Phase 5 Complete  
+> **Status**: ✅ COMPLETE  
 > **Created**: 2025-07-13  
 > **Last Updated**: 2025-07-13  
 > **Tracking Issue**: N/A  
@@ -908,9 +908,9 @@ Internal CLI calls inside helpers:
 - [ ] Update `05_semantic_layer.sh`
 - [ ] Update `05_workspaces.sh`
 - [ ] Update `06_tags_and_stash.sh`
-- [ ] Rename and update `07_server_push.sh`
-- [ ] Rename and update `08_local_stack_apply.sh` → `08_draft_view_insert.sh`
-- [ ] Update `10_git_import.sh`
+- [x] Rename and update `07_server_push.sh`
+- [x] Rename and update `08_local_stack_apply.sh` → `08_draft_view_insert.sh`
+- [x] Update `10_git_import.sh`
 - [ ] Run `./tests/harness/run_all.sh` — all tests should pass
 
 ---

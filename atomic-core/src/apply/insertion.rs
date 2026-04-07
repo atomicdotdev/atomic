@@ -103,7 +103,7 @@ pub fn write_new_vertex<T: MutTxnT>(
 
     // Resolve predecessors: vertices that come BEFORE this new content.
     // Uses the unified overlay-aware resolver so Local stacks can find
-    // vertices written to STACK_GRAPH earlier in the same change.
+    // vertices written to GRAPH earlier in the same change.
     for up_pos in &insertion.predecessors {
         let internal_pos = resolve_position(txn, up_pos, change_id)?;
         let up_vertex = resolve_context_vertex(txn, internal_pos, true)?;
