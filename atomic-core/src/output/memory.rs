@@ -75,7 +75,7 @@
 //!     wc.add_file("README.md", b"# Hello");
 //!
 //!     // Run output operation
-//!     output_repository(&wc, &txn, &channel)?;
+//!     materialize_view(&wc, &txn, &channel)?;
 //!
 //!     // Verify results
 //!     let content = wc.get_file_contents("README.md").unwrap();

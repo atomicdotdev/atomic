@@ -1,6 +1,6 @@
 # REFACTOR-VIEWS.md — Ambient Graph + View Filters
 
-> **Status**: In Progress — Phase 2 Complete  
+> **Status**: In Progress — Phase 3 Complete  
 > **Created**: 2025-07-13  
 > **Last Updated**: 2025-07-13  
 > **Tracking Issue**: N/A  
@@ -521,10 +521,11 @@ fn add_edge_with_reverse(txn, source, dest, inode) {
 
 ---
 
-## Phase 3: Materialize Rename
+## Phase 3: Materialize Rename ✅ COMPLETE
 
 **Goal**: Rename the output/materialization layer.  
-**Depends on**: Phase 1 (trait renames only — can run in parallel with Phase 2).
+**Depends on**: Phase 1 (trait renames only — can run in parallel with Phase 2).  
+**Result**: `cargo test -p atomic-core` — 442 passed, 0 failed, 178 ignored. Zero old `RepositoryOutput*` or `output_repository` references remain.
 
 ### Files to Modify
 
@@ -544,14 +545,16 @@ Recommendation: rename the module.
 
 ### Checklist
 
-- [ ] Rename `output_repository()` → `materialize_view()`
-- [ ] Rename `output_repository_prefix()` → `materialize_prefix()`
-- [ ] Rename `RepositoryOutputOptions` → `MaterializeOptions`
-- [ ] Rename `RepositoryOutputResult` → `MaterializeResult`
-- [ ] Rename `RepositoryOutputError` → `MaterializeError`
-- [ ] Update re-exports in `output/repo/mod.rs` and `output/mod.rs`
-- [ ] Update all call sites in `atomic-core` tests
-- [ ] Run `cargo check -p atomic-core`
+- [x] Rename `output_repository()` → `materialize_view()`
+- [x] Rename `output_repository_prefix()` → `materialize_prefix()`
+- [x] Rename `RepositoryOutputOptions` → `MaterializeOptions`
+- [x] Rename `RepositoryOutputResult` → `MaterializeResult`
+- [x] Rename `RepositoryOutputError` → `MaterializeError`
+- [x] Update re-exports in `output/repo/mod.rs` and `output/mod.rs`
+- [x] Update all 53 test functions in `repository.rs`
+- [x] Fix stale doc comment references in `memory.rs` and `output/mod.rs`
+- [x] Run `cargo check -p atomic-core` — passes clean
+- [x] Run `cargo test -p atomic-core` — 442 passed, 0 failed
 
 ---
 

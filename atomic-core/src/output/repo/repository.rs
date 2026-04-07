@@ -40,26 +40,26 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use atomic_core::output::repo::{output_repository, RepositoryOutputOptions};
+//! use atomic_core::output::repo::{materialize_view, MaterializeOptions};
 //!
-//! // Output entire repository
-//! let result = output_repository(
+//! // Materialize entire repository
+//! let result = materialize_view(
 //!     &txn,
 //!     &changes,
 //!     &working_copy,
-//!     RepositoryOutputOptions::new(),
+//!     MaterializeOptions::new(),
 //! )?;
 //!
 //! println!("Output {} files with {} conflicts",
 //!     result.files_written,
 //!     result.conflict_count());
 //!
-//! // Output only a prefix
-//! let result = output_repository(
+//! // Materialize only a prefix
+//! let result = materialize_view(
 //!     &txn,
 //!     &changes,
 //!     &working_copy,
-//!     RepositoryOutputOptions::new().prefix("src/"),
+//!     MaterializeOptions::new().prefix("src/"),
 //! )?;
 //! ```
 //!
@@ -91,36 +91,36 @@ use super::outcome::OutputOutcome;
 use super::tree::{collect_tree, TreeCollectOptions};
 
 // ============================================================================
-// REPOSITORY OUTPUT OPTIONS
+// MATERIALIZE OPTIONS
 // ============================================================================
 
-/// Options for repository output operations.
+/// Options for materializing the repository view to the working copy.
 ///
-/// Controls how the repository is output to the working copy, including
+/// Controls how the repository is materialized to the working copy, including
 /// filtering, optimization, and conflict handling options.
 ///
 /// # Example
 ///
 /// ```rust
-/// use atomic_core::output::repo::RepositoryOutputOptions;
+/// use atomic_core::output::repo::MaterializeOptions;
 ///
 /// // Default options - output everything
-/// let opts = RepositoryOutputOptions::new();
+/// let opts = MaterializeOptions::new();
 ///
 /// // Output only files under src/
-/// let opts = RepositoryOutputOptions::new()
+/// let opts = MaterializeOptions::new()
 ///     .prefix("src/");
 ///
 /// // Skip files not modified since a certain time
-/// let opts = RepositoryOutputOptions::new()
+/// let opts = MaterializeOptions::new()
 ///     .if_modified_since(std::time::SystemTime::now());
 ///
 /// // Output with name conflict resolution
-/// let opts = RepositoryOutputOptions::new()
+/// let opts = MaterializeOptions::new()
 ///     .output_name_conflicts(true);
 /// ```
 #[derive(Debug, Clone)]
-pub struct RepositoryOutputOptions {
+pub struct MaterializeOptions {
     /// Prefix to filter output paths.
     ///
     /// Only files under this prefix will be output. Empty string means
@@ -178,7 +178,7 @@ pub struct RepositoryOutputOptions {
     pub change_filter: Option<Arc<HashSet<NodeId>>>,
 }
 
-impl RepositoryOutputOptions {
+impl MaterializeOptions {
     /// Create new options with defaults.
     ///
     /// Default configuration:
@@ -194,9 +194,9 @@ impl RepositoryOutputOptions {
     /// # Example
     ///
     /// ```rust
-    /// use atomic_core::output::repo::RepositoryOutputOptions;
+    /// use atomic_core::output::repo::MaterializeOptions;
     ///
-    /// let opts = RepositoryOutputOptions::new();
+    /// let opts = MaterializeOptions::new();
     /// assert!(opts.prefix.is_empty());
     /// assert!(opts.output_name_conflicts);
     /// assert!(!opts.parallel);
@@ -217,13 +217,13 @@ impl RepositoryOutputOptions {
     /// # Example
     ///
     /// ```rust,ignore
-    /// use atomic_core::output::repo::RepositoryOutputOptions;
+    /// use atomic_core::output::repo::MaterializeOptions;
     /// use std::collections::HashSet;
     ///
     /// // Get changes in the current stack
     /// let changes: HashSet<NodeId> = collect_stack_changes(&txn, &stack)?;
-    /// let options = RepositoryOutputOptions::new().with_change_filter(changes);
-    /// let result = output_repository(&txn, &changes_store, &wc, options)?;
+    /// let options = MaterializeOptions::new().with_change_filter(changes);
+    /// let result = materialize_view(&txn, &changes_store, &wc, options)?;
     /// ```
     pub fn with_change_filter(mut self, filter: HashSet<NodeId>) -> Self {
         self.change_filter = Some(Arc::new(filter));
@@ -248,9 +248,9 @@ impl RepositoryOutputOptions {
     /// # Example
     ///
     /// ```rust
-    /// use atomic_core::output::repo::RepositoryOutputOptions;
+    /// use atomic_core::output::repo::MaterializeOptions;
     ///
-    /// let opts = RepositoryOutputOptions::new().prefix("src/lib/");
+    /// let opts = MaterializeOptions::new().prefix("src/lib/");
     /// assert_eq!(opts.prefix, "src/lib/");
     /// ```
     pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
@@ -267,10 +267,10 @@ impl RepositoryOutputOptions {
     /// # Example
     ///
     /// ```rust
-    /// use atomic_core::output::repo::RepositoryOutputOptions;
+    /// use atomic_core::output::repo::MaterializeOptions;
     /// use std::time::SystemTime;
     ///
-    /// let opts = RepositoryOutputOptions::new()
+    /// let opts = MaterializeOptions::new()
     ///     .if_modified_since(SystemTime::now());
     /// assert!(opts.if_modified_since.is_some());
     /// ```
@@ -288,9 +288,9 @@ impl RepositoryOutputOptions {
     /// # Example
     ///
     /// ```rust
-    /// use atomic_core::output::repo::RepositoryOutputOptions;
+    /// use atomic_core::output::repo::MaterializeOptions;
     ///
-    /// let opts = RepositoryOutputOptions::new().output_name_conflicts(false);
+    /// let opts = MaterializeOptions::new().output_name_conflicts(false);
     /// assert!(!opts.output_name_conflicts);
     /// ```
     pub fn output_name_conflicts(mut self, output: bool) -> Self {
@@ -307,9 +307,9 @@ impl RepositoryOutputOptions {
     /// # Example
     ///
     /// ```rust
-    /// use atomic_core::output::repo::RepositoryOutputOptions;
+    /// use atomic_core::output::repo::MaterializeOptions;
     ///
-    /// let opts = RepositoryOutputOptions::new().include_deleted(true);
+    /// let opts = MaterializeOptions::new().include_deleted(true);
     /// assert!(opts.include_deleted);
     /// ```
     pub fn include_deleted(mut self, include: bool) -> Self {
@@ -326,9 +326,9 @@ impl RepositoryOutputOptions {
     /// # Example
     ///
     /// ```rust
-    /// use atomic_core::output::repo::RepositoryOutputOptions;
+    /// use atomic_core::output::repo::MaterializeOptions;
     ///
-    /// let opts = RepositoryOutputOptions::new().max_vertices_per_file(10000);
+    /// let opts = MaterializeOptions::new().max_vertices_per_file(10000);
     /// assert_eq!(opts.max_vertices_per_file, Some(10000));
     /// ```
     pub fn max_vertices_per_file(mut self, max: usize) -> Self {
@@ -345,9 +345,9 @@ impl RepositoryOutputOptions {
     /// # Example
     ///
     /// ```rust
-    /// use atomic_core::output::repo::RepositoryOutputOptions;
+    /// use atomic_core::output::repo::MaterializeOptions;
     ///
-    /// let opts = RepositoryOutputOptions::new().salt(12345);
+    /// let opts = MaterializeOptions::new().salt(12345);
     /// assert_eq!(opts.salt, 12345);
     /// ```
     pub fn salt(mut self, salt: u64) -> Self {
@@ -364,9 +364,9 @@ impl RepositoryOutputOptions {
     /// # Example
     ///
     /// ```rust
-    /// use atomic_core::output::repo::RepositoryOutputOptions;
+    /// use atomic_core::output::repo::MaterializeOptions;
     ///
-    /// let opts = RepositoryOutputOptions::new().parallel(true);
+    /// let opts = MaterializeOptions::new().parallel(true);
     /// assert!(opts.parallel);
     /// ```
     pub fn parallel(mut self, parallel: bool) -> Self {
@@ -383,9 +383,9 @@ impl RepositoryOutputOptions {
     /// # Example
     ///
     /// ```rust
-    /// use atomic_core::output::repo::RepositoryOutputOptions;
+    /// use atomic_core::output::repo::MaterializeOptions;
     ///
-    /// let opts = RepositoryOutputOptions::new().num_workers(4);
+    /// let opts = MaterializeOptions::new().num_workers(4);
     /// assert_eq!(opts.num_workers, 4);
     /// ```
     pub fn num_workers(mut self, num: usize) -> Self {
@@ -423,7 +423,7 @@ impl RepositoryOutputOptions {
     }
 }
 
-impl Default for RepositoryOutputOptions {
+impl Default for MaterializeOptions {
     fn default() -> Self {
         Self {
             prefix: String::new(),
@@ -440,20 +440,20 @@ impl Default for RepositoryOutputOptions {
 }
 
 // ============================================================================
-// REPOSITORY OUTPUT RESULT
+// MATERIALIZE RESULT
 // ============================================================================
 
-/// Result of a repository output operation.
+/// Result of a materialize operation.
 ///
 /// Contains statistics about the output and all conflicts detected.
 ///
 /// # Example
 ///
 /// ```rust
-/// use atomic_core::output::repo::RepositoryOutputResult;
+/// use atomic_core::output::repo::MaterializeResult;
 ///
-/// // After calling output_repository:
-/// // let result = output_repository(...)?;
+/// // After calling materialize_view:
+/// // let result = materialize_view(...)?;
 /// //
 /// // println!("Output {} files, {} bytes",
 /// //     result.files_written,
@@ -464,7 +464,7 @@ impl Default for RepositoryOutputOptions {
 /// // }
 /// ```
 #[derive(Debug, Clone, Default)]
-pub struct RepositoryOutputResult {
+pub struct MaterializeResult {
     /// Number of files written.
     pub files_written: usize,
 
@@ -493,7 +493,7 @@ pub struct RepositoryOutputResult {
     pub file_results: BTreeMap<String, FileOutputResult>,
 }
 
-impl RepositoryOutputResult {
+impl MaterializeResult {
     /// Create a new empty result.
     pub fn new() -> Self {
         Self::default()
@@ -508,9 +508,9 @@ impl RepositoryOutputResult {
     /// # Example
     ///
     /// ```rust
-    /// use atomic_core::output::repo::RepositoryOutputResult;
+    /// use atomic_core::output::repo::MaterializeResult;
     ///
-    /// let result = RepositoryOutputResult::new();
+    /// let result = MaterializeResult::new();
     /// assert!(!result.has_conflicts());
     /// ```
     pub fn has_conflicts(&self) -> bool {
@@ -526,9 +526,9 @@ impl RepositoryOutputResult {
     /// # Example
     ///
     /// ```rust
-    /// use atomic_core::output::repo::RepositoryOutputResult;
+    /// use atomic_core::output::repo::MaterializeResult;
     ///
-    /// let result = RepositoryOutputResult::new();
+    /// let result = MaterializeResult::new();
     /// assert_eq!(result.conflict_count(), 0);
     /// ```
     pub fn conflict_count(&self) -> usize {
@@ -548,9 +548,9 @@ impl RepositoryOutputResult {
     /// # Example
     ///
     /// ```rust
-    /// use atomic_core::output::repo::{RepositoryOutputResult, FileConflictType};
+    /// use atomic_core::output::repo::{MaterializeResult, FileConflictType};
     ///
-    /// let result = RepositoryOutputResult::new();
+    /// let result = MaterializeResult::new();
     /// let name_conflicts: Vec<_> = result.conflicts_of_type(FileConflictType::Name).collect();
     /// assert!(name_conflicts.is_empty());
     /// ```
@@ -656,12 +656,12 @@ impl RepositoryOutputResult {
 }
 
 // ============================================================================
-// REPOSITORY OUTPUT ERROR
+// MATERIALIZE ERROR
 // ============================================================================
 
-/// Error type for repository output operations.
+/// Error type for materialize operations.
 #[derive(Debug)]
-pub enum RepositoryOutputError<WE> {
+pub enum MaterializeError<WE> {
     /// Error from the pristine database.
     Pristine(crate::pristine::PristineError),
 
@@ -678,7 +678,7 @@ pub enum RepositoryOutputError<WE> {
     TreeError(String),
 }
 
-impl<WE: std::fmt::Debug> std::fmt::Display for RepositoryOutputError<WE> {
+impl<WE: std::fmt::Debug> std::fmt::Display for MaterializeError<WE> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Pristine(e) => write!(f, "Pristine error: {}", e),
@@ -690,9 +690,7 @@ impl<WE: std::fmt::Debug> std::fmt::Display for RepositoryOutputError<WE> {
     }
 }
 
-impl<WE: std::fmt::Debug + std::error::Error + 'static> std::error::Error
-    for RepositoryOutputError<WE>
-{
+impl<WE: std::fmt::Debug + std::error::Error + 'static> std::error::Error for MaterializeError<WE> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Pristine(e) => Some(e),
@@ -703,13 +701,13 @@ impl<WE: std::fmt::Debug + std::error::Error + 'static> std::error::Error
     }
 }
 
-impl<WE> From<std::io::Error> for RepositoryOutputError<WE> {
+impl<WE> From<std::io::Error> for MaterializeError<WE> {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
     }
 }
 
-impl<WE> From<crate::pristine::PristineError> for RepositoryOutputError<WE> {
+impl<WE> From<crate::pristine::PristineError> for MaterializeError<WE> {
     fn from(e: crate::pristine::PristineError) -> Self {
         Self::Pristine(e)
     }
@@ -814,10 +812,10 @@ impl OutputItem {
 /// # Example
 ///
 /// ```rust,ignore
-/// use atomic_core::output::repo::{collect_children, RepositoryOutputOptions};
+/// use atomic_core::output::repo::{collect_children, MaterializeOptions};
 /// use atomic_core::types::Inode;
 ///
-/// let options = RepositoryOutputOptions::new().prefix("src/");
+/// let options = MaterializeOptions::new().prefix("src/");
 /// let items = collect_children(&txn, Inode::ROOT, "", &options)?;
 ///
 /// for item in items {
@@ -828,9 +826,9 @@ pub fn collect_children<T: TreeTxnT + GraphTxnT>(
     txn: &T,
     _parent_inode: Inode,
     parent_path: &str,
-    options: &RepositoryOutputOptions,
+    options: &MaterializeOptions,
 ) -> Result<Vec<OutputItem>, crate::pristine::PristineError> {
-    // Convert RepositoryOutputOptions to TreeCollectOptions
+    // Convert MaterializeOptions to TreeCollectOptions
     let mut tree_opts = TreeCollectOptions::new()
         .collect_directories(true)
         .collect_files(true);
@@ -862,10 +860,10 @@ pub fn collect_children<T: TreeTxnT + GraphTxnT>(
 }
 
 // ============================================================================
-// OUTPUT REPOSITORY FUNCTION
+// MATERIALIZE VIEW FUNCTION
 // ============================================================================
 
-/// Output the repository (or prefix) to the working copy.
+/// Materialize the repository view (or prefix) to the working copy.
 ///
 /// This is the main entry point for synchronizing the working copy with
 /// the repository graph state. It traverses the tree, outputs each file,
@@ -876,11 +874,11 @@ pub fn collect_children<T: TreeTxnT + GraphTxnT>(
 /// * `txn` - Transaction providing graph and tree access
 /// * `changes` - Change store for retrieving content
 /// * `working_copy` - Working copy to write to
-/// * `options` - Output options
+/// * `options` - Materialize options
 ///
 /// # Returns
 ///
-/// A `RepositoryOutputResult` with statistics and conflicts.
+/// A `MaterializeResult` with statistics and conflicts.
 ///
 /// # Errors
 ///
@@ -889,30 +887,30 @@ pub fn collect_children<T: TreeTxnT + GraphTxnT>(
 /// # Example
 ///
 /// ```rust,ignore
-/// use atomic_core::output::repo::{output_repository, RepositoryOutputOptions};
+/// use atomic_core::output::repo::{materialize_view, MaterializeOptions};
 ///
-/// let result = output_repository(
+/// let result = materialize_view(
 ///     &txn,
 ///     &changes,
 ///     &working_copy,
-///     RepositoryOutputOptions::new(),
+///     MaterializeOptions::new(),
 /// )?;
 ///
 /// println!("Output {} files", result.files_written);
 /// ```
-pub fn output_repository<T, C, W>(
+pub fn materialize_view<T, C, W>(
     txn: &T,
     changes: &C,
     working_copy: &W,
-    options: RepositoryOutputOptions,
-) -> Result<RepositoryOutputResult, RepositoryOutputError<W::Error>>
+    options: MaterializeOptions,
+) -> Result<MaterializeResult, MaterializeError<W::Error>>
 where
     T: TreeTxnT + GraphTxnT,
     C: ChangeStore,
     W: WorkingCopy,
     W::Writer: std::io::Write,
 {
-    let mut result = RepositoryOutputResult::new();
+    let mut result = MaterializeResult::new();
 
     // Collect items to output starting from root
     let items = collect_children(txn, Inode::ROOT, "", &options)?;
@@ -984,7 +982,7 @@ where
             // Create directory
             working_copy
                 .create_dir_all(&item.path)
-                .map_err(RepositoryOutputError::WorkingCopy)?;
+                .map_err(MaterializeError::WorkingCopy)?;
             result.record_directory();
         } else {
             // Check prefix filter
@@ -1029,7 +1027,7 @@ where
     Ok(result)
 }
 
-/// Output the repository to a specific prefix only.
+/// Materialize a specific prefix of the repository to the working copy.
 ///
 /// Convenience function that sets the prefix option.
 ///
@@ -1042,24 +1040,24 @@ where
 ///
 /// # Returns
 ///
-/// A `RepositoryOutputResult` with statistics and conflicts.
-pub fn output_repository_prefix<T, C, W>(
+/// A `MaterializeResult` with statistics and conflicts.
+pub fn materialize_prefix<T, C, W>(
     txn: &T,
     changes: &C,
     working_copy: &W,
     prefix: &str,
-) -> Result<RepositoryOutputResult, RepositoryOutputError<W::Error>>
+) -> Result<MaterializeResult, MaterializeError<W::Error>>
 where
     T: TreeTxnT + GraphTxnT,
     C: ChangeStore,
     W: WorkingCopy,
     W::Writer: std::io::Write,
 {
-    output_repository(
+    materialize_view(
         txn,
         changes,
         working_copy,
-        RepositoryOutputOptions::new().prefix(prefix),
+        MaterializeOptions::new().prefix(prefix),
     )
 }
 
@@ -1073,12 +1071,12 @@ mod tests {
     use std::time::SystemTime;
 
     // ========================================================================
-    // RepositoryOutputOptions Tests
+    // MaterializeOptions Tests
     // ========================================================================
 
     #[test]
     fn test_options_new() {
-        let opts = RepositoryOutputOptions::new();
+        let opts = MaterializeOptions::new();
 
         assert!(opts.prefix.is_empty());
         assert!(opts.if_modified_since.is_none());
@@ -1092,7 +1090,7 @@ mod tests {
 
     #[test]
     fn test_options_default() {
-        let opts = RepositoryOutputOptions::default();
+        let opts = MaterializeOptions::default();
 
         assert!(opts.prefix.is_empty());
         assert!(!opts.parallel);
@@ -1100,14 +1098,14 @@ mod tests {
 
     #[test]
     fn test_options_prefix() {
-        let opts = RepositoryOutputOptions::new().prefix("src/");
+        let opts = MaterializeOptions::new().prefix("src/");
 
         assert_eq!(opts.prefix, "src/");
     }
 
     #[test]
     fn test_options_prefix_empty() {
-        let opts = RepositoryOutputOptions::new().prefix("");
+        let opts = MaterializeOptions::new().prefix("");
 
         assert!(opts.prefix.is_empty());
     }
@@ -1115,56 +1113,56 @@ mod tests {
     #[test]
     fn test_options_if_modified_since() {
         let time = SystemTime::now();
-        let opts = RepositoryOutputOptions::new().if_modified_since(time);
+        let opts = MaterializeOptions::new().if_modified_since(time);
 
         assert!(opts.if_modified_since.is_some());
     }
 
     #[test]
     fn test_options_output_name_conflicts() {
-        let opts = RepositoryOutputOptions::new().output_name_conflicts(false);
+        let opts = MaterializeOptions::new().output_name_conflicts(false);
 
         assert!(!opts.output_name_conflicts);
     }
 
     #[test]
     fn test_options_include_deleted() {
-        let opts = RepositoryOutputOptions::new().include_deleted(true);
+        let opts = MaterializeOptions::new().include_deleted(true);
 
         assert!(opts.include_deleted);
     }
 
     #[test]
     fn test_options_max_vertices_per_file() {
-        let opts = RepositoryOutputOptions::new().max_vertices_per_file(5000);
+        let opts = MaterializeOptions::new().max_vertices_per_file(5000);
 
         assert_eq!(opts.max_vertices_per_file, Some(5000));
     }
 
     #[test]
     fn test_options_salt() {
-        let opts = RepositoryOutputOptions::new().salt(42);
+        let opts = MaterializeOptions::new().salt(42);
 
         assert_eq!(opts.salt, 42);
     }
 
     #[test]
     fn test_options_parallel() {
-        let opts = RepositoryOutputOptions::new().parallel(true);
+        let opts = MaterializeOptions::new().parallel(true);
 
         assert!(opts.parallel);
     }
 
     #[test]
     fn test_options_num_workers() {
-        let opts = RepositoryOutputOptions::new().num_workers(8);
+        let opts = MaterializeOptions::new().num_workers(8);
 
         assert_eq!(opts.num_workers, 8);
     }
 
     #[test]
     fn test_options_chaining() {
-        let opts = RepositoryOutputOptions::new()
+        let opts = MaterializeOptions::new()
             .prefix("src/")
             .include_deleted(true)
             .output_name_conflicts(false)
@@ -1182,7 +1180,7 @@ mod tests {
 
     #[test]
     fn test_options_matches_prefix_empty() {
-        let opts = RepositoryOutputOptions::new();
+        let opts = MaterializeOptions::new();
 
         assert!(opts.matches_prefix("anything"));
         assert!(opts.matches_prefix("src/main.rs"));
@@ -1191,7 +1189,7 @@ mod tests {
 
     #[test]
     fn test_options_matches_prefix_with_prefix() {
-        let opts = RepositoryOutputOptions::new().prefix("src/");
+        let opts = MaterializeOptions::new().prefix("src/");
 
         assert!(opts.matches_prefix("src/main.rs"));
         assert!(opts.matches_prefix("src/lib/mod.rs"));
@@ -1201,7 +1199,7 @@ mod tests {
 
     #[test]
     fn test_options_to_file_options_default() {
-        let opts = RepositoryOutputOptions::new();
+        let opts = MaterializeOptions::new();
         let file_opts = opts.to_file_options();
 
         assert!(!file_opts.include_deleted);
@@ -1210,7 +1208,7 @@ mod tests {
 
     #[test]
     fn test_options_to_file_options_with_deleted() {
-        let opts = RepositoryOutputOptions::new().include_deleted(true);
+        let opts = MaterializeOptions::new().include_deleted(true);
         let file_opts = opts.to_file_options();
 
         assert!(file_opts.include_deleted);
@@ -1218,7 +1216,7 @@ mod tests {
 
     #[test]
     fn test_options_to_file_options_with_max() {
-        let opts = RepositoryOutputOptions::new().max_vertices_per_file(1000);
+        let opts = MaterializeOptions::new().max_vertices_per_file(1000);
         let file_opts = opts.to_file_options();
 
         assert_eq!(file_opts.max_vertices, Some(1000));
@@ -1226,7 +1224,7 @@ mod tests {
 
     #[test]
     fn test_options_clone() {
-        let opts = RepositoryOutputOptions::new().prefix("test/");
+        let opts = MaterializeOptions::new().prefix("test/");
         let cloned = opts.clone();
 
         assert_eq!(opts.prefix, cloned.prefix);
@@ -1234,19 +1232,19 @@ mod tests {
 
     #[test]
     fn test_options_debug() {
-        let opts = RepositoryOutputOptions::new();
+        let opts = MaterializeOptions::new();
         let debug = format!("{:?}", opts);
 
-        assert!(debug.contains("RepositoryOutputOptions"));
+        assert!(debug.contains("MaterializeOptions"));
     }
 
     // ========================================================================
-    // RepositoryOutputResult Tests
+    // MaterializeResult Tests
     // ========================================================================
 
     #[test]
     fn test_result_new() {
-        let result = RepositoryOutputResult::new();
+        let result = MaterializeResult::new();
 
         assert_eq!(result.files_written, 0);
         assert_eq!(result.files_skipped, 0);
@@ -1257,21 +1255,21 @@ mod tests {
 
     #[test]
     fn test_result_default() {
-        let result = RepositoryOutputResult::default();
+        let result = MaterializeResult::default();
 
         assert_eq!(result.files_written, 0);
     }
 
     #[test]
     fn test_result_has_conflicts_empty() {
-        let result = RepositoryOutputResult::new();
+        let result = MaterializeResult::new();
 
         assert!(!result.has_conflicts());
     }
 
     #[test]
     fn test_result_has_conflicts_with_conflict() {
-        let mut result = RepositoryOutputResult::new();
+        let mut result = MaterializeResult::new();
         result.add_conflict(FileConflict::new(
             "test.rs".to_string(),
             FileConflictType::Order,
@@ -1282,7 +1280,7 @@ mod tests {
 
     #[test]
     fn test_result_conflict_count() {
-        let mut result = RepositoryOutputResult::new();
+        let mut result = MaterializeResult::new();
 
         assert_eq!(result.conflict_count(), 0);
 
@@ -1300,7 +1298,7 @@ mod tests {
 
     #[test]
     fn test_result_add_conflict() {
-        let mut result = RepositoryOutputResult::new();
+        let mut result = MaterializeResult::new();
         let conflict = FileConflict::new("test.rs".to_string(), FileConflictType::Cyclic);
 
         result.add_conflict(conflict);
@@ -1311,7 +1309,7 @@ mod tests {
 
     #[test]
     fn test_result_conflicts_of_type() {
-        let mut result = RepositoryOutputResult::new();
+        let mut result = MaterializeResult::new();
         result.add_conflict(FileConflict::new(
             "a.rs".to_string(),
             FileConflictType::Order,
@@ -1334,7 +1332,7 @@ mod tests {
 
     #[test]
     fn test_result_name_conflicts() {
-        let mut result = RepositoryOutputResult::new();
+        let mut result = MaterializeResult::new();
         result.add_conflict(FileConflict::new(
             "a.rs".to_string(),
             FileConflictType::Name,
@@ -1350,7 +1348,7 @@ mod tests {
 
     #[test]
     fn test_result_content_conflicts() {
-        let mut result = RepositoryOutputResult::new();
+        let mut result = MaterializeResult::new();
         result.add_conflict(FileConflict::new(
             "a.rs".to_string(),
             FileConflictType::Order,
@@ -1374,7 +1372,7 @@ mod tests {
 
     #[test]
     fn test_result_merge_file_result() {
-        let mut result = RepositoryOutputResult::new();
+        let mut result = MaterializeResult::new();
 
         let file_result = FileOutputResult::empty("test.rs", Inode::ROOT)
             .with_bytes_written(1024)
@@ -1391,7 +1389,7 @@ mod tests {
 
     #[test]
     fn test_result_merge_file_result_with_conflicts() {
-        let mut result = RepositoryOutputResult::new();
+        let mut result = MaterializeResult::new();
 
         let mut file_result = FileOutputResult::empty("test.rs", Inode::ROOT);
         file_result.add_conflict(FileConflict::new(
@@ -1406,7 +1404,7 @@ mod tests {
 
     #[test]
     fn test_result_merge_file_result_truncated() {
-        let mut result = RepositoryOutputResult::new();
+        let mut result = MaterializeResult::new();
 
         let file_result = FileOutputResult::empty("test.rs", Inode::ROOT).with_truncated(true);
 
@@ -1417,7 +1415,7 @@ mod tests {
 
     #[test]
     fn test_result_merge_file_result_store() {
-        let mut result = RepositoryOutputResult::new();
+        let mut result = MaterializeResult::new();
 
         let file_result = FileOutputResult::empty("test.rs", Inode::ROOT);
 
@@ -1428,7 +1426,7 @@ mod tests {
 
     #[test]
     fn test_result_record_skipped() {
-        let mut result = RepositoryOutputResult::new();
+        let mut result = MaterializeResult::new();
 
         result.record_skipped();
         result.record_skipped();
@@ -1438,7 +1436,7 @@ mod tests {
 
     #[test]
     fn test_result_record_directory() {
-        let mut result = RepositoryOutputResult::new();
+        let mut result = MaterializeResult::new();
 
         result.record_directory();
 
@@ -1447,7 +1445,7 @@ mod tests {
 
     #[test]
     fn test_result_to_outcome() {
-        let mut result = RepositoryOutputResult::new();
+        let mut result = MaterializeResult::new();
         result.files_written = 5;
         result.directories_created = 2;
         result.files_skipped = 1;
@@ -1463,7 +1461,7 @@ mod tests {
 
     #[test]
     fn test_result_clone() {
-        let mut result = RepositoryOutputResult::new();
+        let mut result = MaterializeResult::new();
         result.files_written = 3;
 
         let cloned = result.clone();
@@ -1473,20 +1471,20 @@ mod tests {
 
     #[test]
     fn test_result_debug() {
-        let result = RepositoryOutputResult::new();
+        let result = MaterializeResult::new();
         let debug = format!("{:?}", result);
 
-        assert!(debug.contains("RepositoryOutputResult"));
+        assert!(debug.contains("MaterializeResult"));
     }
 
     // ========================================================================
-    // RepositoryOutputError Tests
+    // MaterializeError Tests
     // ========================================================================
 
     #[test]
     fn test_error_display_pristine() {
-        let err: RepositoryOutputError<std::io::Error> =
-            RepositoryOutputError::Pristine(crate::pristine::PristineError::ViewNotFound {
+        let err: MaterializeError<std::io::Error> =
+            MaterializeError::Pristine(crate::pristine::PristineError::ViewNotFound {
                 name: "test".to_string(),
             });
         let display = format!("{}", err);
@@ -1496,8 +1494,8 @@ mod tests {
 
     #[test]
     fn test_error_display_change_store() {
-        let err: RepositoryOutputError<std::io::Error> =
-            RepositoryOutputError::ChangeStore("not found".to_string());
+        let err: MaterializeError<std::io::Error> =
+            MaterializeError::ChangeStore("not found".to_string());
         let display = format!("{}", err);
 
         assert!(display.contains("Change store error"));
@@ -1506,7 +1504,7 @@ mod tests {
     #[test]
     fn test_error_display_io() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
-        let err: RepositoryOutputError<std::io::Error> = RepositoryOutputError::Io(io_err);
+        let err: MaterializeError<std::io::Error> = MaterializeError::Io(io_err);
         let display = format!("{}", err);
 
         assert!(display.contains("I/O error"));
@@ -1515,7 +1513,7 @@ mod tests {
     #[test]
     fn test_error_display_working_copy() {
         let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
-        let err: RepositoryOutputError<std::io::Error> = RepositoryOutputError::WorkingCopy(io_err);
+        let err: MaterializeError<std::io::Error> = MaterializeError::WorkingCopy(io_err);
         let display = format!("{}", err);
 
         assert!(display.contains("Working copy error"));
@@ -1523,8 +1521,8 @@ mod tests {
 
     #[test]
     fn test_error_display_tree() {
-        let err: RepositoryOutputError<std::io::Error> =
-            RepositoryOutputError::TreeError("invalid tree".to_string());
+        let err: MaterializeError<std::io::Error> =
+            MaterializeError::TreeError("invalid tree".to_string());
         let display = format!("{}", err);
 
         assert!(display.contains("Tree traversal error"));
@@ -1533,10 +1531,10 @@ mod tests {
     #[test]
     fn test_error_from_io() {
         let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test");
-        let err: RepositoryOutputError<std::io::Error> = io_err.into();
+        let err: MaterializeError<std::io::Error> = io_err.into();
 
         match err {
-            RepositoryOutputError::Io(_) => (),
+            MaterializeError::Io(_) => (),
             _ => panic!("Expected Io variant"),
         }
     }
@@ -1546,18 +1544,17 @@ mod tests {
         let pristine_err = crate::pristine::PristineError::ViewNotFound {
             name: "test".to_string(),
         };
-        let err: RepositoryOutputError<std::io::Error> = pristine_err.into();
+        let err: MaterializeError<std::io::Error> = pristine_err.into();
 
         match err {
-            RepositoryOutputError::Pristine(_) => (),
+            MaterializeError::Pristine(_) => (),
             _ => panic!("Expected Pristine variant"),
         }
     }
 
     #[test]
     fn test_error_debug() {
-        let err: RepositoryOutputError<std::io::Error> =
-            RepositoryOutputError::TreeError("test".to_string());
+        let err: MaterializeError<std::io::Error> = MaterializeError::TreeError("test".to_string());
         let debug = format!("{:?}", err);
 
         assert!(debug.contains("TreeError"));
@@ -1567,8 +1564,8 @@ mod tests {
     fn test_error_source_pristine() {
         use std::error::Error;
 
-        let err: RepositoryOutputError<std::io::Error> =
-            RepositoryOutputError::Pristine(crate::pristine::PristineError::ViewNotFound {
+        let err: MaterializeError<std::io::Error> =
+            MaterializeError::Pristine(crate::pristine::PristineError::ViewNotFound {
                 name: "test".to_string(),
             });
 
@@ -1580,7 +1577,7 @@ mod tests {
         use std::error::Error;
 
         let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test");
-        let err: RepositoryOutputError<std::io::Error> = RepositoryOutputError::Io(io_err);
+        let err: MaterializeError<std::io::Error> = MaterializeError::Io(io_err);
 
         assert!(err.source().is_some());
     }
@@ -1589,8 +1586,8 @@ mod tests {
     fn test_error_source_change_store() {
         use std::error::Error;
 
-        let err: RepositoryOutputError<std::io::Error> =
-            RepositoryOutputError::ChangeStore("test".to_string());
+        let err: MaterializeError<std::io::Error> =
+            MaterializeError::ChangeStore("test".to_string());
 
         assert!(err.source().is_none());
     }
