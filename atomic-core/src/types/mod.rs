@@ -19,12 +19,14 @@
 //! This simplifies the codebase by having a single hash type for both
 //! content addressing (identifying changes) and state tracking (channel state).
 
+mod edge_kind;
 mod graph_edge;
 mod graph_node;
 mod hash;
 mod node_id;
 mod position;
 
+pub use edge_kind::{Edge, EdgeKind, ForwardEdge, ParentEdge, ParentEdgeKind};
 pub use graph_edge::{EdgeFlags, GraphEdge, SerializedGraphEdge};
 pub use graph_node::{GraphNode, IntoGraphNode};
 pub use hash::{Hash, Hasher, Merkle};
