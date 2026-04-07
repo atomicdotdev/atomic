@@ -389,23 +389,38 @@ Do NOT change any call sites yet.
 
 ---
 
-### Phase A2: Typed Graph Queries
+### Phase A2: Typed Graph Queries ✅ COMPLETE
 
 **Goal**: Add `iter_forward` and `iter_parents` methods to `GraphTxnT`.
 These wrap `iter_adjacent` and return typed edges. Existing code continues
 to use `iter_adjacent`; new code uses the typed methods.
 
-**Files to modify**:
-- `atomic-core/src/pristine/traits.rs` — add default methods to `GraphTxnT`
-- `atomic-core/src/pristine/view_graph.rs` — implement typed methods with filtering
+**Result**: Two default methods added to `GraphTxnT` with 12 new tests. All 3,196 `atomic-core` lib tests pass.
+
+**Files modified**:
+- `atomic-core/src/pristine/traits.rs` — added default methods + `MockGraph` tests
+
+**Implementation notes**:
+- Both methods are **default methods** on `GraphTxnT`, so `ReadTxn`, `WriteTxn`,
+  and `ViewGraph` get them for free with no code changes.
+- `ViewGraph` inherits correct filtering automatically because its `iter_adjacent`
+  already filters by `introduced_by` visibility — the default impls delegate
+  through it.
+- Flag ranges are carefully computed to avoid missing edge kinds:
+  - `iter_forward` alive: `[empty, PSEUDO|FOLDER]` (0x00–0x14)
+  - `iter_forward` +deleted: `[empty, DELETED|FOLDER]` (0x00–0x90), skips PARENT edges in loop
+  - `iter_parents` alive: `[PARENT, all()-DELETED]` (0x20–0x35)
+  - `iter_parents` +deleted: `[PARENT, all()]` (0x20–0xB5), skips non-PARENT edges in loop
+- A consistency test verifies `iter_forward(true).len() + iter_parents(true).len()`
+  equals the count of valid `Edge` variants from raw `iter_adjacent`.
 
 **Checklist**:
-- [ ] Add `iter_forward(&self, node, include_deleted)` as default method on `GraphTxnT`
-- [ ] Add `iter_parents(&self, node, include_deleted)` as default method on `GraphTxnT`
-- [ ] Both methods delegate to `iter_adjacent` + parse edges into typed structs
-- [ ] `ViewGraph` overrides to filter by `introduced_by` visibility
-- [ ] Unit tests: verify typed iteration matches raw iteration
-- [ ] `cargo test -p atomic-core`
+- [x] Add `iter_forward(&self, node, include_deleted)` as default method on `GraphTxnT`
+- [x] Add `iter_parents(&self, node, include_deleted)` as default method on `GraphTxnT`
+- [x] Both methods delegate to `iter_adjacent` + parse edges into typed structs
+- [x] `ViewGraph` inherits via default methods (no override needed)
+- [x] Unit tests: 12 tests with `MockGraph` verify typed iteration matches raw iteration
+- [x] `cargo test -p atomic-core` — 3,196 tests pass
 
 ---
 
