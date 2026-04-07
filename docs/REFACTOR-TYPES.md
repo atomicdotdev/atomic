@@ -1,6 +1,6 @@
 # REFACTOR-TYPES.md — Type-Safe Edge Model & File Splitting
 
-> **Status**: In Progress — Phase A1 + B1.3 Complete  
+> **Status**: In Progress — Phases A1, A2, B1.1, B1.2, B1.3, B1.4 Complete  
 > **Created**: 2025-07-13  
 > **Last Updated**: 2025-07-13  
 > **Prerequisite**: REFACTOR-VIEWS.md (complete)  
@@ -497,28 +497,28 @@ These files are on the hot path for the view-filter bug class and have the
 highest conditional density. Splitting them makes the type-safe edge migration
 (Part A) tractable.
 
-#### B1.1: `record/workflow/record.rs` (2,758 lines → 5 files)
+#### B1.1: `record/workflow/record.rs` (2,758 lines → 5 files) ✅ COMPLETE
 
-| New File | Contents | ~Lines |
-|----------|----------|-------:|
-| `record/workflow/record/options.rs` | `RecordingOptions` + builder + `Default` | 250 |
-| `record/workflow/record/types.rs` | `RecordingStats`, `RecordedFile`, `RecordingResult`, `IntoIterator` impls | 560 |
-| `record/workflow/record/mod.rs` | `record_added_file`, `record_deleted_file`, `record_modified_file`, `calculate_line_offsets`, re-exports | 380 |
-| `record/workflow/record/crdt.rs` | `build_crdt_ops_for_added_file`, `build_crdt_ops_for_deleted_file`, `build_crdt_ops_for_modified_file` (the 566-line function) | 600 |
-| `record/workflow/record/tests.rs` | All `#[cfg(test)]` tests | 762 |
+| New File | Actual Lines | Contents |
+|----------|-------------:|----------|
+| `record/workflow/record/mod.rs` | 510 | Recording functions, `calculate_line_offsets`, re-exports |
+| `record/workflow/record/options.rs` | 274 | `RecordingOptions` + builder + `Default` |
+| `record/workflow/record/types.rs` | 588 | `RecordingStats`, `RecordedFile`, `RecordingResult`, `IntoIterator` impls |
+| `record/workflow/record/crdt.rs` | 646 | CRDT builders including the 566-line `build_crdt_ops_for_modified_file` |
+| `record/workflow/record/tests.rs` | 767 | All 42 tests |
 
 **Note**: `build_crdt_ops_for_modified_file` is 566 lines and contains its
 own sub-algorithm for bigram-based Delete/Insert → Modify promotion.
 Extract to `crdt_consolidation.rs` as a follow-up.
 
-#### B1.2: `output/alive/retrieve.rs` (1,273 lines → 4 files)
+#### B1.2: `output/alive/retrieve.rs` (1,273 lines → 4 files) ✅ COMPLETE
 
-| New File | Contents | ~Lines |
-|----------|----------|-------:|
-| `output/alive/retrieve/options.rs` | `RetrieveOptions` + builder + filter logic + `PartialEq`/`Eq`, `RetrieveResult` | 350 |
-| `output/alive/retrieve/mod.rs` | `retrieve_graph` + re-exports | 160 |
-| `output/alive/retrieve/classify.rs` | `create_alive_vertex`, `new_vertex_at_position`, `is_vertex_alive`, `is_vertex_zombie` | 110 |
-| `output/alive/retrieve/tests.rs` | All tests | 506 |
+| New File | Actual Lines | Contents |
+|----------|-------------:|----------|
+| `output/alive/retrieve/mod.rs` | 261 | `retrieve_graph` DFS + re-exports |
+| `output/alive/retrieve/options.rs` | 398 | `RetrieveOptions` + builder + filter logic + `RetrieveResult` |
+| `output/alive/retrieve/classify.rs` | 132 | `create_alive_vertex`, `is_vertex_alive`, `is_vertex_zombie` |
+| `output/alive/retrieve/tests.rs` | 508 | All 43 tests |
 
 #### B1.3: `repository/mod.rs` (1,562 lines → 5 files) ✅ COMPLETE
 
@@ -530,23 +530,23 @@ Extract to `crdt_consolidation.rs` as a follow-up.
 | `repository/materialize.rs` | 169 | `visible_file_paths`, `materialize`, `materialize_prefix` |
 | `repository/filter.rs` | 98 | `collect_view_change_ids`, `collect_visible_change_ids` |
 
-#### B1.4: `apply.rs` (1,290 lines → 5 files)
+#### B1.4: `apply.rs` (1,290 lines → 5 files) ✅ COMPLETE
 
-| New File | Contents | ~Lines |
-|----------|----------|-------:|
-| `apply/types.rs` | `InsertError`, `InsertResult`, `InsertOptions`, `InsertStats`, `InsertOutcome`, impls | 290 |
-| `apply/mod.rs` | `write_change_to_graph`, `write_hunk`, `check_missing_dependencies`, `compute_insert_order`, `collect_all_dependencies`, re-exports | 310 |
-| `apply/cross_view.rs` | `CrossViewInsertOptions`, `CrossViewInsertOutcome`, impls | 140 |
-| `apply/queries.rs` | `get_view_changes`, `get_missing_changes`, `get_changes_up_to_seq`, `filter_missing_in_view`, `order_changes_by_deps` | 165 |
-| `apply/tests.rs` | All tests | 249 |
+| New File | Actual Lines | Contents |
+|----------|-------------:|----------|
+| `apply/mod.rs` | 442 | `write_change_to_graph`, `write_hunk`, `check_missing_dependencies`, `compute_insert_order`, `collect_all_dependencies`, re-exports |
+| `apply/types.rs` | 293 | `InsertError`, `InsertResult`, `InsertOptions`, `InsertStats`, `InsertOutcome` |
+| `apply/queries.rs` | 182 | `get_view_changes`, `get_missing_changes`, `get_changes_up_to_seq`, `filter_missing_in_view`, `order_changes_by_deps` |
+| `apply/cross_view.rs` | 156 | `CrossViewInsertOptions`, `CrossViewInsertOutcome` |
+| `apply/tests.rs` | 251 | All 23 tests |
 
 **Checklist for Phase B1**:
-- [ ] Split `record/workflow/record.rs` into 5 files
-- [ ] Split `output/alive/retrieve.rs` into 4 files
-- [x] Split `repository/mod.rs` into 5 files — 1,562 → 574 lines (+ 4 sub-modules all under 500)
-- [ ] Split `apply.rs` into 5 files
-- [ ] `cargo test` — full workspace, all tests pass
-- [ ] `tests/harness/run_all.sh` — all suites pass
+- [x] Split `record/workflow/record.rs` into 5 files — 2,758 → largest 767 (tests)
+- [x] Split `output/alive/retrieve.rs` into 4 files — 1,273 → largest 508 (tests)
+- [x] Split `repository/mod.rs` into 5 files — 1,562 → largest 574 (mod.rs)
+- [x] Split `apply.rs` into 5 files — 1,290 → largest 442 (mod.rs)
+- [x] `cargo test` — 6,887 tests pass, 0 failures
+- [x] `tests/harness/run_all.sh` — all suites pass
 
 ---
 
