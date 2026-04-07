@@ -68,10 +68,10 @@ use crate::error::{CliError, CliResult};
 
 // Phase 2: Core Local Commands
 pub mod add;
-pub mod apply;
 pub mod change;
 pub mod diff;
 pub mod init;
+pub mod insert;
 pub mod log;
 pub mod mv;
 pub mod record;
@@ -79,11 +79,11 @@ pub mod remove;
 pub mod reset;
 pub mod revise;
 pub mod split;
-pub mod stack;
 pub mod stash;
 pub mod status;
 pub mod tag;
 pub mod unrecord;
+pub mod view;
 
 // Phase 6: Agent Integration
 pub mod agent;
@@ -107,7 +107,6 @@ pub mod git;
 // Re-export command structs for convenience
 pub use add::Add;
 pub use agent::Agent;
-pub use apply::Apply;
 pub use change::ChangeCmd;
 pub use clone::Clone;
 pub use diff::Diff;
@@ -115,6 +114,7 @@ pub use git::Git;
 pub use hive::Hive;
 pub use identity::Identity;
 pub use init::Init;
+pub use insert::Insert;
 pub use log::Log;
 pub use mv::Move;
 pub use pull::Pull;
@@ -125,11 +125,11 @@ pub use remove::Remove;
 pub use reset::Reset;
 pub use revise::Revise;
 pub use split::Split;
-pub use stack::Stack;
 pub use stash::Stash;
 pub use status::Status;
 pub use tag::Tag;
 pub use unrecord::Unrecord;
+pub use view::View;
 
 // Command Trait
 

@@ -1,49 +1,51 @@
-//! Apply command implementation.
+//! Insert command implementation.
 //!
-//! The `apply` command applies changes to stacks, supporting:
-//! - Applying a single change by hash
-//! - Applying changes from one stack to another
-//! - Applying changes up to a specific tag
+//! The `insert` command inserts changes into views, supporting:
+//! - Inserting a single change by hash
+//! - Inserting changes from one view to another
+//! - Inserting changes up to a specific tag
 //! - Cherry-picking specific changes
 
 use clap::{Args, Subcommand};
 
 use atomic_core::types::{Base32, Hash};
-use atomic_repository::{ApplyOptions, CrossStackApplyOptions, CrossStackApplyOutcome, Repository};
+use atomic_repository::{
+    CrossViewInsertOptions, CrossViewInsertOutcome, InsertOptions, Repository,
+};
 
 use crate::commands::{format_hash, require_repository};
 use crate::error::{CliError, CliResult};
 use crate::output;
 
-// Apply Command
+// Insert Command
 
-/// Apply changes to a stack.
+/// Insert changes into a view.
 ///
-/// This command applies changes to the repository graph. It supports several
+/// This command inserts changes into the repository graph. It supports several
 /// modes of operation:
 ///
-/// - Apply a single change by hash
-/// - Apply all changes from one stack to another
-/// - Apply changes up to a specific tag
+/// - Insert a single change by hash
+/// - Insert all changes from one view to another
+/// - Insert changes up to a specific tag
 /// - Cherry-pick specific changes
 #[derive(Debug, Args)]
-pub struct Apply {
+pub struct Insert {
     #[command(subcommand)]
-    command: Option<ApplySubcommand>,
+    command: Option<InsertSubcommand>,
 
-    /// Hash of the change to apply (when not using subcommands).
+    /// Hash of the change to insert (when not using subcommands).
     #[arg(value_name = "CHANGE")]
     change: Option<String>,
 
-    /// Stack to apply the change to (default: current stack).
+    /// View to insert the change into (default: current view).
     #[arg(short, long)]
-    stack: Option<String>,
+    view: Option<String>,
 
-    /// Apply dependencies automatically.
+    /// Insert dependencies automatically.
     #[arg(long, default_value = "true")]
     deps: bool,
 
-    /// Allow conflicts during apply.
+    /// Allow conflicts during insert.
     #[arg(long)]
     allow_conflicts: bool,
 
@@ -52,14 +54,14 @@ pub struct Apply {
     repository: Option<String>,
 }
 
-/// Apply subcommands for cross-stack operations.
+/// Insert subcommands for cross-view operations.
 #[derive(Debug, Subcommand)]
-pub enum ApplySubcommand {
-    /// Apply changes from one stack to another.
-    #[command(name = "from-stack")]
-    FromStack(FromStackArgs),
+pub enum InsertSubcommand {
+    /// Insert changes from one view to another.
+    #[command(name = "from-view")]
+    FromView(FromViewArgs),
 
-    /// Apply changes up to a specific tag.
+    /// Insert changes up to a specific tag.
     #[command(name = "tag")]
     Tag(TagArgs),
 
@@ -67,59 +69,59 @@ pub enum ApplySubcommand {
     #[command(name = "pick")]
     Pick(PickArgs),
 
-    /// Show what would be applied (dry run).
+    /// Show what would be inserted (dry run).
     #[command(name = "preview")]
     Preview(PreviewArgs),
 }
 
-/// Arguments for applying from one stack to another.
+/// Arguments for inserting from one view to another.
 #[derive(Debug, Args)]
-pub struct FromStackArgs {
-    /// Source stack to copy changes from.
+pub struct FromViewArgs {
+    /// Source view to copy changes from.
     #[arg(value_name = "SOURCE")]
-    from_stack: String,
+    from_view: String,
 
-    /// Target stack to apply changes to (default: current stack).
+    /// Target view to insert changes into (default: current view).
     #[arg(short, long)]
-    to_stack: Option<String>,
+    to_view: Option<String>,
 
-    /// Apply dependencies automatically.
+    /// Insert dependencies automatically.
     #[arg(long, default_value = "true")]
     deps: bool,
 
-    /// Allow conflicts during apply.
+    /// Allow conflicts during insert.
     #[arg(long)]
     allow_conflicts: bool,
 
-    /// Perform a dry run (don't actually apply).
+    /// Perform a dry run (don't actually insert).
     #[arg(long)]
     dry_run: bool,
 }
 
-/// Arguments for applying up to a tag.
+/// Arguments for inserting up to a tag.
 #[derive(Debug, Args)]
 pub struct TagArgs {
-    /// Name of the tag to apply up to.
+    /// Name of the tag to insert up to.
     #[arg(value_name = "TAG")]
     tag_name: String,
 
-    /// Source stack containing the tag.
+    /// Source view containing the tag.
     #[arg(short, long)]
-    from_stack: Option<String>,
+    from_view: Option<String>,
 
-    /// Target stack to apply changes to (default: current stack).
+    /// Target view to insert changes into (default: current view).
     #[arg(short, long)]
-    to_stack: Option<String>,
+    to_view: Option<String>,
 
-    /// Apply dependencies automatically.
+    /// Insert dependencies automatically.
     #[arg(long, default_value = "true")]
     deps: bool,
 
-    /// Allow conflicts during apply.
+    /// Allow conflicts during insert.
     #[arg(long)]
     allow_conflicts: bool,
 
-    /// Perform a dry run (don't actually apply).
+    /// Perform a dry run (don't actually insert).
     #[arg(long)]
     dry_run: bool,
 }
@@ -131,29 +133,29 @@ pub struct PickArgs {
     #[arg(value_name = "CHANGES", required = true)]
     changes: Vec<String>,
 
-    /// Target stack to apply changes to (default: current stack).
+    /// Target view to insert changes into (default: current view).
     #[arg(short, long)]
-    to_stack: Option<String>,
+    to_view: Option<String>,
 
-    /// Apply dependencies automatically.
+    /// Insert dependencies automatically.
     #[arg(long, default_value = "true")]
     deps: bool,
 
-    /// Allow conflicts during apply.
+    /// Allow conflicts during insert.
     #[arg(long)]
     allow_conflicts: bool,
 }
 
-/// Arguments for previewing what would be applied.
+/// Arguments for previewing what would be inserted.
 #[derive(Debug, Args)]
 pub struct PreviewArgs {
-    /// Source stack to preview changes from.
+    /// Source view to preview changes from.
     #[arg(value_name = "SOURCE")]
-    from_stack: String,
+    from_view: String,
 
-    /// Target stack (default: current stack).
+    /// Target view (default: current view).
     #[arg(short, long)]
-    to_stack: Option<String>,
+    to_view: Option<String>,
 
     /// Optional tag to limit preview up to.
     #[arg(long)]
@@ -162,23 +164,23 @@ pub struct PreviewArgs {
 
 // Command Implementation
 
-impl crate::commands::Command for Apply {
+impl crate::commands::Command for Insert {
     fn run(&self) -> CliResult<()> {
         let repo_path = self.repository.as_ref().map(std::path::Path::new);
         let repo = require_repository(repo_path)?;
 
         match &self.command {
-            Some(ApplySubcommand::FromStack(args)) => run_from_stack(&repo, args),
-            Some(ApplySubcommand::Tag(args)) => run_tag(&repo, args),
-            Some(ApplySubcommand::Pick(args)) => run_pick(&repo, args),
-            Some(ApplySubcommand::Preview(args)) => run_preview(&repo, args),
+            Some(InsertSubcommand::FromView(args)) => run_from_view(&repo, args),
+            Some(InsertSubcommand::Tag(args)) => run_tag(&repo, args),
+            Some(InsertSubcommand::Pick(args)) => run_pick(&repo, args),
+            Some(InsertSubcommand::Preview(args)) => run_preview(&repo, args),
             None => {
-                // Apply a single change
+                // Insert a single change
                 if let Some(ref change_str) = self.change {
-                    run_single_apply(&repo, change_str, self)
+                    run_single_insert(&repo, change_str, self)
                 } else {
                     Err(CliError::InvalidArgument {
-                        message: "Missing CHANGE argument. Provide a change hash or use a subcommand (from-stack, tag, pick)".to_string(),
+                        message: "Missing CHANGE argument. Provide a change hash or use a subcommand (from-view, tag, pick)".to_string(),
                     })
                 }
             }
@@ -188,42 +190,41 @@ impl crate::commands::Command for Apply {
 
 // Subcommand Implementations
 
-/// Apply a single change by hash.
-fn run_single_apply(repo: &Repository, change_str: &str, args: &Apply) -> CliResult<()> {
+/// Insert a single change by hash.
+fn run_single_insert(repo: &Repository, change_str: &str, args: &Insert) -> CliResult<()> {
     let hash = parse_change_hash(repo, change_str)?;
-    let is_current_stack =
-        args.stack.is_none() || args.stack.as_deref() == Some(repo.current_stack());
+    let is_current_view = args.view.is_none() || args.view.as_deref() == Some(repo.current_view());
 
-    let options = ApplyOptions::default()
+    let options = InsertOptions::default()
         .apply_deps(args.deps)
         .allow_conflict(args.allow_conflicts);
 
-    let options = if let Some(ref stack) = args.stack {
-        options.stack(stack)
+    let options = if let Some(ref view) = args.view {
+        options.view(view)
     } else {
         options
     };
 
-    output::print_info(&format!("Applying change {}...", format_hash(&hash, true)));
+    output::print_info(&format!("Inserting change {}...", format_hash(&hash, true)));
 
     let outcome = if args.deps {
-        repo.apply_change_rec(&hash, options)
+        repo.insert_change_rec(&hash, options)
     } else {
-        repo.apply_change(&hash, options)
+        repo.insert_change(&hash, options)
     }
     .map_err(|e| CliError::Conflict {
         description: e.to_string(),
     })?;
 
-    print_apply_outcome(
+    print_insert_outcome(
         &outcome.stats.applied_hashes,
         outcome.new_state,
         outcome.has_conflicts,
     );
 
-    // Update working copy if we applied to the current stack (like Git merge)
-    if is_current_stack && !outcome.stats.applied_hashes.is_empty() {
-        let output_result = repo.output_working_copy().map_err(|e| {
+    // Update working copy if we inserted into the current view
+    if is_current_view && !outcome.stats.applied_hashes.is_empty() {
+        let output_result = repo.materialize().map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
         })?;
         output::print_success(&format!(
@@ -235,35 +236,35 @@ fn run_single_apply(repo: &Repository, change_str: &str, args: &Apply) -> CliRes
     Ok(())
 }
 
-/// Apply changes from one stack to another.
-fn run_from_stack(repo: &Repository, args: &FromStackArgs) -> CliResult<()> {
-    let to_stack = args
-        .to_stack
+/// Insert changes from one view to another.
+fn run_from_view(repo: &Repository, args: &FromViewArgs) -> CliResult<()> {
+    let to_view = args
+        .to_view
         .clone()
-        .unwrap_or_else(|| repo.current_stack().to_string());
-    let is_current_stack = to_stack == repo.current_stack();
+        .unwrap_or_else(|| repo.current_view().to_string());
+    let is_current_view = to_view == repo.current_view();
 
     output::print_info(&format!(
-        "Applying changes from '{}' to '{}'...",
-        args.from_stack, to_stack
+        "Inserting changes from '{}' to '{}'...",
+        args.from_view, to_view
     ));
 
-    let options = CrossStackApplyOptions::new(&args.from_stack, &to_stack)
+    let options = CrossViewInsertOptions::new(&args.from_view, &to_view)
         .with_dependencies(args.deps)
         .allow_conflicts(args.allow_conflicts)
         .dry_run(args.dry_run);
 
     let outcome = repo
-        .apply_from_stack(options)
+        .insert_from_view(options)
         .map_err(|e| CliError::Conflict {
             description: e.to_string(),
         })?;
 
-    print_cross_stack_outcome(&outcome, args.dry_run);
+    print_cross_view_outcome(&outcome, args.dry_run);
 
-    // Update working copy if we applied to the current stack (like Git merge)
-    if is_current_stack && !args.dry_run && outcome.changes_applied > 0 {
-        let output_result = repo.output_working_copy().map_err(|e| {
+    // Update working copy if we inserted into the current view
+    if is_current_view && !args.dry_run && outcome.changes_applied > 0 {
+        let output_result = repo.materialize().map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
         })?;
         output::print_success(&format!(
@@ -275,40 +276,40 @@ fn run_from_stack(repo: &Repository, args: &FromStackArgs) -> CliResult<()> {
     Ok(())
 }
 
-/// Apply changes up to a specific tag.
+/// Insert changes up to a specific tag.
 fn run_tag(repo: &Repository, args: &TagArgs) -> CliResult<()> {
-    let from_stack = args
-        .from_stack
+    let from_view = args
+        .from_view
         .clone()
-        .unwrap_or_else(|| repo.current_stack().to_string());
-    let to_stack = args
-        .to_stack
+        .unwrap_or_else(|| repo.current_view().to_string());
+    let to_view = args
+        .to_view
         .clone()
-        .unwrap_or_else(|| repo.current_stack().to_string());
-    let is_current_stack = to_stack == repo.current_stack();
+        .unwrap_or_else(|| repo.current_view().to_string());
+    let is_current_view = to_view == repo.current_view();
 
     output::print_info(&format!(
-        "Applying changes up to tag '{}' from '{}' to '{}'...",
-        args.tag_name, from_stack, to_stack
+        "Inserting changes up to tag '{}' from '{}' to '{}'...",
+        args.tag_name, from_view, to_view
     ));
 
-    let options = CrossStackApplyOptions::new(&from_stack, &to_stack)
+    let options = CrossViewInsertOptions::new(&from_view, &to_view)
         .up_to_tag(&args.tag_name)
         .with_dependencies(args.deps)
         .allow_conflicts(args.allow_conflicts)
         .dry_run(args.dry_run);
 
     let outcome = repo
-        .apply_from_stack(options)
+        .insert_from_view(options)
         .map_err(|e| CliError::Conflict {
             description: e.to_string(),
         })?;
 
-    print_cross_stack_outcome(&outcome, args.dry_run);
+    print_cross_view_outcome(&outcome, args.dry_run);
 
-    // Update working copy if we applied to the current stack (like Git merge)
-    if is_current_stack && !args.dry_run && outcome.changes_applied > 0 {
-        let output_result = repo.output_working_copy().map_err(|e| {
+    // Update working copy if we inserted into the current view
+    if is_current_view && !args.dry_run && outcome.changes_applied > 0 {
+        let output_result = repo.materialize().map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
         })?;
         output::print_success(&format!(
@@ -322,11 +323,11 @@ fn run_tag(repo: &Repository, args: &TagArgs) -> CliResult<()> {
 
 /// Cherry-pick specific changes.
 fn run_pick(repo: &Repository, args: &PickArgs) -> CliResult<()> {
-    let to_stack = args
-        .to_stack
+    let to_view = args
+        .to_view
         .clone()
-        .unwrap_or_else(|| repo.current_stack().to_string());
-    let is_current_stack = to_stack == repo.current_stack();
+        .unwrap_or_else(|| repo.current_view().to_string());
+    let is_current_view = to_view == repo.current_view();
 
     // Parse all change hashes
     let mut hashes = Vec::new();
@@ -338,20 +339,20 @@ fn run_pick(repo: &Repository, args: &PickArgs) -> CliResult<()> {
     output::print_info(&format!(
         "Cherry-picking {} change(s) to '{}'...",
         hashes.len(),
-        to_stack
+        to_view
     ));
 
-    let outcome = repo
-        .cherry_pick(&hashes, "", Some(&to_stack))
-        .map_err(|e| CliError::Conflict {
-            description: e.to_string(),
-        })?;
+    let outcome =
+        repo.cherry_pick(&hashes, "", Some(&to_view))
+            .map_err(|e| CliError::Conflict {
+                description: e.to_string(),
+            })?;
 
-    print_cross_stack_outcome(&outcome, false);
+    print_cross_view_outcome(&outcome, false);
 
-    // Update working copy if we applied to the current stack (like Git merge)
-    if is_current_stack && outcome.changes_applied > 0 {
-        let output_result = repo.output_working_copy().map_err(|e| {
+    // Update working copy if we inserted into the current view
+    if is_current_view && outcome.changes_applied > 0 {
+        let output_result = repo.materialize().map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
         })?;
         output::print_success(&format!(
@@ -363,47 +364,47 @@ fn run_pick(repo: &Repository, args: &PickArgs) -> CliResult<()> {
     Ok(())
 }
 
-/// Preview what would be applied.
+/// Preview what would be inserted.
 fn run_preview(repo: &Repository, args: &PreviewArgs) -> CliResult<()> {
-    let to_stack = args
-        .to_stack
+    let to_view = args
+        .to_view
         .clone()
-        .unwrap_or_else(|| repo.current_stack().to_string());
+        .unwrap_or_else(|| repo.current_view().to_string());
 
-    output::print_section("Apply Preview");
+    output::print_section("Insert Preview");
     println!();
-    println!("  Source stack: {}", args.from_stack);
-    println!("  Target stack: {}", to_stack);
+    println!("  Source view: {}", args.from_view);
+    println!("  Target view: {}", to_view);
     if let Some(ref tag) = args.up_to_tag {
-        println!("  Up to tag:    {}", tag);
+        println!("  Up to tag:   {}", tag);
     }
     println!();
 
-    // Get the changes that would be applied
+    // Get the changes that would be inserted
     let missing = if let Some(ref tag_name) = args.up_to_tag {
         // Get changes up to tag, then filter to missing
-        let options = CrossStackApplyOptions::new(&args.from_stack, &to_stack)
+        let options = CrossViewInsertOptions::new(&args.from_view, &to_view)
             .up_to_tag(tag_name)
             .dry_run(true);
 
         let outcome = repo
-            .apply_from_stack(options)
+            .insert_from_view(options)
             .map_err(|e| CliError::Conflict {
                 description: e.to_string(),
             })?;
 
         outcome.applied_hashes
     } else {
-        repo.get_missing_changes_between(&args.from_stack, Some(&to_stack))
+        repo.get_missing_changes_between(&args.from_view, Some(&to_view))
             .map_err(|e| CliError::Conflict {
                 description: e.to_string(),
             })?
     };
 
     if missing.is_empty() {
-        output::print_success("No changes to apply - target stack is up to date.");
+        output::print_success("No changes to insert - target view is up to date.");
     } else {
-        println!("Changes that would be applied ({}):", missing.len());
+        println!("Changes that would be inserted ({}):", missing.len());
         println!();
         for (i, hash) in missing.iter().enumerate() {
             // Try to load change header for more info
@@ -421,8 +422,8 @@ fn run_preview(repo: &Repository, args: &PreviewArgs) -> CliResult<()> {
         }
         println!();
         output::print_info(&format!(
-            "Run 'atomic apply from-stack {}' to apply these changes.",
-            args.from_stack
+            "Run 'atomic insert from-view {}' to insert these changes.",
+            args.from_view
         ));
     }
 
@@ -458,8 +459,8 @@ fn parse_change_hash(repo: &Repository, hash_str: &str) -> CliResult<Hash> {
     })
 }
 
-/// Print the outcome of a single apply operation.
-fn print_apply_outcome(
+/// Print the outcome of a single insert operation.
+fn print_insert_outcome(
     applied: &[Hash],
     new_state: atomic_core::types::Merkle,
     has_conflicts: bool,
@@ -467,11 +468,11 @@ fn print_apply_outcome(
     println!();
 
     if applied.is_empty() {
-        output::print_warning("No changes applied.");
+        output::print_warning("No changes inserted.");
         return;
     }
 
-    output::print_success(&format!("Applied {} change(s)", applied.len()));
+    output::print_success(&format!("Inserted {} change(s)", applied.len()));
 
     println!("  New state: {}", new_state.to_base32());
 
@@ -481,16 +482,16 @@ fn print_apply_outcome(
     }
 }
 
-/// Print the outcome of a cross-stack apply operation.
-fn print_cross_stack_outcome(outcome: &CrossStackApplyOutcome, dry_run: bool) {
+/// Print the outcome of a cross-view insert operation.
+fn print_cross_view_outcome(outcome: &CrossViewInsertOutcome, dry_run: bool) {
     println!();
 
     if dry_run {
         if outcome.applied_hashes.is_empty() {
-            output::print_info("Dry run: No changes would be applied.");
+            output::print_info("Dry run: No changes would be inserted.");
         } else {
             output::print_info(&format!(
-                "Dry run: {} change(s) would be applied",
+                "Dry run: {} change(s) would be inserted",
                 outcome.applied_hashes.len()
             ));
 
@@ -504,14 +505,14 @@ fn print_cross_stack_outcome(outcome: &CrossStackApplyOutcome, dry_run: bool) {
     }
 
     if outcome.changes_applied == 0 {
-        output::print_success("No changes to apply - already up to date.");
+        output::print_success("No changes to insert - already up to date.");
     } else {
-        output::print_success(&format!("Applied {} change(s)", outcome.changes_applied));
+        output::print_success(&format!("Inserted {} change(s)", outcome.changes_applied));
         println!("  New state: {}", outcome.new_state.to_base32());
 
         if !outcome.skipped_hashes.is_empty() {
             println!(
-                "  Skipped:   {} (already applied)",
+                "  Skipped:   {} (already inserted)",
                 outcome.skipped_hashes.len()
             );
         }
@@ -530,51 +531,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_apply_subcommand_variants() {
+    fn test_insert_subcommand_variants() {
         // Just verify the enums compile correctly
-        let _ = ApplySubcommand::FromStack(FromStackArgs {
-            from_stack: "feature".to_string(),
-            to_stack: Some("main".to_string()),
+        let _ = InsertSubcommand::FromView(FromViewArgs {
+            from_view: "feature".to_string(),
+            to_view: Some("main".to_string()),
             deps: true,
             allow_conflicts: false,
             dry_run: false,
         });
 
-        let _ = ApplySubcommand::Tag(TagArgs {
+        let _ = InsertSubcommand::Tag(TagArgs {
             tag_name: "v1.0.0".to_string(),
-            from_stack: Some("feature".to_string()),
-            to_stack: Some("main".to_string()),
+            from_view: Some("feature".to_string()),
+            to_view: Some("main".to_string()),
             deps: true,
             allow_conflicts: false,
             dry_run: false,
         });
 
-        let _ = ApplySubcommand::Pick(PickArgs {
+        let _ = InsertSubcommand::Pick(PickArgs {
             changes: vec!["abc123".to_string()],
-            to_stack: None,
+            to_view: None,
             deps: true,
             allow_conflicts: false,
         });
 
-        let _ = ApplySubcommand::Preview(PreviewArgs {
-            from_stack: "feature".to_string(),
-            to_stack: None,
+        let _ = InsertSubcommand::Preview(PreviewArgs {
+            from_view: "feature".to_string(),
+            to_view: None,
             up_to_tag: None,
         });
     }
 
     #[test]
-    fn test_from_stack_args_defaults() {
-        let args = FromStackArgs {
-            from_stack: "feature".to_string(),
-            to_stack: None,
+    fn test_from_view_args_defaults() {
+        let args = FromViewArgs {
+            from_view: "feature".to_string(),
+            to_view: None,
             deps: true,
             allow_conflicts: false,
             dry_run: false,
         };
 
-        assert_eq!(args.from_stack, "feature");
-        assert!(args.to_stack.is_none());
+        assert_eq!(args.from_view, "feature");
+        assert!(args.to_view.is_none());
         assert!(args.deps);
         assert!(!args.allow_conflicts);
         assert!(!args.dry_run);
@@ -584,16 +585,16 @@ mod tests {
     fn test_tag_args_with_all_options() {
         let args = TagArgs {
             tag_name: "v1.0.0".to_string(),
-            from_stack: Some("feature".to_string()),
-            to_stack: Some("main".to_string()),
+            from_view: Some("feature".to_string()),
+            to_view: Some("main".to_string()),
             deps: false,
             allow_conflicts: true,
             dry_run: true,
         };
 
         assert_eq!(args.tag_name, "v1.0.0");
-        assert_eq!(args.from_stack, Some("feature".to_string()));
-        assert_eq!(args.to_stack, Some("main".to_string()));
+        assert_eq!(args.from_view, Some("feature".to_string()));
+        assert_eq!(args.to_view, Some("main".to_string()));
         assert!(!args.deps);
         assert!(args.allow_conflicts);
         assert!(args.dry_run);
@@ -607,33 +608,33 @@ mod tests {
                 "def456".to_string(),
                 "ghi789".to_string(),
             ],
-            to_stack: Some("main".to_string()),
+            to_view: Some("main".to_string()),
             deps: true,
             allow_conflicts: false,
         };
 
         assert_eq!(args.changes.len(), 3);
-        assert_eq!(args.to_stack, Some("main".to_string()));
+        assert_eq!(args.to_view, Some("main".to_string()));
     }
 
     #[test]
     fn test_preview_args_minimal() {
         let args = PreviewArgs {
-            from_stack: "feature".to_string(),
-            to_stack: None,
+            from_view: "feature".to_string(),
+            to_view: None,
             up_to_tag: None,
         };
 
-        assert_eq!(args.from_stack, "feature");
-        assert!(args.to_stack.is_none());
+        assert_eq!(args.from_view, "feature");
+        assert!(args.to_view.is_none());
         assert!(args.up_to_tag.is_none());
     }
 
     #[test]
     fn test_preview_args_with_tag() {
         let args = PreviewArgs {
-            from_stack: "feature".to_string(),
-            to_stack: Some("main".to_string()),
+            from_view: "feature".to_string(),
+            to_view: Some("main".to_string()),
             up_to_tag: Some("v1.0.0".to_string()),
         };
 

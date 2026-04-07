@@ -230,13 +230,13 @@ impl Push {
         }
     }
 
-    /// Get the local stack name to push from.
+    /// Get the local view name to push from.
     ///
-    /// Returns the explicitly specified stack or the repository's current stack.
+    /// Returns the explicitly specified view or the repository's current view.
     fn get_local_stack(&self, repo: &Repository) -> String {
         self.from_stack
             .clone()
-            .unwrap_or_else(|| repo.current_stack().to_string())
+            .unwrap_or_else(|| repo.current_view().to_string())
     }
 
     /// Get the remote stack name to push to.
@@ -440,7 +440,7 @@ impl Push {
                     style_stack(source)
                 ));
 
-                match remote.fork_stack(&remote_stack, source).await {
+                match remote.fork_view(&remote_stack, source).await {
                     Ok(count) => {
                         finish_success(
                             &spinner,

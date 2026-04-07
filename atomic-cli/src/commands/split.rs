@@ -2,7 +2,7 @@
 //!
 //! This module implements the `atomic split` command, which creates a new
 //! stack by forking from an existing stack. This is a convenience wrapper
-//! around `atomic stack new --from`.
+//! around `atomic view create --from`.
 //!
 //! # Usage
 //!
@@ -23,20 +23,20 @@
 //! Split from current stack:
 //! ```text
 //! $ atomic split experimental
-//! Created stack: experimental (forked from dev with 5 changes)
+//! Created view: experimental (forked from dev with 5 changes)
 //! ```
 //!
 //! Split from a specific stack:
 //! ```text
 //! $ atomic split hotfix --stack release-1.0
-//! Created stack: hotfix (forked from release-1.0 with 42 changes)
+//! Created view: hotfix (forked from release-1.0 with 42 changes)
 //! ```
 //!
 //! Split and switch:
 //! ```text
 //! $ atomic split feature-auth --switch
-//! Created stack: feature-auth (forked from dev with 10 changes)
-//! Switched to stack: feature-auth
+//! Created view: feature-auth (forked from dev with 10 changes)
+//! Switched to view: feature-auth
 //! ```
 
 use clap::Parser;
@@ -103,7 +103,7 @@ fn validate_stack_name(name: &str) -> Result<(), String> {
 /// Creates a new stack by forking from an existing stack. All changes from
 /// the source stack are copied to the new stack, preserving history.
 ///
-/// This is equivalent to `atomic stack new <NAME> --from <SOURCE>`.
+/// This is equivalent to `atomic view create <NAME> --from <SOURCE>`.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "split")]
 #[derive(Default)]
@@ -167,63 +167,60 @@ impl Command for Split {
             other => CliError::Repository(other),
         })?;
 
-        // Determine source stack (default to current)
+        // Determine source view (default to current)
         let source = self
             .source
             .clone()
-            .unwrap_or_else(|| repo.current_stack().to_string());
+            .unwrap_or_else(|| repo.current_view().to_string());
 
-        // Verify source stack exists
-        if !repo.stack_exists(&source).map_err(CliError::Repository)? {
-            return Err(CliError::StackNotFound {
+        // Verify source view exists
+        if !repo.view_exists(&source).map_err(CliError::Repository)? {
+            return Err(CliError::ViewNotFound {
                 name: source.clone(),
             });
         }
 
-        // Check if the new stack already exists
-        if repo
-            .stack_exists(&self.name)
-            .map_err(CliError::Repository)?
-        {
-            return Err(CliError::StackAlreadyExists {
+        // Check if the new view already exists
+        if repo.view_exists(&self.name).map_err(CliError::Repository)? {
+            return Err(CliError::ViewAlreadyExists {
                 name: self.name.clone(),
             });
         }
 
-        // Get source stack info for reporting
-        let source_info = repo.get_stack_info(&source).map_err(CliError::Repository)?;
+        // Get source view info for reporting
+        let source_info = repo.get_view_info(&source).map_err(CliError::Repository)?;
         let change_count = source_info.change_count;
 
-        // Create the new stack by copying change log from source.
-        // This does NOT re-apply changes to the graph - it just copies metadata.
-        // This avoids conflicts that would occur if we tried to re-apply changes
+        // Create the new view by copying change log from source.
+        // This does NOT re-insert changes into the graph - it just copies metadata.
+        // This avoids conflicts that would occur if we tried to re-insert changes
         // that have already modified the shared graph.
-        repo.create_stack_from(&self.name, &source)
+        repo.create_view_from(&self.name, &source)
             .map_err(CliError::Repository)?;
 
         if change_count > 0 {
             print_success(&format!(
-                "Created stack: {} (split from {} with {} changes)",
+                "Created view: {} (split from {} with {} changes)",
                 style_stack(&self.name),
                 style_stack(&source),
                 change_count
             ));
         } else {
             print_success(&format!(
-                "Created stack: {} (split from {} - empty)",
+                "Created view: {} (split from {} - empty)",
                 style_stack(&self.name),
                 style_stack(&source)
             ));
         }
 
-        // Optionally switch to the new stack
+        // Optionally switch to the new view
         if self.switch {
-            repo.set_current_stack(&self.name)
+            repo.set_current_view(&self.name)
                 .map_err(CliError::Repository)?;
-            print_success(&format!("Switched to stack: {}", style_stack(&self.name)));
+            print_success(&format!("Switched to view: {}", style_stack(&self.name)));
         } else {
             print_hint(&format!(
-                "Use 'atomic stack switch {}' to switch to the new stack",
+                "Use 'atomic view switch {}' to switch to the new view",
                 self.name
             ));
         }

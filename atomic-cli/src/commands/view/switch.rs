@@ -1,22 +1,22 @@
-//! The `stack switch` command for switching between stacks.
+//! The `view switch` command for switching between views.
 //!
-//! This module implements the `atomic stack switch` command, which changes
-//! the current stack to a different one and updates the working copy to
-//! match the new stack's state.
+//! This module implements the `atomic view switch` command, which changes
+//! the current view to a different one and updates the working copy to
+//! match the new view's state.
 //!
 //! # Working Copy Update
 //!
-//! Like Pijul's channel switching, switching stacks in Atomic updates the
-//! working copy to reflect the new stack's state. Files are created, updated,
-//! or removed to match what's recorded in the target stack.
+//! Like Pijul's channel switching, switching views in Atomic updates the
+//! working copy to reflect the new view's state. Files are created, updated,
+//! or removed to match what's recorded in the target view.
 //!
 //! # Usage
 //!
 //! ```text
-//! atomic stack switch <NAME>
+//! atomic view switch <NAME>
 //!
 //! Arguments:
-//!   <NAME>  Name of the stack to switch to
+//!   <NAME>  Name of the view to switch to
 //!
 //! Options:
 //!   -h, --help  Print help information
@@ -24,16 +24,16 @@
 //!
 //! # Examples
 //!
-//! Switch to a different stack:
+//! Switch to a different view:
 //! ```text
-//! $ atomic stack switch feature-auth
-//! Switched to stack: feature-auth
+//! $ atomic view switch feature-auth
+//! Switched to view: feature-auth
 //! ```
 //!
 //! Switch back to dev:
 //! ```text
-//! $ atomic stack switch dev
-//! Switched to stack: dev
+//! $ atomic view switch dev
+//! Switched to view: dev
 //! ```
 
 use clap::Parser;
@@ -49,27 +49,27 @@ use std::path::PathBuf;
 
 // Switch Command
 
-/// Switch to a different stack.
+/// Switch to a different view.
 ///
-/// Changes the current stack to the specified one and updates the working
-/// copy to match the new stack's state. This behavior matches Pijul's
+/// Changes the current view to the specified one and updates the working
+/// copy to match the new view's state. This behavior matches Pijul's
 /// channel switching.
 ///
-/// **Note**: Switching stacks WILL update your working copy files to match
-/// the target stack's state. Unrecorded changes may be overwritten.
+/// **Note**: Switching views WILL update your working copy files to match
+/// the target view's state. Unrecorded changes may be overwritten.
 #[derive(Parser, Debug, Default)]
 #[command(name = "switch")]
 pub struct Switch {
-    /// Name of the stack to switch to.
+    /// Name of the view to switch to.
     ///
-    /// The stack must already exist. Use `atomic stack list` to see
-    /// available stacks, or `atomic stack new` to create a new one.
+    /// The view must already exist. Use `atomic view list` to see
+    /// available views, or `atomic view create` to create a new one.
     #[arg(value_name = "NAME")]
     pub name: Option<String>,
 }
 
 impl Switch {
-    /// Create a new Switch command targeting the given stack.
+    /// Create a new Switch command targeting the given view.
     pub fn with_name(name: impl Into<String>) -> Self {
         Self {
             name: Some(name.into()),
@@ -79,12 +79,12 @@ impl Switch {
 
 impl Command for Switch {
     fn run(&self) -> CliResult<()> {
-        // Get the stack name
+        // Get the view name
         let name = self
             .name
             .as_ref()
             .ok_or_else(|| CliError::InvalidArgument {
-                message: "Stack name is required".to_string(),
+                message: "View name is required".to_string(),
             })?;
 
         // Find the repository
@@ -96,21 +96,21 @@ impl Command for Switch {
             other => CliError::Repository(other),
         })?;
 
-        // Check if we're already on this stack
-        if repo.current_stack() == name {
-            print_success(&format!("Already on stack: {}", style_stack(name)));
+        // Check if we're already on this view
+        if repo.current_view() == name {
+            print_success(&format!("Already on view: {}", style_stack(name)));
             return Ok(());
         }
 
-        // Switch to the stack and update working copy
-        let result = repo.switch_stack(name).map_err(|e| match e {
-            atomic_repository::RepositoryError::StackNotFound { name } => {
-                CliError::StackNotFound { name }
+        // Switch to the view and update working copy
+        let result = repo.switch_view(name).map_err(|e| match e {
+            atomic_repository::RepositoryError::ViewNotFound { name } => {
+                CliError::ViewNotFound { name }
             }
             other => CliError::Repository(other),
         })?;
 
-        print_success(&format!("Switched to stack: {}", style_stack(name)));
+        print_success(&format!("Switched to view: {}", style_stack(name)));
 
         // Show output statistics if any files were updated
         if result.files_written > 0 || result.directories_created > 0 {
@@ -199,35 +199,35 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_switch_to_existing_stack() {
+    fn test_switch_to_existing_view() {
         use tempfile::tempdir;
 
         let _guard = DirGuard::new();
         let temp = tempdir().unwrap();
         let repo_path = temp.path();
 
-        // Initialize a repository and create a stack, then drop to release lock
+        // Initialize a repository and create a view, then drop to release lock
         {
             let mut repo = Repository::init(repo_path).unwrap();
-            repo.create_stack("feature-test").unwrap();
+            repo.create_view("feature-test").unwrap();
         }
 
         // Change to the repo directory
         std::env::set_current_dir(repo_path).unwrap();
 
-        // Switch to the new stack
+        // Switch to the new view
         let cmd = Switch::with_name("feature-test");
         let result = cmd.run();
         assert!(result.is_ok());
 
         // Verify we switched
         let repo = Repository::open(repo_path).unwrap();
-        assert_eq!(repo.current_stack(), "feature-test");
+        assert_eq!(repo.current_view(), "feature-test");
     }
 
     #[test]
     #[serial]
-    fn test_switch_to_nonexistent_stack() {
+    fn test_switch_to_nonexistent_view() {
         use tempfile::tempdir;
 
         let _guard = DirGuard::new();
@@ -242,28 +242,28 @@ mod tests {
         // Change to the repo directory
         std::env::set_current_dir(repo_path).unwrap();
 
-        // Try to switch to a non-existent stack
+        // Try to switch to a non-existent view
         let cmd = Switch::with_name("nonexistent");
         let result = cmd.run();
         assert!(result.is_err());
         match result.unwrap_err() {
-            CliError::StackNotFound { name } => {
+            CliError::ViewNotFound { name } => {
                 assert_eq!(name, "nonexistent");
             }
-            other => panic!("Expected StackNotFound, got: {:?}", other),
+            other => panic!("Expected ViewNotFound, got: {:?}", other),
         }
     }
 
     #[test]
     #[serial]
-    fn test_switch_to_current_stack() {
+    fn test_switch_to_current_view() {
         use tempfile::tempdir;
 
         let _guard = DirGuard::new();
         let temp = tempdir().unwrap();
         let repo_path = temp.path();
 
-        // Initialize a repository (default stack is "dev") and drop to release lock
+        // Initialize a repository (default view is "dev") and drop to release lock
         {
             let _repo = Repository::init(repo_path).unwrap();
         }
@@ -271,13 +271,13 @@ mod tests {
         // Change to the repo directory
         std::env::set_current_dir(repo_path).unwrap();
 
-        // Switch to the current stack (should succeed with a message)
+        // Switch to the current view (should succeed with a message)
         let cmd = Switch::with_name("dev");
         let result = cmd.run();
         assert!(result.is_ok());
 
         // Verify we're still on dev
         let repo = Repository::open(repo_path).unwrap();
-        assert_eq!(repo.current_stack(), "dev");
+        assert_eq!(repo.current_view(), "dev");
     }
 }

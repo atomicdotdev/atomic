@@ -3,7 +3,7 @@
 //! This module implements the `atomic unrecord` command, which removes
 //! the most recent change (or a specific change) from the current stack's
 //! change log. The change itself is NOT deleted from the change store —
-//! it can be re-applied later via `atomic apply`.
+//! it can be re-inserted later via `atomic insert`.
 //!
 //! # Usage
 //!
@@ -51,7 +51,7 @@ use crate::output::{print_success, print_warning};
 /// Remove the last change from the current stack.
 ///
 /// The change is removed from the stack's change log but NOT deleted
-/// from the change store. It can be re-applied later with `atomic apply`.
+/// from the change store. It can be re-inserted later with `atomic insert`.
 ///
 /// This is the inverse of `atomic record` — it "un-records" a change,
 /// reverting the stack to the state before that change was applied.

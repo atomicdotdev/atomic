@@ -161,14 +161,14 @@ impl Attest {
         Ok(())
     }
 
-    /// Show attestations for a specific stack.
+    /// Show attestations for a specific view.
     fn show_for_stack(&self, repo: &Repository, stack_name: &str) -> CliResult<()> {
         let results = repo
-            .find_attestations_for_stack(stack_name)
+            .find_attestations_for_view(stack_name)
             .map_err(CliError::Repository)?;
 
         if results.is_empty() {
-            println!("No attestations cover changes in stack '{}'.", stack_name);
+            println!("No attestations cover changes in view '{}'.", stack_name);
             return Ok(());
         }
 
@@ -354,7 +354,7 @@ impl Attest {
 
     /// Print coverage per stack.
     fn print_coverage(&self, repo: &Repository, attest: &Attestation) {
-        let stacks = match repo.list_stacks() {
+        let stacks = match repo.list_views() {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -365,7 +365,7 @@ impl Attest {
 
         for stack_name in &stacks {
             let history = match repo
-                .log(atomic_repository::history::HistoryOptions::default().stack(stack_name))
+                .log(atomic_repository::history::HistoryOptions::default().view(stack_name))
             {
                 Ok(h) => h,
                 Err(_) => continue,

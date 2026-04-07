@@ -229,13 +229,13 @@ pub enum AgentError {
         turn_number: u32,
     },
 
-    /// Failed to create or access the agent's Atomic stack.
-    #[error("Failed to {operation} stack '{stack_name}': {reason}")]
-    StackError {
+    /// Failed to create or access the agent's Atomic view.
+    #[error("Failed to {operation} view '{view_name}': {reason}")]
+    ViewError {
         /// "create", "open", or "switch".
         operation: String,
-        /// The stack name (e.g., "agent-2026-01-15-abc123").
-        stack_name: String,
+        /// The view name (e.g., "agent-2026-01-15-abc123").
+        view_name: String,
         /// What went wrong.
         reason: String,
     },
@@ -381,7 +381,7 @@ impl AgentError {
 
             // Recording errors
             AgentError::RecordFailed { .. } => 4,
-            AgentError::StackError { .. } => 4,
+            AgentError::ViewError { .. } => 4,
 
             // Everything else
             _ => 1,
@@ -647,9 +647,9 @@ mod tests {
             4
         );
         assert_eq!(
-            AgentError::StackError {
+            AgentError::ViewError {
                 operation: "create".to_string(),
-                stack_name: "s".to_string(),
+                view_name: "s".to_string(),
                 reason: "x".to_string(),
             }
             .exit_code(),

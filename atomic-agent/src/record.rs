@@ -21,7 +21,7 @@
 //!     ├──▶ Build ChangeHeader (message, author, timestamp)
 //!     ├──▶ Build Provenance (vendor, model, tool, prompt hash)
 //!     ├──▶ Build SessionEnvelope → encode → hashed.metadata
-//!     ├──▶ Build RecordOptions (all: true, stack, provenance)
+//!     ├──▶ Build RecordOptions (all: true, view, provenance)
 //!     │
 //!     ▼
 //! repo.record(header, options)  ← repo diffs working copy vs pristine
@@ -779,7 +779,7 @@ fn build_turn_envelope(
 /// # Returns
 ///
 /// A `TurnRecordOutcome` with the change hash, turn number, file count,
-/// and message. The change has already been applied to the agent's stack.
+/// and message. The change has already been applied to the agent's view.
 ///
 /// # Errors
 ///
@@ -903,7 +903,7 @@ pub fn record_turn(
     // is tamper-evident and commutes via patch theory.
     let record_options = atomic_repository::record::RecordOptions::new()
         .with_all(true)
-        .stack(options.session.stack_name.clone())
+        .view(options.session.view_name.clone())
         .apply_after_record(true)
         .save_to_store(true)
         .provenance(vec![provenance])

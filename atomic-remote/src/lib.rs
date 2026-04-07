@@ -47,7 +47,7 @@
 //!         "https://api.example.com/tenant/t/portfolio/p/project/myrepo/code"
 //!     )?;
 //!
-// Query the current state of the "main" stack
+// Query the current state of the "main" view
 //!     let state = remote.get_state("main").await?;
 //!     println!("Remote state: {:?}", state);
 //!
@@ -67,12 +67,12 @@
 //!
 //! | Operation | Endpoint | Description |
 //! |-----------|----------|-------------|
-//! | Get State | `GET ?stack={s}&state=` | Query stack state |
-//! | Get Changelist | `GET ?stack={s}&changelist={from}` | Get changes from position |
+//! | Get State | `GET ?view={s}&state=` | Query view state |
+//! | Get Changelist | `GET ?view={s}&changelist={from}` | Get changes from position |
 //! | Download Change | `GET ?change={hash}` | Download change file |
 //! | Download Tag | `GET ?tag={state}` | Download short tag data |
-//! | Upload Change | `POST ?apply={hash}&stack={s}` | Upload and apply change to stack |
-//! | Upload Tag | `POST ?tagup={state}&stack={s}` | Upload tag |
+//! | Upload Change | `POST ?insert={hash}&view={s}` | Upload and insert change to view |
+//! | Upload Tag | `POST ?tagup={state}&view={s}` | Upload tag |
 //!
 //! ## Changelist Format
 //!
@@ -84,7 +84,7 @@
 //!
 //! State responses are in the format:
 //! - With state: `{position} {merkle} {tag_merkle}`
-//! - Empty stack: `-`
+//! - Empty view: `-`
 //!
 //! # User-Agent
 //!

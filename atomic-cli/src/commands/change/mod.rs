@@ -114,7 +114,7 @@ use clap::{Parser, ValueEnum};
 use serde::Serialize;
 
 use atomic_core::change::{Author, Change, GraphOp, Provenance};
-use atomic_core::pristine::StackTxnT;
+use atomic_core::pristine::ViewTxnT;
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::history::{find_change_sequence, get_change_at_sequence};
 use atomic_repository::Repository;

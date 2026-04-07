@@ -5,8 +5,8 @@ impl Record {
     pub(super) fn format_outcome(&self, repo: &Repository, outcome: &RecordOutcome) -> String {
         let mut output = String::new();
 
-        // Get the actual current stack name from the repository
-        let stack_name = repo.current_stack();
+        // Get the actual current view name from the repository
+        let stack_name = repo.current_view();
 
         // Get hash (shortened)
         let hash_short = &outcome.hash().to_base32()[..DEFAULT_HASH_LENGTH.min(8)];

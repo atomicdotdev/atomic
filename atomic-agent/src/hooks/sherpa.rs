@@ -128,7 +128,7 @@ struct SherpaHookInput {
 /// Agent hook adapter for Sherpa TUI sessions.
 ///
 /// Implements [`AgentHook`] so the `TurnOrchestrator` can manage Sherpa
-/// sessions with the same stack-fork / record / switch-back lifecycle as
+/// sessions with the same view-fork / record / switch-back lifecycle as
 /// Claude Code and OpenCode.
 #[derive(Debug, Default)]
 pub struct SherpaHook {

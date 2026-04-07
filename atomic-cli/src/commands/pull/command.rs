@@ -259,7 +259,7 @@ impl Pull {
     fn get_local_stack(&self, repo: &Repository) -> String {
         self.to_stack
             .clone()
-            .unwrap_or_else(|| repo.current_stack().to_string())
+            .unwrap_or_else(|| repo.current_view().to_string())
     }
 
     /// Get the remote stack name to pull from.
@@ -517,7 +517,7 @@ impl Pull {
         if self.download_only {
             print_blank();
             print_success(&format!(
-                "Downloaded {} (not applied - use 'atomic apply' to apply)",
+                "Downloaded {} (not inserted - use 'atomic insert' to insert)",
                 format_count(stats.changes_downloaded, "change")
             ));
             return Ok(());
@@ -530,8 +530,8 @@ impl Pull {
         // Note: Full apply implementation would iterate through downloaded changes
         // and apply them to the stack. For now, we indicate this is a future feature.
         for _change in &to_download {
-            // In a full implementation, this would call repo.apply_change()
-            // For now, we just count them as applied
+            // In a full implementation, this would call repo.insert_change()
+            // For now, we just count them as inserted
             if !stats.has_failures() {
                 stats.record_applied();
             }

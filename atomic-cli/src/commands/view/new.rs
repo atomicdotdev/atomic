@@ -1,54 +1,54 @@
-//! The `stack new` command for creating new stacks.
+//! The `view create` command for creating new views.
 //!
-//! # Two-Tier Stack Model
+//! # Two-Tier View Model
 //!
-//! Stacks can be **Shared** (default) or **Local**:
+//! Views can be **Shared** (default) or **Draft**:
 //!
-//! - **Shared** stacks (dev, release, main) write edges to the global graph.
-//!   They are permanent and visible to all stacks.
-//! - **Local** stacks (feature, bug, experiment) write edges to a per-stack
+//! - **Shared** views (dev, release, main) write edges to the global graph.
+//!   They are permanent and visible to all views.
+//! - **Draft** views (feature, bug, experiment) write edges to a per-view
 //!   graph. They can be deleted cleanly with zero orphaned edges.
 //!
-//! Use `--local` to create an local workspace. Use `--parent` to set the
-//! parent stack (defaults to the current stack).
+//! Use `--draft` to create a draft workspace. Use `--parent` to set the
+//! parent view (defaults to the current view).
 //!
-//! This module implements the `atomic stack new` command, which creates a new
-//! stack in the repository. Stacks in Atomic are views of the graph - they
-//! represent which changes have been applied and in what order.
+//! This module implements the `atomic view create` command, which creates a new
+//! view in the repository. Views in Atomic are perspectives on the graph - they
+//! represent which changes have been inserted and in what order.
 //!
 //! # Usage
 //!
 //! ```text
-//! atomic stack new [OPTIONS] <NAME>
+//! atomic view create [OPTIONS] <NAME>
 //!
 //! Arguments:
-//!   <NAME>  Name of the new stack
+//!   <NAME>  Name of the new view
 //!
 //! Options:
-//!       --from <STACK>  Create from an existing stack (fork/split)
-//!   -s, --switch        Switch to the new stack after creating it
+//!       --from <VIEW>   Create from an existing view (fork/split)
+//!   -s, --switch        Switch to the new view after creating it
 //!   -h, --help          Print help information
 //! ```
 //!
 //! # Examples
 //!
-//! Create a new empty stack:
+//! Create a new empty view:
 //! ```text
-//! $ atomic stack new feature-auth
-//! Created stack: feature-auth
+//! $ atomic view create feature-auth
+//! Created view: feature-auth
 //! ```
 //!
-//! Create a stack from another (fork/split):
+//! Create a view from another (fork/split):
 //! ```text
-//! $ atomic stack new hotfix --from main
-//! Created stack: hotfix (forked from main with 42 changes)
+//! $ atomic view create hotfix --from main
+//! Created view: hotfix (forked from main with 42 changes)
 //! ```
 //!
-//! Create and switch to a new stack:
+//! Create and switch to a new view:
 //! ```text
-//! $ atomic stack new feature-auth --switch
-//! Created stack: feature-auth
-//! Switched to stack: feature-auth
+//! $ atomic view create feature-auth --switch
+//! Created view: feature-auth
+//! Switched to view: feature-auth
 //! ```
 
 use clap::Parser;
@@ -64,17 +64,17 @@ use std::path::PathBuf;
 
 // Constants
 
-/// Maximum length for a stack name.
-const MAX_STACK_NAME_LENGTH: usize = 255;
+/// Maximum length for a view name.
+const MAX_VIEW_NAME_LENGTH: usize = 255;
 
-/// Characters not allowed in stack names.
+/// Characters not allowed in view names.
 const INVALID_CHARS: &[char] = &['/', '\\', '\0', ':', '*', '?', '"', '<', '>', '|', ' '];
 
-// Stack Name Validation
+// View Name Validation
 
-/// Validate a stack name.
+/// Validate a view name.
 ///
-/// Stack names must:
+/// View names must:
 /// - Not be empty
 /// - Not exceed 255 characters
 /// - Not contain invalid characters (/, \, :, *, ?, ", <, >, |, space, null)
@@ -83,22 +83,22 @@ const INVALID_CHARS: &[char] = &['/', '\\', '\0', ':', '*', '?', '"', '<', '>', 
 ///
 /// # Arguments
 ///
-/// * `name` - The stack name to validate
+/// * `name` - The view name to validate
 ///
 /// # Returns
 ///
 /// `Ok(())` if the name is valid, or an error describing why it's invalid.
-fn validate_stack_name(name: &str) -> Result<(), String> {
+fn validate_view_name(name: &str) -> Result<(), String> {
     // Check for empty name
     if name.is_empty() {
-        return Err("Stack name cannot be empty".to_string());
+        return Err("View name cannot be empty".to_string());
     }
 
     // Check length
-    if name.len() > MAX_STACK_NAME_LENGTH {
+    if name.len() > MAX_VIEW_NAME_LENGTH {
         return Err(format!(
-            "Stack name cannot exceed {} characters",
-            MAX_STACK_NAME_LENGTH
+            "View name cannot exceed {} characters",
+            MAX_VIEW_NAME_LENGTH
         ));
     }
 
@@ -110,21 +110,21 @@ fn validate_stack_name(name: &str) -> Result<(), String> {
                 '\0' => "null characters".to_string(),
                 _ => format!("'{}'", c),
             };
-            return Err(format!("Stack name cannot contain {}", char_desc));
+            return Err(format!("View name cannot contain {}", char_desc));
         }
     }
 
     // Check for reserved names
     if name == "." || name == ".." {
-        return Err("Stack name cannot be '.' or '..'".to_string());
+        return Err("View name cannot be '.' or '..'".to_string());
     }
 
     // Check for leading/trailing dots
     if name.starts_with('.') {
-        return Err("Stack name cannot start with a dot".to_string());
+        return Err("View name cannot start with a dot".to_string());
     }
     if name.ends_with('.') {
-        return Err("Stack name cannot end with a dot".to_string());
+        return Err("View name cannot end with a dot".to_string());
     }
 
     Ok(())
@@ -132,33 +132,33 @@ fn validate_stack_name(name: &str) -> Result<(), String> {
 
 // New Command
 
-/// Create a new stack.
+/// Create a new view.
 ///
-/// Creates a new stack in the repository. By default, the new stack starts
-/// empty (with no changes applied). Use `--from` to fork from an existing
-/// stack, copying all its changes to the new stack.
+/// Creates a new view in the repository. By default, the new view starts
+/// empty (with no changes inserted). Use `--from` to fork from an existing
+/// view, copying all its changes to the new view.
 #[derive(Parser, Debug, Default)]
-#[command(name = "new")]
+#[command(name = "create")]
 pub struct New {
-    /// Name of the new stack.
+    /// Name of the new view.
     ///
-    /// Stack names should be descriptive and follow a naming convention
+    /// View names should be descriptive and follow a naming convention
     /// like `feature-*`, `bugfix-*`, `release-*`, etc.
     #[arg(value_name = "NAME")]
     pub name: Option<String>,
 
-    /// Fork from a specific stack instead of the current one.
+    /// Fork from a specific view instead of the current one.
     ///
-    /// By default, `stack new` forks from the current stack.  Use
-    /// `--from <STACK>` to fork from a different stack instead.
+    /// By default, `view create` forks from the current view.  Use
+    /// `--from <VIEW>` to fork from a different view instead.
     ///
-    /// The new stack inherits all changes from the source and gets
+    /// The new view inherits all changes from the source and gets
     /// its own isolated edge storage (`STACK_GRAPH`) so that future
     /// changes recorded on it are invisible to the source.
-    #[arg(long, value_name = "STACK")]
+    #[arg(long, value_name = "VIEW")]
     pub from: Option<String>,
 
-    /// Create an empty stack with no inherited history.
+    /// Create an empty view with no inherited history.
     ///
     /// Rarely needed — this is what `stash` is for.  Kept for
     /// backward compatibility and advanced workflows like importing
@@ -166,69 +166,69 @@ pub struct New {
     #[arg(long, hide = true)]
     pub empty: bool,
 
-    /// Switch to the new stack after creating it.
+    /// Switch to the new view after creating it.
     ///
-    /// By default, the current stack remains unchanged after creating
-    /// a new stack. Use this flag to automatically switch to the new stack.
+    /// By default, the current view remains unchanged after creating
+    /// a new view. Use this flag to automatically switch to the new view.
     #[arg(long, short = 's')]
     pub switch: bool,
 
-    /// Create an local workspace (ephemeral, deletable).
+    /// Create a draft workspace (ephemeral, deletable).
     ///
-    /// Local workspaces write edges to a per-stack graph (`STACK_GRAPH`)
+    /// Draft workspaces write edges to a per-view graph (`STACK_GRAPH`)
     /// instead of the global graph. When deleted, all their edges are
     /// cascade-removed with zero orphans.
     ///
-    /// Without this flag, stacks are created as **shared** (permanent).
+    /// Without this flag, views are created as **shared** (permanent).
     ///
     /// # Examples
     ///
     /// ```text
-    /// # Create a local feature stack parented on dev
-    /// atomic stack new feature-auth --local
+    /// # Create a draft feature view parented on dev
+    /// atomic view create feature-auth --draft
     ///
-    /// # Create an local workspace with an explicit parent
-    /// atomic stack new feature-login --local --parent service-auth
+    /// # Create a draft workspace with an explicit parent
+    /// atomic view create feature-login --draft --parent service-auth
     /// ```
-    #[arg(long, short = 'i')]
-    pub local: bool,
+    #[arg(long, short = 'd')]
+    pub draft: bool,
 
-    /// Parent stack for the new stack.
+    /// Parent view for the new view.
     ///
-    /// Sets the parent in the stack hierarchy. The parent determines
-    /// the overlay chain for graph traversal: an local workspace sees
+    /// Sets the parent in the view hierarchy. The parent determines
+    /// the overlay chain for graph traversal: a draft workspace sees
     /// its own edges plus its parent's effective view (recursively).
     ///
-    /// Defaults to the current stack. Use `--parent` to specify a
+    /// Defaults to the current view. Use `--parent` to specify a
     /// different parent explicitly.
     ///
     /// # Examples
     ///
     /// ```text
-    /// # Parent on a long-lived service stack
-    /// atomic stack new feature-login --local --parent service-auth
+    /// # Parent on a long-lived service view
+    /// atomic view create feature-login --draft --parent service-auth
     ///
     /// # Parent on dev (the default if dev is current)
-    /// atomic stack new bugfix-123 --local --parent dev
+    /// atomic view create bugfix-123 --draft --parent dev
     /// ```
-    #[arg(long, value_name = "STACK")]
+    #[arg(long, value_name = "VIEW")]
     pub parent: Option<String>,
 }
 
 impl New {
-    /// Create a new New command with the given stack name.
+    /// Create a new New command with the given view name.
     pub fn with_name(name: impl Into<String>) -> Self {
         Self {
             name: Some(name.into()),
             from: None,
             empty: false,
             switch: false,
-            local: false,
+            draft: false,
             parent: None,
         }
     }
 
-    /// Builder: set the source stack to fork from.
+    /// Builder: set the source view to fork from.
     pub fn with_from(mut self, from: impl Into<String>) -> Self {
         self.from = Some(from.into());
         self
@@ -246,47 +246,47 @@ impl New {
         self
     }
 
-    /// Two-tier stack creation: --local and/or --parent
+    /// Two-tier view creation: --draft and/or --parent
     fn run_two_tier(&self, name: &str, repo: &mut Repository) -> CliResult<()> {
-        use atomic_core::pristine::{MutTxnT, StackKind, StackTxnT};
+        use atomic_core::pristine::{MutTxnT, ViewScope, ViewTxnT};
 
-        let kind = if self.local {
-            StackKind::Local
+        let kind = if self.draft {
+            ViewScope::Draft
         } else {
-            StackKind::Shared
+            ViewScope::Shared
         };
 
-        // Resolve the parent stack name → ID
+        // Resolve the parent view name → ID
         let parent_name = self
             .parent
             .clone()
-            .unwrap_or_else(|| repo.current_stack().to_string());
+            .unwrap_or_else(|| repo.current_view().to_string());
 
         let mut txn = repo
             .pristine()
             .write_txn()
             .map_err(|e| CliError::Internal(e.into()))?;
 
-        let parent_stack = txn
-            .get_stack(&parent_name)
+        let parent_view = txn
+            .get_view(&parent_name)
             .map_err(|e| CliError::Internal(e.into()))?
-            .ok_or_else(|| CliError::StackNotFound {
+            .ok_or_else(|| CliError::ViewNotFound {
                 name: parent_name.clone(),
             })?;
 
-        let parent_id = parent_stack.id;
+        let parent_id = parent_view.id;
 
-        // Create the stack with explicit kind and parent
-        let _stack = txn
-            .create_stack(name, kind, Some(parent_id))
+        // Create the view with explicit kind and parent
+        let _view = txn
+            .create_view(name, kind, Some(parent_id))
             .map_err(|e| CliError::Internal(e.into()))?;
 
         txn.commit().map_err(|e| CliError::Internal(e.into()))?;
 
-        let kind_label = if kind.is_local() { "local" } else { "shared" };
+        let kind_label = if kind.is_draft() { "draft" } else { "shared" };
 
         print_success(&format!(
-            "Created {} stack: {} (parent: {})",
+            "Created {} view: {} (parent: {})",
             kind_label,
             style_stack(name),
             style_stack(&parent_name),
@@ -295,14 +295,14 @@ impl New {
         self.maybe_switch(name, repo)
     }
 
-    /// Optionally switch to the new stack and print hint.
+    /// Optionally switch to the new view and print hint.
     fn maybe_switch(&self, name: &str, repo: &mut Repository) -> CliResult<()> {
         if self.switch {
-            repo.set_current_stack(name).map_err(CliError::Repository)?;
-            print_success(&format!("Switched to stack: {}", style_stack(name)));
+            repo.set_current_view(name).map_err(CliError::Repository)?;
+            print_success(&format!("Switched to view: {}", style_stack(name)));
         } else {
             print_hint(&format!(
-                "Use 'atomic stack switch {}' to switch to the new stack",
+                "Use 'atomic view switch {}' to switch to the new view",
                 name
             ));
         }
@@ -312,16 +312,16 @@ impl New {
 
 impl Command for New {
     fn run(&self) -> CliResult<()> {
-        // Get the stack name
+        // Get the view name
         let name = self
             .name
             .as_ref()
             .ok_or_else(|| CliError::InvalidArgument {
-                message: "Stack name is required".to_string(),
+                message: "View name is required".to_string(),
             })?;
 
-        // Validate the stack name
-        validate_stack_name(name).map_err(|msg| CliError::InvalidArgument { message: msg })?;
+        // Validate the view name
+        validate_view_name(name).map_err(|msg| CliError::InvalidArgument { message: msg })?;
 
         // Find the repository
         let repo_root = find_repository_root()?;
@@ -332,82 +332,82 @@ impl Command for New {
             other => CliError::Repository(other),
         })?;
 
-        // Check if the stack already exists
-        if repo.stack_exists(name).map_err(CliError::Repository)? {
-            return Err(CliError::StackAlreadyExists {
+        // Check if the view already exists
+        if repo.view_exists(name).map_err(CliError::Repository)? {
+            return Err(CliError::ViewAlreadyExists {
                 name: name.to_string(),
             });
         }
 
-        // If --local or --parent is specified, use the two-tier create path
-        if self.local || self.parent.is_some() {
+        // If --draft or --parent is specified, use the two-tier create path
+        if self.draft || self.parent.is_some() {
             return self.run_two_tier(name, &mut repo);
         }
 
-        // Determine how to create the new stack:
+        // Determine how to create the new view:
         //
-        //   --from X → create Local parented on X, apply X's changes
-        //   default  → create Local parented on nearest Shared ancestor,
-        //              with an EMPTY change log (no files until `apply`)
+        //   --from X → create Draft parented on X, insert X's changes
+        //   default  → create Draft parented on nearest Shared ancestor,
+        //              with an EMPTY change log (no files until `insert`)
         //
-        // The new stack is a Local workspace whose edges go to
-        // STACK_GRAPH (isolated from other stacks).  The parent link
+        // The new view is a Draft workspace whose edges go to
+        // STACK_GRAPH (isolated from other views).  The parent link
         // gives the overlay chain read-access to the shared graph for
         // record-time diff computation.
         //
-        // When --from is specified, the source's changes are applied
-        // immediately so the new stack starts with the source's files.
+        // When --from is specified, the source's changes are inserted
+        // immediately so the new view starts with the source's files.
         // Without --from, the change log starts empty — the user brings
-        // in changes explicitly via `apply from-stack`.  This is the
+        // in changes explicitly via `insert from-view`.  This is the
         // normal workflow:
         //
-        //   atomic stack new feature          # empty workspace
-        //   atomic apply from-stack dev       # inherit dev's files
+        //   atomic view create feature          # empty workspace
+        //   atomic insert from-view dev         # inherit dev's files
         //   # ... make changes, record ...
-        //   atomic apply from-stack feature --to-stack dev  # promote
+        //   atomic insert from-view feature --to-view dev  # promote
         if let Some(ref source) = self.from {
-            // Explicit --from: fork from the specified stack.
-            if !repo.stack_exists(source).map_err(CliError::Repository)? {
-                return Err(CliError::StackNotFound {
+            // Explicit --from: fork from the specified view.
+            if !repo.view_exists(source).map_err(CliError::Repository)? {
+                return Err(CliError::ViewNotFound {
                     name: source.to_string(),
                 });
             }
 
-            let source_info = repo.get_stack_info(source).map_err(CliError::Repository)?;
+            let source_info = repo.get_view_info(source).map_err(CliError::Repository)?;
             let change_count = source_info.change_count;
 
-            // create_stack_from creates a Local workspace parented on
+            // create_stack_from creates a Draft workspace parented on
             // the source, with the source's change log copied over.
-            repo.create_stack_from(name, source)
+            repo.create_view_from(name, source)
                 .map_err(CliError::Repository)?;
 
             if change_count > 0 {
                 print_success(&format!(
-                    "Created stack: {} (forked from {} with {} changes)",
+                    "Created view: {} (forked from {} with {} changes)",
                     style_stack(name),
                     style_stack(source),
                     change_count,
                 ));
             } else {
                 print_success(&format!(
-                    "Created stack: {} (forked from {} - empty)",
+                    "Created view: {} (forked from {} - empty)",
                     style_stack(name),
                     style_stack(source),
                 ));
             }
         } else {
-            // No --from: create an empty Local workspace parented on the
+            // No --from: create an empty Draft workspace parented on the
             // nearest Shared ancestor.  No changes are inherited — the
-            // user applies them explicitly.
-            repo.create_stack(name).map_err(CliError::Repository)?;
+            // user inserts them explicitly.
+            repo.create_view(name).map_err(CliError::Repository)?;
 
             print_success(&format!(
-                "Created stack: {} (forked from {} - empty)",
+                "Created view: {} (forked from {} - empty)",
                 style_stack(name),
                 style_stack(
                     &repo
-                        .nearest_shared_ancestor(repo.current_stack())
-                        .unwrap_or_else(|_| repo.current_stack().to_string())
+                        .nearest_shared_ancestor(repo.current_view())
+                        .unwrap_or_else(|_| repo.current_view().to_string())
                 ),
             ));
         }
@@ -446,66 +446,66 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Stack Name Validation Tests
+    // View Name Validation Tests
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_valid_stack_names() {
-        assert!(validate_stack_name("main").is_ok());
-        assert!(validate_stack_name("dev").is_ok());
-        assert!(validate_stack_name("feature-auth").is_ok());
-        assert!(validate_stack_name("feature_auth").is_ok());
-        assert!(validate_stack_name("bugfix-123").is_ok());
-        assert!(validate_stack_name("release-1.0.0").is_ok());
-        assert!(validate_stack_name("user@domain").is_ok());
-        assert!(validate_stack_name("CamelCase").is_ok());
-        assert!(validate_stack_name("UPPERCASE").is_ok());
-        assert!(validate_stack_name("a").is_ok());
-        assert!(validate_stack_name("123").is_ok());
+    fn test_valid_view_names() {
+        assert!(validate_view_name("main").is_ok());
+        assert!(validate_view_name("dev").is_ok());
+        assert!(validate_view_name("feature-auth").is_ok());
+        assert!(validate_view_name("feature_auth").is_ok());
+        assert!(validate_view_name("bugfix-123").is_ok());
+        assert!(validate_view_name("release-1.0.0").is_ok());
+        assert!(validate_view_name("user@domain").is_ok());
+        assert!(validate_view_name("CamelCase").is_ok());
+        assert!(validate_view_name("UPPERCASE").is_ok());
+        assert!(validate_view_name("a").is_ok());
+        assert!(validate_view_name("123").is_ok());
     }
 
     #[test]
     fn test_empty_name() {
-        let result = validate_stack_name("");
+        let result = validate_view_name("");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("empty"));
     }
 
     #[test]
     fn test_name_too_long() {
-        let long_name = "a".repeat(MAX_STACK_NAME_LENGTH + 1);
-        let result = validate_stack_name(&long_name);
+        let long_name = "a".repeat(MAX_VIEW_NAME_LENGTH + 1);
+        let result = validate_view_name(&long_name);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("255"));
     }
 
     #[test]
     fn test_invalid_characters() {
-        assert!(validate_stack_name("feature/auth").is_err());
-        assert!(validate_stack_name("feature\\auth").is_err());
-        assert!(validate_stack_name("feature:auth").is_err());
-        assert!(validate_stack_name("feature*auth").is_err());
-        assert!(validate_stack_name("feature?auth").is_err());
-        assert!(validate_stack_name("feature\"auth").is_err());
-        assert!(validate_stack_name("feature<auth").is_err());
-        assert!(validate_stack_name("feature>auth").is_err());
-        assert!(validate_stack_name("feature|auth").is_err());
-        assert!(validate_stack_name("feature auth").is_err());
+        assert!(validate_view_name("feature/auth").is_err());
+        assert!(validate_view_name("feature\\auth").is_err());
+        assert!(validate_view_name("feature:auth").is_err());
+        assert!(validate_view_name("feature*auth").is_err());
+        assert!(validate_view_name("feature?auth").is_err());
+        assert!(validate_view_name("feature\"auth").is_err());
+        assert!(validate_view_name("feature<auth").is_err());
+        assert!(validate_view_name("feature>auth").is_err());
+        assert!(validate_view_name("feature|auth").is_err());
+        assert!(validate_view_name("feature auth").is_err());
     }
 
     #[test]
     fn test_reserved_names() {
-        assert!(validate_stack_name(".").is_err());
-        assert!(validate_stack_name("..").is_err());
+        assert!(validate_view_name(".").is_err());
+        assert!(validate_view_name("..").is_err());
     }
 
     #[test]
     fn test_dot_restrictions() {
-        assert!(validate_stack_name(".hidden").is_err());
-        assert!(validate_stack_name("trailing.").is_err());
+        assert!(validate_view_name(".hidden").is_err());
+        assert!(validate_view_name("trailing.").is_err());
         // Dots in the middle are allowed
-        assert!(validate_stack_name("feature.auth").is_ok());
-        assert!(validate_stack_name("v1.0.0").is_ok());
+        assert!(validate_view_name("feature.auth").is_ok());
+        assert!(validate_view_name("v1.0.0").is_ok());
     }
 
     // -------------------------------------------------------------------------
@@ -530,8 +530,8 @@ mod tests {
 
     #[test]
     fn test_new_with_empty() {
-        let cmd = New::with_name("orphan-stack").with_empty(true);
-        assert_eq!(cmd.name, Some("orphan-stack".to_string()));
+        let cmd = New::with_name("orphan-view").with_empty(true);
+        assert_eq!(cmd.name, Some("orphan-view".to_string()));
         assert!(cmd.empty);
         assert!(!cmd.switch);
     }
@@ -587,7 +587,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_run_creates_stack_forked_from_current() {
+    fn test_run_creates_view_forked_from_current() {
         use tempfile::tempdir;
 
         let _guard = DirGuard::new();
@@ -599,28 +599,28 @@ mod tests {
             let _repo = Repository::init(repo_path).unwrap();
         }
 
-        // Change to the repo directory and create a stack
+        // Change to the repo directory and create a view
         std::env::set_current_dir(repo_path).unwrap();
 
-        // Create a stack without --from (should default to forking from current stack)
+        // Create a view without --from (should default to forking from current view)
         let cmd = New::with_name("feature-test");
         let result = cmd.run();
         assert!(result.is_ok());
 
-        // Verify the stack exists and was forked from dev (the default stack)
+        // Verify the view exists and was forked from dev (the default view)
         let repo = Repository::open(repo_path).unwrap();
-        assert!(repo.stack_exists("feature-test").unwrap());
+        assert!(repo.view_exists("feature-test").unwrap());
 
-        // Both stacks should have the same state (since dev is empty, feature-test
+        // Both views should have the same state (since dev is empty, feature-test
         // should also be empty but forked from dev's changelog)
-        let dev_info = repo.get_stack_info("dev").unwrap();
-        let feature_info = repo.get_stack_info("feature-test").unwrap();
+        let dev_info = repo.get_view_info("dev").unwrap();
+        let feature_info = repo.get_view_info("feature-test").unwrap();
         assert_eq!(dev_info.change_count, feature_info.change_count);
     }
 
     #[test]
     #[serial]
-    fn test_run_creates_empty_stack_with_flag() {
+    fn test_run_creates_empty_view_with_flag() {
         use tempfile::tempdir;
 
         let _guard = DirGuard::new();
@@ -634,17 +634,17 @@ mod tests {
 
         std::env::set_current_dir(repo_path).unwrap();
 
-        // Create an empty (orphan) stack with --empty flag
-        let cmd = New::with_name("orphan-stack").with_empty(true);
+        // Create an empty (orphan) view with --empty flag
+        let cmd = New::with_name("orphan-view").with_empty(true);
         let result = cmd.run();
         assert!(result.is_ok());
 
-        // Verify the stack exists
+        // Verify the view exists
         let repo = Repository::open(repo_path).unwrap();
-        assert!(repo.stack_exists("orphan-stack").unwrap());
+        assert!(repo.view_exists("orphan-view").unwrap());
 
-        // The orphan stack should have 0 changes (truly empty, not forked)
-        let orphan_info = repo.get_stack_info("orphan-stack").unwrap();
+        // The orphan view should have 0 changes (truly empty, not forked)
+        let orphan_info = repo.get_view_info("orphan-view").unwrap();
         assert_eq!(orphan_info.change_count, 0);
     }
 
@@ -669,14 +669,14 @@ mod tests {
         let result = cmd.run();
         assert!(result.is_ok());
 
-        // Verify we switched to the new stack
+        // Verify we switched to the new view
         let repo = Repository::open(repo_path).unwrap();
-        assert_eq!(repo.current_stack(), "feature-switch");
+        assert_eq!(repo.current_view(), "feature-switch");
     }
 
     #[test]
     #[serial]
-    fn test_run_duplicate_stack() {
+    fn test_run_duplicate_view() {
         use tempfile::tempdir;
 
         let _guard = DirGuard::new();
@@ -691,7 +691,7 @@ mod tests {
         // Change to the repo directory
         std::env::set_current_dir(repo_path).unwrap();
 
-        // Create the stack first time
+        // Create the view first time
         let cmd = New::with_name("duplicate");
         assert!(cmd.run().is_ok());
 
@@ -700,10 +700,10 @@ mod tests {
         let result = cmd.run();
         assert!(result.is_err());
         match result.unwrap_err() {
-            CliError::StackAlreadyExists { name } => {
+            CliError::ViewAlreadyExists { name } => {
                 assert_eq!(name, "duplicate");
             }
-            other => panic!("Expected StackAlreadyExists, got: {:?}", other),
+            other => panic!("Expected ViewAlreadyExists, got: {:?}", other),
         }
     }
 
@@ -716,27 +716,27 @@ mod tests {
         let temp = tempdir().unwrap();
         let repo_path = temp.path();
 
-        // Initialize a repository and create a source stack
+        // Initialize a repository and create a source view
         {
             let mut repo = Repository::init(repo_path).unwrap();
-            repo.create_stack("source-stack").unwrap();
+            repo.create_view("source-view").unwrap();
         }
 
         std::env::set_current_dir(repo_path).unwrap();
 
-        // Create a stack explicitly forked from source-stack
-        let cmd = New::with_name("forked-stack").with_from("source-stack");
+        // Create a view explicitly forked from source-view
+        let cmd = New::with_name("forked-view").with_from("source-view");
         let result = cmd.run();
         assert!(result.is_ok());
 
-        // Verify the stack exists
+        // Verify the view exists
         let repo = Repository::open(repo_path).unwrap();
-        assert!(repo.stack_exists("forked-stack").unwrap());
+        assert!(repo.view_exists("forked-view").unwrap());
     }
 
     #[test]
     #[serial]
-    fn test_run_from_nonexistent_stack_fails() {
+    fn test_run_from_nonexistent_view_fails() {
         use tempfile::tempdir;
 
         let _guard = DirGuard::new();
@@ -749,15 +749,15 @@ mod tests {
 
         std::env::set_current_dir(repo_path).unwrap();
 
-        // Try to create a stack from a nonexistent source
-        let cmd = New::with_name("new-stack").with_from("nonexistent");
+        // Try to create a view from a nonexistent source
+        let cmd = New::with_name("new-view").with_from("nonexistent");
         let result = cmd.run();
         assert!(result.is_err());
         match result.unwrap_err() {
-            CliError::StackNotFound { name } => {
+            CliError::ViewNotFound { name } => {
                 assert_eq!(name, "nonexistent");
             }
-            other => panic!("Expected StackNotFound, got: {:?}", other),
+            other => panic!("Expected ViewNotFound, got: {:?}", other),
         }
     }
 }

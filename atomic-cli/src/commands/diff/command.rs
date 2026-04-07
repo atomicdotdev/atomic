@@ -1300,12 +1300,12 @@ impl Command for Diff {
             match file_status {
                 FileStatus::Deleted => {
                     // For deleted files, retrieve the old content from the graph
-                    let old_content =
-                        match repo.get_file_content_via_overlay(path, repo.current_stack()) {
-                            Ok(Some(content)) => content,
-                            Ok(None) => Vec::new(),
-                            Err(_) => Vec::new(),
-                        };
+                    let old_content = match repo.get_file_content_on_view(path, repo.current_view())
+                    {
+                        Ok(Some(content)) => content,
+                        Ok(None) => Vec::new(),
+                        Err(_) => Vec::new(),
+                    };
 
                     let mut diff = FileDiff::deleted(&path_str);
 
@@ -1404,12 +1404,12 @@ impl Command for Diff {
                     // Retrieve the old (recorded) content from the graph.
                     // Use get_file_content_via_overlay so local workspaces see
                     // their parent chain's content via the overlay model.
-                    let old_content =
-                        match repo.get_file_content_via_overlay(path, repo.current_stack()) {
-                            Ok(Some(content)) => content,
-                            Ok(None) => Vec::new(), // No recorded content (newly tracked)
-                            Err(_) => Vec::new(),   // Error retrieving - treat as new
-                        };
+                    let old_content = match repo.get_file_content_on_view(path, repo.current_view())
+                    {
+                        Ok(Some(content)) => content,
+                        Ok(None) => Vec::new(), // No recorded content (newly tracked)
+                        Err(_) => Vec::new(),   // Error retrieving - treat as new
+                    };
 
                     // Compute diff between old (recorded) and new (working copy)
                     let diff_result = diff_text(&old_content, &new_content, algorithm);

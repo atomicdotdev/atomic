@@ -16,7 +16,7 @@
 //!     ▼
 //! TurnOrchestrator::dispatch(event)
 //!     │
-//!     ├─ SessionStart → create/resume session, create stack
+//!     ├─ SessionStart → create/resume session, create view
 //!     ├─ TurnStart    → watcher.begin_turn(), transition to Active
 //!     ├─ TurnEnd      → watcher.end_turn(), transition to Idle, record_turn()
 //!     ├─ SessionEnd   → transition to Ended, save session
@@ -289,8 +289,8 @@ impl TurnOrchestrator {
     /// Handle a SessionStart event.
     ///
     /// Creates a new session or re-enters an ended session. Creates the
-    /// agent's Atomic stack if needed (stack creation is deferred to first
-    /// recording since we don't want to create stacks for sessions that
+    /// agent's Atomic view if needed (view creation is deferred to first
+    /// recording since we don't want to create views for sessions that
     /// never produce changes).
     async fn handle_session_start(&mut self, event: TurnEvent) -> AgentResult<DispatchResult> {
         let session_id = &event.session_id;
@@ -366,62 +366,62 @@ impl TurnOrchestrator {
             }
         }
 
-        // Fork the agent stack from the current stack.
+        // Fork the agent view from the current view.
         //
         // This ensures the agent inherits all existing changes (e.g.,
         // .atomicignore, project config, previously recorded code) instead
         // of starting from an empty graph. Without this, files that only
-        // exist in the current stack (like .atomicignore) would be invisible
+        // exist in the current view (like .atomicignore) would be invisible
         // to the agent's status/record workflow.
         //
-        // Best-effort: if the repo can't be opened or the stack already
+        // Best-effort: if the repo can't be opened or the view already
         // exists (resumed session), we log and continue — recording will
         // still work, it just won't have the parent's history.
-        if session.parent_stack.is_none() {
+        if session.parent_view.is_none() {
             match atomic_repository::Repository::open(&self.repo_root) {
                 Ok(mut repo) => {
-                    let current = repo.current_stack().to_string();
-                    session.set_parent_stack(&current);
+                    let current = repo.current_view().to_string();
+                    session.set_parent_view(&current);
 
-                    match repo.create_stack_from(&session.stack_name, &current) {
+                    match repo.create_view_from(&session.view_name, &current) {
                         Ok(()) => {
                             log::info!(
-                                "Created agent stack '{}' forked from '{}'",
-                                session.stack_name,
+                                "Created agent view '{}' forked from '{}'",
+                                session.view_name,
                                 current,
                             );
                         }
                         Err(e) => {
-                            // Stack may already exist (idempotent session start)
-                            // or the source stack may not exist yet (fresh repo).
+                            // View may already exist (idempotent session start)
+                            // or the source view may not exist yet (fresh repo).
                             // Either way, this is non-fatal.
                             log::debug!(
-                                "Could not fork stack '{}' from '{}': {} (non-fatal)",
-                                session.stack_name,
+                                "Could not fork view '{}' from '{}': {} (non-fatal)",
+                                session.view_name,
                                 current,
                                 e,
                             );
                         }
                     }
 
-                    // Switch to the agent stack so that all file writes during
+                    // Switch to the agent view so that all file writes during
                     // the session (tool calls, npm install, builds, etc.) happen
-                    // while current_stack points to the agent stack. This ensures
+                    // while current_view points to the agent view. This ensures
                     // status/add/record see the right view. session-end will
-                    // switch back to the user's stack.
-                    if let Err(e) = repo.set_current_stack(&session.stack_name) {
+                    // switch back to the user's view.
+                    if let Err(e) = repo.set_current_view(&session.view_name) {
                         log::warn!(
-                            "Could not switch to agent stack '{}': {} (non-fatal)",
-                            session.stack_name,
+                            "Could not switch to agent view '{}': {} (non-fatal)",
+                            session.view_name,
                             e,
                         );
                     } else {
-                        log::info!("Switched to agent stack '{}'", session.stack_name,);
+                        log::info!("Switched to agent view '{}'", session.view_name,);
                     }
                 }
                 Err(e) => {
                     log::warn!(
-                        "Could not open repository to fork agent stack: {} (non-fatal)",
+                        "Could not open repository to fork agent view: {} (non-fatal)",
                         e,
                     );
                 }
@@ -432,8 +432,8 @@ impl TurnOrchestrator {
         self.session_store.save(&session)?;
 
         let message = format!(
-            "Atomic is tracking this session. Each turn will be recorded as a change on stack '{}'.",
-            session.stack_name,
+            "Atomic is tracking this session. Each turn will be recorded as a change on view '{}'.",
+            session.view_name,
         );
 
         Ok(DispatchResult::new(session_id, session.phase).with_message(message))
@@ -755,25 +755,25 @@ impl TurnOrchestrator {
             self.create_session_attestation(&session);
         }
 
-        // Switch back to the user's original stack. session-start switched
-        // to the agent stack so that all file writes happened there. Now
+        // Switch back to the user's original view. session-start switched
+        // to the agent view so that all file writes happened there. Now
         // that the session is over, restore the user's view.
-        if let Some(ref parent) = session.parent_stack {
+        if let Some(ref parent) = session.parent_view {
             match atomic_repository::Repository::open(&self.repo_root) {
                 Ok(mut repo) => {
-                    if let Err(e) = repo.switch_stack(parent) {
+                    if let Err(e) = repo.switch_view(parent) {
                         log::warn!(
-                            "Could not switch back to user stack '{}': {} (non-fatal)",
+                            "Could not switch back to user view '{}': {} (non-fatal)",
                             parent,
                             e,
                         );
                     } else {
-                        log::info!("Restored user stack '{}'", parent);
+                        log::info!("Restored user view '{}'", parent);
                     }
                 }
                 Err(e) => {
                     log::warn!(
-                        "Could not open repository to restore user stack: {} (non-fatal)",
+                        "Could not open repository to restore user view: {} (non-fatal)",
                         e,
                     );
                 }
@@ -1261,9 +1261,9 @@ impl TurnOrchestrator {
     // Attestation
     // =========================================================================
 
-    /// Create an attestation covering changes in a session's agent stack.
+    /// Create an attestation covering changes in a session's agent view.
     ///
-    /// On a fresh session, this covers all changes in the stack. On a
+    /// On a fresh session, this covers all changes in the view. On a
     /// resumed session (`claude --resume`), this only covers the NEW
     /// changes that aren't already covered by a previous attestation,
     /// and chains to that attestation via `previous_attestation`.
@@ -1273,7 +1273,7 @@ impl TurnOrchestrator {
     /// and line-level code change statistics. This data was recorded by
     /// `build_turn_provenance()` at `record_turn()` time.
     ///
-    /// Best-effort: if anything fails (repo can't open, stack doesn't exist,
+    /// Best-effort: if anything fails (repo can't open, view doesn't exist,
     /// no changes recorded), we log and continue — the session still ended
     /// successfully.
     fn create_session_attestation(&self, session: &AgentSession) {
@@ -1296,15 +1296,15 @@ impl TurnOrchestrator {
             }
         };
 
-        // Query the agent stack for all change hashes
+        // Query the agent view for all change hashes
         let history = match repo
-            .log(atomic_repository::history::HistoryOptions::default().stack(&session.stack_name))
+            .log(atomic_repository::history::HistoryOptions::default().view(&session.view_name))
         {
             Ok(h) => h,
             Err(e) => {
                 log::debug!(
-                    "Could not read history for stack '{}': {} (no attestation created)",
-                    session.stack_name,
+                    "Could not read history for view '{}': {} (no attestation created)",
+                    session.view_name,
                     e,
                 );
                 return;
@@ -1313,8 +1313,8 @@ impl TurnOrchestrator {
 
         if history.is_empty() {
             log::debug!(
-                "Stack '{}' has no changes — skipping attestation",
-                session.stack_name,
+                "View '{}' has no changes — skipping attestation",
+                session.view_name,
             );
             return;
         }

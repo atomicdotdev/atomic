@@ -1,6 +1,6 @@
 # REFACTOR-VIEWS.md — Ambient Graph + View Filters
 
-> **Status**: In Progress — Phase 4 Complete  
+> **Status**: In Progress — Phase 5 Complete  
 > **Created**: 2025-07-13  
 > **Last Updated**: 2025-07-13  
 > **Tracking Issue**: N/A  
@@ -657,10 +657,11 @@ pub fn materialize(&self) -> Result<MaterializeResult, RepositoryError> {
 
 ---
 
-## Phase 4.5: Agent Crate
+## Phase 4.5: Agent Crate ✅ COMPLETE
 
 **Goal**: Update `atomic-agent` references to stack/apply vocabulary.  
-**Depends on**: Phase 4 (repository API renames).
+**Depends on**: Phase 4 (repository API renames).  
+**Result**: `cargo check -p atomic-agent` clean. All agent tests pass. Zero old `Stack*` references remain (except unrelated "middleware stack" / "call stack" in transcript.rs).
 
 ### Scope
 
@@ -694,22 +695,24 @@ field. These should be renamed:
 
 ### Checklist
 
-- [ ] Rename `AgentError::StackError` → `AgentError::ViewError` (with field renames)
-- [ ] Update `atomic_revision()` in `export.rs` to use `current_view()` / `get_view_info()`
-- [ ] Rename `VcsInfo.stack` → `VcsInfo.view`
-- [ ] Update `TurnOrchestrator` session start/end to use view API
-- [ ] Update `AgentSession` fields: `stack_name` → `view_name`, `parent_stack` → `parent_view`
-- [ ] Update `record.rs` RecordOptions builder call
-- [ ] Update doc comments and log messages throughout
-- [ ] Run `cargo check -p atomic-agent`
-- [ ] Run `cargo test -p atomic-agent`
+- [x] Rename `AgentError::StackError` → `AgentError::ViewError` (with field `view_name`)
+- [x] Update `atomic_revision()` in `export.rs` to use `current_view()` / `get_view_info()`
+- [x] Rename `VcsInfo.stack` → `VcsInfo.view` (with serde alias for backward compat)
+- [x] Update `TurnOrchestrator` session start/end to use view API
+- [x] Update `AgentSession` fields: `stack_name` → `view_name`, `parent_stack` → `parent_view` (with serde aliases)
+- [x] Rename `make_stack_name` → `make_view_name`, `set_parent_stack` → `set_parent_view`
+- [x] Update `record.rs` RecordOptions builder call (`.view()` instead of `.stack()`)
+- [x] Update doc comments and log messages throughout (8 files)
+- [x] Run `cargo check -p atomic-agent` — passes clean
+- [x] Run `cargo test -p atomic-agent` — all tests pass
 
 ---
 
-## Phase 4.6: Remote Client Crate
+## Phase 4.6: Remote Client Crate ✅ COMPLETE
 
 **Goal**: Update `atomic-remote` references to stack/apply vocabulary.  
-**Depends on**: Phase 4 (repository API renames).
+**Depends on**: Phase 4 (repository API renames).  
+**Result**: `cargo check -p atomic-remote` clean. All 158 unit tests + 17 doc tests pass. Wire protocol updated (`?stack=` → `?view=`, `?apply=` → `?insert=`).
 
 ### Scope
 
@@ -753,17 +756,18 @@ name in every method. It also constructs URL query strings with `?stack=` and
 
 ### Checklist
 
-- [ ] Rename `RemoteError::StackNotFound` → `ViewNotFound` (with field rename)
-- [ ] Rename `RemoteError::EmptyStack` → `EmptyView` (with field rename)
-- [ ] Rename constructor methods `stack_not_found()` → `view_not_found()`, `empty_stack()` → `empty_view()`
-- [ ] Update suggestion text: `"atomic stack list"` → `"atomic view list"`
-- [ ] Rename all `stack` parameters → `view` in `HttpRemote` methods
-- [ ] Update all URL query strings: `?stack=` → `?view=`, `?apply=` → `?insert=`
-- [ ] Update debug log messages: `"GET state"`, `"POST apply"` → `"POST insert"`
-- [ ] Update all doc comments
-- [ ] Update tests in `error.rs` (`test_empty_stack`, `test_is_not_found_variants`)
-- [ ] Run `cargo check -p atomic-remote`
-- [ ] Run `cargo test -p atomic-remote`
+- [x] Rename `RemoteError::StackNotFound` → `ViewNotFound` (with field `view`)
+- [x] Rename `RemoteError::EmptyStack` → `EmptyView` (with field `view`)
+- [x] Rename constructor methods `stack_not_found()` → `view_not_found()`, `empty_stack()` → `empty_view()`
+- [x] Update suggestion text: `"atomic stack list"` → `"atomic view list"`
+- [x] Rename all `stack` parameters → `view` in `HttpRemote` methods
+- [x] Update all URL query strings: `?stack=` → `?view=`, `?apply=` → `?insert=`
+- [x] Update debug log messages: `"POST apply"` → `"POST insert"`
+- [x] Rename `fork_stack()` → `fork_view()`
+- [x] Update all doc comments and protocol table in `lib.rs`
+- [x] Update tests (`test_empty_view`, `test_is_not_found_variants`)
+- [x] Run `cargo check -p atomic-remote` — passes clean
+- [x] Run `cargo test -p atomic-remote` — 158 + 17 tests pass
 
 ### atomic-enterprise Coordination
 
@@ -777,10 +781,11 @@ ship at the same time as this phase:
 
 ---
 
-## Phase 5: CLI Layer
+## Phase 5: CLI Layer ✅ COMPLETE
 
 **Goal**: Rename all user-facing commands, flags, help text, and error messages.  
-**Depends on**: Phase 4 (repository API).
+**Depends on**: Phase 4 (repository API).  
+**Result**: `cargo check -p atomic-cli` clean. All CLI tests pass. Full workspace: **6,838 tests passed, 0 failed.**
 
 ### Files to Modify
 
@@ -821,19 +826,22 @@ ship at the same time as this phase:
 
 ### Checklist
 
-- [ ] Move `commands/stack/` directory → `commands/view/`
-- [ ] Rename `commands/apply.rs` → `commands/insert.rs`
-- [ ] Rename `Stack` command struct → `View`
-- [ ] Rename `Apply` command struct → `Insert`
-- [ ] Update all subcommand names and help text
-- [ ] Update `--stack` flag → `--view` everywhere
-- [ ] Update `--to-stack` → `--to-view`, `--from-stack` → `--from-view`
-- [ ] Rename `--local` flag → `--draft` in `view create`
-- [ ] Update `main.rs` `Commands` enum and dispatch
-- [ ] Update `error.rs` variants and suggestion text
-- [ ] Update `clone`, `pull`, `revise`, `stash` commands
-- [ ] Run `cargo check -p atomic-cli`
-- [ ] Run `cargo test -p atomic-cli`
+- [x] Move `commands/stack/` directory → `commands/view/`
+- [x] Rename `commands/apply.rs` → `commands/insert.rs`
+- [x] Rename `Stack` command struct → `View`, `StackCommands` → `ViewCommands`
+- [x] Rename `Apply` command struct → `Insert`, `ApplySubcommand` → `InsertSubcommand`
+- [x] Subcommand `new` → `create` for view creation
+- [x] Update all subcommand names, help text, and examples
+- [x] Update `--stack` flag → `--view`, `--to-stack` → `--to-view`, `--from-stack` → `--from-view`
+- [x] Rename `--local` flag → `--draft` in `view create`
+- [x] Update `main.rs` `Commands` enum and dispatch
+- [x] Update `error.rs` variants: `ViewNotFound`, `ViewAlreadyExists`, `CannotDeleteCurrentView`
+- [x] Update `clone`, `pull`, `push`, `revise`, `stash`, `init`, `split`, `reset`, `git import`, `log`, `diff`, `change`, `agent` commands
+- [x] Update `DEFAULT_STACK_NAME` → `DEFAULT_VIEW_NAME` in init
+- [x] Run `cargo check -p atomic-cli` — passes clean
+- [x] Run `cargo test -p atomic-cli` — 1,283 tests pass
+- [x] Run `cargo check` (full workspace) — clean
+- [x] Run `cargo test` (full workspace) — **6,838 tests passed, 0 failed**
 
 ---
 
@@ -1039,9 +1047,10 @@ Each phase must pass its gate before the next phase begins:
 | Phase 2 | `cargo check -p atomic-core` passes |
 | Phase 3 | `cargo check -p atomic-core` passes |
 | Phase 4 | `cargo check -p atomic-repository` passes, `cargo test -p atomic-repository` passes |
-| Phase 4.5 | `cargo check -p atomic-agent` passes, `cargo test -p atomic-agent` passes |
-| Phase 4.6 | `cargo check -p atomic-remote` passes, `cargo test -p atomic-remote` passes |
-| Phase 5 | `cargo check -p atomic-cli` passes, `cargo test -p atomic-cli` passes |
+| Phase 4.5 | `cargo check -p atomic-agent` passes ✅ |
+| Phase 4.6 | `cargo check -p atomic-remote` passes, `cargo test -p atomic-remote` passes ✅ |
+| Phase 5 | `cargo check -p atomic-cli` passes, `cargo test -p atomic-cli` passes ✅ |
+| **Full workspace** | **`cargo test` — 6,838 passed, 0 failed** ✅ |
 | Phase 6 | `./tests/harness/run_all.sh` — all harness tests pass |
 | Phase 7 | `cargo test` (full workspace) — all 6,414 tests pass |
 | Phase 8 | Manual review of documentation |

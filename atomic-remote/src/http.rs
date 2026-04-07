@@ -11,7 +11,7 @@
 //! async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //!     let remote = HttpRemote::new("https://api.example.com/tenant/t/portfolio/p/project/pr/code")?;
 //!
-//!     // Get the current state of the "main" stack
+//!     // Get the current state of the "main" view
 //!     let state = remote.get_state("main").await?;
 //!     println!("Current state: {:?}", state);
 //!
@@ -236,16 +236,16 @@ impl HttpRemote {
         self.name.as_deref()
     }
 
-    /// Get the current state of a stack.
+    /// Get the current state of a view.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The name of the stack to query.
+    /// * `view` - The name of the view to query.
     ///
     /// # Returns
     ///
-    /// The current state of the stack, or `StateResponse::Empty` if the
-    /// stack is empty.
+    /// The current state of the view, or `StateResponse::Empty` if the
+    /// view is empty.
     ///
     /// # Example
     ///
@@ -257,15 +257,15 @@ impl HttpRemote {
     ///     let state = remote.get_state("main").await?;
     ///
     ///     if let Some(pos) = state.position() {
-    ///         println!("Stack at position {}", pos);
+    ///         println!("View at position {}", pos);
     ///     } else {
-    ///         println!("Stack is empty");
+    ///         println!("View is empty");
     ///     }
     ///     Ok(())
     /// }
     /// ```
-    pub async fn get_state(&self, stack: &str) -> RemoteResult<StateResponse> {
-        let url = format!("{}?stack={}&state=", self.base_url, stack);
+    pub async fn get_state(&self, view: &str) -> RemoteResult<StateResponse> {
+        let url = format!("{}?view={}&state=", self.base_url, view);
         debug!("GET state: {}", url);
 
         let response = self
@@ -291,7 +291,7 @@ impl HttpRemote {
                     RemoteError::protocol(format!("Failed to parse state response: {}", e))
                 })
             }
-            StatusCode::NOT_FOUND => Err(RemoteError::stack_not_found(stack)),
+            StatusCode::NOT_FOUND => Err(RemoteError::view_not_found(view)),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 let msg = response.text().await.unwrap_or_default();
                 Err(RemoteError::auth_failed(&url, msg))
@@ -303,11 +303,11 @@ impl HttpRemote {
         }
     }
 
-    /// Get the changelist for a stack starting from a position.
+    /// Get the changelist for a view starting from a position.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The name of the stack to query.
+    /// * `view` - The name of the view to query.
     /// * `from` - The starting position (sequence number).
     ///
     /// # Returns
@@ -334,10 +334,10 @@ impl HttpRemote {
     /// ```
     pub async fn get_changelist(
         &self,
-        stack: &str,
+        view: &str,
         from: u64,
     ) -> RemoteResult<Vec<ChangelistEntry>> {
-        let url = format!("{}?stack={}&changelist={}", self.base_url, stack, from);
+        let url = format!("{}?view={}&changelist={}", self.base_url, view, from);
         debug!("GET changelist: {}", url);
 
         let response = self
@@ -361,7 +361,7 @@ impl HttpRemote {
 
                 parse_changelist(&text)
             }
-            StatusCode::NOT_FOUND => Err(RemoteError::stack_not_found(stack)),
+            StatusCode::NOT_FOUND => Err(RemoteError::view_not_found(view)),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 let msg = response.text().await.unwrap_or_default();
                 Err(RemoteError::auth_failed(&url, msg))
@@ -373,17 +373,17 @@ impl HttpRemote {
         }
     }
 
-    /// Get the stack ID (UUID).
+    /// Get the view ID (UUID).
     ///
     /// # Arguments
     ///
-    /// * `stack` - The name of the stack to query.
+    /// * `view` - The name of the view to query.
     ///
     /// # Returns
     ///
-    /// The stack's UUID as a string.
-    pub async fn get_id(&self, stack: &str) -> RemoteResult<String> {
-        let url = format!("{}?stack={}&id", self.base_url, stack);
+    /// The view's UUID as a string.
+    pub async fn get_id(&self, view: &str) -> RemoteResult<String> {
+        let url = format!("{}?view={}&id", self.base_url, view);
         debug!("GET id: {}", url);
 
         let response = self
@@ -404,7 +404,7 @@ impl HttpRemote {
 
                 Ok(text.trim().to_string())
             }
-            StatusCode::NOT_FOUND => Err(RemoteError::stack_not_found(stack)),
+            StatusCode::NOT_FOUND => Err(RemoteError::view_not_found(view)),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 let msg = response.text().await.unwrap_or_default();
                 Err(RemoteError::auth_failed(&url, msg))
@@ -529,11 +529,11 @@ impl HttpRemote {
     /// # Arguments
     ///
     /// * `hash` - The base32-encoded hash of the change.
-    /// * `stack` - The target stack name.
+    /// * `view` - The target view name.
     /// * `data` - The raw change file data.
-    pub async fn upload_change(&self, hash: &str, stack: &str, data: Bytes) -> RemoteResult<()> {
-        let url = format!("{}?apply={}&stack={}", self.base_url, hash, stack);
-        debug!("POST apply: {} ({} bytes)", url, data.len());
+    pub async fn upload_change(&self, hash: &str, view: &str, data: Bytes) -> RemoteResult<()> {
+        let url = format!("{}?insert={}&view={}", self.base_url, hash, view);
+        debug!("POST insert: {} ({} bytes)", url, data.len());
 
         let response = self
             .client
@@ -578,15 +578,10 @@ impl HttpRemote {
     /// # Arguments
     ///
     /// * `state` - The base32-encoded state merkle.
-    /// * `stack` - The target stack name.
+    /// * `view` - The target view name.
     /// * `short_data` - The short tag data.
-    pub async fn upload_tag(
-        &self,
-        state: &str,
-        stack: &str,
-        short_data: Bytes,
-    ) -> RemoteResult<()> {
-        let url = format!("{}?tagup={}&stack={}", self.base_url, state, stack);
+    pub async fn upload_tag(&self, state: &str, view: &str, short_data: Bytes) -> RemoteResult<()> {
+        let url = format!("{}?tagup={}&view={}", self.base_url, state, view);
         debug!("POST tagup: {} ({} bytes)", url, short_data.len());
 
         let response = self
@@ -605,7 +600,7 @@ impl HttpRemote {
                 debug!("Successfully uploaded tag for state {}", state);
                 Ok(())
             }
-            StatusCode::NOT_FOUND => Err(RemoteError::stack_not_found(stack)),
+            StatusCode::NOT_FOUND => Err(RemoteError::view_not_found(view)),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 let msg = response.text().await.unwrap_or_default();
                 Err(RemoteError::auth_failed(&url, msg))
@@ -626,25 +621,25 @@ impl HttpRemote {
         }
     }
 
-    /// Fork a stack on the remote server.
+    /// Fork a view on the remote server.
     ///
-    /// Creates a new stack as a view of an existing one. This is a
+    /// Creates a new view from an existing one. This is a
     /// lightweight server-side operation — no data is duplicated. The
-    /// new stack's changelog is copied from the source stack in a single
+    /// new view's changelog is copied from the source view in a single
     /// transaction.
     ///
     /// # Arguments
     ///
-    /// * `target_stack` - The name of the new stack to create.
-    /// * `source_stack` - The name of the existing stack to fork from.
+    /// * `target_view` - The name of the new view to create.
+    /// * `source_view` - The name of the existing view to fork from.
     ///
     /// # Returns
     ///
-    /// The number of changes adopted into the new stack view.
-    pub async fn fork_stack(&self, target_stack: &str, source_stack: &str) -> RemoteResult<u64> {
+    /// The number of changes adopted into the new view.
+    pub async fn fork_view(&self, target_view: &str, source_view: &str) -> RemoteResult<u64> {
         let url = format!(
-            "{}?fork_from={}&stack={}",
-            self.base_url, source_stack, target_stack
+            "{}?fork_from={}&view={}",
+            self.base_url, source_view, target_view
         );
         debug!("POST fork: {}", url);
 
@@ -671,8 +666,8 @@ impl HttpRemote {
                 let changes = parsed.get("changes").and_then(|v| v.as_u64()).unwrap_or(0);
 
                 debug!(
-                    "Forked stack '{}' from '{}' ({} changes)",
-                    target_stack, source_stack, changes
+                    "Forked view '{}' from '{}' ({} changes)",
+                    target_view, source_view, changes
                 );
 
                 Ok(changes)
@@ -681,7 +676,7 @@ impl HttpRemote {
                 let msg = response.text().await.unwrap_or_default();
                 Err(RemoteError::protocol(msg))
             }
-            StatusCode::NOT_FOUND => Err(RemoteError::stack_not_found(source_stack)),
+            StatusCode::NOT_FOUND => Err(RemoteError::view_not_found(source_view)),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 let msg = response.text().await.unwrap_or_default();
                 Err(RemoteError::auth_failed(&url, msg))
@@ -899,7 +894,7 @@ impl HttpRemote {
     /// # Arguments
     ///
     /// * `hash` - The base32-encoded hash of the change.
-    /// * `stack` - The target stack name.
+    /// * `view` - The target view name.
     /// * `path` - Path to the `.change` file on disk.
     ///
     /// # Errors
@@ -909,11 +904,11 @@ impl HttpRemote {
     pub async fn upload_change_file(
         &self,
         hash: &str,
-        stack: &str,
+        view: &str,
         path: &Path,
     ) -> RemoteResult<()> {
-        let url = format!("{}?apply={}&stack={}", self.base_url, hash, stack);
-        debug!("POST apply (from file): {} from {:?}", url, path);
+        let url = format!("{}?insert={}&view={}", self.base_url, hash, view);
+        debug!("POST insert (from file): {} from {:?}", url, path);
 
         let data = tokio::fs::read(path).await.map_err(|e| {
             RemoteError::other(format!("Failed to read change file {:?}: {}", path, e))
@@ -1250,11 +1245,11 @@ mod tests {
     fn test_upload_change_file_url_format() {
         // Verify the URL format matches the protocol spec
         let url = format!(
-            "{}?apply={}&stack={}",
+            "{}?insert={}&view={}",
             "https://api.example.com/code", "ABCDEF123456", "dev"
         );
-        assert!(url.contains("apply=ABCDEF123456"));
-        assert!(url.contains("stack=dev"));
+        assert!(url.contains("insert=ABCDEF123456"));
+        assert!(url.contains("view=dev"));
     }
 
     #[test]

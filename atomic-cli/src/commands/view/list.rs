@@ -1,12 +1,12 @@
-//! The `stack list` command for listing all stacks.
+//! The `view list` command for listing all views.
 //!
-//! This module implements the `atomic stack list` command, which shows all
-//! stacks in the repository. The current stack is marked with an asterisk (*).
+//! This module implements the `atomic view list` command, which shows all
+//! views in the repository. The current view is marked with an asterisk (*).
 //!
 //! # Usage
 //!
 //! ```text
-//! atomic stack list [OPTIONS]
+//! atomic view list [OPTIONS]
 //!
 //! Options:
 //!   -v, --verbose  Show additional details (state hash, change count)
@@ -15,9 +15,9 @@
 //!
 //! # Examples
 //!
-//! List all stacks:
+//! List all views:
 //! ```text
-//! $ atomic stack list
+//! $ atomic view list
 //!   dev
 //! * feature-auth
 //!   release-1.0
@@ -25,7 +25,7 @@
 //!
 //! List with verbose output:
 //! ```text
-//! $ atomic stack list --verbose
+//! $ atomic view list --verbose
 //!   dev           (0 changes)   state: 2AAAAAAAA...
 //! * feature-auth  (3 changes)   state: XYZABCDEF...
 //!   release-1.0   (10 changes)  state: 123456789...
@@ -44,9 +44,9 @@ use std::path::PathBuf;
 
 // List Command
 
-/// List all stacks.
+/// List all views.
 ///
-/// Shows all stacks in the repository with the current stack marked
+/// Shows all views in the repository with the current view marked
 /// with an asterisk (*).
 #[derive(Parser, Debug, Default)]
 #[command(name = "list")]
@@ -54,7 +54,7 @@ pub struct List {
     /// Show additional details (state hash, change count).
     ///
     /// When enabled, displays the Merkle state hash and number of
-    /// changes for each stack.
+    /// changes for each view.
     #[arg(long, short = 'v')]
     pub verbose: bool,
 }
@@ -83,32 +83,32 @@ impl Command for List {
             other => CliError::Repository(other),
         })?;
 
-        // Get list of stacks
-        let stacks = repo.list_stacks().map_err(CliError::Repository)?;
-        let current = repo.current_stack();
+        // Get list of views
+        let views = repo.list_views().map_err(CliError::Repository)?;
+        let current = repo.current_view();
 
-        if stacks.is_empty() {
+        if views.is_empty() {
             println!(
                 "{}",
-                hint("No stacks found. Use 'atomic stack new <name>' to create one.")
+                hint("No views found. Use 'atomic view create <name>' to create one.")
             );
             return Ok(());
         }
 
-        // Sort stacks alphabetically, but keep current stack considerations
-        let mut sorted_stacks = stacks;
-        sorted_stacks.sort();
+        // Sort views alphabetically, but keep current view considerations
+        let mut sorted_views = views;
+        sorted_views.sort();
 
         // Calculate padding for alignment in verbose mode
-        let max_name_len = sorted_stacks.iter().map(|s| s.len()).max().unwrap_or(0);
+        let max_name_len = sorted_views.iter().map(|s| s.len()).max().unwrap_or(0);
 
-        for stack in sorted_stacks {
-            let is_current = stack == current;
+        for view in sorted_views {
+            let is_current = view == current;
             let marker = if is_current { "*" } else { " " };
 
             if self.verbose {
-                // Get stack info for verbose output
-                match repo.get_stack_info(&stack) {
+                // Get view info for verbose output
+                match repo.get_view_info(&view) {
                     Ok(info) => {
                         let change_word = if info.change_count == 1 {
                             "change"
@@ -116,7 +116,7 @@ impl Command for List {
                             "changes"
                         };
                         let kind_tag = match info.kind_label() {
-                            "local" => "[local]",
+                            "local" => "[draft]",
                             _ => "[shared]",
                         };
                         let parent_info = match &info.parent_name {
@@ -126,7 +126,7 @@ impl Command for List {
                         println!(
                             "{} {:<width$}  {:<10}  ({} {})  state: {}{}",
                             marker,
-                            style_stack(&stack),
+                            style_stack(&view),
                             kind_tag,
                             info.change_count,
                             change_word,
@@ -137,11 +137,11 @@ impl Command for List {
                     }
                     Err(_) => {
                         // Fall back to simple output if we can't get info
-                        println!("{} {}", marker, style_stack(&stack));
+                        println!("{} {}", marker, style_stack(&view));
                     }
                 }
             } else {
-                println!("{} {}", marker, style_stack(&stack));
+                println!("{} {}", marker, style_stack(&view));
             }
         }
 
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_list_default_stack() {
+    fn test_list_default_view() {
         use tempfile::tempdir;
 
         let _guard = DirGuard::new();
@@ -221,7 +221,7 @@ mod tests {
         // Change to the repo directory
         std::env::set_current_dir(repo_path).unwrap();
 
-        // List stacks
+        // List views
         let cmd = List::new();
         let result = cmd.run();
         assert!(result.is_ok());
@@ -229,25 +229,25 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_list_multiple_stacks() {
+    fn test_list_multiple_views() {
         use tempfile::tempdir;
 
         let _guard = DirGuard::new();
         let temp = tempdir().unwrap();
         let repo_path = temp.path();
 
-        // Initialize a repository and create some stacks, then drop to release lock
+        // Initialize a repository and create some views, then drop to release lock
         {
             let mut repo = Repository::init(repo_path).unwrap();
-            repo.create_stack("feature-a").unwrap();
-            repo.create_stack("feature-b").unwrap();
-            repo.create_stack("release-1.0").unwrap();
+            repo.create_view("feature-a").unwrap();
+            repo.create_view("feature-b").unwrap();
+            repo.create_view("release-1.0").unwrap();
         }
 
         // Change to the repo directory
         std::env::set_current_dir(repo_path).unwrap();
 
-        // List stacks
+        // List views
         let cmd = List::new();
         let result = cmd.run();
         assert!(result.is_ok());
@@ -262,16 +262,16 @@ mod tests {
         let temp = tempdir().unwrap();
         let repo_path = temp.path();
 
-        // Initialize a repository and create a stack, then drop to release lock
+        // Initialize a repository and create a view, then drop to release lock
         {
             let mut repo = Repository::init(repo_path).unwrap();
-            repo.create_stack("feature").unwrap();
+            repo.create_view("feature").unwrap();
         }
 
         // Change to the repo directory
         std::env::set_current_dir(repo_path).unwrap();
 
-        // List stacks with verbose output
+        // List views with verbose output
         let cmd = List::new().with_verbose(true);
         let result = cmd.run();
         assert!(result.is_ok());
@@ -286,18 +286,18 @@ mod tests {
         let temp = tempdir().unwrap();
         let repo_path = temp.path();
 
-        // Initialize a repository and create stacks, then drop to release lock
+        // Initialize a repository and create views, then drop to release lock
         {
             let mut repo = Repository::init(repo_path).unwrap();
-            repo.create_stack("other").unwrap();
-            // Verify current stack is dev
-            assert_eq!(repo.current_stack(), "dev");
+            repo.create_view("other").unwrap();
+            // Verify current view is dev
+            assert_eq!(repo.current_view(), "dev");
         }
 
         // Change to the repo directory
         std::env::set_current_dir(repo_path).unwrap();
 
-        // List stacks - should mark "dev" as current
+        // List views - should mark "dev" as current
         let cmd = List::new();
         let result = cmd.run();
         assert!(result.is_ok());
@@ -312,23 +312,23 @@ mod tests {
         let temp = tempdir().unwrap();
         let repo_path = temp.path();
 
-        // Initialize a repository and create a stack, then drop to release lock
+        // Initialize a repository and create a view, then drop to release lock
         {
             let mut repo = Repository::init(repo_path).unwrap();
-            repo.create_stack("feature").unwrap();
-            repo.set_current_stack("feature").unwrap();
+            repo.create_view("feature").unwrap();
+            repo.set_current_view("feature").unwrap();
         }
 
         // Change to the repo directory
         std::env::set_current_dir(repo_path).unwrap();
 
-        // List stacks - should mark "feature" as current
+        // List views - should mark "feature" as current
         let cmd = List::new();
         let result = cmd.run();
         assert!(result.is_ok());
 
         // Verify we're still on feature
         let repo = Repository::open(repo_path).unwrap();
-        assert_eq!(repo.current_stack(), "feature");
+        assert_eq!(repo.current_view(), "feature");
     }
 }
