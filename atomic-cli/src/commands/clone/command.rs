@@ -16,7 +16,7 @@
 //! 5. **Connect to Remote**: Establish HTTP connection
 //! 6. **Query Remote State**: Get channel state and changelist
 //! 7. **Download Changes**: Fetch all changes in order
-//! 8. **Apply Changes**: Apply to local stack (unless download-only)
+//! 8. **Apply Changes**: Apply to local view (unless download-only)
 //! 9. **Configure Remote**: Save "origin" remote configuration
 //! 10. **Report Results**: Display summary to user
 //!
@@ -38,7 +38,7 @@ use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{
     create_progress_bar, create_spinner, error, finish_error, finish_success, hash as style_hash,
-    hint, print_blank, print_hint, print_success, print_warning, stack as style_stack, success,
+    hint, print_blank, print_hint, print_success, print_warning, success, view as style_view,
 };
 
 use super::helpers::{
@@ -49,10 +49,10 @@ use super::types::{ClonePhase, CloneProgress, CloneStats};
 
 // Constants
 
-/// Default stack to clone when none is specified.
+/// Default view to clone when none is specified.
 ///
 /// This is "dev" to match atomic-api convention.
-pub const DEFAULT_STACK: &str = "dev";
+pub const DEFAULT_VIEW: &str = "dev";
 
 /// Default request timeout in seconds.
 ///
@@ -91,8 +91,8 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// # Clone to specific directory
 /// atomic clone https://example.com/org/project/code my-project
 ///
-/// # Clone specific stack
-/// atomic clone https://example.com/org/project/code --stack dev
+/// # Clone specific view
+/// atomic clone https://example.com/org/project/code --view dev
 ///
 /// # Clone without applying changes
 /// atomic clone https://example.com/org/project/code --download-only
@@ -110,11 +110,11 @@ pub struct Clone {
     /// If not specified, the repository name is inferred from the URL.
     pub path: Option<String>,
 
-    /// Stack to clone.
+    /// View to clone.
     ///
-    /// If not specified, clones the "dev" stack (atomic-api default).
-    #[arg(long, default_value = DEFAULT_STACK)]
-    pub stack: String,
+    /// If not specified, clones the "dev" view (atomic-api default).
+    #[arg(long, default_value = DEFAULT_VIEW)]
+    pub view: String,
 
     /// Skip TLS certificate verification.
     ///
@@ -129,9 +129,9 @@ pub struct Clone {
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
     pub timeout: u64,
 
-    /// Download changes without applying them to the local stack.
+    /// Download changes without applying them to the local view.
     ///
-    /// Changes are saved to the change store but not applied to any stack.
+    /// Changes are saved to the change store but not applied to any view.
     /// Useful for examining changes before applying.
     #[arg(long)]
     pub download_only: bool,
@@ -151,13 +151,13 @@ impl Clone {
     ///
     /// let clone = Clone::new("https://example.com/repo".to_string());
     /// assert_eq!(clone.url, "https://example.com/repo");
-    /// assert_eq!(clone.stack, "dev");
+    /// assert_eq!(clone.view, "dev");
     /// ```
     pub fn new(url: String) -> Self {
         Self {
             url,
             path: None,
-            stack: DEFAULT_STACK.to_string(),
+            view: DEFAULT_VIEW.to_string(),
             insecure: false,
             timeout: DEFAULT_TIMEOUT_SECS,
             download_only: false,
@@ -170,9 +170,9 @@ impl Clone {
         self
     }
 
-    /// Builder: set the stack name.
-    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
-        self.stack = stack.into();
+    /// Builder: set the view name.
+    pub fn with_view(mut self, view: impl Into<String>) -> Self {
+        self.view = view.into();
         self
     }
 
@@ -231,7 +231,7 @@ impl Clone {
         println!(
             "Cloning from {} into {}...",
             hint(&self.url),
-            style_stack(&display_name)
+            style_view(&display_name)
         );
         print_blank();
 
@@ -266,13 +266,13 @@ impl Clone {
 
         // Query remote state
         let spinner = create_spinner("Querying remote state...");
-        let remote_state = remote.get_state(&self.stack).await.map_err(|e| {
+        let remote_state = remote.get_state(&self.view).await.map_err(|e| {
             finish_error(&spinner, "Failed to query state");
             convert_remote_error(e, &self.url)
         })?;
 
         if remote_state.is_empty() {
-            finish_success(&spinner, &format!("Stack '{}' is empty", self.stack));
+            finish_success(&spinner, &format!("View '{}' is empty", self.view));
 
             // Configure remote as "origin" even for empty repositories
             let spinner = create_spinner("Configuring remote...");
@@ -301,8 +301,8 @@ impl Clone {
         finish_success(
             &spinner,
             &format!(
-                "Stack '{}' at {}",
-                self.stack,
+                "View '{}' at {}",
+                self.view,
                 remote_merkle
                     .as_ref()
                     .map(|m| format!("{}...", &m[..12.min(m.len())]))
@@ -312,7 +312,7 @@ impl Clone {
 
         // Get remote changelist
         let spinner = create_spinner("Fetching changelist...");
-        let remote_entries = remote.get_changelist(&self.stack, 0).await.map_err(|e| {
+        let remote_entries = remote.get_changelist(&self.view, 0).await.map_err(|e| {
             finish_error(&spinner, "Failed to fetch changelist");
             convert_remote_error(e, &self.url)
         })?;
@@ -449,7 +449,7 @@ impl Clone {
             return Ok(());
         }
 
-        // Apply downloaded changes to the local stack
+        // Apply downloaded changes to the local view
         if stats.changes_downloaded > 0 {
             print_blank();
             progress.phase = ClonePhase::Applying;
@@ -507,7 +507,7 @@ impl Clone {
                     &format!(
                         "Applied {} to {}",
                         format_count(stats.changes_applied, "change"),
-                        self.stack
+                        self.view
                     ),
                 );
             } else {
@@ -612,7 +612,7 @@ mod tests {
 
         assert_eq!(clone.url, "https://example.com/repo");
         assert!(clone.path.is_none());
-        assert_eq!(clone.stack, DEFAULT_STACK);
+        assert_eq!(clone.view, DEFAULT_VIEW);
         assert!(!clone.insecure);
         assert_eq!(clone.timeout, DEFAULT_TIMEOUT_SECS);
         assert!(!clone.download_only);
@@ -623,7 +623,7 @@ mod tests {
     fn test_clone_default() {
         let clone: Clone = Default::default();
         assert!(clone.url.is_empty());
-        assert_eq!(clone.stack, DEFAULT_STACK);
+        assert_eq!(clone.view, DEFAULT_VIEW);
     }
 
     /// Test with_path builder method.
@@ -633,11 +633,11 @@ mod tests {
         assert_eq!(clone.path, Some("my-project".to_string()));
     }
 
-    /// Test with_stack builder method.
+    /// Test with_view builder method.
     #[test]
-    fn test_clone_with_stack() {
-        let clone = Clone::new("https://example.com/repo".to_string()).with_stack("dev");
-        assert_eq!(clone.stack, "dev");
+    fn test_clone_with_view() {
+        let clone = Clone::new("https://example.com/repo".to_string()).with_view("dev");
+        assert_eq!(clone.view, "dev");
     }
 
     /// Test with_insecure builder method.
@@ -666,14 +666,14 @@ mod tests {
     fn test_clone_builder_chain() {
         let clone = Clone::new("https://example.com/repo".to_string())
             .with_path("my-project")
-            .with_stack("dev")
+            .with_view("dev")
             .with_insecure(true)
             .with_timeout(120)
             .with_download_only(true);
 
         assert_eq!(clone.url, "https://example.com/repo");
         assert_eq!(clone.path, Some("my-project".to_string()));
-        assert_eq!(clone.stack, "dev");
+        assert_eq!(clone.view, "dev");
         assert!(clone.insecure);
         assert_eq!(clone.timeout, 120);
         assert!(clone.download_only);
@@ -755,10 +755,10 @@ mod tests {
 
     // Constant Tests
 
-    /// Test that DEFAULT_STACK is "dev" (atomic-api convention).
+    /// Test that DEFAULT_VIEW is "dev" (atomic-api convention).
     #[test]
-    fn test_default_stack() {
-        assert_eq!(DEFAULT_STACK, "dev");
+    fn test_default_view() {
+        assert_eq!(DEFAULT_VIEW, "dev");
     }
 
     /// Test that DEFAULT_TIMEOUT_SECS is 30.

@@ -12,7 +12,7 @@ impl Command for Record {
     /// 5. If --dry-run, display preview and exit
     /// 6. Create the change from modifications
     /// 7. Save the change to the store
-    /// 8. Apply the change to the current stack
+    /// 8. Apply the change to the current view
     /// 9. Display the result
     fn run(&self) -> CliResult<()> {
         // Find repository

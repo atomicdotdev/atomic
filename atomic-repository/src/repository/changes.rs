@@ -457,8 +457,8 @@ impl Repository {
     ///
     /// # Warning
     ///
-    /// Deleting a change that is still referenced by a stack will cause
-    /// errors when trying to access that stack. Use with caution.
+    /// Deleting a change that is still referenced by a view will cause
+    /// errors when trying to access that view. Use with caution.
     pub fn delete_change(&self, hash: &Hash) -> Result<bool, RepositoryError> {
         self.change_store
             .delete_change(hash)

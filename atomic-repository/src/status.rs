@@ -53,7 +53,7 @@
 //! let repo = Repository::open(".")?;
 //! let status = repo.status()?;
 //!
-//! println!("On stack: {}", status.stack());
+//! println!("On view: {}", status.view());
 //! println!("Modified files: {}", status.modified_count());
 //!
 //! for entry in status.modified() {
@@ -388,10 +388,10 @@ impl FileStatusEntry {
 /// providing convenient access to files by status category.
 #[derive(Debug, Clone)]
 pub struct RepositoryStatus {
-    /// The current stack name.
-    stack: String,
+    /// The current view name.
+    view: String,
 
-    /// The Merkle state of the current stack (if any changes have been applied).
+    /// The Merkle state of the current view (if any changes have been applied).
     state: Option<Merkle>,
 
     /// All file status entries.
@@ -406,11 +406,11 @@ impl RepositoryStatus {
     ///
     /// # Arguments
     ///
-    /// * `stack` - The current stack name
-    /// * `state` - The Merkle state of the stack (if any)
-    pub fn new(stack: String, state: Option<Merkle>) -> Self {
+    /// * `view` - The current view name
+    /// * `state` - The Merkle state of the view (if any)
+    pub fn new(view: String, state: Option<Merkle>) -> Self {
         Self {
-            stack,
+            view,
             state,
             entries: Vec::new(),
             path_index: HashMap::new(),
@@ -421,24 +421,29 @@ impl RepositoryStatus {
     ///
     /// # Arguments
     ///
-    /// * `stack` - The current stack name
-    /// * `state` - The Merkle state of the stack
+    /// * `view` - The current view name
+    /// * `state` - The Merkle state of the view
     /// * `capacity` - Expected number of entries
-    pub fn with_capacity(stack: String, state: Option<Merkle>, capacity: usize) -> Self {
+    pub fn with_capacity(view: String, state: Option<Merkle>, capacity: usize) -> Self {
         Self {
-            stack,
+            view,
             state,
             entries: Vec::with_capacity(capacity),
             path_index: HashMap::with_capacity(capacity),
         }
     }
 
-    /// Get the current stack name.
-    pub fn stack(&self) -> &str {
-        &self.stack
+    /// Get the current view name.
+    pub fn view(&self) -> &str {
+        &self.view
     }
 
-    /// Get the Merkle state of the current stack.
+    /// Backward-compatible alias for [`view()`](Self::view).
+    pub fn stack(&self) -> &str {
+        &self.view
+    }
+
+    /// Get the Merkle state of the current view.
     pub fn state(&self) -> Option<&Merkle> {
         self.state.as_ref()
     }
@@ -940,7 +945,7 @@ mod tests {
         let merkle = Merkle::of(b"test state");
         let status = RepositoryStatus::new("main".to_string(), Some(merkle));
 
-        assert_eq!(status.stack(), "main");
+        assert_eq!(status.view(), "main");
         assert_eq!(status.state(), Some(&merkle));
         assert_eq!(status.total_count(), 0);
         assert!(status.is_clean());

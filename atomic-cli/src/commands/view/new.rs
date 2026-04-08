@@ -57,7 +57,7 @@ use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{print_hint, print_success, stack as style_stack};
+use crate::output::{print_hint, print_success, view as style_view};
 
 #[cfg(test)]
 use std::path::PathBuf;
@@ -288,8 +288,8 @@ impl New {
         print_success(&format!(
             "Created {} view: {} (parent: {})",
             kind_label,
-            style_stack(name),
-            style_stack(&parent_name),
+            style_view(name),
+            style_view(&parent_name),
         ));
 
         self.maybe_switch(name, repo)
@@ -299,7 +299,7 @@ impl New {
     fn maybe_switch(&self, name: &str, repo: &mut Repository) -> CliResult<()> {
         if self.switch {
             repo.set_current_view(name).map_err(CliError::Repository)?;
-            print_success(&format!("Switched to view: {}", style_stack(name)));
+            print_success(&format!("Switched to view: {}", style_view(name)));
         } else {
             print_hint(&format!(
                 "Use 'atomic view switch {}' to switch to the new view",
@@ -384,15 +384,15 @@ impl Command for New {
             if change_count > 0 {
                 print_success(&format!(
                     "Created view: {} (forked from {} with {} changes)",
-                    style_stack(name),
-                    style_stack(source),
+                    style_view(name),
+                    style_view(source),
                     change_count,
                 ));
             } else {
                 print_success(&format!(
                     "Created view: {} (forked from {} - empty)",
-                    style_stack(name),
-                    style_stack(source),
+                    style_view(name),
+                    style_view(source),
                 ));
             }
         } else {
@@ -403,8 +403,8 @@ impl Command for New {
 
             print_success(&format!(
                 "Created view: {} (forked from {} - empty)",
-                style_stack(name),
-                style_stack(
+                style_view(name),
+                style_view(
                     &repo
                         .nearest_shared_ancestor(repo.current_view())
                         .unwrap_or_else(|_| repo.current_view().to_string())

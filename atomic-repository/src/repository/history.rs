@@ -3,7 +3,7 @@ use super::*;
 impl Repository {
     // History Methods
 
-    /// Get a forward history log for the current stack.
+    /// Get a forward history log for the current view.
     ///
     /// Returns an iterator over history entries starting from the given
     /// sequence number and proceeding forward (oldest to newest).
@@ -34,14 +34,14 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let view_name = options.view.as_deref().unwrap_or(&self.current_view);
-        let stack = txn
+        let view = txn
             .get_view(view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: view_name.to_string(),
             })?;
 
-        let iter = crate::history::log(&txn, &stack, &options)
+        let iter = crate::history::log(&txn, &view, &options)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Collect entries, loading headers if requested
@@ -81,14 +81,14 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let view_name = options.view.as_deref().unwrap_or(&self.current_view);
-        let stack = txn
+        let view = txn
             .get_view(view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: view_name.to_string(),
             })?;
 
-        let mut entries = crate::history::reverse_log(&txn, &stack, &options)
+        let mut entries = crate::history::reverse_log(&txn, &view, &options)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Load headers if requested
@@ -103,7 +103,7 @@ impl Repository {
         Ok(entries)
     }
 
-    /// Get a summary of the current stack's history.
+    /// Get a summary of the current view's history.
     ///
     /// # Returns
     ///
@@ -114,22 +114,22 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let stack = txn
+        let view = txn
             .get_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: self.current_view.clone(),
             })?;
 
-        crate::history::history_summary(&txn, &stack)
+        crate::history::history_summary(&txn, &view)
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
     // Unrecord Methods
 
-    /// Unrecord a change from the current stack.
+    /// Unrecord a change from the current view.
     ///
-    /// This removes the change from the stack's view without deleting the change
+    /// This removes the change from the view's change log without deleting the change
     /// itself. The change remains in the change store and graph, and can be
     /// re-applied later. This is similar to Gerrit's workflow where a patch can
     /// be removed from a change set, modified, and re-inserted.
@@ -165,12 +165,12 @@ impl Repository {
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Determine which stack to use
-        let stack_name = options.view.as_deref().unwrap_or(&self.current_view);
+        // Determine which view to use
+        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
 
-        // Get the stack
-        let mut stack = txn
-            .open_or_create_view(stack_name)
+        // Get the view
+        let mut view = txn
+            .open_or_create_view(view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Get internal ID
@@ -184,26 +184,26 @@ impl Repository {
         // Check if this is a dry run
         if options.dry_run {
             // Preview mode - just return what would happen
-            let preview = crate::unrecord::preview_unrecord(&txn, &stack, &[*hash], &options)
+            let preview = crate::unrecord::preview_unrecord(&txn, &view, &[*hash], &options)
                 .map_err(|e| RepositoryError::Unrecord(e.to_string()))?;
             return Ok(preview);
         }
 
-        // Remove the change from the stack
+        // Remove the change from the view
         let original_seq = txn
-            .del_change(&mut stack, change_id, hash)
+            .del_change(&mut view, change_id, hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if original_seq.is_none() {
             return Err(RepositoryError::Unrecord(format!(
-                "Change {} is not in stack '{}'",
+                "Change {} is not in view '{}'",
                 hash.to_base32(),
-                stack_name
+                view_name
             )));
         }
 
-        // Update the stack
-        txn.update_view(&stack)
+        // Update the view
+        txn.update_view(&view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Commit the transaction
@@ -211,13 +211,13 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Build outcome
-        let mut outcome = UnrecordOutcome::new(vec![*hash], stack.state, stack.change_count);
+        let mut outcome = UnrecordOutcome::new(vec![*hash], view.state, view.change_count);
         outcome.stats.direct_unrecords = 1;
 
         Ok(outcome)
     }
 
-    /// Unrecord the last change from the current stack.
+    /// Unrecord the last change from the current view.
     ///
     /// This is a convenience method for unrecording the most recent change.
     ///
@@ -245,17 +245,17 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let stack_name = options.view.as_deref().unwrap_or(&self.current_view);
-        let stack = txn
-            .get_view(stack_name)
+        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
+        let view = txn
+            .get_view(view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
             .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: stack_name.to_string(),
+                name: view_name.to_string(),
             })?;
 
-        let last_hash = crate::unrecord::get_last_change(&txn, &stack)
+        let last_hash = crate::unrecord::get_last_change(&txn, &view)
             .map_err(|e| RepositoryError::Unrecord(e.to_string()))?
-            .ok_or_else(|| RepositoryError::Unrecord("Stack is empty".to_string()))?;
+            .ok_or_else(|| RepositoryError::Unrecord("View is empty".to_string()))?;
 
         drop(txn);
 
@@ -295,8 +295,8 @@ impl Repository {
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Get the stack
-        let mut stack = txn
+        // Get the view
+        let mut view = txn
             .open_or_create_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
@@ -309,26 +309,26 @@ impl Repository {
             })?;
 
         // Determine insertion point
-        let insert_at = at_sequence.unwrap_or(stack.change_count);
+        let insert_at = at_sequence.unwrap_or(view.change_count);
 
         // Reinsert the change
-        txn.reinsert_change(&mut stack, change_id, hash, insert_at)
+        txn.reinsert_change(&mut view, change_id, hash, insert_at)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Update the stack
-        txn.update_view(&stack)
+        // Update the view
+        txn.update_view(&view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Commit the transaction
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        Ok((stack.state, stack.change_count))
+        Ok((view.state, view.change_count))
     }
 
     /// Check if a change can be unrecorded.
     ///
-    /// This checks whether the change is in the stack and whether it has
+    /// This checks whether the change is in the view and whether it has
     /// any dependents that would also need to be unrecorded.
     ///
     /// # Arguments
@@ -348,14 +348,14 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let stack = txn
+        let view = txn
             .get_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: self.current_view.clone(),
             })?;
 
-        crate::unrecord::check_can_unrecord(&txn, &stack, hash, &UnrecordOptions::default())
+        crate::unrecord::check_can_unrecord(&txn, &view, hash, &UnrecordOptions::default())
             .map_err(|e| RepositoryError::Unrecord(e.to_string()))
     }
 }

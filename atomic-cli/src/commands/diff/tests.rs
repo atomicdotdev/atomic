@@ -596,7 +596,7 @@ mod tests {
         assert!(!diff.name_only);
         assert!(!diff.name_status);
         assert!(!diff.cached);
-        assert!(diff.stack.is_none());
+        assert!(diff.view.is_none());
     }
 
     #[test]
@@ -661,9 +661,9 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_with_stack() {
-        let diff = Diff::new().with_stack("feature");
-        assert_eq!(diff.stack, Some("feature".to_string()));
+    fn test_diff_with_view() {
+        let diff = Diff::new().with_view("feature");
+        assert_eq!(diff.view, Some("feature".to_string()));
     }
 
     #[test]

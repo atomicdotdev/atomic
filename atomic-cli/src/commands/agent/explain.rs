@@ -25,8 +25,8 @@
 //!
 //! # How It Works
 //!
-//! 1. Looks up the session → gets the agent stack name
-//! 2. Loads changes from the agent stack via `repo.log()`
+//! 1. Looks up the session → gets the agent view name
+//! 2. Loads changes from the agent view via `repo.log()`
 //! 3. For each target turn:
 //!    a. Reads the condensed transcript from `change.unhashed["agent_turn"]`
 //!    b. If no transcript in the change, reads from the session's transcript file
@@ -68,7 +68,7 @@ use crate::output::{emphasis, hint, info, print_error, print_success, print_warn
 pub struct Explain {
     /// Session ID to explain.
     ///
-    /// The session must have at least one recorded turn on its agent stack.
+    /// The session must have at least one recorded turn on its agent view.
     /// Use `atomic agent status` to see available sessions.
     session_id: String,
 
@@ -116,7 +116,7 @@ impl Command for Explain {
     fn run(&self) -> CliResult<()> {
         let repo_root = find_repository_root()?;
 
-        // Load the session to get the stack name
+        // Load the session to get the view name
         let session_store =
             SessionStore::for_repo(&repo_root).map_err(|e| CliError::InvalidRepository {
                 reason: format!("Failed to open session store: {}", e),
@@ -135,7 +135,7 @@ impl Command for Explain {
         // Open the repository
         let repo = Repository::open(&repo_root)?;
 
-        // Get the changes on the agent stack
+        // Get the changes on the agent view
         let history_options = HistoryOptions::with_headers().view(&session.view_name);
 
         let entries = repo.log(history_options).map_err(|e| match e {

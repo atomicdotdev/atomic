@@ -146,7 +146,7 @@ impl ReadSection {
     ///
     /// # Errors
     ///
-    /// - [`FormatError::Postcard`] if deserialization fails.
+    /// - `FormatError::Postcard` if deserialization fails.
     ///
     /// # Examples
     ///
@@ -361,10 +361,10 @@ impl<'r, R: Read> ChangeReader<'r, R> {
     ///
     /// # Errors
     ///
-    /// - [`FormatError::InvalidMagic`] if the file doesn't start with `b"ATOM"`.
-    /// - [`FormatError::UnsupportedVersion`] if the format version isn't supported.
-    /// - [`FormatError::InvalidHeader`] if the header fields are inconsistent.
-    /// - [`FormatError::HashTableFull`] if the hash table has too many entries.
+    /// - `FormatError::InvalidMagic` if the file doesn't start with `b"ATOM"`.
+    /// - `FormatError::UnsupportedVersion` if the format version isn't supported.
+    /// - `FormatError::InvalidHeader` if the header fields are inconsistent.
+    /// - `FormatError::HashTableFull` if the hash table has too many entries.
     /// - I/O errors if the source can't be read.
     ///
     /// # Examples

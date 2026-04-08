@@ -11,7 +11,7 @@
 //! - **Green**: Success, additions, positive outcomes
 //! - **Red**: Errors, deletions, warnings
 //! - **Yellow**: Warnings, modifications, attention needed
-//! - **Cyan**: Informational messages, stack/branch names
+//! - **Cyan**: Informational messages, view/branch names
 //! - **Blue**: Links, references, secondary information
 //! - **Dim**: Supplementary information, hashes, timestamps
 //!
@@ -384,13 +384,13 @@ pub fn hash<D: std::fmt::Display>(text: D) -> StyledObject<D> {
     style(text).dim()
 }
 
-/// Format a stack/branch name in cyan and bold.
+/// Format a view/branch name in cyan and bold.
 ///
-/// Use this for stack names to make them prominent.
+/// Use this for view names to make them prominent.
 ///
 /// # Arguments
 ///
-/// * `text` - The stack name to format
+/// * `text` - The view name to format
 ///
 /// # Returns
 ///
@@ -399,9 +399,9 @@ pub fn hash<D: std::fmt::Display>(text: D) -> StyledObject<D> {
 /// # Example
 ///
 /// ```rust,ignore
-/// println!("On stack: {}", colors::stack("main"));
+/// println!("On view: {}", colors::view("main"));
 /// ```
-pub fn stack<D: std::fmt::Display>(text: D) -> StyledObject<D> {
+pub fn view<D: std::fmt::Display>(text: D) -> StyledObject<D> {
     style(text).cyan().bold()
 }
 
@@ -648,8 +648,8 @@ mod tests {
     }
 
     #[test]
-    fn test_stack_returns_styled() {
-        let styled = stack("main");
+    fn test_view_returns_styled() {
+        let styled = view("main");
         let _ = styled.to_string();
     }
 

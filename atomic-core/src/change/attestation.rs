@@ -4,7 +4,7 @@
 //! metadata about a set of changes: cost, token usage per model, duration,
 //! and agent identity. Unlike changes, attestations produce zero hunks —
 //! they don't modify the content graph. Unlike tags, they're not tied to
-//! a stack's state. They live in the graph as standalone nodes with
+//! a view's state. They live in the graph as standalone nodes with
 //! dependencies pointing to the changes they cover.
 //!
 //! # Graph Position
@@ -21,7 +21,7 @@
 //!
 //! Attestations are registered in EXTERNAL/INTERNAL (content-addressed),
 //! NODE_TYPES (type = 2), and DEPS (attestation → covered changes).
-//! They are NOT added to any stack's STACK_CHANGES table.
+//! They are NOT added to any view's VIEW_CHANGES table.
 //!
 //! # File Format
 //!
@@ -32,14 +32,14 @@
 //! [postcard payload → Attestation]
 //! ```
 //!
-//! # Cross-Stack Queries
+//! # Cross-View Queries
 //!
-//! Given a stack, find attestations by:
-//! 1. Iterate changes in the stack (STACK_CHANGES)
+//! Given a view, find attestations by:
+//! 1. Iterate changes in the view (VIEW_CHANGES)
 //! 2. For each change, check REV_DEPS for attestation nodes
 //! 3. Filter by node_type = ATTESTATION
 //! 4. Deduplicate (multiple changes may point to same attestation)
-//! 5. Resolve which stacks contain each covered change
+//! 5. Resolve which views contain each covered change
 //!
 //! # Session Resume Chaining
 //!

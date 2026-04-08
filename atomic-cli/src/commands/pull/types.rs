@@ -61,7 +61,7 @@ pub struct PullChange {
     /// identify the change across all repositories.
     pub hash: Hash,
 
-    /// Sequence number in the remote stack (0-indexed).
+    /// Sequence number in the remote view (0-indexed).
     ///
     /// This indicates the order of this change in the remote's history.
     /// Changes must be applied in sequence order to maintain consistency.
@@ -69,7 +69,7 @@ pub struct PullChange {
 
     /// The Merkle state after this change was applied.
     ///
-    /// This represents the cumulative state of the stack after applying
+    /// This represents the cumulative state of the view after applying
     /// this change, enabling efficient state comparison.
     pub state: Merkle,
 
@@ -96,7 +96,7 @@ impl PullChange {
     /// # Arguments
     ///
     /// * `hash` - The change's content hash
-    /// * `sequence` - The sequence number in the remote stack
+    /// * `sequence` - The sequence number in the remote view
     /// * `state` - The Merkle state after this change
     ///
     /// # Returns
@@ -212,7 +212,7 @@ impl PullChange {
 /// - `bytes_transferred`: Total bytes received from the remote
 /// - `changes_skipped`: Number of changes that already existed locally
 /// - `changes_failed`: Number of changes that failed to download
-/// - `changes_applied`: Number of changes successfully applied to the stack
+/// - `changes_applied`: Number of changes successfully applied to the view
 ///
 /// # Example
 ///
@@ -259,7 +259,7 @@ pub struct PullStats {
     /// issues, or other problems.
     pub changes_failed: usize,
 
-    /// Number of changes successfully applied to the local stack.
+    /// Number of changes successfully applied to the local view.
     ///
     /// This may differ from `changes_downloaded` if `--download-only` is used,
     /// or if some changes fail to apply due to conflicts.
@@ -309,7 +309,7 @@ impl PullStats {
         self.changes_failed > 0
     }
 
-    /// Check if any changes were applied to the stack.
+    /// Check if any changes were applied to the view.
     ///
     /// # Returns
     ///

@@ -342,4 +342,3 @@ impl Default for StreamingPullOptions {
         }
     }
 }
-

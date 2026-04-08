@@ -1,15 +1,15 @@
 //! Tag query and listing operations.
 //!
 //! Functions for searching, listing, filtering, and counting tags
-//! across one or more stacks.
+//! across one or more views.
 
 use std::path::Path;
 
 use super::types::{Tag, TagFilter, TagResult, TagSort};
 
-/// Load a tag by name, searching all stacks.
+/// Load a tag by name, searching all views.
 ///
-/// This is useful when you don't know which stack a tag belongs to.
+/// This is useful when you don't know which view a tag belongs to.
 /// Returns the first matching tag found.
 ///
 /// # Arguments
@@ -19,8 +19,8 @@ use super::types::{Tag, TagFilter, TagResult, TagSort};
 ///
 /// # Returns
 ///
-/// The loaded `Tag`, or `None` if not found in any stack.
-pub fn load_tag_any_stack(tags_dir: &Path, name: &str) -> TagResult<Option<Tag>> {
+/// The loaded `Tag`, or `None` if not found in any view.
+pub fn load_tag_any_view(tags_dir: &Path, name: &str) -> TagResult<Option<Tag>> {
     if !tags_dir.exists() {
         return Ok(None);
     }
@@ -30,9 +30,9 @@ pub fn load_tag_any_stack(tags_dir: &Path, name: &str) -> TagResult<Option<Tag>>
         let path = entry.path();
 
         if path.is_dir() {
-            let stack = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let view = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-            if let Some(tag) = super::load_tag(tags_dir, stack, name)? {
+            if let Some(tag) = super::load_tag(tags_dir, view, name)? {
                 return Ok(Some(tag));
             }
         }
@@ -41,26 +41,26 @@ pub fn load_tag_any_stack(tags_dir: &Path, name: &str) -> TagResult<Option<Tag>>
     Ok(None)
 }
 
-/// List all tags for a specific stack.
+/// List all tags for a specific view.
 ///
 /// # Arguments
 ///
 /// * `tags_dir` - The tags directory
-/// * `stack` - The stack name
+/// * `view` - The view name
 ///
 /// # Returns
 ///
-/// A vector of loaded tags for the specified stack.
-pub fn list_tags(tags_dir: &Path, stack: &str) -> TagResult<Vec<Tag>> {
-    let stack_dir = super::stack_tags_dir(tags_dir, stack);
+/// A vector of loaded tags for the specified view.
+pub fn list_tags(tags_dir: &Path, view: &str) -> TagResult<Vec<Tag>> {
+    let view_dir = super::view_tags_dir(tags_dir, view);
 
-    if !stack_dir.exists() {
+    if !view_dir.exists() {
         return Ok(Vec::new());
     }
 
     let mut tags = Vec::new();
 
-    for entry in std::fs::read_dir(&stack_dir)? {
+    for entry in std::fs::read_dir(&view_dir)? {
         let entry = entry?;
         let path = entry.path();
 
@@ -75,7 +75,7 @@ pub fn list_tags(tags_dir: &Path, stack: &str) -> TagResult<Vec<Tag>> {
     Ok(tags)
 }
 
-/// List all tags across all stacks.
+/// List all tags across all views.
 ///
 /// # Arguments
 ///
@@ -83,7 +83,7 @@ pub fn list_tags(tags_dir: &Path, stack: &str) -> TagResult<Vec<Tag>> {
 ///
 /// # Returns
 ///
-/// A vector of all loaded tags from all stacks.
+/// A vector of all loaded tags from all views.
 pub fn list_all_tags(tags_dir: &Path) -> TagResult<Vec<Tag>> {
     if !tags_dir.exists() {
         return Ok(Vec::new());
@@ -91,24 +91,24 @@ pub fn list_all_tags(tags_dir: &Path) -> TagResult<Vec<Tag>> {
 
     let mut tags = Vec::new();
 
-    // Iterate over stack directories
+    // Iterate over view directories
     for entry in std::fs::read_dir(tags_dir)? {
         let entry = entry?;
         let path = entry.path();
 
         if path.is_dir() {
-            let stack = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let view = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-            // Get tags from this stack
-            let stack_tags = list_tags(tags_dir, stack)?;
-            tags.extend(stack_tags);
+            // Get tags from this view
+            let view_tags = list_tags(tags_dir, view)?;
+            tags.extend(view_tags);
         }
     }
 
     Ok(tags)
 }
 
-/// List all stack names that have tags.
+/// List all view names that have tags.
 ///
 /// # Arguments
 ///
@@ -116,13 +116,13 @@ pub fn list_all_tags(tags_dir: &Path) -> TagResult<Vec<Tag>> {
 ///
 /// # Returns
 ///
-/// A vector of stack names that have at least one tag.
-pub fn list_tag_stacks(tags_dir: &Path) -> TagResult<Vec<String>> {
+/// A vector of view names that have at least one tag.
+pub fn list_tag_views(tags_dir: &Path) -> TagResult<Vec<String>> {
     if !tags_dir.exists() {
         return Ok(Vec::new());
     }
 
-    let mut stacks = Vec::new();
+    let mut views = Vec::new();
 
     for entry in std::fs::read_dir(tags_dir)? {
         let entry = entry?;
@@ -130,19 +130,19 @@ pub fn list_tag_stacks(tags_dir: &Path) -> TagResult<Vec<String>> {
 
         if path.is_dir() {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                stacks.push(name.to_string());
+                views.push(name.to_string());
             }
         }
     }
 
-    stacks.sort();
-    Ok(stacks)
+    views.sort();
+    Ok(views)
 }
 
 /// List tags matching a filter.
 ///
-/// If the filter specifies a stack, only that stack is searched.
-/// Otherwise, all stacks are searched.
+/// If the filter specifies a view, only that view is searched.
+/// Otherwise, all views are searched.
 ///
 /// # Arguments
 ///
@@ -154,8 +154,8 @@ pub fn list_tag_stacks(tags_dir: &Path) -> TagResult<Vec<String>> {
 /// A filtered and sorted vector of tags.
 pub fn list_tags_filtered(tags_dir: &Path, filter: &TagFilter) -> TagResult<Vec<Tag>> {
     // Get tags from appropriate source
-    let all_tags = if let Some(ref stack) = filter.stack {
-        list_tags(tags_dir, stack)?
+    let all_tags = if let Some(ref view) = filter.view {
+        list_tags(tags_dir, view)?
     } else {
         list_all_tags(tags_dir)?
     };
@@ -177,24 +177,24 @@ pub fn list_tags_filtered(tags_dir: &Path, filter: &TagFilter) -> TagResult<Vec<
     Ok(tags)
 }
 
-/// Count tags for a specific stack.
+/// Count tags for a specific view.
 ///
 /// # Arguments
 ///
 /// * `tags_dir` - The tags directory
-/// * `stack` - The stack name
+/// * `view` - The view name
 ///
 /// # Returns
 ///
-/// The number of tags in the specified stack.
-pub fn count_tags(tags_dir: &Path, stack: &str) -> TagResult<usize> {
-    let stack_dir = super::stack_tags_dir(tags_dir, stack);
+/// The number of tags in the specified view.
+pub fn count_tags(tags_dir: &Path, view: &str) -> TagResult<usize> {
+    let view_dir = super::view_tags_dir(tags_dir, view);
 
-    if !stack_dir.exists() {
+    if !view_dir.exists() {
         return Ok(0);
     }
 
-    let count = std::fs::read_dir(&stack_dir)?
+    let count = std::fs::read_dir(&view_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "tag"))
         .count();
@@ -202,7 +202,7 @@ pub fn count_tags(tags_dir: &Path, stack: &str) -> TagResult<usize> {
     Ok(count)
 }
 
-/// Count all tags across all stacks.
+/// Count all tags across all views.
 ///
 /// # Arguments
 ///
@@ -210,7 +210,7 @@ pub fn count_tags(tags_dir: &Path, stack: &str) -> TagResult<usize> {
 ///
 /// # Returns
 ///
-/// The total number of tags across all stacks.
+/// The total number of tags across all views.
 pub fn count_all_tags(tags_dir: &Path) -> TagResult<usize> {
     if !tags_dir.exists() {
         return Ok(0);
@@ -223,8 +223,8 @@ pub fn count_all_tags(tags_dir: &Path) -> TagResult<usize> {
         let path = entry.path();
 
         if path.is_dir() {
-            let stack = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            count += count_tags(tags_dir, stack)?;
+            let view = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            count += count_tags(tags_dir, view)?;
         }
     }
 

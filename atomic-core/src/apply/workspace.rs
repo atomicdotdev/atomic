@@ -23,11 +23,11 @@
 //! let mut workspace = Workspace::new();
 //!
 //! // Apply first change
-//! apply_change(&mut txn, &mut stack, &change1, &mut workspace)?;
+//! apply_change(&mut txn, &mut view, &change1, &mut workspace)?;
 //! workspace.clear(); // Reuse the workspace
 //!
 //! // Apply second change
-//! apply_change(&mut txn, &mut stack, &change2, &mut workspace)?;
+//! apply_change(&mut txn, &mut view, &change2, &mut workspace)?;
 //! ```
 //!
 //! # Conflict Tracking

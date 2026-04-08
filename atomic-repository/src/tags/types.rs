@@ -33,12 +33,12 @@ pub enum TagError {
     #[error("Invalid tag name '{name}': {reason}")]
     InvalidName { name: String, reason: String },
 
-    /// The specified stack was not found.
-    #[error("Stack not found: {name}")]
-    StackNotFound { name: String },
+    /// The specified view was not found.
+    #[error("View not found: {name}")]
+    ViewNotFound { name: String },
 
-    /// The specified state was not found in the stack.
-    #[error("State not found in stack: {state}")]
+    /// The specified state was not found in the view.
+    #[error("State not found in view: {state}")]
     StateNotFound { state: String },
 
     /// The tag file is corrupted or invalid.
@@ -70,9 +70,10 @@ pub enum TagError {
 pub struct Tag {
     /// The human-readable name of the tag.
     pub name: String,
-    /// The stack this tag belongs to.
-    pub stack: String,
-    /// The sequence number in the stack when tagged.
+    /// The view this tag belongs to.
+    #[serde(alias = "stack")]
+    pub view: String,
+    /// The sequence number in the view when tagged.
     pub sequence: u64,
     /// The Merkle state at the tagged point.
     pub state: Merkle,
@@ -90,13 +91,13 @@ impl Tag {
     /// Create a new lightweight tag.
     pub fn new(
         name: impl Into<String>,
-        stack: impl Into<String>,
+        view: impl Into<String>,
         sequence: u64,
         state: Merkle,
     ) -> Self {
         Self {
             name: name.into(),
-            stack: stack.into(),
+            view: view.into(),
             sequence,
             state,
             timestamp: Utc::now(),
@@ -109,7 +110,7 @@ impl Tag {
     /// Create a new annotated tag.
     pub fn annotated(
         name: impl Into<String>,
-        stack: impl Into<String>,
+        view: impl Into<String>,
         sequence: u64,
         state: Merkle,
         message: impl Into<String>,
@@ -117,7 +118,7 @@ impl Tag {
     ) -> Self {
         Self {
             name: name.into(),
-            stack: stack.into(),
+            view: view.into(),
             sequence,
             state,
             timestamp: Utc::now(),
@@ -135,6 +136,16 @@ impl Tag {
     /// Check if this is a lightweight tag.
     pub fn is_lightweight(&self) -> bool {
         !self.annotated
+    }
+
+    /// Get the view this tag belongs to.
+    pub fn view(&self) -> &str {
+        &self.view
+    }
+
+    /// Backward-compatible alias for [`view()`](Self::view).
+    pub fn stack(&self) -> &str {
+        self.view()
     }
 
     /// Get the tag message if present.
@@ -172,11 +183,11 @@ impl fmt::Display for Tag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} -> {} (seq: {}, stack: {})",
+            "{} -> {} (seq: {}, view: {})",
             self.name,
             &self.state.to_base32()[..8],
             self.sequence,
-            self.stack
+            self.view
         )
     }
 }
@@ -192,8 +203,8 @@ pub struct TagOptions {
     pub message: Option<String>,
     /// Optional author for an annotated tag.
     pub author: Option<Author>,
-    /// Stack to tag (None = current stack).
-    pub stack: Option<String>,
+    /// View to tag (None = current view).
+    pub view: Option<String>,
     /// Specific sequence to tag (None = current HEAD).
     pub sequence: Option<u64>,
     /// Whether to force overwrite an existing tag.
@@ -218,10 +229,15 @@ impl TagOptions {
         self
     }
 
-    /// Set the stack to tag.
-    pub fn stack(mut self, name: impl Into<String>) -> Self {
-        self.stack = Some(name.into());
+    /// Set the view to tag.
+    pub fn view(mut self, name: impl Into<String>) -> Self {
+        self.view = Some(name.into());
         self
+    }
+
+    /// Backward-compatible alias for [`view()`](Self::view).
+    pub fn stack(self, name: impl Into<String>) -> Self {
+        self.view(name)
     }
 
     /// Set a specific sequence to tag.
@@ -254,8 +270,8 @@ impl TagOptions {
 /// Filter options for listing tags.
 #[derive(Debug, Clone, Default)]
 pub struct TagFilter {
-    /// Filter by stack name.
-    pub stack: Option<String>,
+    /// Filter by view name.
+    pub view: Option<String>,
     /// Filter by name pattern (glob-like).
     pub pattern: Option<String>,
     /// Only include annotated tags.
@@ -274,10 +290,15 @@ impl TagFilter {
         Self::default()
     }
 
-    /// Filter by stack.
-    pub fn stack(mut self, name: impl Into<String>) -> Self {
-        self.stack = Some(name.into());
+    /// Filter by view.
+    pub fn view(mut self, name: impl Into<String>) -> Self {
+        self.view = Some(name.into());
         self
+    }
+
+    /// Backward-compatible alias for [`view()`](Self::view).
+    pub fn stack(self, name: impl Into<String>) -> Self {
+        self.view(name)
     }
 
     /// Filter by name pattern.
@@ -314,9 +335,9 @@ impl TagFilter {
 
     /// Check if a tag matches this filter.
     pub fn matches(&self, tag: &Tag) -> bool {
-        // Stack filter
-        if let Some(ref stack) = self.stack {
-            if tag.stack != *stack {
+        // View filter
+        if let Some(ref view) = self.view {
+            if tag.view != *view {
                 return false;
             }
         }

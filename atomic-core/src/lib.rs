@@ -110,8 +110,11 @@ pub use merge::{
 /// The directory name for Atomic repositories
 pub const DOT_DIR: &str = ".atomic";
 
-/// The default stack name
-pub const DEFAULT_STACK: &str = "main";
+/// The default view name
+pub const DEFAULT_VIEW: &str = "main";
+
+/// Backward-compatible alias.
+pub const DEFAULT_STACK: &str = DEFAULT_VIEW;
 
 /// Crate version for change format compatibility
 pub const VERSION: u64 = 1;

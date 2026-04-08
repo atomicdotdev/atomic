@@ -134,7 +134,7 @@ pub fn retrieve_graph<T: GraphTxnT>(
     }
 
     // Track whether a change filter is active so callers can distinguish
-    // "genuinely empty file" from "file belongs to a different stack".
+    // "genuinely empty file" from "file belongs to a different view".
     result.was_filtered = options.has_filter();
 
     let root_alive = AliveVertex::new(root_vertex);

@@ -42,7 +42,7 @@
 //! │  RecordContext<T, W, C>                                                 │
 //! │  ┌───────────────────────────────────────────────────────────────────┐ │
 //! │  │                                                                   │ │
-//! │  │  DetectContext + RecordBuilder + Stack Reference                  │ │
+//! │  │  DetectContext + RecordBuilder + View Reference                   │ │
 //! │  │                                                                   │ │
 //! │  │         ┌─────────────────────────────────────────┐              │ │
 //! │  │         │  record() / record_files() / record_path()  │          │ │
@@ -64,7 +64,7 @@
 //! let result = detect_ctx.detect_changes(DetectOptions::new())?;
 //!
 //! // Or create a full recording context
-//! let record_ctx = RecordContext::new(&txn, &stack, &working_copy, &changes);
+//! let record_ctx = RecordContext::new(&txn, &view, &working_copy, &changes);
 //!
 //! // Record all changes
 //! let recorded = record_ctx.record("")?;
@@ -237,7 +237,7 @@ where
         self.change_store
     }
 
-    /// Get the stack reference, if set.
+    /// Get the view reference, if set.
     ///
     /// # Returns
     ///
@@ -304,7 +304,7 @@ where
 
 /// Context for recording changes.
 ///
-/// This struct extends [`DetectContext`] with a [`RecordBuilder`] and stack
+/// This struct extends [`DetectContext`] with a [`RecordBuilder`] and view
 /// reference, providing everything needed for the full recording workflow.
 ///
 /// # Type Parameters
@@ -451,7 +451,7 @@ where
         &mut self.builder
     }
 
-    /// Get the stack reference.
+    /// Get the view reference.
     ///
     /// # Returns
     ///
@@ -525,7 +525,7 @@ where
     /// # Example
     ///
     /// ```rust,ignore
-    /// let mut ctx = RecordContext::new(&txn, &stack, &working_copy, &changes);
+    /// let mut ctx = RecordContext::new(&txn, &view, &working_copy, &changes);
     /// // ... record changes ...
     /// let builder = ctx.into_builder();
     /// let recorded = builder.finish();
@@ -545,7 +545,7 @@ where
     /// # Example
     ///
     /// ```rust,ignore
-    /// let mut ctx = RecordContext::new(&txn, &stack, &working_copy, &changes);
+    /// let mut ctx = RecordContext::new(&txn, &view, &working_copy, &changes);
     /// // ... record first batch ...
     /// let first_batch = ctx.take_builder();
     /// // ... record second batch ...

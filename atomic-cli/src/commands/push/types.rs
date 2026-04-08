@@ -33,7 +33,7 @@ pub struct PushChange {
     /// The change hash (content-addressed identifier).
     pub hash: Hash,
 
-    /// Sequence number in the local stack (0-indexed).
+    /// Sequence number in the local view (0-indexed).
     pub sequence: u64,
 
     /// The Merkle state after this change was applied.
@@ -48,11 +48,11 @@ pub struct PushChange {
     /// Whether the change already exists in the remote graph.
     ///
     /// When `true`, this change is already stored on the server (applied
-    /// via another stack) and only needs to be adopted into the target
-    /// stack's view — no data transfer is required.
+    /// via another view) and only needs to be adopted into the target
+    /// view's filter — no data transfer is required.
     ///
-    /// Stacks are views of the same underlying graph. When pushing to a
-    /// new stack, changes from other stacks don't need re-uploading.
+    /// Views are filters of the same underlying graph. When pushing to a
+    /// new view, changes from other views don't need re-uploading.
     pub in_graph: bool,
 }
 
@@ -62,7 +62,7 @@ impl PushChange {
     /// # Arguments
     ///
     /// * `hash` - The change's content hash
-    /// * `sequence` - The sequence number in the stack
+    /// * `sequence` - The sequence number in the view
     /// * `state` - The Merkle state after this change
     ///
     /// # Example
@@ -147,9 +147,9 @@ impl PushChange {
 
     /// Mark this change as already existing in the remote graph.
     ///
-    /// Changes that are already in the graph only need stack adoption,
-    /// not a full data upload. This happens when pushing to a new stack
-    /// where the changes were already pushed via another stack.
+    /// Changes that are already in the graph only need view adoption,
+    /// not a full data upload. This happens when pushing to a new view
+    /// where the changes were already pushed via another view.
     ///
     /// # Example
     ///

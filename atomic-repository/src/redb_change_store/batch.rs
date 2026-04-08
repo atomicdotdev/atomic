@@ -12,7 +12,7 @@ use atomic_core::change::format_v3::SectionType;
 /// A single section loaded from redb.
 ///
 /// Contains the decompressed payload and the section type. This is the
-/// redb equivalent of [`format_v3::reader::ReadSection`] but loaded
+/// redb equivalent of `format_v3::reader::ReadSection` but loaded
 /// from table values instead of a file stream.
 #[derive(Clone, Debug)]
 pub struct StoredSection {

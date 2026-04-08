@@ -42,7 +42,7 @@ use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{print_success, stack as style_stack};
+use crate::output::{print_success, view as style_view};
 
 #[cfg(test)]
 use std::path::PathBuf;
@@ -98,7 +98,7 @@ impl Command for Switch {
 
         // Check if we're already on this view
         if repo.current_view() == name {
-            print_success(&format!("Already on view: {}", style_stack(name)));
+            print_success(&format!("Already on view: {}", style_view(name)));
             return Ok(());
         }
 
@@ -110,7 +110,7 @@ impl Command for Switch {
             other => CliError::Repository(other),
         })?;
 
-        print_success(&format!("Switched to view: {}", style_stack(name)));
+        print_success(&format!("Switched to view: {}", style_view(name)));
 
         // Show output statistics if any files were updated
         if result.files_written > 0 || result.directories_created > 0 {

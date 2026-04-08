@@ -37,7 +37,7 @@ use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{hint, stack as style_stack};
+use crate::output::{hint, view as style_view};
 
 #[cfg(test)]
 use std::path::PathBuf;
@@ -120,13 +120,13 @@ impl Command for List {
                             _ => "[shared]",
                         };
                         let parent_info = match &info.parent_name {
-                            Some(p) => format!("  parent: {}", style_stack(p)),
+                            Some(p) => format!("  parent: {}", style_view(p)),
                             None => String::new(),
                         };
                         println!(
                             "{} {:<width$}  {:<10}  ({} {})  state: {}{}",
                             marker,
-                            style_stack(&view),
+                            style_view(&view),
                             kind_tag,
                             info.change_count,
                             change_word,
@@ -137,11 +137,11 @@ impl Command for List {
                     }
                     Err(_) => {
                         // Fall back to simple output if we can't get info
-                        println!("{} {}", marker, style_stack(&view));
+                        println!("{} {}", marker, style_view(&view));
                     }
                 }
             } else {
-                println!("{} {}", marker, style_stack(&view));
+                println!("{} {}", marker, style_view(&view));
             }
         }
 
