@@ -12,7 +12,7 @@
 //! 1. **Validate** that all dependencies are present in the repository
 //! 2. **Register** the change to get an internal [`NodeId`]
 //! 3. **Apply** each atom (span or edge operation) to the graph
-//! 4. **Update** the stack's Merkle state
+//! 4. **Update** the view's Merkle state
 //! 5. **Update** file tree mappings for added/deleted files
 //!
 //! # Architecture
@@ -117,11 +117,11 @@
 //! });
 //! ```
 //!
-//! # Stack Updates
+//! # View Updates
 //!
-//! After applying a change, the stack is updated:
+//! After applying a change, the view is updated:
 //!
-//! 1. The change is added to the stack's change log
+//! 1. The change is added to the view's change log
 //! 2. The Merkle state is updated: `new_state = Hash(old_state || change_hash)`
 //! 3. The change count is incremented
 //!
@@ -145,7 +145,7 @@
 //! Application can fail for various reasons:
 //!
 //! - **Missing dependencies**: Required changes not yet applied
-//! - **Already applied**: Change is already on the stack
+//! - **Already applied**: Change is already on the view
 //! - **Invalid format**: Corrupted or malformed change data
 //! - **Graph inconsistency**: Operations that violate graph invariants
 //!
@@ -189,10 +189,10 @@
 //!         }
 //!     }
 //!
-//!     // Update stack state
-//!     let new_state = compute_new_state(&stack.state, change_hash);
-//!     txn.put_change(stack, change_id, change_hash)?;
-//!     txn.update_stack(stack)?;
+//!     // Update view state
+//!     let new_state = compute_new_state(&view.state, change_hash);
+//!     txn.put_change(view, change_id, change_hash)?;
+//!     txn.update_view(view)?;
 //!
 //!     // Commit the transaction
 //!     txn.commit()?;

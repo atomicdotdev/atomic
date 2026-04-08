@@ -193,7 +193,7 @@ mod tests {
     fn test_change_cmd_new() {
         let cmd = ChangeCmd::new();
         assert!(cmd.identifier.is_none());
-        assert!(cmd.stack.is_none());
+        assert!(cmd.view.is_none());
         assert_eq!(cmd.format, ChangeFormat::Default);
         assert!(!cmd.show_deps);
         assert!(!cmd.show_hunks);
@@ -220,9 +220,9 @@ mod tests {
     }
 
     #[test]
-    fn test_change_cmd_with_stack() {
-        let cmd = ChangeCmd::new().with_stack("feature");
-        assert_eq!(cmd.stack, Some("feature".to_string()));
+    fn test_change_cmd_with_view() {
+        let cmd = ChangeCmd::new().with_view("feature");
+        assert_eq!(cmd.view, Some("feature".to_string()));
     }
 
     #[test]
@@ -253,14 +253,14 @@ mod tests {
     fn test_change_cmd_builder_chain() {
         let cmd = ChangeCmd::new()
             .with_identifier("ABC123")
-            .with_stack("main")
+            .with_view("main")
             .with_format(ChangeFormat::Short)
             .with_show_deps(true)
             .with_show_hunks(true)
             .with_full_hash(true);
 
         assert_eq!(cmd.identifier, Some("ABC123".to_string()));
-        assert_eq!(cmd.stack, Some("main".to_string()));
+        assert_eq!(cmd.view, Some("main".to_string()));
         assert_eq!(cmd.format, ChangeFormat::Short);
         assert!(cmd.show_deps);
         assert!(cmd.show_hunks);
@@ -552,14 +552,14 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_change_run_nonexistent_stack() {
+    fn test_change_run_nonexistent_view() {
         let _guard = TestGuard::new();
 
         let _repo = Repository::init(".").unwrap();
 
         let cmd = ChangeCmd::new()
             .with_identifier("#0")
-            .with_stack("nonexistent");
+            .with_view("nonexistent");
         let result = cmd.run();
 
         assert!(result.is_err());

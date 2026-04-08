@@ -59,7 +59,7 @@ pub mod table;
 // Re-export commonly used items for convenience
 pub use colors::{
     added, author, command, conflict, deleted, emphasis, error, hash, hint, info, modified, path,
-    renamed, stack, success, timestamp, untracked, warning, ColorMode, StatusChar,
+    renamed, success, timestamp, untracked, view, warning, ColorMode, StatusChar,
 };
 
 pub use table::{Alignment, Column, KeyValueTable, Row, Table};
@@ -288,7 +288,7 @@ mod tests {
         let _ = modified("test");
         let _ = path("test");
         let _ = hash("test");
-        let _ = stack("test");
+        let _ = view("test");
         let _ = timestamp("test");
         let _ = author("test");
         let _ = emphasis("test");

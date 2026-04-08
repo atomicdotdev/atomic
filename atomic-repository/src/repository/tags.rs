@@ -48,7 +48,7 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let view_name = options.stack.as_deref().unwrap_or(&self.current_view);
+        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
         let view = txn
             .get_view(view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
@@ -144,7 +144,7 @@ impl Repository {
     /// The `Tag` if found in any view, or `None` if not.
     pub fn get_tag_any_view(&self, name: &str) -> Result<Option<Tag>, RepositoryError> {
         let tags_dir = self.dot_dir.join("tags");
-        crate::tags::load_tag_any_stack(&tags_dir, name)
+        crate::tags::load_tag_any_view(&tags_dir, name)
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
@@ -189,8 +189,7 @@ impl Repository {
     /// A vector of view names that have at least one tag.
     pub fn list_tag_views(&self) -> Result<Vec<String>, RepositoryError> {
         let tags_dir = self.dot_dir.join("tags");
-        crate::tags::list_tag_stacks(&tags_dir)
-            .map_err(|e| RepositoryError::Database(e.to_string()))
+        crate::tags::list_tag_views(&tags_dir).map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
     /// List tags matching a filter.

@@ -111,7 +111,10 @@ mod tests;
 pub const DOT_DIR: &str = ".atomic";
 
 /// The default view name
-pub const DEFAULT_STACK: &str = "dev";
+pub const DEFAULT_VIEW: &str = "dev";
+
+/// Backward-compatible alias for [`DEFAULT_VIEW`].
+pub const DEFAULT_STACK: &str = DEFAULT_VIEW;
 
 /// Subdirectory inside `.atomic/` that holds per-view workspace state.
 ///
@@ -211,10 +214,10 @@ impl Repository {
         let initial_config = format!(
             r#"# Atomic repository configuration
 
-[stack]
+[view]
 default = "{}"
 "#,
-            DEFAULT_STACK
+            DEFAULT_VIEW
         );
         std::fs::write(&config_path, initial_config)?;
 
@@ -233,12 +236,12 @@ default = "{}"
             let mut txn = pristine
                 .write_txn()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            txn.open_or_create_view(DEFAULT_STACK)
+            txn.open_or_create_view(DEFAULT_VIEW)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             txn.commit()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
         }
-        ensure_workspace_dir(&dot_dir, DEFAULT_STACK)?;
+        ensure_workspace_dir(&dot_dir, DEFAULT_VIEW)?;
 
         // Initialize the change store
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
@@ -247,7 +250,7 @@ default = "{}"
         Ok(Self {
             root,
             dot_dir,
-            current_view: DEFAULT_STACK.to_string(),
+            current_view: DEFAULT_VIEW.to_string(),
             pristine,
             change_store,
         })

@@ -1,6 +1,6 @@
 //! Tag management for Atomic VCS.
 //!
-//! Tags are named snapshots of a stack's state at a particular point in time.
+//! Tags are named snapshots of a view's state at a particular point in time.
 //! This module provides CRUD operations and query functions for tags.
 
 mod queries;
@@ -11,8 +11,8 @@ mod tests;
 
 // Re-export all public types and functions
 pub use queries::{
-    count_all_tags, count_tags, list_all_tags, list_tag_stacks, list_tags, list_tags_filtered,
-    load_tag_any_stack,
+    count_all_tags, count_tags, list_all_tags, list_tag_views, list_tags, list_tags_filtered,
+    load_tag_any_view,
 };
 pub use types::{
     matches_pattern, validate_tag_name, Tag, TagError, TagFilter, TagOptions, TagResult, TagSort,
@@ -20,45 +20,54 @@ pub use types::{
 
 use std::path::{Path, PathBuf};
 
+// Backward-compatible aliases
+pub use queries::list_tag_views as list_tag_stacks;
+pub use queries::load_tag_any_view as load_tag_any_stack;
+
 // ============================================================================
 // TAG FILE PATH HELPERS
 // ============================================================================
 
-/// Get the path for a tag file (per-stack storage).
+/// Get the path for a tag file (per-view storage).
 ///
-/// Tags are stored in a per-stack directory structure:
-/// `{tags_dir}/{stack}/{name}.tag`
+/// Tags are stored in a per-view directory structure:
+/// `{tags_dir}/{view}/{name}.tag`
 ///
-/// This allows the same tag name to exist in different stacks,
-/// enabling stack-specific releases and milestones.
-pub fn tag_file_path(tags_dir: &Path, stack: &str, name: &str) -> PathBuf {
-    tags_dir.join(stack).join(format!("{}.tag", name))
+/// This allows the same tag name to exist in different views,
+/// enabling view-specific releases and milestones.
+pub fn tag_file_path(tags_dir: &Path, view: &str, name: &str) -> PathBuf {
+    tags_dir.join(view).join(format!("{}.tag", name))
 }
 
-/// Get the stack directory for tags.
-pub fn stack_tags_dir(tags_dir: &Path, stack: &str) -> PathBuf {
-    tags_dir.join(stack)
+/// Get the view directory for tags.
+pub fn view_tags_dir(tags_dir: &Path, view: &str) -> PathBuf {
+    tags_dir.join(view)
+}
+
+/// Backward-compatible alias for [`view_tags_dir`].
+pub fn stack_tags_dir(tags_dir: &Path, view: &str) -> PathBuf {
+    view_tags_dir(tags_dir, view)
 }
 
 // ============================================================================
 // SAVE OPERATIONS
 // ============================================================================
 
-/// Save a tag to a file (per-stack storage).
+/// Save a tag to a file (per-view storage).
 ///
-/// The tag is saved to `{tags_dir}/{tag.stack}/{tag.name}.tag`.
-/// The stack directory is created if it doesn't exist.
+/// The tag is saved to `{tags_dir}/{tag.view}/{tag.name}.tag`.
+/// The view directory is created if it doesn't exist.
 ///
 /// # Errors
 ///
 /// Returns `TagError::AlreadyExists` if a tag with the same name
-/// already exists in the same stack.
+/// already exists in the same view.
 pub fn save_tag(tags_dir: &Path, tag: &Tag) -> TagResult<()> {
-    // Ensure stack directory exists
-    let stack_dir = stack_tags_dir(tags_dir, &tag.stack);
-    std::fs::create_dir_all(&stack_dir)?;
+    // Ensure view directory exists
+    let view_dir = view_tags_dir(tags_dir, &tag.view);
+    std::fs::create_dir_all(&view_dir)?;
 
-    let path = tag_file_path(tags_dir, &tag.stack, &tag.name);
+    let path = tag_file_path(tags_dir, &tag.view, &tag.name);
 
     // Check for existing tag
     if path.exists() {
@@ -75,15 +84,15 @@ pub fn save_tag(tags_dir: &Path, tag: &Tag) -> TagResult<()> {
     Ok(())
 }
 
-/// Save a tag to a file, optionally overwriting (per-stack storage).
+/// Save a tag to a file, optionally overwriting (per-view storage).
 ///
-/// The tag is saved to `{tags_dir}/{tag.stack}/{tag.name}.tag`.
+/// The tag is saved to `{tags_dir}/{tag.view}/{tag.name}.tag`.
 pub fn save_tag_force(tags_dir: &Path, tag: &Tag, force: bool) -> TagResult<()> {
-    // Ensure stack directory exists
-    let stack_dir = stack_tags_dir(tags_dir, &tag.stack);
-    std::fs::create_dir_all(&stack_dir)?;
+    // Ensure view directory exists
+    let view_dir = view_tags_dir(tags_dir, &tag.view);
+    std::fs::create_dir_all(&view_dir)?;
 
-    let path = tag_file_path(tags_dir, &tag.stack, &tag.name);
+    let path = tag_file_path(tags_dir, &tag.view, &tag.name);
 
     // Check for existing tag
     if path.exists() && !force {
@@ -104,13 +113,13 @@ pub fn save_tag_force(tags_dir: &Path, tag: &Tag, force: bool) -> TagResult<()> 
 // LOAD OPERATIONS
 // ============================================================================
 
-/// Load a tag from a file (per-stack storage).
+/// Load a tag from a file (per-view storage).
 ///
 /// # Returns
 ///
 /// The loaded `Tag`, or `None` if not found.
-pub fn load_tag(tags_dir: &Path, stack: &str, name: &str) -> TagResult<Option<Tag>> {
-    let path = tag_file_path(tags_dir, stack, name);
+pub fn load_tag(tags_dir: &Path, view: &str, name: &str) -> TagResult<Option<Tag>> {
+    let path = tag_file_path(tags_dir, view, name);
 
     if !path.exists() {
         return Ok(None);
@@ -128,13 +137,13 @@ pub fn load_tag(tags_dir: &Path, stack: &str, name: &str) -> TagResult<Option<Ta
 // DELETE OPERATIONS
 // ============================================================================
 
-/// Delete a tag file (per-stack storage).
+/// Delete a tag file (per-view storage).
 ///
 /// # Returns
 ///
 /// `Ok(true)` if deleted, `Ok(false)` if not found.
-pub fn delete_tag(tags_dir: &Path, stack: &str, name: &str) -> TagResult<bool> {
-    let path = tag_file_path(tags_dir, stack, name);
+pub fn delete_tag(tags_dir: &Path, view: &str, name: &str) -> TagResult<bool> {
+    let path = tag_file_path(tags_dir, view, name);
 
     if !path.exists() {
         return Ok(false);
@@ -142,12 +151,12 @@ pub fn delete_tag(tags_dir: &Path, stack: &str, name: &str) -> TagResult<bool> {
 
     std::fs::remove_file(&path)?;
 
-    // Clean up empty stack directory
-    let stack_dir = stack_tags_dir(tags_dir, stack);
-    if stack_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&stack_dir) {
+    // Clean up empty view directory
+    let view_dir = view_tags_dir(tags_dir, view);
+    if view_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&view_dir) {
             if entries.count() == 0 {
-                let _ = std::fs::remove_dir(&stack_dir);
+                let _ = std::fs::remove_dir(&view_dir);
             }
         }
     }

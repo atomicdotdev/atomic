@@ -1,7 +1,7 @@
-//! The `unrecord` command for removing changes from a stack.
+//! The `unrecord` command for removing changes from a view.
 //!
 //! This module implements the `atomic unrecord` command, which removes
-//! the most recent change (or a specific change) from the current stack's
+//! the most recent change (or a specific change) from the current view's
 //! change log. The change itself is NOT deleted from the change store —
 //! it can be re-inserted later via `atomic insert`.
 //!
@@ -48,20 +48,20 @@ use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_success, print_warning};
 
-/// Remove the last change from the current stack.
+/// Remove the last change from the current view.
 ///
-/// The change is removed from the stack's change log but NOT deleted
+/// The change is removed from the view's change log but NOT deleted
 /// from the change store. It can be re-inserted later with `atomic insert`.
 ///
 /// This is the inverse of `atomic record` — it "un-records" a change,
-/// reverting the stack to the state before that change was applied.
+/// reverting the view to the state before that change was applied.
 /// The working copy is NOT modified; files remain on disk as-is.
 ///
 /// # Workflow
 ///
 /// ```text
 /// atomic record -m "oops"   # record a change
-/// atomic unrecord            # remove it from the stack
+/// atomic unrecord            # remove it from the view
 /// # fix the issue
 /// atomic record -m "fixed"  # record the corrected version
 /// ```
@@ -70,7 +70,7 @@ use crate::output::{print_success, print_warning};
 pub struct Unrecord {
     /// Hash or prefix of the change to unrecord.
     ///
-    /// If not specified, the most recent change on the current stack
+    /// If not specified, the most recent change on the current view
     /// is unrecorded. Provide a hash prefix to unrecord a specific change.
     #[arg(value_name = "CHANGE")]
     pub change: Option<String>,
@@ -111,7 +111,7 @@ impl Command for Unrecord {
                     if msg.contains("empty") || msg.contains("Empty") =>
                 {
                     CliError::InvalidArgument {
-                        message: "Stack is empty — nothing to unrecord".to_string(),
+                        message: "View is empty — nothing to unrecord".to_string(),
                     }
                 }
                 other => CliError::Repository(other),

@@ -235,8 +235,8 @@ pub struct ArchiveOptions {
     /// State to archive (None = current state).
     pub state: Option<Merkle>,
 
-    /// Stack to use (None = current stack).
-    pub stack: Option<String>,
+    /// View to use (None = current view).
+    pub view: Option<String>,
 
     /// Prefix to add to all paths in the archive.
     pub prefix: Option<String>,
@@ -280,7 +280,7 @@ impl Default for ArchiveOptions {
         Self {
             format: ArchiveFormat::default(),
             state: None,
-            stack: None,
+            view: None,
             prefix: None,
             include: Vec::new(),
             exclude: Vec::new(),
@@ -315,9 +315,9 @@ impl ArchiveOptions {
         self
     }
 
-    /// Set the stack to use.
-    pub fn stack(mut self, name: impl Into<String>) -> Self {
-        self.stack = Some(name.into());
+    /// Set the view to use.
+    pub fn view(mut self, name: impl Into<String>) -> Self {
+        self.view = Some(name.into());
         self
     }
 

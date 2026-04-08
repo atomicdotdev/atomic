@@ -88,7 +88,7 @@
 //! ```rust,ignore
 //! use atomic_core::record::{RecordContext, DetectOptions};
 //!
-//! let ctx = RecordContext::new(&txn, &stack, &working_copy, &changes);
+//! let ctx = RecordContext::new(&txn, &view, &working_copy, &changes);
 //! ```
 //!
 //! ## Step 2: Configure Detection

@@ -32,7 +32,7 @@
 //! │    - Globalize positions → graph vertices                                │
 //! │    - Write change to RedbChangeStore                                     │
 //! │    - Apply to graph (GRAPH, TREE, INODES tables)                         │
-//! │    - Update stack sequence                                               │
+//! │    - Update view sequence                                               │
 //! ├──────────────────────────────────────────────────────────────────────────┤
 //! │  Phase 3: FINALIZE  (verification)                                       │
 //! │                                                                          │

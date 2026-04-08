@@ -1041,7 +1041,7 @@ default = true"#;
         // Create initial config with other sections
         let initial = r#"# Atomic repository configuration
 
-[stack]
+[view]
 default = "dev"
 
 [other]
@@ -1058,7 +1058,7 @@ key = "value"
 
         // Verify other sections are preserved
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("[stack]"));
+        assert!(content.contains("[view]"));
         assert!(content.contains("[other]"));
         assert!(content.contains("[remotes.origin]") || content.contains("[remotes]"));
     }

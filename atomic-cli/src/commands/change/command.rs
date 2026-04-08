@@ -9,7 +9,7 @@ use super::*;
 ///
 /// - **Full hash**: The complete 52-character Base32 hash
 /// - **Hash prefix**: An unambiguous prefix (minimum 4 characters)
-/// - **Sequence number**: Index in the stack's history (`42` or `#42`)
+/// - **Sequence number**: Index in the view's history (`42` or `#42`)
 ///
 /// If no identifier is provided, shows the most recent change.
 ///
@@ -33,17 +33,17 @@ use super::*;
 pub struct ChangeCmd {
     /// Change identifier (hash, hash prefix, or sequence number).
     ///
-    /// If omitted, shows the most recent change on the current stack.
+    /// If omitted, shows the most recent change on the current view.
     /// Sequence numbers can be prefixed with `#` (e.g., `#42`).
     #[arg(value_name = "HASH_OR_SEQ")]
     pub identifier: Option<String>,
 
-    /// Stack to use for sequence lookup.
+    /// View to use for sequence lookup.
     ///
-    /// When looking up by sequence number, use this stack instead
-    /// of the current stack.
-    #[arg(long = "stack", value_name = "NAME")]
-    pub stack: Option<String>,
+    /// When looking up by sequence number, use this view instead
+    /// of the current view.
+    #[arg(long = "view", value_name = "NAME")]
+    pub view: Option<String>,
 
     /// Output format.
     ///
@@ -84,7 +84,7 @@ impl ChangeCmd {
     pub fn new() -> Self {
         Self {
             identifier: None,
-            stack: None,
+            view: None,
             format: ChangeFormat::Default,
             show_deps: false,
             show_hunks: false,
@@ -99,9 +99,9 @@ impl ChangeCmd {
         self
     }
 
-    /// Builder: set the stack.
-    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
-        self.stack = Some(stack.into());
+    /// Builder: set the view.
+    pub fn with_view(mut self, view: impl Into<String>) -> Self {
+        self.view = Some(view.into());
         self
     }
 
@@ -158,7 +158,7 @@ impl ChangeCmd {
         let id = ChangeIdentifier::parse(self.identifier.as_deref())
             .map_err(|e| CliError::InvalidArgument { message: e })?;
 
-        let stack_name = self.stack.as_deref().unwrap_or_else(|| repo.current_view());
+        let view_name = self.view.as_deref().unwrap_or_else(|| repo.current_view());
 
         match id {
             ChangeIdentifier::FullHash(hash) => {
@@ -170,22 +170,22 @@ impl ChangeCmd {
                 }
 
                 // Try to find sequence number
-                let seq = self.find_sequence_for_hash(repo, stack_name, &hash)?;
+                let seq = self.find_sequence_for_hash(repo, view_name, &hash)?;
                 Ok((hash, seq))
             }
 
             ChangeIdentifier::HashPrefix(prefix) => {
-                let (hash, seq) = self.resolve_hash_prefix(repo, stack_name, &prefix)?;
+                let (hash, seq) = self.resolve_hash_prefix(repo, view_name, &prefix)?;
                 Ok((hash, seq))
             }
 
             ChangeIdentifier::Sequence(seq) => {
-                let hash = self.resolve_sequence(repo, stack_name, seq)?;
+                let hash = self.resolve_sequence(repo, view_name, seq)?;
                 Ok((hash, Some(seq)))
             }
 
             ChangeIdentifier::Latest => {
-                let (hash, seq) = self.get_latest_change(repo, stack_name)?;
+                let (hash, seq) = self.get_latest_change(repo, view_name)?;
                 Ok((hash, Some(seq)))
             }
         }
@@ -195,7 +195,7 @@ impl ChangeCmd {
     fn find_sequence_for_hash(
         &self,
         repo: &Repository,
-        stack_name: &str,
+        view_name: &str,
         hash: &Hash,
     ) -> CliResult<Option<u64>> {
         let txn = repo
@@ -203,14 +203,14 @@ impl ChangeCmd {
             .read_txn()
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
 
-        let stack = txn
-            .get_view(stack_name)
+        let view = txn
+            .get_view(view_name)
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?
             .ok_or_else(|| CliError::ViewNotFound {
-                name: stack_name.to_string(),
+                name: view_name.to_string(),
             })?;
 
-        find_change_sequence(&txn, &stack, hash)
+        find_change_sequence(&txn, &view, hash)
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))
     }
 
@@ -218,7 +218,7 @@ impl ChangeCmd {
     fn resolve_hash_prefix(
         &self,
         repo: &Repository,
-        stack_name: &str,
+        view_name: &str,
         prefix: &str,
     ) -> CliResult<(Hash, Option<u64>)> {
         // Search for matching changes
@@ -238,7 +238,7 @@ impl ChangeCmd {
             }),
             1 => {
                 let hash = matches[0];
-                let seq = self.find_sequence_for_hash(repo, stack_name, &hash)?;
+                let seq = self.find_sequence_for_hash(repo, view_name, &hash)?;
                 Ok((hash, seq))
             }
             _ => {
@@ -252,20 +252,20 @@ impl ChangeCmd {
     }
 
     /// Resolve a sequence number to a hash.
-    fn resolve_sequence(&self, repo: &Repository, stack_name: &str, seq: u64) -> CliResult<Hash> {
+    fn resolve_sequence(&self, repo: &Repository, view_name: &str, seq: u64) -> CliResult<Hash> {
         let txn = repo
             .pristine()
             .read_txn()
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
 
-        let stack = txn
-            .get_view(stack_name)
+        let view = txn
+            .get_view(view_name)
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?
             .ok_or_else(|| CliError::ViewNotFound {
-                name: stack_name.to_string(),
+                name: view_name.to_string(),
             })?;
 
-        let entry = get_change_at_sequence(&txn, &stack, seq).map_err(|e| match e {
+        let entry = get_change_at_sequence(&txn, &view, seq).map_err(|e| match e {
             atomic_repository::history::HistoryError::SequenceOutOfRange { sequence, max } => {
                 CliError::InvalidArgument {
                     message: format!(
@@ -283,25 +283,25 @@ impl ChangeCmd {
     }
 
     /// Get the most recent change on the view.
-    fn get_latest_change(&self, repo: &Repository, stack_name: &str) -> CliResult<(Hash, u64)> {
+    fn get_latest_change(&self, repo: &Repository, view_name: &str) -> CliResult<(Hash, u64)> {
         let txn = repo
             .pristine()
             .read_txn()
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
 
-        let stack = txn
-            .get_view(stack_name)
+        let view = txn
+            .get_view(view_name)
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?
             .ok_or_else(|| CliError::ViewNotFound {
-                name: stack_name.to_string(),
+                name: view_name.to_string(),
             })?;
 
-        if stack.change_count == 0 {
+        if view.change_count == 0 {
             return Err(CliError::NothingToRecord);
         }
 
-        let seq = stack.change_count - 1;
-        let entry = get_change_at_sequence(&txn, &stack, seq)
+        let seq = view.change_count - 1;
+        let entry = get_change_at_sequence(&txn, &view, seq)
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
 
         Ok((entry.hash, seq))

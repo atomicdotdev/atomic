@@ -183,7 +183,7 @@ impl Command for AgentStatus {
                         println!("      Transcript: {}", path.display());
                     }
                     println!(
-                        "      View turn: atomic change -p --stack {}",
+                        "      View turn: atomic change -p --view {}",
                         session.view_name
                     );
                     println!();
@@ -224,7 +224,7 @@ impl Command for AgentStatus {
                         println!("      Files touched: {}", session.files_touched.len());
                     }
                     println!(
-                        "      View turn: atomic change -p --stack {}",
+                        "      View turn: atomic change -p --view {}",
                         session.view_name
                     );
                     println!();

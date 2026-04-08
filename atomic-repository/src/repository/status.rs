@@ -43,7 +43,7 @@ impl Repository {
     /// }
     /// ```
     pub fn status(&self, options: StatusOptions) -> Result<RepositoryStatus, RepositoryError> {
-        // Get the current stack state
+        // Get the current view state
         let txn = self
             .pristine
             .read_txn()

@@ -67,9 +67,9 @@ pub struct Diff {
     #[arg(long, hide = true)]
     pub cached: bool,
 
-    /// Stack to compare against.
+    /// View to compare against.
     #[arg(long)]
-    pub stack: Option<String>,
+    pub view: Option<String>,
 
     /// Enable token-level diff highlighting (CRDT-powered).
     ///
@@ -94,7 +94,7 @@ impl Diff {
             short: false,
             untracked: false,
             cached: false,
-            stack: None,
+            view: None,
             word_diff: false,
         }
     }
@@ -151,9 +151,9 @@ impl Diff {
         self
     }
 
-    /// Builder: set the stack to compare against.
-    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
-        self.stack = Some(stack.into());
+    /// Builder: set the view to compare against.
+    pub fn with_view(mut self, view: impl Into<String>) -> Self {
+        self.view = Some(view.into());
         self
     }
 

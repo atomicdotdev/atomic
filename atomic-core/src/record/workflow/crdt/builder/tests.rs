@@ -9,7 +9,7 @@ mod tests {
         CrdtBuildError, CrdtBuildStats, CrdtChangeBuilder, CrdtChangeResult, FileOps, LineOps,
         TokenOps,
     };
-    use crate::record::workflow::crdt::line_ops::{LineChange, LineChangeKind};
+    use crate::record::workflow::crdt::line_ops::LineChange;
     use crate::types::NodeId;
 
     // ------------------------------------------------------------------------

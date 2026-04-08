@@ -7,7 +7,7 @@ fn test_repo_create_tag() {
     let tag = repo.create_tag("v1.0.0", TagOptions::default()).unwrap();
 
     assert_eq!(tag.name, "v1.0.0");
-    assert_eq!(tag.stack, DEFAULT_STACK);
+    assert_eq!(tag.view, DEFAULT_STACK);
     assert!(!tag.is_annotated());
 }
 

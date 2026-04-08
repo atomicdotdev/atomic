@@ -6,8 +6,8 @@
 //!
 //! # Sub-modules
 //!
-//! - [`batch`]: `StoredSection` type for layer-selective reads
-//! - [`queries`]: Read-only query/stats/export operations on the store
+//! - `batch`: `StoredSection` type for layer-selective reads
+//! - `queries`: Read-only query/stats/export operations on the store
 
 mod batch;
 mod queries;

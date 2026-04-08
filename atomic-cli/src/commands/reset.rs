@@ -1,7 +1,7 @@
 //! The `reset` command for restoring working copy to pristine state.
 //!
 //! This module implements the `atomic reset` command, which restores the working
-//! copy to match the pristine state (last recorded state in the stack).
+//! copy to match the pristine state (last recorded state in the view).
 //!
 //! # Usage
 //!
@@ -12,7 +12,7 @@
 //!   [FILES]...  Optional files/directories to reset (default: all)
 //!
 //! Options:
-//!       --stack <STACK>  Reset to a specific stack and switch to it
+//!       --view <VIEW>    Reset to a specific view and switch to it
 //!   -n, --dry-run        Preview what would be reset without changes
 //!   -f, --force          Force reset even with uncommitted changes
 //!   -h, --help           Print help information
@@ -22,9 +22,9 @@
 //!
 //! The `reset` command:
 //! 1. Compares working copy with pristine state
-//! 2. Restores files to match the stack state
+//! 2. Restores files to match the view state
 //! 3. Discards any unrecorded modifications
-//! 4. Optionally switches to a different stack
+//! 4. Optionally switches to a different view
 //!
 //! **Warning**: Reset discards uncommitted changes permanently.
 //!
@@ -44,11 +44,11 @@
 //! ✓ Reset 1 file
 //! ```
 //!
-//! Switch stacks:
+//! Switch views:
 //! ```text
-//! $ atomic reset --stack main
-//! Switching to stack 'main'...
-//! ✓ Reset working copy to stack 'main'
+//! $ atomic reset --view main
+//! Switching to view 'main'...
+//! ✓ Reset working copy to view 'main'
 //! ```
 //!
 //! Dry run (preview):
@@ -73,14 +73,14 @@ use crate::output::{print_hint, print_success, print_warning};
 /// Reset the working copy to the last recorded state.
 ///
 /// The `reset` command restores the working copy to match the pristine state
-/// (the last recorded state in the stack). This discards any uncommitted
+/// (the last recorded state in the view). This discards any uncommitted
 /// changes.
 ///
 /// # Behavior
 ///
 /// - Without arguments: Resets entire working copy
 /// - With file arguments: Resets only specified files
-/// - With `--stack`: Switches to that stack and resets
+/// - With `--view`: Switches to that view and resets
 ///
 /// # Warning
 ///
@@ -95,12 +95,12 @@ pub struct Reset {
     #[arg(value_name = "FILES")]
     pub files: Vec<String>,
 
-    /// Reset to a specific stack and switch to it.
+    /// Reset to a specific view and switch to it.
     ///
-    /// The working copy will be updated to match the specified stack's
+    /// The working copy will be updated to match the specified view's
     /// pristine state.
     #[arg(long)]
-    pub stack: Option<String>,
+    pub view: Option<String>,
 
     /// Dry run - show what would be reset without doing it.
     ///
@@ -122,7 +122,7 @@ impl Reset {
     pub fn new() -> Self {
         Self {
             files: Vec::new(),
-            stack: None,
+            view: None,
             dry_run: false,
             force: false,
         }
@@ -138,9 +138,9 @@ impl Reset {
         self
     }
 
-    /// Builder: set the stack to reset to.
-    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
-        self.stack = Some(stack.into());
+    /// Builder: set the view to reset to.
+    pub fn with_view(mut self, view: impl Into<String>) -> Self {
+        self.view = Some(view.into());
         self
     }
 
@@ -281,16 +281,16 @@ impl Reset {
     }
 
     /// Switch to a different view.
-    fn switch_stack(&self, repo: &mut Repository, stack_name: &str) -> CliResult<()> {
+    fn switch_view(&self, repo: &mut Repository, view_name: &str) -> CliResult<()> {
         // Check view exists
-        if !repo.view_exists(stack_name).map_err(CliError::Repository)? {
+        if !repo.view_exists(view_name).map_err(CliError::Repository)? {
             return Err(CliError::ViewNotFound {
-                name: stack_name.to_string(),
+                name: view_name.to_string(),
             });
         }
 
         // Switch view
-        repo.set_current_view(stack_name)
+        repo.set_current_view(view_name)
             .map_err(CliError::Repository)?;
 
         Ok(())
@@ -310,7 +310,7 @@ impl Command for Reset {
     ///
     /// 1. Find and open the repository
     /// 2. Check for uncommitted changes (unless --force)
-    /// 3. If --stack, switch to that stack
+    /// 3. If --view, switch to that view
     /// 4. Determine files to reset
     /// 5. If --dry-run, preview changes
     /// 6. Otherwise, reset files to pristine state
@@ -337,13 +337,13 @@ impl Command for Reset {
             )));
         }
 
-        // Handle stack switching
-        if let Some(ref stack_name) = self.stack {
+        // Handle view switching
+        if let Some(ref view_name) = self.view {
             if !self.dry_run {
-                println!("Switching to view '{}'...", stack_name);
-                self.switch_stack(&mut repo, stack_name)?;
+                println!("Switching to view '{}'...", view_name);
+                self.switch_view(&mut repo, view_name)?;
             } else {
-                println!("Would switch to view '{}'", stack_name);
+                println!("Would switch to view '{}'", view_name);
             }
         }
 
@@ -375,10 +375,10 @@ impl Command for Reset {
 
         // Check if there's anything to reset
         if files_to_reset.is_empty() {
-            if let Some(stack) = &self.stack {
+            if let Some(view) = &self.view {
                 print_success(&format!(
                     "Switched to view '{}' (working copy already clean)",
-                    stack
+                    view
                 ));
             } else {
                 println!("Nothing to reset - working copy is clean");
@@ -414,11 +414,11 @@ impl Command for Reset {
         // Summary
         println!();
         if reset_count > 0 {
-            if let Some(ref stack_name) = self.stack {
+            if let Some(ref view_name) = self.view {
                 print_success(&format!(
-                    "Reset {} to stack '{}'",
+                    "Reset {} to view '{}'",
                     format_count(reset_count, "file"),
-                    stack_name
+                    view_name
                 ));
             } else {
                 print_success(&format!("Reset {}", format_count(reset_count, "file")));
@@ -457,7 +457,7 @@ mod tests {
     fn test_reset_new() {
         let cmd = Reset::new();
         assert!(cmd.files.is_empty());
-        assert!(cmd.stack.is_none());
+        assert!(cmd.view.is_none());
         assert!(!cmd.dry_run);
         assert!(!cmd.force);
     }
@@ -466,7 +466,7 @@ mod tests {
     fn test_reset_default() {
         let cmd = Reset::default();
         assert!(cmd.files.is_empty());
-        assert!(cmd.stack.is_none());
+        assert!(cmd.view.is_none());
         assert!(!cmd.dry_run);
         assert!(!cmd.force);
     }
@@ -480,9 +480,9 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_with_stack() {
-        let cmd = Reset::new().with_stack("main");
-        assert_eq!(cmd.stack, Some("main".to_string()));
+    fn test_reset_with_view() {
+        let cmd = Reset::new().with_view("main");
+        assert_eq!(cmd.view, Some("main".to_string()));
     }
 
     #[test]
@@ -501,12 +501,12 @@ mod tests {
     fn test_reset_builder_chain() {
         let cmd = Reset::new()
             .with_files(vec!["src/main.rs".to_string()])
-            .with_stack("feature")
+            .with_view("feature")
             .with_dry_run(true)
             .with_force(true);
 
         assert_eq!(cmd.files, vec!["src/main.rs"]);
-        assert_eq!(cmd.stack, Some("feature".to_string()));
+        assert_eq!(cmd.view, Some("feature".to_string()));
         assert!(cmd.dry_run);
         assert!(cmd.force);
     }
@@ -616,12 +616,12 @@ mod tests {
     fn test_reset_clone() {
         let cmd = Reset::new()
             .with_files(vec!["file.txt".to_string()])
-            .with_stack("main")
+            .with_view("main")
             .with_force(true);
         let cloned = cmd.clone();
 
         assert_eq!(cloned.files, cmd.files);
-        assert_eq!(cloned.stack, cmd.stack);
+        assert_eq!(cloned.view, cmd.view);
         assert_eq!(cloned.force, cmd.force);
     }
 }

@@ -61,7 +61,7 @@ pub enum HistoryError {
 
 /// A single entry in the history log.
 ///
-/// Each entry represents a change that was applied to the stack at a specific
+/// Each entry represents a change that was applied to the view at a specific
 /// point in time. The entry includes:
 ///
 /// - The sequence number (position in the log)

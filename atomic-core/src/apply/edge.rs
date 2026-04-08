@@ -159,7 +159,7 @@ fn write_new_edge<T: MutTxnT>(
     let kind = EdgeKind::from_flags(edge.flag);
 
     // Track folder files for conflict detection
-    if kind.map_or(false, |k| k.is_folder()) {
+    if kind.is_some_and(|k| k.is_folder()) {
         workspace.mark_rooted(target.start_pos());
     }
 
@@ -175,7 +175,7 @@ fn write_new_edge<T: MutTxnT>(
     }
 
     // Handle deletion: collect pseudo-edges for reconnection
-    if kind.map_or(false, |k| k.is_deleted()) {
+    if kind.is_some_and(|k| k.is_deleted()) {
         collect_pseudo_edges_for_reconnection(txn, workspace, target)?;
     }
 
@@ -194,7 +194,7 @@ fn write_new_edge<T: MutTxnT>(
     add_edge_with_reverse(txn, resolved_inode, edge.flag, source, target, change_id)?;
 
     // For non-folder deletions, check for zombie context
-    if kind.map_or(false, |k| k.is_deleted() && !k.is_folder()) {
+    if kind.is_some_and(|k| k.is_deleted() && !k.is_folder()) {
         collect_zombie_context(txn, workspace, change, edge, change_id)?;
     }
 

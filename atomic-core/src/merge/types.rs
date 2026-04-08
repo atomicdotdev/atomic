@@ -40,7 +40,7 @@ pub struct ConflictGroup {
     /// its children. When two children have no ordering between them, that's a
     /// conflict. The parent is the vertex we were traversing *from*.
     ///
-    /// This is needed by [`SemanticMergeEngine::find_ancestor`] to locate the
+    /// This is needed by `SemanticMergeEngine::find_ancestor` to locate the
     /// dead vertex that both competing changes deleted.
     pub parent: Option<GraphNode<NodeId>>,
     /// The branch (line) these vertices belong to, if known.

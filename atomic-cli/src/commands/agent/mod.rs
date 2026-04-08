@@ -172,7 +172,7 @@ pub enum AgentCommands {
     ///
     /// Shows graph-level audit nodes that capture AI cost, token usage,
     /// model breakdown, and which changes are covered. Attestations
-    /// transcend stacks — they're project-level audit data.
+    /// transcend views — they're project-level audit data.
     ///
     /// # Examples
     ///
@@ -183,8 +183,8 @@ pub enum AgentCommands {
     /// # Show details for a specific attestation
     /// atomic agent attest --hash XMJZ3IPF
     ///
-    /// # Show attestations for a stack
-    /// atomic agent attest --stack dev
+    /// # Show attestations for a view
+    /// atomic agent attest --view dev
     ///
     /// # Verbose output with model breakdown
     /// atomic agent attest --verbose

@@ -89,7 +89,7 @@ impl From<&Author> for JsonAuthor {
 /// suitable for machine parsing and scripting.
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonLogEntry {
-    /// The sequence number in the stack.
+    /// The sequence number in the view.
     pub sequence: u64,
 
     /// The change hash (full Base32 encoding).

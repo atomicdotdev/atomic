@@ -74,7 +74,7 @@ pub enum ClonePhase {
     /// Downloading changes from the remote.
     Downloading,
 
-    /// Applying downloaded changes to the local stack.
+    /// Applying downloaded changes to the local view.
     Applying,
 
     /// Configuring the remote in repository settings.
@@ -192,7 +192,7 @@ impl Default for CloneProgress {
 /// - `bytes_transferred`: Total bytes received from the remote
 /// - `changes_skipped`: Number of changes that already existed locally
 /// - `changes_failed`: Number of changes that failed to download
-/// - `changes_applied`: Number of changes successfully applied to the stack
+/// - `changes_applied`: Number of changes successfully applied to the view
 ///
 /// # Example
 ///
@@ -239,7 +239,7 @@ pub struct CloneStats {
     /// issues, or other problems.
     pub changes_failed: usize,
 
-    /// Number of changes successfully applied to the local stack.
+    /// Number of changes successfully applied to the local view.
     ///
     /// This may differ from `changes_downloaded` if `--download-only` is used,
     /// or if some changes fail to apply.
@@ -289,7 +289,7 @@ impl CloneStats {
         self.changes_failed > 0
     }
 
-    /// Check if any changes were applied to the stack.
+    /// Check if any changes were applied to the view.
     ///
     /// # Returns
     ///
@@ -422,8 +422,8 @@ pub struct CloneOutcome {
     pub remote_state: Option<Merkle>,
     /// The local Merkle state after cloning.
     pub local_state: Option<Merkle>,
-    /// The stack name used for the clone.
-    pub stack: String,
+    /// The view name used for the clone.
+    pub view: String,
     /// The remote URL that was cloned.
     pub remote_url: String,
     /// Any warnings produced during the clone.
@@ -438,7 +438,7 @@ impl Default for CloneOutcome {
             download_only: false,
             remote_state: None,
             local_state: None,
-            stack: String::new(),
+            view: String::new(),
             remote_url: String::new(),
             warnings: Vec::new(),
         }
@@ -454,7 +454,7 @@ impl CloneOutcome {
             download_only: false,
             remote_state: None,
             local_state: None,
-            stack: String::new(),
+            view: String::new(),
             remote_url: String::new(),
             warnings: Vec::new(),
         }
@@ -468,7 +468,7 @@ impl CloneOutcome {
             download_only: true,
             remote_state: None,
             local_state: None,
-            stack: String::new(),
+            view: String::new(),
             remote_url: String::new(),
             warnings: Vec::new(),
         }
@@ -486,9 +486,9 @@ impl CloneOutcome {
         self
     }
 
-    /// Builder: set the stack name.
-    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
-        self.stack = stack.into();
+    /// Builder: set the view name.
+    pub fn with_view(mut self, view: impl Into<String>) -> Self {
+        self.view = view.into();
         self
     }
 
@@ -867,7 +867,7 @@ mod tests {
         assert_eq!(outcome.target_path, PathBuf::from("/tmp/repo"));
         assert!(outcome.remote_state.is_none());
         assert!(outcome.local_state.is_none());
-        assert!(outcome.stack.is_empty());
+        assert!(outcome.view.is_empty());
         assert!(outcome.remote_url.is_empty());
         assert!(!outcome.download_only);
         assert!(outcome.warnings.is_empty());
@@ -902,13 +902,13 @@ mod tests {
         assert_eq!(outcome.local_state, Some(state));
     }
 
-    /// Test setting stack.
+    /// Test setting view.
     #[test]
-    fn test_clone_outcome_with_stack() {
+    fn test_clone_outcome_with_view() {
         let outcome =
-            CloneOutcome::new(CloneStats::new(), PathBuf::from("/tmp/repo")).with_stack("main");
+            CloneOutcome::new(CloneStats::new(), PathBuf::from("/tmp/repo")).with_view("main");
 
-        assert_eq!(outcome.stack, "main");
+        assert_eq!(outcome.view, "main");
     }
 
     /// Test setting remote URL.
@@ -967,12 +967,12 @@ mod tests {
         let outcome = CloneOutcome::new(CloneStats::new(), PathBuf::from("/tmp/repo"))
             .with_remote_state(remote_state)
             .with_local_state(local_state)
-            .with_stack("main")
+            .with_view("main")
             .with_remote_url("https://example.com/repo");
 
         assert_eq!(outcome.remote_state, Some(remote_state));
         assert_eq!(outcome.local_state, Some(local_state));
-        assert_eq!(outcome.stack, "main");
+        assert_eq!(outcome.view, "main");
         assert_eq!(outcome.remote_url, "https://example.com/repo");
     }
 

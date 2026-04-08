@@ -29,7 +29,7 @@
 //! │  BuiltHunk                 GlobalizeContext              GraphOp<Option<H>>│
 //! │  ┌──────────────┐         ┌───────────────┐            ┌──────────────┐│
 //! │  │ path: String │         │ txn: &T       │            │ FileAdd {    ││
-//! │  │ line: u64    │  ────►  │ stack: &Stack │  ────►     │   add_name   ││
+//! │  │ line: u64    │  ────►  │ view: &View   │  ────►     │   add_name   ││
 //! │  │ kind: Insert │         │ content_pos   │            │   add_inode  ││
 //! │  │ content: ..  │         │ dependencies  │            │   contents   ││
 //! │  └──────────────┘         └───────────────┘            │ }            ││

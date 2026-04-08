@@ -6,8 +6,8 @@
 //! # Module Structure
 //!
 //! - [`mod@self`]: Core `HttpRemote` struct, configuration, and construction
-//! - [`queries`]: Read operations (state, changelist, downloads)
-//! - [`upload`]: Write operations (change upload, tag upload, fork)
+//! - `queries`: Read operations (state, changelist, downloads)
+//! - `upload`: Write operations (change upload, tag upload, fork)
 //!
 //! # Example
 //!
