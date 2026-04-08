@@ -54,7 +54,7 @@
 //! # Error Handling
 //!
 //! All write methods return [`FormatResult<()>`](super::error::FormatResult) (or
-//! [`FormatResult<WriteOutcome>`] for `finalize`). Errors include:
+//! `FormatResult<WriteOutcome>` for `finalize`). Errors include:
 //! - I/O errors from the underlying writer
 //! - Compression errors from zstd
 //! - Section ordering violations

@@ -287,9 +287,7 @@ impl CrdtChangeBuilder {
 
     /// Applies a line change from the analyzer.
     ///
-    /// This is the integration point between the [`LineAnalyzer`] and the builder.
-    ///
-    /// [`LineAnalyzer`]: super::line_ops::LineAnalyzer
+    /// This is the integration point between the `LineAnalyzer` and the builder.
     pub fn apply_line_change(&mut self, trunk_id: crate::crdt::TrunkId, change: &LineChange) {
         match change.kind() {
             LineChangeKind::Equal => {

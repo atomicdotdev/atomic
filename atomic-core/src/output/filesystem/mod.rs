@@ -1,7 +1,7 @@
 //! Filesystem-backed working copy implementation.
 //!
 //! Provides [`FileSystem`] which implements [`WorkingCopy`] and
-//! [`WorkingCopyRead`] for real filesystem operations, and [`FileWriter`]
+//! `WorkingCopyRead` for real filesystem operations, and [`FileWriter`]
 //! for buffered file output.
 
 mod paths;

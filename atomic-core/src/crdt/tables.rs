@@ -190,7 +190,7 @@ pub const BRANCH_VERTEX: TableDefinition<&[u8; 12], &[u8; 24]> =
 
 /// Graph vertex → BranchId reverse lookup
 ///
-/// Key: 24 bytes encoding GraphNode<NodeId> (change_id: u64, start: u64, end: u64)
+/// Key: 24 bytes encoding `GraphNode<NodeId>` (change_id: u64, start: u64, end: u64)
 /// Value: 12 bytes encoding BranchId (change_id: u64, branch_idx: u32)
 ///
 /// This is the reverse of BRANCH_VERTEX, enabling efficient lookup from a

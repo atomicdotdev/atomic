@@ -36,7 +36,7 @@ pub enum ThreeWayResult {
 
 /// A single token extracted from content bytes.
 ///
-/// This is an owned representation (unlike [`Token`] which borrows), so
+/// This is an owned representation (unlike `Token` which borrows), so
 /// that token sequences can outlive the input buffer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MergeToken {
