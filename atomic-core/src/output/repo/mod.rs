@@ -104,6 +104,7 @@ mod conflict;
 mod content;
 mod error;
 mod file;
+mod fork;
 mod options;
 mod outcome;
 mod repository;
@@ -112,7 +113,9 @@ mod writer;
 
 // Re-export all public types
 pub use conflict::{FileConflict, FileConflictType};
-pub use content::output_graph_content;
+pub use content::{
+    output_graph_content, output_graph_content_resolved, resolve_conflicts_semantically,
+};
 pub use error::{OutputError, OutputResult};
 pub use file::{
     output_file, output_file_to_buffer, output_file_to_buffer_with_options, FileOutputError,

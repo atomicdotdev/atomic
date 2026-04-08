@@ -188,6 +188,16 @@ pub const PATH_TRUNK: TableDefinition<&str, &[u8; 12]> = TableDefinition::new("c
 pub const BRANCH_VERTEX: TableDefinition<&[u8; 12], &[u8; 24]> =
     TableDefinition::new("crdt_branch_vertex");
 
+/// Graph vertex → BranchId reverse lookup
+///
+/// Key: 24 bytes encoding GraphNode<NodeId> (change_id: u64, start: u64, end: u64)
+/// Value: 12 bytes encoding BranchId (change_id: u64, branch_idx: u32)
+///
+/// This is the reverse of BRANCH_VERTEX, enabling efficient lookup from a
+/// graph vertex to its corresponding CRDT branch during semantic merge.
+pub const VERTEX_BRANCH: TableDefinition<&[u8; 24], &[u8; 12]> =
+    TableDefinition::new("crdt_vertex_branch");
+
 // ID Encoding/Decoding (12 bytes each)
 
 /// Encode a TrunkId as 12 bytes for storage.

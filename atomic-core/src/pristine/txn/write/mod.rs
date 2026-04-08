@@ -8,9 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use redb::{ReadableMultimapTable, ReadableTable, WriteTransaction};
 
 use crate::crdt::tables::{
-    decode_branch_value, decode_leaf_value, decode_trunk_value, decode_vertex_position,
-    SerializedBranch, SerializedLeaf, SerializedTrunk, BRANCHES, BRANCH_LEAVES, BRANCH_VERTEX,
-    INODE_TRUNK, LEAVES, PATH_TRUNK, TRUNKS, TRUNK_BRANCHES,
+    decode_branch_id, decode_branch_value, decode_leaf_value, decode_trunk_value,
+    decode_vertex_position, SerializedBranch, SerializedLeaf, SerializedTrunk, BRANCHES,
+    BRANCH_LEAVES, BRANCH_VERTEX, INODE_TRUNK, LEAVES, PATH_TRUNK, TRUNKS, TRUNK_BRANCHES,
+    VERTEX_BRANCH,
 };
 
 use crate::types::{
@@ -1241,6 +1242,32 @@ impl<'a> MutTxnT for WriteTxn<'a> {
                 let bytes: [u8; 24] = *value.value();
                 drop(value); // Explicitly drop the guard
                 Ok(Some(decode_vertex_position(&bytes)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn put_crdt_vertex_branch(
+        &mut self,
+        vertex_key: &[u8; 24],
+        branch_key: &[u8; 12],
+    ) -> PristineResult<()> {
+        let mut table = self.txn.open_table(VERTEX_BRANCH)?;
+        table.insert(vertex_key, branch_key)?;
+        Ok(())
+    }
+
+    fn get_crdt_vertex_branch(
+        &mut self,
+        vertex_key: &[u8; 24],
+    ) -> PristineResult<Option<crate::crdt::BranchId>> {
+        let table = self.txn.open_table(VERTEX_BRANCH)?;
+        let result = table.get(vertex_key)?;
+        match result {
+            Some(value) => {
+                let bytes: [u8; 12] = *value.value();
+                drop(value);
+                Ok(Some(decode_branch_id(&bytes)))
             }
             None => Ok(None),
         }

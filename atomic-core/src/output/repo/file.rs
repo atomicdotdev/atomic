@@ -98,7 +98,7 @@ use crate::pristine::GraphTxnT;
 use crate::types::{Hash, Inode, NodeId, Position};
 
 use super::conflict::{FileConflict, FileConflictType};
-use super::content::output_graph_content;
+use super::content::{output_graph_content_resolved, resolve_conflicts_semantically};
 use super::error::OutputError;
 
 // FILE OUTPUT OPTIONS
@@ -659,6 +659,9 @@ where
     let mut graph = retrieve_result.graph;
     let order = compute_order(&mut graph);
 
+    // Attempt semantic merge for any conflicting SCCs
+    let resolved = resolve_conflicts_semantically(txn, changes, &graph, &order);
+
     // Create writer
     let file_writer = working_copy
         .write_file(path, inode)
@@ -673,22 +676,23 @@ where
         txn.get_external(node_id).ok().flatten()
     };
 
-    // Output the graph content
-    output_graph_content(changes, hash_fn, &graph, &order, &mut writer)?;
+    // Output the graph content (with semantic merge resolution)
+    output_graph_content_resolved(changes, hash_fn, &graph, &order, &mut writer, &resolved)?;
 
     // Flush if requested
     if options.flush_after_write {
         writer.inner_mut().flush()?;
     }
 
-    // Extract conflicts from order result
-    // The order result contains conflict information from SCC analysis
-    // Cyclic conflicts are SCCs with more than one span
-    if order.cyclic_conflicts > 0 {
-        // Add a conflict for each cyclic SCC
+    // Extract conflicts from order result.
+    // Only count SCCs that were NOT resolved by the semantic merge engine.
+    let effectively_resolved = resolved.resolved_count();
+    let remaining_cyclic = order.cyclic_conflicts.saturating_sub(effectively_resolved);
+
+    if remaining_cyclic > 0 {
         let mut conflict_id: u32 = 0;
         for scc in &order.sccs {
-            if scc.len() > 1 {
+            if scc.len() > 1 && resolved.get_merged(scc[0]).is_none() {
                 conflict_id += 1;
                 let file_conflict = FileConflict::new(path.to_string(), FileConflictType::Cyclic)
                     .with_id(conflict_id);
@@ -775,17 +779,20 @@ where
         txn.get_external(node_id).ok().flatten()
     };
 
-    // Output the graph content
-    output_graph_content(changes, hash_fn, &graph, &order, &mut writer)?;
+    // Attempt semantic merge for any conflicting SCCs
+    let resolved = resolve_conflicts_semantically(txn, changes, &graph, &order);
+
+    // Output the graph content (with semantic merge resolution)
+    output_graph_content_resolved(changes, hash_fn, &graph, &order, &mut writer, &resolved)?;
 
     // Extract buffer
     let content = writer.into_inner();
 
-    // Extract conflicts from cyclic SCCs
+    // Extract conflicts from cyclic SCCs (only those NOT resolved by semantic merge)
     let mut conflicts = Vec::new();
     let mut conflict_id: u32 = 0;
     for scc in &order.sccs {
-        if scc.len() > 1 {
+        if scc.len() > 1 && resolved.get_merged(scc[0]).is_none() {
             conflict_id += 1;
             conflicts.push(
                 FileConflict::new(String::new(), FileConflictType::Cyclic).with_id(conflict_id),
@@ -911,17 +918,20 @@ where
         txn.get_external(node_id).ok().flatten()
     };
 
-    // Output the graph content
-    output_graph_content(changes, hash_fn, &graph, &order, &mut writer)?;
+    // Attempt semantic merge for any conflicting SCCs
+    let resolved = resolve_conflicts_semantically(txn, changes, &graph, &order);
+
+    // Output the graph content (with semantic merge resolution)
+    output_graph_content_resolved(changes, hash_fn, &graph, &order, &mut writer, &resolved)?;
 
     // Extract buffer
     let content = writer.into_inner();
 
-    // Extract conflicts from cyclic SCCs
+    // Extract conflicts from cyclic SCCs (only those NOT resolved by semantic merge)
     let mut conflicts = Vec::new();
     let mut conflict_id: u32 = 0;
     for scc in &order.sccs {
-        if scc.len() > 1 {
+        if scc.len() > 1 && resolved.get_merged(scc[0]).is_none() {
             conflict_id += 1;
             conflicts.push(
                 FileConflict::new(String::new(), FileConflictType::Cyclic).with_id(conflict_id),

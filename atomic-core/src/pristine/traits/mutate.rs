@@ -337,6 +337,26 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT {
         branch_key: &[u8; 12],
     ) -> Result<Option<crate::types::GraphNode<NodeId>>, PristineError>;
 
+    /// Store the reverse mapping from a graph vertex to a CRDT BranchId.
+    ///
+    /// This is the reverse of `put_crdt_branch_vertex`, enabling efficient
+    /// lookup from a graph vertex to its corresponding CRDT branch during
+    /// semantic merge operations.
+    fn put_crdt_vertex_branch(
+        &mut self,
+        vertex_key: &[u8; 24],
+        branch_key: &[u8; 12],
+    ) -> Result<(), PristineError>;
+
+    /// Look up the CRDT BranchId for a graph vertex.
+    ///
+    /// Returns the BranchId stored by `put_crdt_vertex_branch`, enabling
+    /// the semantic merge engine to find CRDT data for a graph vertex.
+    fn get_crdt_vertex_branch(
+        &mut self,
+        vertex_key: &[u8; 24],
+    ) -> Result<Option<crate::crdt::BranchId>, PristineError>;
+
     /// Store inode→position mapping for CRDT compatibility.
     fn put_inodes(&mut self, inode: u64, pos: &Position<NodeId>) -> Result<(), PristineError>;
 

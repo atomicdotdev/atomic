@@ -268,6 +268,9 @@ fn apply_line_ops_with_position<T: MutTxnT>(
                 let branch_key = encode_branch_id(&branch_id);
                 let vertex_bytes = encode_vertex_position(&graph_node);
                 txn.put_crdt_branch_vertex(&branch_key, &vertex_bytes)?;
+
+                // Store the Graph→CRDT reverse mapping (for semantic merge)
+                txn.put_crdt_vertex_branch(&vertex_bytes, &branch_key)?;
             }
 
             // Apply leaf operations for this line's tokens

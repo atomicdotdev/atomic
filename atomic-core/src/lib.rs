@@ -41,6 +41,9 @@ pub mod record;
 // Phase 6: Working Copy Output
 pub mod output;
 
+// Semantic merge engine
+pub mod merge;
+
 // Future modules - to be implemented
 // pub mod alive;
 
@@ -94,6 +97,12 @@ pub use output::{
 pub use crdt::{
     Branch, BranchId, BranchOp, BranchState, Leaf, LeafId, LeafOp, LeafState, Trunk, TrunkId,
     TrunkOp, TrunkState,
+};
+
+// Re-export merge types
+pub use merge::{
+    ConflictGroup, LeafEdit, MergeOutcome, MergeSource, MergeToken, SemanticMergeEngine,
+    ThreeWayResult, TxnOnlyMergeEngine,
 };
 // Note: FileMetadata is exported from output module but also exists in record module
 // Use output::FileMetadata or record::FileMetadata explicitly to disambiguate
