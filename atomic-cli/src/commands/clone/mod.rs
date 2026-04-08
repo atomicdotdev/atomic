@@ -147,7 +147,7 @@ pub use types::{CloneOutcome, ClonePhase, CloneProgress, CloneStats};
 pub use helpers::{format_count as helpers_format_count, infer_repo_name, CleanupGuard};
 
 // Constants
-pub use command::{DEFAULT_VIEW, DEFAULT_TIMEOUT_SECS};
+pub use command::{DEFAULT_TIMEOUT_SECS, DEFAULT_VIEW};
 
 // Tests
 

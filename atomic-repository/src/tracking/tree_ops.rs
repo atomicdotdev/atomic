@@ -11,7 +11,6 @@ use atomic_core::types::Inode;
 
 use super::{TrackedFile, TrackingError, TrackingResult};
 
-
 // Core Tracking Functions
 
 /// Add a single file to tracking.

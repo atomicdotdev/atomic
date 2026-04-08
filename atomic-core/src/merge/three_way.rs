@@ -317,8 +317,6 @@ fn insert_positions(ops: &[EditOp]) -> HashMap<usize, Vec<Vec<u8>>> {
 
 /// Combine two non-conflicting edit scripts and produce merged content bytes.
 fn merge_ops(base: &[MergeToken], left_ops: &[EditOp], right_ops: &[EditOp]) -> Vec<u8> {
-    let n = base.len();
-
     // Build per-index action maps.
     let left_action = build_action_map(left_ops);
     let right_action = build_action_map(right_ops);
@@ -332,7 +330,7 @@ fn merge_ops(base: &[MergeToken], left_ops: &[EditOp], right_ops: &[EditOp]) -> 
     emit_inserts(&left_inserts, usize::MAX, &mut result);
     emit_inserts(&right_inserts, usize::MAX, &mut result);
 
-    for i in 0..n {
+    for (i, base_token) in base.iter().enumerate() {
         // Determine what to emit for base token i.
         let left_act = left_action.get(&i);
         let right_act = right_action.get(&i);
@@ -340,19 +338,19 @@ fn merge_ops(base: &[MergeToken], left_ops: &[EditOp], right_ops: &[EditOp]) -> 
         match (left_act, right_act) {
             // Both sides kept (or neither touched) — emit base.
             (None, None) => {
-                result.extend_from_slice(&base[i].content);
+                result.extend_from_slice(&base_token.content);
             }
             // Only left modified.
             (Some(action), None) => {
-                emit_action(action, &base[i], &mut result);
+                emit_action(action, base_token, &mut result);
             }
             // Only right modified.
             (None, Some(action)) => {
-                emit_action(action, &base[i], &mut result);
+                emit_action(action, base_token, &mut result);
             }
             // Both modified identically (already verified no conflict).
             (Some(action), Some(_)) => {
-                emit_action(action, &base[i], &mut result);
+                emit_action(action, base_token, &mut result);
             }
         }
 

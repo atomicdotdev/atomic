@@ -297,7 +297,7 @@ impl fmt::Display for ConversionStats {
 /// assert!(ops.is_empty());
 /// assert_eq!(ops.trunk_ops().len(), 0);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ConvertedOps {
     /// File-level operations.
     pub(crate) trunk_ops: Vec<TrunkOp>,

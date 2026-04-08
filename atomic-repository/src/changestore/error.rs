@@ -102,4 +102,3 @@ impl ChangeStoreError {
         matches!(self, ChangeStoreError::HashMismatch { .. })
     }
 }
-
