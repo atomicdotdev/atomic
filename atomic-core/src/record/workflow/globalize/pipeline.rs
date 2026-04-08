@@ -160,6 +160,108 @@ where
         return Ok(result);
     }
 
+    // Handle file moves/renames (FileMove)
+    if matches!(
+        recorded.kind(),
+        Some(crate::record::workflow::detect::DetectionKind::Moved)
+    ) {
+        use crate::change::EdgeUpdate;
+
+        let old_path = recorded
+            .old_path()
+            .ok_or_else(|| GlobalizeError::MissingField {
+                path: path.to_string(),
+                field: "old_path",
+            })?;
+
+        // Look up the inode for the old path
+        let old_inode =
+            ctx.txn()
+                .get_inode(old_path)?
+                .ok_or_else(|| GlobalizeError::PathNotFound {
+                    path: old_path.to_string(),
+                })?;
+
+        // Look up the inode's graph position
+        let old_inode_pos_node = ctx
+            .txn()
+            .inode_position(old_inode)?
+            .ok_or_else(|| GlobalizeError::InodeNotFound { inode: old_inode })?;
+
+        // Convert the inode position to Option<Hash> using external hash resolution
+        let change_hash: Option<Hash> = ctx.get_external(old_inode_pos_node.change);
+
+        // Add a dependency on the change that introduced this file
+        ctx.add_dependency_by_id(old_inode_pos_node.change)?;
+
+        // Build the del EdgeUpdate: marks the FOLDER edge at the inode vertex as DELETED.
+        // This follows the same pattern as DirDel.
+        let del = EdgeUpdate {
+            edges: vec![NewEdge {
+                previous: EdgeFlags::FOLDER,
+                flag: EdgeFlags::FOLDER | EdgeFlags::DELETED,
+                from: Position {
+                    change: change_hash,
+                    pos: old_inode_pos_node.pos,
+                },
+                to: GraphNode {
+                    change: change_hash,
+                    start: old_inode_pos_node.pos,
+                    end: old_inode_pos_node.pos,
+                },
+                introduced_by: change_hash,
+            }],
+            inode: Position {
+                change: change_hash,
+                pos: old_inode_pos_node.pos,
+            },
+        };
+
+        // Build the add Insertion: a new name vertex pointing to the same inode position.
+        // The parent context is ROOT (top-level file — nested-dir support is a future concern).
+        let parent_context_pos: Position<Option<Hash>> = Position {
+            change: Some(Hash::NONE),
+            pos: ChangePosition::ROOT,
+        };
+
+        // The inode position for the add — references the EXISTING inode (old change).
+        let inode_opt_hash_pos: Position<Option<Hash>> = Position {
+            change: change_hash,
+            pos: old_inode_pos_node.pos,
+        };
+
+        // Write the new filename bytes into the content buffer.
+        let new_filename = extract_filename(path);
+        let new_filename_bytes = new_filename.as_bytes();
+        let initial_content_len = ctx.content_len();
+        let (name_start, name_end) = ctx.append_content(new_filename_bytes);
+
+        let add = Insertion {
+            predecessors: vec![parent_context_pos],
+            successors: vec![],
+            flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+            start: name_start,
+            end: name_end,
+            inode: inode_opt_hash_pos,
+        };
+
+        let graph_op: GraphOp<Option<Hash>> = GraphOp::FileMove {
+            del,
+            add,
+            path: path.to_string(),
+        };
+
+        result.add_hunk(graph_op);
+        result.set_bytes_added(ctx.content_len() - initial_content_len);
+
+        // Carry any CRDT ops that were set on the recorded file
+        if let Some(file_ops) = recorded.crdt_ops().cloned() {
+            result.set_file_ops(file_ops);
+        }
+
+        return Ok(result);
+    }
+
     // Check for empty file
     if recorded.is_empty() && !options.include_empty_files() {
         return Ok(result);
@@ -184,19 +286,34 @@ where
 
         // Process each graph_op for modification
         for built in recorded.hunks() {
-            // Get the content slice for this graph_op
-            let hunk_content =
-                if let (Some(start), Some(end)) = (built.content_start, built.content_end) {
-                    let start = start as usize;
-                    let end = end as usize;
-                    if end <= content.len() {
-                        &content[start..end]
+            // Determine the content slice for this hunk.
+            //
+            // Replace hunks need the full file content because they delete
+            // all existing vertices and re-insert the complete new file.
+            //
+            // Insert hunks only need their own slice — they are guaranteed
+            // (by the upstream consolidation in record_modified_file) to be
+            // clean Prepend or Append operations that wire in their own
+            // bytes without touching anything else.
+            //
+            // Delete hunks carry no content.
+            let hunk_content = match built.kind {
+                crate::record::workflow::graph_op::BuiltHunkKind::Replace => content,
+                crate::record::workflow::graph_op::BuiltHunkKind::Insert => {
+                    if let (Some(start), Some(end)) = (built.content_start, built.content_end) {
+                        let start = start as usize;
+                        let end = end as usize;
+                        if end <= content.len() {
+                            &content[start..end]
+                        } else {
+                            &[]
+                        }
                     } else {
                         &[]
                     }
-                } else {
-                    &[]
-                };
+                }
+                crate::record::workflow::graph_op::BuiltHunkKind::Delete => &[],
+            };
 
             // Track content position before globalization
             let content_pos_before = ctx.content_len();
@@ -207,7 +324,6 @@ where
                 inode,
                 inode_pos,
                 hunk_content,
-                content,
                 recorded.old_line_count(),
             )?;
 
@@ -216,20 +332,17 @@ where
 
             // Record the content range for this hunk
             if content_pos_after > content_pos_before {
+                let uses_full = matches!(
+                    built.kind,
+                    crate::record::workflow::graph_op::BuiltHunkKind::Replace
+                );
                 hunk_content_ranges.push(HunkContentRange {
                     kind: built.kind,
                     new_start: built.new_start,
                     new_len: built.new_len,
                     content_start: ChangePosition::new(content_pos_before),
                     content_end: ChangePosition::new(content_pos_after),
-                    // For Replace hunks, we use full_content, so track that
-                    uses_full_content: matches!(
-                        built.kind,
-                        crate::record::workflow::graph_op::BuiltHunkKind::Replace
-                    ) || matches!(
-                        built.kind,
-                        crate::record::workflow::graph_op::BuiltHunkKind::Insert
-                    ),
+                    uses_full_content: uses_full,
                 });
             }
 

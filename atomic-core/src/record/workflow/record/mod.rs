@@ -154,12 +154,37 @@ mod tests;
 pub use options::RecordingOptions;
 pub use types::{RecordedFile, RecordingResult, RecordingStats};
 
-use crate::change::{Encoding, Local};
+use crate::change::{Encoding, FileOps, Local};
+use crate::crdt::{BranchId, TrunkId};
 use crate::output::WorkingCopyRead;
+use crate::types::NodeId;
 
 use super::compare::{compare_content, detect_encoding};
+use super::crdt::CrdtBuildStats;
 use super::detect::{DetectedFile, DetectionKind};
 use super::graph_op::{BuiltHunk, BuiltHunkKind, HunkBuilder};
+
+/// A single line from a git diff, captured during Phase 1 of git import.
+///
+/// This is a plain data carrier, independent of any git library.
+/// Origin values:
+///   `+`  — line was added in the new file
+///   `-`  — line was deleted from the old file
+///   ` `  — context line (unchanged)
+///
+/// Used by [`build_crdt_ops_from_git_diff`] to build BranchOps that
+/// exactly match `git diff` output.
+#[derive(Debug, Clone)]
+pub struct GitDiffLine {
+    /// `+`, `-`, or ` `
+    pub origin: char,
+    /// Raw line bytes (may include trailing `\n`)
+    pub content: Vec<u8>,
+    /// 1-based line number in the old file (`None` for added lines)
+    pub old_lineno: Option<u32>,
+    /// 1-based line number in the new file (`None` for deleted lines)
+    pub new_lineno: Option<u32>,
+}
 
 // ============================================================================
 // RECORDING FUNCTIONS
@@ -373,6 +398,30 @@ where
     // Compare content and build hunks
     let comparison = compare_content(old_content, &new_content, options.get_algorithm());
 
+    // Handle binary files: compare_content returns is_binary=true with zero
+    // diff_ops when either old or new content contains null bytes.  Since we
+    // know the content differs (identical content returns early above), create
+    // a single Replace hunk that swaps the entire file content.  Without this,
+    // binary modifications are silently dropped (zero hunks → empty RecordedFile
+    // → the graph never receives the new content, and `atomic status` reports
+    // the file as modified forever).
+    if comparison.is_binary && old_content != &new_content[..] {
+        let mut replace_hunk = BuiltHunk::new_replace_with_lines(
+            Local::new(&detected.path, 1),
+            Some(encoding),
+            Vec::new(), // no per-line deletion tracking for binary
+            0,          // old_start
+            0,          // new_start
+            1,          // new_len: treat entire binary blob as one unit
+        );
+        replace_hunk.content_start = Some(0);
+        replace_hunk.content_end = Some(new_content.len() as u64);
+        recorded.add_hunk(replace_hunk);
+        recorded.set_content(new_content);
+
+        return Ok(recorded);
+    }
+
     // Build hunks from diff ops using HunkBuilder
     let hunk_options = options.to_hunk_options().encoding(encoding);
     let mut builder = HunkBuilder::with_options(&detected.path, hunk_options);
@@ -387,61 +436,94 @@ where
     let new_line_offsets = calculate_line_offsets(&new_content);
 
     // Add all built hunks to the recorded file, updating content positions
-    // ── Consolidate multiple Replace hunks into a single whole-file Replace ──
+    // ── Consolidate hunks into a single whole-file Replace ──
     //
-    // The diff may produce multiple Replace hunks when changes are in
-    // non-contiguous regions of the file. In the graph layer, each Replace
-    // hunk does delete-ALL-content + insert-full-content. With N Replace
-    // hunks this creates N copies (duplication bug).
+    // In the globalize pipeline, every hunk kind that isn't a clean
+    // Prepend or Append ends up doing the same thing: delete ALL content
+    // vertices for the file, then insert full_content (the entire new
+    // file). Specifically:
     //
-    // Fix: merge all Replace hunks into ONE Replace that covers the entire
-    // file. Insert and Delete hunks are kept as-is — they're additive
-    // operations that don't conflict.
+    //   Replace  → always does delete-all + insert-full_content
+    //   Delete   → always does delete-all (every content vertex)
+    //   Insert with 0 < old_start < old_line_count
+    //            → escalates to NeedsReplace → delete-all + insert-full_content
+    //
+    // When multiple hunks hit these paths, each one independently
+    // inserts a full copy of the file, causing N× content duplication.
+    //
+    // Fix: detect when ANY combination of hunks would trigger whole-file
+    // behavior, and collapse them all into a single Replace that covers
+    // the entire file. This guarantees exactly one delete-all +
+    // insert-full_content in the globalizer, regardless of diff shape.
+    //
+    // Insert hunks that are clean Prepend (old_start == 0) or Append
+    // (old_start >= old_line_count) are safe — they only insert their
+    // own content slice, not full_content. Those are kept as-is.
     //
     // The semantic layer (CRDT line_ops) is unaffected — it's built
     // separately from the raw diff and retains per-line granularity.
     let mut hunks: Vec<BuiltHunk> = hunk_result.into_hunks();
-    let replace_count = hunks
-        .iter()
-        .filter(|h| h.kind == BuiltHunkKind::Replace)
-        .count();
 
-    if replace_count > 1 {
-        // Merge all Replace hunks: union their deleted_lines, span the
-        // full new content range (0..new_content.len()).
+    // Count hunks that will trigger whole-file operations in globalize.
+    //
+    // The globalize layer has NO concept of partial deletion — both
+    // `globalize_delete` and `globalize_replace` call `delete_all_content`
+    // which marks EVERY content vertex as deleted.  So:
+    //
+    //   Replace  → delete-all + insert-full_content  (correct on its own)
+    //   Delete   → delete-all, insert nothing         (DESTROYS the file)
+    //   Insert with 0 < old_start < old_line_count
+    //            → escalates to delete-all + insert-full_content
+    //
+    // A Delete hunk in a *modified* file means "some lines were removed"
+    // — the file still has content.  But globalize_delete would nuke the
+    // whole file.  Since `record_modified_file` is never called for truly
+    // deleted files (those go through `record_deleted_file`), every
+    // Delete hunk here MUST be promoted to a Replace so the surviving
+    // content is re-inserted.
+    //
+    // We also consolidate when multiple nuclear hunks coexist, or when a
+    // nuclear hunk coexists with other hunks, to prevent N× duplication.
+    let has_nuclear_hunk = hunks.iter().any(|h| match h.kind {
+        // Replace already does delete-all + insert-full; correct on its own
+        // but must be consolidated if it coexists with other hunks.
+        BuiltHunkKind::Replace => true,
+        // Delete does delete-all with NO re-insert — would nuke the whole
+        // file.  Since record_modified_file is never called for truly
+        // deleted files, every Delete here is a partial line removal that
+        // must become a Replace so the surviving content is re-inserted.
+        BuiltHunkKind::Delete => true,
+        // Middle inserts (0 < old_start < old_line_count) cannot be
+        // handled by the globalizer — it only supports Prepend and Append.
+        // These must be consolidated into a Replace.
+        BuiltHunkKind::Insert => h.old_start != 0 && h.old_start < old_line_count,
+    });
+
+    if has_nuclear_hunk {
+        // Multiple hunks where at least one is nuclear, OR a single nuclear
+        // hunk coexisting with other hunks. Collapse everything into one
+        // Replace to prevent duplication.
+        //
+        // Collect deleted lines from all hunks that delete old content.
         let mut all_deleted: Vec<usize> = Vec::new();
-        let mut min_old_start = usize::MAX;
-
-        // Collect deleted lines from all Replace hunks
         for h in &hunks {
-            if h.kind == BuiltHunkKind::Replace {
-                all_deleted.extend_from_slice(&h.deleted_lines);
-                if h.old_start < min_old_start {
-                    min_old_start = h.old_start;
-                }
-            }
+            all_deleted.extend_from_slice(&h.deleted_lines);
         }
         all_deleted.sort_unstable();
         all_deleted.dedup();
 
-        if min_old_start == usize::MAX {
-            min_old_start = 0;
-        }
-
-        // Build the merged Replace covering the entire new file
         let new_line_count = new_content.split(|&b| b == b'\n').count();
         let merged_replace = BuiltHunk::new_replace_with_lines(
-            Local::new(&detected.path, (min_old_start + 1) as u64),
+            Local::new(&detected.path, 1),
             Some(encoding),
             all_deleted,
-            min_old_start,
+            0,              // old_start: beginning of old content
             0,              // new_start: beginning of new content
             new_line_count, // new_len: all lines in the new file
         );
 
-        // Remove all Replace hunks, keep Insert/Delete hunks
-        hunks.retain(|h| h.kind != BuiltHunkKind::Replace);
-        // Add the single merged Replace
+        // Replace all hunks with the single merged Replace
+        hunks.clear();
         hunks.push(merged_replace);
     }
 
@@ -493,6 +575,132 @@ where
     recorded.set_content(new_content);
 
     Ok(recorded)
+}
+
+/// Build CRDT FileOps directly from git diff lines.
+///
+/// This is the authoritative path for git import: instead of re-running
+/// our Myers diff algorithm (which may produce different edit operations
+/// than git), we translate git's own `+`/`-`/` ` line classifications
+/// directly into BranchOps.
+///
+/// The result has exactly the same Insert/Delete operations that
+/// `git diff` would show — so `atomic diff -c` output matches `git diff`
+/// line-for-line.
+///
+/// # Arguments
+///
+/// * `path`       — file path (for the FileOps container)
+/// * `diff_lines` — ordered slice of GitDiffLine from git2::Diff::foreach
+///
+/// # Returns
+///
+/// `(FileOps, CrdtBuildStats)` ready to be stored in a `RecordedFile`.
+pub fn build_crdt_ops_from_git_diff(
+    path: &str,
+    diff_lines: &[GitDiffLine],
+) -> (FileOps, CrdtBuildStats) {
+    use super::crdt::FileOps as BuilderFileOps;
+    use super::crdt::LineOps as BuilderLineOps;
+    use crate::crdt::LeafOp;
+
+    let placeholder_change_id = NodeId::new(0);
+    let trunk_id = TrunkId::new(placeholder_change_id, 0);
+    let mut file_ops = BuilderFileOps::new(trunk_id, path.to_string(), None);
+
+    let mut stats = CrdtBuildStats::new();
+    let mut next_branch_idx: u32 = 0;
+    let mut next_leaf_idx: u32 = 0;
+
+    let mut alloc_branch = || {
+        let id = BranchId::new(placeholder_change_id, next_branch_idx);
+        next_branch_idx += 1;
+        id
+    };
+
+    let mut alloc_leaf = || {
+        let id = crate::crdt::LeafId::new(placeholder_change_id, next_leaf_idx);
+        next_leaf_idx += 1;
+        id
+    };
+
+    let mut prev_branch: Option<BranchId> = None;
+
+    for diff_line in diff_lines {
+        match diff_line.origin {
+            // ── Deleted line ─────────────────────────────────────────────
+            '-' => {
+                let branch_id = alloc_branch();
+
+                // Store the deleted line content as leaf ops so
+                // `atomic diff -c` can reconstruct the old line text.
+                let content_bytes = &diff_line.content;
+                // Strip trailing newline for storage (consistent with inserts).
+                let trimmed = if content_bytes.ends_with(b"\n") {
+                    &content_bytes[..content_bytes.len() - 1]
+                } else {
+                    content_bytes
+                };
+
+                let leaf_ops = vec![LeafOp::Insert {
+                    after: None,
+                    kind: crate::diff::TokenKind::Word,
+                    content: trimmed.to_vec(),
+                }];
+
+                let mut line_op = BuilderLineOps::delete(branch_id, leaf_ops);
+                if let Some(n) = diff_line.old_lineno {
+                    line_op = line_op.with_old_line_num(n as usize);
+                }
+                file_ops.add_line_op(line_op);
+                stats.lines_deleted += 1;
+            }
+
+            // ── Added line ───────────────────────────────────────────────
+            '+' => {
+                let branch_id = alloc_branch();
+
+                let content_bytes = &diff_line.content;
+                let trimmed = if content_bytes.ends_with(b"\n") {
+                    &content_bytes[..content_bytes.len() - 1]
+                } else {
+                    content_bytes
+                };
+
+                let leaf_id = alloc_leaf();
+                let leaf_ops = vec![LeafOp::Insert {
+                    after: None,
+                    kind: crate::diff::TokenKind::Word,
+                    content: trimmed.to_vec(),
+                }];
+                let _ = leaf_id; // leaf_id allocated for ordering; content is in leaf_ops
+
+                let mut line_op = BuilderLineOps::insert(branch_id, prev_branch, leaf_ops);
+                if let Some(n) = diff_line.new_lineno {
+                    line_op = line_op.with_new_line_num(n as usize);
+                }
+                file_ops.add_line_op(line_op);
+                stats.lines_added += 1;
+                prev_branch = Some(branch_id);
+            }
+
+            // ── Context line (unchanged) — update prev_branch ────────────
+            ' ' => {
+                // Context lines are not recorded as BranchOps; they only
+                // advance the `prev_branch` cursor so subsequent inserts
+                // are anchored after the right line.
+                //
+                // We allocate a phantom branch ID to maintain the ordering
+                // chain.  It is never stored anywhere.
+                let phantom_id = alloc_branch();
+                prev_branch = Some(phantom_id);
+            }
+
+            _ => {} // Hunk headers, no-newline markers, etc. — skip.
+        }
+    }
+
+    (file_ops.into_change_ops(), stats)
 }
 
 /// Calculate byte offsets for each line in content.

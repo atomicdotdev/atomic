@@ -385,6 +385,152 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
+# Section 14: Status Parity After Import (Renames + Deletions)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# After `atomic git import`, `atomic status` must be clean — the pristine
+# graph should match the git working copy exactly.  This section exercises
+# the two operations that historically caused spurious status entries:
+#
+#   1. File deletions:  record_modified_file (for diff lines) produces
+#      GraphOp::Replacement, not GraphOp::FileDel, so apply_change never
+#      removed the TREE entry.  The fix explicitly untracks deleted files
+#      after apply.
+#
+#   2. File renames:  git mv old new must produce a GraphOp::FileMove that
+#      updates TREE (del old path, put new path with same inode).
+
+begin_section "Git Import: Status Parity After Import (renames + deletions)"
+
+make_temp_repo "git-import-status-parity"
+GIT_REPO="$REPO_DIR"
+
+git -C "$GIT_REPO" init --quiet 2>/dev/null
+git -C "$GIT_REPO" config user.email "test@test.com" 2>/dev/null
+git -C "$GIT_REPO" config user.name "Test" 2>/dev/null
+
+# ── v1: create a small tree (including a binary file) ───────────────────
+mkdir -p "$GIT_REPO/src/sub" "$GIT_REPO/docs"
+printf 'fn app() {}\n'    > "$GIT_REPO/src/sub/app.rs"
+printf 'fn bench() {}\n'  > "$GIT_REPO/src/sub/bench.rs"
+printf 'mod sub;\n'        > "$GIT_REPO/src/sub/mod.rs"
+printf '# readme\n'        > "$GIT_REPO/docs/README.md"
+printf 'old ci config\n'   > "$GIT_REPO/.travis.yml"
+# Binary file: PNG header + null bytes (triggers is_binary detection)
+printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR_old_logo_data_here\n' > "$GIT_REPO/docs/logo.png"
+git -C "$GIT_REPO" add -A >/dev/null 2>&1
+git -C "$GIT_REPO" commit -m "v1: initial tree" --quiet 2>/dev/null
+
+# ── v2: mass rename + delete + binary modify ────────────────────────────
+#   - src/sub/app.rs   → src/app.rs      (pure rename)
+#   - src/sub/bench.rs → src/bench.rs    (rename + content change)
+#   - src/sub/mod.rs   → deleted
+#   - .travis.yml      → deleted
+#   - docs/logo.png    → modified (binary content swap)
+mkdir -p "$GIT_REPO/src"
+git -C "$GIT_REPO" mv src/sub/app.rs   src/app.rs   2>/dev/null
+git -C "$GIT_REPO" mv src/sub/bench.rs src/bench.rs 2>/dev/null
+printf 'fn bench_v2() {}\n// added in v2\n' > "$GIT_REPO/src/bench.rs"
+git -C "$GIT_REPO" rm src/sub/mod.rs  --quiet 2>/dev/null
+git -C "$GIT_REPO" rm .travis.yml     --quiet 2>/dev/null
+# Replace binary file with different binary content (smaller PNG)
+printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR_new_v2\n' > "$GIT_REPO/docs/logo.png"
+git -C "$GIT_REPO" add -A >/dev/null 2>&1
+git -C "$GIT_REPO" commit -m "v2: flatten + delete + binary update" --quiet 2>/dev/null
+
+# ── v3: modify a renamed file (to exercise the post-rename path) ────────
+printf 'fn bench_v3() {}\n// v3 change\n' > "$GIT_REPO/src/bench.rs"
+git -C "$GIT_REPO" add -A >/dev/null 2>&1
+git -C "$GIT_REPO" commit -m "v3: modify after rename" --quiet 2>/dev/null
+
+# ── Import ──────────────────────────────────────────────────────────────
+(cd "$GIT_REPO" && atomic git import 2>/dev/null) || true
+
+# ── Assertions ──────────────────────────────────────────────────────────
+
+# 1. No spurious deleted files in status
+_deleted_count=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep -c '^D ' || true)
+if [[ "$_deleted_count" -eq 0 ]]; then
+    _pass "no spurious deletions in status after import"
+else
+    _deleted_files=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep '^D ')
+    _fail "spurious deletions in status" "$_deleted_count file(s): $_deleted_files"
+fi
+
+# 2. Renamed files are tracked (not untracked ??)
+_untracked_app=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep '?? src/app.rs' || true)
+if [[ -z "$_untracked_app" ]]; then
+    _pass "src/app.rs tracked after rename"
+else
+    _fail "src/app.rs untracked after rename" "status shows: $_untracked_app"
+fi
+
+_untracked_bench=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep '?? src/bench.rs' || true)
+if [[ -z "$_untracked_bench" ]]; then
+    _pass "src/bench.rs tracked after rename+modify"
+else
+    _fail "src/bench.rs untracked after rename+modify" "status shows: $_untracked_bench"
+fi
+
+# 3. Deleted files are NOT tracked (should not appear in status at all)
+_deleted_travis=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep 'travis' || true)
+if [[ -z "$_deleted_travis" ]]; then
+    _pass ".travis.yml not in status (correctly deleted)"
+else
+    _fail ".travis.yml still in status after delete" "status shows: $_deleted_travis"
+fi
+
+_deleted_mod=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep 'sub/mod.rs' || true)
+if [[ -z "$_deleted_mod" ]]; then
+    _pass "src/sub/mod.rs not in status (correctly deleted)"
+else
+    _fail "src/sub/mod.rs still in status after delete" "status shows: $_deleted_mod"
+fi
+
+# 4. Old rename source paths are gone from tracking
+_old_sub_app=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep 'sub/app.rs' || true)
+if [[ -z "$_old_sub_app" ]]; then
+    _pass "src/sub/app.rs gone from status (old rename source)"
+else
+    _fail "src/sub/app.rs still in status" "should have been removed by rename: $_old_sub_app"
+fi
+
+# 5. Binary file is tracked and NOT modified (graph content matches disk)
+_modified_logo=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep 'docs/logo.png' || true)
+if [[ -z "$_modified_logo" ]]; then
+    _pass "docs/logo.png clean after binary modify (graph matches disk)"
+else
+    _fail "docs/logo.png dirty after import" "status shows: $_modified_logo"
+fi
+
+# 6. Overall: status should be completely clean (no M, D, A, or ?? entries)
+_status_lines=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep -cE '^[MDAU?]' || true)
+if [[ "$_status_lines" -eq 0 ]]; then
+    _pass "status is completely clean after import (full parity)"
+else
+    _dirty=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | head -10)
+    _fail "status not clean after import" "$_status_lines dirty entries: $_dirty"
+fi
+
+# 7. Change count matches git commit count
+_git_count=$(git -C "$GIT_REPO" rev-list --count HEAD 2>/dev/null)
+_atomic_log=$(cd "$GIT_REPO" && atomic log --format short --no-color 2>/dev/null | grep -c '.' || true)
+if [[ "$_atomic_log" -eq "$_git_count" ]]; then
+    _pass "change count matches git ($_git_count)"
+else
+    _fail "change count mismatch" "git=$_git_count atomic=$_atomic_log"
+fi
+
+# 8. Verify file contents match git HEAD
+_bench_content=$(cat "$GIT_REPO/src/bench.rs" 2>/dev/null)
+_expected_bench=$(printf 'fn bench_v3() {}\n// v3 change\n')
+if [[ "$_bench_content" == "$_expected_bench" ]]; then
+    _pass "src/bench.rs content matches git HEAD after rename+modify chain"
+else
+    _fail "src/bench.rs content mismatch" "expected v3 content"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
 # Summary
 # ════════════════════════════════════════════════════════════════════════════
 

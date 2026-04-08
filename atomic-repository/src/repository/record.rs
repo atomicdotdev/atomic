@@ -643,6 +643,83 @@ impl Repository {
         self.record(header, options)
     }
 
+    /// Fast path for external importers (e.g. git-import) that already have
+    /// pre-built `RecordedFile`s and just need globalization + assembly + hashing.
+    ///
+    /// Returns `(Change, Hash)`.
+    pub fn assemble_and_hash(
+        &self,
+        header: ChangeHeader,
+        recorded_files: &[atomic_core::record::workflow::RecordedFile],
+    ) -> Result<(Change, Hash), RecordError> {
+        use atomic_core::record::workflow::assemble_change;
+        use atomic_core::record::workflow::assembly::AssemblyOptions;
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RecordError::Database(e.to_string()))?;
+
+        // Use a bare transaction — no ViewGraph filter needed.
+        //
+        // This method is the fast path for git import, where every change
+        // is written to a shared view and all edges land in the global
+        // GRAPH table.  A bare ReadTxn sees every edge directly.
+        //
+        // Wrapping in ViewGraph + collect_visible_change_ids would scan
+        // the entire view change log on every call (O(N) per commit,
+        // O(N²) total for N commits), which makes large imports
+        // progressively slower.
+        let assembly_options = AssemblyOptions::default();
+
+        let assembly_result = assemble_change(&txn, recorded_files, header, &assembly_options)?;
+
+        let change = assembly_result.into_change();
+
+        let mut v3_bytes = Vec::new();
+        let hash = change
+            .serialize(&mut v3_bytes)
+            .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+
+        let (final_change, _) = Change::deserialize(&mut v3_bytes.as_slice())
+            .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+
+        Ok((final_change, hash))
+    }
+
+    /// Look up a file's inode and graph position from the pristine.
+    ///
+    /// Returns `None` if the file is not tracked or has no graph position.
+    pub fn get_inode_and_position(
+        &self,
+        path: &str,
+    ) -> Result<Option<(Inode, Position<NodeId>)>, RepositoryError> {
+        use atomic_core::pristine::TreeTxnT;
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let inode = match txn
+            .get_inode(path)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+
+        let position = match txn
+            .inode_position(inode)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        Ok(Some((inode, position)))
+    }
+
     /// Record all changes with a message.
     ///
     /// This is a convenience method that records all modified files.

@@ -384,7 +384,7 @@ impl Repository {
         let change_filter = collect_view_change_ids(&txn, &view)?;
 
         // Use the filtered retrieval method
-        self.get_file_content_with_filter(&txn, &normalized, change_filter)
+        self.get_file_content_with_filter(&txn, &normalized, change_filter, true)
     }
 
     /// Get the recorded content for a tracked file with options.
@@ -598,8 +598,10 @@ impl Repository {
             get_changes_up_to_sequence(&txn, &view, state_info.parent_max_sequence_exclusive())
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Retrieve content with the change filter
-        self.get_file_content_with_filter(&txn, &normalized, change_set)
+        // Retrieve content with the change filter.
+        // Pass require_tracked=false: the file may have been deleted after
+        // this point, but we want its content as it existed before the change.
+        self.get_file_content_with_filter(&txn, &normalized, change_set, false)
     }
 
     /// Get file content as it was AFTER a specific change was applied.
@@ -665,8 +667,10 @@ impl Repository {
             None => return Ok(None), // Change not in this view
         };
 
-        // Retrieve content with the change filter
-        self.get_file_content_with_filter(&txn, &normalized, change_set)
+        // Retrieve content with the change filter.
+        // require_tracked=true: if the file was deleted before this point,
+        // there is no "after" content to return.
+        self.get_file_content_with_filter(&txn, &normalized, change_set, true)
     }
 
     /// Get file content at a specific sequence number.
@@ -723,7 +727,7 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Retrieve content with the change filter
-        self.get_file_content_with_filter(&txn, &normalized, change_set)
+        self.get_file_content_with_filter(&txn, &normalized, change_set, true)
     }
 
     /// Internal helper to retrieve file content with a change filter.
@@ -737,6 +741,7 @@ impl Repository {
         txn: &T,
         normalized_path: &str,
         change_set: std::collections::HashSet<NodeId>,
+        require_tracked: bool,
     ) -> Result<Option<Vec<u8>>, RepositoryError>
     where
         T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::TreeTxnT,
@@ -744,9 +749,11 @@ impl Repository {
         use atomic_core::output::alive::RetrieveOptions;
         use atomic_core::record::workflow::retrieve::retrieve_content_with_filter;
 
-        // Check if file is tracked
-        if !is_tracked(txn, normalized_path)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        // Check if file is tracked (skip for deleted files — they are no
+        // longer in the TREE but their inode/content is still in the graph).
+        if require_tracked
+            && !is_tracked(txn, normalized_path)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
             return Ok(None);
         }

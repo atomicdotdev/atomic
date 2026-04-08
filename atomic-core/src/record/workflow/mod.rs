@@ -148,8 +148,8 @@ pub use graph_op::{
 };
 pub use options::WorkflowOptions;
 pub use record::{
-    record_added_file, record_deleted_file, record_modified_file, RecordedFile, RecordingOptions,
-    RecordingResult, RecordingStats,
+    build_crdt_ops_from_git_diff, record_added_file, record_deleted_file, record_modified_file,
+    GitDiffLine, RecordedFile, RecordingOptions, RecordingResult, RecordingStats,
 };
 
 // Re-export commonly used CRDT types for token-level diff support
