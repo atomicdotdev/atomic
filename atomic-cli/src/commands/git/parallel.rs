@@ -224,7 +224,17 @@ impl ParallelImporter {
 
     /// Import commits from a branch into an Atomic repository.
     ///
-    /// This is the main entry point for the three-phase import.
+    /// Commits are processed in **batches** to keep memory bounded and show
+    /// progress sooner. Each batch: parse in parallel → write sequentially.
+    ///
+    /// Batch sizes are tiered by total commit count:
+    ///
+    /// | Total commits | Batch size |
+    /// |---------------|------------|
+    /// | < 5,000       | 250        |
+    /// | 5,000–9,999   | 500        |
+    /// | 10,000–19,999 | 1,000      |
+    /// | ≥ 20,000      | 2,500      |
     pub fn import_branch(
         &self,
         branch_name: &str,
@@ -243,51 +253,98 @@ impl ParallelImporter {
             return Ok(stats);
         }
 
-        print_info(&format!(
-            "Phase 1: Parsing {} commits in parallel...",
-            commit_oids.len()
-        ));
-
-        // Phase 1: Parallel git parsing
-        let phase1_start = Instant::now();
-        let parsed_commits = self.phase1_parse(&commit_oids)?;
-        stats.phase1_duration = phase1_start.elapsed();
-        stats.commits_parsed = parsed_commits.len();
+        let total = commit_oids.len();
+        let batch_size = Self::batch_size_for(total);
 
         print_info(&format!(
-            "Phase 1 complete: {} commits parsed in {:.2}s",
-            stats.commits_parsed,
-            stats.phase1_duration.as_secs_f64()
+            "Importing {} commits in batches of {}...",
+            total, batch_size
         ));
 
-        if parsed_commits.is_empty() {
-            return Ok(stats);
+        let import_start = Instant::now();
+        let mut commits_written = 0usize;
+
+        for (batch_idx, chunk) in commit_oids.chunks(batch_size).enumerate() {
+            let batch_start = batch_idx * batch_size;
+            let batch_end = (batch_start + chunk.len()).min(total);
+
+            print_info(&format!(
+                "Batch {}: parsing commits {}-{} of {}...",
+                batch_idx + 1,
+                batch_start,
+                batch_end,
+                total
+            ));
+
+            // Phase 1: Parallel git parsing for this batch
+            let parse_start = Instant::now();
+            let parsed_commits = self.phase1_parse(chunk)?;
+            let parse_elapsed = parse_start.elapsed();
+
+            stats.phase1_duration += parse_elapsed;
+            stats.commits_parsed += parsed_commits.len();
+
+            if parsed_commits.is_empty() {
+                continue;
+            }
+
+            // Phase 2: Sequential write for this batch
+            let write_start = Instant::now();
+            let write_stats = self.phase2_write(repo, &parsed_commits)?;
+            let write_elapsed = write_start.elapsed();
+
+            stats.phase2_duration += write_elapsed;
+            stats.changes_written += write_stats.changes_written;
+            stats.empty_commits += write_stats.empty_commits;
+            stats.merge_commits += write_stats.merge_commits;
+            stats.files_processed += write_stats.files_processed;
+
+            commits_written +=
+                write_stats.changes_written + write_stats.empty_commits + write_stats.merge_commits;
+
+            let total_elapsed = import_start.elapsed();
+            let avg_ms = if commits_written > 0 {
+                total_elapsed.as_secs_f64() * 1000.0 / commits_written as f64
+            } else {
+                0.0
+            };
+
+            print_info(&format!(
+                "Batch {} done: parsed {:.1}s, wrote {:.1}s ({} changes, avg {:.1}ms/commit)",
+                batch_idx + 1,
+                parse_elapsed.as_secs_f64(),
+                write_elapsed.as_secs_f64(),
+                write_stats.changes_written,
+                avg_ms,
+            ));
         }
 
+        let total_elapsed = import_start.elapsed();
         print_info(&format!(
-            "Phase 2: Writing {} changes sequentially...",
-            parsed_commits.len()
-        ));
-
-        // Phase 2: Sequential write with hash chaining
-        let phase2_start = Instant::now();
-        let write_stats = self.phase2_write(repo, &parsed_commits)?;
-        stats.phase2_duration = phase2_start.elapsed();
-        stats.changes_written = write_stats.changes_written;
-        stats.empty_commits = write_stats.empty_commits;
-        stats.merge_commits = write_stats.merge_commits;
-        stats.files_processed = write_stats.files_processed;
-
-        print_info(&format!(
-            "Phase 2 complete: {} changes written in {:.2}s",
+            "Import complete: {} changes written in {:.1}s ({:.1}ms/commit avg)",
             stats.changes_written,
-            stats.phase2_duration.as_secs_f64()
+            total_elapsed.as_secs_f64(),
+            if stats.changes_written > 0 {
+                total_elapsed.as_secs_f64() * 1000.0 / stats.changes_written as f64
+            } else {
+                0.0
+            },
         ));
 
         // Phase 3: Finalization (just verification for now)
         self.phase3_finalize(&stats)?;
 
         Ok(stats)
+    }
+
+    /// Determine batch size based on total commit count.
+    fn batch_size_for(total: usize) -> usize {
+        match total {
+            0..5_000 => 250,
+            5_000..10_000 => 500,
+            10_000..20_000 => 1_000,
+            _ => 2_500,
+        }
     }
 
     /// Collect commit OIDs in topological order (oldest first).
