@@ -6,7 +6,7 @@ mod tests {
         TagSort,
     };
     use atomic_core::change::Author;
-    use atomic_core::types::{Base32, Merkle};
+    use atomic_core::types::Merkle;
     use chrono::DateTime;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
