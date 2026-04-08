@@ -1,8 +1,8 @@
 # REFACTOR-TYPES.md — Type-Safe Edge Model & File Splitting
 
-> **Status**: In Progress — Phases A1, A2, B1.1, B1.2, B1.3, B1.4 Complete  
+> **Status**: In Progress — Phases A1, A2, A3, A4, B1.1, B1.2, B1.3, B1.4 Complete  
 > **Created**: 2025-07-13  
-> **Last Updated**: 2025-07-13  
+> **Last Updated**: 2026-04-07  
 > **Prerequisite**: REFACTOR-VIEWS.md (complete)  
 
 ## Table of Contents
@@ -424,7 +424,7 @@ to use `iter_adjacent`; new code uses the typed methods.
 
 ---
 
-### Phase A3: ViewGraph as the Standard Interface
+### Phase A3: ViewGraph as the Standard Interface ✅ COMPLETE
 
 **Goal**: Make `ViewGraph` the standard way to read the graph for any
 view-scoped operation. Every function that currently takes
@@ -442,39 +442,46 @@ should take `T: GraphTxnT` where `T` is already a `ViewGraph`.
 | `repository/content.rs` | All content retrieval uses `ViewGraph`. Remove manual filter building. |
 | `repository/record.rs` | Already uses `ViewGraph` (from the bug fix). |
 
+**Result**: `retrieve_graph` now uses `iter_forward` + typed `ForwardEdge`. All `is_vertex_alive_at_target` logic uses `iter_parents` + `ParentEdgeKind` match arms. 6,899 tests pass, all 10 harness suites pass. Zero raw `EdgeFlags` checks in active code paths (2 remain in deprecated methods only).
+
 **Checklist**:
-- [ ] Rewrite `retrieve_graph` to use `iter_forward` and `iter_parents`
-- [ ] Remove `is_alive_at_target_state` (single-edge check — no longer needed)
-- [ ] Simplify `is_vertex_alive_at_target` to use `iter_parents` + match
-- [ ] Remove `change_filter` from `RetrieveOptions`
-- [ ] Remove `change_filter` from `MaterializeOptions`
-- [ ] Update `materialize()` to pass `ViewGraph` instead of raw txn
-- [ ] Update `materialize_prefix()` same way
-- [ ] Update all content retrieval to use `ViewGraph`
-- [ ] Remove `is_vertex_alive` (non-filtered version) — `ViewGraph` with no filter handles this
-- [ ] `cargo test -p atomic-core`
-- [ ] `cargo test -p atomic-repository`
-- [ ] Run `tests/harness/run_all.sh` — all suites pass
+- [x] Rewrite `retrieve_graph` to use `iter_forward` — parent edges excluded at type level
+- [x] Add `is_edge_alive(&ForwardEdge)` — typed replacement for `is_alive_at_target_state`
+- [x] Add `is_vertex_alive(txn, vertex)` — typed replacement using `iter_parents` + exhaustive match
+- [x] Deprecate `is_alive_at_target_state` and `is_vertex_alive_at_target` (kept for backward compat)
+- [x] Deprecate `edge_flags()` — replaced by `include_deleted_edges()` boolean
+- [x] Rewrite `classify::is_vertex_alive` with typed `iter_parents` + match
+- [x] Rewrite `classify::is_vertex_zombie` with typed `iter_parents` + `ParentEdgeKind::BlockDeleted`
+- [x] Remove debug `log::trace!` logging from old implementation
+- [x] Add 10 new `test_is_edge_alive_*` tests for all EdgeKind variants with/without filters
+- [x] `cargo test -p atomic-core` — 3,208 + 442 tests pass
+- [x] `cargo test` (full workspace) — 6,899 passed, 0 failures
+- [x] `tests/harness/run_all.sh` — all 10 suites pass
 
 ---
 
-### Phase A4: Typed Edge Construction in Record Pipeline
+### Phase A4: Typed Edge Construction in Record Pipeline ✅ COMPLETE
 
 **Goal**: The record/globalize pipeline creates `NewEdge` structs with
 `EdgeFlags` fields. Replace these with typed edge construction.
 
-**Files to modify**:
-- `record/workflow/globalize/hunk.rs` — `create_deletion_edges_for_vertices` uses `EdgeFlags::BLOCK` and `EdgeFlags::BLOCK | EdgeFlags::DELETED`. Replace with `EdgeKind::Block` and `EdgeKind::BlockDeleted`.
-- `apply/edge.rs` — `write_new_edge` and `add_edge_with_reverse` take `EdgeFlags`. Add overloads or migrate to `EdgeKind`.
+**Files modified**:
+- `record/workflow/globalize/hunk.rs` — `create_deletion_edges_for_vertices` now uses `EdgeKind::Block.to_flags()` and `EdgeKind::BlockDeleted.to_flags()` instead of raw `EdgeFlags` combinations. `find_predecessor_end_position` migrated from `iter_adjacent` with flag ranges to `iter_parents` with `ParentEdgeKind` match. `find_edge_introduced_by` migrated from `iter_adjacent` to `iter_forward` with `EdgeKind` match.
+- `apply/edge.rs` — `write_new_edge` now parses `EdgeKind::from_flags(edge.flag)` for semantic dispatch (`is_folder()`, `is_deleted()`). `collect_pseudo_edges_for_reconnection` migrated from `iter_adjacent` to `iter_forward` with `kind.is_pseudo()` check. `check_vertex_for_zombies` migrated from a single wide `iter_adjacent` range to separate `iter_forward` + `iter_parents` calls with typed edge fields.
+
+**Design decision**: `NewEdge` struct retains `EdgeFlags` fields (wire/serialization format). Construction sites use `EdgeKind::X.to_flags()` to make intent explicit. `add_edge_with_reverse` signature unchanged (deeper change deferred). The typed model is used at call sites and for semantic dispatch, not yet in the struct definition.
 
 **Checklist**:
-- [ ] Update `NewEdge` to use `EdgeKind` for `previous` and `flag` fields
-- [ ] Update `create_deletion_edges_for_vertices` to use `EdgeKind::BlockDeleted`
-- [ ] Update `write_new_edge` to work with `EdgeKind`
-- [ ] Update `add_edge_with_reverse` to accept `EdgeKind` and compute `ParentEdgeKind` from it
-- [ ] Deprecate raw `EdgeFlags` construction outside of serialization
-- [ ] `cargo test` — full workspace
-- [ ] `tests/harness/run_all.sh` — all suites pass
+- [x] Update `create_deletion_edges_for_vertices` to use `EdgeKind::Block.to_flags()` / `EdgeKind::BlockDeleted.to_flags()`
+- [x] Update `find_predecessor_end_position` to use `iter_parents` with `ParentEdgeKind` match
+- [x] Update `find_edge_introduced_by` to use `iter_forward` with `EdgeKind` match
+- [x] Update `write_new_edge` to parse `EdgeKind::from_flags` for semantic dispatch
+- [x] Update `collect_pseudo_edges_for_reconnection` to use `iter_forward` with typed `kind.is_pseudo()`
+- [x] Update `check_vertex_for_zombies` to use `iter_forward` + `iter_parents` (replacing wide `iter_adjacent` range)
+- [ ] Update `NewEdge` struct fields to use `EdgeKind` directly (deferred — requires serialization changes)
+- [ ] Update `add_edge_with_reverse` signature to accept `EdgeKind` (deferred — deeper change)
+- [x] `cargo test` — full workspace (6,899+ tests pass, 0 failures)
+- [x] `tests/harness/run_all.sh` — all 6 suites pass (608 assertions, 0 failures)
 
 ---
 

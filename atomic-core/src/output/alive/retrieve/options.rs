@@ -5,7 +5,7 @@
 
 use super::super::graph::AliveGraph;
 use crate::pristine::{GraphTxnT, PristineError};
-use crate::types::{EdgeFlags, GraphNode, NodeId, SerializedGraphEdge};
+use crate::types::{ForwardEdge, GraphNode, NodeId, ParentEdgeKind};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -161,89 +161,65 @@ impl RetrieveOptions {
         self.change_filter.is_some()
     }
 
-    /// Get the edge flags to use for adjacency queries.
+    /// Whether `iter_forward` should include deleted edges.
     ///
-    /// When a change filter is set, we always include DELETED edges because
-    /// we need to traverse them to find content that was deleted by changes
-    /// OUTSIDE our filter (which means the content was still alive at the
-    /// target state).
-    pub(crate) fn edge_flags(&self) -> (EdgeFlags, EdgeFlags) {
-        let min = EdgeFlags::empty();
-        // When we have a change filter, always include DELETED edges so we can
-        // find content that was deleted after our target state
-        let max = if self.include_deleted || self.change_filter.is_some() {
-            EdgeFlags::PSEUDO | EdgeFlags::BLOCK | EdgeFlags::DELETED
-        } else {
-            EdgeFlags::PSEUDO | EdgeFlags::BLOCK
-        };
-        (min, max)
+    /// When a change filter is active, we always include deleted edges
+    /// because we need to traverse them to find content that was deleted
+    /// by changes OUTSIDE our filter (which means the content was still
+    /// alive at the target state). Same when `include_deleted` is
+    /// explicitly set.
+    pub(crate) fn include_deleted_edges(&self) -> bool {
+        self.include_deleted || self.change_filter.is_some()
     }
 
-    /// Check if a span should be considered "alive" at the target state.
-    ///
-    /// When using a change filter for state-based retrieval, a span is alive if:
-    /// 1. The span was created by a change in the filter set
-    /// 2. Any DELETED edges TO this span were introduced by changes OUTSIDE the filter
-    ///
-    /// This handles the case where content was deleted by a later change - at the
-    /// target state, that deletion hadn't happened yet.
-    ///
-    /// # Arguments
-    ///
-    /// * `edge` - The edge we followed to reach the span
-    /// * `introduced_by` - The change that introduced this edge
-    ///
-    /// # Returns
-    ///
-    /// True if the span should be considered alive at the target state.
-    pub fn is_alive_at_target_state(&self, edge: &SerializedGraphEdge) -> bool {
-        // If no filter, use normal aliveness check
-        if self.change_filter.is_none() {
-            return !edge.flag().contains(EdgeFlags::DELETED);
-        }
+    // ------------------------------------------------------------------
+    // Typed edge model — Phase A3 replacements
+    // ------------------------------------------------------------------
 
-        // With a filter, check if the DELETED edge was introduced by a change in the filter
-        if edge.flag().contains(EdgeFlags::DELETED) {
-            let introduced_by = edge.introduced_by();
-            // If the deletion was introduced by a change OUTSIDE our filter,
-            // then at the target state, this deletion hadn't happened yet,
-            // so the span is still alive
-            if !self.passes_filter(introduced_by) {
-                return true; // Deletion is "in the future" - span is alive
+    /// Check if a forward edge should be followed during traversal.
+    ///
+    /// With no filter, deleted edges are always skipped.
+    /// With a filter, a deleted edge is skipped only if its introducing
+    /// change is IN the filter (meaning the deletion has happened from
+    /// our view's perspective).
+    pub fn is_edge_alive(&self, edge: &ForwardEdge) -> bool {
+        match &self.change_filter {
+            None => !edge.kind.is_deleted(),
+            Some(_) => {
+                if edge.kind.is_deleted() {
+                    // Deletion from outside our view = "hasn't happened yet" = alive
+                    !self.passes_filter(edge.introduced_by)
+                } else {
+                    true
+                }
             }
-            // Deletion was introduced by a change in the filter - span is deleted
-            return false;
         }
-
-        // Non-deleted edge - span is alive
-        true
     }
 
-    /// Check if a vertex is alive at the target state by examining all its parent edges.
+    /// Check if a vertex is alive by examining all its parent edges.
     ///
-    /// This is more thorough than `is_alive_at_target_state` which only checks a single edge.
-    /// A vertex is considered deleted at the target state if ANY of its parent edges have
-    /// the DELETED flag introduced by a change IN our filter.
+    /// A vertex is alive if it has at least one live parent AND was not
+    /// deleted by a change in our view's filter.
     ///
-    /// The key insight is:
-    /// - A vertex needs at least one "live" parent edge from a change in our filter
-    /// - If there's a DELETED edge from a change in our filter, the vertex is deleted
-    /// - DELETED edges from changes OUTSIDE our filter are ignored (deletion is "in the future")
+    /// Uses typed [`ParentEdgeKind`] matching instead of raw `EdgeFlags`
+    /// bitflag checks, so every case is visible and the compiler rejects
+    /// missing arms.
     ///
-    /// # Arguments
+    /// # Logic
     ///
-    /// * `txn` - Transaction for graph lookups
-    /// * `vertex` - The vertex to check
+    /// - **Non-deleted parent edge** → live parent
+    /// - **DELETED parent, introduced OUTSIDE filter** → live parent
+    ///   (the deletion is "in the future" from our perspective)
+    /// - **DELETED parent, introduced IN filter** → marks vertex dead
     ///
-    /// # Returns
-    ///
-    /// True if the vertex is alive at the target state.
-    pub fn is_vertex_alive_at_target<T: GraphTxnT>(
+    /// The vertex is alive when it has at least one live parent AND
+    /// was not deleted by an in-filter change.
+    pub fn is_vertex_alive<T: GraphTxnT>(
         &self,
         txn: &T,
         vertex: GraphNode<NodeId>,
     ) -> Result<bool, PristineError> {
-        // If no filter, use normal aliveness check
+        // If no filter, delegate to the unfiltered classifier
         if self.change_filter.is_none() {
             return super::classify::is_vertex_alive(txn, &vertex);
         }
@@ -253,94 +229,47 @@ impl RetrieveOptions {
             return Ok(true);
         }
 
-        // Check parent edges to determine if this vertex is alive at the
-        // target state defined by the change filter.
-        //
-        // Key insight for Replacement operations and divergent stacks:
-        //
-        // When stack A and stack B both modify the same file, they each
-        // create a Replacement that deletes the original content vertex
-        // and adds a new one.  In the global graph the original vertex
-        // ends up with TWO DELETED parent edges:
-        //
-        //   - One introduced by stack A's change (in A's filter)
-        //   - One introduced by stack B's change (in B's filter)
-        //
-        // The original non-deleted parent edge from the creating change
-        // was removed by `del_edge_with_reverse` during the first
-        // Replacement apply.  So the vertex may have NO non-deleted
-        // parent edges at all — only DELETED ones from different changes.
-        //
-        // A DELETED edge from OUTSIDE the filter means "this vertex was
-        // alive, then a change we cannot see deleted it."  From our
-        // stack's perspective that deletion has not happened yet, so the
-        // vertex IS still alive — UNLESS our own filter also contains a
-        // change that explicitly deleted it.
-        //
-        // Logic:
-        //   - NON-deleted parent edge              → live parent
-        //   - DELETED parent, introduced OUTSIDE filter → live parent
-        //     (the deletion is "in the future" from our perspective)
-        //   - DELETED parent, introduced IN filter  → marks vertex dead
-        //
-        // The vertex is alive when it has at least one live parent AND
-        // was not deleted by an in-filter change.
+        // Include deleted parents so we can distinguish "deleted by us"
+        // from "deleted by someone outside our filter".
+        let parents = txn.iter_parents(vertex, true)?;
 
         let mut has_live_parent = false;
         let mut deleted_by_filter_change = false;
-        let mut edge_count = 0u32;
 
-        let parent_flags = EdgeFlags::PARENT;
-        let max_flags = EdgeFlags::all();
-        let adj = txn.iter_adjacent(vertex, parent_flags, max_flags)?;
-
-        for edge_result in adj {
-            let edge = edge_result?;
-            let flag = edge.flag();
-
-            if !flag.contains(EdgeFlags::PARENT) {
-                continue;
-            }
-
-            edge_count += 1;
-            let introduced_by = edge.introduced_by();
+        for parent in &parents {
+            let introduced_by = parent.introduced_by;
             let in_filter = self.passes_filter(introduced_by);
 
-            log::trace!(
-                "is_vertex_alive_at_target: vertex=[{:?} {:?}:{:?}] edge #{} flag={:?} introduced_by={:?} in_filter={}",
-                vertex.change, vertex.start, vertex.end,
-                edge_count, flag, introduced_by, in_filter
-            );
-
-            if flag.contains(EdgeFlags::DELETED) {
-                if in_filter {
-                    // Deletion from a change in our filter → vertex is dead
-                    deleted_by_filter_change = true;
-                } else {
-                    // Deletion from a change OUTSIDE our filter.
-                    // From our perspective that deletion hasn't happened yet,
-                    // so this edge still counts as a live connection.
-                    if flag.contains(EdgeFlags::BLOCK) || vertex.is_empty() {
+            match parent.kind {
+                // Non-deleted parent edges — vertex is connected (alive)
+                ParentEdgeKind::Block | ParentEdgeKind::Folder => {
+                    has_live_parent = true;
+                }
+                // Pseudo parents count for empty vertices (inodes)
+                ParentEdgeKind::PseudoBlock | ParentEdgeKind::PseudoFolder => {
+                    if vertex.is_empty() {
                         has_live_parent = true;
                     }
                 }
-            } else if flag.contains(EdgeFlags::BLOCK) || vertex.is_empty() {
-                // Non-deleted parent edge → vertex is connected (alive)
-                has_live_parent = true;
+                // Deleted parent — check who deleted it
+                ParentEdgeKind::BlockDeleted | ParentEdgeKind::FolderDeleted => {
+                    if in_filter {
+                        // Deletion from a change in our filter → vertex is dead
+                        deleted_by_filter_change = true;
+                    } else {
+                        // Deletion from a change OUTSIDE our filter.
+                        // From our perspective that deletion hasn't happened yet,
+                        // so this edge still counts as a live connection.
+                        has_live_parent = true;
+                    }
+                }
             }
         }
-
-        let alive = has_live_parent && !deleted_by_filter_change;
-        log::trace!(
-            "is_vertex_alive_at_target: vertex=[{:?} {:?}:{:?}] edges={} has_live_parent={} deleted_by_filter={} → alive={}",
-            vertex.change, vertex.start, vertex.end,
-            edge_count, has_live_parent, deleted_by_filter_change, alive
-        );
 
         // Vertex is alive if it has at least one live parent (non-deleted
         // or deleted-by-outside-change) AND was not explicitly deleted by
         // a change in our filter.
-        Ok(alive)
+        Ok(has_live_parent && !deleted_by_filter_change)
     }
 }
 

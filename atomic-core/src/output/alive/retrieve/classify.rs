@@ -6,7 +6,7 @@
 
 use super::super::vertex::{AliveVertex, VertexFlags};
 use crate::pristine::{GraphTxnT, PristineError};
-use crate::types::{EdgeFlags, GraphNode, NodeId, Position};
+use crate::types::{GraphNode, NodeId, ParentEdgeKind, Position};
 
 /// Create an AliveVertex from an already-resolved span, if it's alive.
 ///
@@ -72,7 +72,13 @@ pub(super) fn new_vertex_at_position<T: GraphTxnT>(
 
 /// Check if a node is alive (not fully deleted).
 ///
-/// A node is alive if it has at least one non-deleted edge.
+/// A node is alive if it has at least one non-deleted, non-pseudo-only
+/// parent edge. For empty vertices (inodes), any non-deleted parent
+/// — including pseudo parents — proves aliveness.
+///
+/// Uses typed [`ParentEdgeKind`] matching instead of raw `EdgeFlags`
+/// bitflag checks, so every case is visible and the compiler rejects
+/// missing arms.
 pub(super) fn is_vertex_alive<T: GraphTxnT>(
     txn: &T,
     node: &GraphNode<NodeId>,
@@ -82,25 +88,25 @@ pub(super) fn is_vertex_alive<T: GraphTxnT>(
         return Ok(true);
     }
 
-    // Check for any parent edges that are not deleted
-    let parent_flags = EdgeFlags::PARENT;
-    let max_flags = EdgeFlags::all() - EdgeFlags::DELETED;
+    // Iterate non-deleted parent edges only
+    let parents = txn.iter_parents(*node, false)?;
 
-    let adj = txn.iter_adjacent(*node, parent_flags, max_flags)?;
+    for parent in &parents {
+        match parent.kind {
+            // Real (non-pseudo) parent edges prove aliveness for any vertex
+            ParentEdgeKind::Block | ParentEdgeKind::Folder => return Ok(true),
 
-    for edge_result in adj {
-        let edge = edge_result?;
-        let flag = edge.flag();
+            // Pseudo parents prove aliveness only for empty vertices (inodes)
+            ParentEdgeKind::PseudoBlock | ParentEdgeKind::PseudoFolder => {
+                if node.is_empty() {
+                    return Ok(true);
+                }
+                // For content vertices, pseudo parents alone don't prove aliveness
+            }
 
-        // Skip pseudo-only edges
-        let pseudo_flag = EdgeFlags::PSEUDO | EdgeFlags::PARENT;
-        if (flag & pseudo_flag) == EdgeFlags::PSEUDO {
-            continue;
-        }
-
-        // If it has a block edge or is empty, it's alive
-        if flag.contains(EdgeFlags::BLOCK) || node.is_empty() {
-            return Ok(true);
+            // BlockDeleted/FolderDeleted are excluded by include_deleted=false,
+            // but handle them explicitly for exhaustiveness
+            ParentEdgeKind::BlockDeleted | ParentEdgeKind::FolderDeleted => {}
         }
     }
 
@@ -109,22 +115,19 @@ pub(super) fn is_vertex_alive<T: GraphTxnT>(
 
 /// Check if a node is a zombie (deleted but with live connections).
 ///
-/// A zombie node is one that has both:
-/// - A deleted parent edge (meaning it was deleted)
-/// - A non-deleted parent edge (meaning something still references it)
+/// A zombie node has at least one deleted block parent edge, meaning
+/// something explicitly deleted it. Uses typed [`ParentEdgeKind`]
+/// matching for clarity.
 pub(super) fn is_vertex_zombie<T: GraphTxnT>(
     txn: &T,
     node: &GraphNode<NodeId>,
 ) -> Result<bool, PristineError> {
-    // Check for deleted block parent edges
-    let deleted_flags = EdgeFlags::PARENT | EdgeFlags::DELETED | EdgeFlags::BLOCK;
+    // Include deleted edges so we can see deletion markers
+    let parents = txn.iter_parents(*node, true)?;
 
-    let adj = txn.iter_adjacent(*node, deleted_flags, EdgeFlags::all())?;
-
-    for edge_result in adj {
-        let edge = edge_result?;
-        if edge.flag().contains(deleted_flags) {
-            return Ok(true);
+    for parent in &parents {
+        if parent.kind == ParentEdgeKind::BlockDeleted {
+            return Ok(true); // Has a deleted block parent = zombie
         }
     }
 

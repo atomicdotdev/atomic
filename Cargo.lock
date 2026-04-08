@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-agent"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "atomic-core",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-cli"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "atomic-agent",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-config"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-core"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bitflags",
@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-identity"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "atomic-config",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-remote"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-repository"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "atomic-config",

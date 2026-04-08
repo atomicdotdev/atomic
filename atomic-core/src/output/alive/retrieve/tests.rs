@@ -1,7 +1,7 @@
 use super::super::graph::AliveGraph;
 use super::super::vertex::{AliveVertex, VertexFlags, VertexId};
 use super::options::{RetrieveOptions, RetrieveResult};
-use crate::types::{ChangePosition, EdgeFlags, GraphNode, NodeId, Position};
+use crate::types::{ChangePosition, EdgeFlags, EdgeKind, ForwardEdge, GraphNode, NodeId, Position};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -47,23 +47,131 @@ fn test_retrieve_options_chaining() {
 }
 
 #[test]
-fn test_retrieve_options_edge_flags_default() {
+fn test_include_deleted_edges_default() {
     let opts = RetrieveOptions::default();
-    let (min, max) = opts.edge_flags();
-
-    assert!(min.is_empty());
-    assert!(max.contains(EdgeFlags::BLOCK));
-    assert!(max.contains(EdgeFlags::PSEUDO));
-    assert!(!max.contains(EdgeFlags::DELETED));
+    assert!(!opts.include_deleted_edges());
 }
 
 #[test]
-fn test_retrieve_options_edge_flags_include_deleted() {
+fn test_include_deleted_edges_explicit() {
     let opts = RetrieveOptions::new().include_deleted(true);
-    let (min, max) = opts.edge_flags();
+    assert!(opts.include_deleted_edges());
+}
 
-    assert!(min.is_empty());
-    assert!(max.contains(EdgeFlags::DELETED));
+#[test]
+fn test_include_deleted_edges_with_filter() {
+    let mut filter = HashSet::new();
+    filter.insert(NodeId::new(1));
+    let opts = RetrieveOptions::new().with_change_filter(filter);
+    // A change filter always forces inclusion of deleted edges
+    assert!(opts.include_deleted_edges());
+}
+
+// -------------------------------------------------------------------------
+// is_edge_alive Tests (typed ForwardEdge model)
+// -------------------------------------------------------------------------
+
+fn make_forward_edge(kind: EdgeKind, introduced_by: u64) -> ForwardEdge {
+    ForwardEdge {
+        kind,
+        dest: Position::new(NodeId::new(99), ChangePosition::new(0)),
+        introduced_by: NodeId::new(introduced_by),
+    }
+}
+
+#[test]
+fn test_is_edge_alive_no_filter_alive_edge() {
+    let opts = RetrieveOptions::new();
+    let edge = make_forward_edge(EdgeKind::Block, 1);
+    assert!(opts.is_edge_alive(&edge));
+}
+
+#[test]
+fn test_is_edge_alive_no_filter_deleted_edge() {
+    let opts = RetrieveOptions::new();
+    let edge = make_forward_edge(EdgeKind::BlockDeleted, 1);
+    assert!(!opts.is_edge_alive(&edge));
+}
+
+#[test]
+fn test_is_edge_alive_no_filter_folder_edge() {
+    let opts = RetrieveOptions::new();
+    let edge = make_forward_edge(EdgeKind::Folder, 1);
+    assert!(opts.is_edge_alive(&edge));
+}
+
+#[test]
+fn test_is_edge_alive_no_filter_folder_deleted() {
+    let opts = RetrieveOptions::new();
+    let edge = make_forward_edge(EdgeKind::FolderDeleted, 1);
+    assert!(!opts.is_edge_alive(&edge));
+}
+
+#[test]
+fn test_is_edge_alive_no_filter_pseudo_block() {
+    let opts = RetrieveOptions::new();
+    let edge = make_forward_edge(EdgeKind::PseudoBlock, 1);
+    assert!(opts.is_edge_alive(&edge));
+}
+
+#[test]
+fn test_is_edge_alive_no_filter_pseudo_folder() {
+    let opts = RetrieveOptions::new();
+    let edge = make_forward_edge(EdgeKind::PseudoFolder, 1);
+    assert!(opts.is_edge_alive(&edge));
+}
+
+#[test]
+fn test_is_edge_alive_with_filter_alive_edge_in_filter() {
+    let mut filter = HashSet::new();
+    filter.insert(NodeId::new(1));
+    let opts = RetrieveOptions::new().with_change_filter(filter);
+
+    let edge = make_forward_edge(EdgeKind::Block, 1);
+    assert!(opts.is_edge_alive(&edge));
+}
+
+#[test]
+fn test_is_edge_alive_with_filter_deleted_by_in_filter_change() {
+    let mut filter = HashSet::new();
+    filter.insert(NodeId::new(1));
+    let opts = RetrieveOptions::new().with_change_filter(filter);
+
+    // Deletion introduced by change 1 which IS in our filter → dead
+    let edge = make_forward_edge(EdgeKind::BlockDeleted, 1);
+    assert!(!opts.is_edge_alive(&edge));
+}
+
+#[test]
+fn test_is_edge_alive_with_filter_deleted_by_outside_change() {
+    let mut filter = HashSet::new();
+    filter.insert(NodeId::new(1));
+    let opts = RetrieveOptions::new().with_change_filter(filter);
+
+    // Deletion introduced by change 2 which is NOT in our filter
+    // → deletion "hasn't happened yet" from our perspective → alive
+    let edge = make_forward_edge(EdgeKind::BlockDeleted, 2);
+    assert!(opts.is_edge_alive(&edge));
+}
+
+#[test]
+fn test_is_edge_alive_with_filter_folder_deleted_by_outside_change() {
+    let mut filter = HashSet::new();
+    filter.insert(NodeId::new(1));
+    let opts = RetrieveOptions::new().with_change_filter(filter);
+
+    let edge = make_forward_edge(EdgeKind::FolderDeleted, 2);
+    assert!(opts.is_edge_alive(&edge));
+}
+
+#[test]
+fn test_is_edge_alive_with_filter_folder_deleted_by_in_filter_change() {
+    let mut filter = HashSet::new();
+    filter.insert(NodeId::new(1));
+    let opts = RetrieveOptions::new().with_change_filter(filter);
+
+    let edge = make_forward_edge(EdgeKind::FolderDeleted, 1);
+    assert!(!opts.is_edge_alive(&edge));
 }
 
 #[test]

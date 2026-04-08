@@ -44,7 +44,9 @@
 
 use crate::change::{Change, EdgeUpdate, NewEdge};
 use crate::pristine::{GraphTxnT, MutTxnT};
-use crate::types::{EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge};
+use crate::types::{
+    EdgeFlags, EdgeKind, GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge,
+};
 
 use super::error::LocalApplyError;
 use super::position::{resolve_inode, resolve_introduced_by, resolve_position};
@@ -138,7 +140,7 @@ fn write_new_edge<T: MutTxnT>(
     change: &Change,
 ) -> Result<(), LocalApplyError> {
     // Resolve the introduced_by change
-    let introduced_by = resolve_introduced_by(txn, &edge.introduced_by, change_id)?;
+    let _introduced_by = resolve_introduced_by(txn, &edge.introduced_by, change_id)?;
 
     // Find source span — predecessor context (ending at position).
     let source_pos = resolve_position(txn, &edge.from, change_id)?;
@@ -151,8 +153,13 @@ fn write_new_edge<T: MutTxnT>(
     // Resolve inode for indexing
     let resolved_inode = resolve_inode(txn, inode, change_id)?;
 
+    // Parse the edge kind for semantic dispatch.
+    // `edge.flag` is still `EdgeFlags` (wire format from the change), so we
+    // parse it into a typed `EdgeKind` for cleaner branching below.
+    let kind = EdgeKind::from_flags(edge.flag);
+
     // Track folder files for conflict detection
-    if edge.flag.contains(EdgeFlags::FOLDER) {
+    if kind.map_or(false, |k| k.is_folder()) {
         workspace.mark_rooted(target.start_pos());
     }
 
@@ -168,7 +175,7 @@ fn write_new_edge<T: MutTxnT>(
     }
 
     // Handle deletion: collect pseudo-edges for reconnection
-    if edge.flag.contains(EdgeFlags::DELETED) {
+    if kind.map_or(false, |k| k.is_deleted()) {
         collect_pseudo_edges_for_reconnection(txn, workspace, target)?;
     }
 
@@ -186,8 +193,8 @@ fn write_new_edge<T: MutTxnT>(
     // graph — no view can destroy information that another view depends on.
     add_edge_with_reverse(txn, resolved_inode, edge.flag, source, target, change_id)?;
 
-    // For deletions, check for zombie context
-    if edge.flag.contains(EdgeFlags::DELETED) && !edge.flag.contains(EdgeFlags::FOLDER) {
+    // For non-folder deletions, check for zombie context
+    if kind.map_or(false, |k| k.is_deleted() && !k.is_folder()) {
         collect_zombie_context(txn, workspace, change, edge, change_id)?;
     }
 
@@ -334,60 +341,6 @@ fn add_edge_with_reverse<T: MutTxnT>(
     Ok(())
 }
 
-/// Remove an edge and its reverse from the graph.
-///
-/// This is the inverse of `add_edge_with_reverse`. Removes both the
-/// forward and reverse edges from the global GRAPH table and, when an
-/// inode is provided, from the INODE_GRAPH secondary index.
-///
-/// # Arguments
-///
-/// * `txn` - Write transaction
-/// * `inode` - Optional inode for inode_graph cleanup
-/// * `flag` - Edge flags for the forward edge
-/// * `source` - Source span
-/// * `dest` - Destination span
-/// * `introduced_by` - Change that introduced the edge
-///
-/// # Notes
-///
-/// This function ignores not-found errors, as the edge may have
-/// already been removed or may not exist.
-fn del_edge_with_reverse<T: MutTxnT>(
-    txn: &mut T,
-    inode: Option<Inode>,
-    flag: EdgeFlags,
-    source: GraphNode<NodeId>,
-    dest: GraphNode<NodeId>,
-    introduced_by: NodeId,
-) -> Result<(), LocalApplyError> {
-    // Create forward edge to delete
-    let forward_edge = SerializedGraphEdge::new(flag, dest.start_pos(), introduced_by);
-
-    // Create reverse edge to delete
-    let reverse_flag = flag | EdgeFlags::PARENT;
-    let reverse_edge = SerializedGraphEdge::new(reverse_flag, source.end_pos(), introduced_by);
-
-    // Remove from global GRAPH
-    let del_fwd = txn.del_graph(source, forward_edge);
-    let del_rev = txn.del_graph(dest, reverse_edge);
-
-    log::debug!(
-        "del_edge_with_reverse: flag={:?} source=[{:?} {:?}:{:?}] dest=[{:?} {:?}:{:?}] introduced_by={:?} fwd_ok={} rev_ok={}",
-        flag, source.change, source.start, source.end,
-        dest.change, dest.start, dest.end,
-        introduced_by, del_fwd.is_ok(), del_rev.is_ok()
-    );
-
-    // Remove from INODE_GRAPH secondary index
-    if let Some(inode_val) = inode {
-        let _ = txn.del_inode_graph(inode_val, source, forward_edge);
-        let _ = txn.del_inode_graph(inode_val, dest, reverse_edge);
-    }
-
-    Ok(())
-}
-
 // Deletion Handling
 
 /// Collect pseudo-edges for reconnection when deleting a span.
@@ -411,24 +364,19 @@ fn collect_pseudo_edges_for_reconnection<T: GraphTxnT>(
         return Ok(());
     }
 
-    // Collect children of the target span that need reconnection
-    let child_flags = EdgeFlags::empty();
-    let max_child_flags = EdgeFlags::BLOCK | EdgeFlags::FOLDER | EdgeFlags::PSEUDO;
-
+    // Collect children of the target span that need reconnection.
+    // Use typed `iter_forward` — we want all alive forward edges
+    // (block, folder, pseudo) but NOT deleted ones.
     let children = txn
-        .iter_adjacent(target, child_flags, max_child_flags)
+        .iter_forward(target, false)
         .map_err(|e| LocalApplyError::Internal {
             message: format!("Failed to iterate children: {}", e),
         })?;
 
-    for child_result in children {
-        let child = child_result.map_err(|e| LocalApplyError::Internal {
-            message: format!("Child iteration error: {}", e),
-        })?;
-
-        if !child.flag().contains(EdgeFlags::PSEUDO) {
+    for child in children {
+        if !child.kind.is_pseudo() {
             // Track this child as needing reconnection
-            workspace.set_parent(child.dest(), target.end_pos());
+            workspace.set_parent(child.dest, target.end_pos());
         }
     }
 
@@ -489,31 +437,50 @@ fn check_vertex_for_zombies<T: GraphTxnT>(
     node: GraphNode<NodeId>,
     change_id: NodeId,
 ) -> Result<(), LocalApplyError> {
-    let min_flag = EdgeFlags::empty();
-    let max_flag = EdgeFlags::all() - EdgeFlags::DELETED;
+    // The original code used `iter_adjacent(node, empty(), all() - DELETED)`,
+    // which spans BOTH forward and parent (reverse) edges — everything that
+    // is NOT deleted.  The typed replacement must therefore check both
+    // directions: `iter_forward` (alive forward edges) and `iter_parents`
+    // (alive parent edges).
 
-    let edges =
-        txn.iter_adjacent(node, min_flag, max_flag)
-            .map_err(|e| LocalApplyError::Internal {
-                message: format!("Failed to iterate for zombies: {}", e),
-            })?;
-
-    for edge_result in edges {
-        let adj_edge = edge_result.map_err(|e| LocalApplyError::Internal {
-            message: format!("Zombie edge iteration error: {}", e),
+    // --- Forward edges (alive only) ---
+    let forward_edges = txn
+        .iter_forward(node, false)
+        .map_err(|e| LocalApplyError::Internal {
+            message: format!("Failed to iterate forward edges for zombies: {}", e),
         })?;
 
-        let introduced_by = adj_edge.introduced_by();
-        if introduced_by == change_id || introduced_by.is_root() {
+    for edge in &forward_edges {
+        if edge.introduced_by == change_id || edge.introduced_by.is_root() {
             continue;
         }
 
-        // Check if we know about this change
-        if let Ok(Some(hash)) = txn.get_external(introduced_by) {
+        if let Ok(Some(hash)) = txn.get_external(edge.introduced_by) {
             if !change.knows(&hash) {
                 // Unknown live edge - this is a zombie
                 workspace.add_zombie_vertex(node);
-                break;
+                return Ok(());
+            }
+        }
+    }
+
+    // --- Parent edges (alive only) ---
+    let parent_edges = txn
+        .iter_parents(node, false)
+        .map_err(|e| LocalApplyError::Internal {
+            message: format!("Failed to iterate parent edges for zombies: {}", e),
+        })?;
+
+    for edge in &parent_edges {
+        if edge.introduced_by == change_id || edge.introduced_by.is_root() {
+            continue;
+        }
+
+        if let Ok(Some(hash)) = txn.get_external(edge.introduced_by) {
+            if !change.knows(&hash) {
+                // Unknown live edge - this is a zombie
+                workspace.add_zombie_vertex(node);
+                return Ok(());
             }
         }
     }

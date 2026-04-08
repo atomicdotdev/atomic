@@ -462,7 +462,7 @@ where
     T: GraphTxnT + TreeTxnT,
 {
     use crate::change::NewEdge;
-    use crate::types::EdgeFlags;
+    use crate::types::EdgeKind;
 
     let mut edges = Vec::new();
 
@@ -478,13 +478,12 @@ where
         // the source position.
         let from_pos = find_predecessor_end_position(ctx.txn(), *v)?;
 
-        // Create a deletion edge
-        // This marks the edge FROM the predecessor TO this span as deleted
+        // Create a deletion edge using typed EdgeKind.
+        // previous = Block (the existing live edge we expect)
+        // flag     = BlockDeleted (mark the edge as deleted)
         let edge = NewEdge {
-            // The previous edge type (what we expect the existing edge to have)
-            previous: EdgeFlags::BLOCK,
-            // The new edge type (add DELETED flag)
-            flag: EdgeFlags::BLOCK | EdgeFlags::DELETED,
+            previous: EdgeKind::Block.to_flags(),
+            flag: EdgeKind::BlockDeleted.to_flags(),
             // From: the end position of the predecessor span
             from: position_to_option_hash_resolved(ctx.txn(), from_pos, None),
             // To: the span being deleted
@@ -508,28 +507,32 @@ fn find_predecessor_end_position<T: GraphTxnT>(
     txn: &T,
     node: GraphNode<NodeId>,
 ) -> GlobalizeResult<Position<NodeId>> {
-    use crate::types::EdgeFlags;
+    use crate::types::ParentEdgeKind;
 
-    // Look for BLOCK|PARENT edges - these tell us where the edge came from.
+    // Use typed iter_parents to find BLOCK|PARENT or FOLDER|PARENT edges.
     //
     // NOTE: No change filter here.  This is a structural lookup — we need
     // the predecessor vertex regardless of which view introduced the edge.
     // The `introduced_by` on a parent edge records WHEN the connection was
     // made, not WHETHER the predecessor exists.  Filtering here would reject
     // edges introduced by sibling views and leave content vertices orphaned.
-    let min_flag = EdgeFlags::BLOCK | EdgeFlags::PARENT;
-    let max_flag = EdgeFlags::BLOCK | EdgeFlags::PARENT | EdgeFlags::FOLDER;
-
-    let adj = txn
-        .iter_adjacent(node, min_flag, max_flag)
+    //
+    // include_deleted=false: we only want alive parent edges.
+    let parents = txn
+        .iter_parents(node, false)
         .map_err(|e| GlobalizeError::Pristine(Box::new(e)))?;
 
-    for edge_result in adj {
-        let edge = edge_result.map_err(|e| GlobalizeError::Pristine(Box::new(e)))?;
-
-        // The edge dest() points to where the forward edge came FROM
-        // (remember, this is a reverse/PARENT edge)
-        return Ok(edge.dest());
+    for parent in parents {
+        match parent.kind {
+            // Block or Folder parent — the dest points to where the forward
+            // edge came FROM (remember, this is a reverse/PARENT edge).
+            ParentEdgeKind::Block | ParentEdgeKind::Folder => {
+                return Ok(parent.dest);
+            }
+            // Skip pseudo parents — they are synthetic connectivity edges,
+            // not real predecessors from stored changes.
+            _ => continue,
+        }
     }
 
     // If no parent found, this shouldn't happen for content vertices
@@ -545,7 +548,7 @@ fn find_edge_introduced_by<T: GraphTxnT>(
     from_pos: Position<NodeId>,
     to_vertex: GraphNode<NodeId>,
 ) -> Option<Hash> {
-    use crate::types::EdgeFlags;
+    use crate::types::EdgeKind;
 
     // Find the span at the from position
     // (find_block_end resolves a position to a vertex — no filtering needed
@@ -555,33 +558,30 @@ fn find_edge_introduced_by<T: GraphTxnT>(
         Err(_) => return None,
     };
 
-    // Look for the edge from from_vertex to to_vertex
-    let min_flag = EdgeFlags::BLOCK;
-    let max_flag = EdgeFlags::BLOCK | EdgeFlags::FOLDER;
-
-    let adj = match txn.iter_adjacent(from_vertex, min_flag, max_flag) {
-        Ok(a) => a,
+    // Use typed iter_forward to find Block or Folder edges.
+    // include_deleted=false: we want the alive edge that originally
+    // connected from_vertex to to_vertex.
+    //
+    // NOTE: No change filter here.  This is a structural lookup — we
+    // need to find the edge that connects from_vertex to to_vertex
+    // regardless of which view introduced it.  The original edge may
+    // have been replaced by a sibling view (e.g., agent-a deletes
+    // the C1 edge and adds a C2 edge).  We still need to find it so
+    // we can record the correct `introduced_by` in the new change.
+    let edges = match txn.iter_forward(from_vertex, false) {
+        Ok(e) => e,
         Err(_) => return None,
     };
 
-    for edge_result in adj {
-        let edge = match edge_result {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        // NOTE: No change filter here.  This is a structural lookup — we
-        // need to find the edge that connects from_vertex to to_vertex
-        // regardless of which view introduced it.  The original edge may
-        // have been replaced by a sibling view (e.g., agent-a deletes
-        // the C1 edge and adds a C2 edge).  We still need to find it so
-        // we can record the correct `introduced_by` in the new change.
-
-        // Check if this edge points to our target span
-        if edge.dest() == to_vertex.start_pos() {
-            // Get the hash for the introduced_by NodeId
-            let introduced_by_id = edge.introduced_by();
-            return txn.get_external(introduced_by_id).ok().flatten();
+    for edge in edges {
+        match edge.kind {
+            EdgeKind::Block | EdgeKind::Folder => {
+                // Check if this edge points to our target span
+                if edge.dest == to_vertex.start_pos() {
+                    return txn.get_external(edge.introduced_by).ok().flatten();
+                }
+            }
+            _ => continue,
         }
     }
 

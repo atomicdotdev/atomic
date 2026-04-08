@@ -75,7 +75,7 @@ use classify::create_alive_vertex;
 use super::graph::AliveGraph;
 use super::vertex::{AliveVertex, VertexId};
 use crate::pristine::{GraphTxnT, PristineError};
-use crate::types::{EdgeFlags, GraphNode, NodeId, Position, SerializedGraphEdge};
+use crate::types::{GraphNode, NodeId, Position, SerializedGraphEdge};
 use std::collections::HashMap;
 
 /// Retrieve the alive graph for a file starting from a position.
@@ -144,7 +144,10 @@ pub fn retrieve_graph<T: GraphTxnT>(
     // DFS traversal stack
     let mut stack = vec![VertexId::new(1)];
 
-    let (min_flag, max_flag) = options.edge_flags();
+    // Determine whether iter_forward should include deleted edges.
+    // When a change filter is active we need to see deleted edges so we can
+    // decide whether the deletion "has happened" from our view's perspective.
+    let include_deleted = options.include_deleted_edges();
 
     while let Some(vid) = stack.pop() {
         // Check span limit
@@ -168,22 +171,17 @@ pub fn retrieve_graph<T: GraphTxnT>(
         // Get the node to traverse
         let node = result.graph.get_vertex(vid).node;
 
-        // Get adjacent edges from the graph
-        let adj = txn.iter_adjacent(node, min_flag, max_flag)?;
+        // Get typed forward edges — parent edges are excluded at the type
+        // level, so no manual `if PARENT { continue }` guard is needed.
+        let forward_edges = txn.iter_forward(node, include_deleted)?;
 
         // Collect children for this span
         let mut children_to_add: Vec<(Option<SerializedGraphEdge>, VertexId)> = Vec::new();
 
-        for edge_result in adj {
-            let edge = edge_result?;
+        for edge in forward_edges {
             result.edges_traversed += 1;
 
-            // Skip parent edges (we want forward edges only)
-            if edge.flag().intersects(EdgeFlags::PARENT) {
-                continue;
-            }
-
-            let dest_pos = edge.dest();
+            let dest_pos = edge.dest;
 
             // First resolve the position to an actual span using find_block.
             // This handles the case where position 9 could refer to either an
@@ -193,18 +191,19 @@ pub fn retrieve_graph<T: GraphTxnT>(
                 Err(_) => continue, // Position doesn't resolve to a span
             };
 
-            // Check if this span passes the change filter
+            // Check if this span passes the change filter.
             // This is the key mechanism for state-based content retrieval:
-            // only include vertices from changes that existed at the target state
+            // only include vertices from changes that existed at the target state.
             if !options.passes_filter(resolved_vertex.change) {
                 continue; // Span is from a change not in the filter set
             }
 
-            // Check if this span is "alive" at the target state.
-            // This handles DELETED edges: if the deletion was introduced by a
-            // change OUTSIDE our filter, then at the target state the deletion
-            // hadn't happened yet, so the span is still alive.
-            if !options.is_alive_at_target_state(&edge) {
+            // Single-edge alive check using the typed EdgeKind.
+            // With no filter, deleted edges are skipped.
+            // With a filter, a deleted edge is skipped only if its introducing
+            // change is IN the filter (meaning the deletion has happened from
+            // our view's perspective).
+            if !options.is_edge_alive(&edge) {
                 continue; // Span was deleted at the target state
             }
 
@@ -219,8 +218,8 @@ pub fn retrieve_graph<T: GraphTxnT>(
                 // examining all its parent edges (not just the edge we followed).
                 // Otherwise, use the normal create_alive_vertex check.
                 let alive_vertex = if options.has_filter() {
-                    // Check if this vertex is alive at the target state
-                    if !options.is_vertex_alive_at_target(txn, resolved_vertex)? {
+                    // Full vertex aliveness check using typed parent iteration
+                    if !options.is_vertex_alive(txn, resolved_vertex)? {
                         continue; // Vertex was deleted at the target state
                     }
                     AliveVertex::new(resolved_vertex)
@@ -237,8 +236,14 @@ pub fn retrieve_graph<T: GraphTxnT>(
                 new_id
             };
 
+            // Convert the typed ForwardEdge back to a SerializedGraphEdge
+            // for storage in the AliveGraph children list, which uses the
+            // wire format.
+            let serialized =
+                SerializedGraphEdge::new(edge.kind.to_flags(), edge.dest, edge.introduced_by);
+
             // Collect this child (don't add yet, we'll add all at once)
-            children_to_add.push((Some(edge), dest_vid));
+            children_to_add.push((Some(serialized), dest_vid));
         }
 
         // Add sentinel at end of children
