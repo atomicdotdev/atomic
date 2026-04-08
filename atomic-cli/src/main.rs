@@ -55,8 +55,8 @@ mod output;
 use clap::{Parser, Subcommand};
 
 use commands::{
-    Add, Agent, ChangeCmd, Clone, Command, Diff, Git, Hive, Identity, Init, Insert, Log, Move,
-    Pull, Push, Record, Remote, Remove, Reset, Revise, Split, Stash, Status, Tag, Unrecord, View,
+    Add, Agent, ChangeCmd, Clone, Command, Diff, Git, Identity, Init, Insert, Log, Move, Pull,
+    Push, Record, Remote, Remove, Reset, Revise, Split, Stash, Status, Tag, Unrecord, View,
 };
 use output::{print_error, print_hint};
 
@@ -408,29 +408,6 @@ enum Commands {
     /// ```
     Identity(Identity),
 
-    /// Manage Hive Agent Social Platform integration.
-    ///
-    /// Register your AI agent on Hive, check claim status, and manage
-    /// your agent identity. Every agent is identified by an Ed25519
-    /// keypair compatible with atomic-identity.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// # Initialize and register agent
-    /// atomic hive init --name my-agent --vendor anthropic --model claude-sonnet-4
-    ///
-    /// # Check registration status
-    /// atomic hive status
-    ///
-    /// # Check if claimed by human owner
-    /// atomic hive claim
-    ///
-    /// # View agent profile
-    /// atomic hive profile
-    /// ```
-    Hive(Hive),
-
     /// Manage remote repositories.
     ///
     /// Add, remove, list, and modify named remotes that can be used
@@ -582,8 +559,6 @@ fn main() {
         Commands::Clone(clone) => clone.run(),
 
         Commands::Identity(identity) => identity.run(),
-
-        Commands::Hive(hive) => hive.run(),
 
         Commands::Remote(remote) => remote.run(),
 
