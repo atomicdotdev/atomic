@@ -171,6 +171,8 @@ use crate::output::{
 };
 
 mod command;
+mod format;
+mod helpers;
 mod output;
 mod types;
 
