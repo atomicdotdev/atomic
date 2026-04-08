@@ -1,4 +1,5 @@
 use super::*;
+use crate::pristine::InodeGraphOps;
 
 /// Globalize all hunks in a recorded file.
 ///
@@ -29,7 +30,7 @@ pub fn globalize_recorded_file<T>(
     options: &GlobalizeOptions,
 ) -> GlobalizeResult<GlobalizedFile>
 where
-    T: GraphTxnT + TreeTxnT,
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
     use crate::change::{GraphOp, Insertion};
     use crate::types::{ChangePosition, EdgeFlags, Position};

@@ -1,5 +1,13 @@
 //! Globalize a single built hunk into a graph operation.
 //!
+//! # Performance
+//!
+//! Content vertex discovery uses the `INODE_GRAPH` secondary index when the
+//! transaction implements [`InodeGraphOps`].  This gives O(m) traversal
+//! where m = edges for THIS file, instead of O(n) where n = all edges in
+//! the repository.  See the [Performance at Scale] documentation for the
+//! dual-index architecture.
+//!
 //! This module converts a local working-copy change (a [`BuiltHunk`]) into a
 //! graph-compatible [`GraphOp<Option<Hash>>`].
 //!
@@ -26,6 +34,7 @@
 
 use super::*;
 use crate::change::Local;
+use crate::pristine::InodeGraphOps;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Public entry point
@@ -52,7 +61,7 @@ pub fn globalize_hunk<T>(
     old_line_count: Option<usize>,
 ) -> GlobalizeResult<GraphOp<Option<Hash>>>
 where
-    T: GraphTxnT + TreeTxnT,
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
     let local = built.local.clone();
     let encoding = built.encoding;
@@ -71,7 +80,7 @@ where
         BuiltHunkKind::Replace => {
             globalize_replace(ctx, inode, inode_pos, content, local, encoding)
         }
-        BuiltHunkKind::Delete => globalize_delete(ctx, inode_pos, local, encoding),
+        BuiltHunkKind::Delete => globalize_delete(ctx, inode, inode_pos, local, encoding),
     }
 }
 
@@ -101,9 +110,9 @@ fn globalize_insert<T>(
     encoding: Option<Encoding>,
 ) -> GlobalizeResult<GraphOp<Option<Hash>>>
 where
-    T: GraphTxnT + TreeTxnT,
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    let position = classify_insert(ctx.txn(), inode_pos, built.old_start, old_line_count)?;
+    let position = classify_insert(ctx.txn(), inode, inode_pos, built.old_start, old_line_count)?;
 
     let (predecessors, successors) = match position {
         InsertPosition::Prepend { first_content } => (vec![inode_pos], vec![first_content]),
@@ -134,9 +143,15 @@ fn globalize_replace<T>(
     encoding: Option<Encoding>,
 ) -> GlobalizeResult<GraphOp<Option<Hash>>>
 where
-    T: GraphTxnT + TreeTxnT,
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    let deletion = delete_all_content(ctx, inode_pos)?;
+    let content_vertices = find_content_vertices(ctx.txn(), inode, inode_pos)?;
+    let deletion_edges = build_deletion_edges(ctx, &content_vertices)?;
+
+    let deletion = EdgeUpdate {
+        edges: deletion_edges,
+        inode: position_to_option_hash(inode_pos),
+    };
 
     let insertion = create_content_vertex(ctx, inode, inode_pos, vec![inode_pos], vec![], content)?;
 
@@ -155,14 +170,15 @@ where
 /// Mark every content vertex for this file as deleted.
 fn globalize_delete<T>(
     ctx: &mut GlobalizeContext<'_, T>,
+    inode: Inode,
     inode_pos: Position<NodeId>,
     local: Local,
     encoding: Option<Encoding>,
 ) -> GlobalizeResult<GraphOp<Option<Hash>>>
 where
-    T: GraphTxnT + TreeTxnT,
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    let deletion = delete_all_content(ctx, inode_pos)?;
+    let deletion = delete_all_content(ctx, inode, inode_pos)?;
 
     Ok(GraphOp::Edit {
         change: Atom::EdgeUpdate(deletion),
@@ -183,16 +199,17 @@ where
 /// [`globalize_delete`] delegate here.
 fn delete_all_content<T>(
     ctx: &mut GlobalizeContext<'_, T>,
+    inode: Inode,
     inode_pos: Position<NodeId>,
 ) -> GlobalizeResult<EdgeUpdate<Option<Hash>>>
 where
-    T: GraphTxnT + TreeTxnT,
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    let vertices = find_content_vertices(ctx.txn(), inode_pos)?;
-    let edges = build_deletion_edges(ctx, &vertices)?;
+    let content_vertices = find_content_vertices(ctx.txn(), inode, inode_pos)?;
+    let deletion_edges = build_deletion_edges(ctx, &content_vertices)?;
 
     Ok(EdgeUpdate {
-        edges,
+        edges: deletion_edges,
         inode: position_to_option_hash(inode_pos),
     })
 }
@@ -223,14 +240,15 @@ enum InsertPosition {
 /// case should have been consolidated into a Replace upstream.
 fn classify_insert<T>(
     txn: &T,
+    inode: Inode,
     inode_pos: Position<NodeId>,
     old_start: usize,
     old_line_count: Option<usize>,
 ) -> GlobalizeResult<InsertPosition>
 where
-    T: GraphTxnT,
+    T: GraphTxnT + InodeGraphOps,
 {
-    let vertices = collect_sorted_content_vertices(txn, inode_pos)?;
+    let vertices = collect_sorted_content_vertices(txn, inode, inode_pos)?;
 
     // Empty file → append (predecessor is the inode itself).
     if vertices.is_empty() {
@@ -277,18 +295,114 @@ where
 /// Returns non-empty, non-root, non-inode vertices from the alive graph.
 fn collect_sorted_content_vertices<T>(
     txn: &T,
+    inode: Inode,
     inode_pos: Position<NodeId>,
 ) -> GlobalizeResult<Vec<GraphNode<NodeId>>>
 where
-    T: GraphTxnT,
+    T: GraphTxnT + InodeGraphOps,
 {
-    let mut vertices = find_content_vertices(txn, inode_pos)?;
+    let mut vertices = find_content_vertices(txn, inode, inode_pos)?;
     vertices.sort_by(|a, b| a.start.cmp(&b.start));
     Ok(vertices)
 }
 
-/// Retrieve every content vertex for a file (excluding ROOT / inode markers).
+/// Retrieve every alive content vertex for a file using the INODE_GRAPH
+/// secondary index.
+///
+/// This is O(m) where m = edges for this file, instead of the O(n)
+/// `retrieve_graph` approach that scans the entire global GRAPH.
+///
+/// Falls back to the global `retrieve_graph` if INODE_GRAPH is not
+/// populated for this inode.
 fn find_content_vertices<T>(
+    txn: &T,
+    inode: Inode,
+    inode_pos: Position<NodeId>,
+) -> GlobalizeResult<Vec<GraphNode<NodeId>>>
+where
+    T: GraphTxnT + InodeGraphOps,
+{
+    // Try the fast path: INODE_GRAPH secondary index
+    let populated = txn.inode_graph_is_populated(inode).unwrap_or(false);
+
+    if populated {
+        return find_content_vertices_via_inode(txn, inode, inode_pos);
+    }
+
+    // Fallback: global GRAPH scan (for repos where INODE_GRAPH wasn't populated)
+    find_content_vertices_global(txn, inode_pos)
+}
+
+/// Fast path: scan INODE_GRAPH for this file's vertices only.
+fn find_content_vertices_via_inode<T>(
+    txn: &T,
+    inode: Inode,
+    inode_pos: Position<NodeId>,
+) -> GlobalizeResult<Vec<GraphNode<NodeId>>>
+where
+    T: GraphTxnT + InodeGraphOps,
+{
+    use crate::types::EdgeFlags;
+
+    let mut out = Vec::new();
+
+    // Iterate all forward (non-PARENT) edges in this file's INODE_GRAPH.
+    // Each unique destination vertex that is alive is a content vertex.
+    let mut seen = std::collections::HashSet::new();
+
+    // Start from the inode vertex — follow its forward edges
+    let mut stack = vec![inode_pos.inode_node()];
+    seen.insert(inode_pos.inode_node());
+
+    while let Some(node) = stack.pop() {
+        // Get forward (non-deleted, non-parent) edges for this node
+        // within the inode scope.
+        let min_flag = EdgeFlags::BLOCK;
+        let max_flag = EdgeFlags::all()
+            .difference(EdgeFlags::PARENT)
+            .difference(EdgeFlags::DELETED);
+
+        let mut adj = match txn.init_inode_adj(inode, node, min_flag, max_flag) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+
+        while let Some(edge_result) = txn.next_inode_adj(&mut adj) {
+            let edge = match edge_result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let dest_pos = edge.dest();
+            let resolved = match txn.find_block(dest_pos) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if seen.contains(&resolved) {
+                continue;
+            }
+            seen.insert(resolved);
+
+            // Skip ROOT
+            if resolved.change.is_root() {
+                continue;
+            }
+            // Skip inode marker (empty vertex at inode position)
+            if resolved.start == resolved.end && resolved.start == inode_pos.pos {
+                continue;
+            }
+
+            out.push(resolved);
+            stack.push(resolved);
+        }
+    }
+
+    Ok(out)
+}
+
+/// Fallback: retrieve content vertices via global GRAPH DFS.
+fn find_content_vertices_global<T>(
     txn: &T,
     inode_pos: Position<NodeId>,
 ) -> GlobalizeResult<Vec<GraphNode<NodeId>>>
@@ -333,7 +447,7 @@ fn build_deletion_edges<T>(
     vertices: &[GraphNode<NodeId>],
 ) -> GlobalizeResult<Vec<NewEdge<Option<Hash>>>>
 where
-    T: GraphTxnT + TreeTxnT,
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
     let mut edges = Vec::with_capacity(vertices.len());
 
@@ -355,7 +469,7 @@ where
 }
 
 /// Walk PARENT edges of `node` to find the end position of its predecessor.
-fn find_predecessor_end<T: GraphTxnT>(
+fn find_predecessor_end<T: GraphTxnT + InodeGraphOps>(
     txn: &T,
     node: GraphNode<NodeId>,
 ) -> GlobalizeResult<Position<NodeId>> {
@@ -378,7 +492,7 @@ fn find_predecessor_end<T: GraphTxnT>(
 
 /// Discover which change introduced the forward edge from `from_pos` to
 /// `to_vertex`.
-fn find_edge_introduced_by<T: GraphTxnT>(
+fn find_edge_introduced_by<T: GraphTxnT + InodeGraphOps>(
     txn: &T,
     from_pos: Position<NodeId>,
     to_vertex: GraphNode<NodeId>,
@@ -411,7 +525,7 @@ fn find_edge_introduced_by<T: GraphTxnT>(
 
 /// Convert a [`GraphNode<NodeId>`] to [`GraphNode<Option<Hash>>`], resolving
 /// external change hashes via the transaction.
-fn vertex_to_option_hash_resolved<T: GraphTxnT>(
+fn vertex_to_option_hash_resolved<T: GraphTxnT + InodeGraphOps>(
     txn: &T,
     node: GraphNode<NodeId>,
     current_change_id: Option<NodeId>,
