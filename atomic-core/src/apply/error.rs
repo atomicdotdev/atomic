@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn storage_errors_are_pristine_or_io() {
-        let pristine: ApplyError = PristineError::StackNotFound {
+        let pristine: ApplyError = PristineError::ViewNotFound {
             name: "gone".into(),
         }
         .into();

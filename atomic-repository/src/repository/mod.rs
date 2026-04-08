@@ -4,20 +4,20 @@
 //! all VCS operations including initialization, opening existing repositories,
 //! recording changes, and working copy management.
 //!
-//! # Stacks vs Branches
+//! # Views
 //!
-//! Atomic uses **Stacks** instead of branches. This is a fundamental conceptual
+//! Atomic uses **Views** to organize changes. This is a fundamental conceptual
 //! difference from Git:
 //!
-//! | Concept | Git Branches | Atomic Stacks |
-//! |---------|--------------|---------------|
-//! | Nature | Fork of history | View of the graph |
+//! | Concept | Git Branches | Atomic Views |
+//! |---------|--------------|--------------|
+//! | Nature | Fork of history | Perspective on the graph |
 //! | Data | Duplicates commits | References same changes |
-//! | Merge | Combines divergent histories | Applies missing changes |
+//! | Merge | Combines divergent histories | Inserts missing changes |
 //! | Identity | Pointer to a commit | Ordered sequence + Merkle state |
 //!
-//! Stacks are **views** of the graph - they represent which changes have been
-//! applied and in what order. Multiple stacks can coexist, each showing a
+//! Views are **perspectives** on the graph - they represent which changes have
+//! been inserted and in what order. Multiple views can coexist, each showing a
 //! different perspective on the same underlying data.
 //!
 //! # Change Storage
@@ -42,21 +42,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atomic_core::change::{Author, Change, ChangeHeader, GraphOp};
-use atomic_core::output::repo::{
-    output_repository, RepositoryOutputOptions, RepositoryOutputResult,
-};
+use atomic_core::output::repo::{materialize_view, MaterializeOptions, MaterializeResult};
 use atomic_core::output::FileSystem;
 use atomic_core::output::WorkingCopy;
-use atomic_core::pristine::{
-    GraphTxnT, MutTxnT, OverlayTxn, Pristine, StackKind, StackTxnT, TreeTxnT,
-};
+use atomic_core::pristine::{GraphTxnT, MutTxnT, Pristine, TreeTxnT, ViewScope, ViewTxnT};
 use atomic_core::record::workflow::retrieve::{RetrieveContentOptions, RetrieveResult};
 use atomic_core::types::{Base32, Hash, Inode, Merkle, NodeId, Position};
 
-use crate::apply::{
-    apply_change_to_graph, filter_missing_in_stack, get_missing_changes, get_stack_changes,
-    ApplyOptions, ApplyOutcome, ApplyStats, CrossStackApplyOptions, CrossStackApplyOutcome,
-};
 use crate::archive::{
     Archive, ArchiveEntry, ArchiveManifest, ArchiveOptions, ArchiveOutcome, DirectoryArchive,
 };
@@ -81,227 +73,56 @@ use crate::tracking::{
 use crate::unrecord::{UnrecordOptions, UnrecordOutcome};
 use crate::RepositoryError;
 
+// ── Sub-modules (new) ───────────────────────────────────────────────────
+
+mod filter;
+mod materialize;
+mod switch;
+mod views;
+
+// Re-export public items so external callers and sibling sub-modules that
+// use `use super::*;` continue to resolve them at `crate::repository::…`.
+pub use filter::{collect_view_change_ids, collect_visible_change_ids};
+pub use views::ViewInfo;
+
+// Re-import workspace helpers from `switch` so they are available to
+// `mod.rs` (used in `init`) and to sibling sub-modules via `use super::*;`.
+use switch::{ensure_workspace_dir, workspace_path};
+
+// ── Sub-modules (existing) ──────────────────────────────────────────────
+
+mod archive;
+mod changes;
+mod content;
+mod history;
+mod insert;
+mod record;
+mod remotes;
+mod status;
+mod tags;
+mod tracking;
+
+#[cfg(test)]
+mod tests;
+
+// ── Constants ───────────────────────────────────────────────────────────
+
 /// The name of the Atomic directory
 pub const DOT_DIR: &str = ".atomic";
 
-/// The default stack name
+/// The default view name
 pub const DEFAULT_STACK: &str = "dev";
 
-/// Subdirectory inside `.atomic/` that holds per-stack workspace state.
+/// Subdirectory inside `.atomic/` that holds per-view workspace state.
 ///
-/// Each stack gets a directory at `.atomic/workspaces/<stack_name>/` where
-/// ignored/artifact files are shelved on `switch_stack` and restored when
-/// switching back.  This is the mechanism by which stacks achieve full
+/// Each view gets a directory at `.atomic/workspaces/<view_name>/` where
+/// ignored/artifact files are shelved on `switch_view` and restored when
+/// switching back.  This is the mechanism by which views achieve full
 /// working copy isolation — not just tracked files (managed by the graph)
 /// but also build artifacts like `node_modules/`, `dist/`, `.next/`, etc.
 const WORKSPACES_DIR: &str = "workspaces";
 
-/// Return the workspace directory path for a given stack.
-///
-/// The path is `.atomic/workspaces/<stack_name>/`.  Stack names may
-/// contain `/` (e.g. `agent/ses_abc123`), which becomes a nested
-/// directory structure.
-fn workspace_path(dot_dir: &Path, stack_name: &str) -> PathBuf {
-    dot_dir.join(WORKSPACES_DIR).join(stack_name)
-}
-
-/// Ensure the workspace directory for a stack exists.
-///
-/// Creates `.atomic/workspaces/<stack_name>/` and any intermediate
-/// directories.  This is called from `init`, `create_stack`, and
-/// `create_stack_from`.
-fn ensure_workspace_dir(dot_dir: &Path, stack_name: &str) -> Result<(), RepositoryError> {
-    let ws = workspace_path(dot_dir, stack_name);
-    std::fs::create_dir_all(&ws)?;
-    Ok(())
-}
-
-/// Remove empty ancestor directories after file removal.
-///
-/// Given an iterator of relative paths that were just deleted, this
-/// collects every parent directory, sorts them deepest-first, and
-/// attempts `std::fs::remove_dir` on each.  Because `remove_dir` only
-/// succeeds on *empty* directories, this is always safe — a directory
-/// that still contains files (tracked, untracked, or otherwise) will
-/// simply fail silently.
-///
-/// Extracting this into a standalone helper keeps `switch_stack` at the
-/// orchestration level and makes the cleanup logic reusable for other
-/// operations (e.g. `atomic clean`).
-fn cleanup_empty_ancestors<'a>(root: &Path, removed_paths: impl Iterator<Item = &'a str>) {
-    let mut dirs: HashSet<PathBuf> = HashSet::new();
-    for path in removed_paths {
-        let p = PathBuf::from(path);
-        let mut ancestor = p.parent();
-        while let Some(dir) = ancestor {
-            if dir == Path::new("") || dir == Path::new(".") {
-                break;
-            }
-            dirs.insert(dir.to_path_buf());
-            ancestor = dir.parent();
-        }
-    }
-    // Sort deepest-first so children are removed before parents.
-    let mut sorted: Vec<PathBuf> = dirs.into_iter().collect();
-    sorted.sort_by_key(|a| std::cmp::Reverse(a.components().count()));
-    for dir in sorted {
-        let abs = root.join(&dir);
-        if abs.is_dir() {
-            // Only succeeds if the directory is empty — safe by construction.
-            let _ = std::fs::remove_dir(&abs);
-        }
-    }
-}
-
-/// Collect all change `NodeId`s applied to a stack into a `HashSet`.
-///
-/// This is the canonical helper for building a **change filter** — the set
-/// of changes that define a stack's content.  It is used by:
-///
-/// - `output_working_copy` (to filter which files are materialised)
-/// - `visible_file_paths` (to compute the file set for `switch_stack`)
-/// - `status` (to decide which tracked files are "ours")
-/// - `get_file_content*` variants (to scope graph retrieval)
-///
-/// Centralising this pattern eliminates duplication and ensures every
-/// call site uses the same iteration + error handling.
-///
-/// # Complexity
-///
-/// O(C) where C is the number of changes on the stack — a single linear
-/// scan of `STACK_CHANGES`.
-pub fn collect_stack_change_ids<T: StackTxnT>(
-    txn: &T,
-    stack: &atomic_core::pristine::StackState,
-) -> Result<HashSet<NodeId>, RepositoryError> {
-    let mut ids = HashSet::new();
-    let iter = txn
-        .iter_changes(stack, 0)
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-    for result in iter {
-        let (_seq, node_id, _merkle) =
-            result.map_err(|e| RepositoryError::Database(e.to_string()))?;
-        ids.insert(node_id);
-    }
-    Ok(ids)
-}
-
-/// Collect all change `NodeId`s visible from a stack, including parent stacks.
-///
-/// For **local** stacks this walks the full overlay chain (other local
-/// ancestors) and then the shared ancestor chain, collecting every change
-/// that contributes to the stack's effective view.  This mirrors the filter
-/// built inside `get_file_content_via_overlay` and must be used wherever
-/// `output_working_copy` needs to decide which vertices are alive.
-///
-/// For **shared** stacks this is identical to `collect_stack_change_ids`.
-///
-/// # Why this is needed
-///
-/// The `change_filter` passed to `output_repository` controls which graph
-/// vertices are considered "alive".  If the filter only contains the local
-/// stack's own changes, vertices introduced by the shared `dev` stack (the
-/// base content) fail the filter and are excluded — producing empty or
-/// incomplete file output.
-pub fn collect_visible_change_ids<T: StackTxnT>(
-    txn: &T,
-    stack: &atomic_core::pristine::StackState,
-) -> Result<HashSet<NodeId>, RepositoryError> {
-    // Start with the current stack's own changes.
-    let mut ids = collect_stack_change_ids(txn, stack)?;
-
-    if stack.kind.is_local() {
-        // Include changes from every local ancestor in the overlay chain.
-        let chain = txn
-            .resolve_overlay_chain(stack)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        for &ancestor_id in &chain {
-            if ancestor_id == stack.id {
-                continue; // already included above
-            }
-            if let Some(ancestor) = txn
-                .get_stack_by_id(ancestor_id)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?
-            {
-                let ancestor_ids = collect_stack_change_ids(txn, &ancestor)?;
-                ids.extend(ancestor_ids);
-            }
-        }
-
-        // Walk the parent chain past all local ancestors to find the nearest
-        // shared stack and include its changes (the global graph base).
-        let mut cursor = stack.parent;
-        while let Some(pid) = cursor {
-            let parent = txn
-                .get_stack_by_id(pid)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            match parent {
-                Some(p) if p.kind.is_shared() => {
-                    let shared_ids = collect_stack_change_ids(txn, &p)?;
-                    ids.extend(shared_ids);
-                    break;
-                }
-                Some(p) => cursor = p.parent,
-                None => break,
-            }
-        }
-    }
-
-    Ok(ids)
-}
-
-/// Information about a stack.
-///
-/// This struct provides metadata about a stack including its current
-/// Merkle state and the number of changes applied to it.
-#[derive(Debug, Clone)]
-pub struct StackInfo {
-    /// The name of the stack
-    pub name: String,
-    /// The current Merkle state (hash of all applied changes)
-    pub state: Merkle,
-    /// The number of changes applied to this stack
-    pub change_count: u64,
-    /// Stack kind (Local or Shared)
-    pub kind: StackKind,
-    /// Parent stack name, if any
-    pub parent_name: Option<String>,
-}
-
-impl StackInfo {
-    /// Get the Merkle state as a base32-encoded string.
-    pub fn state_base32(&self) -> String {
-        self.state.to_base32()
-    }
-
-    /// Get a short version of the Merkle state (first 12 characters).
-    pub fn state_short(&self) -> String {
-        let full = self.state.to_base32();
-        if full.len() > 12 {
-            full[..12].to_string()
-        } else {
-            full
-        }
-    }
-
-    /// Check if the stack is empty (has no changes).
-    pub fn is_empty(&self) -> bool {
-        self.change_count == 0
-    }
-
-    /// Get a human-readable label for the stack kind.
-    pub fn kind_label(&self) -> &str {
-        match self.kind {
-            StackKind::Shared => "shared",
-            StackKind::Local => "local",
-        }
-    }
-
-    /// Get the parent name for display, or "—" if root.
-    pub fn parent_display(&self) -> &str {
-        self.parent_name.as_deref().unwrap_or("—")
-    }
-}
+// ── Repository struct ───────────────────────────────────────────────────
 
 /// An Atomic repository.
 ///
@@ -325,8 +146,8 @@ pub struct Repository {
     root: PathBuf,
     /// Path to the .atomic directory
     dot_dir: PathBuf,
-    /// Current stack name
-    current_stack: String,
+    /// Current view name
+    current_view: String,
     /// The pristine database handle.
     ///
     /// Wrapped in `Arc` so that multiple `Repository` instances _can_
@@ -344,12 +165,14 @@ impl std::fmt::Debug for Repository {
         f.debug_struct("Repository")
             .field("root", &self.root)
             .field("dot_dir", &self.dot_dir)
-            .field("current_stack", &self.current_stack)
+            .field("current_view", &self.current_view)
             .field("pristine", &"<Pristine>")
             .field("change_store", &self.change_store)
             .finish()
     }
 }
+
+// ── Construction, accessors, internal helpers ────────────────────────────
 
 impl Repository {
     /// Initialize a new repository at the given path.
@@ -405,12 +228,12 @@ default = "{}"
                 .map_err(|e| RepositoryError::Database(e.to_string()))?,
         );
 
-        // Create the default stack and its workspace directory
+        // Create the default view and its workspace directory
         {
             let mut txn = pristine
                 .write_txn()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            txn.open_or_create_stack(DEFAULT_STACK)
+            txn.open_or_create_view(DEFAULT_STACK)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             txn.commit()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -424,7 +247,7 @@ default = "{}"
         Ok(Self {
             root,
             dot_dir,
-            current_stack: DEFAULT_STACK.to_string(),
+            current_view: DEFAULT_STACK.to_string(),
             pristine,
             change_store,
         })
@@ -452,9 +275,9 @@ default = "{}"
                 .map_err(|e| RepositoryError::Database(e.to_string()))?,
         );
 
-        // Read current stack from config or use default
-        let current_stack =
-            Self::read_current_stack(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
+        // Read current view from config or use default
+        let current_view =
+            Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
 
         // Open the change store
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
@@ -463,7 +286,7 @@ default = "{}"
         Ok(Self {
             root,
             dot_dir,
-            current_stack,
+            current_view,
             pristine,
             change_store,
         })
@@ -509,9 +332,9 @@ default = "{}"
                 .map_err(|e| RepositoryError::Database(e.to_string()))?,
         );
 
-        // Read current stack from config or use default
-        let current_stack =
-            Self::read_current_stack(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
+        // Read current view from config or use default
+        let current_view =
+            Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
 
         // Open the change store
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
@@ -520,7 +343,7 @@ default = "{}"
         Ok(Self {
             root,
             dot_dir,
-            current_stack,
+            current_view,
             pristine,
             change_store,
         })
@@ -548,8 +371,8 @@ default = "{}"
         let root = Self::find_root(path.as_ref())?;
         let dot_dir = root.join(DOT_DIR);
 
-        let current_stack =
-            Self::read_current_stack(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
+        let current_view =
+            Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
 
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -557,7 +380,7 @@ default = "{}"
         Ok(Self {
             root,
             dot_dir,
-            current_stack,
+            current_view,
             pristine,
             change_store,
         })
@@ -604,6 +427,8 @@ default = "{}"
         })
     }
 
+    // ── Path accessors ──────────────────────────────────────────────────
+
     /// Check if a path is inside an Atomic repository.
     pub fn is_repository<P: AsRef<Path>>(path: P) -> bool {
         Self::find_root(path.as_ref()).is_ok()
@@ -633,10 +458,10 @@ default = "{}"
         self.dot_dir.join("changes")
     }
 
-    /// Get the current stack name.
+    /// Get the current view name.
     #[inline]
-    pub fn current_stack(&self) -> &str {
-        &self.current_stack
+    pub fn current_view(&self) -> &str {
+        &self.current_view
     }
 
     /// Get the config file path.
@@ -645,23 +470,25 @@ default = "{}"
         self.dot_dir.join("config.toml")
     }
 
-    /// Set the current stack (internal, does not update working copy).
+    // ── View pointer (internal state) ───────────────────────────────────
+
+    /// Set the current view (internal, does not update working copy).
     ///
     /// This updates both the in-memory state and persists the change to disk,
-    /// but does NOT update the working copy. Use `switch_stack` instead for
+    /// but does NOT update the working copy. Use `switch_view` instead for
     /// the full switch operation that also updates the working copy.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The name of the stack to switch to
+    /// * `view` - The name of the view to switch to
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The stack does not exist in the pristine database
-    /// - The stack file cannot be written
-    pub fn set_current_stack(&mut self, stack: &str) -> Result<(), RepositoryError> {
-        // Verify the stack exists in the pristine database
+    /// - The view does not exist in the pristine database
+    /// - The view file cannot be written
+    pub fn set_current_view(&mut self, view: &str) -> Result<(), RepositoryError> {
+        // Verify the view exists in the pristine database
         {
             let txn = self
                 .pristine
@@ -669,839 +496,22 @@ default = "{}"
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
             if txn
-                .get_stack(stack)
+                .get_view(view)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?
                 .is_none()
             {
-                return Err(RepositoryError::StackNotFound {
-                    name: stack.to_string(),
+                return Err(RepositoryError::ViewNotFound {
+                    name: view.to_string(),
                 });
             }
         }
 
-        self.current_stack = stack.to_string();
-        self.write_current_stack(stack)?;
+        self.current_view = view.to_string();
+        self.write_current_view(view)?;
         Ok(())
     }
 
-    /// Switch to a different stack and update the working copy.
-    ///
-    /// This is the primary method for switching stacks. It:
-    /// 1. Validates the stack exists
-    /// 2. Updates the current stack pointer
-    /// 3. Outputs the working copy to match the new stack's state
-    ///
-    /// This behavior matches Pijul's channel switching, where switching
-    /// channels also updates the working copy to reflect that channel's state.
-    ///
-    /// # Arguments
-    ///
-    /// * `stack` - The name of the stack to switch to
-    ///
-    /// # Returns
-    ///
-    /// Statistics about the output operation (files written, etc.)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The stack does not exist
-    /// - The working copy cannot be updated
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let mut repo = Repository::open(".")?;
-    ///
-    /// // Switch to feature stack and update working copy
-    /// let result = repo.switch_stack("feature")?;
-    /// println!("Updated {} files", result.files_written);
-    /// ```
-    pub fn switch_stack(&mut self, stack: &str) -> Result<RepositoryOutputResult, RepositoryError> {
-        let old_stack_name = self.current_stack.clone();
-
-        // Compute files visible on the OLD stack via its overlay.
-        let old_files = self.visible_file_paths(&old_stack_name)?;
-
-        // Set the current stack (validates it exists)
-        self.set_current_stack(stack)?;
-
-        // Compute files visible on the NEW stack via its overlay.
-        let new_files = self.visible_file_paths(stack)?;
-
-        let working_copy = FileSystem::from_root(&self.root);
-
-        // ── Phase 1: Shelve ignored files into the OLD stack's workspace ──
-        //
-        // Ignored files (node_modules/, dist/, .next/, etc.) are build
-        // artifacts that belong to the stack that created them.  We move
-        // them into `.atomic/workspaces/<old_stack>/` so they can be
-        // restored when the user switches back.
-        //
-        // This uses `rename()` which is O(1) on the same filesystem —
-        // no data is copied, just inode pointers are updated.
-        //
-        // The rule:
-        //   - Tracked files      → managed by the graph (phases 2-4)
-        //   - Untracked, ignored → shelved/restored per-stack (phases 1 & 5)
-        //   - Untracked, novel   → user's undecided work, left alone
-        let old_ws = workspace_path(&self.dot_dir, &old_stack_name);
-        ensure_workspace_dir(&self.dot_dir, &old_stack_name)?;
-        let ignored_paths = self.collect_ignored_paths_on_disk();
-        if !ignored_paths.is_empty() {
-            // Clear old workspace content, then move current ignored files in.
-            // We clear first because the workspace may contain stale state
-            // from a previous shelve.
-            for path in &ignored_paths {
-                let ws_dest = old_ws.join(path);
-                // Remove stale entry in workspace if it exists
-                if ws_dest.is_dir() {
-                    let _ = std::fs::remove_dir_all(&ws_dest);
-                } else if ws_dest.exists() {
-                    let _ = std::fs::remove_file(&ws_dest);
-                }
-                // Ensure parent dirs exist in workspace
-                if let Some(parent) = ws_dest.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                // Move from working copy → workspace (O(1) rename)
-                let src = self.root.join(path);
-                if src.exists() {
-                    let _ = std::fs::rename(&src, &ws_dest);
-                }
-            }
-        }
-
-        // ── Phase 2: Remove tracked files that belong to the old stack ──
-        //
-        // Files visible on the old stack but NOT on the new stack are
-        // removed from disk.
-        let mut removed_paths: Vec<String> = Vec::new();
-        for path in old_files.difference(&new_files) {
-            let abs_path = self.root.join(path);
-            if abs_path.exists()
-                && !abs_path.is_dir()
-                && working_copy.remove_path(path, false).is_ok()
-            {
-                removed_paths.push(path.clone());
-            }
-        }
-
-        // ── Phase 3: Clean up empty ancestor directories ────────────────
-        let all_removed = removed_paths
-            .iter()
-            .map(|s| s.as_str())
-            .chain(ignored_paths.iter().map(|s| s.as_str()));
-        cleanup_empty_ancestors(&self.root, all_removed);
-
-        // ── Phase 4: Output the new stack's tracked files from graph ─────
-        let result = self.output_working_copy()?;
-
-        // ── Phase 5: Restore ignored files from the NEW stack's workspace ─
-        //
-        // Move artifacts from `.atomic/workspaces/<new_stack>/` back into
-        // the working copy.  Again O(1) renames, no data copying.
-        let new_ws = workspace_path(&self.dot_dir, stack);
-        if new_ws.is_dir() {
-            self.restore_workspace_to_working_copy(&new_ws);
-        }
-
-        Ok(result)
-    }
-
-    /// Restore entries from a workspace directory into the working copy.
-    ///
-    /// Walks the top-level entries in `ws_dir` and moves each into the
-    /// project root via `rename()`.  Skips the `.atomic` directory if
-    /// present.
-    fn restore_workspace_to_working_copy(&self, ws_dir: &Path) {
-        let entries = match std::fs::read_dir(ws_dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-
-            // Never move .atomic into the working copy
-            if name_str == DOT_DIR {
-                continue;
-            }
-
-            let src = entry.path();
-            let dst = self.root.join(&*name_str);
-
-            // If the destination already exists (e.g. a directory that
-            // was created by output_working_copy for tracked content),
-            // merge by recursing into it rather than replacing it.
-            if dst.is_dir() && src.is_dir() {
-                self.merge_dir_into(&src, &dst);
-                let _ = std::fs::remove_dir_all(&src);
-            } else {
-                // Ensure parent exists
-                if let Some(parent) = dst.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::fs::rename(&src, &dst);
-            }
-        }
-    }
-
-    /// Recursively merge the contents of `src_dir` into `dst_dir`.
-    ///
-    /// Files in `src_dir` are moved into `dst_dir`.  If a subdirectory
-    /// exists in both, the merge recurses.  This is used when restoring
-    /// workspace artifacts into a directory that already contains tracked
-    /// files (e.g. `src/` might have tracked `.ts` files from the graph
-    /// AND ignored `.cache/` from the workspace).
-    fn merge_dir_into(&self, src_dir: &Path, dst_dir: &Path) {
-        let entries = match std::fs::read_dir(src_dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let src = entry.path();
-            let dst = dst_dir.join(&name);
-
-            if dst.is_dir() && src.is_dir() {
-                self.merge_dir_into(&src, &dst);
-                let _ = std::fs::remove_dir_all(&src);
-            } else {
-                if let Some(parent) = dst.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::fs::rename(&src, &dst);
-            }
-        }
-    }
-
-    /// Walk the working copy and collect relative paths of files and
-    /// directories that match `.atomicignore` rules.
-    ///
-    /// Only top-level ignored entries are returned — if `node_modules/`
-    /// matches, we return `"node_modules"` rather than enumerating every
-    /// file inside it (the caller will `remove_dir_all`).
-    ///
-    /// Paths that live inside `.atomic/` are never returned.
-    fn collect_ignored_paths_on_disk(&self) -> Vec<String> {
-        let rules = self.ignore_rules();
-        let mut result = Vec::new();
-
-        // Recursive walker that stops descending into ignored directories.
-        fn walk(
-            root: &Path,
-            dir: &Path,
-            rules: &crate::ignore::IgnoreRules,
-            out: &mut Vec<String>,
-        ) {
-            let entries = match std::fs::read_dir(dir) {
-                Ok(e) => e,
-                Err(_) => return,
-            };
-            for entry in entries.flatten() {
-                let abs = entry.path();
-                let rel = match abs.strip_prefix(root) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-
-                // Never touch the .atomic directory itself.
-                if rel.starts_with(DOT_DIR) {
-                    continue;
-                }
-
-                let is_dir = abs.is_dir();
-
-                if rules.is_ignored(rel, is_dir) {
-                    // Collect the top-level ignored entry — don't recurse.
-                    if let Some(s) = rel.to_str() {
-                        out.push(s.to_string());
-                    }
-                } else if is_dir {
-                    // Not ignored — recurse to find ignored children.
-                    walk(root, &abs, rules, out);
-                }
-                // Non-ignored files are left alone.
-            }
-        }
-
-        walk(&self.root, &self.root, &rules, &mut result);
-        result
-    }
-
-    /// Compute the set of file paths whose creating change is on a stack.
-    ///
-    /// Visibility is determined by the stack's **change log**, not the
-    /// overlay chain.  The overlay provides graph-level read access for
-    /// record / diff operations, but file *materialization* (what shows
-    /// up on disk after `switch_stack`) is governed by which changes have
-    /// been explicitly applied to the stack.
-    ///
-    /// A file is visible on a stack when:
-    /// 1. It appears in the global TREE table (has been `add`ed).
-    /// 2. Its inode has a graph position in the INODES table (has been
-    ///    `record`ed).
-    /// 3. The change that introduced that position is present in the
-    ///    stack's change log (via `iter_changes`).
-    ///
-    /// Files that have been `add`ed but not yet `record`ed (no INODES
-    /// entry) are NOT returned — they persist across switches as
-    /// working-copy state.
-    pub fn visible_file_paths(&self, stack_name: &str) -> Result<HashSet<String>, RepositoryError> {
-        let txn = self
-            .pristine
-            .read_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let stack = match txn
-            .get_stack(stack_name)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-        {
-            Some(s) => s,
-            None => return Ok(HashSet::new()),
-        };
-
-        let stack_change_ids = collect_stack_change_ids(&txn, &stack)?;
-
-        // Walk TREE and keep paths whose introducing change is in the log.
-        let mut paths: HashSet<String> = HashSet::new();
-        let tree_iter = txn
-            .iter_tree()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        for result in tree_iter {
-            let (path, inode) = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
-            if let Some(position) = txn
-                .inode_position(inode)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?
-            {
-                if stack_change_ids.contains(&position.change) {
-                    paths.insert(path);
-                }
-            }
-        }
-
-        Ok(paths)
-    }
-
-    /// Output the working copy to match the current stack's state.
-    ///
-    /// This synchronizes the working copy files with the repository graph
-    /// state for the current stack. Files are created, updated, or deleted
-    /// to match what's recorded in the stack.
-    ///
-    /// # Returns
-    ///
-    /// Statistics about the output operation including:
-    /// - Number of files written
-    /// - Number of directories created
-    /// - Any conflicts detected
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The database cannot be read
-    /// - Files cannot be written to the working copy
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let repo = Repository::open(".")?;
-    ///
-    /// // Reset working copy to current stack's state
-    /// let result = repo.output_working_copy()?;
-    /// println!("Output {} files", result.files_written);
-    ///
-    /// if result.has_conflicts() {
-    ///     println!("Warning: {} conflicts detected", result.conflict_count());
-    /// }
-    /// ```
-    pub fn output_working_copy(&self) -> Result<RepositoryOutputResult, RepositoryError> {
-        let txn = self
-            .pristine
-            .read_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Get the current stack
-        let stack = txn
-            .get_stack(&self.current_stack)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: self.current_stack.clone(),
-            })?;
-
-        // Build the overlay for this stack's perspective.
-        //
-        // For Local stacks the overlay reads STACK_GRAPH[this] ∪ ... ∪ GRAPH.
-        // For Shared stacks the overlay is empty and falls through to GRAPH.
-        // This is the architectural foundation of per-stack file isolation:
-        // edges written by a Local stack live in its STACK_GRAPH and are
-        // invisible to other stacks.
-        let overlay = OverlayTxn::from_stack(&txn, &stack)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Collect all change NodeIds visible from the current stack for the
-        // change_filter.  For local stacks this includes the current stack's
-        // own changes PLUS all changes from the overlay chain (other local
-        // ancestors) and the nearest shared ancestor (e.g. dev).
-        //
-        // Without the parent-chain changes, vertices introduced by dev (the
-        // base content) fail the filter and output_repository skips them,
-        // producing empty or duplicated file content on the local stack.
-        let change_filter = collect_visible_change_ids(&txn, &stack)?;
-
-        let working_copy = FileSystem::from_root(&self.root);
-        let options = RepositoryOutputOptions::new().with_change_filter(change_filter);
-
-        // Use the overlay transaction for graph reads so that Local
-        // stacks see their own STACK_GRAPH edges while Shared stacks
-        // read from the global GRAPH as before.
-        let result = output_repository(&overlay, &self.change_store, &working_copy, options)
-            .map_err(|e| RepositoryError::Output(format!("{}", e)))?;
-
-        Ok(result)
-    }
-
-    /// Output the working copy for a specific prefix only.
-    ///
-    /// This is useful for partial updates when you only want to sync
-    /// a subset of files.
-    ///
-    /// # Arguments
-    ///
-    /// * `prefix` - Path prefix to output (e.g., "src/")
-    ///
-    /// # Returns
-    ///
-    /// Statistics about the output operation.
-    pub fn output_working_copy_prefix(
-        &self,
-        prefix: &str,
-    ) -> Result<RepositoryOutputResult, RepositoryError> {
-        let txn = self
-            .pristine
-            .read_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let working_copy = FileSystem::from_root(&self.root);
-        let options = RepositoryOutputOptions::new().prefix(prefix);
-
-        let result = output_repository(&txn, &self.change_store, &working_copy, options)
-            .map_err(|e| RepositoryError::Output(format!("{}", e)))?;
-
-        Ok(result)
-    }
-
-    /// Create a new stack.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the stack to create
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The stack already exists
-    /// - The database operation fails
-    pub fn create_stack(&mut self, name: &str) -> Result<(), RepositoryError> {
-        // Create the workspace directory for this stack.
-        ensure_workspace_dir(&self.dot_dir, name)?;
-
-        // Create a **Local** workspace parented on the nearest Shared
-        // ancestor of the current stack.  The change log starts EMPTY —
-        // no changes are inherited automatically.
-        //
-        // The parent link gives the stack read-access to the shared
-        // graph content (via the overlay chain) so that `record` can
-        // compute diffs against the existing state.  But no files are
-        // *materialised* on disk until changes are explicitly `apply`-ed
-        // to this stack (which copies them into the stack's change log
-        // and writes edges to its STACK_GRAPH).
-        //
-        // This means:
-        //   `stack new feature`            → empty workspace, no files
-        //   `apply from-stack dev feature` → inherits dev's files
-        //
-        // Using the nearest Shared ancestor (instead of the current
-        // stack directly) prevents sibling Local stacks from seeing
-        // each other's STACK_GRAPH edges through the overlay chain.
-        let parent_name = self.nearest_shared_ancestor(&self.current_stack.clone())?;
-
-        let mut txn = self
-            .pristine
-            .write_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        if txn
-            .get_stack(name)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .is_some()
-        {
-            return Err(RepositoryError::StackAlreadyExists {
-                name: name.to_string(),
-            });
-        }
-
-        let parent_stack = txn
-            .get_stack(&parent_name)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: parent_name.clone(),
-            })?;
-
-        txn.create_stack(name, StackKind::Local, Some(parent_stack.id))
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        txn.commit()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        Ok(())
-    }
-
-    /// Create a new Shared stack with no parent.
-    ///
-    /// Edges written to a Shared stack go into the global `GRAPH` table and
-    /// are permanently visible to all stacks. This is the correct kind to use
-    /// for server-side push targets, where changes must be universally visible
-    /// regardless of which run or request applies them.
-    ///
-    /// Returns `StackAlreadyExists` if the stack already exists.
-    pub fn create_shared_stack(&mut self, name: &str) -> Result<(), RepositoryError> {
-        ensure_workspace_dir(&self.dot_dir, name)?;
-
-        let mut txn = self
-            .pristine
-            .write_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        if txn
-            .get_stack(name)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .is_some()
-        {
-            return Err(RepositoryError::StackAlreadyExists {
-                name: name.to_string(),
-            });
-        }
-
-        txn.create_stack(name, StackKind::Shared, None)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        txn.commit()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        Ok(())
-    }
-
-    /// Walk the parent chain from `stack_name` and return the name of the
-    /// first Shared stack encountered.  If `stack_name` is itself Shared,
-    /// it is returned immediately.  This is used to determine the correct
-    /// parent for newly created Local stacks.
-    pub fn nearest_shared_ancestor(&self, stack_name: &str) -> Result<String, RepositoryError> {
-        let txn = self
-            .pristine
-            .read_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let stack = txn
-            .get_stack(stack_name)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: stack_name.to_string(),
-            })?;
-
-        // Already Shared → use it directly.
-        if stack.kind.is_shared() {
-            return Ok(stack_name.to_string());
-        }
-
-        // Walk up the parent chain looking for a Shared ancestor.
-        let mut cursor = stack.parent;
-        while let Some(parent_id) = cursor {
-            if let Some(parent) = txn
-                .get_stack_by_id(parent_id)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?
-            {
-                if parent.kind.is_shared() {
-                    return Ok(parent.name.clone());
-                }
-                cursor = parent.parent;
-            } else {
-                break;
-            }
-        }
-
-        // Fallback: if no Shared ancestor found (shouldn't happen in
-        // normal use — dev is always Shared), use the current stack.
-        Ok(stack_name.to_string())
-    }
-
-    /// Create a new stack that inherits changes from another stack.
-    ///
-    /// This creates a new stack and copies all changes from the source stack
-    /// to the new stack. The new stack will have the same content state as
-    /// the source stack at the time of creation.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the new stack to create
-    /// * `from_stack` - The name of the stack to inherit changes from
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The new stack already exists
-    /// - The source stack does not exist
-    /// - The database operation fails
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// // Create a feature stack that starts with dev's changes
-    /// repo.create_stack_from("feature", "dev")?;
-    /// ```
-    pub fn create_stack_from(
-        &mut self,
-        name: &str,
-        from_stack: &str,
-    ) -> Result<(), RepositoryError> {
-        let mut txn = self
-            .pristine
-            .write_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Check if the new stack already exists
-        if txn
-            .get_stack(name)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .is_some()
-        {
-            return Err(RepositoryError::StackAlreadyExists {
-                name: name.to_string(),
-            });
-        }
-
-        // Get the source stack
-        let source_stack = txn
-            .get_stack(from_stack)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: from_stack.to_string(),
-            })?;
-
-        let source_id = source_stack.id;
-
-        // Collect all changes from the source stack
-        let changes: Vec<(NodeId, Hash)> = {
-            let iter = txn
-                .iter_changes(&source_stack, 0)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-            let mut result = Vec::new();
-            for item in iter {
-                let (_seq, node_id, _merkle) =
-                    item.map_err(|e| RepositoryError::Database(e.to_string()))?;
-                let hash = txn
-                    .get_external(node_id)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?
-                    .ok_or_else(|| {
-                        RepositoryError::Database(format!(
-                            "Change {} has no external hash",
-                            node_id.0
-                        ))
-                    })?;
-                result.push((node_id, hash));
-            }
-            result
-        };
-
-        // Create the new stack as a **Local** workspace parented on the
-        // source stack.  Local stacks write edges to STACK_GRAPH which
-        // isolates them from other stacks.  The parent link means the
-        // overlay chain (STACK_GRAPH[self] ∪ ... ∪ GRAPH) includes the
-        // source's content.
-        // Create workspace directory for the new stack.
-        ensure_workspace_dir(&self.dot_dir, name)?;
-
-        let mut new_stack = txn
-            .create_stack(name, StackKind::Local, Some(source_id))
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Copy all changes from the source to the new stack's log.
-        // This does NOT re-apply hunks — the edges already exist in
-        // GRAPH (for Shared sources) or in the source's STACK_GRAPH.
-        // The new stack sees them via the overlay chain.
-        for (node_id, hash) in changes {
-            txn.put_change(&mut new_stack, node_id, &hash)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        }
-
-        // Update the stack state
-        txn.update_stack(&new_stack)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        txn.commit()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        Ok(())
-    }
-
-    /// List all stacks in the repository.
-    ///
-    /// # Returns
-    ///
-    /// A vector of stack names.
-    pub fn list_stacks(&self) -> Result<Vec<String>, RepositoryError> {
-        let txn = self
-            .pristine
-            .read_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        txn.list_stacks()
-            .map_err(|e| RepositoryError::Database(e.to_string()))
-    }
-
-    /// Check if a stack exists.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the stack to check
-    pub fn stack_exists(&self, name: &str) -> Result<bool, RepositoryError> {
-        let txn = self
-            .pristine
-            .read_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        Ok(txn
-            .get_stack(name)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .is_some())
-    }
-
-    /// Delete a stack from the repository.
-    ///
-    /// This removes the stack and all its associated metadata, but does not
-    /// delete the changes themselves. Changes remain in the graph and may be
-    /// referenced by other stacks.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the stack to delete
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The stack does not exist
-    /// - The stack is the current stack (cannot delete current stack)
-    /// - The database operation fails
-    pub fn delete_stack(&mut self, name: &str) -> Result<(), RepositoryError> {
-        // Cannot delete the current stack
-        if name == self.current_stack {
-            return Err(RepositoryError::CannotDeleteCurrentStack {
-                name: name.to_string(),
-            });
-        }
-
-        let mut txn = self
-            .pristine
-            .write_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Get the stack to delete
-        let stack = txn
-            .get_stack(name)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: name.to_string(),
-            })?;
-
-        // Delete the stack.
-        //
-        // `del_stack` enforces:
-        // - Shared stacks cannot be deleted (returns CannotDeleteSharedStack)
-        // - Stacks with children cannot be deleted (returns StackHasChildren)
-        // - Local workspaces cascade-delete all STACK_GRAPH edges (zero orphans)
-        // Remove workspace directory for this stack before deleting
-        // the stack from the database.  This cleans up any shelved
-        // artifacts (node_modules, dist, etc.) that were stored when
-        // the user last switched away from this stack.
-        let ws = workspace_path(&self.dot_dir, name);
-        if ws.is_dir() {
-            let _ = std::fs::remove_dir_all(&ws);
-        }
-
-        txn.del_stack(&stack).map_err(|e| match &e {
-            atomic_core::pristine::PristineError::CannotDeleteSharedStack { name } => {
-                RepositoryError::InvalidOperation {
-                    message: format!(
-                        "cannot delete shared stack '{}': shared stacks are permanent. \
-                         Use 'stack new' to create an local workspace instead.",
-                        name
-                    ),
-                }
-            }
-            atomic_core::pristine::PristineError::StackHasChildren { name, children } => {
-                RepositoryError::InvalidOperation {
-                    message: format!(
-                        "cannot delete stack '{}': has child stacks ({}). \
-                         Delete or reparent children first.",
-                        name,
-                        children.join(", ")
-                    ),
-                }
-            }
-            _ => RepositoryError::Database(e.to_string()),
-        })?;
-
-        txn.commit()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        Ok(())
-    }
-
-    /// Get information about a stack.
-    ///
-    /// Returns the stack's metadata including its Merkle state and change count.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the stack to query
-    ///
-    /// # Returns
-    ///
-    /// A tuple of (merkle_state_hex, change_count) or an error if the stack
-    /// doesn't exist.
-    pub fn get_stack_info(&self, name: &str) -> Result<StackInfo, RepositoryError> {
-        let txn = self
-            .pristine
-            .read_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let stack = txn
-            .get_stack(name)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: name.to_string(),
-            })?;
-
-        // Resolve parent name if the stack has a parent
-        let parent_name = if let Some(parent_id) = stack.parent {
-            txn.get_stack_by_id(parent_id)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?
-                .map(|p| p.name)
-        } else {
-            None
-        };
-
-        Ok(StackInfo {
-            name: stack.name.clone(),
-            state: stack.state,
-            change_count: stack.change_count,
-            kind: stack.kind,
-            parent_name,
-        })
-    }
+    // ── Internal helpers ────────────────────────────────────────────────
 
     /// Get a reference to the pristine database.
     #[inline]
@@ -1509,21 +519,28 @@ default = "{}"
         &self.pristine
     }
 
-    /// Read the current stack from the config file.
-    fn read_current_stack(dot_dir: &Path) -> Result<String, RepositoryError> {
-        let current_path = dot_dir.join("current_stack");
+    /// Read the current view from the config file.
+    fn read_current_view(dot_dir: &Path) -> Result<String, RepositoryError> {
+        let current_path = dot_dir.join("current_view");
         if current_path.exists() {
             let content = std::fs::read_to_string(&current_path)?;
             Ok(content.trim().to_string())
         } else {
-            Ok(DEFAULT_STACK.to_string())
+            // Fall back to legacy path for backward compatibility
+            let legacy_path = dot_dir.join("current_stack");
+            if legacy_path.exists() {
+                let content = std::fs::read_to_string(&legacy_path)?;
+                Ok(content.trim().to_string())
+            } else {
+                Ok(DEFAULT_STACK.to_string())
+            }
         }
     }
 
-    /// Write the current stack to disk.
-    fn write_current_stack(&self, stack: &str) -> Result<(), RepositoryError> {
-        let current_path = self.dot_dir.join("current_stack");
-        std::fs::write(&current_path, stack)?;
+    /// Write the current view to disk.
+    fn write_current_view(&self, view: &str) -> Result<(), RepositoryError> {
+        let current_path = self.dot_dir.join("current_view");
+        std::fs::write(&current_path, view)?;
         Ok(())
     }
 
@@ -1555,17 +572,3 @@ default = "{}"
         path.as_ref().starts_with(&self.dot_dir)
     }
 }
-
-mod apply;
-mod archive;
-mod changes;
-mod content;
-mod history;
-mod record;
-mod remotes;
-mod status;
-mod tags;
-mod tracking;
-
-#[cfg(test)]
-mod tests;

@@ -49,7 +49,7 @@
 //!
 //! | Entire CLI Concept | Atomic Agent Replacement |
 //! |--------------------|--------------------------|
-//! | Shadow git branches | Atomic stacks (`agent-{session_id}`) |
+//! | Shadow git branches | Atomic views (`agent-{session_id}`) |
 //! | Orphan metadata branch | Change `metadata` + `unhashed` fields |
 //! | Checkpoint IDs | Merkle state hashing |
 //! | Git status diffing | Watchman `since`-clock queries |

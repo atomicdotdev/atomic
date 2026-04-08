@@ -79,7 +79,7 @@
 use crate::change::ChangeStore;
 use crate::diff::Algorithm;
 use crate::output::WorkingCopyRead;
-use crate::pristine::{GraphTxnT, StackState, StackTxnT, TreeTxnT};
+use crate::pristine::{GraphTxnT, TreeTxnT, ViewState, ViewTxnT};
 
 use super::builder::RecordBuilder;
 use super::detect::DetectOptions;
@@ -94,7 +94,7 @@ use super::detect::DetectOptions;
 ///
 /// # Type Parameters
 ///
-/// * `T` - Transaction type implementing `GraphTxnT + TreeTxnT + StackTxnT`
+/// * `T` - Transaction type implementing `GraphTxnT + TreeTxnT + ViewTxnT`
 /// * `W` - Working copy type implementing `WorkingCopyRead`
 /// * `C` - Change store type implementing `ChangeStore`
 ///
@@ -116,7 +116,7 @@ use super::detect::DetectOptions;
 #[derive(Debug)]
 pub struct DetectContext<'a, T, W, C>
 where
-    T: GraphTxnT + TreeTxnT + StackTxnT,
+    T: GraphTxnT + TreeTxnT + ViewTxnT,
     W: WorkingCopyRead,
     C: ChangeStore,
 {
@@ -129,10 +129,10 @@ where
     /// Reference to the change store for content retrieval.
     change_store: &'a C,
 
-    /// The stack to compare against.
+    /// The view to compare against.
     ///
-    /// If `None`, uses the repository's current stack.
-    stack: Option<&'a StackState>,
+    /// If `None`, uses the repository's current view.
+    view: Option<&'a ViewState>,
 
     /// Detection options.
     options: DetectOptions,
@@ -140,7 +140,7 @@ where
 
 impl<'a, T, W, C> DetectContext<'a, T, W, C>
 where
-    T: GraphTxnT + TreeTxnT + StackTxnT,
+    T: GraphTxnT + TreeTxnT + ViewTxnT,
     W: WorkingCopyRead,
     C: ChangeStore,
 {
@@ -162,28 +162,28 @@ where
             txn,
             working_copy,
             change_store,
-            stack: None,
+            view: None,
             options: DetectOptions::default(),
         }
     }
 
-    /// Set the stack to compare against.
+    /// Set the view to compare against.
     ///
-    /// By default, detection compares against the repository's current stack.
-    /// Use this method to compare against a specific stack.
+    /// By default, detection compares against the repository's current view.
+    /// Use this method to compare against a specific view.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The stack state to compare against
+    /// * `view` - The view state to compare against
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// let ctx = DetectContext::new(&txn, &working_copy, &changes)
-    ///     .with_stack(&feature_stack);
+    ///     .with_view(&feature_view);
     /// ```
-    pub fn with_stack(mut self, stack: &'a StackState) -> Self {
-        self.stack = Some(stack);
+    pub fn with_view(mut self, view: &'a ViewState) -> Self {
+        self.view = Some(view);
         self
     }
 
@@ -241,9 +241,9 @@ where
     ///
     /// # Returns
     ///
-    /// Optional reference to the stack being compared against.
-    pub fn stack(&self) -> Option<&StackState> {
-        self.stack
+    /// Optional reference to the view being compared against.
+    pub fn view(&self) -> Option<&ViewState> {
+        self.view
     }
 
     /// Get the detection options.
@@ -285,7 +285,7 @@ where
 
 impl<'a, T, W, C> Clone for DetectContext<'a, T, W, C>
 where
-    T: GraphTxnT + TreeTxnT + StackTxnT,
+    T: GraphTxnT + TreeTxnT + ViewTxnT,
     W: WorkingCopyRead,
     C: ChangeStore,
 {
@@ -294,7 +294,7 @@ where
             txn: self.txn,
             working_copy: self.working_copy,
             change_store: self.change_store,
-            stack: self.stack,
+            view: self.view,
             options: self.options.clone(),
         }
     }
@@ -309,7 +309,7 @@ where
 ///
 /// # Type Parameters
 ///
-/// * `T` - Transaction type implementing `GraphTxnT + TreeTxnT + StackTxnT`
+/// * `T` - Transaction type implementing `GraphTxnT + TreeTxnT + ViewTxnT`
 /// * `W` - Working copy type implementing `WorkingCopyRead`
 /// * `C` - Change store type implementing `ChangeStore`
 ///
@@ -318,7 +318,7 @@ where
 /// ```rust,ignore
 /// use atomic_core::record::{RecordContext, DetectOptions};
 ///
-/// let mut ctx = RecordContext::new(&txn, &stack, &working_copy, &changes);
+/// let mut ctx = RecordContext::new(&txn, &view, &working_copy, &changes);
 ///
 /// // Record all changes
 /// let recorded = ctx.record("")?;
@@ -329,7 +329,7 @@ where
 #[derive(Debug)]
 pub struct RecordContext<'a, T, W, C>
 where
-    T: GraphTxnT + TreeTxnT + StackTxnT,
+    T: GraphTxnT + TreeTxnT + ViewTxnT,
     W: WorkingCopyRead,
     C: ChangeStore,
 {
@@ -339,13 +339,13 @@ where
     /// The record builder for accumulating changes.
     builder: RecordBuilder,
 
-    /// The stack we're recording changes to.
-    stack: &'a StackState,
+    /// The view we're recording changes to.
+    view: &'a ViewState,
 }
 
 impl<'a, T, W, C> RecordContext<'a, T, W, C>
 where
-    T: GraphTxnT + TreeTxnT + StackTxnT,
+    T: GraphTxnT + TreeTxnT + ViewTxnT,
     W: WorkingCopyRead,
     C: ChangeStore,
 {
@@ -354,25 +354,20 @@ where
     /// # Arguments
     ///
     /// * `txn` - Read-only pristine transaction
-    /// * `stack` - The stack to record changes to
+    /// * `view` - The view to record changes to
     /// * `working_copy` - Working copy for file access
     /// * `change_store` - Change store for content retrieval
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// let ctx = RecordContext::new(&txn, &stack, &working_copy, &changes);
+    /// let ctx = RecordContext::new(&txn, &view, &working_copy, &changes);
     /// ```
-    pub fn new(
-        txn: &'a T,
-        stack: &'a StackState,
-        working_copy: &'a W,
-        change_store: &'a C,
-    ) -> Self {
+    pub fn new(txn: &'a T, view: &'a ViewState, working_copy: &'a W, change_store: &'a C) -> Self {
         Self {
-            detect: DetectContext::new(txn, working_copy, change_store).with_stack(stack),
+            detect: DetectContext::new(txn, working_copy, change_store).with_view(view),
             builder: RecordBuilder::new(),
-            stack,
+            view,
         }
     }
 
@@ -383,7 +378,7 @@ where
     /// # Arguments
     ///
     /// * `txn` - Read-only pristine transaction
-    /// * `stack` - The stack to record changes to
+    /// * `view` - The view to record changes to
     /// * `working_copy` - Working copy for file access
     /// * `change_store` - Change store for content retrieval
     /// * `builder` - Pre-configured record builder
@@ -395,20 +390,20 @@ where
     /// builder.force_rediff = true;
     ///
     /// let ctx = RecordContext::with_builder(
-    ///     &txn, &stack, &working_copy, &changes, builder
+    ///     &txn, &view, &working_copy, &changes, builder
     /// );
     /// ```
     pub fn with_builder(
         txn: &'a T,
-        stack: &'a StackState,
+        view: &'a ViewState,
         working_copy: &'a W,
         change_store: &'a C,
         builder: RecordBuilder,
     ) -> Self {
         Self {
-            detect: DetectContext::new(txn, working_copy, change_store).with_stack(stack),
+            detect: DetectContext::new(txn, working_copy, change_store).with_view(view),
             builder,
-            stack,
+            view,
         }
     }
 
@@ -421,7 +416,7 @@ where
     /// # Example
     ///
     /// ```rust,ignore
-    /// let ctx = RecordContext::new(&txn, &stack, &working_copy, &changes)
+    /// let ctx = RecordContext::new(&txn, &view, &working_copy, &changes)
     ///     .with_options(DetectOptions::new().with_check_mtime(false));
     /// ```
     pub fn with_options(mut self, options: DetectOptions) -> Self {
@@ -460,9 +455,9 @@ where
     ///
     /// # Returns
     ///
-    /// Reference to the stack being recorded to.
-    pub fn stack(&self) -> &StackState {
-        self.stack
+    /// Reference to the view being recorded to.
+    pub fn view(&self) -> &ViewState {
+        self.view
     }
 
     /// Get the pristine transaction reference.
@@ -889,43 +884,22 @@ mod tests {
         }
     }
 
-    impl StackTxnT for MockTxn {
-        fn get_stack_by_id(&self, _id: u64) -> Result<Option<StackState>, PristineError> {
+    impl ViewTxnT for MockTxn {
+        fn get_view_by_id(&self, _id: u64) -> Result<Option<ViewState>, PristineError> {
             Ok(None)
         }
 
-        fn iter_stack_graph_adjacent(
-            &self,
-            _stack_id: u64,
-            _node: GraphNode<NodeId>,
-            _min_flag: EdgeFlags,
-            _max_flag: EdgeFlags,
-        ) -> Result<
-            Box<dyn Iterator<Item = Result<SerializedGraphEdge, PristineError>> + '_>,
-            PristineError,
-        > {
-            Ok(Box::new(std::iter::empty()))
-        }
-
-        fn iter_stack_graph_vertices_for_change(
-            &self,
-            _stack_id: u64,
-            _change_id: u64,
-        ) -> Result<Vec<(u64, u64)>, PristineError> {
-            Ok(Vec::new())
-        }
-
-        fn get_stack(&self, _name: &str) -> Result<Option<StackState>, PristineError> {
+        fn get_view(&self, _name: &str) -> Result<Option<ViewState>, PristineError> {
             Ok(None)
         }
 
-        fn list_stacks(&self) -> Result<Vec<String>, PristineError> {
+        fn list_views(&self) -> Result<Vec<String>, PristineError> {
             Ok(Vec::new())
         }
 
         fn get_change_seq(
             &self,
-            _stack: &StackState,
+            _view: &ViewState,
             _change_id: NodeId,
         ) -> Result<Option<u64>, PristineError> {
             Ok(None)
@@ -933,7 +907,7 @@ mod tests {
 
         fn get_change_at_seq(
             &self,
-            _stack: &StackState,
+            _view: &ViewState,
             _seq: u64,
         ) -> Result<Option<NodeId>, PristineError> {
             Ok(None)
@@ -941,7 +915,7 @@ mod tests {
 
         fn iter_changes(
             &self,
-            _stack: &StackState,
+            _view: &ViewState,
             _from_seq: u64,
         ) -> Result<
             Box<dyn Iterator<Item = Result<(u64, NodeId, Merkle), PristineError>> + '_>,
@@ -961,23 +935,23 @@ mod tests {
 
         let ctx = DetectContext::new(&txn, &working_copy, &change_store);
 
-        assert!(ctx.stack().is_none());
+        assert!(ctx.view().is_none());
         assert_eq!(ctx.algorithm(), Algorithm::Myers);
         assert!(ctx.check_mtime());
         assert!(ctx.prefix().is_empty());
     }
 
     #[test]
-    fn test_detect_context_with_stack() {
+    fn test_detect_context_with_view() {
         let txn = MockTxn;
         let working_copy = Memory::new();
         let change_store = MemoryChangeStore::new();
-        let stack = StackState::default();
+        let view = ViewState::default();
 
-        let ctx = DetectContext::new(&txn, &working_copy, &change_store).with_stack(&stack);
+        let ctx = DetectContext::new(&txn, &working_copy, &change_store).with_view(&view);
 
-        assert!(ctx.stack().is_some());
-        assert_eq!(ctx.stack().unwrap().name, stack.name);
+        assert!(ctx.view().is_some());
+        assert_eq!(ctx.view().unwrap().name, view.name);
     }
 
     #[test]
@@ -1020,13 +994,13 @@ mod tests {
         let txn = MockTxn;
         let working_copy = Memory::new();
         let change_store = MemoryChangeStore::new();
-        let stack = StackState::default();
+        let view = ViewState::default();
 
-        let ctx = RecordContext::new(&txn, &stack, &working_copy, &change_store);
+        let ctx = RecordContext::new(&txn, &view, &working_copy, &change_store);
 
         assert!(ctx.is_empty());
         assert_eq!(ctx.hunk_count(), 0);
-        assert_eq!(ctx.stack().name, stack.name);
+        assert_eq!(ctx.view().name, view.name);
     }
 
     #[test]
@@ -1034,12 +1008,12 @@ mod tests {
         let txn = MockTxn;
         let working_copy = Memory::new();
         let change_store = MemoryChangeStore::new();
-        let stack = StackState::default();
+        let view = ViewState::default();
 
         let mut builder = RecordBuilder::with_capacity(10, 1024);
         builder.force_rediff = true;
 
-        let ctx = RecordContext::with_builder(&txn, &stack, &working_copy, &change_store, builder);
+        let ctx = RecordContext::with_builder(&txn, &view, &working_copy, &change_store, builder);
 
         assert!(ctx.builder().force_rediff);
     }
@@ -1049,9 +1023,9 @@ mod tests {
         let txn = MockTxn;
         let working_copy = Memory::new();
         let change_store = MemoryChangeStore::new();
-        let stack = StackState::default();
+        let view = ViewState::default();
 
-        let ctx = RecordContext::new(&txn, &stack, &working_copy, &change_store)
+        let ctx = RecordContext::new(&txn, &view, &working_copy, &change_store)
             .with_options(DetectOptions::new().with_algorithm(Algorithm::Patience));
 
         assert_eq!(ctx.options().algorithm, Algorithm::Patience);
@@ -1062,9 +1036,9 @@ mod tests {
         let txn = MockTxn;
         let working_copy = Memory::new();
         let change_store = MemoryChangeStore::new();
-        let stack = StackState::default();
+        let view = ViewState::default();
 
-        let ctx = RecordContext::new(&txn, &stack, &working_copy, &change_store);
+        let ctx = RecordContext::new(&txn, &view, &working_copy, &change_store);
         let builder = ctx.into_builder();
 
         assert!(builder.is_empty());
@@ -1075,9 +1049,9 @@ mod tests {
         let txn = MockTxn;
         let working_copy = Memory::new();
         let change_store = MemoryChangeStore::new();
-        let stack = StackState::default();
+        let view = ViewState::default();
 
-        let mut ctx = RecordContext::new(&txn, &stack, &working_copy, &change_store);
+        let mut ctx = RecordContext::new(&txn, &view, &working_copy, &change_store);
         let first_builder = ctx.take_builder();
         let second_builder = ctx.take_builder();
 
@@ -1091,9 +1065,9 @@ mod tests {
         let txn = MockTxn;
         let working_copy = Memory::new();
         let change_store = MemoryChangeStore::new();
-        let stack = StackState::default();
+        let view = ViewState::default();
 
-        let mut ctx = RecordContext::new(&txn, &stack, &working_copy, &change_store);
+        let mut ctx = RecordContext::new(&txn, &view, &working_copy, &change_store);
         ctx.builder_mut().force_rediff = true;
 
         assert!(ctx.builder().force_rediff);

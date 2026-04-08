@@ -442,7 +442,7 @@ impl Clone {
                 format_count(stats.changes_downloaded, "change"),
                 target_path.display()
             ));
-            print_hint("Use 'atomic apply' to apply the downloaded changes");
+            print_hint("Use 'atomic insert' to insert the downloaded changes");
 
             // Disable cleanup guard - clone succeeded
             guard.disable();
@@ -453,10 +453,10 @@ impl Clone {
         if stats.changes_downloaded > 0 {
             print_blank();
             progress.phase = ClonePhase::Applying;
-            let spinner = create_spinner("Applying changes to stack...");
+            let spinner = create_spinner("Inserting changes into view...");
 
-            // Apply each downloaded change in order to build the graph
-            let apply_options = atomic_repository::ApplyOptions::default();
+            // Insert each downloaded change in order to build the graph
+            let insert_options = atomic_repository::InsertOptions::default();
             let mut apply_errors = Vec::new();
 
             for entry in &remote_entries {
@@ -465,7 +465,7 @@ impl Clone {
                     None => continue,
                 };
 
-                match repo.apply_change(&hash, apply_options.clone()) {
+                match repo.insert_change(&hash, insert_options.clone()) {
                     Ok(_outcome) => {
                         stats.record_applied();
                         progress.record_applied();
@@ -488,7 +488,7 @@ impl Clone {
             }
 
             // Output the working copy — reconstruct files from the graph
-            match repo.output_working_copy() {
+            match repo.materialize() {
                 Ok(output) => {
                     log::info!(
                         "Output working copy: {} files, {} dirs",

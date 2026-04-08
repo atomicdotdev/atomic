@@ -464,7 +464,7 @@ mod tests {
     #[test]
     fn pristine_chains_through_tree_to_output() {
         fn walk_tree() -> TreeResult<()> {
-            Err(PristineError::StackNotFound {
+            Err(PristineError::ViewNotFound {
                 name: "main".into(),
             })?
         }

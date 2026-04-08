@@ -158,10 +158,7 @@ impl ChangeCmd {
         let id = ChangeIdentifier::parse(self.identifier.as_deref())
             .map_err(|e| CliError::InvalidArgument { message: e })?;
 
-        let stack_name = self
-            .stack
-            .as_deref()
-            .unwrap_or_else(|| repo.current_stack());
+        let stack_name = self.stack.as_deref().unwrap_or_else(|| repo.current_view());
 
         match id {
             ChangeIdentifier::FullHash(hash) => {
@@ -194,7 +191,7 @@ impl ChangeCmd {
         }
     }
 
-    /// Find the sequence number for a hash in the current stack.
+    /// Find the sequence number for a hash in the current view.
     fn find_sequence_for_hash(
         &self,
         repo: &Repository,
@@ -207,9 +204,9 @@ impl ChangeCmd {
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
 
         let stack = txn
-            .get_stack(stack_name)
+            .get_view(stack_name)
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?
-            .ok_or_else(|| CliError::StackNotFound {
+            .ok_or_else(|| CliError::ViewNotFound {
                 name: stack_name.to_string(),
             })?;
 
@@ -262,9 +259,9 @@ impl ChangeCmd {
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
 
         let stack = txn
-            .get_stack(stack_name)
+            .get_view(stack_name)
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?
-            .ok_or_else(|| CliError::StackNotFound {
+            .ok_or_else(|| CliError::ViewNotFound {
                 name: stack_name.to_string(),
             })?;
 
@@ -272,7 +269,7 @@ impl ChangeCmd {
             atomic_repository::history::HistoryError::SequenceOutOfRange { sequence, max } => {
                 CliError::InvalidArgument {
                     message: format!(
-                        "Sequence {} out of range. Stack has {} changes (0-{}).",
+                        "Sequence {} out of range. View has {} changes (0-{}).",
                         sequence,
                         max + 1,
                         max
@@ -285,7 +282,7 @@ impl ChangeCmd {
         Ok(entry.hash)
     }
 
-    /// Get the most recent change on the stack.
+    /// Get the most recent change on the view.
     fn get_latest_change(&self, repo: &Repository, stack_name: &str) -> CliResult<(Hash, u64)> {
         let txn = repo
             .pristine()
@@ -293,9 +290,9 @@ impl ChangeCmd {
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
 
         let stack = txn
-            .get_stack(stack_name)
+            .get_view(stack_name)
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?
-            .ok_or_else(|| CliError::StackNotFound {
+            .ok_or_else(|| CliError::ViewNotFound {
                 name: stack_name.to_string(),
             })?;
 
@@ -633,8 +630,8 @@ impl Command for ChangeCmd {
             atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
                 searched_path: path.into(),
             },
-            atomic_repository::RepositoryError::StackNotFound { name } => {
-                CliError::StackNotFound { name }
+            atomic_repository::RepositoryError::ViewNotFound { name } => {
+                CliError::ViewNotFound { name }
             }
             other => CliError::Internal(anyhow::anyhow!("{}", other)),
         })?;

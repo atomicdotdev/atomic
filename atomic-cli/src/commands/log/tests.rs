@@ -293,7 +293,7 @@ mod tests {
         let options = log.build_history_options();
         assert!(options.load_headers);
         assert!(options.limit.is_none());
-        assert!(options.stack.is_none());
+        assert!(options.view.is_none());
         assert!(!options.tagged_only);
         assert_eq!(options.from_sequence, 0);
     }
@@ -309,7 +309,7 @@ mod tests {
     fn test_log_build_history_options_with_stack() {
         let log = Log::new().with_stack("test-stack");
         let options = log.build_history_options();
-        assert_eq!(options.stack, Some("test-stack".to_string()));
+        assert_eq!(options.view, Some("test-stack".to_string()));
     }
 
     #[test]
@@ -336,7 +336,7 @@ mod tests {
         let options = log.build_history_options();
 
         assert_eq!(options.limit, Some(10));
-        assert_eq!(options.stack, Some("feature".to_string()));
+        assert_eq!(options.view, Some("feature".to_string()));
         assert!(options.tagged_only);
         assert_eq!(options.from_sequence, 5);
         assert!(options.load_headers);
@@ -732,9 +732,9 @@ mod tests {
         // Should fail with stack not found or internal error
         assert!(result.is_err());
         match result {
-            Err(CliError::StackNotFound { name }) => assert_eq!(name, "nonexistent-stack"),
+            Err(CliError::ViewNotFound { name }) => assert_eq!(name, "nonexistent-stack"),
             Err(CliError::Internal(_)) => {} // Also acceptable
-            other => panic!("Expected StackNotFound or Internal error, got: {:?}", other),
+            other => panic!("Expected ViewNotFound or Internal error, got: {:?}", other),
         }
     }
 

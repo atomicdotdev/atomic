@@ -78,7 +78,7 @@
 //! let wc = Memory::new();
 //!
 //! // Output the repository state
-//! let conflicts = output_repository(
+//! let conflicts = materialize_view(
 //!     &wc,
 //!     &changes,
 //!     &txn,
@@ -174,6 +174,11 @@ pub use filesystem::{FileSystem, FileWriter, DOT_DIR};
 pub use repo::{
     FileConflict, FileConflictType, FileWritten, OutputError as OutputRepoError, OutputOptions,
     OutputOutcome, OutputResult as OutputRepoResult,
+};
+
+// Re-export materialize (repository output) types
+pub use repo::{
+    materialize_prefix, materialize_view, MaterializeError, MaterializeOptions, MaterializeResult,
 };
 
 // Re-export alive graph types

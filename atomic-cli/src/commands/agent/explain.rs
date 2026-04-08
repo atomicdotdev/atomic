@@ -136,19 +136,19 @@ impl Command for Explain {
         let repo = Repository::open(&repo_root)?;
 
         // Get the changes on the agent stack
-        let history_options = HistoryOptions::with_headers().stack(&session.stack_name);
+        let history_options = HistoryOptions::with_headers().view(&session.view_name);
 
         let entries = repo.log(history_options).map_err(|e| match e {
-            atomic_repository::RepositoryError::StackNotFound { name } => {
-                CliError::StackNotFound { name }
+            atomic_repository::RepositoryError::ViewNotFound { name } => {
+                CliError::ViewNotFound { name }
             }
             other => CliError::Repository(other),
         })?;
 
         if entries.is_empty() {
             println!(
-                "Session '{}' has no recorded turns on stack '{}'.",
-                self.session_id, session.stack_name,
+                "Session '{}' has no recorded turns on view '{}'.",
+                self.session_id, session.view_name,
             );
             return Ok(());
         }

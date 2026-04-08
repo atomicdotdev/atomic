@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # 06_tags_and_stash.sh — Tag and stash lifecycle tests.
 #
-# Tags are named state snapshots — lightweight references to a stack's
+# Tags are named state snapshots — lightweight references to a view's
 # Merkle state at a point in time.  Stash temporarily saves uncommitted
-# working-copy changes to an orphan stack, restores the working copy to
+# working-copy changes to an orphan view, restores the working copy to
 # a clean state, and can replay those changes later.
 #
 # These tests verify:
 #
 #   - Tag create / list / show / delete
-#   - Tags are scoped to the stack they were created on
-#   - Tags survive stack switches
+#   - Tags are scoped to the view they were created on
+#   - Tags survive view switches
 #   - Stash push saves dirty state and restores clean working copy
 #   - Stash pop restores the dirty state and removes the stash
 #   - Stash apply restores without removing
 #   - Stash list / drop / clear
-#   - Stash across stack switches
+#   - Stash across view switches
 #   - Multiple stashes (LIFO ordering)
 #   - Stash with untracked files
 #   - Stash + tag interaction (tag before stash, pop after)
@@ -61,8 +61,8 @@ else
     _fail "tag show displays tag name" "got: $(echo "$show_out" | head -5)"
 fi
 
-if echo "$show_out" | grep -qiE "stack.*dev|dev"; then
-    _pass "tag show mentions the stack"
+if echo "$show_out" | grep -qiE "view.*dev|dev"; then
+    _pass "tag show mentions the view"
 else
     _pass "tag show completed"
 fi
@@ -148,7 +148,7 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Tags: Tags survive stack switches"
+begin_section "Tags: Tags survive view switches"
 # ═══════════════════════════════════════════════════════════════════════════
 
 make_temp_repo "tag-switch"
@@ -159,33 +159,33 @@ assert_success "add base.txt" atomic add base.txt
 record_change "base commit" >/dev/null 2>&1 || true
 atomic tag create release-1 >/dev/null 2>&1
 
-new_stack "feature" >/dev/null 2>&1 || true
-apply_from_stack "dev" "feature" >/dev/null 2>&1 || true
-switch_stack "feature" >/dev/null 2>&1 || true
+new_view "feature" >/dev/null 2>&1 || true
+insert_from_view "dev" "feature" >/dev/null 2>&1 || true
+switch_view "feature" >/dev/null 2>&1 || true
 
 # Tag should still be visible from feature
 list_from_feature="$(atomic tag list 2>&1)"
 if echo "$list_from_feature" | grep -qF "release-1"; then
-    _pass "tag visible from feature stack"
+    _pass "tag visible from feature view"
 else
-    _fail "tag visible from feature stack" "not found"
+    _fail "tag visible from feature view" "not found"
 fi
 
 # Switch back to dev — tag still there
-switch_stack "dev" >/dev/null 2>&1 || true
+switch_view "dev" >/dev/null 2>&1 || true
 list_back="$(atomic tag list 2>&1)"
 if echo "$list_back" | grep -qF "release-1"; then
-    _pass "tag persists after stack round-trip"
+    _pass "tag persists after view round-trip"
 else
-    _fail "tag persists after stack round-trip" "not found"
+    _fail "tag persists after view round-trip" "not found"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Tags: Tag on feature stack"
+begin_section "Tags: Tag on feature view"
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Continuing from previous
-switch_stack "feature" >/dev/null 2>&1 || true
+switch_view "feature" >/dev/null 2>&1 || true
 create_file "feat.txt" "feature"
 assert_success "add feat.txt" atomic add feat.txt
 record_change "feature work" >/dev/null 2>&1 || true
@@ -193,9 +193,9 @@ atomic tag create feature-done >/dev/null 2>&1
 
 list_feat="$(atomic tag list 2>&1)"
 if echo "$list_feat" | grep -qF "feature-done"; then
-    _pass "tag created on feature stack"
+    _pass "tag created on feature view"
 else
-    _fail "tag created on feature stack" "not found"
+    _fail "tag created on feature view" "not found"
 fi
 
 # Both tags should be visible
@@ -426,12 +426,12 @@ assert_file_content "code.py has exact modified content after pop" "code.py" "de
     return False"
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Stash: Stash across stack switch"
+begin_section "Stash: Stash across view switch"
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # Stash on dev, switch to feature, do work, switch back, pop stash.
 
-make_temp_repo "stash-cross-stack"
+make_temp_repo "stash-cross-view"
 init_repo
 
 create_file "shared.txt" "shared"
@@ -444,24 +444,24 @@ atomic stash >/dev/null 2>&1
 assert_file_content "shared.txt clean after stash" "shared.txt" "shared"
 
 # Switch to feature, do work
-new_stack "feature" >/dev/null 2>&1 || true
-apply_from_stack "dev" "feature" >/dev/null 2>&1 || true
-switch_stack "feature" >/dev/null 2>&1 || true
+new_view "feature" >/dev/null 2>&1 || true
+insert_from_view "dev" "feature" >/dev/null 2>&1 || true
+switch_view "feature" >/dev/null 2>&1 || true
 
 create_file "feature.txt" "feature work"
 assert_success "add feature.txt" atomic add feature.txt
 record_change "feature work" >/dev/null 2>&1 || true
 
 # Switch back to dev
-switch_stack "dev" >/dev/null 2>&1 || true
+switch_view "dev" >/dev/null 2>&1 || true
 assert_file_content "shared.txt still clean on dev" "shared.txt" "shared"
 
 # Stash list should still have the stash
 list_cross="$(atomic stash list 2>&1)"
 if echo "$list_cross" | grep -qE "stash@"; then
-    _pass "stash persists across stack switches"
+    _pass "stash persists across view switches"
 else
-    _fail "stash persists across stack switches" "not found"
+    _fail "stash persists across view switches" "not found"
 fi
 
 # Pop the stash
@@ -668,15 +668,15 @@ atomic stash pop >/dev/null 2>&1
 assert_file_content "app.txt has WIP after pop" "app.txt" "work in progress"
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Tags + Stash: Full cross-stack workflow"
+begin_section "Tags + Stash: Full cross-view workflow"
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # 1. Record and tag v1 on dev
-# 2. Create feature, apply dev, record feature work
+# 2. Create feature, insert dev, record feature work
 # 3. Switch to dev, start work, stash it
 # 4. Record v2 on dev, tag v2
 # 5. Pop stash, continue working
-# 6. Apply feature to dev
+# 6. Insert feature to dev
 # 7. Verify all tags, content, and history
 
 make_temp_repo "full-tag-stash"
@@ -689,16 +689,16 @@ record_change "Core v1" >/dev/null 2>&1 || true
 atomic tag create v1.0 >/dev/null 2>&1
 
 # Step 2: feature work
-new_stack "feature" >/dev/null 2>&1 || true
-apply_from_stack "dev" "feature" >/dev/null 2>&1 || true
-switch_stack "feature" >/dev/null 2>&1 || true
+new_view "feature" >/dev/null 2>&1 || true
+insert_from_view "dev" "feature" >/dev/null 2>&1 || true
+switch_view "feature" >/dev/null 2>&1 || true
 
 create_file "feature.txt" "feature content"
 assert_success "add feature.txt" atomic add feature.txt
 record_change "Feature work" >/dev/null 2>&1 || true
 
 # Step 3: switch to dev, start work, stash
-switch_stack "dev" >/dev/null 2>&1 || true
+switch_view "dev" >/dev/null 2>&1 || true
 overwrite_file "core.txt" "core v1 + WIP changes"
 assert_status_flag "core.txt modified on dev" "M" "core.txt"
 
@@ -724,10 +724,10 @@ done
 atomic stash pop >/dev/null 2>&1
 assert_file_content "core.txt has WIP after pop" "core.txt" "core v1 + WIP changes"
 
-# Step 6: apply feature to dev
-apply_from_stack "feature" "dev" >/dev/null 2>&1 || true
-switch_stack "dev" >/dev/null 2>&1 || true
-assert_file_exists "feature.txt on dev after apply" "feature.txt"
+# Step 6: insert feature to dev
+insert_from_view "feature" "dev" >/dev/null 2>&1 || true
+switch_view "dev" >/dev/null 2>&1 || true
+assert_file_exists "feature.txt on dev after insert" "feature.txt"
 
 # Step 7: verify tags still intact
 tags_final="$(atomic tag list 2>&1)"
@@ -740,7 +740,7 @@ for t in v1.0 v2.0; do
 done
 
 # Verify feature is intact
-switch_stack "feature" >/dev/null 2>&1 || true
+switch_view "feature" >/dev/null 2>&1 || true
 assert_file_exists "feature.txt still on feature" "feature.txt"
 assert_file_exists "core.txt on feature" "core.txt"
 
@@ -757,15 +757,15 @@ create_file "f.txt" "base"
 assert_success "add f.txt" atomic add f.txt
 record_change "base" >/dev/null 2>&1 || true
 
-new_stack "feature" >/dev/null 2>&1 || true
-apply_from_stack "dev" "feature" >/dev/null 2>&1 || true
+new_view "feature" >/dev/null 2>&1 || true
+insert_from_view "dev" "feature" >/dev/null 2>&1 || true
 
 # Stash on dev
 overwrite_file "f.txt" "dev dirty"
 atomic stash -m "dev stash" >/dev/null 2>&1 || true
 
 # Switch to feature, make dirty changes, stash
-switch_stack "feature" >/dev/null 2>&1 || true
+switch_view "feature" >/dev/null 2>&1 || true
 overwrite_file "f.txt" "feature dirty"
 atomic stash -m "feature stash" >/dev/null 2>&1 || true
 
@@ -773,13 +773,13 @@ atomic stash -m "feature stash" >/dev/null 2>&1 || true
 list_nested="$(atomic stash list 2>&1)"
 nested_count="$(echo "$list_nested" | grep -c "stash@" || true)"
 if [[ $nested_count -ge 2 ]]; then
-    _pass "two stashes from different stacks ($nested_count)"
+    _pass "two stashes from different views ($nested_count)"
 else
-    _fail "two stashes from different stacks" "got $nested_count"
+    _fail "two stashes from different views" "got $nested_count"
 fi
 
 # Switch back to dev, pop most recent stash (feature's)
-switch_stack "dev" >/dev/null 2>&1 || true
+switch_view "dev" >/dev/null 2>&1 || true
 atomic stash pop >/dev/null 2>&1 || true
 
 # Pop the dev stash

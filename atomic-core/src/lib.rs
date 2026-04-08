@@ -41,6 +41,9 @@ pub mod record;
 // Phase 6: Working Copy Output
 pub mod output;
 
+// Semantic merge engine
+pub mod merge;
+
 // Future modules - to be implemented
 // pub mod alive;
 
@@ -56,8 +59,8 @@ pub use change::{
 
 // Re-export pristine types
 pub use pristine::{
-    GraphTxnT, MutTxnT, Pristine, PristineError, PristineResult, ReadTxn, StackState, StackTxnT,
-    TreeTxnT, VertexExt, WriteTxn,
+    GraphTxnT, MutTxnT, Pristine, PristineError, PristineResult, ReadTxn, TreeTxnT, VertexExt,
+    ViewState, ViewTxnT, WriteTxn,
 };
 
 // Re-export diff types
@@ -78,7 +81,7 @@ pub use record::{
 
 // Re-export apply types
 pub use apply::{
-    compute_new_state, is_change_on_stack, validate_can_apply, verify_dependencies,
+    compute_new_state, is_change_on_view, validate_can_apply, verify_dependencies,
     ApplyChangeResult, ApplyError, ApplyResult, ChangeToApply, LocalApplyError, LocalApplyResult,
     MissingContext, PendingEdge, Workspace, WorkspaceStats, Zombie,
 };
@@ -94,6 +97,12 @@ pub use output::{
 pub use crdt::{
     Branch, BranchId, BranchOp, BranchState, Leaf, LeafId, LeafOp, LeafState, Trunk, TrunkId,
     TrunkOp, TrunkState,
+};
+
+// Re-export merge types
+pub use merge::{
+    ConflictGroup, LeafEdit, MergeOutcome, MergeSource, MergeToken, SemanticMergeEngine,
+    ThreeWayResult, TxnOnlyMergeEngine,
 };
 // Note: FileMetadata is exported from output module but also exists in record module
 // Use output::FileMetadata or record::FileMetadata explicitly to disambiguate

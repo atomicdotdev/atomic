@@ -291,10 +291,10 @@ impl Revise {
     fn resolve_reference(&self, repo: &Repository) -> CliResult<(u64, HistoryEntry)> {
         let change_ref = self.parse_reference();
 
-        // Get current stack info
-        let stack_name = repo.current_stack();
+        // Get current view info
+        let stack_name = repo.current_view();
         let stack_info = repo
-            .get_stack_info(stack_name)
+            .get_view_info(stack_name)
             .map_err(CliError::Repository)?;
 
         if stack_info.change_count == 0 {
@@ -455,9 +455,9 @@ impl Revise {
         sequence: u64,
         entry: &HistoryEntry,
     ) -> CliResult<()> {
-        let stack_name = repo.current_stack();
+        let stack_name = repo.current_view();
         let stack_info = repo
-            .get_stack_info(stack_name)
+            .get_view_info(stack_name)
             .map_err(CliError::Repository)?;
         let changes_to_unrecord = stack_info.change_count - sequence;
 
@@ -523,9 +523,9 @@ impl Revise {
         sequence: u64,
         entry: &HistoryEntry,
     ) -> CliResult<Hash> {
-        let stack_name = repo.current_stack();
+        let stack_name = repo.current_view();
         let stack_info = repo
-            .get_stack_info(stack_name)
+            .get_view_info(stack_name)
             .map_err(CliError::Repository)?;
 
         // Load the original change to get its message
@@ -696,8 +696,8 @@ impl Revise {
             CliError::Internal(anyhow::anyhow!("Failed to save reworded change: {}", e))
         })?;
 
-        // Apply the new change to the stack (it replaces the unrecorded one)
-        repo.apply_change(&new_hash, Default::default())
+        // Insert the new change into the view (it replaces the unrecorded one)
+        repo.insert_change(&new_hash, Default::default())
             .map_err(|e| {
                 CliError::Internal(anyhow::anyhow!("Failed to apply reworded change: {}", e))
             })?;

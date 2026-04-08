@@ -5,17 +5,6 @@
 //! updating edges, maintaining the dependency graph, and updating file tree
 //! mappings.
 //!
-//! # Two-Tier Edge Routing
-//!
-//! The apply module uses [`ApplyTarget`] to route edges to the correct storage
-//! table based on the stack kind:
-//!
-//! - **`ApplyTarget::Global`**: Edges go to the global `GRAPH` + `INODE_GRAPH`
-//!   tables. Used for Shared stacks (dev, release, main).
-//! - **`ApplyTarget::Local { stack_id }`**: Edges go to the per-stack
-//!   `STACK_GRAPH[(stack_id, vertex)]` table. Used for Local workspaces
-//!   (feature, bug, service-*). Cascade-deleted when the stack is removed.
-//!
 //! # Overview
 //!
 //! Applying a change is the inverse of recording:
@@ -62,8 +51,8 @@
 //!
 //! # Key Components
 //!
-//! - [`apply_new_vertex`]: Apply a Insertion atom to insert content
-//! - [`apply_edge_map`]: Apply an EdgeUpdate atom to modify edges
+//! - [`write_new_vertex`]: Apply a Insertion atom to insert content
+//! - [`write_edge_map`]: Apply an EdgeUpdate atom to modify edges
 //! - [`verify_dependencies`]: Check all dependencies are present
 //! - [`compute_new_state`]: Calculate new Merkle state
 //! - [`Workspace`]: Temporary state during application
@@ -167,13 +156,13 @@
 //! ```rust,ignore
 //! use atomic_core::apply::{
 //!     verify_dependencies, validate_can_apply, compute_new_state,
-//!     apply_new_vertex, apply_edge_map, Workspace, ApplyError,
+//!     write_new_vertex, write_edge_map, Workspace, ApplyError,
 //! };
 //! use atomic_core::change::{Change, Atom};
 //!
-//! fn apply_to_stack(
+//! fn apply_to_view(
 //!     txn: &mut impl MutTxnT,
-//!     stack: &mut StackState,
+//!     view: &mut ViewState,
 //!     change: &Change,
 //!     change_hash: &Hash,
 //! ) -> Result<(), ApplyError> {
@@ -181,7 +170,7 @@
 //!     let change_id = txn.register_change(change_hash)?;
 //!
 //!     // Validate the change can be applied
-//!     validate_can_apply(txn, stack, change_id, change_hash, change)?;
+//!     validate_can_apply(txn, view, change_id, change_hash, change)?;
 //!
 //!     // Create workspace for tracking state
 //!     let mut workspace = Workspace::new();
@@ -191,10 +180,10 @@
 //!         for atom in graph_op.atoms() {
 //!             match atom {
 //!                 Atom::Insertion(nv) => {
-//!                     apply_new_vertex(txn, &mut workspace, change_id, nv, change)?;
+//!                     write_new_vertex(txn, &mut workspace, change_id, nv, change)?;
 //!                 }
 //!                 Atom::EdgeUpdate(em) => {
-//!                     apply_edge_map(txn, &mut workspace, change_id, em, change)?;
+//!                     write_edge_map(txn, &mut workspace, change_id, em, change)?;
 //!                 }
 //!             }
 //!         }
@@ -240,83 +229,9 @@ pub mod insertion;
 pub mod position;
 mod workspace;
 
-// Two-Tier Edge Routing
-
-/// Controls where edges are written during change application.
-///
-/// This is the bridge between the stack model (`StackKind`) and the apply
-/// pipeline. The caller constructs the appropriate `ApplyTarget` from the
-/// stack being applied to, and passes it through to `add_edge_with_reverse`
-/// and `del_edge_with_reverse`.
-///
-/// # Construction
-///
-/// ```rust,ignore
-/// use atomic_core::apply::ApplyTarget;
-/// use atomic_core::pristine::StackKind;
-///
-/// let target = match stack.kind {
-///     StackKind::Shared   => ApplyTarget::Global,
-///     StackKind::Local => ApplyTarget::Local { stack_id: stack.id },
-/// };
-/// ```
-///
-/// # Edge Routing
-///
-/// | Target | Forward/Reverse Edges | Inode Index |
-/// |--------|----------------------|-------------|
-/// | `Global` | `GRAPH` | `INODE_GRAPH` |
-/// | `Local { stack_id }` | `STACK_GRAPH[(stack_id, vertex)]` | — |
-///
-/// Local workspaces do not populate `INODE_GRAPH` because their edges are
-/// ephemeral and the inode index is only needed for long-lived graph data.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ApplyTarget {
-    /// Write edges to the global `GRAPH` and `INODE_GRAPH` tables.
-    ///
-    /// Used for Shared stacks (dev, release, main). These edges are
-    /// permanent and visible to all stacks.
-    Global,
-
-    /// Write edges to `STACK_GRAPH[(stack_id, vertex)]`.
-    ///
-    /// Used for Local workspaces (feature, bug, service-*). These edges
-    /// are only visible through the overlay chain and are cascade-deleted
-    /// when the stack is removed.
-    Local {
-        /// The local workspace's internal ID.
-        stack_id: u64,
-    },
-}
-
-impl ApplyTarget {
-    /// Create an `ApplyTarget` from a stack's kind and ID.
-    ///
-    /// This is the canonical way to construct the target from stack metadata.
-    #[inline]
-    pub fn from_stack_kind(kind: crate::pristine::StackKind, stack_id: u64) -> Self {
-        match kind {
-            crate::pristine::StackKind::Shared => Self::Global,
-            crate::pristine::StackKind::Local => Self::Local { stack_id },
-        }
-    }
-
-    /// Check if this targets the global graph.
-    #[inline]
-    pub fn is_global(&self) -> bool {
-        matches!(self, Self::Global)
-    }
-
-    /// Check if this targets an local workspace's graph.
-    #[inline]
-    pub fn is_local(&self) -> bool {
-        matches!(self, Self::Local { .. })
-    }
-}
-
 // Re-export core change application functions
 pub use change::{
-    compute_new_state, is_change_on_stack, validate_can_apply, verify_dependencies,
+    compute_new_state, is_change_on_view, validate_can_apply, verify_dependencies,
     ApplyResult as ApplyChangeResult, ChangeToApply,
 };
 
@@ -332,8 +247,8 @@ pub use position::{
 };
 
 // Re-export atom application functions
-pub use edge::{apply_edge_map, find_source_vertex, find_target_vertex};
-pub use insertion::{add_edge_with_reverse, apply_new_vertex};
+pub use edge::{find_source_vertex, find_target_vertex, write_edge_map};
+pub use insertion::{add_edge_with_reverse, write_new_vertex};
 
 // Re-export conflict tracking types
 pub use conflict::{
@@ -342,25 +257,3 @@ pub use conflict::{
 
 // Re-export FileOps application
 pub use file_ops::{apply_file_ops, ApplyFileOpsStats};
-
-#[cfg(test)]
-mod target_tests {
-    use super::*;
-    use crate::pristine::StackKind;
-
-    #[test]
-    fn apply_target_from_shared_stack() {
-        let target = ApplyTarget::from_stack_kind(StackKind::Shared, 42);
-        assert_eq!(target, ApplyTarget::Global);
-        assert!(target.is_global());
-        assert!(!target.is_local());
-    }
-
-    #[test]
-    fn apply_target_from_isolated_stack() {
-        let target = ApplyTarget::from_stack_kind(StackKind::Local, 7);
-        assert_eq!(target, ApplyTarget::Local { stack_id: 7 });
-        assert!(target.is_local());
-        assert!(!target.is_global());
-    }
-}

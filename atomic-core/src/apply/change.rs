@@ -28,7 +28,7 @@
 //! [`NodeId`]: crate::types::NodeId
 
 use crate::change::Change;
-use crate::pristine::{GraphTxnT, PristineError, StackState, StackTxnT};
+use crate::pristine::{GraphTxnT, PristineError, ViewState, ViewTxnT};
 use crate::types::{Hash, Merkle, NodeId};
 
 use super::error::LocalApplyError;
@@ -90,16 +90,16 @@ pub fn verify_dependencies<T: GraphTxnT>(
 ///
 /// ```rust,ignore
 /// let change_id = txn.get_internal(&change_hash)?.unwrap();
-/// if is_change_on_stack(&txn, &stack, change_id)? {
+/// if is_change_on_view(&txn, &view, change_id)? {
 ///     println!("Change already applied");
 /// }
 /// ```
-pub fn is_change_on_stack<T: StackTxnT>(
+pub fn is_change_on_view<T: ViewTxnT>(
     txn: &T,
-    stack: &StackState,
+    view: &ViewState,
     change_id: NodeId,
 ) -> Result<bool, PristineError> {
-    Ok(txn.get_change_seq(stack, change_id)?.is_some())
+    Ok(txn.get_change_seq(view, change_id)?.is_some())
 }
 
 /// Compute the new Merkle state after applying a change.
@@ -203,16 +203,16 @@ impl ApplyResult {
 /// # Returns
 ///
 /// `Ok(())` if the change can be applied, or an error describing why not.
-pub fn validate_can_apply<T: StackTxnT + GraphTxnT>(
+pub fn validate_can_apply<T: ViewTxnT + GraphTxnT>(
     txn: &T,
-    stack: &StackState,
+    view: &ViewState,
     change_id: NodeId,
     change_hash: &Hash,
     change: &Change,
 ) -> Result<(), LocalApplyError> {
     // Check if already applied
-    if is_change_on_stack(txn, stack, change_id).map_err(|e| LocalApplyError::Internal {
-        message: format!("Failed to check stack: {}", e),
+    if is_change_on_view(txn, view, change_id).map_err(|e| LocalApplyError::Internal {
+        message: format!("Failed to check view: {}", e),
     })? {
         return Err(LocalApplyError::ChangeAlreadyApplied { hash: *change_hash });
     }
@@ -417,43 +417,43 @@ mod tests {
     // Stack State Tests
 
     #[test]
-    fn test_stack_state_initial() {
-        let stack = StackState::new(1, "main".to_string());
+    fn test_view_state_initial() {
+        let view = ViewState::new(1, "main".to_string());
 
-        assert_eq!(stack.id, 1);
-        assert_eq!(stack.name, "main");
-        assert_eq!(stack.state, Merkle::ZERO);
-        assert_eq!(stack.change_count, 0);
-        assert!(stack.is_empty());
+        assert_eq!(view.id, 1);
+        assert_eq!(view.name, "main");
+        assert_eq!(view.state, Merkle::ZERO);
+        assert_eq!(view.change_count, 0);
+        assert!(view.is_empty());
     }
 
     #[test]
-    fn test_stack_state_simulate_apply() {
-        let mut stack = StackState::new(1, "feature".to_string());
+    fn test_view_state_simulate_apply() {
+        let mut view = ViewState::new(1, "feature".to_string());
         let change_hash = test_hash();
 
         // Simulate what apply does
-        let new_state = compute_new_state(&stack.state, &change_hash);
-        stack.state = new_state;
-        stack.change_count += 1;
+        let new_state = compute_new_state(&view.state, &change_hash);
+        view.state = new_state;
+        view.change_count += 1;
 
-        assert_eq!(stack.change_count, 1);
-        assert!(!stack.is_empty());
-        assert_eq!(stack.state, new_state);
+        assert_eq!(view.change_count, 1);
+        assert!(!view.is_empty());
+        assert_eq!(view.state, new_state);
     }
 
     #[test]
-    fn test_stack_state_multiple_applies() {
-        let mut stack = StackState::new(1, "develop".to_string());
+    fn test_view_state_multiple_applies() {
+        let mut view = ViewState::new(1, "develop".to_string());
 
         // Apply 3 changes
         for i in 0..3 {
             let change_hash = Hash::of(format!("change {}", i).as_bytes());
-            stack.state = compute_new_state(&stack.state, &change_hash);
-            stack.change_count += 1;
+            view.state = compute_new_state(&view.state, &change_hash);
+            view.change_count += 1;
         }
 
-        assert_eq!(stack.change_count, 3);
+        assert_eq!(view.change_count, 3);
     }
 
     // Position and Span Tests (Structure Verification)

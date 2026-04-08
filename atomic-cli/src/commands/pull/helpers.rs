@@ -253,8 +253,8 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
             message: "Repository not found on remote".to_string(),
             url: Some(url.to_string()),
         },
-        RemoteError::StackNotFound { stack } => CliError::RemoteError {
-            message: format!("Stack '{}' not found on remote", stack),
+        RemoteError::ViewNotFound { view } => CliError::RemoteError {
+            message: format!("View '{}' not found on remote", view),
             url: Some(url.to_string()),
         },
         RemoteError::ChangeNotFound { hash } => CliError::ChangeNotFound { hash },
@@ -286,8 +286,8 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
             message: format!("Request timed out after {} seconds", seconds),
             url: Some(url.to_string()),
         },
-        RemoteError::EmptyStack { stack } => CliError::RemoteError {
-            message: format!("Stack '{}' is empty", stack),
+        RemoteError::EmptyView { view } => CliError::RemoteError {
+            message: format!("View '{}' is empty", view),
             url: Some(url.to_string()),
         },
         _ => CliError::RemoteError {
@@ -690,10 +690,10 @@ mod tests {
         }
     }
 
-    /// Test converting stack not found error.
+    /// Test converting view not found error.
     #[test]
-    fn test_convert_stack_not_found() {
-        let err = RemoteError::stack_not_found("missing-stack");
+    fn test_convert_view_not_found() {
+        let err = RemoteError::view_not_found("missing-stack");
         let cli_err = convert_remote_error(err, "http://example.com");
 
         match cli_err {
@@ -741,10 +741,10 @@ mod tests {
         }
     }
 
-    /// Test converting empty stack error.
+    /// Test converting empty view error.
     #[test]
-    fn test_convert_empty_stack() {
-        let err = RemoteError::empty_stack("main");
+    fn test_convert_empty_view() {
+        let err = RemoteError::empty_view("main");
         let cli_err = convert_remote_error(err, "http://example.com");
 
         match cli_err {

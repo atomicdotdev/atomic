@@ -180,7 +180,7 @@ impl Log {
         }
 
         if let Some(ref stack) = self.stack {
-            options = options.stack(stack.clone());
+            options = options.view(stack.clone());
         }
 
         if self.tags_only {
@@ -445,33 +445,30 @@ impl Command for Log {
             atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
                 searched_path: path.into(),
             },
-            atomic_repository::RepositoryError::StackNotFound { name } => {
-                CliError::StackNotFound { name }
+            atomic_repository::RepositoryError::ViewNotFound { name } => {
+                CliError::ViewNotFound { name }
             }
             other => CliError::Internal(anyhow::anyhow!("{}", other)),
         })?;
 
         // Build options
         let options = self.build_history_options();
-        let stack_name = self
-            .stack
-            .as_deref()
-            .unwrap_or_else(|| repo.current_stack());
+        let stack_name = self.stack.as_deref().unwrap_or_else(|| repo.current_view());
 
         // Get history
         let entries = if self.reverse {
             // Use forward log for reverse display (oldest first)
             repo.log(options).map_err(|e| match e {
-                atomic_repository::RepositoryError::StackNotFound { name } => {
-                    CliError::StackNotFound { name }
+                atomic_repository::RepositoryError::ViewNotFound { name } => {
+                    CliError::ViewNotFound { name }
                 }
                 other => CliError::Internal(anyhow::anyhow!("{}", other)),
             })?
         } else {
             // Use reverse log for default display (newest first)
             repo.reverse_log(options).map_err(|e| match e {
-                atomic_repository::RepositoryError::StackNotFound { name } => {
-                    CliError::StackNotFound { name }
+                atomic_repository::RepositoryError::ViewNotFound { name } => {
+                    CliError::ViewNotFound { name }
                 }
                 other => CliError::Internal(anyhow::anyhow!("{}", other)),
             })?

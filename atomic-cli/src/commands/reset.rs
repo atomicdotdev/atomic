@@ -280,20 +280,17 @@ impl Reset {
         }
     }
 
-    /// Switch to a different stack.
+    /// Switch to a different view.
     fn switch_stack(&self, repo: &mut Repository, stack_name: &str) -> CliResult<()> {
-        // Check stack exists
-        if !repo
-            .stack_exists(stack_name)
-            .map_err(CliError::Repository)?
-        {
-            return Err(CliError::StackNotFound {
+        // Check view exists
+        if !repo.view_exists(stack_name).map_err(CliError::Repository)? {
+            return Err(CliError::ViewNotFound {
                 name: stack_name.to_string(),
             });
         }
 
-        // Switch stack
-        repo.set_current_stack(stack_name)
+        // Switch view
+        repo.set_current_view(stack_name)
             .map_err(CliError::Repository)?;
 
         Ok(())
@@ -343,10 +340,10 @@ impl Command for Reset {
         // Handle stack switching
         if let Some(ref stack_name) = self.stack {
             if !self.dry_run {
-                println!("Switching to stack '{}'...", stack_name);
+                println!("Switching to view '{}'...", stack_name);
                 self.switch_stack(&mut repo, stack_name)?;
             } else {
-                println!("Would switch to stack '{}'", stack_name);
+                println!("Would switch to view '{}'", stack_name);
             }
         }
 
@@ -380,7 +377,7 @@ impl Command for Reset {
         if files_to_reset.is_empty() {
             if let Some(stack) = &self.stack {
                 print_success(&format!(
-                    "Switched to stack '{}' (working copy already clean)",
+                    "Switched to view '{}' (working copy already clean)",
                     stack
                 ));
             } else {

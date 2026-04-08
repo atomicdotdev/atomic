@@ -33,7 +33,7 @@ use clap::Parser;
 use atomic_core::types::Base32;
 use atomic_remote::{HttpRemote, HttpRemoteConfig};
 use atomic_repository::history::HistoryOptions;
-use atomic_repository::Repository;
+use atomic_repository::{InsertOptions, Repository};
 
 use crate::commands::{find_repository_root, format_hash, Command};
 use crate::error::{CliError, CliResult};
@@ -259,7 +259,7 @@ impl Pull {
     fn get_local_stack(&self, repo: &Repository) -> String {
         self.to_stack
             .clone()
-            .unwrap_or_else(|| repo.current_stack().to_string())
+            .unwrap_or_else(|| repo.current_view().to_string())
     }
 
     /// Get the remote stack name to pull from.
@@ -517,7 +517,7 @@ impl Pull {
         if self.download_only {
             print_blank();
             print_success(&format!(
-                "Downloaded {} (not applied - use 'atomic apply' to apply)",
+                "Downloaded {} (not inserted - use 'atomic insert' to insert)",
                 format_count(stats.changes_downloaded, "change")
             ));
             return Ok(());
@@ -527,13 +527,26 @@ impl Pull {
         print_blank();
         let spinner = create_spinner("Applying changes to stack...");
 
-        // Note: Full apply implementation would iterate through downloaded changes
-        // and apply them to the stack. For now, we indicate this is a future feature.
-        for _change in &to_download {
-            // In a full implementation, this would call repo.apply_change()
-            // For now, we just count them as applied
-            if !stats.has_failures() {
-                stats.record_applied();
+        // Apply downloaded changes to the local stack in sequence order.
+        // Changes that failed to save during download are skipped gracefully
+        // by insert_change_rec (it will return a "change not found" error).
+        let mut apply_errors: Vec<String> = Vec::new();
+
+        for change in &to_download {
+            let options = InsertOptions::default().apply_deps(true).view(&local_stack);
+
+            match repo.insert_change_rec(&change.hash, options) {
+                Ok(_outcome) => {
+                    stats.record_applied();
+                }
+                Err(e) => {
+                    // Log but don't abort — other changes may still apply
+                    apply_errors.push(format!(
+                        "Failed to apply {}: {}",
+                        format_hash(&change.hash, false),
+                        e
+                    ));
+                }
             }
         }
 
@@ -548,6 +561,34 @@ impl Pull {
             );
         } else {
             finish_error(&spinner, "No changes were applied");
+        }
+
+        // Report any per-change apply errors
+        if !apply_errors.is_empty() {
+            for err in &apply_errors {
+                print_warning(err);
+            }
+        }
+
+        // Materialize the working copy so on-disk files reflect the new state
+        if stats.has_applied() {
+            let mat_spinner = create_spinner("Updating working copy...");
+            match repo.materialize() {
+                Ok(result) => {
+                    finish_success(
+                        &mat_spinner,
+                        &format!("{} files updated", result.files_written),
+                    );
+                }
+                Err(e) => {
+                    finish_error(&mat_spinner, "Failed to update working copy");
+                    print_warning(&format!(
+                        "Applied {} but failed to update working copy: {}",
+                        format_count(stats.changes_applied, "change"),
+                        e
+                    ));
+                }
+            }
         }
 
         // Final summary

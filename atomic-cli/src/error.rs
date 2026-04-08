@@ -48,9 +48,9 @@ pub type CliResult<T> = Result<T, CliError>;
 /// Errors are organized into several categories:
 ///
 /// - **Repository errors**: Issues finding or accessing repositories
-/// - **Stack errors**: Problems with stack operations
+/// - **View errors**: Problems with view operations
 /// - **File errors**: Issues with file tracking or access
-/// - **Change errors**: Problems recording or applying changes
+/// - **Change errors**: Problems recording or inserting changes
 /// - **Remote errors**: Issues with remote operations
 /// - **Internal errors**: Unexpected failures (bugs)
 #[derive(Debug, Error)]
@@ -99,34 +99,34 @@ pub enum CliError {
         reason: String,
     },
 
-    // Stack Errors
-    /// The specified stack doesn't exist.
+    // View Errors
+    /// The specified view doesn't exist.
     ///
     /// This occurs when trying to switch to, delete, or otherwise
-    /// operate on a stack that hasn't been created.
-    #[error("Stack '{name}' not found")]
-    StackNotFound {
-        /// The name of the stack that wasn't found
+    /// operate on a view that hasn't been created.
+    #[error("View '{name}' not found")]
+    ViewNotFound {
+        /// The name of the view that wasn't found
         name: String,
     },
 
-    /// A stack with the given name already exists.
+    /// A view with the given name already exists.
     ///
-    /// This occurs when trying to create a new stack with a name
+    /// This occurs when trying to create a new view with a name
     /// that's already in use.
-    #[error("Stack '{name}' already exists")]
-    StackAlreadyExists {
-        /// The name of the existing stack
+    #[error("View '{name}' already exists")]
+    ViewAlreadyExists {
+        /// The name of the existing view
         name: String,
     },
 
-    /// Cannot delete the currently active stack.
+    /// Cannot delete the currently active view.
     ///
-    /// Users must switch to a different stack before deleting
+    /// Users must switch to a different view before deleting
     /// the current one.
-    #[error("Cannot delete the current stack '{name}'")]
-    CannotDeleteCurrentStack {
-        /// The name of the current stack
+    #[error("Cannot delete the current view '{name}'")]
+    CannotDeleteCurrentView {
+        /// The name of the current view
         name: String,
     },
 
@@ -189,7 +189,7 @@ pub enum CliError {
 
     /// A change with the given hash wasn't found.
     ///
-    /// This can occur when trying to view, apply, or unrecord a
+    /// This can occur when trying to view, insert, or unrecord a
     /// change that doesn't exist in the repository.
     #[error("Change not found: {hash}")]
     ChangeNotFound {
@@ -207,11 +207,11 @@ pub enum CliError {
         hash: String,
     },
 
-    /// The change cannot be applied due to missing dependencies.
+    /// The change cannot be inserted due to missing dependencies.
     ///
     /// Changes in Atomic can depend on other changes. This error
-    /// occurs when trying to apply a change whose dependencies
-    /// haven't been applied yet.
+    /// occurs when trying to insert a change whose dependencies
+    /// haven't been inserted yet.
     #[error("Missing dependency for change {change}: requires {dependency}")]
     MissingDependency {
         /// The change that has missing dependencies
@@ -222,7 +222,7 @@ pub enum CliError {
 
     /// A conflict occurred during the operation.
     ///
-    /// This can occur when applying changes that conflict with
+    /// This can occur when inserting changes that conflict with
     /// existing content.
     #[error("Conflict: {description}")]
     Conflict {
@@ -347,9 +347,9 @@ impl CliError {
         }
     }
 
-    /// Create a `StackNotFound` error for the given name.
-    pub fn stack_not_found(name: impl Into<String>) -> Self {
-        Self::StackNotFound { name: name.into() }
+    /// Create a `ViewNotFound` error for the given name.
+    pub fn view_not_found(name: impl Into<String>) -> Self {
+        Self::ViewNotFound { name: name.into() }
     }
 
     /// Create a `FileNotFound` error for the given path.
@@ -377,20 +377,20 @@ impl CliError {
         matches!(
             self,
             Self::RepositoryNotFound { .. }
-                | Self::StackNotFound { .. }
+                | Self::ViewNotFound { .. }
                 | Self::FileNotFound { .. }
                 | Self::ChangeNotFound { .. }
                 | Self::RemoteNotFound { .. }
         )
     }
 
-    /// Check if this error is related to stack operations.
-    pub fn is_stack_error(&self) -> bool {
+    /// Check if this error is related to view operations.
+    pub fn is_view_error(&self) -> bool {
         matches!(
             self,
-            Self::StackNotFound { .. }
-                | Self::StackAlreadyExists { .. }
-                | Self::CannotDeleteCurrentStack { .. }
+            Self::ViewNotFound { .. }
+                | Self::ViewAlreadyExists { .. }
+                | Self::CannotDeleteCurrentView { .. }
         )
     }
 
@@ -422,9 +422,9 @@ impl CliError {
             self,
             Self::RepositoryNotFound { .. }
                 | Self::RepositoryExists { .. }
-                | Self::StackNotFound { .. }
-                | Self::StackAlreadyExists { .. }
-                | Self::CannotDeleteCurrentStack { .. }
+                | Self::ViewNotFound { .. }
+                | Self::ViewAlreadyExists { .. }
+                | Self::CannotDeleteCurrentView { .. }
                 | Self::FileNotFound { .. }
                 | Self::FileNotTracked { .. }
                 | Self::FileAlreadyTracked { .. }
@@ -478,14 +478,14 @@ impl CliError {
             Self::RepositoryExists { .. } => {
                 Some("The directory is already an Atomic repository. Use 'atomic status' to see its state.")
             }
-            Self::StackNotFound { .. } => {
-                Some("Run 'atomic stack list' to see available stacks, or 'atomic stack new <name>' to create a new one.")
+            Self::ViewNotFound { .. } => {
+                Some("Run 'atomic view list' to see available views, or 'atomic view create <name>' to create a new one.")
             }
-            Self::StackAlreadyExists { .. } => {
-                Some("Choose a different name, or use 'atomic stack switch <name>' to switch to the existing stack.")
+            Self::ViewAlreadyExists { .. } => {
+                Some("Choose a different name, or use 'atomic view switch <name>' to switch to the existing view.")
             }
-            Self::CannotDeleteCurrentStack { .. } => {
-                Some("Switch to a different stack first with 'atomic stack switch <name>', then delete this one.")
+            Self::CannotDeleteCurrentView { .. } => {
+                Some("Switch to a different view first with 'atomic view switch <name>', then delete this one.")
             }
             Self::FileNotFound { .. } => {
                 Some("Check that the file path is correct. Use 'ls' or your file manager to verify the file exists.")
@@ -509,7 +509,7 @@ impl CliError {
                 Some("Provide more characters of the hash to uniquely identify the change.")
             }
             Self::MissingDependency { .. } => {
-                Some("Apply the required dependency first, or use '--force' to skip dependency checking (not recommended).")
+                Some("Insert the required dependency first, or use '--force' to skip dependency checking (not recommended).")
             }
             Self::RemoteNotFound { .. } => {
                 Some("Check your repository configuration, or add a remote with 'atomic remote add <name> <url>'.")
@@ -557,7 +557,7 @@ impl CliError {
             Self::NothingToRecord
             | Self::Cancelled
             | Self::FileAlreadyTracked { .. }
-            | Self::StackAlreadyExists { .. } => 1,
+            | Self::ViewAlreadyExists { .. } => 1,
 
             // Command-line usage errors
             Self::InvalidArgument { .. } => 2,
@@ -567,8 +567,8 @@ impl CliError {
             | Self::RepositoryExists { .. }
             | Self::InvalidPath { .. }
             | Self::InvalidRepository { .. }
-            | Self::StackNotFound { .. }
-            | Self::CannotDeleteCurrentStack { .. }
+            | Self::ViewNotFound { .. }
+            | Self::CannotDeleteCurrentView { .. }
             | Self::FileNotFound { .. }
             | Self::FileNotTracked { .. }
             | Self::PathOutsideRepository { .. }
@@ -624,10 +624,10 @@ mod tests {
     }
 
     #[test]
-    fn test_stack_not_found_display() {
-        let err = CliError::stack_not_found("feature");
+    fn test_view_not_found_display() {
+        let err = CliError::view_not_found("feature");
         let msg = err.to_string();
-        assert!(msg.contains("Stack 'feature' not found"));
+        assert!(msg.contains("View 'feature' not found"));
     }
 
     #[test]
@@ -694,12 +694,12 @@ mod tests {
     }
 
     #[test]
-    fn test_is_stack_error() {
-        assert!(CliError::stack_not_found("main").is_stack_error());
-        assert!(CliError::StackAlreadyExists { name: "dev".into() }.is_stack_error());
-        assert!(CliError::CannotDeleteCurrentStack { name: "dev".into() }.is_stack_error());
+    fn test_is_view_error() {
+        assert!(CliError::view_not_found("main").is_view_error());
+        assert!(CliError::ViewAlreadyExists { name: "dev".into() }.is_view_error());
+        assert!(CliError::CannotDeleteCurrentView { name: "dev".into() }.is_view_error());
 
-        assert!(!CliError::NothingToRecord.is_stack_error());
+        assert!(!CliError::NothingToRecord.is_view_error());
     }
 
     #[test]
@@ -772,11 +772,11 @@ mod tests {
     }
 
     #[test]
-    fn test_stack_not_found_suggestion() {
-        let err = CliError::stack_not_found("feature");
+    fn test_view_not_found_suggestion() {
+        let err = CliError::view_not_found("feature");
         let suggestion = err.suggestion();
         assert!(suggestion.is_some());
-        assert!(suggestion.unwrap().contains("atomic stack list"));
+        assert!(suggestion.unwrap().contains("atomic view list"));
     }
 
     #[test]
@@ -835,7 +835,7 @@ mod tests {
     #[test]
     fn test_exit_code_repository_error() {
         assert_eq!(CliError::repository_not_found("/path").exit_code(), 3);
-        assert_eq!(CliError::stack_not_found("main").exit_code(), 3);
+        assert_eq!(CliError::view_not_found("main").exit_code(), 3);
         assert_eq!(CliError::file_not_found("test.txt").exit_code(), 3);
     }
 
@@ -909,10 +909,10 @@ mod tests {
     }
 
     #[test]
-    fn test_constructor_stack_not_found() {
-        let err = CliError::stack_not_found("feature-branch");
+    fn test_constructor_view_not_found() {
+        let err = CliError::view_not_found("feature-branch");
         match err {
-            CliError::StackNotFound { name } => {
+            CliError::ViewNotFound { name } => {
                 assert_eq!(name, "feature-branch");
             }
             _ => panic!("Wrong error variant"),
@@ -994,9 +994,9 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_empty_stack_name() {
-        let err = CliError::stack_not_found("");
-        assert!(err.to_string().contains("Stack '' not found"));
+    fn test_empty_view_name() {
+        let err = CliError::view_not_found("");
+        assert!(err.to_string().contains("View '' not found"));
     }
 
     #[test]
@@ -1007,7 +1007,7 @@ mod tests {
 
     #[test]
     fn test_unicode_in_error_messages() {
-        let err = CliError::stack_not_found("功能分支");
+        let err = CliError::view_not_found("功能分支");
         assert!(err.to_string().contains("功能分支"));
     }
 
@@ -1021,9 +1021,9 @@ mod tests {
             CliError::InvalidRepository {
                 reason: "corrupted".into(),
             },
-            CliError::stack_not_found("main"),
-            CliError::StackAlreadyExists { name: "dev".into() },
-            CliError::CannotDeleteCurrentStack { name: "dev".into() },
+            CliError::view_not_found("main"),
+            CliError::ViewAlreadyExists { name: "dev".into() },
+            CliError::CannotDeleteCurrentView { name: "dev".into() },
             CliError::file_not_found("test.txt"),
             CliError::FileNotTracked {
                 path: "test.txt".into(),

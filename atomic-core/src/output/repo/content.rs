@@ -76,11 +76,14 @@
 //! ```
 
 use crate::change::ChangeStore;
+use crate::merge::{ConflictGroup, MergeOutcome, ResolvedConflicts, SemanticMergeEngine};
 use crate::output::alive::{AliveGraph, OrderResult};
 use crate::output::traits::VertexBuffer;
-use crate::types::{Hash, NodeId};
+use crate::pristine::GraphTxnT;
+use crate::types::{ChangePosition, GraphNode, Hash, NodeId};
 
 use super::error::{OutputError, OutputResult};
+use super::fork::detect_fork_conflicts;
 
 // OUTPUT GRAPH CONTENT
 
@@ -255,6 +258,314 @@ where
     }
 
     // Close any remaining zombie conflict
+    if let Some(zombie_id) = in_zombie {
+        buffer
+            .end_zombie_conflict(zombie_id)
+            .map_err(OutputError::io)?;
+    }
+
+    Ok(())
+}
+
+// RESOLVE CONFLICTS SEMANTICALLY
+
+/// Attempt to resolve conflicts using the semantic merge engine.
+///
+/// Handles two kinds of conflict:
+///
+/// 1. **Cyclic conflicts** — multi-vertex SCCs where Tarjan found a cycle.
+/// 2. **Fork conflicts** — a parent vertex with multiple children that
+///    landed in *different* single-vertex SCCs (no ordering between them).
+///    This is the most common conflict type when two agents edit the same
+///    line concurrently.
+///
+/// For each resolved conflict the merged bytes are stored in the returned
+/// [`ResolvedConflicts`] map keyed on the **first** child `VertexId`.
+/// The remaining vertices are recorded in the skip set.
+///
+/// The caller should pass the returned map to
+/// [`output_graph_content_resolved`] so that resolved conflicts are written
+/// as plain content instead of conflict markers.
+///
+/// Failures are swallowed gracefully — if the engine cannot merge a
+/// particular conflict the markers are left for the normal output path.
+pub fn resolve_conflicts_semantically<T, C>(
+    txn: &T,
+    changes: &C,
+    graph: &AliveGraph,
+    order: &OrderResult,
+) -> ResolvedConflicts
+where
+    T: GraphTxnT,
+    C: ChangeStore,
+{
+    let mut resolved = ResolvedConflicts::new();
+    let engine = SemanticMergeEngine::new(txn, changes);
+
+    // 1. Resolve cyclic conflicts (multi-vertex SCCs)
+    for scc in &order.sccs {
+        if scc.len() <= 1 {
+            continue;
+        }
+
+        let vertices: Vec<GraphNode<NodeId>> = scc
+            .iter()
+            .filter_map(|&vid| graph.try_get_vertex(vid))
+            .map(|v| v.node)
+            .collect();
+
+        if vertices.len() < 2 {
+            continue;
+        }
+
+        let group = ConflictGroup::new(vertices);
+
+        match engine.try_merge(&group) {
+            Ok(MergeOutcome::AutoMerged { content, .. }) => {
+                log::info!(
+                    "Semantic merge resolved cyclic conflict ({} vertices, {} bytes)",
+                    scc.len(),
+                    content.len(),
+                );
+                let first = scc[0];
+                resolved.insert_merged(first, content);
+                for &vid in &scc[1..] {
+                    resolved.insert_skip(vid);
+                }
+            }
+            Ok(MergeOutcome::Conflict { .. }) => {
+                log::debug!("Semantic merge: true conflict in SCC, keeping markers");
+            }
+            Ok(MergeOutcome::NoCrdtData) | Ok(MergeOutcome::Clean(_)) => {}
+            Err(e) => {
+                log::warn!("Semantic merge failed for SCC: {}", e);
+            }
+        }
+    }
+
+    // 2. Detect and resolve fork conflicts
+    let forks = detect_fork_conflicts(graph, order);
+    for fork in &forks {
+        let vertices: Vec<GraphNode<NodeId>> = fork
+            .children
+            .iter()
+            .filter_map(|&vid| graph.try_get_vertex(vid))
+            .map(|v| v.node)
+            .collect();
+
+        if vertices.len() < 2 {
+            continue;
+        }
+
+        let group = ConflictGroup::new(vertices).with_parent(graph.get_vertex(fork.parent).node);
+
+        match engine.try_merge(&group) {
+            Ok(MergeOutcome::AutoMerged { content, .. }) => {
+                log::info!(
+                    "Semantic merge resolved fork conflict ({} children, {} bytes)",
+                    fork.children.len(),
+                    content.len(),
+                );
+                resolved.insert_merged(fork.children[0], content);
+                for &vid in &fork.children[1..] {
+                    resolved.insert_skip(vid);
+                }
+            }
+            Ok(MergeOutcome::Conflict { .. }) => {
+                log::debug!("Semantic merge: true conflict at fork, keeping both sides");
+            }
+            Ok(MergeOutcome::NoCrdtData) | Ok(MergeOutcome::Clean(_)) => {}
+            Err(e) => {
+                log::warn!("Semantic merge failed for fork: {}", e);
+            }
+        }
+    }
+
+    resolved
+}
+
+// OUTPUT GRAPH CONTENT (RESOLVED)
+
+/// Output graph content with semantic-merge resolution.
+///
+/// This is the merge-aware counterpart of [`output_graph_content`].  For
+/// every SCC whose lead vertex appears in `resolved`, the merged bytes are
+/// written directly and the remaining vertices are silently skipped.  All
+/// other SCCs are handled identically to `output_graph_content`.
+///
+/// If `resolved` is empty this function behaves exactly like
+/// [`output_graph_content`].
+pub fn output_graph_content_resolved<C, F, V>(
+    changes: &C,
+    hash_fn: F,
+    graph: &AliveGraph,
+    order: &OrderResult,
+    buffer: &mut V,
+    resolved: &ResolvedConflicts,
+) -> OutputResult<()>
+where
+    C: ChangeStore,
+    F: Fn(NodeId) -> Option<Hash>,
+    V: VertexBuffer,
+{
+    // Fast path: nothing was resolved — delegate to the original function.
+    if resolved.is_empty() {
+        return output_graph_content(changes, hash_fn, graph, order, buffer);
+    }
+
+    // Track conflict IDs
+    let mut conflict_id: usize = 0;
+
+    // Track zombie state
+    let mut in_zombie: Option<usize> = None;
+
+    for scc in order.sccs.iter().rev() {
+        if scc.is_empty() {
+            continue;
+        }
+
+        let is_cyclic = scc.len() > 1;
+
+        // ── Resolved SCC: emit merged bytes, no conflict markers ──────
+        if is_cyclic {
+            if let Some(merged) = resolved.get_merged(scc[0]) {
+                if !merged.is_empty() {
+                    let synthetic = GraphNode::new(
+                        NodeId::ROOT,
+                        ChangePosition::new(0),
+                        ChangePosition::new(merged.len() as u64),
+                    );
+                    // Clone into a local so the closure can own it
+                    // (`output_line` takes `FnOnce`).
+                    let bytes = merged.to_vec();
+                    buffer
+                        .output_line(synthetic, |buf: &mut [u8]| -> Result<(), std::io::Error> {
+                            buf.copy_from_slice(&bytes);
+                            Ok(())
+                        })
+                        .map_err(OutputError::io)?;
+                }
+                continue; // skip remaining vertices in this SCC
+            }
+        }
+
+        // ── Fork-resolved: single-vertex SCC with merged or skipped content ─
+        if !is_cyclic && scc.len() == 1 {
+            let vid = scc[0];
+            if resolved.should_skip(vid) {
+                continue;
+            }
+            if let Some(merged) = resolved.get_merged(vid) {
+                if !merged.is_empty() {
+                    let synthetic = GraphNode::new(
+                        NodeId::ROOT,
+                        ChangePosition::new(0),
+                        ChangePosition::new(merged.len() as u64),
+                    );
+                    let bytes = merged.to_vec();
+                    buffer
+                        .output_line(synthetic, |buf: &mut [u8]| -> Result<(), std::io::Error> {
+                            buf.copy_from_slice(&bytes);
+                            Ok(())
+                        })
+                        .map_err(OutputError::io)?;
+                }
+                continue;
+            }
+        }
+
+        // ── Normal (unresolved) path — same logic as output_graph_content ─
+        if is_cyclic {
+            conflict_id += 1;
+            buffer
+                .begin_cyclic_conflict(conflict_id)
+                .map_err(OutputError::io)?;
+        }
+
+        for (i, &vertex_id) in scc.iter().enumerate() {
+            // Skip vertices that belong to a *different* resolved SCC
+            // (shouldn't happen, but guard defensively).
+            if resolved.should_skip(vertex_id) {
+                continue;
+            }
+
+            let vertex_data = match graph.try_get_vertex(vertex_id) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let node = vertex_data.node;
+
+            // Handle zombie state transitions
+            let is_zombie = vertex_data.is_zombie();
+
+            if is_zombie && in_zombie.is_none() {
+                conflict_id += 1;
+                in_zombie = Some(conflict_id);
+
+                let hash = hash_fn(node.change);
+                let hashes: Vec<Hash> = hash.into_iter().collect();
+                let hashes_ref: Option<&[Hash]> = if hashes.is_empty() {
+                    None
+                } else {
+                    Some(&hashes)
+                };
+
+                buffer
+                    .begin_zombie_conflict(conflict_id, hashes_ref)
+                    .map_err(OutputError::io)?;
+            } else if !is_zombie {
+                if let Some(zombie_id) = in_zombie.take() {
+                    buffer
+                        .end_zombie_conflict(zombie_id)
+                        .map_err(OutputError::io)?;
+                }
+            }
+
+            if is_cyclic && i > 0 {
+                let hash = hash_fn(node.change);
+                let hashes: Vec<Hash> = hash.into_iter().collect();
+                let hashes_ref: Option<&[Hash]> = if hashes.is_empty() {
+                    None
+                } else {
+                    Some(&hashes)
+                };
+
+                buffer
+                    .conflict_next(conflict_id, hashes_ref)
+                    .map_err(OutputError::io)?;
+            }
+
+            let vertex_len = node.end.get() - node.start.get();
+            if vertex_len == 0 {
+                continue;
+            }
+
+            let get_contents = |buf: &mut [u8]| -> Result<(), std::io::Error> {
+                changes
+                    .get_contents(&hash_fn, node, buf)
+                    .map(|_| ())
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            };
+
+            buffer
+                .output_line(node, get_contents)
+                .map_err(OutputError::io)?;
+        }
+
+        if is_cyclic {
+            if let Some(zombie_id) = in_zombie.take() {
+                buffer
+                    .end_zombie_conflict(zombie_id)
+                    .map_err(OutputError::io)?;
+            }
+
+            buffer
+                .end_cyclic_conflict(conflict_id)
+                .map_err(OutputError::io)?;
+        }
+    }
+
     if let Some(zombie_id) = in_zombie {
         buffer
             .end_zombie_conflict(zombie_id)
@@ -649,5 +960,97 @@ mod tests {
             assert!(result.is_ok());
         }
         assert!(buffer.is_empty()); // Missing span produces no output
+    }
+
+    // ------------------------------------------------------------------------
+    // Fork-Resolved Output Tests
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_fork_resolved_output_writes_merged_skips_rest() {
+        let content_merged = b"merged result\n";
+
+        let vertex1 = make_vertex(1, 0, 5);
+        let vertex2 = make_vertex(2, 0, 5);
+
+        let mut graph = AliveGraph::new();
+        graph.push_vertex(AliveVertex::DUMMY);
+        graph.push_vertex(AliveVertex::new(vertex1));
+        graph.push_vertex(AliveVertex::new(vertex2));
+
+        // Two single-vertex SCCs (fork children, no cycle)
+        let order = OrderResult {
+            sccs: vec![vec![VertexId(1)], vec![VertexId(2)]],
+            conflict_tree: Default::default(),
+            cyclic_conflicts: 0,
+            forward_edges: Vec::new(),
+        };
+
+        // Simulate fork resolution
+        let mut resolved = ResolvedConflicts::new();
+        resolved.insert_merged(VertexId::new(1), content_merged.to_vec());
+        resolved.insert_skip(VertexId::new(2));
+
+        let changes = MemoryChangeStore::new();
+        let hash_fn = |_: NodeId| None;
+
+        let mut buffer = Vec::new();
+        {
+            let pos = Position::ROOT;
+            let mut writer = ConflictWriter::new(&mut buffer, "test.rs", pos);
+
+            let result = output_graph_content_resolved(
+                &changes,
+                hash_fn,
+                &graph,
+                &order,
+                &mut writer,
+                &resolved,
+            );
+            assert!(result.is_ok());
+        }
+        // Should contain only merged content, not the original vertices
+        assert_eq!(&buffer, content_merged);
+    }
+
+    #[test]
+    fn test_fork_resolved_empty_resolved_falls_through() {
+        // With an empty ResolvedConflicts, single-vertex SCCs output normally
+        let content = b"hello world";
+        let vertex1 = make_vertex(1, 0, content.len() as u64);
+
+        let graph = make_simple_graph(vertex1);
+        let order = make_simple_order();
+        let resolved = ResolvedConflicts::new();
+
+        let changes = MemoryChangeStore::new();
+        let change = make_change(content);
+        let hash = change.hash().unwrap();
+        changes.insert(hash, change);
+
+        let hash_fn = |id: NodeId| {
+            if id.get() == 1 {
+                Some(hash)
+            } else {
+                None
+            }
+        };
+
+        let mut buffer = Vec::new();
+        {
+            let pos = Position::ROOT;
+            let mut writer = ConflictWriter::new(&mut buffer, "test.rs", pos);
+
+            let result = output_graph_content_resolved(
+                &changes,
+                hash_fn,
+                &graph,
+                &order,
+                &mut writer,
+                &resolved,
+            );
+            assert!(result.is_ok());
+        }
+        assert_eq!(&buffer, content);
     }
 }

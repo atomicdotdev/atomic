@@ -387,8 +387,8 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
             message: "Repository not found on remote".to_string(),
             url: Some(url.to_string()),
         },
-        RemoteError::StackNotFound { stack } => CliError::RemoteError {
-            message: format!("Stack '{}' not found on remote", stack),
+        RemoteError::ViewNotFound { view } => CliError::RemoteError {
+            message: format!("View '{}' not found on remote", view),
             url: Some(url.to_string()),
         },
         RemoteError::ChangeNotFound { hash } => CliError::ChangeNotFound { hash },
@@ -603,8 +603,8 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_stack_not_found() {
-        let err = RemoteError::stack_not_found("main");
+    fn test_convert_view_not_found() {
+        let err = RemoteError::view_not_found("main");
         let cli_err = convert_remote_error(err, "http://example.com");
 
         match cli_err {

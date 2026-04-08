@@ -215,8 +215,8 @@ impl Command for Create {
                     message: format!("Invalid tag name '{}': {}", name, reason),
                 }
             }
-            atomic_repository::RepositoryError::StackNotFound { name } => {
-                CliError::StackNotFound { name }
+            atomic_repository::RepositoryError::ViewNotFound { name } => {
+                CliError::ViewNotFound { name }
             }
             other => CliError::Repository(other),
         })?;

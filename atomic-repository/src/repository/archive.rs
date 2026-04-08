@@ -42,11 +42,11 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let stack_name = options.stack.as_deref().unwrap_or(&self.current_stack);
+        let stack_name = options.stack.as_deref().unwrap_or(&self.current_view);
         let stack = txn
-            .get_stack(stack_name)
+            .get_view(stack_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
+            .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: stack_name.to_string(),
             })?;
 

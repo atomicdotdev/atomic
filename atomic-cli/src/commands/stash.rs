@@ -63,8 +63,8 @@
 //! ✓ Saved working copy to stash@{0}
 //! ✓ Working copy restored to clean state
 //!
-//! $ atomic stack switch feature/auth
-//! ✓ Switched to stack: feature/auth
+//! $ atomic view switch feature/auth
+//! ✓ Switched to view: feature/auth
 //!
 //! $ atomic stash pop
 //! ✓ Applied stash@{0} to working copy
@@ -282,14 +282,14 @@ impl Stash {
 
     /// List all stash stacks, sorted by creation time (newest first).
     fn list_stashes(&self, repo: &Repository) -> CliResult<Vec<StashEntry>> {
-        let stacks = repo.list_stacks().map_err(CliError::Repository)?;
+        let stacks = repo.list_views().map_err(CliError::Repository)?;
 
         let mut stashes: Vec<StashEntry> = stacks
             .into_iter()
             .filter(|name| name.starts_with(STASH_PREFIX))
             .filter_map(|name| {
                 // Parse stash metadata from stack info
-                let _info = repo.get_stack_info(&name).ok()?;
+                let _info = repo.get_view_info(&name).ok()?;
 
                 // Extract source stack and message from stack name or metadata
                 // Format: stash/auto_{timestamp} or stash/{source}_{timestamp}_{message}
@@ -400,8 +400,8 @@ impl Stash {
             return Ok(());
         }
 
-        // Get current stack for metadata
-        let source_stack = repo.current_stack().to_string();
+        // Get current view for metadata
+        let source_stack = repo.current_view().to_string();
 
         // Generate stash message
         let stash_message = message
@@ -423,8 +423,8 @@ impl Stash {
             STASH_PREFIX, safe_source, timestamp, safe_message
         );
 
-        // Create orphan stash stack
-        repo.create_stack(&stash_name)
+        // Create orphan stash view
+        repo.create_view(&stash_name)
             .map_err(CliError::Repository)?;
 
         // ── Save dirty files as raw bytes to a sidecar directory ────────
@@ -511,7 +511,7 @@ impl Stash {
 
         // Restore working copy to clean state (unless --keep)
         if !keep && !self.keep {
-            repo.output_working_copy().map_err(CliError::Repository)?;
+            repo.materialize().map_err(CliError::Repository)?;
             print_success("Working copy restored to clean state");
         }
 
@@ -525,8 +525,8 @@ impl Stash {
         // Apply the stash
         self.apply_stash(repo, &stash)?;
 
-        // Delete the stash stack
-        repo.delete_stack(&stash.stack_name)
+        // Delete the stash view
+        repo.delete_view(&stash.stack_name)
             .map_err(CliError::Repository)?;
 
         print_success(&format!("Dropped {}", stash.reference()));
@@ -630,9 +630,9 @@ impl Stash {
             format_timestamp_relative(&stash.created_at)
         );
 
-        // Get stack info
+        // Get view info
         let info = repo
-            .get_stack_info(&stash.stack_name)
+            .get_view_info(&stash.stack_name)
             .map_err(CliError::Repository)?;
 
         println!("  Changes: {}", info.change_count);
@@ -656,8 +656,8 @@ impl Stash {
             let _ = std::fs::remove_dir_all(&stash_dir);
         }
 
-        // Delete the stash stack
-        repo.delete_stack(&stash.stack_name)
+        // Delete the stash view
+        repo.delete_view(&stash.stack_name)
             .map_err(CliError::Repository)?;
 
         print_success(&format!("Dropped {}", stash.reference()));
@@ -691,7 +691,7 @@ impl Stash {
 
         let count = stashes.len();
         for stash in stashes {
-            repo.delete_stack(&stash.stack_name)
+            repo.delete_view(&stash.stack_name)
                 .map_err(CliError::Repository)?;
         }
 

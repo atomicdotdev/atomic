@@ -144,10 +144,10 @@ pub use tracking::{
 
 // Apply exports
 pub use apply::{
-    apply_change_to_graph, check_missing_dependencies, collect_all_dependencies,
-    compute_apply_order, filter_missing_in_stack, get_changes_up_to_seq, get_missing_changes,
-    get_stack_changes, order_changes_by_deps, ApplyError, ApplyOptions, ApplyOutcome, ApplyResult,
-    ApplyStats, CrossStackApplyOptions, CrossStackApplyOutcome,
+    check_missing_dependencies, collect_all_dependencies, compute_insert_order,
+    filter_missing_in_view, get_changes_up_to_seq, get_missing_changes, get_view_changes,
+    order_changes_by_deps, write_change_to_graph, CrossViewInsertOptions, CrossViewInsertOutcome,
+    InsertError, InsertOptions, InsertOutcome, InsertResult, InsertStats,
 };
 
 // History exports

@@ -48,8 +48,8 @@ echo "  Found $expected_commits commits on branch '$default_branch'"
 # Initialize atomic and import
 assert_success "atomic git import succeeds" atomic git import
 
-# Verify stack created (should use default branch name)
-assert_stack_exists "stack '$default_branch' created" "$default_branch"
+# Verify view created (should use default branch name)
+assert_view_exists "view '$default_branch' created" "$default_branch"
 
 # Verify change count matches
 assert_atomic_log_count "change count matches git commits ($expected_commits)" "$expected_commits"
@@ -112,7 +112,7 @@ assert_atomic_log_count "main has 2 commits" 2
 
 # Import feature branch
 assert_success "import feature branch" atomic git import --branch feature
-assert_stack_exists "feature stack created" "feature"
+assert_view_exists "feature view created" "feature"
 
 # ════════════════════════════════════════════════════════════════════════════
 # Section 5: Author/Message/Timestamp Preservation (Medium Repo)
@@ -320,10 +320,10 @@ git checkout "$initial_branch" --quiet
 atomic init >/dev/null 2>&1
 atomic git import --all-branches >/dev/null 2>&1
 
-# Verify all branches became stacks
-assert_stack_exists "${initial_branch} stack exists" "$initial_branch"
-assert_stack_exists "feature-a stack exists" "feature-a"
-assert_stack_exists "feature-b stack exists" "feature-b"
+# Verify all branches became views
+assert_view_exists "${initial_branch} view exists" "$initial_branch"
+assert_view_exists "feature-a view exists" "feature-a"
+assert_view_exists "feature-b view exists" "feature-b"
 
 # ════════════════════════════════════════════════════════════════════════════
 # Section 12: Merge Commit Handling

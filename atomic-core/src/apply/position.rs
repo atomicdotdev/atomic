@@ -28,8 +28,8 @@
 //! let found = txn.find_block(internal_pos)?;
 //! ```
 
-use crate::pristine::overlay::FindBlockMode;
-use crate::pristine::{GraphTxnT, MutTxnT, TreeTxnT};
+use crate::pristine::{GraphTxnT, TreeTxnT};
+
 use crate::types::{GraphNode, Hash, Inode, NodeId, Position};
 
 use super::error::LocalApplyError;
@@ -277,9 +277,8 @@ pub fn resolve_context_vertex<T: GraphTxnT>(
 /// vertex — everything up to the position for predecessors, or everything
 /// from the position onward for successors.
 ///
-/// This helper is shared by both `resolve_context_vertex` and
-/// `resolve_context_vertex_for_target` so the splitting logic has a
-/// single definition.
+/// This helper is used by `resolve_context_vertex` so the splitting
+/// logic has a single definition.
 #[inline]
 fn adjust_for_mid_span(
     found: GraphNode<NodeId>,
@@ -309,42 +308,6 @@ fn adjust_for_mid_span(
             found
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Overlay-aware context resolution for the apply pipeline
-// ---------------------------------------------------------------------------
-
-/// Resolve a context vertex using the overlay-aware vertex finder.
-///
-/// This is the apply-pipeline counterpart of [`resolve_context_vertex`].
-/// It delegates vertex lookup to `super::edge::resolve_vertex_for_target`,
-/// which consults STACK_GRAPH (via the shared `overlay::find_block_in_stack_graph`)
-/// before falling back to the global GRAPH.  For `ApplyTarget::Global` the
-/// behaviour is identical to the non-overlay version.
-///
-/// The mid-span adjustment logic is shared with `resolve_context_vertex`
-/// via `adjust_for_mid_span`, ensuring a single source of truth.
-pub fn resolve_context_vertex_for_target<T: MutTxnT>(
-    txn: &T,
-    pos: Position<NodeId>,
-    is_predecessor: bool,
-    target: &super::ApplyTarget,
-) -> Result<GraphNode<NodeId>, LocalApplyError> {
-    use super::edge::resolve_vertex_for_target;
-
-    if pos.change.is_root() {
-        return Ok(GraphNode::root());
-    }
-
-    let mode = if is_predecessor {
-        FindBlockMode::EndingAtPosition
-    } else {
-        FindBlockMode::ContainingPosition
-    };
-
-    let found = resolve_vertex_for_target(txn, pos, target, mode)?;
-    Ok(adjust_for_mid_span(found, pos, is_predecessor))
 }
 
 // Tests

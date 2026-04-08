@@ -25,7 +25,7 @@
 //! ```text
 //! $ atomic init
 //! Initialized empty Atomic repository in /home/user/project/.atomic
-//! Created stack: dev
+//! Created view: dev
 //!
 //! Next steps:
 //!   atomic add <files>      Add files to track
@@ -36,14 +36,14 @@
 //! ```text
 //! $ atomic init --stack main
 //! Initialized empty Atomic repository in /home/user/project/.atomic
-//! Created stack: main
+//! Created view: main
 //! ```
 //!
 //! Initialize a Rust project (creates appropriate .atomicignore):
 //! ```text
 //! $ atomic init --kind rust
 //! Initialized empty Atomic repository in /home/user/project/.atomic
-//! Created stack: dev
+//! Created view: dev
 //! Created .atomicignore for rust project
 //! ```
 
@@ -59,8 +59,8 @@ use crate::output::{print_hint, print_next_steps, print_success};
 
 // Constants
 
-/// Default stack name for new repositories.
-pub const DEFAULT_STACK_NAME: &str = "dev";
+/// Default view name for new repositories.
+pub const DEFAULT_VIEW_NAME: &str = "dev";
 
 // Project Kind Templates
 
@@ -283,10 +283,10 @@ pub struct Init {
 
     /// Name of the initial stack (defaults to "dev").
     ///
-    /// Atomic uses stacks instead of branches. The initial stack is where
-    /// you'll record your first changes. You can create more stacks later
-    /// with `atomic stack new`.
-    #[arg(long, short = 's', default_value = DEFAULT_STACK_NAME)]
+    /// Atomic uses views instead of branches. The initial view is where
+    /// you'll record your first changes. You can create more views later
+    /// with `atomic view create`.
+    #[arg(long, short = 's', default_value = DEFAULT_VIEW_NAME)]
     pub stack: String,
 
     /// Project kind for .atomicignore template.
@@ -312,7 +312,7 @@ impl Init {
     pub fn new() -> Self {
         Self {
             path: PathBuf::from("."),
-            stack: DEFAULT_STACK_NAME.to_string(),
+            stack: DEFAULT_VIEW_NAME.to_string(),
             kind: None,
         }
     }
@@ -321,7 +321,7 @@ impl Init {
     pub fn at_path<P: Into<PathBuf>>(path: P) -> Self {
         Self {
             path: path.into(),
-            stack: DEFAULT_STACK_NAME.to_string(),
+            stack: DEFAULT_VIEW_NAME.to_string(),
             kind: None,
         }
     }
@@ -395,7 +395,7 @@ impl Init {
     }
 
     /// Validate the stack name.
-    fn validate_stack_name(&self) -> CliResult<()> {
+    fn validate_view_name(&self) -> CliResult<()> {
         let name = &self.stack;
 
         if name.is_empty() {
@@ -453,7 +453,7 @@ impl Command for Init {
     /// - The repository cannot be created
     fn run(&self) -> CliResult<()> {
         // Validate inputs
-        self.validate_stack_name()?;
+        self.validate_view_name()?;
 
         // Resolve the target path
         let target_path = self.resolve_path()?;
@@ -481,15 +481,15 @@ impl Command for Init {
             }
         })?;
 
-        // Create the initial stack if it's different from the default
-        // Repository::init() already creates a "dev" stack by default
+        // Create the initial view if it's different from the default
+        // Repository::init() already creates a "dev" view by default
         if self.stack != atomic_repository::DEFAULT_STACK {
-            // Create the requested stack
-            repo.create_stack(&self.stack)
+            // Create the requested view
+            repo.create_view(&self.stack)
                 .map_err(CliError::Repository)?;
 
-            // Set it as the current stack
-            repo.set_current_stack(&self.stack)
+            // Set it as the current view
+            repo.set_current_view(&self.stack)
                 .map_err(CliError::Repository)?;
         }
 
@@ -498,7 +498,7 @@ impl Command for Init {
             "Initialized empty Atomic repository in {}",
             dot_dir.display()
         ));
-        println!("Created stack: {}", self.stack);
+        println!("Created view: {}", self.stack);
 
         // Create .atomicignore if kind specified
         if let Ok(true) = self.create_ignore_file(&target_path) {
@@ -534,7 +534,7 @@ mod tests {
     fn test_init_new() {
         let init = Init::new();
         assert_eq!(init.path, PathBuf::from("."));
-        assert_eq!(init.stack, DEFAULT_STACK_NAME);
+        assert_eq!(init.stack, DEFAULT_VIEW_NAME);
         assert!(init.kind.is_none());
     }
 
@@ -542,14 +542,14 @@ mod tests {
     fn test_init_default() {
         let init = Init::default();
         assert_eq!(init.path, PathBuf::from("."));
-        assert_eq!(init.stack, DEFAULT_STACK_NAME);
+        assert_eq!(init.stack, DEFAULT_VIEW_NAME);
     }
 
     #[test]
     fn test_init_at_path() {
         let init = Init::at_path("/some/path");
         assert_eq!(init.path, PathBuf::from("/some/path"));
-        assert_eq!(init.stack, DEFAULT_STACK_NAME);
+        assert_eq!(init.stack, DEFAULT_VIEW_NAME);
     }
 
     #[test]
@@ -580,55 +580,55 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_validate_stack_name_valid() {
+    fn test_validate_view_name_valid() {
         let init = Init::new().with_stack("main");
-        assert!(init.validate_stack_name().is_ok());
+        assert!(init.validate_view_name().is_ok());
 
         let init = Init::new().with_stack("feature-branch");
-        assert!(init.validate_stack_name().is_ok());
+        assert!(init.validate_view_name().is_ok());
 
         let init = Init::new().with_stack("v1.0.0");
-        assert!(init.validate_stack_name().is_ok());
+        assert!(init.validate_view_name().is_ok());
     }
 
     #[test]
-    fn test_validate_stack_name_empty() {
+    fn test_validate_view_name_empty() {
         let init = Init::new().with_stack("");
-        let result = init.validate_stack_name();
+        let result = init.validate_view_name();
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, CliError::InvalidArgument { .. }));
     }
 
     #[test]
-    fn test_validate_stack_name_with_slash() {
+    fn test_validate_view_name_with_slash() {
         let init = Init::new().with_stack("feature/branch");
-        let result = init.validate_stack_name();
+        let result = init.validate_view_name();
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_validate_stack_name_with_backslash() {
+    fn test_validate_view_name_with_backslash() {
         let init = Init::new().with_stack("feature\\branch");
-        let result = init.validate_stack_name();
+        let result = init.validate_view_name();
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_validate_stack_name_starts_with_dot() {
+    fn test_validate_view_name_starts_with_dot() {
         let init = Init::new().with_stack(".hidden");
-        let result = init.validate_stack_name();
+        let result = init.validate_view_name();
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_validate_stack_name_with_whitespace() {
+    fn test_validate_view_name_with_whitespace() {
         let init = Init::new().with_stack("my stack");
-        let result = init.validate_stack_name();
+        let result = init.validate_view_name();
         assert!(result.is_err());
 
         let init = Init::new().with_stack("my\tstack");
-        let result = init.validate_stack_name();
+        let result = init.validate_view_name();
         assert!(result.is_err());
     }
 
@@ -935,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn test_default_stack_name_constant() {
-        assert_eq!(DEFAULT_STACK_NAME, "dev");
+    fn test_default_view_name_constant() {
+        assert_eq!(DEFAULT_VIEW_NAME, "dev");
     }
 }

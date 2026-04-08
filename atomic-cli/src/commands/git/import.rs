@@ -294,15 +294,15 @@ impl Command for Import {
             for branch_name in branches {
                 // Ensure the stack exists
                 if !repo
-                    .stack_exists(&branch_name)
+                    .view_exists(&branch_name)
                     .map_err(|e| CliError::Internal(e.into()))?
                 {
-                    repo.create_stack(&branch_name)
+                    repo.create_view(&branch_name)
                         .map_err(|e| CliError::Internal(e.into()))?;
                 }
 
-                // Switch to the stack
-                repo.set_current_stack(&branch_name)
+                // Switch to the view
+                repo.set_current_view(&branch_name)
                     .map_err(|e| CliError::Internal(e.into()))?;
 
                 // Import the branch
@@ -328,15 +328,15 @@ impl Command for Import {
 
             // Ensure the stack exists with the branch name
             if !repo
-                .stack_exists(&branch_name)
+                .view_exists(&branch_name)
                 .map_err(|e| CliError::Internal(e.into()))?
             {
-                repo.create_stack(&branch_name)
+                repo.create_view(&branch_name)
                     .map_err(|e| CliError::Internal(e.into()))?;
             }
 
-            // Switch to the stack
-            repo.set_current_stack(&branch_name)
+            // Switch to the view
+            repo.set_current_view(&branch_name)
                 .map_err(|e| CliError::Internal(e.into()))?;
 
             // Import
