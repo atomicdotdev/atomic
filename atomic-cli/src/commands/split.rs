@@ -283,7 +283,7 @@ mod tests {
         assert!(validate_view_name("feature").is_ok());
         assert!(validate_view_name("feature-auth").is_ok());
         assert!(validate_view_name("release-1.0.0").is_ok());
-        assert!(validate_view_name("my_view").is_ok());
+        assert!(validate_view_name("my_stack").is_ok());
     }
 
     #[test]

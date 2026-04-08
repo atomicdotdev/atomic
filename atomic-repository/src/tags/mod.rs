@@ -18,11 +18,11 @@ pub use types::{
     matches_pattern, validate_tag_name, Tag, TagError, TagFilter, TagOptions, TagResult, TagSort,
 };
 
+use std::path::{Path, PathBuf};
+
 // Backward-compatible aliases
 pub use queries::list_tag_views as list_tag_stacks;
 pub use queries::load_tag_any_view as load_tag_any_stack;
-
-use std::path::{Path, PathBuf};
 
 // ============================================================================
 // TAG FILE PATH HELPERS
@@ -44,7 +44,7 @@ pub fn view_tags_dir(tags_dir: &Path, view: &str) -> PathBuf {
     tags_dir.join(view)
 }
 
-/// Backward-compatible alias.
+/// Backward-compatible alias for [`view_tags_dir`].
 pub fn stack_tags_dir(tags_dir: &Path, view: &str) -> PathBuf {
     view_tags_dir(tags_dir, view)
 }

@@ -355,7 +355,7 @@ impl Push {
         );
 
         // If the target view is empty/new and differs from the default,
-        // check the default view to find a fork source. Views are filters
+        // check the default view to find a fork source. Views are perspectives
         // of the same graph — we can fork instead of re-uploading.
         let mut fork_source: Option<String> = None;
         let mut graph_hashes: HashSet<String> = HashSet::new();
@@ -431,7 +431,7 @@ impl Push {
 
         // If there's a fork source and changes to adopt, fork the view first.
         // This is a single server-side operation that copies the changelog —
-        // no data transfer, no per-change round trips. Views are filters.
+        // no data transfer, no per-change round trips. Views are perspectives.
         if let Some(ref source) = fork_source {
             if adopt_count > 0 {
                 let spinner = create_spinner(&format!(

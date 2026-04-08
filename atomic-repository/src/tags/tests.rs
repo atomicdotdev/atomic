@@ -1,3 +1,6 @@
+//! Tests for the tag management module.
+
+#[cfg(test)]
 mod tests {
     use crate::tags::{
         count_all_tags, count_tags, delete_tag, list_all_tags, list_tag_views, list_tags,
@@ -6,7 +9,7 @@ mod tests {
         TagSort,
     };
     use atomic_core::change::Author;
-    use atomic_core::types::Merkle;
+    use atomic_core::types::{Base32, Merkle};
     use chrono::DateTime;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;

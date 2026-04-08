@@ -201,7 +201,7 @@ pub struct StashEntry {
     /// Index of the stash (0 = most recent).
     pub index: usize,
     /// Name of the stash view.
-    pub stack_name: String,
+    pub view_name: String,
     /// View the stash was created from.
     pub source_view: String,
     /// Message describing the stash.
@@ -319,7 +319,7 @@ impl Stash {
 
                 Some(StashEntry {
                     index: 0, // Will be set after sorting
-                    stack_name: name,
+                    view_name: name,
                     source_view,
                     message,
                     created_at,
@@ -376,7 +376,7 @@ impl Stash {
 
         stashes
             .into_iter()
-            .find(|s| s.stack_name == full_name)
+            .find(|s| s.view_name == full_name)
             .ok_or_else(|| CliError::InvalidArgument {
                 message: format!("Stash '{}' not found", reference),
             })
@@ -503,7 +503,7 @@ impl Stash {
         let stashes = self.list_stashes(repo)?;
         let stash_ref = stashes
             .iter()
-            .find(|s| s.stack_name == stash_name)
+            .find(|s| s.view_name == stash_name)
             .map(|s| s.reference())
             .unwrap_or_else(|| "stash@{0}".to_string());
 
@@ -526,7 +526,7 @@ impl Stash {
         self.apply_stash(repo, &stash)?;
 
         // Delete the stash view
-        repo.delete_view(&stash.stack_name)
+        repo.delete_view(&stash.view_name)
             .map_err(CliError::Repository)?;
 
         print_success(&format!("Dropped {}", stash.reference()));
@@ -548,10 +548,10 @@ impl Stash {
     /// Apply a stash to the current working copy.
     ///
     /// Reads raw file bytes from the sidecar directory
-    /// (`.atomic/stashes/<stash_name>/`) and writes them to disk.
+    /// (`.atomic/stashes/<view_name>/`) and writes them to disk.
     /// This is a pure filesystem operation — no graph interaction.
     fn apply_stash(&self, repo: &mut Repository, stash: &StashEntry) -> CliResult<()> {
-        let stash_dir = repo.dot_dir().join("stashes").join(&stash.stack_name);
+        let stash_dir = repo.dot_dir().join("stashes").join(&stash.view_name);
         let manifest_path = stash_dir.join("MANIFEST");
 
         if !manifest_path.exists() {
@@ -632,7 +632,7 @@ impl Stash {
 
         // Get view info
         let info = repo
-            .get_view_info(&stash.stack_name)
+            .get_view_info(&stash.view_name)
             .map_err(CliError::Repository)?;
 
         println!("  Changes: {}", info.change_count);
@@ -651,13 +651,13 @@ impl Stash {
         let stash = self.parse_stash_ref(repo, stash_ref)?;
 
         // Delete the sidecar directory
-        let stash_dir = repo.dot_dir().join("stashes").join(&stash.stack_name);
+        let stash_dir = repo.dot_dir().join("stashes").join(&stash.view_name);
         if stash_dir.exists() {
             let _ = std::fs::remove_dir_all(&stash_dir);
         }
 
         // Delete the stash view
-        repo.delete_view(&stash.stack_name)
+        repo.delete_view(&stash.view_name)
             .map_err(CliError::Repository)?;
 
         print_success(&format!("Dropped {}", stash.reference()));
@@ -691,7 +691,7 @@ impl Stash {
 
         let count = stashes.len();
         for stash in stashes {
-            repo.delete_view(&stash.stack_name)
+            repo.delete_view(&stash.view_name)
                 .map_err(CliError::Repository)?;
         }
 
@@ -796,7 +796,7 @@ mod tests {
     fn test_stash_entry_reference() {
         let entry = StashEntry {
             index: 0,
-            stack_name: "stash/test".to_string(),
+            view_name: "stash/test".to_string(),
             source_view: "dev".to_string(),
             message: "WIP".to_string(),
             created_at: Utc::now(),
@@ -809,7 +809,7 @@ mod tests {
     fn test_stash_entry_reference_nonzero() {
         let entry = StashEntry {
             index: 3,
-            stack_name: "stash/test".to_string(),
+            view_name: "stash/test".to_string(),
             source_view: "dev".to_string(),
             message: "WIP".to_string(),
             created_at: Utc::now(),
@@ -822,7 +822,7 @@ mod tests {
     fn test_stash_entry_display() {
         let entry = StashEntry {
             index: 0,
-            stack_name: "stash/test".to_string(),
+            view_name: "stash/test".to_string(),
             source_view: "feature".to_string(),
             message: "Work in progress".to_string(),
             created_at: Utc::now(),

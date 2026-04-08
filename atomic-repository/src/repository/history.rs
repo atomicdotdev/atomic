@@ -129,7 +129,7 @@ impl Repository {
 
     /// Unrecord a change from the current view.
     ///
-    /// This removes the change from the view without deleting the change
+    /// This removes the change from the view's change log without deleting the change
     /// itself. The change remains in the change store and graph, and can be
     /// re-applied later. This is similar to Gerrit's workflow where a patch can
     /// be removed from a change set, modified, and re-inserted.

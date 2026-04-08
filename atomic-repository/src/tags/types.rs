@@ -71,6 +71,7 @@ pub struct Tag {
     /// The human-readable name of the tag.
     pub name: String,
     /// The view this tag belongs to.
+    #[serde(alias = "stack")]
     pub view: String,
     /// The sequence number in the view when tagged.
     pub sequence: u64,
@@ -135,6 +136,16 @@ impl Tag {
     /// Check if this is a lightweight tag.
     pub fn is_lightweight(&self) -> bool {
         !self.annotated
+    }
+
+    /// Get the view this tag belongs to.
+    pub fn view(&self) -> &str {
+        &self.view
+    }
+
+    /// Backward-compatible alias for [`view()`](Self::view).
+    pub fn stack(&self) -> &str {
+        self.view()
     }
 
     /// Get the tag message if present.
@@ -224,6 +235,11 @@ impl TagOptions {
         self
     }
 
+    /// Backward-compatible alias for [`view()`](Self::view).
+    pub fn stack(self, name: impl Into<String>) -> Self {
+        self.view(name)
+    }
+
     /// Set a specific sequence to tag.
     pub fn sequence(mut self, seq: u64) -> Self {
         self.sequence = Some(seq);
@@ -278,6 +294,11 @@ impl TagFilter {
     pub fn view(mut self, name: impl Into<String>) -> Self {
         self.view = Some(name.into());
         self
+    }
+
+    /// Backward-compatible alias for [`view()`](Self::view).
+    pub fn stack(self, name: impl Into<String>) -> Self {
+        self.view(name)
     }
 
     /// Filter by name pattern.

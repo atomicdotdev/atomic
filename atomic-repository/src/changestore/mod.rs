@@ -109,7 +109,6 @@ pub use error::{ChangeStoreError, ChangeStoreResult};
 mod cache;
 pub(crate) use cache::LruCache;
 
-/// File-system backed change store with LRU caching.
 pub struct ChangeStore {
     /// Path to the changes directory (`.atomic/changes/`)
     pub(crate) changes_dir: PathBuf,

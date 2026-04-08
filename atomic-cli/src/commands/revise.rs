@@ -292,22 +292,22 @@ impl Revise {
         let change_ref = self.parse_reference();
 
         // Get current view info
-        let view_name = repo.current_view();
-        let view_info = repo
-            .get_view_info(view_name)
+        let stack_name = repo.current_view();
+        let stack_info = repo
+            .get_view_info(stack_name)
             .map_err(CliError::Repository)?;
 
-        if view_info.change_count == 0 {
+        if stack_info.change_count == 0 {
             return Err(CliError::Internal(anyhow::anyhow!(
                 "Cannot revise: view '{}' is empty",
-                view_info.name
+                stack_info.name
             )));
         }
 
         // Resolve reference to sequence number
         let sequence = match &change_ref {
             ChangeRef::Last | ChangeRef::Relative(_) => change_ref
-                .resolve(view_info.change_count)
+                .resolve(stack_info.change_count)
                 .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?,
             ChangeRef::Hash(hash_str) => {
                 // Find the change by hash prefix
@@ -455,11 +455,11 @@ impl Revise {
         sequence: u64,
         entry: &HistoryEntry,
     ) -> CliResult<()> {
-        let view_name = repo.current_view();
-        let view_info = repo
-            .get_view_info(view_name)
+        let stack_name = repo.current_view();
+        let stack_info = repo
+            .get_view_info(stack_name)
             .map_err(CliError::Repository)?;
-        let changes_to_unrecord = view_info.change_count - sequence;
+        let changes_to_unrecord = stack_info.change_count - sequence;
 
         println!(
             "Would revise change {} (sequence #{})",
@@ -523,9 +523,9 @@ impl Revise {
         sequence: u64,
         entry: &HistoryEntry,
     ) -> CliResult<Hash> {
-        let view_name = repo.current_view();
-        let view_info = repo
-            .get_view_info(view_name)
+        let stack_name = repo.current_view();
+        let stack_info = repo
+            .get_view_info(stack_name)
             .map_err(CliError::Repository)?;
 
         // Load the original change to get its message
@@ -536,7 +536,7 @@ impl Revise {
         let original_message = original_change.hashed.header.message.clone();
 
         // Determine how many changes need to be unrecorded
-        let changes_to_unrecord = view_info.change_count - sequence;
+        let changes_to_unrecord = stack_info.change_count - sequence;
 
         // Collect changes that will need to be re-applied (everything after target)
         let mut pending_changes: Vec<Hash> = Vec::new();
@@ -857,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn test_change_ref_resolve_last_empty_stack() {
+    fn test_change_ref_resolve_last_empty_view() {
         assert!(ChangeRef::Last.resolve(0).is_err());
     }
 

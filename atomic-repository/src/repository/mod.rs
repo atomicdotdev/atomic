@@ -113,7 +113,7 @@ pub const DOT_DIR: &str = ".atomic";
 /// The default view name
 pub const DEFAULT_VIEW: &str = "dev";
 
-/// Backward-compatible alias.
+/// Backward-compatible alias for [`DEFAULT_VIEW`].
 pub const DEFAULT_STACK: &str = DEFAULT_VIEW;
 
 /// Subdirectory inside `.atomic/` that holds per-view workspace state.

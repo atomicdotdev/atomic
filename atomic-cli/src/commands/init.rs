@@ -14,7 +14,7 @@
 //!   [PATH]  Path to initialize (defaults to current directory)
 //!
 //! Options:
-//!   -v, --view <NAME>   Name of the initial view (defaults to "dev")
+//!   -s, --view <NAME>   Name of the initial view (defaults to "dev")
 //!   -k, --kind <KIND>   Project kind for .atomicignore template
 //!   -h, --help          Print help information
 //! ```
@@ -286,7 +286,7 @@ pub struct Init {
     /// Atomic uses views instead of branches. The initial view is where
     /// you'll record your first changes. You can create more views later
     /// with `atomic view create`.
-    #[arg(long = "view", short = 'v', default_value = DEFAULT_VIEW_NAME)]
+    #[arg(long, short = 's', default_value = DEFAULT_VIEW_NAME)]
     pub view: String,
 
     /// Project kind for .atomicignore template.
@@ -483,7 +483,7 @@ impl Command for Init {
 
         // Create the initial view if it's different from the default
         // Repository::init() already creates a "dev" view by default
-        if self.view != atomic_repository::DEFAULT_STACK {
+        if self.view != atomic_repository::DEFAULT_VIEW {
             // Create the requested view
             repo.create_view(&self.view).map_err(CliError::Repository)?;
 

@@ -1,7 +1,7 @@
 //! Recording changes from the working copy.
 //!
 //! This module provides the high-level interface for recording changes from
-//! the working copy into serializable [`Change`](atomic_core::change::Change) objects that can be applied
+//! the working copy into serializable `Change` objects that can be applied
 //! to other repositories.
 //!
 //! # Overview
