@@ -43,40 +43,40 @@ impl Repository {
     /// }
     /// ```
     pub fn status(&self, options: StatusOptions) -> Result<RepositoryStatus, RepositoryError> {
-        // Get the current stack state
+        // Get the current view state
         let txn = self
             .pristine
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let stack_state = txn
-            .get_stack(&self.current_stack)
+        let view_state = txn
+            .get_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
             .map(|s| s.state);
 
-        let mut status = RepositoryStatus::new(self.current_stack.clone(), stack_state);
+        let mut status = RepositoryStatus::new(self.current_view.clone(), view_state);
 
-        // ── Stack-aware filtering ──────────────────────────────────────
-        // Collect every change NodeId that belongs to the current stack,
+        // ── View-aware filtering ───────────────────────────────────────
+        // Collect every change NodeId that belongs to the current view,
         // PLUS all of their transitive dependencies (via the DEPS table).
         //
-        // Why dependencies?  After a content revise, the stack log has A'
+        // Why dependencies?  After a content revise, the view log has A'
         // (the revised change) but NOT A (the original).  A' depends on A
         // because its hunks reference A's graph vertices.  The INODES
         // position for the file still points to A's NodeId (which created
         // the inode vertex).  Without including dependencies, the status
-        // stack filter would see A's NodeId as "not on this stack" and
+        // view filter would see A's NodeId as "not on this view" and
         // hide the file — even though A' (which superseded A) IS on the
-        // stack.
-        let current_stack_change_ids: HashSet<NodeId> = if let Some(ref stack) = txn
-            .get_stack(&self.current_stack)
+        // view.
+        let current_view_change_ids: HashSet<NodeId> = if let Some(ref view) = txn
+            .get_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
-            let mut ids = collect_stack_change_ids(&txn, stack)?;
+            let mut ids = collect_view_change_ids(&txn, view)?;
 
             // Expand with dependencies from change FILES (not the DEPS
             // table, which is for attestations).  After a content revise,
-            // the stack has A' but not A.  A' depends on A (its hunks
+            // the view has A' but not A.  A' depends on A (its hunks
             // reference A's vertices).  Without including A's NodeId,
             // the status filter would hide files introduced by A.
             let direct_ids: Vec<NodeId> = ids.iter().copied().collect();
@@ -117,10 +117,10 @@ impl Repository {
         // Build a set of tracked paths for quick lookup
         // We also normalize paths to handle any incorrectly stored absolute paths.
         //
-        // Stack-aware filtering: a file that has been recorded (has an
+        // View-aware filtering: a file that has been recorded (has an
         // INODES position) but whose creating change is NOT on the current
-        // stack is excluded from tracked_paths.  This prevents files
-        // recorded on other stacks from appearing in status.  Files that
+        // view is excluded from tracked_paths.  This prevents files
+        // recorded on other views from appearing in status.  Files that
         // have been `add`ed but not yet recorded (no INODES position) are
         // kept — they are pending working-copy state.
         let mut tracked_paths: std::collections::HashSet<PathBuf> =
@@ -129,19 +129,18 @@ impl Repository {
         for result in tracked_files {
             let (path, inode) = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-            // ── Stack filter ───────────────────────────────────────────
+            // ── View filter ────────────────────────────────────────────
             // If this file has been recorded (has INODES position), check
-            // whether the creating change is on the current stack.  If
-            // not, skip it entirely — it belongs to another stack.
+            // whether the creating change is on the current view.  If
+            // not, skip it entirely — it belongs to another view.
             if let Ok(Some(position)) = txn.inode_position(inode) {
-                if !position.change.is_root()
-                    && !current_stack_change_ids.contains(&position.change)
+                if !position.change.is_root() && !current_view_change_ids.contains(&position.change)
                 {
-                    // File is recorded on a different stack — invisible here
+                    // File is recorded on a different view — invisible here
                     continue;
                 }
             }
-            // Files with no INODES position (added, not recorded) pass through.
+            // Files with no INODES position (added, not yet recorded) pass through.
 
             let path_buf = PathBuf::from(&path);
 
@@ -210,13 +209,13 @@ impl Repository {
             };
 
             // Use the original path for database lookup since that's what's stored.
-            // Apply the same stack-awareness filter here: skip inodes whose
-            // creating change is not on the current stack.
+            // Apply the same view-awareness filter here: skip inodes whose
+            // creating change is not on the current view.
             if let Ok(Some(inode)) = txn.get_inode(&original_path) {
-                // Stack filter (mirrors the tracked_paths filter above)
+                // View filter (mirrors the tracked_paths filter above)
                 if let Ok(Some(position)) = txn.inode_position(inode) {
                     if !position.change.is_root()
-                        && !current_stack_change_ids.contains(&position.change)
+                        && !current_view_change_ids.contains(&position.change)
                     {
                         continue;
                     }
@@ -322,11 +321,9 @@ impl Repository {
                                 // If file has graph content, compare with recorded content
                                 if has_graph_content {
                                     // Retrieve the recorded content from the graph and hash it.
-                                    // Use get_file_content_via_overlay so that local workspaces
-                                    // see their parent chain's content via the overlay model.
-                                    match self
-                                        .get_file_content_via_overlay(path, &self.current_stack)
-                                    {
+                                    // Use get_file_content which builds a change filter
+                                    // so that the view's content is correctly scoped.
+                                    match self.get_file_content(path) {
                                         Ok(Some(recorded_content)) => {
                                             let recorded_hash = Hash::of(&recorded_content);
                                             if current_hash != recorded_hash {

@@ -101,7 +101,7 @@ pub enum LocalApplyError {
         hash: Hash,
     },
 
-    /// The change has already been applied to this stack.
+    /// The change has already been applied to this view.
     ///
     /// Applying the same change twice is not allowed and would corrupt
     /// the graph state.
@@ -109,42 +109,42 @@ pub enum LocalApplyError {
     /// # Fields
     ///
     /// * `hash` - The hash of the already-applied change
-    #[error("Change already applied to stack: {hash}")]
+    #[error("Change already applied to view: {hash}")]
     ChangeAlreadyApplied {
-        /// The hash of the change that's already on the stack
+        /// The hash of the change that's already on the view
         hash: Hash,
     },
 
-    /// A tag has already been applied to this stack.
+    /// A tag has already been applied to this view.
     ///
-    /// Tags, like changes, can only be applied once per stack.
+    /// Tags, like changes, can only be applied once per view.
     ///
     /// # Fields
     ///
     /// * `hash` - The hash of the already-applied tag
-    #[error("Tag already applied to stack: {hash}")]
+    #[error("Tag already applied to view: {hash}")]
     TagAlreadyApplied {
-        /// The hash of the tag that's already on the stack
+        /// The hash of the tag that's already on the view
         hash: Hash,
     },
 
-    /// Tag state doesn't match the expected stack state.
+    /// Tag state doesn't match the expected view state.
     ///
-    /// Tags are associated with a specific Merkle state. If the stack's
+    /// Tags are associated with a specific Merkle state. If the view's
     /// current state doesn't match, the tag cannot be applied.
     ///
     /// # Fields
     ///
     /// * `tag_hash` - The hash of the tag
     /// * `expected_state` - The Merkle state the tag expects
-    /// * `actual_state` - The stack's current Merkle state
+    /// * `actual_state` - The view's current Merkle state
     #[error("Tag state mismatch for {tag_hash}: expected {expected_state}, got {actual_state}")]
     TagStateMismatch {
         /// The hash of the tag being applied
         tag_hash: Hash,
         /// The Merkle state the tag was created for
         expected_state: Merkle,
-        /// The current state of the stack
+        /// The current state of the view
         actual_state: Merkle,
     },
 
@@ -297,7 +297,7 @@ impl LocalApplyError {
     ///
     /// * `tag_hash` - The hash of the tag
     /// * `expected_state` - The expected Merkle state
-    /// * `actual_state` - The actual stack state
+    /// * `actual_state` - The actual view state
     pub fn tag_state_mismatch(
         tag_hash: Hash,
         expected_state: Merkle,
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn storage_errors_are_pristine_or_io() {
-        let pristine: ApplyError = PristineError::StackNotFound {
+        let pristine: ApplyError = PristineError::ViewNotFound {
             name: "gone".into(),
         }
         .into();

@@ -42,15 +42,15 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let stack_name = options.stack.as_deref().unwrap_or(&self.current_stack);
-        let stack = txn
-            .get_stack(stack_name)
+        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
+        let view = txn
+            .get_view(view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: stack_name.to_string(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
             })?;
 
-        let state = options.state.unwrap_or(stack.state);
+        let state = options.state.unwrap_or(view.state);
 
         // Build manifest from tracked files
         let mut manifest = ArchiveManifest::new();

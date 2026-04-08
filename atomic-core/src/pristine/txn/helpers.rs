@@ -9,7 +9,7 @@ use crate::types::{
 };
 
 use crate::pristine::error::{PristineError, PristineResult};
-use crate::pristine::traits::{StackKind, StackState};
+use crate::pristine::traits::{ViewScope, ViewState};
 
 // Edge Serialization
 
@@ -45,21 +45,21 @@ pub fn deserialize_edge(bytes: &[u8; 24]) -> SerializedGraphEdge {
     SerializedGraphEdge::new(flag, dest, NodeId::new(introduced_by))
 }
 
-// Stack State Serialization
+// View State Serialization
 
 /// Sentinel value for "no parent" in serialized form.
 ///
-/// We use `u64::MAX` because stack IDs are allocated from an incrementing
-/// counter starting at 1, so `u64::MAX` will never be a valid stack ID.
+/// We use `u64::MAX` because view IDs are allocated from an incrementing
+/// counter starting at 1, so `u64::MAX` will never be a valid view ID.
 const NO_PARENT: u64 = u64::MAX;
 
-/// Serialize a StackState to bytes
+/// Serialize a ViewState to bytes
 ///
 /// Layout (v2): [id:8][name_len:4][name:var][merkle:32][change_count:8][kind:1][parent:8]
 ///
 /// The `kind` and `parent` fields are appended after the original layout,
 /// making v1 data readable with backward-compatible defaults (Shared, no parent).
-pub fn serialize_stack_state(state: &StackState) -> Vec<u8> {
+pub fn serialize_view_state(state: &ViewState) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(8 + 4 + state.name.len() + 32 + 8 + 1 + 8);
     // id: u64
     bytes.extend_from_slice(&state.id.to_le_bytes());
@@ -79,17 +79,17 @@ pub fn serialize_stack_state(state: &StackState) -> Vec<u8> {
     bytes
 }
 
-/// Deserialize bytes to a StackState
+/// Deserialize bytes to a ViewState
 ///
 /// Backward-compatible: if the v2 fields (`kind`, `parent`) are missing
 /// (i.e., the data was written by an older version), defaults to
-/// `StackKind::Shared` and `parent: None`.
-pub fn deserialize_stack_state(bytes: &[u8]) -> PristineResult<StackState> {
+/// `ViewScope::Shared` and `parent: None`.
+pub fn deserialize_view_state(bytes: &[u8]) -> PristineResult<ViewState> {
     const MIN_SIZE: usize = 8 + 4; // id + name_len
 
     if bytes.len() < MIN_SIZE {
         return Err(PristineError::Serialization {
-            message: "stack state too short".to_string(),
+            message: "view state too short".to_string(),
         });
     }
 
@@ -100,13 +100,13 @@ pub fn deserialize_stack_state(bytes: &[u8]) -> PristineResult<StackState> {
     let v1_size = 12 + name_len + 32 + 8;
     if bytes.len() < v1_size {
         return Err(PristineError::Serialization {
-            message: "stack state truncated".to_string(),
+            message: "view state truncated".to_string(),
         });
     }
 
     let name = String::from_utf8(bytes[12..12 + name_len].to_vec()).map_err(|_| {
         PristineError::Serialization {
-            message: "invalid stack name encoding".to_string(),
+            message: "invalid view name encoding".to_string(),
         }
     })?;
 
@@ -124,8 +124,8 @@ pub fn deserialize_stack_state(bytes: &[u8]) -> PristineResult<StackState> {
     let v2_size = v1_size + 1 + 8;
     let (kind, parent) = if bytes.len() >= v2_size {
         let kind_byte = bytes[v1_size];
-        let kind = StackKind::from_u8(kind_byte).ok_or_else(|| PristineError::Serialization {
-            message: format!("invalid stack kind: {}", kind_byte),
+        let kind = ViewScope::from_u8(kind_byte).ok_or_else(|| PristineError::Serialization {
+            message: format!("invalid view kind: {}", kind_byte),
         })?;
 
         let parent_val = u64::from_le_bytes(bytes[v1_size + 1..v1_size + 9].try_into().unwrap());
@@ -138,10 +138,10 @@ pub fn deserialize_stack_state(bytes: &[u8]) -> PristineResult<StackState> {
         (kind, parent)
     } else {
         // v1 data — default to Shared with no parent
-        (StackKind::Shared, None)
+        (ViewScope::Shared, None)
     };
 
-    Ok(StackState {
+    Ok(ViewState {
         id,
         name,
         state,
@@ -248,18 +248,18 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_deserialize_stack_state() {
-        let state = StackState {
+    fn test_serialize_deserialize_view_state() {
+        let state = ViewState {
             id: 42,
-            name: "test-stack".to_string(),
+            name: "test-view".to_string(),
             state: Hash::of(b"test state"),
             change_count: 100,
-            kind: StackKind::Shared,
+            kind: ViewScope::Shared,
             parent: None,
         };
 
-        let bytes = serialize_stack_state(&state);
-        let recovered = deserialize_stack_state(&bytes).unwrap();
+        let bytes = serialize_view_state(&state);
+        let recovered = deserialize_view_state(&bytes).unwrap();
 
         assert_eq!(state.id, recovered.id);
         assert_eq!(state.name, recovered.name);
@@ -270,20 +270,20 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_deserialize_isolated_with_parent() {
-        let state = StackState {
+    fn test_serialize_deserialize_draft_with_parent() {
+        let state = ViewState {
             id: 5,
             name: "feature-login".to_string(),
             state: Hash::of(b"some state"),
             change_count: 7,
-            kind: StackKind::Local,
+            kind: ViewScope::Draft,
             parent: Some(2),
         };
 
-        let bytes = serialize_stack_state(&state);
-        let recovered = deserialize_stack_state(&bytes).unwrap();
+        let bytes = serialize_view_state(&state);
+        let recovered = deserialize_view_state(&bytes).unwrap();
 
-        assert_eq!(recovered.kind, StackKind::Local);
+        assert_eq!(recovered.kind, ViewScope::Draft);
         assert_eq!(recovered.parent, Some(2));
         assert_eq!(recovered.name, "feature-login");
         assert_eq!(recovered.change_count, 7);
@@ -295,85 +295,85 @@ mod tests {
         // Without the kind and parent fields
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&42u64.to_le_bytes()); // id
-        let name = "old-stack";
+        let name = "old-view";
         bytes.extend_from_slice(&(name.len() as u32).to_le_bytes()); // name_len
         bytes.extend_from_slice(name.as_bytes()); // name
         bytes.extend_from_slice(&[0u8; 32]); // merkle (zero)
         bytes.extend_from_slice(&10u64.to_le_bytes()); // change_count
 
-        let recovered = deserialize_stack_state(&bytes).unwrap();
+        let recovered = deserialize_view_state(&bytes).unwrap();
 
         assert_eq!(recovered.id, 42);
-        assert_eq!(recovered.name, "old-stack");
+        assert_eq!(recovered.name, "old-view");
         assert_eq!(recovered.change_count, 10);
         // v1 data defaults to Shared + no parent
-        assert_eq!(recovered.kind, StackKind::Shared);
+        assert_eq!(recovered.kind, ViewScope::Shared);
         assert_eq!(recovered.parent, None);
     }
 
     #[test]
-    fn test_stack_state_empty_name() {
-        let state = StackState {
+    fn test_view_state_empty_name() {
+        let state = ViewState {
             id: 1,
             name: String::new(),
             state: Merkle::ZERO,
             change_count: 0,
-            kind: StackKind::Shared,
+            kind: ViewScope::Shared,
             parent: None,
         };
 
-        let bytes = serialize_stack_state(&state);
-        let recovered = deserialize_stack_state(&bytes).unwrap();
+        let bytes = serialize_view_state(&state);
+        let recovered = deserialize_view_state(&bytes).unwrap();
 
         assert_eq!(state.name, recovered.name);
     }
 
     #[test]
-    fn test_stack_state_unicode_name() {
-        let state = StackState {
+    fn test_view_state_unicode_name() {
+        let state = ViewState {
             id: 1,
-            name: "スタック-日本語".to_string(),
+            name: "ビュー-日本語".to_string(),
             state: Merkle::ZERO,
             change_count: 0,
-            kind: StackKind::Local,
+            kind: ViewScope::Draft,
             parent: Some(99),
         };
 
-        let bytes = serialize_stack_state(&state);
-        let recovered = deserialize_stack_state(&bytes).unwrap();
+        let bytes = serialize_view_state(&state);
+        let recovered = deserialize_view_state(&bytes).unwrap();
 
         assert_eq!(state.name, recovered.name);
-        assert_eq!(recovered.kind, StackKind::Local);
+        assert_eq!(recovered.kind, ViewScope::Draft);
         assert_eq!(recovered.parent, Some(99));
     }
 
     #[test]
-    fn test_stack_state_too_short() {
+    fn test_view_state_too_short() {
         let bytes = [0u8; 4]; // Too short
-        let result = deserialize_stack_state(&bytes);
+        let result = deserialize_view_state(&bytes);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_stack_state_truncated() {
-        let state = StackState {
+    fn test_view_state_truncated() {
+        let state = ViewState {
             id: 1,
             name: "test".to_string(),
             state: Merkle::ZERO,
             change_count: 0,
-            kind: StackKind::Shared,
+            kind: ViewScope::Shared,
             parent: None,
         };
 
-        let bytes = serialize_stack_state(&state);
+        let bytes = serialize_view_state(&state);
         // Cut into the v1 portion (not just the v2 extension)
         let truncated = &bytes[..12];
-        let result = deserialize_stack_state(truncated);
+        let result = deserialize_view_state(truncated);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_stack_state_invalid_kind() {
+    fn test_view_state_invalid_kind() {
         // Build valid v2 bytes but with an invalid kind byte
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&1u64.to_le_bytes()); // id
@@ -385,7 +385,7 @@ mod tests {
         bytes.push(99); // invalid kind
         bytes.extend_from_slice(&u64::MAX.to_le_bytes()); // parent (none)
 
-        let result = deserialize_stack_state(&bytes);
+        let result = deserialize_view_state(&bytes);
         assert!(result.is_err());
     }
 

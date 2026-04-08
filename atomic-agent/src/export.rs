@@ -21,8 +21,8 @@
 //! ## VCS revision
 //!
 //! The `vcs` field is populated by opening the Atomic repository at `root` and
-//! reading the current stack's Merkle state via
-//! [`atomic_repository::Repository::get_stack_info`].  This gives a
+//! reading the current view's Merkle state via
+//! [`atomic_repository::Repository::get_view_info`].  This gives a
 //! content-addressed, tamper-evident revision that is native to the Atomic
 //! graph model.  Git is not consulted.
 //!
@@ -69,7 +69,7 @@ pub struct TraceRecord {
     /// ISO 8601 / RFC 3339 timestamp.
     pub timestamp: String,
 
-    /// VCS context (best-effort — absent if Atomic stack state is unavailable).
+    /// VCS context (best-effort — absent if Atomic view state is unavailable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vcs: Option<VcsInfo>,
 
@@ -91,10 +91,10 @@ pub struct VcsInfo {
     #[serde(rename = "type")]
     pub vcs_type: String,
 
-    /// Name of the Atomic stack that was current when the record was written.
-    pub stack: String,
+    /// Name of the Atomic view that was current when the record was written.
+    pub view: String,
 
-    /// Merkle state of the current stack (base32 Blake3 hash of the applied
+    /// Merkle state of the current view (base32 Blake3 hash of the applied
     /// change sequence) at the time the provenance graph was saved.
     pub revision: String,
 }
@@ -189,10 +189,10 @@ pub fn to_agent_trace_record(graph: &ProvenanceGraph, root: &Path) -> TraceRecor
     // Unique record ID: session + timestamp epoch
     let id = format!("{}-{}", graph.session_id, graph.timestamp);
 
-    // VCS: best-effort Atomic stack Merkle state
-    let vcs = atomic_revision(root).map(|(stack, revision)| VcsInfo {
+    // VCS: best-effort Atomic view Merkle state
+    let vcs = atomic_revision(root).map(|(view, revision)| VcsInfo {
         vcs_type: "atomic".to_string(),
-        stack,
+        view,
         revision,
     });
 
@@ -434,16 +434,16 @@ fn build_files_and_metadata(graph: &ProvenanceGraph) -> (Vec<FileEntry>, Value) 
     (files, dev_atomic)
 }
 
-/// Open the Atomic repository at `root` and return `(stack_name, merkle_base32)`
-/// for the current stack.
+/// Open the Atomic repository at `root` and return `(view_name, merkle_base32)`
+/// for the current view.
 ///
 /// Returns `None` if the directory is not an Atomic repository or any error
 /// occurs — callers treat absence of VCS info as non-fatal.
 fn atomic_revision(root: &Path) -> Option<(String, String)> {
     let repo = atomic_repository::Repository::open(root).ok()?;
-    let stack_name = repo.current_stack().to_string();
-    let info = repo.get_stack_info(&stack_name).ok()?;
-    Some((stack_name, info.state.to_base32()))
+    let view_name = repo.current_view().to_string();
+    let info = repo.get_view_info(&view_name).ok()?;
+    Some((view_name, info.state.to_base32()))
 }
 
 /// Inner fallible implementation of [`append_agent_trace`].

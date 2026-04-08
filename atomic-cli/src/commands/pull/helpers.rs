@@ -30,7 +30,7 @@ use atomic_repository::history::HistoryEntry;
 use atomic_repository::Repository;
 
 use crate::error::{CliError, CliResult};
-use crate::output::{hint, info, stack as style_stack};
+use crate::output::{hint, info, view as style_view};
 
 use super::types::PullChange;
 
@@ -253,8 +253,8 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
             message: "Repository not found on remote".to_string(),
             url: Some(url.to_string()),
         },
-        RemoteError::StackNotFound { stack } => CliError::RemoteError {
-            message: format!("Stack '{}' not found on remote", stack),
+        RemoteError::ViewNotFound { view } => CliError::RemoteError {
+            message: format!("View '{}' not found on remote", view),
             url: Some(url.to_string()),
         },
         RemoteError::ChangeNotFound { hash } => CliError::ChangeNotFound { hash },
@@ -286,8 +286,8 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
             message: format!("Request timed out after {} seconds", seconds),
             url: Some(url.to_string()),
         },
-        RemoteError::EmptyStack { stack } => CliError::RemoteError {
-            message: format!("Stack '{}' is empty", stack),
+        RemoteError::EmptyView { view } => CliError::RemoteError {
+            message: format!("View '{}' is empty", view),
             url: Some(url.to_string()),
         },
         _ => CliError::RemoteError {
@@ -306,9 +306,9 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
 ///
 /// # Arguments
 ///
-/// * `local_stack` - The name of the local stack
+/// * `local_view` - The name of the local view
 /// * `local_entries` - Local history entries
-/// * `remote_stack` - The name of the remote stack
+/// * `remote_view` - The name of the remote view
 /// * `remote_state` - The remote's current state response
 /// * `remote_entries` - The remote's changelist entries
 ///
@@ -319,9 +319,9 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
 ///   Local:  main at ABC123... (10 changes)
 /// ```
 pub fn display_state_comparison(
-    local_stack: &str,
+    local_view: &str,
     local_entries: &[HistoryEntry],
-    remote_stack: &str,
+    remote_view: &str,
     remote_state: &StateResponse,
     remote_entries: &[ChangelistEntry],
 ) {
@@ -331,13 +331,13 @@ pub fn display_state_comparison(
     println!(
         "  {}: {} {}",
         info("Remote"),
-        style_stack(remote_stack),
+        style_view(remote_view),
         remote_state_str
     );
     println!(
         "  {}: {} {}",
         info("Local"),
-        style_stack(local_stack),
+        style_view(local_view),
         local_state_str
     );
 }
@@ -690,15 +690,15 @@ mod tests {
         }
     }
 
-    /// Test converting stack not found error.
+    /// Test converting view not found error.
     #[test]
-    fn test_convert_stack_not_found() {
-        let err = RemoteError::stack_not_found("missing-stack");
+    fn test_convert_view_not_found() {
+        let err = RemoteError::view_not_found("missing-view");
         let cli_err = convert_remote_error(err, "http://example.com");
 
         match cli_err {
             CliError::RemoteError { message, .. } => {
-                assert!(message.contains("missing-stack"));
+                assert!(message.contains("missing-view"));
             }
             _ => panic!("Expected RemoteError"),
         }
@@ -741,10 +741,10 @@ mod tests {
         }
     }
 
-    /// Test converting empty stack error.
+    /// Test converting empty view error.
     #[test]
-    fn test_convert_empty_stack() {
-        let err = RemoteError::empty_stack("main");
+    fn test_convert_empty_view() {
+        let err = RemoteError::empty_view("main");
         let cli_err = convert_remote_error(err, "http://example.com");
 
         match cli_err {

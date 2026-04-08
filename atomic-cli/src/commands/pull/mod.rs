@@ -16,13 +16,13 @@
 //!
 //! The pull command performs the following workflow:
 //!
-//! 1. **Open local repository** and determine current stack
+//! 1. **Open local repository** and determine current view
 //! 2. **Load remote configuration** from repository settings
 //! 3. **Connect to remote** using HTTP client
 //! 4. **Query remote state** to determine what changes exist remotely
 //! 5. **Calculate delta** between remote and local changelists
 //! 6. **Download changes** in dependency order (dependencies first)
-//! 7. **Apply changes** to the local stack (unless download-only)
+//! 7. **Apply changes** to the local view (unless download-only)
 //! 8. **Download tags** for any tagged states
 //! 9. **Report results** to the user
 //!
@@ -123,7 +123,7 @@
 //! │         │  5. Store changes│                        │                  │
 //! │         ├─────────────────►│                        │                  │
 //! │         │                  │                        │                  │
-//! │         │  6. Apply to stack                        │                  │
+//! │         │  6. Apply to view                        │                  │
 //! │         ├───────────────────                        │                  │
 //! │         │                  │                        │                  │
 //! └─────────────────────────────────────────────────────────────────────────┘

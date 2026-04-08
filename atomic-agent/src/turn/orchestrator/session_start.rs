@@ -1,0 +1,199 @@
+//! Session start handling for the turn orchestrator.
+
+use crate::error::AgentResult;
+use crate::event::TurnEvent;
+use crate::turn::phase::{self, Action, Event, TransitionContext};
+use crate::turn::session::AgentSession;
+
+use super::{vendor_from_agent_name, DispatchResult, TurnOrchestrator};
+
+impl TurnOrchestrator {
+    /// Handle a SessionStart event.
+    ///
+    /// Creates a new session or re-enters an ended session. Creates the
+    /// agent's Atomic view if needed (view creation is deferred to first
+    /// recording since we don't want to create views for sessions that
+    /// never produce changes).
+    pub(super) async fn handle_session_start(
+        &mut self,
+        event: TurnEvent,
+    ) -> AgentResult<DispatchResult> {
+        let session_id = &event.session_id;
+
+        // Load or create session
+        let mut session = match self.session_store.load(session_id)? {
+            Some(mut existing) => {
+                // Re-entering an existing session
+                let result = phase::transition(
+                    existing.phase,
+                    Event::SessionStart,
+                    TransitionContext::default(),
+                );
+                let remaining = phase::apply_common_actions(&mut existing, &result);
+
+                // Handle strategy-specific actions
+                let mut warnings = Vec::new();
+                for action in &remaining {
+                    if let Action::WarnStaleSession = action {
+                        warnings.push(format!(
+                            "Session {} was already active — concurrent session detected",
+                            session_id
+                        ));
+                    }
+                }
+
+                self.session_store.save(&existing)?;
+
+                let mut dispatch = DispatchResult::new(session_id, existing.phase);
+                for w in warnings {
+                    dispatch = dispatch.with_warning(w);
+                }
+
+                return Ok(dispatch.with_message(format!(
+                    "Atomic is tracking session {} (resumed, {} turn{} so far)",
+                    session_id,
+                    existing.turn_count,
+                    if existing.turn_count == 1 { "" } else { "s" },
+                )));
+            }
+            None => {
+                // New session — use the agent identity set by the CLI hook handler
+                let mut session =
+                    AgentSession::new(session_id, &self.agent_name, &self.agent_display_name);
+
+                // Set vendor from agent name. Model comes from the event's
+                // raw_json (SessionStart sends it) — see below.
+                let vendor = vendor_from_agent_name(&self.agent_name);
+                session.agent_vendor = vendor.to_string();
+
+                session
+            }
+        };
+
+        // Set transcript path if provided
+        if let Some(ref path) = event.transcript_path {
+            session.set_transcript_path(path);
+        }
+
+        // Extract model and provider from SessionStart raw_json if present.
+        // Claude Code sends: {"model": "claude-sonnet-4-5-20250929", "source": "startup", ...}
+        // OpenCode sends:    {"model": "claude-opus-4-5", "provider": "anthropic", ...}
+        if let Some(ref raw) = event.raw_json {
+            if let Some(model) = raw.get("model").and_then(|v| v.as_str()) {
+                if !model.is_empty() {
+                    session.model = model.to_string();
+                }
+            }
+            if let Some(provider) = raw.get("provider").and_then(|v| v.as_str()) {
+                if !provider.is_empty() {
+                    session.agent_vendor = provider.to_string();
+                }
+            }
+        }
+
+        // Fork the agent view from the current view.
+        //
+        // This ensures the agent inherits all existing changes (e.g.,
+        // .atomicignore, project config, previously recorded code) instead
+        // of starting from an empty graph. Without this, files that only
+        // exist in the current view (like .atomicignore) would be invisible
+        // to the agent's status/record workflow.
+        //
+        // Best-effort: if the repo can't be opened or the view already
+        // exists (resumed session), we log and continue — recording will
+        // still work, it just won't have the parent's history.
+        if session.parent_view.is_none() {
+            match atomic_repository::Repository::open(&self.repo_root) {
+                Ok(mut repo) => {
+                    let current = repo.current_view().to_string();
+                    session.set_parent_view(&current);
+
+                    match repo.create_view_from(&session.view_name, &current) {
+                        Ok(()) => {
+                            log::info!(
+                                "Created agent view '{}' forked from '{}'",
+                                session.view_name,
+                                current,
+                            );
+                        }
+                        Err(e) => {
+                            // View may already exist (idempotent session start)
+                            // or the source view may not exist yet (fresh repo).
+                            // Either way, this is non-fatal.
+                            log::debug!(
+                                "Could not fork view '{}' from '{}': {} (non-fatal)",
+                                session.view_name,
+                                current,
+                                e,
+                            );
+                        }
+                    }
+
+                    // Switch to the agent view so that all file writes during
+                    // the session (tool calls, npm install, builds, etc.) happen
+                    // while current_view points to the agent view. This ensures
+                    // status/add/record see the right view. session-end will
+                    // switch back to the user's view.
+                    if let Err(e) = repo.set_current_view(&session.view_name) {
+                        log::warn!(
+                            "Could not switch to agent view '{}': {} (non-fatal)",
+                            session.view_name,
+                            e,
+                        );
+                    } else {
+                        log::info!("Switched to agent view '{}'", session.view_name,);
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Could not open repository to fork agent view: {} (non-fatal)",
+                        e,
+                    );
+                }
+            }
+        }
+
+        // Save the new session
+        self.session_store.save(&session)?;
+
+        let message = format!(
+            "Atomic is tracking this session. Each turn will be recorded as a change on view '{}'.",
+            session.view_name,
+        );
+
+        Ok(DispatchResult::new(session_id, session.phase).with_message(message))
+    }
+
+    /// Load an existing session or create a new one.
+    ///
+    /// This is the resilient path — if a hook arrives for an unknown session
+    /// (e.g., the session state was lost due to a crash), we create a new
+    /// session rather than failing.
+    pub(crate) fn load_or_create_session(
+        &self,
+        session_id: &str,
+        event: &TurnEvent,
+    ) -> AgentResult<AgentSession> {
+        match self.session_store.load(session_id)? {
+            Some(session) => Ok(session),
+            None => {
+                log::info!(
+                    "Creating session {} from {} event (no prior state found)",
+                    session_id,
+                    event.event_type,
+                );
+                let mut session =
+                    AgentSession::new(session_id, &self.agent_name, &self.agent_display_name);
+
+                let vendor = vendor_from_agent_name(&self.agent_name);
+                session.agent_vendor = vendor.to_string();
+
+                if let Some(ref path) = event.transcript_path {
+                    session.set_transcript_path(path);
+                }
+
+                Ok(session)
+            }
+        }
+    }
+}

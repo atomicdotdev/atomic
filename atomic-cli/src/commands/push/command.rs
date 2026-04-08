@@ -18,7 +18,7 @@ use crate::commands::{find_repository_root, format_hash, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{
     create_progress_bar, create_spinner, error, finish_error, finish_success, hash as style_hash,
-    hint, print_blank, print_hint, print_success, print_warning, stack as style_stack, success,
+    hint, print_blank, print_hint, print_success, print_warning, success, view as style_view,
 };
 
 use super::helpers::{
@@ -49,10 +49,10 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// remote is "origin", but you can specify any configured remote or
 /// provide a URL directly.
 ///
-/// # Stack Mapping
+/// # View Mapping
 ///
-/// By default, the local stack is pushed to a stack with the same name
-/// on the remote. Use `--to-stack` to push to a different remote stack.
+/// By default, the local view is pushed to a view with the same name
+/// on the remote. Use `--to-view` to push to a different remote view.
 ///
 /// # Examples
 ///
@@ -63,8 +63,8 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// # Push to a specific remote
 /// atomic push upstream
 ///
-/// # Push to a different stack
-/// atomic push --to-stack main
+/// # Push to a different view
+/// atomic push --to-view main
 ///
 /// # Preview what would be pushed
 /// atomic push --dry-run
@@ -82,17 +82,17 @@ pub struct Push {
     #[arg(default_value = DEFAULT_REMOTE)]
     pub remote: String,
 
-    /// Remote stack to push to.
+    /// Remote view to push to.
     ///
-    /// If not specified, uses the same name as the local stack.
-    #[arg(long = "to-stack")]
-    pub to_stack: Option<String>,
+    /// If not specified, uses the same name as the local view.
+    #[arg(long = "to-view")]
+    pub to_view: Option<String>,
 
-    /// Local stack to push from.
+    /// Local view to push from.
     ///
-    /// If not specified, uses the current stack.
-    #[arg(long = "from-stack")]
-    pub from_stack: Option<String>,
+    /// If not specified, uses the current view.
+    #[arg(long = "from-view")]
+    pub from_view: Option<String>,
 
     /// Show what would be pushed without actually pushing.
     ///
@@ -138,8 +138,8 @@ impl Push {
     pub fn new() -> Self {
         Self {
             remote: DEFAULT_REMOTE.to_string(),
-            to_stack: None,
-            from_stack: None,
+            to_view: None,
+            from_view: None,
             dry_run: false,
             force: false,
             all: false,
@@ -154,15 +154,15 @@ impl Push {
         self
     }
 
-    /// Builder: set the remote stack to push to.
-    pub fn with_to_stack(mut self, stack: impl Into<String>) -> Self {
-        self.to_stack = Some(stack.into());
+    /// Builder: set the remote view to push to.
+    pub fn with_to_view(mut self, view: impl Into<String>) -> Self {
+        self.to_view = Some(view.into());
         self
     }
 
-    /// Builder: set the local stack to push from.
-    pub fn with_from_stack(mut self, stack: impl Into<String>) -> Self {
-        self.from_stack = Some(stack.into());
+    /// Builder: set the local view to push from.
+    pub fn with_from_view(mut self, view: impl Into<String>) -> Self {
+        self.from_view = Some(view.into());
         self
     }
 
@@ -230,22 +230,22 @@ impl Push {
         }
     }
 
-    /// Get the local stack name to push from.
+    /// Get the local view name to push from.
     ///
-    /// Returns the explicitly specified stack or the repository's current stack.
-    fn get_local_stack(&self, repo: &Repository) -> String {
-        self.from_stack
+    /// Returns the explicitly specified view or the repository's current view.
+    fn get_local_view(&self, repo: &Repository) -> String {
+        self.from_view
             .clone()
-            .unwrap_or_else(|| repo.current_stack().to_string())
+            .unwrap_or_else(|| repo.current_view().to_string())
     }
 
-    /// Get the remote stack name to push to.
+    /// Get the remote view name to push to.
     ///
-    /// Returns the explicitly specified stack or the local stack name.
-    fn get_remote_stack(&self, local_stack: &str) -> String {
-        self.to_stack
+    /// Returns the explicitly specified view or the local view name.
+    fn get_remote_view(&self, local_view: &str) -> String {
+        self.to_view
             .clone()
-            .unwrap_or_else(|| local_stack.to_string())
+            .unwrap_or_else(|| local_view.to_string())
     }
 
     /// Build the HTTP remote configuration.
@@ -261,7 +261,7 @@ impl Push {
     fn display_dry_run(
         &self,
         remote_url: &str,
-        remote_stack: &str,
+        remote_view: &str,
         to_upload: &[PushChange],
     ) -> CliResult<()> {
         if to_upload.is_empty() {
@@ -270,10 +270,10 @@ impl Push {
         }
 
         println!(
-            "Would push {} to {} (stack: {}):",
+            "Would push {} to {} (view: {}):",
             format_count(to_upload.len(), "change"),
             self.remote,
-            remote_stack
+            remote_view
         );
         print_blank();
 
@@ -298,15 +298,15 @@ impl Push {
         // Resolve remote URL
         let remote_url = self.resolve_remote_url(&repo)?;
 
-        // Determine stacks
-        let local_stack = self.get_local_stack(&repo);
-        let remote_stack = self.get_remote_stack(&local_stack);
-        let default_remote_stack = "dev".to_string();
+        // Determine views
+        let local_view = self.get_local_view(&repo);
+        let remote_view = self.get_remote_view(&local_view);
+        let default_remote_view = "dev".to_string();
 
         // Print header
         println!(
             "Pushing to {} ({})",
-            style_stack(&self.remote),
+            style_view(&self.remote),
             hint(&remote_url)
         );
 
@@ -321,7 +321,7 @@ impl Push {
 
         // Query remote state
         let spinner = create_spinner("Querying remote state...");
-        let remote_state = remote.get_state(&remote_stack).await.map_err(|e| {
+        let remote_state = remote.get_state(&remote_view).await.map_err(|e| {
             finish_error(&spinner, "Failed to query state");
             convert_remote_error(e, &remote_url)
         })?;
@@ -337,11 +337,11 @@ impl Push {
             &format!("Loaded {} local changes", local_entries.len()),
         );
 
-        // Get remote changelist for the target stack
+        // Get remote changelist for the target view
         let spinner = create_spinner("Fetching remote changelist...");
         let remote_entries = if !remote_state.is_empty() {
             // Remote has changes - fetch the full changelist from position 0
-            remote.get_changelist(&remote_stack, 0).await.map_err(|e| {
+            remote.get_changelist(&remote_view, 0).await.map_err(|e| {
                 finish_error(&spinner, "Failed to fetch changelist");
                 convert_remote_error(e, &remote_url)
             })?
@@ -354,30 +354,30 @@ impl Push {
             &format!("Got {} remote changes", remote_entries.len()),
         );
 
-        // If the target stack is empty/new and differs from the default,
-        // check the default stack to find a fork source. Stacks are views
+        // If the target view is empty/new and differs from the default,
+        // check the default view to find a fork source. Views are filters
         // of the same graph — we can fork instead of re-uploading.
         let mut fork_source: Option<String> = None;
         let mut graph_hashes: HashSet<String> = HashSet::new();
 
-        if remote_entries.is_empty() && remote_stack != default_remote_stack {
-            let default_state = remote.get_state(&default_remote_stack).await;
+        if remote_entries.is_empty() && remote_view != default_remote_view {
+            let default_state = remote.get_state(&default_remote_view).await;
             if let Ok(ref state) = default_state {
                 if !state.is_empty() {
                     if let Ok(default_entries) =
-                        remote.get_changelist(&default_remote_stack, 0).await
+                        remote.get_changelist(&default_remote_view, 0).await
                     {
                         for entry in &default_entries {
                             graph_hashes.insert(entry.hash.clone());
                         }
                         if !default_entries.is_empty() {
-                            fork_source = Some(default_remote_stack.clone());
+                            fork_source = Some(default_remote_view.clone());
                         }
                     }
                 }
             }
         }
-        // Also include the target stack's own entries
+        // Also include the target view's own entries
         for entry in &remote_entries {
             graph_hashes.insert(entry.hash.clone());
         }
@@ -385,9 +385,9 @@ impl Push {
         // Display state comparison
         print_blank();
         display_state_comparison(
-            &local_stack,
+            &local_view,
             &local_entries,
-            &remote_stack,
+            &remote_view,
             &remote_state,
             &remote_entries,
         );
@@ -404,7 +404,7 @@ impl Push {
 
         // Handle dry run
         if self.dry_run {
-            return self.display_dry_run(&remote_url, &remote_stack, &to_upload);
+            return self.display_dry_run(&remote_url, &remote_view, &to_upload);
         }
 
         // Check for nothing to push
@@ -429,22 +429,22 @@ impl Push {
         let new_changes: Vec<&PushChange> = to_upload.iter().filter(|c| c.needs_upload()).collect();
         let adopt_count = to_upload.iter().filter(|c| c.in_graph).count();
 
-        // If there's a fork source and changes to adopt, fork the stack first.
+        // If there's a fork source and changes to adopt, fork the view first.
         // This is a single server-side operation that copies the changelog —
-        // no data transfer, no per-change round trips. Stacks are views.
+        // no data transfer, no per-change round trips. Views are filters.
         if let Some(ref source) = fork_source {
             if adopt_count > 0 {
                 let spinner = create_spinner(&format!(
                     "Forking {} view from {}...",
-                    style_stack(&remote_stack),
-                    style_stack(source)
+                    style_view(&remote_view),
+                    style_view(source)
                 ));
 
-                match remote.fork_stack(&remote_stack, source).await {
+                match remote.fork_view(&remote_view, source).await {
                     Ok(count) => {
                         finish_success(
                             &spinner,
-                            &format!("Forked {} → {} ({} changes)", source, remote_stack, count),
+                            &format!("Forked {} → {} ({} changes)", source, remote_view, count),
                         );
                     }
                     Err(e) => {
@@ -455,13 +455,13 @@ impl Push {
             }
         }
 
-        // Now upload only the truly new changes (not in any remote stack)
+        // Now upload only the truly new changes (not in any remote view)
         if new_changes.is_empty() {
             // Everything was handled by the fork
             print_blank();
             print_success(&format!(
                 "Push complete: {} view created on {}",
-                remote_stack, self.remote
+                remote_view, self.remote
             ));
             return Ok(());
         }
@@ -480,7 +480,7 @@ impl Push {
         let mut _delta_count: usize = 0;
 
         for (i, change) in new_changes.iter().enumerate() {
-            let transfer = upload_change_smart(&remote, &repo, &change.hash, &remote_stack).await;
+            let transfer = upload_change_smart(&remote, &repo, &change.hash, &remote_view).await;
 
             match transfer {
                 Ok(result) => {
@@ -526,7 +526,7 @@ impl Push {
 
         // Upload attestations that cover the pushed changes.
         // Attestations are graph-level audit nodes — they travel with
-        // their dependencies but aren't part of any stack's changelog.
+        // their dependencies but aren't part of any view's changelog.
         let mut attest_count = 0;
         {
             let all_pushed_hashes: Vec<Hash> = to_upload.iter().map(|c| c.hash).collect();
@@ -595,7 +595,7 @@ impl Push {
 
         // Upload provenance graphs that explain the pushed changes.
         // Provenance graphs are causal decision DAGs — they travel with
-        // their dependencies but aren't part of any stack's changelog.
+        // their dependencies but aren't part of any view's changelog.
         let mut provenance_count = 0;
         {
             let all_pushed_hashes: Vec<Hash> = to_upload.iter().map(|c| c.hash).collect();
@@ -663,7 +663,7 @@ impl Push {
         let mut summary = format!(
             "Push complete: {} uploaded to {}",
             format_count(new_changes.len(), "change"),
-            remote_stack
+            remote_view
         );
         if adopt_count > 0 {
             summary.push_str(&format!(
@@ -703,7 +703,7 @@ impl Command for Push {
     ///
     /// 1. Find and open the local repository
     /// 2. Resolve the remote URL from configuration or argument
-    /// 3. Determine local and remote stack names
+    /// 3. Determine local and remote view names
     /// 4. Connect to the remote server
     /// 5. Query remote state and changelist
     /// 6. Calculate which changes need to be pushed
@@ -742,8 +742,8 @@ mod tests {
     fn test_push_new() {
         let push = Push::new();
         assert_eq!(push.remote, "origin");
-        assert!(push.to_stack.is_none());
-        assert!(push.from_stack.is_none());
+        assert!(push.to_view.is_none());
+        assert!(push.from_view.is_none());
         assert!(!push.dry_run);
         assert!(!push.force);
         assert!(!push.all);
@@ -770,15 +770,15 @@ mod tests {
     }
 
     #[test]
-    fn test_push_with_to_stack() {
-        let push = Push::new().with_to_stack("main");
-        assert_eq!(push.to_stack, Some("main".to_string()));
+    fn test_push_with_to_view() {
+        let push = Push::new().with_to_view("main");
+        assert_eq!(push.to_view, Some("main".to_string()));
     }
 
     #[test]
-    fn test_push_with_from_stack() {
-        let push = Push::new().with_from_stack("dev");
-        assert_eq!(push.from_stack, Some("dev".to_string()));
+    fn test_push_with_from_view() {
+        let push = Push::new().with_from_view("dev");
+        assert_eq!(push.from_view, Some("dev".to_string()));
     }
 
     #[test]
@@ -818,8 +818,8 @@ mod tests {
     fn test_push_builder_chain() {
         let push = Push::new()
             .with_remote("upstream")
-            .with_to_stack("main")
-            .with_from_stack("feature")
+            .with_to_view("main")
+            .with_from_view("feature")
             .with_dry_run(true)
             .with_force(false)
             .with_all(true)
@@ -827,8 +827,8 @@ mod tests {
             .with_timeout(120);
 
         assert_eq!(push.remote, "upstream");
-        assert_eq!(push.to_stack, Some("main".to_string()));
-        assert_eq!(push.from_stack, Some("feature".to_string()));
+        assert_eq!(push.to_view, Some("main".to_string()));
+        assert_eq!(push.from_view, Some("feature".to_string()));
         assert!(push.dry_run);
         assert!(!push.force);
         assert!(push.all);
@@ -857,15 +857,15 @@ mod tests {
     // Remote Channel Tests
 
     #[test]
-    fn test_get_remote_stack_explicit() {
-        let push = Push::new().with_to_stack("main");
-        assert_eq!(push.get_remote_stack("dev"), "main");
+    fn test_get_remote_view_explicit() {
+        let push = Push::new().with_to_view("main");
+        assert_eq!(push.get_remote_view("dev"), "main");
     }
 
     #[test]
-    fn test_get_remote_stack_default() {
+    fn test_get_remote_view_default() {
         let push = Push::new();
-        assert_eq!(push.get_remote_stack("dev"), "dev");
+        assert_eq!(push.get_remote_view("dev"), "dev");
     }
 
     // Remote Config Tests

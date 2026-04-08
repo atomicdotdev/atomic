@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn test_from_pristine_error() {
-        let pristine_err = PristineError::StackNotFound {
+        let pristine_err = PristineError::ViewNotFound {
             name: "test".to_string(),
         };
         let err: OutputError = pristine_err.into();
@@ -584,7 +584,7 @@ mod tests {
         let g = OutputError::graph(std::io::Error::new(std::io::ErrorKind::Other, ""));
         assert!(g.is_graph());
 
-        let p: OutputError = PristineError::StackNotFound {
+        let p: OutputError = PristineError::ViewNotFound {
             name: "test".to_string(),
         }
         .into();

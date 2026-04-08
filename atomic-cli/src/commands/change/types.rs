@@ -55,7 +55,7 @@ impl std::str::FromStr for ChangeFormat {
 /// Parsed change identifier.
 ///
 /// A change can be identified by its hash (full or prefix) or by its
-/// sequence number in a stack.
+/// sequence number in a view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangeIdentifier {
     /// Full 52-character Base32 hash.
@@ -64,7 +64,7 @@ pub enum ChangeIdentifier {
     /// Hash prefix (4-51 characters).
     HashPrefix(String),
 
-    /// Sequence number in the stack's history.
+    /// Sequence number in the view's history.
     Sequence(u64),
 
     /// No identifier - use most recent change.
@@ -104,7 +104,7 @@ impl ChangeIdentifier {
         if let Some(offset_str) = s.strip_prefix("@~") {
             // This would need special handling in the resolve step
             // For now, we'll treat it as a relative sequence lookup
-            // which requires the stack's length
+            // which requires the view's length
             return Err(format!(
                 "Relative reference '@~N' is not yet supported: {}",
                 s
@@ -236,7 +236,7 @@ pub struct JsonChange {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<JsonProvenance>,
 
-    /// Sequence number in the current stack (if known).
+    /// Sequence number in the current view (if known).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<u64>,
 }
@@ -248,7 +248,7 @@ impl JsonChange {
     ///
     /// * `change` - The change to represent
     /// * `hash` - The change's hash
-    /// * `sequence` - Optional sequence number in the stack
+    /// * `sequence` - Optional sequence number in the view
     pub fn from_change(change: &Change, hash: &Hash, sequence: Option<u64>) -> Self {
         Self {
             hash: hash.to_base32(),

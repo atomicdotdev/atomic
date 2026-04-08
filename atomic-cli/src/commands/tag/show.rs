@@ -22,7 +22,7 @@
 //! ```text
 //! $ atomic tag show v1.0.0
 //! Tag: v1.0.0
-//! Stack: dev
+//! View: dev
 //! Sequence: 42
 //! State: ABCDEF123456789...
 //! Created: 2024-01-15 10:30:00 UTC
@@ -91,7 +91,7 @@ impl Command for Show {
         match tag {
             Some(tag) => {
                 println!("{}: {}", emphasis("Tag"), tag.name);
-                println!("{}: {}", emphasis("Stack"), tag.stack);
+                println!("{}: {}", emphasis("View"), tag.view);
                 println!("{}: {}", emphasis("Sequence"), tag.sequence);
                 println!("{}: {}", emphasis("State"), tag.state.to_base32());
                 println!(

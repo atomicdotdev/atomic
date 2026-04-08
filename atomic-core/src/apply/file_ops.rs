@@ -11,7 +11,7 @@
 //! 2. **Semantic layer** (file_ops): CRDT tables for human-readable operations
 //!
 //! This module handles the semantic layer. The graph layer is handled by
-//! the existing `apply_new_vertex` and `apply_edge_map` functions.
+//! the existing `write_new_vertex` and `write_edge_map` functions.
 //!
 //! # Architecture
 //!
@@ -268,6 +268,9 @@ fn apply_line_ops_with_position<T: MutTxnT>(
                 let branch_key = encode_branch_id(&branch_id);
                 let vertex_bytes = encode_vertex_position(&graph_node);
                 txn.put_crdt_branch_vertex(&branch_key, &vertex_bytes)?;
+
+                // Store the Graph→CRDT reverse mapping (for semantic merge)
+                txn.put_crdt_vertex_branch(&vertex_bytes, &branch_key)?;
             }
 
             // Apply leaf operations for this line's tokens

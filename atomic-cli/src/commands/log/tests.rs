@@ -90,7 +90,7 @@ mod tests {
         assert!(!config.reverse);
         assert_eq!(config.from_sequence, 0);
         assert!(!config.tags_only);
-        assert!(config.stack.is_none());
+        assert!(config.view.is_none());
         assert!(config.path.is_none());
         assert_eq!(config.hash_length, DEFAULT_HASH_LENGTH);
     }
@@ -132,15 +132,15 @@ mod tests {
     }
 
     #[test]
-    fn test_log_output_config_stack() {
-        let config = LogOutputConfig::new().stack("feature");
-        assert_eq!(config.stack, Some("feature".to_string()));
+    fn test_log_output_config_view() {
+        let config = LogOutputConfig::new().view("feature");
+        assert_eq!(config.view, Some("feature".to_string()));
     }
 
     #[test]
-    fn test_log_output_config_stack_string() {
-        let config = LogOutputConfig::new().stack(String::from("main"));
-        assert_eq!(config.stack, Some("main".to_string()));
+    fn test_log_output_config_view_string() {
+        let config = LogOutputConfig::new().view(String::from("main"));
+        assert_eq!(config.view, Some("main".to_string()));
     }
 
     #[test]
@@ -163,7 +163,7 @@ mod tests {
             .reverse(true)
             .from_sequence(10)
             .tags_only(true)
-            .stack("dev")
+            .view("dev")
             .path("lib/")
             .hash_length(16);
 
@@ -172,7 +172,7 @@ mod tests {
         assert!(config.reverse);
         assert_eq!(config.from_sequence, 10);
         assert!(config.tags_only);
-        assert_eq!(config.stack, Some("dev".to_string()));
+        assert_eq!(config.view, Some("dev".to_string()));
         assert_eq!(config.path, Some("lib/".to_string()));
         assert_eq!(config.hash_length, 16);
     }
@@ -183,7 +183,7 @@ mod tests {
     fn test_log_new() {
         let log = Log::new();
         assert!(log.count.is_none());
-        assert!(log.stack.is_none());
+        assert!(log.view.is_none());
         assert!(!log.tags_only);
         assert!(log.path.is_none());
         assert_eq!(log.format, LogFormat::Default);
@@ -206,15 +206,15 @@ mod tests {
     }
 
     #[test]
-    fn test_log_with_stack() {
-        let log = Log::new().with_stack("feature-branch");
-        assert_eq!(log.stack, Some("feature-branch".to_string()));
+    fn test_log_with_view() {
+        let log = Log::new().with_view("feature-branch");
+        assert_eq!(log.view, Some("feature-branch".to_string()));
     }
 
     #[test]
-    fn test_log_with_stack_string() {
-        let log = Log::new().with_stack(String::from("dev"));
-        assert_eq!(log.stack, Some("dev".to_string()));
+    fn test_log_with_view_string() {
+        let log = Log::new().with_view(String::from("dev"));
+        assert_eq!(log.view, Some("dev".to_string()));
     }
 
     #[test]
@@ -257,7 +257,7 @@ mod tests {
     fn test_log_builder_chain() {
         let log = Log::new()
             .with_count(20)
-            .with_stack("release")
+            .with_view("release")
             .with_tags_only(true)
             .with_path("docs/")
             .with_format(LogFormat::Json)
@@ -266,7 +266,7 @@ mod tests {
             .with_full_hash(true);
 
         assert_eq!(log.count, Some(20));
-        assert_eq!(log.stack, Some("release".to_string()));
+        assert_eq!(log.view, Some("release".to_string()));
         assert!(log.tags_only);
         assert_eq!(log.path, Some("docs/".to_string()));
         assert_eq!(log.format, LogFormat::Json);
@@ -293,7 +293,7 @@ mod tests {
         let options = log.build_history_options();
         assert!(options.load_headers);
         assert!(options.limit.is_none());
-        assert!(options.stack.is_none());
+        assert!(options.view.is_none());
         assert!(!options.tagged_only);
         assert_eq!(options.from_sequence, 0);
     }
@@ -306,10 +306,10 @@ mod tests {
     }
 
     #[test]
-    fn test_log_build_history_options_with_stack() {
-        let log = Log::new().with_stack("test-stack");
+    fn test_log_build_history_options_with_view() {
+        let log = Log::new().with_view("test-view");
         let options = log.build_history_options();
-        assert_eq!(options.stack, Some("test-stack".to_string()));
+        assert_eq!(options.view, Some("test-view".to_string()));
     }
 
     #[test]
@@ -330,13 +330,13 @@ mod tests {
     fn test_log_build_history_options_combined() {
         let log = Log::new()
             .with_count(10)
-            .with_stack("feature")
+            .with_view("feature")
             .with_tags_only(true)
             .with_from(5);
         let options = log.build_history_options();
 
         assert_eq!(options.limit, Some(10));
-        assert_eq!(options.stack, Some("feature".to_string()));
+        assert_eq!(options.view, Some("feature".to_string()));
         assert!(options.tagged_only);
         assert_eq!(options.from_sequence, 5);
         assert!(options.load_headers);
@@ -720,21 +720,21 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_log_run_with_nonexistent_stack() {
+    fn test_log_run_with_nonexistent_view() {
         let _guard = TestGuard::new();
 
         // Initialize repository
         let _repo = Repository::init(".").unwrap();
 
-        let log = Log::new().with_stack("nonexistent-stack");
+        let log = Log::new().with_view("nonexistent-view");
         let result = log.run();
 
-        // Should fail with stack not found or internal error
+        // Should fail with view not found or internal error
         assert!(result.is_err());
         match result {
-            Err(CliError::StackNotFound { name }) => assert_eq!(name, "nonexistent-stack"),
+            Err(CliError::ViewNotFound { name }) => assert_eq!(name, "nonexistent-view"),
             Err(CliError::Internal(_)) => {} // Also acceptable
-            other => panic!("Expected StackNotFound or Internal error, got: {:?}", other),
+            other => panic!("Expected ViewNotFound or Internal error, got: {:?}", other),
         }
     }
 
@@ -1066,12 +1066,12 @@ mod tests {
     fn test_log_clone() {
         let log = Log::new()
             .with_count(5)
-            .with_stack("test")
+            .with_view("test")
             .with_format(LogFormat::Short);
         let cloned = log.clone();
 
         assert_eq!(log.count, cloned.count);
-        assert_eq!(log.stack, cloned.stack);
+        assert_eq!(log.view, cloned.view);
         assert_eq!(log.format, cloned.format);
     }
 

@@ -32,7 +32,7 @@
 //! │    - Globalize positions → graph vertices                                │
 //! │    - Write change to RedbChangeStore                                     │
 //! │    - Apply to graph (GRAPH, TREE, INODES tables)                         │
-//! │    - Update stack sequence                                               │
+//! │    - Update view sequence                                               │
 //! ├──────────────────────────────────────────────────────────────────────────┤
 //! │  Phase 3: FINALIZE  (verification)                                       │
 //! │                                                                          │
@@ -520,7 +520,7 @@ impl ParallelImporter {
         repo.save_change(&change)
             .map_err(|e| CliError::Internal(e.into()))?;
 
-        repo.apply_change(&hash, Default::default())
+        repo.insert_change(&hash, Default::default())
             .map_err(|e| CliError::Internal(e.into()))?;
 
         Ok(true)
@@ -541,7 +541,7 @@ impl ParallelImporter {
         repo.save_change(&change)
             .map_err(|e| CliError::Internal(e.into()))?;
 
-        repo.apply_change(&hash, Default::default())
+        repo.insert_change(&hash, Default::default())
             .map_err(|e| CliError::Internal(e.into()))?;
 
         Ok(true)

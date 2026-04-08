@@ -1,7 +1,7 @@
 //! The `log` command for viewing change history.
 //!
 //! This module implements the `atomic log` command, which displays the
-//! history of changes applied to a stack. It supports multiple output
+//! history of changes applied to a view. It supports multiple output
 //! formats, filtering, and pagination.
 //!
 //! # Usage
@@ -11,8 +11,8 @@
 //!
 //! Options:
 //!   -n, --count <N>        Show only the last N changes
-//!       --all              Show all stacks' history
-//!       --stack <NAME>     Show history for specific stack
+//!       --all              Show all views' history
+//!       --view <NAME>      Show history for specific view
 //!       --tags-only        Only show tagged changes
 //!       --path <PATH>      Show only changes affecting this path
 //!   -f, --format <FORMAT>  Output format (default, short, oneline, json)
@@ -89,9 +89,9 @@
 //! $ atomic log -n 10
 //! ```
 //!
-//! Show changes on a specific stack:
+//! Show changes on a specific view:
 //! ```text
-//! $ atomic log --stack feature-auth
+//! $ atomic log --view feature-auth
 //! ```
 //!
 //! Show all tagged changes in short format:
@@ -102,7 +102,7 @@
 //! # Exit Codes
 //!
 //! - `0`: Success
-//! - `1`: Error (repository not found, stack not found, etc.)
+//! - `1`: Error (repository not found, view not found, etc.)
 
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
@@ -117,8 +117,8 @@ use crate::commands::{
 };
 use crate::error::{CliError, CliResult};
 use crate::output::{
-    author as style_author, hash as style_hash, hint, print_hint, stack as style_stack,
-    timestamp as style_timestamp, warning,
+    author as style_author, hash as style_hash, hint, print_hint, timestamp as style_timestamp,
+    view as style_view, warning,
 };
 
 // Output Format

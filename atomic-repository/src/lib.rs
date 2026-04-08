@@ -144,10 +144,10 @@ pub use tracking::{
 
 // Apply exports
 pub use apply::{
-    apply_change_to_graph, check_missing_dependencies, collect_all_dependencies,
-    compute_apply_order, filter_missing_in_stack, get_changes_up_to_seq, get_missing_changes,
-    get_stack_changes, order_changes_by_deps, ApplyError, ApplyOptions, ApplyOutcome, ApplyResult,
-    ApplyStats, CrossStackApplyOptions, CrossStackApplyOutcome,
+    check_missing_dependencies, collect_all_dependencies, compute_insert_order,
+    filter_missing_in_view, get_changes_up_to_seq, get_missing_changes, get_view_changes,
+    order_changes_by_deps, write_change_to_graph, CrossViewInsertOptions, CrossViewInsertOutcome,
+    InsertError, InsertOptions, InsertOutcome, InsertResult, InsertStats,
 };
 
 // History exports
@@ -161,10 +161,13 @@ pub use history::{
 
 // Tags exports
 pub use tags::{
-    count_all_tags, count_tags, delete_tag, list_all_tags, list_tag_stacks, list_tags,
-    list_tags_filtered, load_tag, load_tag_any_stack, save_tag, save_tag_force, stack_tags_dir,
-    tag_file_path, validate_tag_name, Tag, TagError, TagFilter, TagOptions, TagResult, TagSort,
+    count_all_tags, count_tags, delete_tag, list_all_tags, list_tag_views, list_tags,
+    list_tags_filtered, load_tag, load_tag_any_view, save_tag, save_tag_force, tag_file_path,
+    validate_tag_name, view_tags_dir, Tag, TagError, TagFilter, TagOptions, TagResult, TagSort,
 };
+
+// Backward-compatible aliases for renamed tag functions
+pub use tags::{list_tag_stacks, load_tag_any_stack, stack_tags_dir};
 
 // Unrecord exports
 pub use unrecord::{

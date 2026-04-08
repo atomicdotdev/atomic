@@ -1,4 +1,9 @@
+use std::sync::Arc;
+
 use super::*;
+use crate::apply::InsertOptions;
+use crate::repository::collect_visible_change_ids;
+use atomic_core::pristine::ViewGraph;
 
 impl Repository {
     /// This is the main entry point for creating a change from working copy
@@ -371,11 +376,9 @@ impl Repository {
                     };
 
                     // Step 2: Retrieve old content from the graph.
-                    // Use get_file_content_via_overlay so that local workspaces
-                    // see their parent chain's content via the overlay model.
-                    let old_content = match self
-                        .get_file_content_via_overlay(entry.path(), &self.current_stack)
-                    {
+                    // Use get_file_content which builds a change filter
+                    // so that the view's content is correctly scoped.
+                    let old_content = match self.get_file_content(entry.path()) {
                         Ok(Some(content)) => content,
                         Ok(None) => {
                             // No recorded content found - treat as new file
@@ -482,44 +485,36 @@ impl Repository {
             return Err(RecordError::NothingToRecord);
         }
 
-        // Assemble the change.
+        // Assemble the change from the recorded files.
         //
-        // The globalization pipeline (find_content_vertices, create_deletion_edges)
-        // needs to see ALL content vertices for the file — including those written
-        // to STACK_GRAPH by earlier changes on a local stack.
-        //
-        // A raw ReadTxn only sees the global GRAPH table. For local stacks, the
-        // content vertices live in STACK_GRAPH. Without the overlay, find_content_vertices
-        // returns an empty list, the Replacement atom gets zero deletion edges, and
-        // the old content is never marked as DELETED — causing duplication on output.
-        //
-        // Fix: wrap the ReadTxn in an OverlayTxn for the current stack so that
-        // iter_adjacent / find_block see STACK_GRAPH ∪ GRAPH.
+        // We wrap the transaction in a ViewGraph so that the entire
+        // globalization pipeline (retrieve_graph, iter_adjacent, etc.)
+        // transparently sees only edges introduced by changes visible
+        // on the current view.  No manual filter threading needed.
         let txn = self
             .pristine
             .read_txn()
             .map_err(|e| RecordError::Database(e.to_string()))?;
 
-        let stack = txn
-            .get_stack(&self.current_stack)
+        let view_name = options.get_view().unwrap_or(&self.current_view);
+        let view_graph = if let Some(view) = txn
+            .get_view(view_name)
             .map_err(|e| RecordError::Database(e.to_string()))?
-            .ok_or_else(|| {
-                RecordError::Database(format!(
-                    "Stack '{}' not found during record assembly",
-                    self.current_stack
-                ))
-            })?;
-
-        let overlay_txn = OverlayTxn::from_stack(&txn, &stack)
-            .map_err(|e| RecordError::Database(e.to_string()))?;
+        {
+            let change_filter = collect_visible_change_ids(&txn, &view)
+                .map_err(|e| RecordError::Database(e.to_string()))?;
+            ViewGraph::new(&txn, Arc::new(change_filter))
+        } else {
+            // No view found — use an empty filter (ROOT-only visibility).
+            // In practice this shouldn't happen because the repository
+            // always has at least one view, but we handle it gracefully.
+            ViewGraph::new(&txn, Arc::new(std::collections::HashSet::new()))
+        };
 
         let assembly_options = options.to_assembly_options();
 
-        // Use the assembly module to create the change.
-        // Pass the overlay transaction so the globalization pipeline can see
-        // vertices in STACK_GRAPH (for local stacks) as well as GRAPH.
         let assembly_result = assemble_change(
-            &overlay_txn,
+            &view_graph,
             &recorded_files,
             final_header,
             &assembly_options,
@@ -577,15 +572,15 @@ impl Repository {
         }
 
         // Apply if requested
-        // We use apply_recorded() instead of apply_change() because it creates
+        // We use write_recorded() instead of insert_change() because it creates
         // the TREE and INODES entries for FileAdd hunks, which is necessary
         // for the file to be recognized as tracked with graph content.
         if options.get_apply_after_record() && outcome.was_saved() {
-            let apply_opts = match options.get_stack() {
-                Some(stack) => ApplyOptions::default().stack(stack),
-                None => ApplyOptions::default(),
+            let apply_opts = match options.get_view() {
+                Some(view) => InsertOptions::default().view(view),
+                None => InsertOptions::default(),
             };
-            match self.apply_recorded(&outcome, apply_opts) {
+            match self.write_recorded(&outcome, apply_opts) {
                 Ok(apply_outcome) => {
                     outcome.set_applied(apply_outcome.new_state);
 

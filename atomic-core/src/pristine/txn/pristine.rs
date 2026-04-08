@@ -27,7 +27,7 @@ use redb::{Database, ReadableTable};
 use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
 
-use super::helpers::deserialize_stack_state;
+use super::helpers::deserialize_view_state;
 use super::read::ReadTxn;
 use super::write::WriteTxn;
 
@@ -48,19 +48,19 @@ fn next_id(max_id: u64) -> PristineResult<u64> {
 ///
 /// // Read-only access
 /// let read_txn = pristine.read_txn()?;
-/// let stack = read_txn.get_stack("main")?;
+/// let view = read_txn.get_view("main")?;
 ///
 /// // Read-write access
 /// let mut write_txn = pristine.write_txn()?;
-/// let stack = write_txn.open_or_create_stack("main")?;
+/// let view = write_txn.open_or_create_view("main")?;
 /// write_txn.commit()?;
 /// ```
 pub struct Pristine {
     db: Database,
     /// Counter for allocating node IDs
     pub(crate) next_node_id: AtomicU64,
-    /// Counter for allocating stack IDs
-    pub(crate) next_stack_id: AtomicU64,
+    /// Counter for allocating view IDs
+    pub(crate) next_view_id: AtomicU64,
     /// Counter for allocating inodes
     pub(crate) next_inode: AtomicU64,
 }
@@ -83,12 +83,11 @@ impl Pristine {
             // Graph tables
             write_txn.open_multimap_table(GRAPH)?;
             write_txn.open_multimap_table(INODE_GRAPH)?;
-            write_txn.open_multimap_table(STACK_GRAPH)?;
 
-            // Stack tables
-            write_txn.open_table(STACKS)?;
-            write_txn.open_table(STACK_CHANGES)?;
-            write_txn.open_table(REV_STACK_CHANGES)?;
+            // View tables
+            write_txn.open_table(VIEWS)?;
+            write_txn.open_table(VIEW_CHANGES)?;
+            write_txn.open_table(REV_VIEW_CHANGES)?;
 
             // Tree tables
             write_txn.open_table(TREE)?;
@@ -132,12 +131,12 @@ impl Pristine {
             AtomicU64::new(next_id(max_id)?)
         };
 
-        let next_stack_id = {
-            let table = read_txn.open_table(STACKS)?;
+        let next_view_id = {
+            let table = read_txn.open_table(VIEWS)?;
             let mut max_id = 0u64;
             for result in table.iter()? {
                 let (_, value) = result?;
-                let state = deserialize_stack_state(value.value())?;
+                let state = deserialize_view_state(value.value())?;
                 max_id = max_id.max(state.id);
             }
             AtomicU64::new(next_id(max_id)?)
@@ -156,7 +155,7 @@ impl Pristine {
         Ok(Self {
             db,
             next_node_id,
-            next_stack_id,
+            next_view_id,
             next_inode,
         })
     }
@@ -201,12 +200,12 @@ impl Pristine {
             AtomicU64::new(next_id(max_id)?)
         };
 
-        let next_stack_id = {
-            let table = read_txn.open_table(STACKS)?;
+        let next_view_id = {
+            let table = read_txn.open_table(VIEWS)?;
             let mut max_id = 0u64;
             for result in table.iter()? {
                 let (_, value) = result?;
-                let state = deserialize_stack_state(value.value())?;
+                let state = deserialize_view_state(value.value())?;
                 max_id = max_id.max(state.id);
             }
             AtomicU64::new(next_id(max_id)?)
@@ -225,7 +224,7 @@ impl Pristine {
         Ok(Self {
             db,
             next_node_id,
-            next_stack_id,
+            next_view_id,
             next_inode,
         })
     }
@@ -249,7 +248,7 @@ impl Pristine {
         Ok(WriteTxn::new(
             txn,
             &self.next_node_id,
-            &self.next_stack_id,
+            &self.next_view_id,
             &self.next_inode,
         ))
     }

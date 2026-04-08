@@ -1,37 +1,31 @@
 use super::*;
-use atomic_core::pristine::OverlayTxn;
 
 impl Repository {
-    /// Get the recorded content for a tracked file using the overlay model.
+    /// Get the recorded content for a tracked file.
     ///
-    /// This is the **two-tier-aware** content retrieval method. It creates an
-    /// `OverlayTxn` for the given stack so that graph traversal sees both the
-    /// stack's own `STACK_GRAPH` edges and the global `GRAPH`.
-    ///
-    /// For Shared stacks this is equivalent to `get_file_content_on_stack`.
-    /// For Local workspaces this is the only correct way to read content,
-    /// because their edges live in `STACK_GRAPH`, not `GRAPH`.
+    /// This method builds a **change filter** that defines the current view's
+    /// content perspective, then retrieves file content through the raw
+    /// transaction.  Since all edges live in the global GRAPH, the raw
+    /// transaction sees everything — the change filter handles view isolation.
     ///
     /// # Arguments
     ///
     /// * `path` - Path to the file (relative to repository root)
-    /// * `stack_name` - The stack whose perspective to use
     ///
     /// # Returns
     ///
     /// The file content as bytes, or `None` if the file is not tracked or
-    /// has no recorded content from this stack's perspective.
+    /// has no recorded content from this view's perspective.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// // Read file as seen by the "feature" local workspace
-    /// let content = repo.get_file_content_via_overlay("src/main.rs", "feature")?;
+    /// // Read file content as seen by the current view
+    /// let content = repo.get_file_content("src/main.rs")?;
     /// ```
-    pub fn get_file_content_via_overlay<P: AsRef<Path>>(
+    pub fn get_file_content<P: AsRef<Path>>(
         &self,
         path: P,
-        stack_name: &str,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
         use atomic_core::output::alive::RetrieveOptions;
         use atomic_core::record::workflow::retrieve::retrieve_content_with_filter;
@@ -44,48 +38,42 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let stack = txn
-            .get_stack(stack_name)
+        let view = txn
+            .get_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: stack_name.to_string(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: self.current_view.clone(),
             })?;
 
-        // Build the overlay for this stack's perspective
-        let overlay = OverlayTxn::from_stack(&txn, &stack)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Check if file is tracked (tree tables are global, overlay passes through)
-        if !is_tracked(&overlay, &normalized)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-        {
+        // Check if file is tracked (tree tables are global)
+        if !is_tracked(&txn, &normalized).map_err(|e| RepositoryError::Database(e.to_string()))? {
             return Ok(None);
         }
 
         // Get inode → position
-        let inode = match get_inode(&overlay, &normalized) {
+        let inode = match get_inode(&txn, &normalized) {
             Ok(Some(inode)) => inode,
             Ok(None) => return Ok(None),
             Err(e) => return Err(RepositoryError::Database(e.to_string())),
         };
 
-        let position = match overlay.inner().inode_position(inode) {
+        let position = match txn.inode_position(inode) {
             Ok(Some(pos)) => pos,
             Ok(None) => return Ok(None),
             Err(e) => return Err(RepositoryError::Database(e.to_string())),
         };
 
-        // Build a change filter starting from this stack's own changes,
+        // Build a change filter starting from this view's own changes,
         // then expand with their dependencies (from the change FILES,
         // not the DEPS table which is for attestations).
         //
-        // After a content revise, the stack has A' but not A.  A' depends
+        // After a content revise, the view has A' but not A.  A' depends
         // on A (its hunks modify A's vertices).  Without including A's
         // NodeId in the filter, the alive-graph traversal would exclude
         // A's vertices and fail to produce content.
-        let mut change_filter = collect_stack_change_ids(&txn, &stack)?;
+        let mut change_filter = collect_view_change_ids(&txn, &view)?;
 
-        // Expand: for each stack change, load its change file, resolve
+        // Expand: for each view change, load its change file, resolve
         // each dependency hash to a NodeId, and add to the filter.
         let direct_ids: Vec<NodeId> = change_filter.iter().copied().collect();
         for node_id in direct_ids {
@@ -100,36 +88,36 @@ impl Repository {
             }
         }
 
-        // For local workspaces, also include changes from parent stacks in the
+        // For draft views, also include changes from parent views in the
         // overlay chain, since those changes' vertices should be visible too.
-        if stack.kind.is_local() {
+        if view.kind.is_draft() {
             let chain = txn
-                .resolve_overlay_chain(&stack)
+                .resolve_view_chain(&view)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             for &ancestor_id in &chain {
-                if ancestor_id == stack.id {
+                if ancestor_id == view.id {
                     continue; // already included above
                 }
                 if let Some(ancestor) = txn
-                    .get_stack_by_id(ancestor_id)
+                    .get_view_by_id(ancestor_id)
                     .map_err(|e| RepositoryError::Database(e.to_string()))?
                 {
-                    let ancestor_ids = collect_stack_change_ids(&txn, &ancestor)?;
+                    let ancestor_ids = collect_view_change_ids(&txn, &ancestor)?;
                     change_filter.extend(ancestor_ids);
                 }
             }
 
-            // Also include changes from all shared ancestor stacks (the global
+            // Also include changes from all shared ancestor views (the global
             // graph base). Walk the parent chain past the overlay to find the
-            // shared stack and include its changes.
-            let mut cursor = stack.parent;
+            // shared view and include its changes.
+            let mut cursor = view.parent;
             while let Some(pid) = cursor {
                 let parent = txn
-                    .get_stack_by_id(pid)
+                    .get_view_by_id(pid)
                     .map_err(|e| RepositoryError::Database(e.to_string()))?;
                 match parent {
                     Some(p) if p.kind.is_shared() => {
-                        let shared_ids = collect_stack_change_ids(&txn, &p)?;
+                        let shared_ids = collect_view_change_ids(&txn, &p)?;
                         change_filter.extend(shared_ids);
                         break;
                     }
@@ -141,8 +129,9 @@ impl Repository {
 
         let options = RetrieveOptions::new().with_change_filter(change_filter);
 
-        // Use the overlay for graph traversal so STACK_GRAPH edges are visible
-        let content = retrieve_content_with_filter(&overlay, &self.change_store, position, options)
+        // All edges are in GRAPH — raw transaction sees everything.
+        // The change_filter handles view isolation.
+        let content = retrieve_content_with_filter(&txn, &self.change_store, position, options)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if content.is_empty() {
@@ -152,16 +141,15 @@ impl Repository {
         }
     }
 
-    /// Get file content via overlay, excluding a specific change.
+    /// Get file content, excluding a specific change.
     ///
-    /// This is identical to [`Self::get_file_content_via_overlay`] but removes
+    /// This is identical to [`Self::get_file_content`] but removes
     /// `exclude_hash` from the change filter. Use this to get the file
     /// content as it was **before** a specific change was applied — pass
     /// the change's hash as `exclude_hash` and you get the prior state.
-    pub fn get_file_content_via_overlay_excluding<P: AsRef<Path>>(
+    pub fn get_file_content_excluding<P: AsRef<Path>>(
         &self,
         path: P,
-        stack_name: &str,
         exclude_hash: &Hash,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
         use atomic_core::output::alive::RetrieveOptions;
@@ -175,61 +163,56 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let stack = txn
-            .get_stack(stack_name)
+        let view = txn
+            .get_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: stack_name.to_string(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: self.current_view.clone(),
             })?;
 
-        let overlay = OverlayTxn::from_stack(&txn, &stack)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        if !is_tracked(&overlay, &normalized)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-        {
+        if !is_tracked(&txn, &normalized).map_err(|e| RepositoryError::Database(e.to_string()))? {
             return Ok(None);
         }
 
-        let inode = match get_inode(&overlay, &normalized) {
+        let inode = match get_inode(&txn, &normalized) {
             Ok(Some(inode)) => inode,
             Ok(None) => return Ok(None),
             Err(e) => return Err(RepositoryError::Database(e.to_string())),
         };
 
-        let position = match overlay.inner().inode_position(inode) {
+        let position = match txn.inode_position(inode) {
             Ok(Some(pos)) => pos,
             Ok(None) => return Ok(None),
             Err(e) => return Err(RepositoryError::Database(e.to_string())),
         };
 
-        let mut change_filter = collect_stack_change_ids(&txn, &stack)?;
+        let mut change_filter = collect_view_change_ids(&txn, &view)?;
 
-        if stack.kind.is_local() {
+        if view.kind.is_draft() {
             let chain = txn
-                .resolve_overlay_chain(&stack)
+                .resolve_view_chain(&view)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             for &ancestor_id in &chain {
-                if ancestor_id == stack.id {
+                if ancestor_id == view.id {
                     continue;
                 }
                 if let Some(ancestor) = txn
-                    .get_stack_by_id(ancestor_id)
+                    .get_view_by_id(ancestor_id)
                     .map_err(|e| RepositoryError::Database(e.to_string()))?
                 {
-                    let ancestor_ids = collect_stack_change_ids(&txn, &ancestor)?;
+                    let ancestor_ids = collect_view_change_ids(&txn, &ancestor)?;
                     change_filter.extend(ancestor_ids);
                 }
             }
 
-            let mut cursor = stack.parent;
+            let mut cursor = view.parent;
             while let Some(pid) = cursor {
                 let parent = txn
-                    .get_stack_by_id(pid)
+                    .get_view_by_id(pid)
                     .map_err(|e| RepositoryError::Database(e.to_string()))?;
                 match parent {
                     Some(p) if p.kind.is_shared() => {
-                        let shared_ids = collect_stack_change_ids(&txn, &p)?;
+                        let shared_ids = collect_view_change_ids(&txn, &p)?;
                         change_filter.extend(shared_ids);
                         break;
                     }
@@ -246,7 +229,7 @@ impl Repository {
 
         let options = RetrieveOptions::new().with_change_filter(change_filter);
 
-        let content = retrieve_content_with_filter(&overlay, &self.change_store, position, options)
+        let content = retrieve_content_with_filter(&txn, &self.change_store, position, options)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if content.is_empty() {
@@ -256,15 +239,15 @@ impl Repository {
         }
     }
 
-    /// Diff two stacks: returns (changes only in A, changes only in B, common changes).
+    /// Diff two views: returns (changes only in A, changes only in B, common changes).
     ///
     /// This is the change-level diff. For file-content diff, use
-    /// `get_file_content_via_overlay` for each stack and diff the results.
+    /// `get_file_content` for each view and diff the results.
     ///
     /// # Arguments
     ///
-    /// * `stack_a` - First stack name
-    /// * `stack_b` - Second stack name
+    /// * `view_a` - First view name
+    /// * `view_b` - Second view name
     ///
     /// # Returns
     ///
@@ -273,16 +256,16 @@ impl Repository {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let (only_feature, only_dev, common) = repo.diff_stacks("feature", "dev")?;
+    /// let (only_feature, only_dev, common) = repo.diff_views("feature", "dev")?;
     /// println!("{} changes only in feature", only_feature.len());
     /// println!("{} changes only in dev", only_dev.len());
     /// println!("{} changes in common", common.len());
     /// ```
     #[allow(clippy::type_complexity)]
-    pub fn diff_stacks(
+    pub fn diff_views(
         &self,
-        stack_a: &str,
-        stack_b: &str,
+        view_a: &str,
+        view_b: &str,
     ) -> Result<(Vec<Hash>, Vec<Hash>, Vec<Hash>), RepositoryError> {
         let txn = self
             .pristine
@@ -290,20 +273,20 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let a = txn
-            .get_stack(stack_a)
+            .get_view(view_a)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: stack_a.to_string(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_a.to_string(),
             })?;
 
         let b = txn
-            .get_stack(stack_b)
+            .get_view(view_b)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: stack_b.to_string(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_b.to_string(),
             })?;
 
-        // Collect hashes from each stack
+        // Collect hashes from each view
         let a_changes: Vec<Hash> = {
             let iter = txn
                 .iter_changes(&a, 0)
@@ -362,82 +345,25 @@ impl Repository {
         Ok((only_a, only_b, common))
     }
 
-    /// This retrieves the file content from the repository graph as it was
-    /// at the last recorded state. This is useful for computing diffs between
-    /// the working copy and the recorded state.
+    /// Get the recorded content for a tracked file on a specific view.
+    ///
+    /// Like `get_file_content`, but reads from the specified view instead
+    /// of the current view. This is a **read-only** operation — it does
+    /// NOT call `set_current_view` or write anything to disk.
     ///
     /// # Arguments
     ///
     /// * `path` - Path to the file (relative to repository root)
-    ///
-    /// # Returns
-    ///
-    /// The file content as bytes, or `None` if the file is not tracked or
-    /// has no recorded content.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The database cannot be accessed
-    /// - Content retrieval fails
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// // Get recorded content for a file
-    /// if let Some(content) = repo.get_file_content("src/main.rs")? {
-    ///     let text = String::from_utf8_lossy(&content);
-    ///     println!("Recorded content:\n{}", text);
-    /// } else {
-    ///     println!("File not tracked or has no content");
-    /// }
-    /// ```
-    pub fn get_file_content<P: AsRef<Path>>(
-        &self,
-        path: P,
-    ) -> Result<Option<Vec<u8>>, RepositoryError> {
-        let path = path.as_ref();
-        let normalized = normalize_path(path);
-
-        let txn = self
-            .pristine
-            .read_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Get the current stack to build change filter
-        // This ensures we only retrieve content from changes in the current stack
-        let stack = txn
-            .get_stack(&self.current_stack)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: self.current_stack.clone(),
-            })?;
-
-        let change_filter = collect_stack_change_ids(&txn, &stack)?;
-
-        // Use the filtered retrieval method
-        self.get_file_content_with_filter(&txn, &normalized, change_filter)
-    }
-
-    /// Get the recorded content for a tracked file on a specific stack.
-    ///
-    /// Like `get_file_content`, but reads from the specified stack instead
-    /// of the current stack. This is a **read-only** operation — it does
-    /// NOT call `set_current_stack` or write anything to disk.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the file (relative to repository root)
-    /// * `stack_name` - The stack to read from
+    /// * `view_name` - The view to read from
     ///
     /// # Returns
     ///
     /// The file content as bytes, or `None` if the file is not tracked
-    /// on the specified stack.
-    pub fn get_file_content_on_stack<P: AsRef<Path>>(
+    /// on the specified view.
+    pub fn get_file_content_on_view<P: AsRef<Path>>(
         &self,
         path: P,
-        stack_name: &str,
+        view_name: &str,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
         let path = path.as_ref();
         let normalized = normalize_path(path);
@@ -447,15 +373,15 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Get the specified stack (read-only — no set_current_stack)
-        let stack = txn
-            .get_stack(stack_name)
+        // Get the specified view (read-only — no set_current_stack)
+        let view = txn
+            .get_view(view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: stack_name.to_string(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
             })?;
 
-        let change_filter = collect_stack_change_ids(&txn, &stack)?;
+        let change_filter = collect_view_change_ids(&txn, &view)?;
 
         // Use the filtered retrieval method
         self.get_file_content_with_filter(&txn, &normalized, change_filter)
@@ -597,7 +523,7 @@ impl Repository {
     ///
     /// * `Ok(Some(content))` - The file content before the change
     /// * `Ok(None)` - The file didn't exist before this change, or the change
-    ///   is not in the current stack's history
+    ///   is not in the current view's history
     /// * `Err(_)` - Database or I/O error
     ///
     /// # Example
@@ -621,7 +547,7 @@ impl Repository {
     /// # Implementation Details
     ///
     /// This method:
-    /// 1. Finds the change's sequence number in the current stack
+    /// 1. Finds the change's sequence number in the current view
     /// 2. Collects all changes applied BEFORE that sequence
     /// 3. Uses the change filter to retrieve content at that state
     ///
@@ -645,21 +571,21 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Get the current stack
-        let stack = txn
-            .get_stack(&self.current_stack)
+        // Get the current view
+        let view = txn
+            .get_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: self.current_stack.clone(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: self.current_view.clone(),
             })?;
 
         // Find the state before this change
-        let state_info = get_state_before_change(&txn, &stack, change_hash)
+        let state_info = get_state_before_change(&txn, &view, change_hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let state_info = match state_info {
             Some(info) => info,
-            None => return Ok(None), // Change not in this stack
+            None => return Ok(None), // Change not in this view
         };
 
         // If this is the first change, there's no content before it
@@ -669,7 +595,7 @@ impl Repository {
 
         // Get the set of changes applied before this change
         let change_set =
-            get_changes_up_to_sequence(&txn, &stack, state_info.parent_max_sequence_exclusive())
+            get_changes_up_to_sequence(&txn, &view, state_info.parent_max_sequence_exclusive())
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Retrieve content with the change filter
@@ -691,7 +617,7 @@ impl Repository {
     ///
     /// * `Ok(Some(content))` - The file content after the change
     /// * `Ok(None)` - The file doesn't exist after this change (was deleted),
-    ///   or the change is not in the current stack's history
+    ///   or the change is not in the current view's history
     /// * `Err(_)` - Database or I/O error
     ///
     /// # Example
@@ -723,20 +649,20 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Get the current stack
-        let stack = txn
-            .get_stack(&self.current_stack)
+        // Get the current view
+        let view = txn
+            .get_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: self.current_stack.clone(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: self.current_view.clone(),
             })?;
 
         // Get all changes up to and including this change
-        let change_set = match get_changes_up_to_change(&txn, &stack, change_hash)
+        let change_set = match get_changes_up_to_change(&txn, &view, change_hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
             Some(set) => set,
-            None => return Ok(None), // Change not in this stack
+            None => return Ok(None), // Change not in this view
         };
 
         // Retrieve content with the change filter
@@ -784,16 +710,16 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Get the current stack
-        let stack = txn
-            .get_stack(&self.current_stack)
+        // Get the current view
+        let view = txn
+            .get_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: self.current_stack.clone(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: self.current_view.clone(),
             })?;
 
         // Get the set of changes up to the sequence
-        let change_set = get_changes_up_to_sequence(&txn, &stack, max_sequence)
+        let change_set = get_changes_up_to_sequence(&txn, &view, max_sequence)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Retrieve content with the change filter

@@ -46,11 +46,11 @@ pub enum RemoteError {
         url: String,
     },
 
-    /// The specified stack does not exist on the remote.
-    #[error("Stack not found: {stack}")]
-    StackNotFound {
-        /// The name of the stack that wasn't found.
-        stack: String,
+    /// The specified view does not exist on the remote.
+    #[error("View not found: {view}")]
+    ViewNotFound {
+        /// The name of the view that wasn't found.
+        view: String,
     },
 
     /// The specified change does not exist on the remote.
@@ -124,11 +124,11 @@ pub enum RemoteError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// The remote stack is empty.
-    #[error("Stack {stack} is empty")]
-    EmptyStack {
-        /// The name of the empty stack.
-        stack: String,
+    /// The remote view is empty.
+    #[error("View {view} is empty")]
+    EmptyView {
+        /// The name of the empty view.
+        view: String,
     },
 
     /// The operation was cancelled.
@@ -181,11 +181,9 @@ impl RemoteError {
         Self::RepositoryNotFound { url: url.into() }
     }
 
-    /// Create a stack not found error.
-    pub fn stack_not_found(stack: impl Into<String>) -> Self {
-        Self::StackNotFound {
-            stack: stack.into(),
-        }
+    /// Create a view not found error.
+    pub fn view_not_found(view: impl Into<String>) -> Self {
+        Self::ViewNotFound { view: view.into() }
     }
 
     /// Create a change not found error.
@@ -239,11 +237,9 @@ impl RemoteError {
         Self::Timeout { seconds }
     }
 
-    /// Create an empty stack error.
-    pub fn empty_stack(stack: impl Into<String>) -> Self {
-        Self::EmptyStack {
-            stack: stack.into(),
-        }
+    /// Create an empty view error.
+    pub fn empty_view(view: impl Into<String>) -> Self {
+        Self::EmptyView { view: view.into() }
     }
 
     /// Create a generic error.
@@ -269,7 +265,7 @@ impl RemoteError {
         matches!(
             self,
             Self::RepositoryNotFound { .. }
-                | Self::StackNotFound { .. }
+                | Self::ViewNotFound { .. }
                 | Self::ChangeNotFound { .. }
                 | Self::TagNotFound { .. }
         )
@@ -287,8 +283,8 @@ impl RemoteError {
             Self::RepositoryNotFound { .. } => {
                 Some("Verify the repository URL is correct and you have access.")
             }
-            Self::StackNotFound { .. } => {
-                Some("Check the stack name. Use 'atomic stack list' to see available stacks.")
+            Self::ViewNotFound { .. } => {
+                Some("Check the view name. Use 'atomic view list' to see available views.")
             }
             Self::MissingDependencies { .. } => {
                 Some("Push the missing dependencies first, or use '--all' to push all changes.")
@@ -296,7 +292,7 @@ impl RemoteError {
             Self::Timeout { .. } => {
                 Some("The server may be slow. Try again or increase the timeout.")
             }
-            Self::EmptyStack { .. } => Some("The stack has no changes yet."),
+            Self::EmptyView { .. } => Some("The view has no changes yet."),
             _ => None,
         }
     }
@@ -386,7 +382,7 @@ mod tests {
     #[test]
     fn test_is_not_found_variants() {
         assert!(RemoteError::repo_not_found("url").is_not_found());
-        assert!(RemoteError::stack_not_found("main").is_not_found());
+        assert!(RemoteError::view_not_found("main").is_not_found());
         assert!(RemoteError::change_not_found("ABC").is_not_found());
         assert!(RemoteError::tag_not_found("XYZ").is_not_found());
         assert!(!RemoteError::timeout(10).is_not_found());
@@ -401,8 +397,8 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_stack() {
-        let err = RemoteError::empty_stack("main");
+    fn test_empty_view() {
+        let err = RemoteError::empty_view("main");
         assert!(err.to_string().contains("main"));
         assert!(err.suggestion().is_some());
     }

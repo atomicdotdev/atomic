@@ -3,11 +3,11 @@
 //! This is the main CLI entry point for Atomic. It parses command-line arguments
 //! and dispatches to the appropriate command implementation.
 //!
-//! # Stacks vs Branches
+//! # Views vs Branches
 //!
-//! Atomic uses **Stacks** instead of branches. Stacks are views of the graph -
-//! they represent which changes have been applied and in what order. Multiple
-//! stacks can coexist, each showing a different perspective on the same
+//! Atomic uses **Views** instead of branches. Views are perspectives on the graph -
+//! they represent which changes have been inserted and in what order. Multiple
+//! views can coexist, each showing a different perspective on the same
 //! underlying data.
 //!
 //! # Command Structure
@@ -55,8 +55,8 @@ mod output;
 use clap::{Parser, Subcommand};
 
 use commands::{
-    Add, Agent, Apply, ChangeCmd, Clone, Command, Diff, Git, Hive, Identity, Init, Log, Move, Pull,
-    Push, Record, Remote, Remove, Reset, Revise, Split, Stack, Stash, Status, Tag, Unrecord,
+    Add, Agent, ChangeCmd, Clone, Command, Diff, Git, Identity, Init, Insert, Log, Move, Pull,
+    Push, Record, Remote, Remove, Reset, Revise, Split, Stash, Status, Tag, Unrecord, View,
 };
 use output::{print_error, print_hint};
 
@@ -119,7 +119,7 @@ enum Commands {
 
     /// Initialize a new Atomic repository.
     ///
-    /// Creates the `.atomic` directory structure and sets up an initial stack.
+    /// Creates the `.atomic` directory structure and sets up an initial view.
     /// If the directory doesn't exist, it will be created.
     ///
     /// # Examples
@@ -128,8 +128,8 @@ enum Commands {
     /// # Initialize in current directory
     /// atomic init
     ///
-    /// # Initialize with custom stack name
-    /// atomic init --stack main
+    /// # Initialize with custom view name
+    /// atomic init --view main
     ///
     /// # Initialize a Rust project
     /// atomic init --kind rust
@@ -186,7 +186,7 @@ enum Commands {
     /// Reset the working copy to the last recorded state.
     ///
     /// Restores the working copy to match the pristine state (last recorded
-    /// state in the stack). This discards any uncommitted changes.
+    /// state in the view). This discards any uncommitted changes.
     ///
     /// # Examples
     ///
@@ -197,31 +197,31 @@ enum Commands {
     /// # Reset specific files
     /// atomic reset src/main.rs
     ///
-    /// # Switch to a different stack
-    /// atomic reset --stack main
+    /// # Switch to a different view
+    /// atomic reset --view main
     ///
     /// # Preview what would be reset
     /// atomic reset --dry-run
     /// ```
     Reset(Reset),
 
-    /// Split a stack (create a new stack from an existing one).
+    /// Split a view (create a new view from an existing one).
     ///
-    /// Creates a new stack by forking from an existing stack. All changes
-    /// from the source stack are copied to the new stack.
+    /// Creates a new view by forking from an existing view. All changes
+    /// from the source view are copied to the new view.
     ///
-    /// This is equivalent to `atomic stack new <NAME> --from <SOURCE>`.
+    /// This is equivalent to `atomic view create <NAME> --from <SOURCE>`.
     ///
     /// # Examples
     ///
     /// ```text
-    /// # Split from current stack
+    /// # Split from current view
     /// atomic split experimental
     ///
-    /// # Split from specific stack
-    /// atomic split hotfix --stack release-1.0
+    /// # Split from specific view
+    /// atomic split hotfix --view release-1.0
     ///
-    /// # Split and switch to new stack
+    /// # Split and switch to new view
     /// atomic split feature-auth --switch
     /// ```
     Split(Split),
@@ -234,7 +234,7 @@ enum Commands {
     /// Revise a change in-place.
     ///
     /// Modifies a previously recorded change without losing its position
-    /// in the stack. This is useful for fixing typos, updating messages,
+    /// in the view. This is useful for fixing typos, updating messages,
     /// or making corrections to recent changes.
     ///
     /// # Examples
@@ -256,7 +256,7 @@ enum Commands {
 
     /// Show change history.
     ///
-    /// Displays the log of changes applied to the current stack.
+    /// Displays the log of changes inserted into the current view.
     Log(Log),
 
     /// Show details for a specific change.
@@ -279,30 +279,30 @@ enum Commands {
     /// ```
     Change(ChangeCmd),
 
-    /// Apply changes to a stack.
+    /// Insert changes into a view.
     ///
-    /// Applies changes from change files, other stacks, or up to tagged states.
-    /// Supports single change application, cross-stack apply, and cherry-picking.
+    /// Inserts changes from change files, other views, or up to tagged states.
+    /// Supports single change insertion, cross-view insert, and cherry-picking.
     ///
     /// # Examples
     ///
     /// ```text
-    /// # Apply a single change by hash
-    /// atomic apply ABC12345
+    /// # Insert a single change by hash
+    /// atomic insert ABC12345
     ///
-    /// # Apply changes from one stack to another
-    /// atomic apply from-stack feature --to-stack main
+    /// # Insert changes from one view to another
+    /// atomic insert from-view feature --to-view main
     ///
-    /// # Apply changes up to a tag
-    /// atomic apply tag v1.0.0 --from-stack feature
+    /// # Insert changes up to a tag
+    /// atomic insert tag v1.0.0 --from-view feature
     ///
     /// # Cherry-pick specific changes
-    /// atomic apply pick ABC123 DEF456 --to-stack main
+    /// atomic insert pick ABC123 DEF456 --to-view main
     ///
-    /// # Preview what would be applied
-    /// atomic apply preview feature --to-stack main
+    /// # Preview what would be inserted
+    /// atomic insert preview feature --to-view main
     /// ```
-    Apply(Apply),
+    Insert(Insert),
 
     /// Show differences in the working copy.
     ///
@@ -340,7 +340,7 @@ enum Commands {
     /// # Import specific branch
     /// atomic git import --branch main
     ///
-    /// # Import all branches as stacks
+    /// # Import all branches as views
     /// atomic git import --all-branches
     ///
     /// # Preview without creating repository
@@ -348,27 +348,27 @@ enum Commands {
     /// ```
     Git(Git),
 
-    /// Manage stacks (views of the graph).
+    /// Manage views (perspectives on the graph).
     ///
-    /// Stacks in Atomic are similar to branches in Git, but they represent
-    /// views of the same underlying graph rather than divergent histories.
+    /// Views in Atomic are similar to branches in Git, but they represent
+    /// perspectives on the same underlying graph rather than divergent histories.
     ///
     /// # Examples
     ///
     /// ```text
-    /// # Create a new stack
-    /// atomic stack new feature-auth
+    /// # Create a new view
+    /// atomic view create feature-auth
     ///
-    /// # Switch to a stack
-    /// atomic stack switch feature-auth
+    /// # Switch to a view
+    /// atomic view switch feature-auth
     ///
-    /// # List all stacks
-    /// atomic stack list
+    /// # List all views
+    /// atomic view list
     ///
-    /// # Delete a stack
-    /// atomic stack delete old-feature
+    /// # Delete a view
+    /// atomic view delete old-feature
     /// ```
-    Stack(Stack),
+    View(View),
 
     /// Push changes to a remote.
     ///
@@ -408,29 +408,6 @@ enum Commands {
     /// ```
     Identity(Identity),
 
-    /// Manage Hive Agent Social Platform integration.
-    ///
-    /// Register your AI agent on Hive, check claim status, and manage
-    /// your agent identity. Every agent is identified by an Ed25519
-    /// keypair compatible with atomic-identity.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// # Initialize and register agent
-    /// atomic hive init --name my-agent --vendor anthropic --model claude-sonnet-4
-    ///
-    /// # Check registration status
-    /// atomic hive status
-    ///
-    /// # Check if claimed by human owner
-    /// atomic hive claim
-    ///
-    /// # View agent profile
-    /// atomic hive profile
-    /// ```
-    Hive(Hive),
-
     /// Manage remote repositories.
     ///
     /// Add, remove, list, and modify named remotes that can be used
@@ -456,8 +433,8 @@ enum Commands {
     /// Temporarily save uncommitted changes.
     ///
     /// Stash saves your uncommitted working copy changes to a temporary
-    /// orphan stack, then restores the working copy to a clean state.
-    /// This is useful when you need to switch stacks but have changes
+    /// orphan view, then restores the working copy to a clean state.
+    /// This is useful when you need to switch views but have changes
     /// that belong elsewhere.
     ///
     /// # Examples
@@ -482,7 +459,7 @@ enum Commands {
 
     /// Manage tags (named state snapshots).
     ///
-    /// Tags are named references to a stack's Merkle state at a specific
+    /// Tags are named references to a view's Merkle state at a specific
     /// point in time. They're useful for marking releases, sync points,
     /// and rollback targets.
     ///
@@ -506,10 +483,10 @@ enum Commands {
     /// ```
     Tag(Tag),
 
-    /// Remove the last change from the current stack.
+    /// Remove the last change from the current view.
     ///
-    /// The change is removed from the stack's change log but NOT deleted
-    /// from the change store. It can be re-applied later with `atomic apply`.
+    /// The change is removed from the view's change log but NOT deleted
+    /// from the change store. It can be re-inserted later with `atomic insert`.
     ///
     /// # Examples
     ///
@@ -569,9 +546,9 @@ fn main() {
 
         Commands::Git(git) => git.run(),
 
-        Commands::Apply(apply) => apply.run(),
+        Commands::Insert(insert) => insert.run(),
 
-        Commands::Stack(stack) => stack.run(),
+        Commands::View(view) => view.run(),
 
         Commands::Stash(stash) => stash.run(),
 
@@ -582,8 +559,6 @@ fn main() {
         Commands::Clone(clone) => clone.run(),
 
         Commands::Identity(identity) => identity.run(),
-
-        Commands::Hive(hive) => hive.run(),
 
         Commands::Remote(remote) => remote.run(),
 

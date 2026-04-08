@@ -15,7 +15,7 @@
 //!    - Timestamp from commit time
 //!    - File operations from tree diff
 //!    - Git SHA stored in unhashed metadata
-//! 5. Saves and applies each change to the stack
+//! 5. Saves and inserts each change into the view
 //!
 //! # Limitations
 //!
@@ -55,9 +55,9 @@ pub struct Import {
     #[arg(long, short = 'b', value_name = "BRANCH")]
     pub branch: Option<String>,
 
-    /// Import all branches as separate stacks.
+    /// Import all branches as separate views.
     ///
-    /// Creates one Atomic stack for each Git branch found in the repository.
+    /// Creates one Atomic view for each Git branch found in the repository.
     #[arg(long)]
     pub all_branches: bool,
 
@@ -70,7 +70,7 @@ pub struct Import {
 }
 
 impl Import {
-    /// Import a single branch into an Atomic stack using parallel processing.
+    /// Import a single branch into an Atomic view using parallel processing.
     fn import_branch(
         &self,
         git_repo: &GitRepository,
@@ -129,7 +129,7 @@ impl Import {
 
         let mut shas = HashSet::new();
 
-        // Iterate through all changes on the current stack via log
+        // Iterate through all changes on the current view via log
         let options = HistoryOptions::default();
         if let Ok(entries) = repo.log(options) {
             for entry in entries {
@@ -292,17 +292,17 @@ impl Command for Import {
 
             let mut total_imported = 0;
             for branch_name in branches {
-                // Ensure the stack exists
+                // Ensure the view exists
                 if !repo
-                    .stack_exists(&branch_name)
+                    .view_exists(&branch_name)
                     .map_err(|e| CliError::Internal(e.into()))?
                 {
-                    repo.create_stack(&branch_name)
+                    repo.create_view(&branch_name)
                         .map_err(|e| CliError::Internal(e.into()))?;
                 }
 
-                // Switch to the stack
-                repo.set_current_stack(&branch_name)
+                // Switch to the view
+                repo.set_current_view(&branch_name)
                     .map_err(|e| CliError::Internal(e.into()))?;
 
                 // Import the branch
@@ -326,17 +326,17 @@ impl Command for Import {
                     message: format!("Branch '{}' not found", branch_name),
                 })?;
 
-            // Ensure the stack exists with the branch name
+            // Ensure the view exists with the branch name
             if !repo
-                .stack_exists(&branch_name)
+                .view_exists(&branch_name)
                 .map_err(|e| CliError::Internal(e.into()))?
             {
-                repo.create_stack(&branch_name)
+                repo.create_view(&branch_name)
                     .map_err(|e| CliError::Internal(e.into()))?;
             }
 
-            // Switch to the stack
-            repo.set_current_stack(&branch_name)
+            // Switch to the view
+            repo.set_current_view(&branch_name)
                 .map_err(|e| CliError::Internal(e.into()))?;
 
             // Import

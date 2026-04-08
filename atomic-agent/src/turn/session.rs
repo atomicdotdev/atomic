@@ -66,13 +66,13 @@ use crate::turn::phase::Phase;
 /// State of an agent session.
 ///
 /// Persisted as JSON in `.atomic/sessions/{session_id}.json`. Updated on every
-/// hook callback via the orchestrator. The session links to an Atomic stack
+/// hook callback via the orchestrator. The session links to an Atomic view
 /// named `agent-{session_id}` where turn changes are recorded.
 ///
 /// # Identity
 ///
 /// Each session is uniquely identified by `session_id`, which is assigned by the
-/// agent (e.g., a UUID from Claude Code). The `stack_name` is derived as
+/// agent (e.g., a UUID from Claude Code). The `view_name` is derived as
 /// `agent-{session_id}`.
 ///
 /// # Thread Safety
@@ -87,10 +87,11 @@ pub struct AgentSession {
     /// Format varies by agent — UUID for Claude Code, path-derived for Gemini CLI.
     pub session_id: String,
 
-    /// The Atomic stack name for this session's turn changes.
+    /// The Atomic view name for this session's turn changes.
     ///
     /// Format: `agent-{session_id}`. Created on first turn recording.
-    pub stack_name: String,
+    #[serde(alias = "stack_name")]
+    pub view_name: String,
 
     /// Current lifecycle phase.
     pub phase: Phase,
@@ -132,16 +133,16 @@ pub struct AgentSession {
     #[serde(default)]
     pub ended_at: Option<DateTime<Utc>>,
 
-    /// The stack that was current when this session started.
+    /// The view that was current when this session started.
     ///
-    /// The agent stack is forked from this stack so it inherits all existing
+    /// The agent view is forked from this view so it inherits all existing
     /// changes (e.g., `.atomicignore`, project config). When the session ends,
-    /// changes can be applied back to this stack.
+    /// changes can be applied back to this view.
     ///
     /// Set during `handle_session_start` by reading the repository's current
-    /// stack. `None` for sessions created before this field was added.
-    #[serde(default)]
-    pub parent_stack: Option<String>,
+    /// view. `None` for sessions created before this field was added.
+    #[serde(default, alias = "parent_stack")]
+    pub parent_view: Option<String>,
 
     /// Path to the agent's transcript file, if known.
     ///
@@ -197,12 +198,12 @@ impl AgentSession {
         agent_display_name: impl Into<String>,
     ) -> Self {
         let session_id = session_id.into();
-        let stack_name = Self::make_stack_name(&session_id);
+        let view_name = Self::make_view_name(&session_id);
         let now = Utc::now();
 
         Self {
             session_id,
-            stack_name,
+            view_name,
             phase: Phase::Idle,
             turn_count: 0,
             agent_name: agent_name.into(),
@@ -212,7 +213,7 @@ impl AgentSession {
             started_at: now,
             last_interaction: Some(now),
             ended_at: None,
-            parent_stack: None,
+            parent_view: None,
             transcript_path: None,
             first_prompt: None,
             current_prompt: None,
@@ -221,13 +222,13 @@ impl AgentSession {
         }
     }
 
-    /// Derive the Atomic stack name from a session ID.
+    /// Derive the Atomic view name from a session ID.
     ///
     /// Format: `agent-{session_id}`
     ///
-    /// Uses `-` as the separator because `/` is forbidden in stack names
+    /// Uses `-` as the separator because `/` is forbidden in view names
     /// (it would create nested directories in `.atomic/workspaces/`).
-    pub fn make_stack_name(session_id: &str) -> String {
+    pub fn make_view_name(session_id: &str) -> String {
         format!("agent-{}", session_id)
     }
 
@@ -237,18 +238,18 @@ impl AgentSession {
         self.model = model.into();
     }
 
-    /// Set the parent stack name (the stack that was current when this session started).
+    /// Set the parent view name (the view that was current when this session started).
     ///
     /// Only sets the value if it hasn't been set already (first call wins).
-    pub fn set_parent_stack(&mut self, stack: impl Into<String>) {
-        if self.parent_stack.is_none() {
-            self.parent_stack = Some(stack.into());
+    pub fn set_parent_view(&mut self, view: impl Into<String>) {
+        if self.parent_view.is_none() {
+            self.parent_view = Some(view.into());
         }
     }
 
-    /// Get the parent stack name, if set.
-    pub fn parent_stack(&self) -> Option<&str> {
-        self.parent_stack.as_deref()
+    /// Get the parent view name, if set.
+    pub fn parent_view(&self) -> Option<&str> {
+        self.parent_view.as_deref()
     }
 
     /// Set the transcript path if not already set.
@@ -661,7 +662,7 @@ mod tests {
         assert_eq!(s.session_id, "sess-abc-123");
         assert_eq!(s.agent_name, "claude-code");
         assert_eq!(s.agent_display_name, "Claude Code");
-        assert_eq!(s.stack_name, "agent-sess-abc-123");
+        assert_eq!(s.view_name, "agent-sess-abc-123");
         assert_eq!(s.phase, Phase::Idle);
         assert_eq!(s.turn_count, 0);
         assert!(s.last_interaction.is_some());
@@ -673,10 +674,10 @@ mod tests {
     }
 
     #[test]
-    fn test_make_stack_name() {
-        assert_eq!(AgentSession::make_stack_name("sess-123"), "agent-sess-123");
+    fn test_make_view_name() {
+        assert_eq!(AgentSession::make_view_name("sess-123"), "agent-sess-123");
         assert_eq!(
-            AgentSession::make_stack_name("2026-01-15-abc"),
+            AgentSession::make_view_name("2026-01-15-abc"),
             "agent-2026-01-15-abc"
         );
     }
@@ -924,7 +925,7 @@ mod tests {
         let loaded: AgentSession = serde_json::from_str(&json).unwrap();
 
         assert_eq!(loaded.session_id, s.session_id);
-        assert_eq!(loaded.stack_name, s.stack_name);
+        assert_eq!(loaded.view_name, s.view_name);
         assert_eq!(loaded.phase, s.phase);
         assert_eq!(loaded.turn_count, s.turn_count);
         assert_eq!(loaded.agent_name, s.agent_name);
@@ -941,7 +942,7 @@ mod tests {
         // Simulate an older session file missing optional fields
         let json = r#"{
             "session_id": "old-sess",
-            "stack_name": "agent-old-sess",
+            "view_name": "agent-old-sess",
             "phase": "idle",
             "turn_count": 5,
             "agent_name": "claude-code",

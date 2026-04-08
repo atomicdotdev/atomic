@@ -278,7 +278,7 @@ impl fmt::Display for RemoteState {
 ///   on the remote (they were unrecorded remotely)
 ///
 /// For a push, we additionally compute `to_upload` by comparing our local
-/// stack state against the remote's actual state.
+/// view state against the remote's actual state.
 #[derive(Debug, Clone)]
 pub struct RemoteDelta {
     /// Changes that exist on the remote but not locally — need to download.
@@ -344,7 +344,7 @@ impl RemoteDelta {
     ///
     /// # Arguments
     ///
-    /// * `local_changes` - All changes in the local stack that should be
+    /// * `local_changes` - All changes in the local view that should be
     ///   considered for upload. The function filters out changes already
     ///   known to the remote.
     pub fn into_push_delta(self, local_changes: &[Node]) -> PushDelta {
@@ -361,7 +361,7 @@ impl RemoteDelta {
         }
 
         // Unknown changes: things in theirs_ge_dichotomy that aren't in
-        // our cache (ours_ge_dichotomy) and aren't in our local stack.
+        // our cache (ours_ge_dichotomy) and aren't in our local view.
         let local_set: HashSet<&str> = local_changes.iter().map(|n| n.hash.as_str()).collect();
         for (_, node) in &self.theirs_ge_dichotomy {
             if !self.ours_ge_dichotomy_set.contains(node) && !local_set.contains(node.hash.as_str())
@@ -486,9 +486,9 @@ impl<'a> SyncEngine<'a> {
     /// # Complexity
     ///
     /// O(log n) remote round-trips where n = number of cached entries.
-    /// Each round-trip is a single `GET ?stack={s}&state=` request that
+    /// Each round-trip is a single `GET ?view={s}&state=` request that
     /// returns three values: `(position, merkle, tag_merkle)`.
-    async fn dichotomy_changelist(&mut self, stack: &str) -> RemoteResult<u64> {
+    async fn dichotomy_changelist(&mut self, view: &str) -> RemoteResult<u64> {
         // If cache is empty, divergence is at the beginning
         let last_seq = match self.cache.last_sequence() {
             Some(seq) => seq,
@@ -511,7 +511,7 @@ impl<'a> SyncEngine<'a> {
         );
 
         // Check if we're already in sync by comparing the last state
-        let remote_state = self.remote.get_state(stack).await?;
+        let remote_state = self.remote.get_state(view).await?;
         self.stats.dichotomy_comparisons += 1;
 
         match &remote_state {
@@ -520,7 +520,7 @@ impl<'a> SyncEngine<'a> {
                 return Ok(last_seq + 1);
             }
             StateResponse::Empty => {
-                debug!("dichotomy: remote stack is empty");
+                debug!("dichotomy: remote view is empty");
                 return Ok(0);
             }
             _ => {
@@ -551,7 +551,7 @@ impl<'a> SyncEngine<'a> {
 
             // Query the remote for its state at this position
             // We use get_changelist with a narrow range to check the state
-            let remote_entries = self.remote.get_changelist(stack, mid).await?;
+            let remote_entries = self.remote.get_changelist(view, mid).await?;
             self.stats.dichotomy_comparisons += 1;
 
             // Find the entry at exactly `mid` in the response
@@ -596,7 +596,7 @@ impl<'a> SyncEngine<'a> {
 
     // Delta Computation
 
-    /// Compute the full `RemoteDelta` for a given stack.
+    /// Compute the full `RemoteDelta` for a given view.
     ///
     /// This is the main entry point for sync operations. It:
     ///
@@ -608,21 +608,21 @@ impl<'a> SyncEngine<'a> {
     ///
     /// # Arguments
     ///
-    /// * `stack` - The stack name to sync
+    /// * `view` - The view name to sync
     /// * `local_hashes` - Set of change hashes present in the local repository.
     ///   Used to determine which remote changes need to be downloaded.
     pub async fn compute_delta(
         &mut self,
-        stack: &str,
+        view: &str,
         local_hashes: &HashSet<String>,
     ) -> RemoteResult<RemoteDelta> {
         // Handle from-scratch sync (no cache)
         if self.cache.is_empty() {
-            return self.compute_delta_from_scratch(stack, local_hashes).await;
+            return self.compute_delta_from_scratch(view, local_hashes).await;
         }
 
         // Find divergence point
-        let divergence = self.dichotomy_changelist(stack).await?;
+        let divergence = self.dichotomy_changelist(view).await?;
         self.stats.divergence_point = divergence;
 
         // Collect our cached entries at or after divergence
@@ -639,7 +639,7 @@ impl<'a> SyncEngine<'a> {
             .collect();
 
         // Download the remote's changelist from the divergence point
-        let remote_entries = self.remote.get_changelist(stack, divergence).await?;
+        let remote_entries = self.remote.get_changelist(view, divergence).await?;
         self.stats.changelist_entries_fetched = remote_entries.len();
 
         // Build "theirs" sets
@@ -691,13 +691,13 @@ impl<'a> SyncEngine<'a> {
     /// cache from scratch.
     async fn compute_delta_from_scratch(
         &mut self,
-        stack: &str,
+        view: &str,
         local_hashes: &HashSet<String>,
     ) -> RemoteResult<RemoteDelta> {
         debug!("sync: no cache, downloading full changelist");
         self.stats.from_scratch = true;
 
-        let remote_entries = self.remote.get_changelist(stack, 0).await?;
+        let remote_entries = self.remote.get_changelist(view, 0).await?;
         self.stats.changelist_entries_fetched = remote_entries.len();
 
         let mut theirs_ge_dichotomy = Vec::new();
@@ -730,35 +730,35 @@ impl<'a> SyncEngine<'a> {
 
     // Convenience: Pull and Push
 
-    /// Compute a pull delta for a given stack.
+    /// Compute a pull delta for a given view.
     ///
     /// This is a convenience method that runs `compute_delta` and converts
     /// the result into a `PullDelta`.
     pub async fn compute_pull_delta(
         &mut self,
-        stack: &str,
+        view: &str,
         local_hashes: &HashSet<String>,
     ) -> RemoteResult<PullDelta> {
-        let remote_state = self.remote.get_state(stack).await?;
-        let delta = self.compute_delta(stack, local_hashes).await?;
+        let remote_state = self.remote.get_state(view).await?;
+        let delta = self.compute_delta(view, local_hashes).await?;
         Ok(delta.into_pull_delta(Some(remote_state)))
     }
 
-    /// Compute a push delta for a given stack.
+    /// Compute a push delta for a given view.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The stack to push to
+    /// * `view` - The view to push to
     /// * `local_hashes` - Hashes present in the local repository
-    /// * `local_changes` - All changes in the local stack (ordered)
+    /// * `local_changes` - All changes in the local view (ordered)
     ///   that are candidates for upload
     pub async fn compute_push_delta(
         &mut self,
-        stack: &str,
+        view: &str,
         local_hashes: &HashSet<String>,
         local_changes: &[Node],
     ) -> RemoteResult<PushDelta> {
-        let delta = self.compute_delta(stack, local_hashes).await?;
+        let delta = self.compute_delta(view, local_hashes).await?;
         Ok(delta.into_push_delta(local_changes))
     }
 }

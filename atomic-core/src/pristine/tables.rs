@@ -5,10 +5,10 @@
 //!
 //! - **ID Mappings**: `EXTERNAL`, `INTERNAL` - map between internal NodeIds and external Hashes
 //! - **Graph**: `GRAPH`, `INODE_GRAPH` - store vertices and edges
-//! - **Stacks**: `STACKS`, `STACK_CHANGES`, `REV_STACK_CHANGES` - stack metadata
+//! - **Views**: `VIEWS`, `VIEW_CHANGES`, `REV_VIEW_CHANGES` - view metadata
 //! - **File Tree**: `TREE`, `REV_TREE`, `INODES`, `REV_INODES`, `DIRECTORIES` - file system mappings
 //! - **Dependencies**: `DEPS`, `REV_DEPS` - change dependency tracking
-//! - **State**: `STATES`, `TAGS` - stack state and tag tracking
+//! - **State**: `STATES`, `TAGS` - view state and tag tracking
 
 use redb::{MultimapTableDefinition, TableDefinition};
 
@@ -62,53 +62,34 @@ pub const GRAPH: MultimapTableDefinition<&[u8; 24], &[u8; 24]> =
 pub const INODE_GRAPH: MultimapTableDefinition<&[u8; 32], &[u8; 24]> =
     MultimapTableDefinition::new("inode_graph");
 
-/// Stack-scoped graph for local workspace edge storage
-///
-/// Key: 32 bytes encoding (stack_id: u64, change_id: u64, start: u64, end: u64)
-/// Value: 24 bytes encoding SerializedGraphEdge
-///
-/// This table stores edges for **Local** stacks only. Shared stacks write
-/// directly to the global `GRAPH` table. When an local workspace is deleted,
-/// all entries with its `stack_id` prefix are cascade-deleted, leaving zero
-/// orphaned edges in the graph.
-///
-/// An local workspace's effective view is the union of its own `STACK_GRAPH`
-/// entries, its parent's effective view (recursively up the ancestry chain),
-/// and the global `GRAPH` (reached when a Shared ancestor is encountered).
-///
-/// The key layout is identical to `INODE_GRAPH` — `(u64 discriminant, 24-byte vertex)` —
-/// so the same encode/decode pattern applies.
-pub const STACK_GRAPH: MultimapTableDefinition<&[u8; 32], &[u8; 24]> =
-    MultimapTableDefinition::new("stack_graph");
+// View Tables
 
-// Stack Tables
-
-/// Stack metadata
+/// View metadata
 ///
-/// Key: stack name (string)
-/// Value: serialized StackState (variable length)
+/// Key: view name (string)
+/// Value: serialized ViewState (variable length)
 ///
-/// Stores stack configuration and current state (merkle root, head change, etc.)
-/// Stacks are views of the graph - they represent which changes have been applied
+/// Stores view configuration and current state (merkle root, head change, etc.)
+/// Views are perspectives of the graph - they represent which changes have been applied
 /// in what order, not forks of the underlying data.
-pub const STACKS: TableDefinition<&str, &[u8]> = TableDefinition::new("stacks");
+pub const VIEWS: TableDefinition<&str, &[u8]> = TableDefinition::new("views");
 
-/// Stack change log: (stack_id, sequence) → change_id
+/// View change log: (view_id, sequence) → change_id
 ///
-/// Key: 16 bytes encoding (stack_id: u64, sequence: u64)
+/// Key: 16 bytes encoding (view_id: u64, sequence: u64)
 /// Value: change NodeId
 ///
-/// Tracks the ordered sequence of changes applied to each stack.
-pub const STACK_CHANGES: TableDefinition<&[u8; 16], u64> = TableDefinition::new("stack_changes");
+/// Tracks the ordered sequence of changes applied to each view.
+pub const VIEW_CHANGES: TableDefinition<&[u8; 16], u64> = TableDefinition::new("view_changes");
 
-/// Reverse change log: (stack_id, change_id) → sequence
+/// Reverse view change log: (view_id, change_id) → sequence
 ///
-/// Key: 16 bytes encoding (stack_id: u64, change_id: u64)
+/// Key: 16 bytes encoding (view_id: u64, change_id: u64)
 /// Value: sequence number
 ///
-/// Allows looking up when a change was applied to a stack.
-pub const REV_STACK_CHANGES: TableDefinition<&[u8; 16], u64> =
-    TableDefinition::new("rev_stack_changes");
+/// Allows looking up when a change was applied to a view.
+pub const REV_VIEW_CHANGES: TableDefinition<&[u8; 16], u64> =
+    TableDefinition::new("rev_view_changes");
 
 // File Tree Tables
 
@@ -246,20 +227,20 @@ pub const REV_DEPS: MultimapTableDefinition<u64, u64> = MultimapTableDefinition:
 
 // State Tables
 
-/// Stack states: (stack_id, merkle) → sequence
+/// View states: (view_id, merkle) → sequence
 ///
-/// Key: 40 bytes encoding (stack_id: u64, merkle: [u8; 32])
+/// Key: 40 bytes encoding (view_id: u64, merkle: [u8; 32])
 /// Value: sequence number when this state was reached
 ///
-/// Allows looking up when a stack reached a particular state.
+/// Allows looking up when a view reached a particular state.
 pub const STATES: TableDefinition<&[u8; 40], u64> = TableDefinition::new("states");
 
-/// Stack tags: (stack_id, sequence) → merkle
+/// View tags: (view_id, sequence) → merkle
 ///
-/// Key: 16 bytes encoding (stack_id: u64, sequence: u64)
+/// Key: 16 bytes encoding (view_id: u64, sequence: u64)
 /// Value: merkle hash at that sequence
 ///
-/// Stores tagged states (named snapshots) for stacks.
+/// Stores tagged states (named snapshots) for views.
 pub const TAGS: TableDefinition<&[u8; 16], &[u8; 32]> = TableDefinition::new("tags");
 
 // File Mtime Cache Table
@@ -446,7 +427,7 @@ pub const CHANGE_UNHASHED: TableDefinition<&[u8; 32], &[u8]> =
 // replay log. Values are postcard-encoded session structs from
 // `atomic_core::change::session`.
 //
-// Composite keys use the same `[u8; 16]` shape as `STACK_CHANGES`:
+// Composite keys use the same `[u8; 16]` shape as `VIEW_CHANGES`:
 // first 8 bytes = provenance_id (u64, big-endian), second 8 bytes = secondary
 // component (u64, big-endian: seq, or first-8-bytes-of-blake3 for string IDs).
 
@@ -536,39 +517,6 @@ pub fn encode_inode_vertex(inode: u64, change_id: u64, start: u64, end: u64) -> 
     bytes
 }
 
-/// Encode a stack-scoped graph key: (stack_id, change_id, start, end) → 32 bytes
-///
-/// Layout is identical to `encode_inode_vertex` but the first u64 is a
-/// `stack_id` instead of an `inode`. This allows prefix scans on `stack_id`
-/// for cascade deletion when an local workspace is removed.
-pub fn encode_stack_graph_key(stack_id: u64, change_id: u64, start: u64, end: u64) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    bytes[0..8].copy_from_slice(&stack_id.to_be_bytes());
-    bytes[8..16].copy_from_slice(&change_id.to_be_bytes());
-    bytes[16..24].copy_from_slice(&start.to_be_bytes());
-    bytes[24..32].copy_from_slice(&end.to_be_bytes());
-    bytes
-}
-
-/// Decode a stack-scoped graph key: 32 bytes → (stack_id, change_id, start, end)
-pub fn decode_stack_graph_key(bytes: &[u8; 32]) -> (u64, u64, u64, u64) {
-    let stack_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
-    let change_id = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-    let start = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
-    let end = u64::from_be_bytes(bytes[24..32].try_into().unwrap());
-    (stack_id, change_id, start, end)
-}
-
-/// Encode a stack-scoped graph prefix key for range scans.
-///
-/// Returns a 32-byte key with only the `stack_id` set and all other fields
-/// zeroed. Used as the start bound for prefix range scans on `STACK_GRAPH`.
-pub fn encode_stack_graph_prefix(stack_id: u64) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    bytes[0..8].copy_from_slice(&stack_id.to_be_bytes());
-    bytes
-}
-
 /// Decode an inode-span from 32 bytes
 #[inline]
 pub fn decode_inode_vertex(key: &[u8; 32]) -> (u64, u64, u64, u64) {
@@ -596,39 +544,39 @@ pub fn decode_position(key: &[u8; 16]) -> (u64, u64) {
     (change_id, pos)
 }
 
-/// Encode a stack-sequence pair as 16 bytes
+/// Encode a view-sequence pair as 16 bytes
 #[inline]
-pub fn encode_stack_seq(stack_id: u64, seq: u64) -> [u8; 16] {
+pub fn encode_view_seq(view_id: u64, seq: u64) -> [u8; 16] {
     let mut key = [0u8; 16];
-    key[0..8].copy_from_slice(&stack_id.to_be_bytes());
+    key[0..8].copy_from_slice(&view_id.to_be_bytes());
     key[8..16].copy_from_slice(&seq.to_be_bytes());
     key
 }
 
-/// Decode a stack-sequence pair from 16 bytes
+/// Decode a view-sequence pair from 16 bytes
 #[inline]
-pub fn decode_stack_seq(key: &[u8; 16]) -> (u64, u64) {
-    let stack_id = u64::from_be_bytes(key[0..8].try_into().unwrap());
+pub fn decode_view_seq(key: &[u8; 16]) -> (u64, u64) {
+    let view_id = u64::from_be_bytes(key[0..8].try_into().unwrap());
     let seq = u64::from_be_bytes(key[8..16].try_into().unwrap());
-    (stack_id, seq)
+    (view_id, seq)
 }
 
-/// Encode a stack-merkle pair as 40 bytes
+/// Encode a view-merkle pair as 40 bytes
 #[inline]
-pub fn encode_stack_merkle(stack_id: u64, merkle: &[u8; 32]) -> [u8; 40] {
+pub fn encode_view_merkle(view_id: u64, merkle: &[u8; 32]) -> [u8; 40] {
     let mut key = [0u8; 40];
-    key[0..8].copy_from_slice(&stack_id.to_be_bytes());
+    key[0..8].copy_from_slice(&view_id.to_be_bytes());
     key[8..40].copy_from_slice(merkle);
     key
 }
 
-/// Decode a stack-merkle pair from 40 bytes
+/// Decode a view-merkle pair from 40 bytes
 #[inline]
-pub fn decode_stack_merkle(key: &[u8; 40]) -> (u64, [u8; 32]) {
-    let stack_id = u64::from_be_bytes(key[0..8].try_into().unwrap());
+pub fn decode_view_merkle(key: &[u8; 40]) -> (u64, [u8; 32]) {
+    let view_id = u64::from_be_bytes(key[0..8].try_into().unwrap());
     let mut merkle = [0u8; 32];
     merkle.copy_from_slice(&key[8..40]);
-    (stack_id, merkle)
+    (view_id, merkle)
 }
 
 #[cfg(test)]
@@ -667,58 +615,6 @@ mod tests {
     }
 
     #[test]
-    fn test_stack_graph_key_encoding_roundtrip() {
-        let stack_id = 7u64;
-        let change_id = 100u64;
-        let start = 200u64;
-        let end = 300u64;
-
-        let encoded = encode_stack_graph_key(stack_id, change_id, start, end);
-        let (d_stack, d_change, d_start, d_end) = decode_stack_graph_key(&encoded);
-
-        assert_eq!(d_stack, stack_id);
-        assert_eq!(d_change, change_id);
-        assert_eq!(d_start, start);
-        assert_eq!(d_end, end);
-    }
-
-    #[test]
-    fn test_stack_graph_prefix_encoding() {
-        let prefix = encode_stack_graph_prefix(42);
-        let (stack_id, change_id, start, end) = decode_stack_graph_key(&prefix);
-
-        assert_eq!(stack_id, 42);
-        assert_eq!(change_id, 0);
-        assert_eq!(start, 0);
-        assert_eq!(end, 0);
-    }
-
-    #[test]
-    fn test_stack_graph_prefix_ordering() {
-        // Entries for stack 5 should sort before entries for stack 6
-        let key_5a = encode_stack_graph_key(5, 1, 0, 10);
-        let key_5b = encode_stack_graph_key(5, 2, 0, 20);
-        let key_6a = encode_stack_graph_key(6, 1, 0, 10);
-
-        assert!(key_5a < key_5b);
-        assert!(key_5b < key_6a);
-
-        // Prefix for stack 6 is strictly greater than all stack 5 entries
-        let prefix_6 = encode_stack_graph_prefix(6);
-        assert!(key_5b < prefix_6);
-    }
-
-    #[test]
-    fn test_stack_graph_key_matches_inode_vertex_layout() {
-        // The two encodings use the same layout, just different semantics
-        // for the first u64 (stack_id vs inode)
-        let stack_encoded = encode_stack_graph_key(42, 100, 200, 300);
-        let inode_encoded = encode_inode_vertex(42, 100, 200, 300);
-
-        assert_eq!(stack_encoded, inode_encoded);
-    }
-
-    #[test]
     fn test_position_encoding_roundtrip() {
         let change_id = 999u64;
         let pos = 12345u64;
@@ -731,26 +627,26 @@ mod tests {
     }
 
     #[test]
-    fn test_stack_seq_encoding_roundtrip() {
-        let stack_id = 1u64;
+    fn test_view_seq_encoding_roundtrip() {
+        let view_id = 1u64;
         let seq = 42u64;
 
-        let encoded = encode_stack_seq(stack_id, seq);
-        let (dec_stack, dec_seq) = decode_stack_seq(&encoded);
+        let encoded = encode_view_seq(view_id, seq);
+        let (dec_view, dec_seq) = decode_view_seq(&encoded);
 
-        assert_eq!(dec_stack, stack_id);
+        assert_eq!(dec_view, view_id);
         assert_eq!(dec_seq, seq);
     }
 
     #[test]
-    fn test_stack_merkle_encoding_roundtrip() {
-        let stack_id = 5u64;
+    fn test_view_merkle_encoding_roundtrip() {
+        let view_id = 5u64;
         let merkle = [0xABu8; 32];
 
-        let encoded = encode_stack_merkle(stack_id, &merkle);
-        let (dec_stack, dec_merkle) = decode_stack_merkle(&encoded);
+        let encoded = encode_view_merkle(view_id, &merkle);
+        let (dec_view, dec_merkle) = decode_view_merkle(&encoded);
 
-        assert_eq!(dec_stack, stack_id);
+        assert_eq!(dec_view, view_id);
         assert_eq!(dec_merkle, merkle);
     }
 
@@ -810,24 +706,9 @@ mod tests {
     }
 
     #[test]
-    fn test_stack_graph_key_ordering_across_byte_boundary() {
-        let k255 = encode_stack_graph_key(255, 1, 0, 10);
-        let k256 = encode_stack_graph_key(256, 1, 0, 10);
-        assert!(k255 < k256, "stack 255 should sort before stack 256");
-
-        // Prefix scan bounds
-        let prefix_255 = encode_stack_graph_prefix(255);
-        let prefix_256 = encode_stack_graph_prefix(256);
-        assert!(
-            prefix_255 < prefix_256,
-            "prefix 255 should sort before prefix 256"
-        );
-    }
-
-    #[test]
-    fn test_stack_seq_ordering_across_byte_boundary() {
-        let s255 = encode_stack_seq(1, 255);
-        let s256 = encode_stack_seq(1, 256);
+    fn test_view_seq_ordering_across_byte_boundary() {
+        let s255 = encode_view_seq(1, 255);
+        let s256 = encode_view_seq(1, 256);
         assert!(s255 < s256, "seq 255 should sort before seq 256");
     }
 

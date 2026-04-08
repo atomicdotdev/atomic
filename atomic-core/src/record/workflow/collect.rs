@@ -65,7 +65,7 @@ use std::collections::HashSet;
 use std::time::SystemTime;
 
 use crate::output::WorkingCopyRead;
-use crate::pristine::{GraphTxnT, StackTxnT, TreeTxnT};
+use crate::pristine::{GraphTxnT, TreeTxnT, ViewTxnT};
 use crate::types::{Inode, NodeId, Position};
 
 use super::super::error::{RecordError, RecordResult};
@@ -361,7 +361,7 @@ pub fn collect_tracked_files<T>(
     prefix: &str,
 ) -> RecordResult<CollectionResult<TrackedFile>>
 where
-    T: GraphTxnT + TreeTxnT + StackTxnT,
+    T: GraphTxnT + TreeTxnT + ViewTxnT,
 {
     let mut result = CollectionResult::new();
 
@@ -542,7 +542,7 @@ where
 /// ```
 pub fn get_tracked_file<T>(txn: &T, path: &str) -> RecordResult<Option<TrackedFile>>
 where
-    T: GraphTxnT + TreeTxnT + StackTxnT,
+    T: GraphTxnT + TreeTxnT + ViewTxnT,
 {
     // Look up the inode for this path
     let inode = match txn

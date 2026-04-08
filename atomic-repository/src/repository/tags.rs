@@ -5,7 +5,7 @@ impl Repository {
 
     /// Create a tag for the current state.
     ///
-    /// Tags are named snapshots of a stack's Merkle state. They can be
+    /// Tags are named snapshots of a view's Merkle state. They can be
     /// lightweight (just name + state) or annotated (with message/author).
     ///
     /// # Arguments
@@ -22,7 +22,7 @@ impl Repository {
     /// Returns an error if:
     /// - The tag name is invalid
     /// - A tag with this name already exists (unless `force` is set)
-    /// - The stack doesn't exist
+    /// - The view doesn't exist
     ///
     /// # Example
     ///
@@ -42,24 +42,24 @@ impl Repository {
             reason: e.to_string(),
         })?;
 
-        // Get current stack state
+        // Get current view state
         let txn = self
             .pristine
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let stack_name = options.stack.as_deref().unwrap_or(&self.current_stack);
-        let stack = txn
-            .get_stack(stack_name)
+        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
+        let view = txn
+            .get_view(view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::StackNotFound {
-                name: stack_name.to_string(),
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
             })?;
 
         // Determine sequence to tag
         let sequence = options
             .sequence
-            .unwrap_or(stack.change_count.saturating_sub(1));
+            .unwrap_or(view.change_count.saturating_sub(1));
 
         // Create the tag
         let tag = if options.is_annotated() {
@@ -67,9 +67,9 @@ impl Repository {
             let author = options
                 .author
                 .unwrap_or_else(|| Author::new("Unknown", None::<String>));
-            Tag::annotated(name, stack_name, sequence, stack.state, message, author)
+            Tag::annotated(name, view_name, sequence, view.state, message, author)
         } else {
-            Tag::new(name, stack_name, sequence, stack.state)
+            Tag::new(name, view_name, sequence, view.state)
         };
 
         // Save to disk
@@ -98,7 +98,7 @@ impl Repository {
         }
     }
 
-    /// Get a tag by name from the current stack.
+    /// Get a tag by name from the current view.
     ///
     /// # Arguments
     ///
@@ -108,32 +108,32 @@ impl Repository {
     ///
     /// The `Tag` if found, or `None` if not.
     pub fn get_tag(&self, name: &str) -> Result<Option<Tag>, RepositoryError> {
-        self.get_tag_from_stack(name, &self.current_stack)
+        self.get_tag_from_view(name, &self.current_view)
     }
 
-    /// Get a tag by name from a specific stack.
+    /// Get a tag by name from a specific view.
     ///
     /// # Arguments
     ///
     /// * `name` - The tag name to look up
-    /// * `stack` - The stack to search in
+    /// * `view` - The view to search in
     ///
     /// # Returns
     ///
     /// The `Tag` if found, or `None` if not.
-    pub fn get_tag_from_stack(
+    pub fn get_tag_from_view(
         &self,
         name: &str,
-        stack: &str,
+        view: &str,
     ) -> Result<Option<Tag>, RepositoryError> {
         let tags_dir = self.dot_dir.join("tags");
-        crate::tags::load_tag(&tags_dir, stack, name)
+        crate::tags::load_tag(&tags_dir, view, name)
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
-    /// Get a tag by name, searching all stacks.
+    /// Get a tag by name, searching all views.
     ///
-    /// This is useful when you don't know which stack a tag belongs to.
+    /// This is useful when you don't know which view a tag belongs to.
     ///
     /// # Arguments
     ///
@@ -141,53 +141,53 @@ impl Repository {
     ///
     /// # Returns
     ///
-    /// The `Tag` if found in any stack, or `None` if not.
-    pub fn get_tag_any_stack(&self, name: &str) -> Result<Option<Tag>, RepositoryError> {
+    /// The `Tag` if found in any view, or `None` if not.
+    pub fn get_tag_any_view(&self, name: &str) -> Result<Option<Tag>, RepositoryError> {
         let tags_dir = self.dot_dir.join("tags");
         crate::tags::load_tag_any_stack(&tags_dir, name)
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
-    /// List all tags for the current stack.
+    /// List all tags for the current view.
     ///
     /// # Returns
     ///
-    /// A vector of tags in the current stack.
+    /// A vector of tags in the current view.
     pub fn list_tags(&self) -> Result<Vec<Tag>, RepositoryError> {
-        self.list_tags_for_stack(&self.current_stack)
+        self.list_tags_for_view(&self.current_view)
     }
 
-    /// List all tags for a specific stack.
+    /// List all tags for a specific view.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The stack to list tags from
+    /// * `view` - The view to list tags from
     ///
     /// # Returns
     ///
-    /// A vector of tags in the specified stack.
-    pub fn list_tags_for_stack(&self, stack: &str) -> Result<Vec<Tag>, RepositoryError> {
+    /// A vector of tags in the specified view.
+    pub fn list_tags_for_view(&self, view: &str) -> Result<Vec<Tag>, RepositoryError> {
         let tags_dir = self.dot_dir.join("tags");
-        crate::tags::list_tags(&tags_dir, stack)
+        crate::tags::list_tags(&tags_dir, view)
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
-    /// List all tags across all stacks.
+    /// List all tags across all views.
     ///
     /// # Returns
     ///
-    /// A vector of all tags in the repository from all stacks.
+    /// A vector of all tags in the repository from all views.
     pub fn list_all_tags(&self) -> Result<Vec<Tag>, RepositoryError> {
         let tags_dir = self.dot_dir.join("tags");
         crate::tags::list_all_tags(&tags_dir).map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
-    /// List all stacks that have tags.
+    /// List all views that have tags.
     ///
     /// # Returns
     ///
-    /// A vector of stack names that have at least one tag.
-    pub fn list_tag_stacks(&self) -> Result<Vec<String>, RepositoryError> {
+    /// A vector of view names that have at least one tag.
+    pub fn list_tag_views(&self) -> Result<Vec<String>, RepositoryError> {
         let tags_dir = self.dot_dir.join("tags");
         crate::tags::list_tag_stacks(&tags_dir)
             .map_err(|e| RepositoryError::Database(e.to_string()))
@@ -208,7 +208,7 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
-    /// Delete a tag from the current stack.
+    /// Delete a tag from the current view.
     ///
     /// # Arguments
     ///
@@ -218,50 +218,50 @@ impl Repository {
     ///
     /// `true` if the tag was deleted, `false` if it didn't exist.
     pub fn delete_tag(&self, name: &str) -> Result<bool, RepositoryError> {
-        self.delete_tag_from_stack(name, &self.current_stack)
+        self.delete_tag_from_view(name, &self.current_view)
     }
 
-    /// Delete a tag from a specific stack.
+    /// Delete a tag from a specific view.
     ///
     /// # Arguments
     ///
     /// * `name` - The tag name to delete
-    /// * `stack` - The stack to delete from
+    /// * `view` - The view to delete from
     ///
     /// # Returns
     ///
     /// `true` if the tag was deleted, `false` if it didn't exist.
-    pub fn delete_tag_from_stack(&self, name: &str, stack: &str) -> Result<bool, RepositoryError> {
+    pub fn delete_tag_from_view(&self, name: &str, view: &str) -> Result<bool, RepositoryError> {
         let tags_dir = self.dot_dir.join("tags");
-        crate::tags::delete_tag(&tags_dir, stack, name)
+        crate::tags::delete_tag(&tags_dir, view, name)
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
-    /// Count the number of tags in the current stack.
+    /// Count the number of tags in the current view.
     ///
     /// # Returns
     ///
-    /// The number of tags in the current stack.
+    /// The number of tags in the current view.
     pub fn tag_count(&self) -> Result<usize, RepositoryError> {
-        self.tag_count_for_stack(&self.current_stack)
+        self.tag_count_for_view(&self.current_view)
     }
 
-    /// Count the number of tags in a specific stack.
+    /// Count the number of tags in a specific view.
     ///
     /// # Arguments
     ///
-    /// * `stack` - The stack to count tags in
+    /// * `view` - The view to count tags in
     ///
     /// # Returns
     ///
-    /// The number of tags in the specified stack.
-    pub fn tag_count_for_stack(&self, stack: &str) -> Result<usize, RepositoryError> {
+    /// The number of tags in the specified view.
+    pub fn tag_count_for_view(&self, view: &str) -> Result<usize, RepositoryError> {
         let tags_dir = self.dot_dir.join("tags");
-        crate::tags::count_tags(&tags_dir, stack)
+        crate::tags::count_tags(&tags_dir, view)
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
-    /// Count all tags across all stacks.
+    /// Count all tags across all views.
     ///
     /// # Returns
     ///

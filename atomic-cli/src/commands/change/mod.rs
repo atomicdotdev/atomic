@@ -14,7 +14,7 @@
 //!                  If omitted, shows the most recent change
 //!
 //! Options:
-//!       --stack <NAME>     Stack to use for sequence lookup (default: current)
+//!       --view <NAME>      View to use for sequence lookup (default: current)
 //!   -f, --format <FORMAT>  Output format (default, short, json)
 //!       --show-deps        Show dependency details
 //!       --show-hunks       Show graph_op details
@@ -78,9 +78,9 @@
 //!
 //! 1. **Full Hash**: The complete 52-character Base32 hash
 //! 2. **Hash Prefix**: An unambiguous prefix (minimum 4 characters)
-//! 3. **Sequence Number**: A numeric index in the stack's history (e.g., `42` or `#42`)
+//! 3. **Sequence Number**: A numeric index in the view's history (e.g., `42` or `#42`)
 //!
-//! If no identifier is provided, the most recent change on the current stack is shown.
+//! If no identifier is provided, the most recent change on the current view is shown.
 //!
 //! # Examples
 //!
@@ -114,7 +114,7 @@ use clap::{Parser, ValueEnum};
 use serde::Serialize;
 
 use atomic_core::change::{Author, Change, GraphOp, Provenance};
-use atomic_core::pristine::StackTxnT;
+use atomic_core::pristine::ViewTxnT;
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::history::{find_change_sequence, get_change_at_sequence};
 use atomic_repository::Repository;

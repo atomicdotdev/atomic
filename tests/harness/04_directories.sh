@@ -9,7 +9,7 @@
 #   - Directory deletion: remove dir contents → record → status
 #   - Directory rename/move
 #   - Mixed directory + file operations
-#   - Cross-stack directory isolation
+#   - Cross-view directory isolation
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
@@ -342,16 +342,16 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Directory: Cross-stack directory isolation"
+begin_section "Directory: Cross-view directory isolation"
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # Record a directory on feature, switch to dev, directory should not exist.
 
-make_temp_repo "dir-cross-stack"
+make_temp_repo "dir-cross-view"
 init_repo
 
-new_stack "feature" >/dev/null 2>&1 || true
-switch_stack "feature" >/dev/null 2>&1 || true
+new_view "feature" >/dev/null 2>&1 || true
+switch_view "feature" >/dev/null 2>&1 || true
 
 create_file "feature_dir/module.rs" "mod feature;"
 create_file "feature_dir/types.rs" "struct Foo;"
@@ -366,7 +366,7 @@ assert_file_exists "feature_dir/module.rs on feature" "feature_dir/module.rs"
 assert_file_exists "feature_dir/types.rs on feature" "feature_dir/types.rs"
 
 # Switch to dev
-switch_stack "dev" >/dev/null 2>&1 || true
+switch_view "dev" >/dev/null 2>&1 || true
 
 # Directory and contents should NOT exist
 assert_file_not_exists "feature_dir/module.rs NOT on dev" "feature_dir/module.rs"
@@ -374,23 +374,23 @@ assert_file_not_exists "feature_dir/types.rs NOT on dev" "feature_dir/types.rs"
 assert_dir_not_exists "feature_dir NOT on dev" "feature_dir"
 
 # Switch back to feature — everything reappears
-switch_stack "feature" >/dev/null 2>&1 || true
+switch_view "feature" >/dev/null 2>&1 || true
 assert_dir_exists "feature_dir on feature (round 2)" "feature_dir"
 assert_file_exists "feature_dir/module.rs on feature (round 2)" "feature_dir/module.rs"
 assert_file_exists "feature_dir/types.rs on feature (round 2)" "feature_dir/types.rs"
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Directory: Cross-stack nested directory cleanup"
+begin_section "Directory: Cross-view nested directory cleanup"
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # Deeply nested directories should be fully cleaned up (empty parents removed)
-# when switching away from the stack that owns them.
+# when switching away from the view that owns them.
 
 make_temp_repo "dir-cross-nested-cleanup"
 init_repo
 
-new_stack "deep-feature" >/dev/null 2>&1 || true
-switch_stack "deep-feature" >/dev/null 2>&1 || true
+new_view "deep-feature" >/dev/null 2>&1 || true
+switch_view "deep-feature" >/dev/null 2>&1 || true
 
 create_file "src/services/auth/handler.rs" "fn auth() {}"
 create_file "src/services/auth/middleware.rs" "fn middleware() {}"
@@ -402,7 +402,7 @@ record_change "Add auth service" >/dev/null 2>&1 || true
 assert_dir_exists "src/services/auth on deep-feature" "src/services/auth"
 
 # Switch to dev — entire src/services/auth tree should vanish
-switch_stack "dev" >/dev/null 2>&1 || true
+switch_view "dev" >/dev/null 2>&1 || true
 
 assert_file_not_exists "handler.rs NOT on dev" "src/services/auth/handler.rs"
 assert_file_not_exists "middleware.rs NOT on dev" "src/services/auth/middleware.rs"
@@ -411,22 +411,22 @@ assert_dir_not_exists "src/services/auth NOT on dev" "src/services/auth"
 assert_dir_not_exists "src/services NOT on dev" "src/services"
 
 # Switch back
-switch_stack "deep-feature" >/dev/null 2>&1 || true
+switch_view "deep-feature" >/dev/null 2>&1 || true
 assert_dir_exists "src/services/auth reappears" "src/services/auth"
 assert_file_exists "handler.rs reappears" "src/services/auth/handler.rs"
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Directory: Apply directory from feature to dev"
+begin_section "Directory: Insert directory from feature to dev"
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Continuing from previous
-apply_from_stack "deep-feature" "dev" >/dev/null 2>&1 || true
+insert_from_view "deep-feature" "dev" >/dev/null 2>&1 || true
 
-switch_stack "dev" >/dev/null 2>&1 || true
+switch_view "dev" >/dev/null 2>&1 || true
 
-assert_dir_exists "src/services/auth on dev after apply" "src/services/auth"
-assert_file_exists "handler.rs on dev after apply" "src/services/auth/handler.rs"
-assert_file_exists "middleware.rs on dev after apply" "src/services/auth/middleware.rs"
+assert_dir_exists "src/services/auth on dev after insert" "src/services/auth"
+assert_file_exists "handler.rs on dev after insert" "src/services/auth/handler.rs"
+assert_file_exists "middleware.rs on dev after insert" "src/services/auth/middleware.rs"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Partial directory add (non-recursive)"
@@ -599,7 +599,7 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Directory: Cross-stack with shared and unique directories"
+begin_section "Directory: Cross-view with shared and unique directories"
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # Dev has src/core/, feature adds src/feature/.
@@ -615,9 +615,9 @@ assert_success "add src/core/engine.rs" atomic add src/core/engine.rs
 record_change "Add core engine" >/dev/null 2>&1 || true
 
 # Create feature from dev
-new_stack "feature" >/dev/null 2>&1 || true
-apply_from_stack "dev" "feature" >/dev/null 2>&1 || true
-switch_stack "feature" >/dev/null 2>&1 || true
+new_view "feature" >/dev/null 2>&1 || true
+insert_from_view "dev" "feature" >/dev/null 2>&1 || true
+switch_view "feature" >/dev/null 2>&1 || true
 
 # Add feature-specific directory
 create_file "src/feature/widget.rs" "fn widget() {}"
@@ -631,7 +631,7 @@ assert_dir_exists "src/feature on feature" "src/feature"
 assert_file_exists "src/feature/widget.rs on feature" "src/feature/widget.rs"
 
 # Switch to dev
-switch_stack "dev" >/dev/null 2>&1 || true
+switch_view "dev" >/dev/null 2>&1 || true
 
 # src/core should exist, src/feature should NOT
 assert_dir_exists "src/core on dev" "src/core"
@@ -643,7 +643,7 @@ assert_dir_not_exists "src/feature NOT on dev" "src/feature"
 assert_dir_exists "src/ still exists on dev (has core/)" "src"
 
 # Switch back
-switch_stack "feature" >/dev/null 2>&1 || true
+switch_view "feature" >/dev/null 2>&1 || true
 assert_dir_exists "src/feature reappears on feature" "src/feature"
 assert_file_exists "src/feature/widget.rs reappears" "src/feature/widget.rs"
 
@@ -663,7 +663,7 @@ fi
 assert_file_exists "widget.rs still on disk after unrecord" "src/feature/widget.rs"
 
 # Switch to dev
-switch_stack "dev" >/dev/null 2>&1 || true
+switch_view "dev" >/dev/null 2>&1 || true
 
 # src/core should still be here
 assert_file_exists "src/core/engine.rs still on dev" "src/core/engine.rs"

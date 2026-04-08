@@ -16,7 +16,7 @@
 //!
 //! The push command performs the following workflow:
 //!
-//! 1. **Open local repository** and determine current stack
+//! 1. **Open local repository** and determine current view
 //! 2. **Load remote configuration** from repository settings
 //! 3. **Connect to remote** using HTTP client
 //! 4. **Query remote state** to determine what changes exist remotely

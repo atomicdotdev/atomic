@@ -3,7 +3,7 @@
 //! This module contains the `Pull` struct and its `Command` implementation,
 //! which orchestrates the pull operation from the CLI. The pull command
 //! downloads changes from a remote repository and applies them to the local
-//! stack.
+//! view.
 //!
 //! # Architecture
 //!
@@ -13,7 +13,7 @@
 //! 2. **Connection**: Connect to the remote using HTTP
 //! 3. **Comparison**: Query remote and local state, calculate delta
 //! 4. **Download**: Fetch missing changes from the remote
-//! 5. **Application**: Apply downloaded changes to the local stack
+//! 5. **Application**: Apply downloaded changes to the local view
 //! 6. **Reporting**: Display results to the user
 //!
 //! # Error Handling
@@ -33,13 +33,13 @@ use clap::Parser;
 use atomic_core::types::Base32;
 use atomic_remote::{HttpRemote, HttpRemoteConfig};
 use atomic_repository::history::HistoryOptions;
-use atomic_repository::Repository;
+use atomic_repository::{InsertOptions, Repository};
 
 use crate::commands::{find_repository_root, format_hash, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{
     create_progress_bar, create_spinner, error, finish_error, finish_success, hash as style_hash,
-    hint, print_blank, print_hint, print_success, print_warning, stack as style_stack, success,
+    hint, print_blank, print_hint, print_success, print_warning, success, view as style_view,
     warning,
 };
 
@@ -66,7 +66,7 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Pull changes from a remote repository.
 ///
-/// Downloads remote changes and applies them to the local stack, bringing
+/// Downloads remote changes and applies them to the local view, bringing
 /// the local repository up to date with the remote.
 ///
 /// # Remote Configuration
@@ -75,11 +75,11 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// remote is "origin", but you can specify any configured remote or
 /// provide a URL directly.
 ///
-/// # Stack Mapping
+/// # View Mapping
 ///
-/// By default, changes are pulled from the remote stack with the same
-/// name as the local stack. Use `--from-stack` to pull from a different
-/// remote stack, and `--to-stack` to apply to a different local stack.
+/// By default, changes are pulled from the remote view with the same
+/// name as the local view. Use `--from-view` to pull from a different
+/// remote view, and `--to-view` to apply to a different local view.
 ///
 /// # Examples
 ///
@@ -90,8 +90,8 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// # Pull from a specific remote
 /// atomic pull upstream
 ///
-/// # Pull from a different stack
-/// atomic pull --from-stack main
+/// # Pull from a different view
+/// atomic pull --from-view main
 ///
 /// # Preview what would be pulled
 /// atomic pull --dry-run
@@ -109,17 +109,17 @@ pub struct Pull {
     #[arg(default_value = DEFAULT_REMOTE)]
     pub remote: String,
 
-    /// Local stack to pull into.
+    /// Local view to pull into.
     ///
-    /// If not specified, uses the current stack.
-    #[arg(long = "to-stack")]
-    pub to_stack: Option<String>,
+    /// If not specified, uses the current view.
+    #[arg(long = "to-view")]
+    pub to_view: Option<String>,
 
-    /// Remote stack to pull from.
+    /// Remote view to pull from.
     ///
-    /// If not specified, uses the same name as the local stack.
-    #[arg(long = "from-stack")]
-    pub from_stack: Option<String>,
+    /// If not specified, uses the same name as the local view.
+    #[arg(long = "from-view")]
+    pub from_view: Option<String>,
 
     /// Show what would be pulled without actually pulling.
     ///
@@ -147,9 +147,9 @@ pub struct Pull {
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
     pub timeout: u64,
 
-    /// Download changes without applying them to the local stack.
+    /// Download changes without applying them to the local view.
     ///
-    /// Changes are saved to the change store but not applied to any stack.
+    /// Changes are saved to the change store but not applied to any view.
     /// Useful for pre-fetching changes or examining them before applying.
     #[arg(long)]
     pub download_only: bool,
@@ -170,8 +170,8 @@ impl Pull {
     pub fn new() -> Self {
         Self {
             remote: DEFAULT_REMOTE.to_string(),
-            to_stack: None,
-            from_stack: None,
+            to_view: None,
+            from_view: None,
             dry_run: false,
             all: false,
             insecure: false,
@@ -186,15 +186,15 @@ impl Pull {
         self
     }
 
-    /// Builder: set the local stack to pull into.
-    pub fn with_to_stack(mut self, stack: impl Into<String>) -> Self {
-        self.to_stack = Some(stack.into());
+    /// Builder: set the local view to pull into.
+    pub fn with_to_view(mut self, view: impl Into<String>) -> Self {
+        self.to_view = Some(view.into());
         self
     }
 
-    /// Builder: set the remote stack to pull from.
-    pub fn with_from_stack(mut self, stack: impl Into<String>) -> Self {
-        self.from_stack = Some(stack.into());
+    /// Builder: set the remote view to pull from.
+    pub fn with_from_view(mut self, view: impl Into<String>) -> Self {
+        self.from_view = Some(view.into());
         self
     }
 
@@ -253,22 +253,22 @@ impl Pull {
         }
     }
 
-    /// Get the local stack name to pull into.
+    /// Get the local view name to pull into.
     ///
-    /// Returns the explicitly specified stack or the repository's current stack.
-    fn get_local_stack(&self, repo: &Repository) -> String {
-        self.to_stack
+    /// Returns the explicitly specified view or the repository's current view.
+    fn get_local_view(&self, repo: &Repository) -> String {
+        self.to_view
             .clone()
-            .unwrap_or_else(|| repo.current_stack().to_string())
+            .unwrap_or_else(|| repo.current_view().to_string())
     }
 
-    /// Get the remote stack name to pull from.
+    /// Get the remote view name to pull from.
     ///
-    /// Returns the explicitly specified stack or defaults to the local stack name.
-    fn get_remote_stack(&self, local_stack: &str) -> String {
-        self.from_stack
+    /// Returns the explicitly specified view or defaults to the local view name.
+    fn get_remote_view(&self, local_view: &str) -> String {
+        self.from_view
             .clone()
-            .unwrap_or_else(|| local_stack.to_string())
+            .unwrap_or_else(|| local_view.to_string())
     }
 
     /// Build the HTTP remote configuration.
@@ -289,7 +289,7 @@ impl Pull {
     fn display_dry_run(
         &self,
         remote_url: &str,
-        remote_stack: &str,
+        remote_view: &str,
         to_download: &[PullChange],
     ) -> CliResult<()> {
         if to_download.is_empty() {
@@ -298,10 +298,10 @@ impl Pull {
         }
 
         println!(
-            "Would pull {} from {} (stack: {}):",
+            "Would pull {} from {} (view: {}):",
             format_count(to_download.len(), "change"),
             self.remote,
-            remote_stack
+            remote_view
         );
         print_blank();
 
@@ -355,14 +355,14 @@ impl Pull {
         // Resolve remote URL
         let remote_url = self.resolve_remote_url(&repo)?;
 
-        // Determine stacks
-        let local_stack = self.get_local_stack(&repo);
-        let remote_stack = self.get_remote_stack(&local_stack);
+        // Determine views
+        let local_view = self.get_local_view(&repo);
+        let remote_view = self.get_remote_view(&local_view);
 
         // Print header
         println!(
             "Pulling from {} ({})",
-            style_stack(&self.remote),
+            style_view(&self.remote),
             hint(&remote_url)
         );
 
@@ -377,7 +377,7 @@ impl Pull {
 
         // Query remote state
         let spinner = create_spinner("Querying remote state...");
-        let remote_state = remote.get_state(&remote_stack).await.map_err(|e| {
+        let remote_state = remote.get_state(&remote_view).await.map_err(|e| {
             finish_error(&spinner, "Failed to query state");
             convert_remote_error(e, &remote_url)
         })?;
@@ -387,7 +387,7 @@ impl Pull {
         let spinner = create_spinner("Fetching remote changelist...");
         let remote_from = 0; // Always get full changelist for comparison
         let remote_entries = remote
-            .get_changelist(&remote_stack, remote_from)
+            .get_changelist(&remote_view, remote_from)
             .await
             .map_err(|e| {
                 finish_error(&spinner, "Failed to fetch changelist");
@@ -411,9 +411,9 @@ impl Pull {
         // Display state comparison
         print_blank();
         display_state_comparison(
-            &local_stack,
+            &local_view,
             &local_entries,
-            &remote_stack,
+            &remote_view,
             &remote_state,
             &remote_entries,
         );
@@ -430,7 +430,7 @@ impl Pull {
 
         // Handle dry run
         if self.dry_run {
-            return self.display_dry_run(&remote_url, &remote_stack, &to_download);
+            return self.display_dry_run(&remote_url, &remote_view, &to_download);
         }
 
         // Check for nothing to pull
@@ -517,23 +517,36 @@ impl Pull {
         if self.download_only {
             print_blank();
             print_success(&format!(
-                "Downloaded {} (not applied - use 'atomic apply' to apply)",
+                "Downloaded {} (not inserted - use 'atomic insert' to insert)",
                 format_count(stats.changes_downloaded, "change")
             ));
             return Ok(());
         }
 
-        // Apply downloaded changes to the local stack
+        // Apply downloaded changes to the local view
         print_blank();
-        let spinner = create_spinner("Applying changes to stack...");
+        let spinner = create_spinner("Applying changes to view...");
 
-        // Note: Full apply implementation would iterate through downloaded changes
-        // and apply them to the stack. For now, we indicate this is a future feature.
-        for _change in &to_download {
-            // In a full implementation, this would call repo.apply_change()
-            // For now, we just count them as applied
-            if !stats.has_failures() {
-                stats.record_applied();
+        // Apply downloaded changes to the local view in sequence order.
+        // Changes that failed to save during download are skipped gracefully
+        // by insert_change_rec (it will return a "change not found" error).
+        let mut apply_errors: Vec<String> = Vec::new();
+
+        for change in &to_download {
+            let options = InsertOptions::default().apply_deps(true).view(&local_view);
+
+            match repo.insert_change_rec(&change.hash, options) {
+                Ok(_outcome) => {
+                    stats.record_applied();
+                }
+                Err(e) => {
+                    // Log but don't abort — other changes may still apply
+                    apply_errors.push(format!(
+                        "Failed to apply {}: {}",
+                        format_hash(&change.hash, false),
+                        e
+                    ));
+                }
             }
         }
 
@@ -543,11 +556,39 @@ impl Pull {
                 &format!(
                     "Applied {} to {}",
                     format_count(stats.changes_applied, "change"),
-                    local_stack
+                    local_view
                 ),
             );
         } else {
             finish_error(&spinner, "No changes were applied");
+        }
+
+        // Report any per-change apply errors
+        if !apply_errors.is_empty() {
+            for err in &apply_errors {
+                print_warning(err);
+            }
+        }
+
+        // Materialize the working copy so on-disk files reflect the new state
+        if stats.has_applied() {
+            let mat_spinner = create_spinner("Updating working copy...");
+            match repo.materialize() {
+                Ok(result) => {
+                    finish_success(
+                        &mat_spinner,
+                        &format!("{} files updated", result.files_written),
+                    );
+                }
+                Err(e) => {
+                    finish_error(&mat_spinner, "Failed to update working copy");
+                    print_warning(&format!(
+                        "Applied {} but failed to update working copy: {}",
+                        format_count(stats.changes_applied, "change"),
+                        e
+                    ));
+                }
+            }
         }
 
         // Final summary
@@ -561,7 +602,7 @@ impl Pull {
             print_success(&format!(
                 "Pull complete: {} downloaded and applied to {}",
                 format_count(stats.changes_downloaded, "change"),
-                local_stack
+                local_view
             ));
         }
 
@@ -613,8 +654,8 @@ mod tests {
         let pull = Pull::new();
 
         assert_eq!(pull.remote, DEFAULT_REMOTE);
-        assert!(pull.to_stack.is_none());
-        assert!(pull.from_stack.is_none());
+        assert!(pull.to_view.is_none());
+        assert!(pull.from_view.is_none());
         assert!(!pull.dry_run);
         assert!(!pull.all);
         assert!(!pull.insecure);
@@ -643,18 +684,18 @@ mod tests {
         assert_eq!(pull.remote, "https://example.com/repo");
     }
 
-    /// Test with_to_stack builder method.
+    /// Test with_to_view builder method.
     #[test]
-    fn test_pull_with_to_stack() {
-        let pull = Pull::new().with_to_stack("feature");
-        assert_eq!(pull.to_stack, Some("feature".to_string()));
+    fn test_pull_with_to_view() {
+        let pull = Pull::new().with_to_view("feature");
+        assert_eq!(pull.to_view, Some("feature".to_string()));
     }
 
-    /// Test with_from_stack builder method.
+    /// Test with_from_view builder method.
     #[test]
-    fn test_pull_with_from_stack() {
-        let pull = Pull::new().with_from_stack("main");
-        assert_eq!(pull.from_stack, Some("main".to_string()));
+    fn test_pull_with_from_view() {
+        let pull = Pull::new().with_from_view("main");
+        assert_eq!(pull.from_view, Some("main".to_string()));
     }
 
     /// Test with_dry_run builder method.
@@ -700,8 +741,8 @@ mod tests {
     fn test_pull_builder_chain() {
         let pull = Pull::new()
             .with_remote("upstream")
-            .with_to_stack("feature")
-            .with_from_stack("main")
+            .with_to_view("feature")
+            .with_from_view("main")
             .with_dry_run(true)
             .with_all(true)
             .with_insecure(true)
@@ -709,8 +750,8 @@ mod tests {
             .with_download_only(true);
 
         assert_eq!(pull.remote, "upstream");
-        assert_eq!(pull.to_stack, Some("feature".to_string()));
-        assert_eq!(pull.from_stack, Some("main".to_string()));
+        assert_eq!(pull.to_view, Some("feature".to_string()));
+        assert_eq!(pull.from_view, Some("main".to_string()));
         assert!(pull.dry_run);
         assert!(pull.all);
         assert!(pull.insecure);
@@ -740,18 +781,18 @@ mod tests {
 
     // Internal Method Tests
 
-    /// Test get_remote_stack with explicit stack.
+    /// Test get_remote_view with explicit view.
     #[test]
-    fn test_get_remote_stack_explicit() {
-        let pull = Pull::new().with_from_stack("production");
-        assert_eq!(pull.get_remote_stack("dev"), "production");
+    fn test_get_remote_view_explicit() {
+        let pull = Pull::new().with_from_view("production");
+        assert_eq!(pull.get_remote_view("dev"), "production");
     }
 
-    /// Test get_remote_stack defaults to local stack name.
+    /// Test get_remote_view defaults to local view name.
     #[test]
-    fn test_get_remote_stack_default() {
+    fn test_get_remote_view_default() {
         let pull = Pull::new();
-        assert_eq!(pull.get_remote_stack("feature"), "feature");
+        assert_eq!(pull.get_remote_view("feature"), "feature");
     }
 
     /// Test build_remote_config with default settings.

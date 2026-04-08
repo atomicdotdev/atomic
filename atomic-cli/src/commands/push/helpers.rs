@@ -33,7 +33,7 @@ use atomic_repository::history::HistoryEntry;
 use atomic_repository::Repository;
 
 use crate::error::{CliError, CliResult};
-use crate::output::{info, stack as style_stack};
+use crate::output::{info, view as style_view};
 
 use super::types::PushChange;
 
@@ -70,7 +70,7 @@ pub fn calculate_push_delta(
     graph_hashes: &HashSet<String>,
     push_all: bool,
 ) -> CliResult<Vec<PushChange>> {
-    // Build set of remote hashes for quick lookup (changes already in this stack)
+    // Build set of remote hashes for quick lookup (changes already in this view)
     let remote_hashes: HashSet<String> = remote_entries.iter().map(|e| e.hash.clone()).collect();
 
     let mut to_upload = Vec::new();
@@ -78,7 +78,7 @@ pub fn calculate_push_delta(
     for entry in local_entries {
         let hash_str = entry.hash.to_base32();
 
-        // Skip if already on this stack on the remote (unless pushing all)
+        // Skip if already on this view on the remote (unless pushing all)
         if !push_all && remote_hashes.contains(&hash_str) {
             continue;
         }
@@ -86,8 +86,8 @@ pub fn calculate_push_delta(
         // Try to load the change header to get the message
         let message = load_change_message(repo, &entry.hash);
 
-        // Check if the change is already in the remote graph (via another stack).
-        // If so, only stack adoption is needed — no data transfer.
+        // Check if the change is already in the remote graph (via another view).
+        // If so, only view adoption is needed — no data transfer.
         let already_in_graph = graph_hashes.contains(&hash_str);
 
         let push_change = PushChange::new(entry.hash, entry.sequence, entry.state)
@@ -278,7 +278,7 @@ impl std::fmt::Display for PushTransferResult {
 /// * `remote` - The HTTP remote to push to.
 /// * `repo` - The local repository.
 /// * `hash` - The change hash.
-/// * `stack` - The target stack name on the remote.
+/// * `view` - The target view name on the remote.
 ///
 /// # Returns
 ///
@@ -287,7 +287,7 @@ pub async fn upload_change_smart(
     remote: &atomic_remote::HttpRemote,
     repo: &Repository,
     hash: &Hash,
-    stack: &str,
+    view: &str,
 ) -> CliResult<PushTransferResult> {
     let change_data = load_change_data(repo, hash)?;
     let data_len = change_data.len();
@@ -297,7 +297,7 @@ pub async fn upload_change_smart(
         // FAST PATH: small change — send directly, no negotiation.
         // This covers 99% of source code changes.
         remote
-            .upload_change(&hash_str, stack, change_data)
+            .upload_change(&hash_str, view, change_data)
             .await
             .map_err(|e| convert_remote_error(e, remote.url().as_ref()))?;
 
@@ -329,7 +329,7 @@ pub async fn upload_change_smart(
                 // TODO: Implement POST ?negotiate_chunks with our manifest body
                 //       Server responds with { "need": [indices] }
                 remote
-                    .upload_change(&hash_str, stack, change_data)
+                    .upload_change(&hash_str, view, change_data)
                     .await
                     .map_err(|e| convert_remote_error(e, remote.url().as_ref()))?;
 
@@ -338,7 +338,7 @@ pub async fn upload_change_smart(
             Ok(None) | Err(_) => {
                 // Server doesn't support manifests or error — direct send.
                 remote
-                    .upload_change(&hash_str, stack, change_data)
+                    .upload_change(&hash_str, view, change_data)
                     .await
                     .map_err(|e| convert_remote_error(e, remote.url().as_ref()))?;
 
@@ -387,8 +387,8 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
             message: "Repository not found on remote".to_string(),
             url: Some(url.to_string()),
         },
-        RemoteError::StackNotFound { stack } => CliError::RemoteError {
-            message: format!("Stack '{}' not found on remote", stack),
+        RemoteError::ViewNotFound { view } => CliError::RemoteError {
+            message: format!("View '{}' not found on remote", view),
             url: Some(url.to_string()),
         },
         RemoteError::ChangeNotFound { hash } => CliError::ChangeNotFound { hash },
@@ -432,15 +432,15 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
 ///
 /// # Arguments
 ///
-/// * `local_stack` - Name of the local stack
+/// * `local_view` - Name of the local view
 /// * `local_entries` - Local history entries
-/// * `remote_stack` - Name of the remote stack
+/// * `remote_view` - Name of the remote view
 /// * `remote_state` - Current state of the remote
 /// * `remote_entries` - Remote changelist entries
 pub fn display_state_comparison(
-    local_stack: &str,
+    local_view: &str,
     local_entries: &[HistoryEntry],
-    remote_stack: &str,
+    remote_view: &str,
     remote_state: &StateResponse,
     remote_entries: &[ChangelistEntry],
 ) {
@@ -449,12 +449,12 @@ pub fn display_state_comparison(
 
     println!(
         "  Local:  {} at {}",
-        style_stack(local_stack),
+        style_view(local_view),
         info(&local_state_str)
     );
     println!(
         "  Remote: {} at {}",
-        style_stack(remote_stack),
+        style_view(remote_view),
         info(&remote_state_str)
     );
 }
@@ -603,8 +603,8 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_stack_not_found() {
-        let err = RemoteError::stack_not_found("main");
+    fn test_convert_view_not_found() {
+        let err = RemoteError::view_not_found("main");
         let cli_err = convert_remote_error(err, "http://example.com");
 
         match cli_err {

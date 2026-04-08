@@ -244,7 +244,7 @@ pub enum Action {
     /// Replaces Entire CLI's `ActionCondense`. The orchestrator should:
     /// 1. Call `watcher.end_turn()` to get `TurnChanges`
     /// 2. Call `record_turn()` to create an Atomic change
-    /// 3. Apply the change to the agent's stack
+    /// 3. Apply the change to the agent's view
     RecordTurn,
 
     /// Record only if files were actually modified during the turn.

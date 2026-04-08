@@ -152,7 +152,7 @@ impl Command for AgentStatus {
                     session.duration_display(),
                 );
                 if self.verbose {
-                    println!("      Stack: {}", session.stack_name);
+                    println!("      View: {}", session.view_name);
                     println!("      Phase: {}", session.phase);
                     if !session.model.is_empty() {
                         println!("      Model: {}", session.model);
@@ -183,8 +183,8 @@ impl Command for AgentStatus {
                         println!("      Transcript: {}", path.display());
                     }
                     println!(
-                        "      View turn: atomic change -p --stack {}",
-                        session.stack_name
+                        "      View turn: atomic change -p --view {}",
+                        session.view_name
                     );
                     println!();
                 }
@@ -213,7 +213,7 @@ impl Command for AgentStatus {
                     session.duration_display(),
                 );
                 if self.verbose {
-                    println!("      Stack: {}", session.stack_name);
+                    println!("      View: {}", session.view_name);
                     if !session.model.is_empty() {
                         println!("      Model: {}", session.model);
                     }
@@ -224,8 +224,8 @@ impl Command for AgentStatus {
                         println!("      Files touched: {}", session.files_touched.len());
                     }
                     println!(
-                        "      View turn: atomic change -p --stack {}",
-                        session.stack_name
+                        "      View turn: atomic change -p --view {}",
+                        session.view_name
                     );
                     println!();
                 }

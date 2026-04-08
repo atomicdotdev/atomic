@@ -21,7 +21,7 @@ begin_section "Single File: Init → Status (empty repo)"
 make_temp_repo "single-file"
 init_repo
 
-assert_current_stack "initial stack is dev" "dev"
+assert_current_view "initial view is dev" "dev"
 
 # An empty repo should be clean
 out="$(get_status)"

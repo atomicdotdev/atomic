@@ -1,15 +1,15 @@
 //! The `stash` command for temporarily saving uncommitted changes.
 //!
 //! This module implements the `atomic stash` command, which saves uncommitted
-//! working copy changes to a temporary orphan stack and restores the working
-//! copy to a clean state. This is useful when you need to switch stacks but
+//! working copy changes to a temporary orphan view and restores the working
+//! copy to a clean state. This is useful when you need to switch views but
 //! have uncommitted changes that belong elsewhere.
 //!
 //! # Concept
 //!
-//! Unlike Git's stash which uses a special ref, Atomic stash uses **orphan stacks**
-//! as temporary holding areas. An orphan stack has no history, making it lightweight
-//! and stack-agnostic - the stashed changes can be applied to any stack later.
+//! Unlike Git's stash which uses a special ref, Atomic stash uses **orphan views**
+//! as temporary holding areas. An orphan view has no history, making it lightweight
+//! and view-agnostic - the stashed changes can be applied to any view later.
 //!
 //! # Usage
 //!
@@ -55,7 +55,7 @@
 //!
 //! ```text
 //! $ atomic status
-//! On stack dev
+//! On view dev
 //! Changes to be recorded:
 //!     modified: src/auth.rs
 //!
@@ -63,8 +63,8 @@
 //! ✓ Saved working copy to stash@{0}
 //! ✓ Working copy restored to clean state
 //!
-//! $ atomic stack switch feature/auth
-//! ✓ Switched to stack: feature/auth
+//! $ atomic view switch feature/auth
+//! ✓ Switched to view: feature/auth
 //!
 //! $ atomic stash pop
 //! ✓ Applied stash@{0} to working copy
@@ -83,11 +83,11 @@ use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, format_timestamp_relative, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{print_blank, print_hint, print_success, print_warning, stack as style_stack};
+use crate::output::{print_blank, print_hint, print_success, print_warning, view as style_view};
 
 // Constants
 
-/// Prefix for stash stack names.
+/// Prefix for stash view names.
 const STASH_PREFIX: &str = "stash/";
 
 /// Default message for stashes without a custom message.
@@ -98,8 +98,8 @@ const DEFAULT_STASH_MESSAGE: &str = "WIP";
 /// Temporarily save uncommitted changes.
 ///
 /// Stash saves your uncommitted working copy changes to a temporary
-/// orphan stack, then restores the working copy to a clean state.
-/// You can later apply the stashed changes to any stack.
+/// orphan view, then restores the working copy to a clean state.
+/// You can later apply the stashed changes to any view.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "stash")]
 pub struct Stash {
@@ -200,10 +200,10 @@ pub enum StashSubcommand {
 pub struct StashEntry {
     /// Index of the stash (0 = most recent).
     pub index: usize,
-    /// Name of the stash stack.
+    /// Name of the stash view.
     pub stack_name: String,
-    /// Stack the stash was created from.
-    pub source_stack: String,
+    /// View the stash was created from.
+    pub source_view: String,
     /// Message describing the stash.
     pub message: String,
     /// When the stash was created.
@@ -224,7 +224,7 @@ impl StashEntry {
         format!(
             "{}: On {}: {}",
             self.reference(),
-            self.source_stack,
+            self.source_view,
             self.message
         )
     }
@@ -280,25 +280,25 @@ impl Stash {
         self
     }
 
-    /// List all stash stacks, sorted by creation time (newest first).
+    /// List all stash views, sorted by creation time (newest first).
     fn list_stashes(&self, repo: &Repository) -> CliResult<Vec<StashEntry>> {
-        let stacks = repo.list_stacks().map_err(CliError::Repository)?;
+        let views = repo.list_views().map_err(CliError::Repository)?;
 
-        let mut stashes: Vec<StashEntry> = stacks
+        let mut stashes: Vec<StashEntry> = views
             .into_iter()
             .filter(|name| name.starts_with(STASH_PREFIX))
             .filter_map(|name| {
-                // Parse stash metadata from stack info
-                let _info = repo.get_stack_info(&name).ok()?;
+                // Parse stash metadata from view info
+                let _info = repo.get_view_info(&name).ok()?;
 
-                // Extract source stack and message from stack name or metadata
+                // Extract source view and message from view name or metadata
                 // Format: stash/auto_{timestamp} or stash/{source}_{timestamp}_{message}
                 let parts: Vec<&str> = name
                     .trim_start_matches(STASH_PREFIX)
                     .splitn(3, '_')
                     .collect();
 
-                let (source_stack, message, timestamp) = if parts.len() >= 2 {
+                let (source_view, message, timestamp) = if parts.len() >= 2 {
                     let ts: i64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
                     let src = if parts[0] == "auto" {
                         "unknown".to_string()
@@ -320,7 +320,7 @@ impl Stash {
                 Some(StashEntry {
                     index: 0, // Will be set after sorting
                     stack_name: name,
-                    source_stack,
+                    source_view,
                     message,
                     created_at,
                 })
@@ -338,7 +338,7 @@ impl Stash {
         Ok(stashes)
     }
 
-    /// Parse a stash reference (e.g., "stash@{0}", "0", or stack name).
+    /// Parse a stash reference (e.g., "stash@{0}", "0", or view name).
     fn parse_stash_ref(&self, repo: &Repository, reference: Option<&str>) -> CliResult<StashEntry> {
         let stashes = self.list_stashes(repo)?;
 
@@ -367,7 +367,7 @@ impl Stash {
             });
         }
 
-        // Try as stack name
+        // Try as view name
         let full_name = if reference.starts_with(STASH_PREFIX) {
             reference.to_string()
         } else {
@@ -400,17 +400,17 @@ impl Stash {
             return Ok(());
         }
 
-        // Get current stack for metadata
-        let source_stack = repo.current_stack().to_string();
+        // Get current view for metadata
+        let source_view = repo.current_view().to_string();
 
         // Generate stash message
         let stash_message = message
             .or_else(|| self.message.clone())
             .unwrap_or_else(|| DEFAULT_STASH_MESSAGE.to_string());
 
-        // Create stash stack name with metadata
+        // Create stash view name with metadata
         let timestamp = Utc::now().timestamp_millis();
-        let safe_source = source_stack.replace('/', "-");
+        let safe_source = source_view.replace('/', "-");
         let safe_message = stash_message
             .chars()
             .take(30)
@@ -423,8 +423,8 @@ impl Stash {
             STASH_PREFIX, safe_source, timestamp, safe_message
         );
 
-        // Create orphan stash stack
-        repo.create_stack(&stash_name)
+        // Create orphan stash view
+        repo.create_view(&stash_name)
             .map_err(CliError::Repository)?;
 
         // ── Save dirty files as raw bytes to a sidecar directory ────────
@@ -511,7 +511,7 @@ impl Stash {
 
         // Restore working copy to clean state (unless --keep)
         if !keep && !self.keep {
-            repo.output_working_copy().map_err(CliError::Repository)?;
+            repo.materialize().map_err(CliError::Repository)?;
             print_success("Working copy restored to clean state");
         }
 
@@ -525,8 +525,8 @@ impl Stash {
         // Apply the stash
         self.apply_stash(repo, &stash)?;
 
-        // Delete the stash stack
-        repo.delete_stack(&stash.stack_name)
+        // Delete the stash view
+        repo.delete_view(&stash.stack_name)
             .map_err(CliError::Repository)?;
 
         print_success(&format!("Dropped {}", stash.reference()));
@@ -609,7 +609,7 @@ impl Stash {
             println!(
                 "{}: On {}: {} ({})",
                 stash.reference(),
-                style_stack(&stash.source_stack),
+                style_view(&stash.source_view),
                 stash.message,
                 relative_time
             );
@@ -623,16 +623,16 @@ impl Stash {
         let stash = self.parse_stash_ref(repo, stash_ref)?;
 
         println!("{}", stash.reference());
-        println!("  Source stack: {}", style_stack(&stash.source_stack));
+        println!("  Source view: {}", style_view(&stash.source_view));
         println!("  Message: {}", stash.message);
         println!(
             "  Created: {}",
             format_timestamp_relative(&stash.created_at)
         );
 
-        // Get stack info
+        // Get view info
         let info = repo
-            .get_stack_info(&stash.stack_name)
+            .get_view_info(&stash.stack_name)
             .map_err(CliError::Repository)?;
 
         println!("  Changes: {}", info.change_count);
@@ -656,8 +656,8 @@ impl Stash {
             let _ = std::fs::remove_dir_all(&stash_dir);
         }
 
-        // Delete the stash stack
-        repo.delete_stack(&stash.stack_name)
+        // Delete the stash view
+        repo.delete_view(&stash.stack_name)
             .map_err(CliError::Repository)?;
 
         print_success(&format!("Dropped {}", stash.reference()));
@@ -691,7 +691,7 @@ impl Stash {
 
         let count = stashes.len();
         for stash in stashes {
-            repo.delete_stack(&stash.stack_name)
+            repo.delete_view(&stash.stack_name)
                 .map_err(CliError::Repository)?;
         }
 
@@ -797,7 +797,7 @@ mod tests {
         let entry = StashEntry {
             index: 0,
             stack_name: "stash/test".to_string(),
-            source_stack: "dev".to_string(),
+            source_view: "dev".to_string(),
             message: "WIP".to_string(),
             created_at: Utc::now(),
         };
@@ -810,7 +810,7 @@ mod tests {
         let entry = StashEntry {
             index: 3,
             stack_name: "stash/test".to_string(),
-            source_stack: "dev".to_string(),
+            source_view: "dev".to_string(),
             message: "WIP".to_string(),
             created_at: Utc::now(),
         };
@@ -823,7 +823,7 @@ mod tests {
         let entry = StashEntry {
             index: 0,
             stack_name: "stash/test".to_string(),
-            source_stack: "feature".to_string(),
+            source_view: "feature".to_string(),
             message: "Work in progress".to_string(),
             created_at: Utc::now(),
         };

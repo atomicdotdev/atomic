@@ -98,7 +98,7 @@ use crate::pristine::GraphTxnT;
 use crate::types::{Hash, Inode, NodeId, Position};
 
 use super::conflict::{FileConflict, FileConflictType};
-use super::content::output_graph_content;
+use super::content::{output_graph_content_resolved, resolve_conflicts_semantically};
 use super::error::OutputError;
 
 // FILE OUTPUT OPTIONS
@@ -581,7 +581,7 @@ where
 
 /// Output a single file from the graph with an optional change filter.
 ///
-/// This is the core file output function that supports stack-aware output.
+/// This is the core file output function that supports view-aware output.
 /// When a `change_filter` is provided, only vertices from changes in the filter
 /// (or ROOT) will be included in the output.
 ///
@@ -632,9 +632,9 @@ where
 
     // Handle empty graph.
     //
-    // When a change_filter is active (stack-aware output), an empty graph
-    // means the file has no content on the target stack.  In that case we
-    // must NOT create the file — it belongs to a different stack and should
+    // When a change_filter is active (view-aware output), an empty graph
+    // means the file has no content on the target view.  In that case we
+    // must NOT create the file — it belongs to a different view and should
     // not appear in the working copy.
     //
     // Without a change_filter the empty graph represents a genuinely empty
@@ -659,6 +659,9 @@ where
     let mut graph = retrieve_result.graph;
     let order = compute_order(&mut graph);
 
+    // Attempt semantic merge for any conflicting SCCs
+    let resolved = resolve_conflicts_semantically(txn, changes, &graph, &order);
+
     // Create writer
     let file_writer = working_copy
         .write_file(path, inode)
@@ -673,22 +676,23 @@ where
         txn.get_external(node_id).ok().flatten()
     };
 
-    // Output the graph content
-    output_graph_content(changes, hash_fn, &graph, &order, &mut writer)?;
+    // Output the graph content (with semantic merge resolution)
+    output_graph_content_resolved(changes, hash_fn, &graph, &order, &mut writer, &resolved)?;
 
     // Flush if requested
     if options.flush_after_write {
         writer.inner_mut().flush()?;
     }
 
-    // Extract conflicts from order result
-    // The order result contains conflict information from SCC analysis
-    // Cyclic conflicts are SCCs with more than one span
-    if order.cyclic_conflicts > 0 {
-        // Add a conflict for each cyclic SCC
+    // Extract conflicts from order result.
+    // Only count SCCs that were NOT resolved by the semantic merge engine.
+    let effectively_resolved = resolved.resolved_count();
+    let remaining_cyclic = order.cyclic_conflicts.saturating_sub(effectively_resolved);
+
+    if remaining_cyclic > 0 {
         let mut conflict_id: u32 = 0;
         for scc in &order.sccs {
-            if scc.len() > 1 {
+            if scc.len() > 1 && resolved.get_merged(scc[0]).is_none() {
                 conflict_id += 1;
                 let file_conflict = FileConflict::new(path.to_string(), FileConflictType::Cyclic)
                     .with_id(conflict_id);
@@ -775,17 +779,20 @@ where
         txn.get_external(node_id).ok().flatten()
     };
 
-    // Output the graph content
-    output_graph_content(changes, hash_fn, &graph, &order, &mut writer)?;
+    // Attempt semantic merge for any conflicting SCCs
+    let resolved = resolve_conflicts_semantically(txn, changes, &graph, &order);
+
+    // Output the graph content (with semantic merge resolution)
+    output_graph_content_resolved(changes, hash_fn, &graph, &order, &mut writer, &resolved)?;
 
     // Extract buffer
     let content = writer.into_inner();
 
-    // Extract conflicts from cyclic SCCs
+    // Extract conflicts from cyclic SCCs (only those NOT resolved by semantic merge)
     let mut conflicts = Vec::new();
     let mut conflict_id: u32 = 0;
     for scc in &order.sccs {
-        if scc.len() > 1 {
+        if scc.len() > 1 && resolved.get_merged(scc[0]).is_none() {
             conflict_id += 1;
             conflicts.push(
                 FileConflict::new(String::new(), FileConflictType::Cyclic).with_id(conflict_id),
@@ -848,7 +855,7 @@ where
 /// use std::collections::HashSet;
 ///
 /// // Get changes applied before a specific change
-/// let change_set: HashSet<NodeId> = get_changes_up_to_sequence(&txn, &stack, 5)?;
+/// let change_set: HashSet<NodeId> = get_changes_up_to_sequence(&txn, &view, 5)?;
 ///
 /// // Create retrieve options with the filter
 /// let retrieve_opts = RetrieveOptions::new().with_change_filter(change_set);
@@ -911,17 +918,20 @@ where
         txn.get_external(node_id).ok().flatten()
     };
 
-    // Output the graph content
-    output_graph_content(changes, hash_fn, &graph, &order, &mut writer)?;
+    // Attempt semantic merge for any conflicting SCCs
+    let resolved = resolve_conflicts_semantically(txn, changes, &graph, &order);
+
+    // Output the graph content (with semantic merge resolution)
+    output_graph_content_resolved(changes, hash_fn, &graph, &order, &mut writer, &resolved)?;
 
     // Extract buffer
     let content = writer.into_inner();
 
-    // Extract conflicts from cyclic SCCs
+    // Extract conflicts from cyclic SCCs (only those NOT resolved by semantic merge)
     let mut conflicts = Vec::new();
     let mut conflict_id: u32 = 0;
     for scc in &order.sccs {
-        if scc.len() > 1 {
+        if scc.len() > 1 && resolved.get_merged(scc[0]).is_none() {
             conflict_id += 1;
             conflicts.push(
                 FileConflict::new(String::new(), FileConflictType::Cyclic).with_id(conflict_id),
@@ -1226,7 +1236,7 @@ mod tests {
     #[test]
     fn test_error_display_graph() {
         let err: FileOutputError<std::io::Error> =
-            FileOutputError::Graph(crate::pristine::PristineError::StackNotFound {
+            FileOutputError::Graph(crate::pristine::PristineError::ViewNotFound {
                 name: "test".to_string(),
             });
         let display = format!("{}", err);
@@ -1292,7 +1302,7 @@ mod tests {
 
     #[test]
     fn test_error_from_pristine() {
-        let pristine_err = crate::pristine::PristineError::StackNotFound {
+        let pristine_err = crate::pristine::PristineError::ViewNotFound {
             name: "test".to_string(),
         };
         let err: FileOutputError<std::io::Error> = pristine_err.into();
@@ -1341,7 +1351,7 @@ mod tests {
         use std::error::Error;
 
         let err: FileOutputError<std::io::Error> =
-            FileOutputError::Graph(crate::pristine::PristineError::StackNotFound {
+            FileOutputError::Graph(crate::pristine::PristineError::ViewNotFound {
                 name: "test".to_string(),
             });
 

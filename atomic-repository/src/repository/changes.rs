@@ -313,25 +313,25 @@ impl Repository {
         Ok(attestations)
     }
 
-    /// Find all attestations relevant to a stack.
+    /// Find all attestations relevant to a view.
     ///
-    /// Iterates over all changes in the stack, checks REV_DEPS for each,
+    /// Iterates over all changes in the view, checks REV_DEPS for each,
     /// and collects unique attestations. Returns them with coverage info
-    /// showing which changes each attestation covers within this stack.
+    /// showing which changes each attestation covers within this view.
     ///
     /// # Arguments
     ///
-    /// * `stack_name` - The name of the stack to query
+    /// * `view_name` - The name of the view to query
     ///
     /// # Returns
     ///
     /// A vector of `(Hash, Attestation, Vec<Hash>)` where the third element
-    /// is the subset of `changes_covered` that are in this stack.
-    pub fn find_attestations_for_stack(
+    /// is the subset of `changes_covered` that are in this view.
+    pub fn find_attestations_for_view(
         &self,
-        stack_name: &str,
+        view_name: &str,
     ) -> Result<Vec<(Hash, atomic_core::change::Attestation, Vec<Hash>)>, RepositoryError> {
-        use atomic_core::pristine::{node_type, GraphTxnT, StackTxnT};
+        use atomic_core::pristine::{node_type, GraphTxnT, ViewTxnT};
         use std::collections::{HashMap, HashSet};
 
         let txn = self
@@ -339,39 +339,39 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Get the stack
-        let stack = match txn
-            .get_stack(stack_name)
+        // Get the view
+        let view = match txn
+            .get_view(view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
             Some(s) => s,
             None => return Ok(Vec::new()),
         };
 
-        // Collect all change IDs and hashes in this stack
-        let mut stack_change_ids: HashSet<u64> = HashSet::new();
-        let mut stack_change_hashes: HashSet<Hash> = HashSet::new();
+        // Collect all change IDs and hashes in this view
+        let mut view_change_ids: HashSet<u64> = HashSet::new();
+        let mut view_change_hashes: HashSet<Hash> = HashSet::new();
 
         let iter = txn
-            .iter_changes(&stack, 0)
+            .iter_changes(&view, 0)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         for result in iter {
             let (_seq, change_id, _merkle) =
                 result.map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-            stack_change_ids.insert(change_id.get());
+            view_change_ids.insert(change_id.get());
 
             if let Ok(Some(hash)) = txn.get_external(change_id) {
-                stack_change_hashes.insert(hash);
+                view_change_hashes.insert(hash);
             }
         }
 
-        // For each change in the stack, find attestation nodes via REV_DEPS
+        // For each change in the view, find attestation nodes via REV_DEPS
         let mut seen_attestations: HashMap<Hash, (atomic_core::change::Attestation, Vec<Hash>)> =
             HashMap::new();
 
-        for change_id_raw in &stack_change_ids {
+        for change_id_raw in &view_change_ids {
             let change_id = NodeId::new(*change_id_raw);
 
             let rev_deps = match txn.get_rev_deps(change_id) {
@@ -416,15 +416,15 @@ impl Repository {
                     Err(_) => continue,
                 };
 
-                // Compute which of this attestation's covered changes are in this stack
-                let covered_in_stack: Vec<Hash> = attest
+                // Compute which of this attestation's covered changes are in this view
+                let covered_in_view: Vec<Hash> = attest
                     .changes_covered
                     .iter()
-                    .filter(|h| stack_change_hashes.contains(h))
+                    .filter(|h| view_change_hashes.contains(h))
                     .cloned()
                     .collect();
 
-                seen_attestations.insert(attest_hash, (attest, covered_in_stack));
+                seen_attestations.insert(attest_hash, (attest, covered_in_view));
             }
         }
 
@@ -457,8 +457,8 @@ impl Repository {
     ///
     /// # Warning
     ///
-    /// Deleting a change that is still referenced by a stack will cause
-    /// errors when trying to access that stack. Use with caution.
+    /// Deleting a change that is still referenced by a view will cause
+    /// errors when trying to access that view. Use with caution.
     pub fn delete_change(&self, hash: &Hash) -> Result<bool, RepositoryError> {
         self.change_store
             .delete_change(hash)

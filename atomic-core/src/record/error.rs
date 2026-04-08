@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn storage_errors_identify_infrastructure_failures() {
         let io: RecordError = std::io::Error::new(std::io::ErrorKind::NotFound, "disk gone").into();
-        let pristine: RecordError = PristineError::StackNotFound { name: "x".into() }.into();
+        let pristine: RecordError = PristineError::ViewNotFound { name: "x".into() }.into();
 
         assert!(io.is_storage_error());
         assert!(pristine.is_storage_error());
@@ -570,7 +570,7 @@ mod tests {
         }
 
         fn check_pristine() -> RecordResult<()> {
-            Err(PristineError::StackNotFound {
+            Err(PristineError::ViewNotFound {
                 name: "main".into(),
             })?
         }

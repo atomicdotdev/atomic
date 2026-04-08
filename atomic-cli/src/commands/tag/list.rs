@@ -11,7 +11,7 @@
 //!
 //! Options:
 //!   -v, --verbose         Show additional details (state, sequence, date)
-//!   -s, --stack <STACK>   Filter tags by stack
+//!   -s, --view <VIEW>     Filter tags by view
 //!   -p, --pattern <PAT>   Filter tags by name pattern (glob)
 //!   --annotated-only      Show only annotated tags
 //!   -h, --help            Print help information
@@ -63,11 +63,11 @@ pub struct List {
     #[arg(long, short = 'v')]
     pub verbose: bool,
 
-    /// Filter tags by stack.
+    /// Filter tags by view.
     ///
-    /// Only show tags that belong to the specified stack.
-    #[arg(long, short = 's', value_name = "STACK")]
-    pub stack: Option<String>,
+    /// Only show tags that belong to the specified view.
+    #[arg(long, short = 's', value_name = "VIEW")]
+    pub view: Option<String>,
 
     /// Filter tags by name pattern.
     ///
@@ -88,7 +88,7 @@ impl List {
     pub fn new() -> Self {
         Self {
             verbose: false,
-            stack: None,
+            view: None,
             pattern: None,
             annotated_only: false,
         }
@@ -100,9 +100,9 @@ impl List {
         self
     }
 
-    /// Builder: set the stack filter.
-    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
-        self.stack = Some(stack.into());
+    /// Builder: set the view filter.
+    pub fn with_view(mut self, view: impl Into<String>) -> Self {
+        self.view = Some(view.into());
         self
     }
 
@@ -133,8 +133,8 @@ impl Command for List {
         // Build filter
         let mut filter = TagFilter::new();
 
-        if let Some(stack) = &self.stack {
-            filter = filter.stack(stack);
+        if let Some(view) = &self.view {
+            filter = filter.view(view);
         }
 
         if let Some(pattern) = &self.pattern {
@@ -209,7 +209,7 @@ mod tests {
     fn test_default() {
         let cmd = List::default();
         assert!(!cmd.verbose);
-        assert!(cmd.stack.is_none());
+        assert!(cmd.view.is_none());
         assert!(cmd.pattern.is_none());
         assert!(!cmd.annotated_only);
     }
@@ -227,9 +227,9 @@ mod tests {
     }
 
     #[test]
-    fn test_with_stack() {
-        let cmd = List::new().with_stack("release");
-        assert_eq!(cmd.stack, Some("release".to_string()));
+    fn test_with_view() {
+        let cmd = List::new().with_view("release");
+        assert_eq!(cmd.view, Some("release".to_string()));
     }
 
     #[test]

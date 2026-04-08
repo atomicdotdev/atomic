@@ -27,17 +27,17 @@ pub enum RepositoryError {
     #[error("Invalid repository structure: {reason}")]
     InvalidRepository { reason: String },
 
-    /// Stack not found
-    #[error("Stack not found: {name}")]
-    StackNotFound { name: String },
+    /// View not found
+    #[error("View not found: {name}")]
+    ViewNotFound { name: String },
 
-    /// Stack already exists
-    #[error("Stack already exists: {name}")]
-    StackAlreadyExists { name: String },
+    /// View already exists
+    #[error("View already exists: {name}")]
+    ViewAlreadyExists { name: String },
 
-    /// Cannot delete the current stack
-    #[error("Cannot delete the current stack '{name}'")]
-    CannotDeleteCurrentStack { name: String },
+    /// Cannot delete the current view
+    #[error("Cannot delete the current view '{name}'")]
+    CannotDeleteCurrentView { name: String },
 
     /// Working copy has uncommitted changes
     #[error("Working copy has uncommitted changes")]
@@ -178,6 +178,7 @@ impl RepositoryError {
                 | RepositoryError::MissingDependency { .. }
                 | RepositoryError::TagAlreadyExists { .. }
                 | RepositoryError::InvalidTagName { .. }
+                | RepositoryError::ViewAlreadyExists { .. }
         )
     }
 
@@ -250,7 +251,7 @@ mod tests {
         let err = RepositoryError::NotInRepository;
         assert!(err.is_not_found());
 
-        let err = RepositoryError::StackNotFound {
+        let err = RepositoryError::ViewNotFound {
             name: "main".to_string(),
         };
         assert!(!err.is_not_found());
@@ -272,10 +273,10 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        let err = RepositoryError::StackNotFound {
+        let err = RepositoryError::ViewNotFound {
             name: "feature".to_string(),
         };
-        assert_eq!(err.to_string(), "Stack not found: feature");
+        assert_eq!(err.to_string(), "View not found: feature");
 
         let err = RepositoryError::MissingDependency {
             change: "ABC123".to_string(),

@@ -26,7 +26,7 @@
 //! sections and helpful hints:
 //!
 //! ```text
-//! On stack dev
+//! On view dev
 //! State: ABCDEF123456
 //!
 //! Changes to be recorded:
@@ -74,7 +74,7 @@
 //! Show status of entire repository:
 //! ```text
 //! $ atomic status
-//! On stack dev
+//! On view dev
 //! State: ABCDEF12
 //!
 //! Changes to be recorded:
@@ -92,7 +92,7 @@
 //! Show status for specific path:
 //! ```text
 //! $ atomic status src/
-//! On stack dev
+//! On view dev
 //! State: ABCDEF12
 //!
 //! Changes to be recorded:
@@ -111,7 +111,7 @@ use crate::commands::{find_repository_root, Command, DEFAULT_HASH_LENGTH};
 use crate::error::{CliError, CliResult};
 use crate::output::{
     added, deleted, hash, hint, info, modified, path as style_path, print_blank, print_hint,
-    print_section, stack as style_stack, untracked as style_untracked, warning,
+    print_section, untracked as style_untracked, view as style_view, warning,
 };
 
 // Status Output Configuration
@@ -123,8 +123,8 @@ use crate::output::{
 /// The `status` command displays information about the current state of
 /// the working copy, including:
 ///
-/// - The current stack name
-/// - The current stack state (Merkle hash)
+/// - The current view name
+/// - The current view state (Merkle hash)
 /// - Modified files (tracked files that have changed)
 /// - Deleted files (tracked files that no longer exist)
 /// - Added files (newly tracked files)
@@ -231,9 +231,9 @@ impl Status {
 
     /// Print the status in long (human-readable) format.
     fn print_long_format(&self, status: &RepositoryStatus) -> CliResult<()> {
-        // Print stack info
-        print!("On stack ");
-        println!("{}", style_stack(status.stack()));
+        // Print view info
+        print!("On view ");
+        println!("{}", style_view(status.view()));
 
         // Print state hash if available
         if let Some(state) = status.state() {
@@ -839,7 +839,7 @@ mod tests {
     #[test]
     fn test_repository_status_empty() {
         let status = RepositoryStatus::new("dev".to_string(), None);
-        assert_eq!(status.stack(), "dev");
+        assert_eq!(status.view(), "dev");
         assert!(status.state().is_none());
         assert!(status.is_clean());
     }
@@ -848,7 +848,7 @@ mod tests {
     fn test_repository_status_with_state() {
         let state = Merkle::initial();
         let status = RepositoryStatus::new("main".to_string(), Some(state));
-        assert_eq!(status.stack(), "main");
+        assert_eq!(status.view(), "main");
         assert!(status.state().is_some());
     }
 
@@ -975,7 +975,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let repo_path = temp_dir.path();
 
-        // Initialize a repository (takes only path, creates default stack)
+        // Initialize a repository (takes only path, creates default view)
         // We need to drop the repository handle before running status to avoid
         // database lock conflicts (redb only allows one open handle at a time)
         {
