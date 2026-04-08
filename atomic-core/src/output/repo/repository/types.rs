@@ -60,8 +60,8 @@ pub struct MaterializeOptions {
     /// Optional filter to only include vertices from specific changes.
     ///
     /// When set, only vertices whose `change_id` is in this set (or is ROOT)
-    /// will be included in the output. This enables stack-aware output where
-    /// switching stacks shows the content as it was when only that stack's
+    /// will be included in the output. This enables view-aware output where
+    /// switching views shows the content as it was when only that view's
     /// changes were applied.
     ///
     /// The filter is wrapped in `Arc` for efficient sharing across files.
@@ -74,7 +74,7 @@ impl MaterializeOptions {
         Self::default()
     }
 
-    /// Set a change filter for stack-aware output.
+    /// Set a change filter for view-aware output.
     pub fn with_change_filter(mut self, filter: HashSet<NodeId>) -> Self {
         self.change_filter = Some(Arc::new(filter));
         self

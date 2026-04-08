@@ -651,10 +651,10 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let view = txn
-            .get_view(&tag.stack)
+            .get_view(&tag.view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
             .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: tag.stack.clone(),
+                name: tag.view.clone(),
             })?;
 
         // Get changes up to and including the tag's sequence

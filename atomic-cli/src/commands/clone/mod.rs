@@ -22,9 +22,9 @@
 //! 3. **Create target directory** with cleanup guard for error recovery
 //! 4. **Initialize empty repository** using `Repository::init()`
 //! 5. **Connect to remote** using HTTP client
-//! 6. **Query remote state** to get the stack's changelist
+//! 6. **Query remote state** to get the view's changelist
 //! 7. **Download all changes** in dependency order
-//! 8. **Apply changes** to the local stack
+//! 8. **Apply changes** to the local view
 //! 9. **Download tags** for any tagged states
 //! 10. **Configure remote** as "origin" in repository config
 //! 11. **Report results** to the user
@@ -39,7 +39,7 @@
 //!   [PATH]  Directory to clone into (defaults to repository name)
 //!
 //! Options:
-//!       --stack <STACK>        Clone specific stack (default: dev)
+//!       --view <VIEW>         Clone specific view (default: dev)
 //!   -k, --insecure            Skip TLS certificate verification
 //!       --timeout <SECONDS>   Request timeout in seconds (default: 30)
 //!       --download-only       Download changes without applying them
@@ -77,7 +77,7 @@
 //! - **Invalid URL**: Cannot parse or connect to the remote URL
 //! - **Authentication failed**: Suggests checking credentials
 //! - **Network errors**: Provides retry suggestions
-//! - **Empty stack**: Remote stack has no changes
+//! - **Empty view: Remote view has no changes
 //!
 //! # Cleanup on Error
 //!
@@ -117,7 +117,7 @@
 //! │         │  5. Save changes │                        │                  │
 //! │         ├─────────────────►│                        │                  │
 //! │         │                  │                        │                  │
-//! │         │  6. Apply to stack                        │                  │
+//! │         │  6. Apply to view                        │                  │
 //! │         ├───────────────────                        │                  │
 //! │         │                  │                        │                  │
 //! └─────────────────────────────────────────────────────────────────────────┘
@@ -147,7 +147,7 @@ pub use types::{CloneOutcome, ClonePhase, CloneProgress, CloneStats};
 pub use helpers::{format_count as helpers_format_count, infer_repo_name, CleanupGuard};
 
 // Constants
-pub use command::{DEFAULT_STACK, DEFAULT_TIMEOUT_SECS};
+pub use command::{DEFAULT_VIEW, DEFAULT_TIMEOUT_SECS};
 
 // Tests
 
@@ -195,7 +195,7 @@ mod tests {
     /// Verify that default constants are properly exported.
     #[test]
     fn test_default_constants() {
-        assert_eq!(DEFAULT_STACK, "dev");
+        assert_eq!(DEFAULT_VIEW, "dev");
         assert_eq!(DEFAULT_TIMEOUT_SECS, 30);
     }
 

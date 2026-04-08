@@ -44,12 +44,12 @@ use std::sync::Arc;
 /// use std::collections::HashSet;
 ///
 /// // Retrieve content at a specific state (e.g., before change at seq 5)
-/// let changes_before: HashSet<NodeId> = get_changes_up_to_sequence(&txn, &stack, 5)?;
+/// let changes_before: HashSet<NodeId> = get_changes_up_to_sequence(&txn, &view, 5)?;
 /// let options = RetrieveOptions::new().with_change_filter(changes_before);
 /// let parent_graph = retrieve_graph(&txn, file_pos, options)?;
 ///
 /// // Retrieve content after the change (includes change at seq 5)
-/// let changes_after: HashSet<NodeId> = get_changes_up_to_sequence(&txn, &stack, 6)?;
+/// let changes_after: HashSet<NodeId> = get_changes_up_to_sequence(&txn, &view, 6)?;
 /// let options = RetrieveOptions::new().with_change_filter(changes_after);
 /// let current_graph = retrieve_graph(&txn, file_pos, options)?;
 /// ```
@@ -119,7 +119,7 @@ impl RetrieveOptions {
     ///
     /// ```rust,ignore
     /// // Get changes applied before sequence 5
-    /// let changes = get_changes_up_to_sequence(&txn, &stack, 5)?;
+    /// let changes = get_changes_up_to_sequence(&txn, &view, 5)?;
     /// let options = RetrieveOptions::new().with_change_filter(changes);
     /// let graph = retrieve_graph(&txn, pos, options)?;
     /// ```
@@ -307,9 +307,9 @@ pub struct RetrieveResult {
     /// Whether a change_filter was active during retrieval.
     ///
     /// When `true` and `graph.is_empty()`, it means the file has no
-    /// content on the target stack (all vertices were filtered out).
+    /// content on the target view (all vertices were filtered out).
     /// Callers can use this to distinguish "genuinely empty file" from
-    /// "file belongs to a different stack".
+    /// "file belongs to a different view".
     pub was_filtered: bool,
 }
 

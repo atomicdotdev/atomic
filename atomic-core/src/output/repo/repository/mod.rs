@@ -222,13 +222,13 @@ where
     // Process each item
     let file_options = options.to_file_options();
 
-    // ── Stack-aware pre-filter ──────────────────────────────────────
+    // ── View-aware pre-filter ──────────────────────────────────────
     let (passing_file_paths, passing_ancestors) =
         filter::compute_filters(&items, &options.change_filter);
 
     for item in items {
         if item.is_directory {
-            // Only create directories that will contain files on this stack
+            // Only create directories that will contain files on this view
             if !filter::dir_has_passing_children(&item.path, &passing_ancestors) {
                 result.record_skipped();
                 continue;
@@ -245,7 +245,7 @@ where
                 continue;
             }
 
-            // Stack-aware skip: if the file's introducing change is not in the
+            // View-aware skip: if the file's introducing change is not in the
             // filter, skip it entirely.
             if let Some(ref paths) = passing_file_paths {
                 if !paths.contains(&item.path) {

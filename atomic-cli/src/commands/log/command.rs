@@ -5,7 +5,7 @@ use super::*;
 /// Show the change history.
 ///
 /// The `log` command displays the history of changes applied to the
-/// current stack (or a specified stack). It supports multiple output
+/// current view (or a specified view). It supports multiple output
 /// formats and filtering options.
 ///
 /// # Output Formats
@@ -24,8 +24,8 @@ use super::*;
 /// # Show all tagged changes
 /// atomic log --tags-only
 ///
-/// # Show changes on feature stack in JSON
-/// atomic log --stack feature -f json
+/// # Show changes on feature view in JSON
+/// atomic log --view feature -f json
 /// ```
 #[derive(Parser, Debug, Clone)]
 #[command(name = "log")]
@@ -37,12 +37,12 @@ pub struct Log {
     #[arg(short = 'n', long = "count", value_name = "N")]
     pub count: Option<usize>,
 
-    /// Show history for a specific stack.
+    /// Show history for a specific view.
     ///
-    /// By default, shows history for the current stack. Use this
-    /// option to view another stack's history without switching.
-    #[arg(long = "stack", value_name = "NAME")]
-    pub stack: Option<String>,
+    /// By default, shows history for the current view. Use this
+    /// option to view another view's history without switching.
+    #[arg(long = "view", value_name = "NAME")]
+    pub view: Option<String>,
 
     /// Only show tagged changes.
     ///
@@ -106,7 +106,7 @@ impl Log {
     pub fn new() -> Self {
         Self {
             count: None,
-            stack: None,
+            view: None,
             tags_only: false,
             path: None,
             format: LogFormat::Default,
@@ -122,9 +122,9 @@ impl Log {
         self
     }
 
-    /// Builder: set the stack name.
-    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
-        self.stack = Some(stack.into());
+    /// Builder: set the view name.
+    pub fn with_view(mut self, view: impl Into<String>) -> Self {
+        self.view = Some(view.into());
         self
     }
 
@@ -179,8 +179,8 @@ impl Log {
             options = options.limit(count);
         }
 
-        if let Some(ref stack) = self.stack {
-            options = options.view(stack.clone());
+        if let Some(ref view) = self.view {
+            options = options.view(view.clone());
         }
 
         if self.tags_only {
@@ -403,15 +403,12 @@ impl Log {
     ///
     /// # Arguments
     ///
-    /// * `stack_name` - Name of the stack being queried
-    fn print_empty_history(&self, stack_name: &str) {
+    /// * `view_name` - Name of the view being queried
+    fn print_empty_history(&self, view_name: &str) {
         if self.format == LogFormat::Json {
             println!("[]");
         } else {
-            println!(
-                "No changes recorded on stack '{}'.\n",
-                style_stack(stack_name)
-            );
+            println!("No changes recorded on view '{}'.\n", style_view(view_name));
             print_hint("Record changes with 'atomic record -m \"message\"'");
         }
     }
@@ -436,7 +433,7 @@ impl Command for Log {
     ///
     /// Returns a `CliError` if:
     /// - No repository is found
-    /// - The specified stack doesn't exist
+    /// - The specified view doesn't exist
     /// - Database errors occur
     fn run(&self) -> CliResult<()> {
         // Find and open repository
@@ -453,7 +450,7 @@ impl Command for Log {
 
         // Build options
         let options = self.build_history_options();
-        let stack_name = self.stack.as_deref().unwrap_or_else(|| repo.current_view());
+        let view_name = self.view.as_deref().unwrap_or_else(|| repo.current_view());
 
         // Get history
         let entries = if self.reverse {
@@ -476,7 +473,7 @@ impl Command for Log {
 
         // Handle empty history
         if entries.is_empty() {
-            self.print_empty_history(stack_name);
+            self.print_empty_history(view_name);
             return Ok(());
         }
 
@@ -571,8 +568,8 @@ pub struct LogOutputConfig {
     pub tags_only: bool,
     /// Path filter.
     pub path: Option<String>,
-    /// Stack filter.
-    pub stack: Option<String>,
+    /// View filter.
+    pub view: Option<String>,
     /// Starting sequence number.
     pub from_sequence: u64,
 }
@@ -594,7 +591,7 @@ impl LogOutputConfig {
             reverse: false,
             tags_only: false,
             path: None,
-            stack: None,
+            view: None,
             from_sequence: 0,
         }
     }
@@ -644,9 +641,9 @@ impl LogOutputConfig {
         self
     }
 
-    /// Builder: set stack filter.
-    pub fn stack(mut self, stack: impl Into<String>) -> Self {
-        self.stack = Some(stack.into());
+    /// Builder: set view filter.
+    pub fn view(mut self, view: impl Into<String>) -> Self {
+        self.view = Some(view.into());
         self
     }
 

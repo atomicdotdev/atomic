@@ -162,11 +162,11 @@ pub struct DelegationScope {
     #[serde(default)]
     pub repository_patterns: Vec<String>,
 
-    /// Stack patterns the delegation applies to (glob patterns).
+    /// View patterns the delegation applies to (glob patterns).
     ///
-    /// Empty means all stacks.
-    #[serde(default)]
-    pub stack_patterns: Vec<String>,
+    /// Empty means all views.
+    #[serde(default, alias = "stack_patterns")]
+    pub view_patterns: Vec<String>,
 
     /// Maximum number of changes the delegate can create.
     #[serde(default)]
@@ -182,7 +182,7 @@ impl Default for DelegationScope {
         Self {
             permissions: vec![DelegationPermission::Read],
             repository_patterns: Vec::new(),
-            stack_patterns: Vec::new(),
+            view_patterns: Vec::new(),
             max_changes: None,
             description: None,
         }
@@ -200,7 +200,7 @@ impl DelegationScope {
         Self {
             permissions: vec![DelegationPermission::Full],
             repository_patterns: Vec::new(),
-            stack_patterns: Vec::new(),
+            view_patterns: Vec::new(),
             max_changes: None,
             description: Some("Full access".to_string()),
         }
@@ -211,7 +211,7 @@ impl DelegationScope {
         Self {
             permissions: vec![DelegationPermission::Read],
             repository_patterns: Vec::new(),
-            stack_patterns: Vec::new(),
+            view_patterns: Vec::new(),
             max_changes: None,
             description: Some("Read-only access".to_string()),
         }
@@ -227,7 +227,7 @@ impl DelegationScope {
                 DelegationPermission::Pull,
             ],
             repository_patterns: Vec::new(),
-            stack_patterns: Vec::new(),
+            view_patterns: Vec::new(),
             max_changes: None,
             description: Some("CI/CD operations".to_string()),
         }
@@ -254,15 +254,15 @@ impl DelegationScope {
             .any(|pattern| Self::matches_pattern(pattern, repo_path))
     }
 
-    /// Check if this scope allows access to a stack.
-    pub fn allows_stack(&self, stack_name: &str) -> bool {
-        if self.stack_patterns.is_empty() {
+    /// Check if this scope allows access to a view.
+    pub fn allows_view(&self, view_name: &str) -> bool {
+        if self.view_patterns.is_empty() {
             return true;
         }
 
-        self.stack_patterns
+        self.view_patterns
             .iter()
-            .any(|pattern| Self::matches_pattern(pattern, stack_name))
+            .any(|pattern| Self::matches_pattern(pattern, view_name))
     }
 
     /// Simple glob pattern matching (supports * and ?).
@@ -293,7 +293,7 @@ impl DelegationScope {
 pub struct DelegationScopeBuilder {
     permissions: Vec<DelegationPermission>,
     repository_patterns: Vec<String>,
-    stack_patterns: Vec<String>,
+    view_patterns: Vec<String>,
     max_changes: Option<u64>,
     description: Option<String>,
 }
@@ -304,7 +304,7 @@ impl DelegationScopeBuilder {
         Self {
             permissions: Vec::new(),
             repository_patterns: Vec::new(),
-            stack_patterns: Vec::new(),
+            view_patterns: Vec::new(),
             max_changes: None,
             description: None,
         }
@@ -337,9 +337,9 @@ impl DelegationScopeBuilder {
         self
     }
 
-    /// Add a stack pattern.
-    pub fn stack_pattern(mut self, pattern: impl Into<String>) -> Self {
-        self.stack_patterns.push(pattern.into());
+    /// Add a view pattern.
+    pub fn view_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.view_patterns.push(pattern.into());
         self
     }
 
@@ -365,7 +365,7 @@ impl DelegationScopeBuilder {
         DelegationScope {
             permissions: self.permissions,
             repository_patterns: self.repository_patterns,
-            stack_patterns: self.stack_patterns,
+            view_patterns: self.view_patterns,
             max_changes: self.max_changes,
             description: self.description,
         }
@@ -530,7 +530,7 @@ impl Delegation {
         &self,
         permission: DelegationPermission,
         repository: Option<&str>,
-        stack: Option<&str>,
+        view: Option<&str>,
     ) -> bool {
         if !self.is_valid() {
             return false;
@@ -546,8 +546,8 @@ impl Delegation {
             }
         }
 
-        if let Some(stack_name) = stack {
-            if !self.scope.allows_stack(stack_name) {
+        if let Some(view_name) = view {
+            if !self.scope.allows_view(view_name) {
                 return false;
             }
         }
@@ -751,8 +751,8 @@ mod tests {
             .permission(DelegationPermission::Read)
             .permission(DelegationPermission::Record)
             .repository_pattern("project/*")
-            .stack_pattern("main")
-            .stack_pattern("feature-*")
+            .view_pattern("main")
+            .view_pattern("feature-*")
             .max_changes(100)
             .description("Limited access for testing")
             .build();
@@ -760,7 +760,7 @@ mod tests {
         assert!(scope.has_permission(DelegationPermission::Read));
         assert!(scope.has_permission(DelegationPermission::Record));
         assert_eq!(scope.repository_patterns.len(), 1);
-        assert_eq!(scope.stack_patterns.len(), 2);
+        assert_eq!(scope.view_patterns.len(), 2);
         assert_eq!(scope.max_changes, Some(100));
         assert!(scope.description.is_some());
     }

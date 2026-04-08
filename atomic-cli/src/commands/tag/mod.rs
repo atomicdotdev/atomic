@@ -1,6 +1,6 @@
 //! Tag management commands for Atomic VCS.
 //!
-//! Tags are named snapshots of a stack's state at a particular point in time.
+//! Tags are named snapshots of a view's state at a particular point in time.
 //! Unlike Git tags which point to commits, Atomic tags point to Merkle states -
 //! cryptographic hashes representing the complete sequence of applied changes.
 //!
@@ -63,7 +63,7 @@
 //! ```text
 //! $ atomic tag show v1.0.0
 //! Tag: v1.0.0
-//! Stack: dev
+//! View: dev
 //! Sequence: 42
 //! State: ABCDEF123456789...
 //! Created: 2024-01-15 10:30:00 UTC
@@ -97,13 +97,13 @@ use crate::error::CliResult;
 
 /// Subcommands for tag management.
 ///
-/// Tags in Atomic are named snapshots of a stack's Merkle state,
+/// Tags in Atomic are named snapshots of a view's Merkle state,
 /// useful for marking releases, synchronization points, and rollback targets.
 #[derive(Subcommand, Debug)]
 pub enum TagCommands {
     /// Create a new tag.
     ///
-    /// Creates a tag pointing to the current state of a stack.
+    /// Creates a tag pointing to the current state of a view.
     /// Tags can be lightweight (just a reference) or annotated
     /// (with message and author information).
     ///
@@ -121,7 +121,7 @@ pub enum TagCommands {
     /// Delete a tag.
     ///
     /// Removes a tag from the repository. This does not affect
-    /// the underlying changes or stack state.
+    /// the underlying changes or view state.
     ///
     /// # Examples
     ///
@@ -140,7 +140,7 @@ pub enum TagCommands {
     /// ```text
     /// atomic tag list
     /// atomic tag list --verbose
-    /// atomic tag list --stack main
+    /// atomic tag list --view main
     /// ```
     List(List),
 

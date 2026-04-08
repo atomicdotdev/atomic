@@ -6,7 +6,7 @@ impl Record {
         let mut output = String::new();
 
         // Get the actual current view name from the repository
-        let stack_name = repo.current_view();
+        let view_name = repo.current_view();
 
         // Get hash (shortened)
         let hash_short = &outcome.hash().to_base32()[..DEFAULT_HASH_LENGTH.min(8)];
@@ -21,11 +21,11 @@ impl Record {
             .next()
             .unwrap_or("No message");
 
-        // Header line: [stack seq/hash] message
+        // Header line: [view seq/hash] message
         let sequence = outcome.new_state().map(|_| "1").unwrap_or("?");
         output.push_str(&format!(
             "[{} {}/{}] {}\n",
-            stack_name, sequence, hash_short, message
+            view_name, sequence, hash_short, message
         ));
 
         // Stats line - show graph-based stats

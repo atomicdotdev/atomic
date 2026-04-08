@@ -1,12 +1,9 @@
-//! Tests for the tag management module.
-
-#[cfg(test)]
 mod tests {
     use crate::tags::{
-        count_all_tags, count_tags, delete_tag, list_all_tags, list_tag_stacks, list_tags,
-        list_tags_filtered, load_tag, load_tag_any_stack, matches_pattern, save_tag,
-        save_tag_force, stack_tags_dir, tag_file_path, validate_tag_name, Tag, TagError, TagFilter,
-        TagOptions, TagSort,
+        count_all_tags, count_tags, delete_tag, list_all_tags, list_tag_views, list_tags,
+        list_tags_filtered, load_tag, load_tag_any_view, matches_pattern, save_tag, save_tag_force,
+        tag_file_path, validate_tag_name, view_tags_dir, Tag, TagError, TagFilter, TagOptions,
+        TagSort,
     };
     use atomic_core::change::Author;
     use atomic_core::types::{Base32, Merkle};
@@ -22,7 +19,7 @@ mod tests {
         let tag = Tag::new("v1.0.0", "main", 42, state);
 
         assert_eq!(tag.name, "v1.0.0");
-        assert_eq!(tag.stack, "main");
+        assert_eq!(tag.view, "main");
         assert_eq!(tag.sequence, 42);
         assert_eq!(tag.state, state);
         assert!(!tag.is_annotated());
@@ -82,7 +79,7 @@ mod tests {
 
         assert!(options.message.is_none());
         assert!(options.author.is_none());
-        assert!(options.stack.is_none());
+        assert!(options.view.is_none());
         assert!(options.sequence.is_none());
         assert!(!options.force);
         assert!(!options.is_annotated());
@@ -93,13 +90,13 @@ mod tests {
         let options = TagOptions::new()
             .message("Test message")
             .author("Alice", Some("alice@example.com"))
-            .stack("feature")
+            .view("feature")
             .sequence(10)
             .force(true);
 
         assert_eq!(options.message, Some("Test message".to_string()));
         assert!(options.author.is_some());
-        assert_eq!(options.stack, Some("feature".to_string()));
+        assert_eq!(options.view, Some("feature".to_string()));
         assert_eq!(options.sequence, Some(10));
         assert!(options.force);
         assert!(options.is_annotated());
@@ -119,7 +116,7 @@ mod tests {
     fn test_tag_filter_default() {
         let filter = TagFilter::default();
 
-        assert!(filter.stack.is_none());
+        assert!(filter.view.is_none());
         assert!(filter.pattern.is_none());
         assert!(!filter.annotated_only);
         assert!(!filter.lightweight_only);
@@ -128,13 +125,13 @@ mod tests {
     #[test]
     fn test_tag_filter_builder() {
         let filter = TagFilter::new()
-            .stack("main")
+            .view("main")
             .pattern("v*")
             .annotated_only()
             .sort(TagSort::Timestamp)
             .limit(10);
 
-        assert_eq!(filter.stack, Some("main".to_string()));
+        assert_eq!(filter.view, Some("main".to_string()));
         assert_eq!(filter.pattern, Some("v*".to_string()));
         assert!(filter.annotated_only);
         assert_eq!(filter.sort, TagSort::Timestamp);
@@ -142,12 +139,12 @@ mod tests {
     }
 
     #[test]
-    fn test_tag_filter_matches_stack() {
+    fn test_tag_filter_matches_view() {
         let state = Merkle::of(b"test");
         let tag = Tag::new("v1.0.0", "main", 1, state);
 
-        let filter_main = TagFilter::new().stack("main");
-        let filter_other = TagFilter::new().stack("other");
+        let filter_main = TagFilter::new().view("main");
+        let filter_other = TagFilter::new().view("other");
 
         assert!(filter_main.matches(&tag));
         assert!(!filter_other.matches(&tag));
@@ -278,9 +275,9 @@ mod tests {
     }
 
     #[test]
-    fn test_stack_tags_dir() {
+    fn test_view_tags_dir() {
         let tags_dir = Path::new("/repo/.atomic/tags");
-        let path = stack_tags_dir(tags_dir, "feature");
+        let path = view_tags_dir(tags_dir, "feature");
 
         assert_eq!(path, PathBuf::from("/repo/.atomic/tags/feature"));
     }
@@ -345,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_tag_any_stack() {
+    fn test_load_tag_any_view() {
         let temp_dir = TempDir::new().unwrap();
         let tags_dir = temp_dir.path();
 
@@ -353,16 +350,16 @@ mod tests {
         save_tag(tags_dir, &Tag::new("v1.0.0", "main", 1, state)).unwrap();
         save_tag(tags_dir, &Tag::new("v2.0.0", "feature", 2, state)).unwrap();
 
-        // Find tag in main stack
-        let tag = load_tag_any_stack(tags_dir, "v1.0.0").unwrap().unwrap();
-        assert_eq!(tag.stack, "main");
+        // Find tag in main view
+        let tag = load_tag_any_view(tags_dir, "v1.0.0").unwrap().unwrap();
+        assert_eq!(tag.view, "main");
 
-        // Find tag in feature stack
-        let tag = load_tag_any_stack(tags_dir, "v2.0.0").unwrap().unwrap();
-        assert_eq!(tag.stack, "feature");
+        // Find tag in feature view
+        let tag = load_tag_any_view(tags_dir, "v2.0.0").unwrap().unwrap();
+        assert_eq!(tag.view, "feature");
 
-        // Not found in any stack
-        let result = load_tag_any_stack(tags_dir, "nonexistent").unwrap();
+        // Not found in any view
+        let result = load_tag_any_view(tags_dir, "nonexistent").unwrap();
         assert!(result.is_none());
     }
 
@@ -388,21 +385,21 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_tag_cleans_empty_stack_dir() {
+    fn test_delete_tag_cleans_empty_view_dir() {
         let temp_dir = TempDir::new().unwrap();
         let tags_dir = temp_dir.path();
 
         let state = Merkle::of(b"test");
         save_tag(tags_dir, &Tag::new("v1.0.0", "main", 1, state)).unwrap();
 
-        // Stack directory should exist
-        assert!(stack_tags_dir(tags_dir, "main").exists());
+        // View directory should exist
+        assert!(view_tags_dir(tags_dir, "main").exists());
 
         // Delete the only tag
         delete_tag(tags_dir, "main", "v1.0.0").unwrap();
 
-        // Stack directory should be cleaned up
-        assert!(!stack_tags_dir(tags_dir, "main").exists());
+        // View directory should be cleaned up
+        assert!(!view_tags_dir(tags_dir, "main").exists());
     }
 
     #[test]
@@ -446,20 +443,20 @@ mod tests {
         save_tag(tags_dir, &Tag::new("v2.0.0", "main", 2, state)).unwrap();
         save_tag(tags_dir, &Tag::new("v1.0.0", "feature", 1, state)).unwrap();
 
-        // list_tags only returns tags from one stack
+        // list_tags only returns tags from one view
         let main_tags = list_tags(tags_dir, "main").unwrap();
         assert_eq!(main_tags.len(), 2);
 
         let feature_tags = list_tags(tags_dir, "feature").unwrap();
         assert_eq!(feature_tags.len(), 1);
 
-        // list_all_tags returns tags from all stacks
+        // list_all_tags returns tags from all views
         let all_tags = list_all_tags(tags_dir).unwrap();
         assert_eq!(all_tags.len(), 3);
     }
 
     #[test]
-    fn test_list_tag_stacks() {
+    fn test_list_tag_views() {
         let temp_dir = TempDir::new().unwrap();
         let tags_dir = temp_dir.path();
 
@@ -468,26 +465,26 @@ mod tests {
         save_tag(tags_dir, &Tag::new("v1.0.0", "feature", 1, state)).unwrap();
         save_tag(tags_dir, &Tag::new("v1.0.0", "dev", 1, state)).unwrap();
 
-        let stacks = list_tag_stacks(tags_dir).unwrap();
-        assert_eq!(stacks.len(), 3);
-        assert!(stacks.contains(&"main".to_string()));
-        assert!(stacks.contains(&"feature".to_string()));
-        assert!(stacks.contains(&"dev".to_string()));
+        let views = list_tag_views(tags_dir).unwrap();
+        assert_eq!(views.len(), 3);
+        assert!(views.contains(&"main".to_string()));
+        assert!(views.contains(&"feature".to_string()));
+        assert!(views.contains(&"dev".to_string()));
     }
 
     #[test]
-    fn test_same_tag_name_different_stacks() {
+    fn test_same_tag_name_different_views() {
         let temp_dir = TempDir::new().unwrap();
         let tags_dir = temp_dir.path();
 
         let state1 = Merkle::of(b"state1");
         let state2 = Merkle::of(b"state2");
 
-        // Same tag name in different stacks
+        // Same tag name in different views
         save_tag(tags_dir, &Tag::new("release", "main", 10, state1)).unwrap();
         save_tag(tags_dir, &Tag::new("release", "feature", 5, state2)).unwrap();
 
-        // Load from each stack
+        // Load from each view
         let main_tag = load_tag(tags_dir, "main", "release").unwrap().unwrap();
         let feature_tag = load_tag(tags_dir, "feature", "release").unwrap().unwrap();
 
@@ -516,8 +513,8 @@ mod tests {
         let tags = list_tags_filtered(tags_dir, &filter).unwrap();
         assert_eq!(tags.len(), 2);
 
-        // Filter by stack
-        let filter = TagFilter::new().stack("main");
+        // Filter by view
+        let filter = TagFilter::new().view("main");
         let tags = list_tags_filtered(tags_dir, &filter).unwrap();
         assert_eq!(tags.len(), 2);
 

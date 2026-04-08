@@ -1,7 +1,7 @@
 //! The `tag create` command for creating a new tag.
 //!
 //! This module implements the `atomic tag create` command, which creates a new
-//! tag pointing to the current state of a stack. Tags can be lightweight
+//! tag pointing to the current state of a view. Tags can be lightweight
 //! (just a reference) or annotated (with message and author information).
 //!
 //! # Usage
@@ -15,7 +15,7 @@
 //! Options:
 //!   -m, --message <MSG>   Message for an annotated tag
 //!   -a, --author <AUTHOR> Author for an annotated tag (format: "Name <email>")
-//!   -s, --stack <STACK>   Stack to tag (default: current stack)
+//!   -s, --view <VIEW>     View to tag (default: current view)
 //!   -f, --force           Overwrite existing tag
 //!   -h, --help            Print help information
 //! ```
@@ -78,7 +78,7 @@ fn parse_author(s: &str) -> (String, Option<String>) {
 
 /// Create a new tag.
 ///
-/// Creates a tag pointing to the current state of a stack. Tags can be
+/// Creates a tag pointing to the current state of a view. Tags can be
 /// lightweight (just a reference) or annotated (with message and author).
 #[derive(Parser, Debug, Default)]
 #[command(name = "create")]
@@ -103,11 +103,11 @@ pub struct Create {
     #[arg(long, short = 'a', value_name = "AUTHOR")]
     pub author: Option<String>,
 
-    /// Stack to tag.
+    /// View to tag.
     ///
-    /// If not provided, uses the current stack.
-    #[arg(long, short = 's', value_name = "STACK")]
-    pub stack: Option<String>,
+    /// If not provided, uses the current view.
+    #[arg(long, short = 's', value_name = "VIEW")]
+    pub view: Option<String>,
 
     /// Overwrite existing tag.
     ///
@@ -123,7 +123,7 @@ impl Create {
             name: None,
             message: None,
             author: None,
-            stack: None,
+            view: None,
             force: false,
         }
     }
@@ -134,7 +134,7 @@ impl Create {
             name: Some(name.into()),
             message: None,
             author: None,
-            stack: None,
+            view: None,
             force: false,
         }
     }
@@ -151,9 +151,9 @@ impl Create {
         self
     }
 
-    /// Builder: set the stack.
-    pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
-        self.stack = Some(stack.into());
+    /// Builder: set the view.
+    pub fn with_view(mut self, view: impl Into<String>) -> Self {
+        self.view = Some(view.into());
         self
     }
 
@@ -195,8 +195,8 @@ impl Command for Create {
             options = options.author(name, email);
         }
 
-        if let Some(stack) = &self.stack {
-            options = options.stack(stack);
+        if let Some(view) = &self.view {
+            options = options.view(view);
         }
 
         if self.force {
@@ -298,9 +298,9 @@ mod tests {
     }
 
     #[test]
-    fn test_create_with_stack() {
-        let cmd = Create::with_name("v1.0.0").with_stack("release");
-        assert_eq!(cmd.stack, Some("release".to_string()));
+    fn test_create_with_view() {
+        let cmd = Create::with_name("v1.0.0").with_view("release");
+        assert_eq!(cmd.view, Some("release".to_string()));
     }
 
     #[test]
@@ -315,7 +315,7 @@ mod tests {
         assert!(cmd.name.is_none());
         assert!(cmd.message.is_none());
         assert!(cmd.author.is_none());
-        assert!(cmd.stack.is_none());
+        assert!(cmd.view.is_none());
         assert!(!cmd.force);
     }
 

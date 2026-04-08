@@ -581,7 +581,7 @@ where
 
 /// Output a single file from the graph with an optional change filter.
 ///
-/// This is the core file output function that supports stack-aware output.
+/// This is the core file output function that supports view-aware output.
 /// When a `change_filter` is provided, only vertices from changes in the filter
 /// (or ROOT) will be included in the output.
 ///
@@ -632,9 +632,9 @@ where
 
     // Handle empty graph.
     //
-    // When a change_filter is active (stack-aware output), an empty graph
-    // means the file has no content on the target stack.  In that case we
-    // must NOT create the file — it belongs to a different stack and should
+    // When a change_filter is active (view-aware output), an empty graph
+    // means the file has no content on the target view.  In that case we
+    // must NOT create the file — it belongs to a different view and should
     // not appear in the working copy.
     //
     // Without a change_filter the empty graph represents a genuinely empty
@@ -855,7 +855,7 @@ where
 /// use std::collections::HashSet;
 ///
 /// // Get changes applied before a specific change
-/// let change_set: HashSet<NodeId> = get_changes_up_to_sequence(&txn, &stack, 5)?;
+/// let change_set: HashSet<NodeId> = get_changes_up_to_sequence(&txn, &view, 5)?;
 ///
 /// // Create retrieve options with the filter
 /// let retrieve_opts = RetrieveOptions::new().with_change_filter(change_set);

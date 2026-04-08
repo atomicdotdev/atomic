@@ -129,7 +129,7 @@ enum Commands {
     /// atomic init
     ///
     /// # Initialize with custom view name
-    /// atomic init --stack main
+    /// atomic init --view main
     ///
     /// # Initialize a Rust project
     /// atomic init --kind rust
@@ -198,7 +198,7 @@ enum Commands {
     /// atomic reset src/main.rs
     ///
     /// # Switch to a different view
-    /// atomic reset --stack main
+    /// atomic reset --view main
     ///
     /// # Preview what would be reset
     /// atomic reset --dry-run
@@ -219,7 +219,7 @@ enum Commands {
     /// atomic split experimental
     ///
     /// # Split from specific view
-    /// atomic split hotfix --stack release-1.0
+    /// atomic split hotfix --view release-1.0
     ///
     /// # Split and switch to new view
     /// atomic split feature-auth --switch

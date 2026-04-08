@@ -43,7 +43,7 @@ use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{print_success, stack as style_stack, warning};
+use crate::output::{print_success, view as style_view, warning};
 
 #[cfg(test)]
 use std::path::PathBuf;
@@ -160,7 +160,7 @@ impl Command for Delete {
             other => CliError::Repository(other),
         })?;
 
-        print_success(&format!("Deleted view: {}", style_stack(name)));
+        print_success(&format!("Deleted view: {}", style_view(name)));
 
         Ok(())
     }

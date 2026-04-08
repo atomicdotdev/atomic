@@ -2,7 +2,7 @@
 //!
 //! This module implements the `atomic tag delete` command, which removes
 //! a tag from the repository. Deleting a tag does not affect the underlying
-//! changes or stack state - it only removes the named reference.
+//! changes or view state - it only removes the named reference.
 //!
 //! # Usage
 //!
@@ -40,7 +40,7 @@ use std::path::PathBuf;
 /// Delete a tag.
 ///
 /// Removes a tag from the repository. This does not affect the underlying
-/// changes or stack state - it only removes the named reference.
+/// changes or view state - it only removes the named reference.
 #[derive(Parser, Debug, Default)]
 #[command(name = "delete")]
 pub struct Delete {

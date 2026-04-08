@@ -161,10 +161,13 @@ pub use history::{
 
 // Tags exports
 pub use tags::{
-    count_all_tags, count_tags, delete_tag, list_all_tags, list_tag_stacks, list_tags,
-    list_tags_filtered, load_tag, load_tag_any_stack, save_tag, save_tag_force, stack_tags_dir,
-    tag_file_path, validate_tag_name, Tag, TagError, TagFilter, TagOptions, TagResult, TagSort,
+    count_all_tags, count_tags, delete_tag, list_all_tags, list_tag_views, list_tags,
+    list_tags_filtered, load_tag, load_tag_any_view, save_tag, save_tag_force, tag_file_path,
+    validate_tag_name, view_tags_dir, Tag, TagError, TagFilter, TagOptions, TagResult, TagSort,
 };
+
+// Backward-compatible aliases for renamed tag functions
+pub use tags::{list_tag_stacks, load_tag_any_stack, stack_tags_dir};
 
 // Unrecord exports
 pub use unrecord::{

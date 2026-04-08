@@ -11,7 +11,7 @@
 //! 1. **Verify dependencies**: All required changes must be present
 //! 2. **Register the change**: Get an internal [`NodeId`] for the change
 //! 3. **Apply atoms**: Process each graph_op's atoms (vertices and edges)
-//! 4. **Update stack state**: Add to change log and update Merkle state
+//! 4. **Update view state**: Add to change log and update Merkle state
 //! 5. **Handle conflicts**: Track zombies and missing contexts
 //!
 //! # Design Notes
@@ -74,17 +74,17 @@ pub fn verify_dependencies<T: GraphTxnT>(
     Ok(missing)
 }
 
-/// Check if a change has already been applied to a stack.
+/// Check if a change has already been applied to a view.
 ///
 /// # Arguments
 ///
 /// * `txn` - The transaction to check against
-/// * `stack` - The stack to check
+/// * `view` - The view to check
 /// * `change_id` - The internal ID of the change
 ///
 /// # Returns
 ///
-/// `true` if the change is already on the stack.
+/// `true` if the change is already on the view.
 ///
 /// # Example
 ///
@@ -108,11 +108,11 @@ pub fn is_change_on_view<T: ViewTxnT>(
 /// `new_state = Hash(old_state || change_hash)`
 ///
 /// This provides a unique identifier for the sequence of changes
-/// applied to a stack.
+/// applied to a view.
 ///
 /// # Arguments
 ///
-/// * `current_state` - The stack's current Merkle state
+/// * `current_state` - The view's current Merkle state
 /// * `change_hash` - The hash of the change being applied
 ///
 /// # Returns
@@ -140,7 +140,7 @@ pub fn compute_new_state(current_state: &Merkle, change_hash: &Hash) -> Merkle {
     current_state.next(change_hash)
 }
 
-/// Describes a change that should be applied to a stack.
+/// Describes a change that should be applied to a view.
 ///
 /// This is a helper struct that bundles all the information needed
 /// to apply a change.
@@ -162,12 +162,12 @@ impl ChangeToApply {
     }
 }
 
-/// Result of applying a change to a stack.
+/// Result of applying a change to a view.
 ///
 /// This contains the updated state after successful application.
 #[derive(Debug, Clone)]
 pub struct ApplyResult {
-    /// The new Merkle state of the stack
+    /// The new Merkle state of the view
     pub new_state: Merkle,
     /// The sequence number of the applied change
     pub sequence: u64,
@@ -189,13 +189,13 @@ impl ApplyResult {
 /// Check if applying a change would succeed (without actually applying).
 ///
 /// This performs validation checks:
-/// - Change not already on stack
+/// - Change not already on view
 /// - All dependencies present
 ///
 /// # Arguments
 ///
 /// * `txn` - The transaction to check against
-/// * `stack` - The stack to check
+/// * `view` - The view to check
 /// * `change_id` - The internal ID of the change
 /// * `change_hash` - The hash of the change
 /// * `change` - The change to validate
@@ -414,7 +414,7 @@ mod tests {
         assert!(!err.is_recoverable());
     }
 
-    // Stack State Tests
+    // View State Tests
 
     #[test]
     fn test_view_state_initial() {

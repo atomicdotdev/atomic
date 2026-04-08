@@ -1,28 +1,28 @@
 //! Unrecord operations for Atomic VCS
 //!
 //! This module provides functionality for undoing (unrecording) changes that
-//! have been applied to a stack. Unrecording is the inverse of applying - it
-//! removes a change from the stack and reverses its effects on the graph.
+//! have been applied to a view. Unrecording is the inverse of applying - it
+//! removes a change from the view and reverses its effects on the graph.
 //!
 //! # Overview
 //!
 //! Unrecording a change involves several steps:
 //!
-//! 1. **Verify**: Ensure the change is in the stack and can be safely removed
+//! 1. **Verify**: Ensure the change is in the view and can be safely removed
 //! 2. **Check Dependencies**: Ensure no other applied changes depend on it
 //! 3. **Unapply**: Reverse the graph modifications made by the change
-//! 4. **Update Stack**: Remove from change log and recompute Merkle state
+//! 4. **Update View**: Remove from change log and recompute Merkle state
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────────────┐
 //! │                      Unrecord Operation Flow                            │
 //! ├─────────────────────────────────────────────────────────────────────────┤
 //! │                                                                         │
-//! │  Stack Log              Graph                    Result                 │
+//! │  View Log               Graph                    Result                 │
 //! │  ┌──────────┐         ┌─────────────┐          ┌─────────────┐         │
 //! │  │ Seq 0: A │         │  Vertices   │          │ Change      │         │
 //! │  │ Seq 1: B │ ──────▶ │  & Edges    │ ──────▶  │ Removed     │         │
-//! │  │ Seq 2: C │ remove  │  from B     │ revert   │ from Stack  │         │
+//! │  │ Seq 2: C │ remove  │  from B     │ revert   │ from View   │         │
 //! │  └──────────┘   B     └─────────────┘          └─────────────┘         │
 //! │                                                                         │
 //! │  Before: [A, B, C]                                                      │
@@ -65,7 +65,7 @@
 //!
 //! Unlike `git reset`, unrecord in Atomic:
 //!
-//! - Only removes changes from the current stack, not globally
+//! - Only removes changes from the current view, not globally
 //! - Preserves the change in the change store (can be re-applied)
 //! - Is fully reversible (just re-apply the change)
 //! - Works with the graph model, not commit trees
@@ -373,7 +373,7 @@ pub struct UnrecordDependencyInfo {
     /// Changes that this change depends on.
     pub dependencies: Vec<Hash>,
 
-    /// Changes that depend on this change (in the current stack).
+    /// Changes that depend on this change (in the current view).
     pub dependents: Vec<Hash>,
 
     /// Whether this change can be safely unrecorded.
@@ -405,7 +405,7 @@ impl UnrecordDependencyInfo {
         self.dependents.push(dep);
         self.can_unrecord = false;
         self.block_reason = Some(format!(
-            "Change has {} dependent(s) in the stack",
+            "Change has {} dependent(s) in the view",
             self.dependents.len()
         ));
     }

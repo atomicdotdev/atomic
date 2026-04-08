@@ -1,19 +1,19 @@
 //! History operations for Atomic VCS
 //!
 //! This module provides functionality for querying and traversing the history
-//! of changes applied to a stack. History in Atomic is fundamentally different
+//! of changes applied to a view. History in Atomic is fundamentally different
 //! from Git: it's not a linked list of commits but an ordered log of changes
-//! applied to a view (stack) of the graph.
+//! applied to a view of the graph.
 //!
 //! # Overview
 //!
-//! Each stack maintains an ordered log of changes that have been applied to it.
+//! Each view maintains an ordered log of changes that have been applied to it.
 //! This log is indexed by sequence number and includes Merkle state hashes at
 //! each point, enabling efficient synchronization and state verification.
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────────────┐
-//! │                          Stack History Log                              │
+//! │                          View History Log                               │
 //! ├─────────────────────────────────────────────────────────────────────────┤
 //! │                                                                         │
 //! │   Seq   │   Change Hash        │   Merkle State                        │

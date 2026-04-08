@@ -1,9 +1,9 @@
-//! Pre-filter logic for stack-aware repository materialization.
+//! Pre-filter logic for view-aware repository materialization.
 //!
-//! When a `change_filter` is active (stack-aware output), these functions
+//! When a `change_filter` is active (view-aware output), these functions
 //! compute which file paths and ancestor directories should be included
 //! in the output. This prevents recreating directories and empty files
-//! that belong to a different stack.
+//! that belong to a different view.
 
 use std::collections::HashSet;
 use std::sync::Arc;

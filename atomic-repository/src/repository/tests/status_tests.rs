@@ -8,7 +8,7 @@ fn test_repo_status_empty_repo() {
         .status(StatusOptions::default())
         .expect("status failed");
 
-    assert_eq!(status.stack(), "dev");
+    assert_eq!(status.view(), "dev");
     // Empty repo should be clean
     assert!(status.is_clean());
 }

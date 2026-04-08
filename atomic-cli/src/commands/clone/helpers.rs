@@ -772,12 +772,12 @@ mod tests {
     /// Test converting view not found error.
     #[test]
     fn test_convert_view_not_found() {
-        let err = RemoteError::view_not_found("missing-stack");
+        let err = RemoteError::view_not_found("missing-view");
         let cli_err = convert_remote_error(err, "http://example.com");
 
         match cli_err {
             CliError::RemoteError { message, .. } => {
-                assert!(message.contains("missing-stack"));
+                assert!(message.contains("missing-view"));
             }
             _ => panic!("Expected RemoteError"),
         }

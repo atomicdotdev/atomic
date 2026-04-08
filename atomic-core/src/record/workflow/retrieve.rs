@@ -350,7 +350,7 @@ where
 /// use std::collections::HashSet;
 ///
 /// // Get changes applied before a specific change
-/// let change_set: HashSet<NodeId> = get_changes_up_to_sequence(&txn, &stack, 5)?;
+/// let change_set: HashSet<NodeId> = get_changes_up_to_sequence(&txn, &view, 5)?;
 ///
 /// // Create options with the filter
 /// let options = RetrieveOptions::new().with_change_filter(change_set);
@@ -411,7 +411,7 @@ where
 ///
 /// # Arguments
 ///
-/// * `txn` - Transaction providing graph and stack access
+/// * `txn` - Transaction providing graph and view access
 /// * `changes` - Change store for span content
 /// * `position` - Position in the graph (identifies the file)
 /// * `change_set` - Set of change NodeIds to include
@@ -424,7 +424,7 @@ where
 ///
 /// ```rust,ignore
 /// // Get the change set for the parent state
-/// let change_set = get_changes_up_to_sequence(&txn, &stack, parent_seq)?;
+/// let change_set = get_changes_up_to_sequence(&txn, &view, parent_seq)?;
 ///
 /// // Retrieve content at that state
 /// let before_content = retrieve_content_at_state(&txn, &changes, position, change_set)?;

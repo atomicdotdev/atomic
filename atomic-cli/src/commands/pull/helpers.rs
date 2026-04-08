@@ -30,7 +30,7 @@ use atomic_repository::history::HistoryEntry;
 use atomic_repository::Repository;
 
 use crate::error::{CliError, CliResult};
-use crate::output::{hint, info, stack as style_stack};
+use crate::output::{hint, info, view as style_view};
 
 use super::types::PullChange;
 
@@ -306,9 +306,9 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
 ///
 /// # Arguments
 ///
-/// * `local_stack` - The name of the local stack
+/// * `local_view` - The name of the local view
 /// * `local_entries` - Local history entries
-/// * `remote_stack` - The name of the remote stack
+/// * `remote_view` - The name of the remote view
 /// * `remote_state` - The remote's current state response
 /// * `remote_entries` - The remote's changelist entries
 ///
@@ -319,9 +319,9 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
 ///   Local:  main at ABC123... (10 changes)
 /// ```
 pub fn display_state_comparison(
-    local_stack: &str,
+    local_view: &str,
     local_entries: &[HistoryEntry],
-    remote_stack: &str,
+    remote_view: &str,
     remote_state: &StateResponse,
     remote_entries: &[ChangelistEntry],
 ) {
@@ -331,13 +331,13 @@ pub fn display_state_comparison(
     println!(
         "  {}: {} {}",
         info("Remote"),
-        style_stack(remote_stack),
+        style_view(remote_view),
         remote_state_str
     );
     println!(
         "  {}: {} {}",
         info("Local"),
-        style_stack(local_stack),
+        style_view(local_view),
         local_state_str
     );
 }
@@ -693,12 +693,12 @@ mod tests {
     /// Test converting view not found error.
     #[test]
     fn test_convert_view_not_found() {
-        let err = RemoteError::view_not_found("missing-stack");
+        let err = RemoteError::view_not_found("missing-view");
         let cli_err = convert_remote_error(err, "http://example.com");
 
         match cli_err {
             CliError::RemoteError { message, .. } => {
-                assert!(message.contains("missing-stack"));
+                assert!(message.contains("missing-view"));
             }
             _ => panic!("Expected RemoteError"),
         }

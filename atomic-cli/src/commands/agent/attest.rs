@@ -3,7 +3,7 @@
 //! Lists attestations in the repository — graph-level audit nodes that
 //! capture AI cost, token usage, model breakdown, and session metadata.
 //!
-//! Attestations are not tied to any stack. They live in the graph as
+//! Attestations are not tied to any view. They live in the graph as
 //! standalone nodes with dependencies pointing to the changes they cover.
 //!
 //! # Examples
@@ -15,8 +15,8 @@
 //! # Show details for a specific attestation
 //! atomic agent attest --hash XMJZ3IPF
 //!
-//! # Show attestations covering changes in a specific stack
-//! atomic agent attest --stack dev
+//! # Show attestations covering changes in a specific view
+//! atomic agent attest --view dev
 //!
 //! # Verbose output with model breakdown
 //! atomic agent attest --verbose
@@ -38,17 +38,17 @@ use crate::output::print_warning;
 ///
 /// Attestations are graph-level audit nodes that capture metadata about
 /// AI agent sessions: cost, token usage per model, duration, and which
-/// changes are covered. They transcend stacks — one attestation can
-/// cover changes across multiple stacks.
+/// changes are covered. They transcend views — one attestation can
+/// cover changes across multiple views.
 #[derive(Debug, Args)]
 pub struct Attest {
     /// Show details for a specific attestation by hash (or prefix).
     #[arg(long, value_name = "HASH")]
     hash: Option<String>,
 
-    /// Filter to attestations covering changes in this stack.
-    #[arg(long, value_name = "STACK")]
-    stack: Option<String>,
+    /// Filter to attestations covering changes in this view.
+    #[arg(long, value_name = "VIEW")]
+    view: Option<String>,
 
     /// Show verbose output with model breakdown and coverage.
     #[arg(short, long)]
@@ -60,7 +60,7 @@ impl Attest {
     pub(crate) fn default_for_test() -> Self {
         Self {
             hash: None,
-            stack: None,
+            view: None,
             verbose: false,
         }
     }
@@ -81,9 +81,9 @@ impl Command for Attest {
             return self.show_detail(&repo, hash_prefix);
         }
 
-        // Filter by stack
-        if let Some(ref stack_name) = self.stack {
-            return self.show_for_stack(&repo, stack_name);
+        // Filter by view
+        if let Some(ref view_name) = self.view {
+            return self.show_for_view(&repo, view_name);
         }
 
         // List all attestations
@@ -162,13 +162,13 @@ impl Attest {
     }
 
     /// Show attestations for a specific view.
-    fn show_for_stack(&self, repo: &Repository, stack_name: &str) -> CliResult<()> {
+    fn show_for_view(&self, repo: &Repository, view_name: &str) -> CliResult<()> {
         let results = repo
-            .find_attestations_for_view(stack_name)
+            .find_attestations_for_view(view_name)
             .map_err(CliError::Repository)?;
 
         if results.is_empty() {
-            println!("No attestations cover changes in view '{}'.", stack_name);
+            println!("No attestations cover changes in view '{}'.", view_name);
             return Ok(());
         }
 
@@ -176,16 +176,16 @@ impl Attest {
             "{} attestation{} covering changes in '{}'",
             results.len(),
             if results.len() == 1 { "" } else { "s" },
-            stack_name,
+            view_name,
         );
         println!();
 
-        for (hash, attest, covered_in_stack) in &results {
+        for (hash, attest, covered_in_view) in &results {
             self.print_summary(hash, attest);
             println!(
                 "    Coverage in {}: {}/{} changes",
-                stack_name,
-                covered_in_stack.len(),
+                view_name,
+                covered_in_view.len(),
                 attest.change_count(),
             );
 
@@ -264,7 +264,7 @@ impl Attest {
         self.print_changes(&attest);
         println!();
 
-        // Coverage per stack
+        // Coverage per view
         self.print_coverage(repo, &attest);
 
         Ok(())
@@ -352,9 +352,9 @@ impl Attest {
         }
     }
 
-    /// Print coverage per stack.
+    /// Print coverage per view.
     fn print_coverage(&self, repo: &Repository, attest: &Attestation) {
-        let stacks = match repo.list_views() {
+        let views = match repo.list_views() {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -363,9 +363,9 @@ impl Attest {
 
         let mut has_coverage = false;
 
-        for stack_name in &stacks {
+        for view_name in &views {
             let history = match repo
-                .log(atomic_repository::history::HistoryOptions::default().view(stack_name))
+                .log(atomic_repository::history::HistoryOptions::default().view(view_name))
             {
                 Ok(h) => h,
                 Err(_) => continue,
@@ -398,7 +398,7 @@ impl Attest {
 
             println!(
                 "  {:<20} {} {}/{} ({:.0}%)",
-                stack_name, bar, covered, total, pct,
+                view_name, bar, covered, total, pct,
             );
         }
     }
@@ -444,7 +444,7 @@ mod tests {
     fn test_attest_default_for_test() {
         let cmd = Attest::default_for_test();
         assert!(cmd.hash.is_none());
-        assert!(cmd.stack.is_none());
+        assert!(cmd.view.is_none());
         assert!(!cmd.verbose);
     }
 
@@ -452,27 +452,27 @@ mod tests {
     fn test_attest_with_hash() {
         let cmd = Attest {
             hash: Some("XMJZ3IPF".to_string()),
-            stack: None,
+            view: None,
             verbose: false,
         };
         assert_eq!(cmd.hash.as_deref(), Some("XMJZ3IPF"));
     }
 
     #[test]
-    fn test_attest_with_stack() {
+    fn test_attest_with_view() {
         let cmd = Attest {
             hash: None,
-            stack: Some("dev".to_string()),
+            view: Some("dev".to_string()),
             verbose: false,
         };
-        assert_eq!(cmd.stack.as_deref(), Some("dev"));
+        assert_eq!(cmd.view.as_deref(), Some("dev"));
     }
 
     #[test]
     fn test_attest_verbose() {
         let cmd = Attest {
             hash: None,
-            stack: None,
+            view: None,
             verbose: true,
         };
         assert!(cmd.verbose);
