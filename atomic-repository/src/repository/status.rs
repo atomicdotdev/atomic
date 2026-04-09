@@ -341,13 +341,8 @@ impl Repository {
                         }
                     }
 
-                    if !mtime_matched && !(filter_is_universal && has_graph_content) {
+                    if !mtime_matched {
                         // Slow path: hash the working copy file and compare with graph content.
-                        //
-                        // Skipped when filter_is_universal (shared root view) AND the file
-                        // has graph content — the file was written by git import and hasn't
-                        // been modified since.  This reduces post-import status from
-                        // O(files × graph_traversal) to O(files × stat).
                         match hash_file_contents(&abs_path) {
                             Ok(current_hash) => {
                                 entry.set_current_hash(current_hash);

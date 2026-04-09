@@ -449,6 +449,41 @@ impl Repository {
     /// let src_files = repo.tracked_files_under("src")?;
     /// println!("Files in src/: {}", src_files.len());
     /// ```
+    /// Store mtime + size for a batch of files in a single transaction.
+    ///
+    /// This populates the mtime cache so that `status` can compare
+    /// file metadata instead of reconstructing graph content for every
+    /// file.  Call this after git import (or any bulk write that puts
+    /// files on disk without going through `record`).
+    ///
+    /// # Arguments
+    ///
+    /// * `files` - Slice of `(path, mtime_secs, mtime_nanos, file_size)` tuples.
+    ///   Paths should be repo-relative with forward slashes.
+    pub fn update_file_mtimes(
+        &self,
+        files: &[(String, i64, u32, u64)],
+    ) -> Result<(), RepositoryError> {
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        for (path, secs, nanos, size) in files {
+            txn.put_file_mtime(path, *secs, *nanos, *size)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
     pub fn tracked_files_under<P: AsRef<Path>>(
         &self,
         prefix: P,

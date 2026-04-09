@@ -511,6 +511,39 @@ impl ParallelImporter {
             }
         }
 
+        // Populate the mtime cache for all files written during this batch.
+        // This lets `atomic status` compare file metadata (stat) instead of
+        // reconstructing graph content for every file — reducing post-import
+        // status from O(files × graph_traversal) to O(files × stat).
+        let repo_root = repo.root().to_path_buf();
+        let mut mtime_entries: Vec<(String, i64, u32, u64)> = Vec::new();
+
+        for parsed in commits {
+            for file in &parsed.files {
+                if file.operation == FileOperation::Deleted {
+                    continue;
+                }
+                let abs_path = repo_root.join(&file.path);
+                if let Ok(metadata) = std::fs::metadata(&abs_path) {
+                    use std::time::SystemTime;
+                    let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    let duration = mtime
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    let secs = duration.as_secs() as i64;
+                    let nanos = duration.subsec_nanos();
+                    let size = metadata.len();
+                    // Normalize path to forward slashes for TREE compatibility
+                    let normalized = file.path.replace('\\', "/");
+                    mtime_entries.push((normalized, secs, nanos, size));
+                }
+            }
+        }
+
+        if !mtime_entries.is_empty() {
+            let _ = repo.update_file_mtimes(&mtime_entries);
+        }
+
         Ok(stats)
     }
 
