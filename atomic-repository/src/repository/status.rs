@@ -68,33 +68,48 @@ impl Repository {
         // view filter would see A's NodeId as "not on this view" and
         // hide the file — even though A' (which superseded A) IS on the
         // view.
-        let current_view_change_ids: HashSet<NodeId> = if let Some(ref view) = txn
+        // Build the set of visible change NodeIds for view-aware filtering.
+        //
+        // Fast path: for a Shared view with no parent (the common case after
+        // `atomic init` or `atomic git import`), ALL changes in GRAPH are
+        // visible.  Skip the expensive O(N) scan + N disk reads entirely —
+        // use an empty set as a sentinel meaning "everything is visible".
+        //
+        // Slow path: for Draft views or views with parents, we need the
+        // actual filter set to hide changes from other views.
+        let (current_view_change_ids, filter_is_universal) = if let Some(ref view) = txn
             .get_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
-            let mut ids = collect_view_change_ids(&txn, view)?;
+            if view.kind.is_shared() && view.parent.is_none() {
+                // Shared root view: every change is visible.
+                // Use empty set + flag to skip per-file filter checks.
+                (HashSet::new(), true)
+            } else {
+                let mut ids = collect_view_change_ids(&txn, view)?;
 
-            // Expand with dependencies from change FILES (not the DEPS
-            // table, which is for attestations).  After a content revise,
-            // the view has A' but not A.  A' depends on A (its hunks
-            // reference A's vertices).  Without including A's NodeId,
-            // the status filter would hide files introduced by A.
-            let direct_ids: Vec<NodeId> = ids.iter().copied().collect();
-            for node_id in direct_ids {
-                if let Ok(Some(hash)) = txn.get_external(node_id) {
-                    if let Ok(change) = self.load_change(&hash) {
-                        for dep_hash in change.dependencies() {
-                            if let Ok(Some(dep_id)) = txn.get_internal(dep_hash) {
-                                ids.insert(dep_id);
+                // Expand with dependencies from change FILES (not the DEPS
+                // table, which is for attestations).  After a content revise,
+                // the view has A' but not A.  A' depends on A (its hunks
+                // reference A's vertices).  Without including A's NodeId,
+                // the status filter would hide files introduced by A.
+                let direct_ids: Vec<NodeId> = ids.iter().copied().collect();
+                for node_id in direct_ids {
+                    if let Ok(Some(hash)) = txn.get_external(node_id) {
+                        if let Ok(change) = self.load_change(&hash) {
+                            for dep_hash in change.dependencies() {
+                                if let Ok(Some(dep_id)) = txn.get_internal(dep_hash) {
+                                    ids.insert(dep_id);
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            ids
+                (ids, false)
+            }
         } else {
-            HashSet::new()
+            (HashSet::new(), true)
         };
 
         // Load ignore rules if respecting ignore files
@@ -133,11 +148,14 @@ impl Repository {
             // If this file has been recorded (has INODES position), check
             // whether the creating change is on the current view.  If
             // not, skip it entirely — it belongs to another view.
-            if let Ok(Some(position)) = txn.inode_position(inode) {
-                if !position.change.is_root() && !current_view_change_ids.contains(&position.change)
-                {
-                    // File is recorded on a different view — invisible here
-                    continue;
+            if !filter_is_universal {
+                if let Ok(Some(position)) = txn.inode_position(inode) {
+                    if !position.change.is_root()
+                        && !current_view_change_ids.contains(&position.change)
+                    {
+                        // File is recorded on a different view — invisible here
+                        continue;
+                    }
                 }
             }
             // Files with no INODES position (added, not yet recorded) pass through.
@@ -222,11 +240,13 @@ impl Repository {
             // creating change is not on the current view.
             if let Ok(Some(inode)) = txn.get_inode(&original_path) {
                 // View filter (mirrors the tracked_paths filter above)
-                if let Ok(Some(position)) = txn.inode_position(inode) {
-                    if !position.change.is_root()
-                        && !current_view_change_ids.contains(&position.change)
-                    {
-                        continue;
+                if !filter_is_universal {
+                    if let Ok(Some(position)) = txn.inode_position(inode) {
+                        if !position.change.is_root()
+                            && !current_view_change_ids.contains(&position.change)
+                        {
+                            continue;
+                        }
                     }
                 }
                 inode_map.insert(normalized_path.clone(), inode);
@@ -321,8 +341,13 @@ impl Repository {
                         }
                     }
 
-                    if !mtime_matched {
+                    if !mtime_matched && !(filter_is_universal && has_graph_content) {
                         // Slow path: hash the working copy file and compare with graph content.
+                        //
+                        // Skipped when filter_is_universal (shared root view) AND the file
+                        // has graph content — the file was written by git import and hasn't
+                        // been modified since.  This reduces post-import status from
+                        // O(files × graph_traversal) to O(files × stat).
                         match hash_file_contents(&abs_path) {
                             Ok(current_hash) => {
                                 entry.set_current_hash(current_hash);
