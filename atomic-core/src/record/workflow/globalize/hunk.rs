@@ -307,30 +307,29 @@ where
     Ok(vertices)
 }
 
-/// Retrieve every alive content vertex for a file using the INODE_GRAPH
-/// secondary index.
+/// Retrieve every alive content vertex for a file.
 ///
-/// This is O(m) where m = edges for this file, instead of the O(n)
-/// `retrieve_graph` approach that scans the entire global GRAPH.
+/// This always uses `retrieve_graph` which traverses via the `GraphTxnT`
+/// implementation.  When the caller passes a `ViewGraph`, the traversal
+/// respects the view's change filter — only vertices from visible changes
+/// are returned.  When the caller passes a bare `ReadTxn`, all vertices
+/// are returned.
 ///
-/// Falls back to the global `retrieve_graph` if INODE_GRAPH is not
-/// populated for this inode.
+/// **Why not INODE_GRAPH?**  The `INODE_GRAPH` secondary index stores ALL
+/// edges regardless of view.  Using it directly would bypass the
+/// `ViewGraph` filter, returning vertices from changes that aren't visible
+/// in the current view — causing content duplication in the `record()`
+/// path.  The INODE_GRAPH optimisation is safe only when there is no
+/// filter (e.g. `assemble_and_hash` for git import, which passes a bare
+/// `&txn`).  For the general case we must go through `retrieve_graph`.
 fn find_content_vertices<T>(
     txn: &T,
-    inode: Inode,
+    _inode: Inode,
     inode_pos: Position<NodeId>,
 ) -> GlobalizeResult<Vec<GraphNode<NodeId>>>
 where
     T: GraphTxnT + InodeGraphOps,
 {
-    // Try the fast path: INODE_GRAPH secondary index
-    let populated = txn.inode_graph_is_populated(inode).unwrap_or(false);
-
-    if populated {
-        return find_content_vertices_via_inode(txn, inode, inode_pos);
-    }
-
-    // Fallback: global GRAPH scan (for repos where INODE_GRAPH wasn't populated)
     find_content_vertices_global(txn, inode_pos)
 }
 
