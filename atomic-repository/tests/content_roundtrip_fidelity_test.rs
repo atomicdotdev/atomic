@@ -13,7 +13,6 @@ use std::fs;
 use std::path::PathBuf;
 
 use atomic_core::change::{Author, ChangeHeader};
-use atomic_core::types::Base32;
 use atomic_core::types::Hash;
 use atomic_repository::{RecordOptions, Repository};
 use tempfile::TempDir;
