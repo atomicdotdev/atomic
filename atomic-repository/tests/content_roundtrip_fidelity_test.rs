@@ -18,19 +18,6 @@ use atomic_core::types::Hash;
 use atomic_repository::{RecordOptions, Repository};
 use tempfile::TempDir;
 
-/// Platform-aware path for subdirectory test files.
-/// On Windows, file tracking with subdirectory paths has known issues,
-/// so we use flat filenames. On Unix, we use subdirectory paths to
-/// exercise the full path handling.
-fn test_path(subdir_path: &str) -> String {
-    if cfg!(windows) {
-        // Flatten: "src/main.rs" → "src_main.rs"
-        subdir_path.replace('/', "_")
-    } else {
-        subdir_path.to_string()
-    }
-}
-
 fn create_test_repo() -> (Repository, TempDir, PathBuf) {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let repo_path = temp.path().to_path_buf();
@@ -276,29 +263,28 @@ fn main() {
 ";
 
     // Record version 1
-    let p = test_path("src/main.rs");
-    write_file(&repo_path, &p, v1);
-    repo.add(&p, Default::default()).unwrap();
+    write_file(&repo_path, "src/main.rs", v1);
+    repo.add("src/main.rs", Default::default()).unwrap();
     let h1 = record_change(&repo, "initial");
-    assert_content_matches(&repo, &p, v1);
+    assert_content_matches(&repo, "src/main.rs", v1);
 
     // Record version 2 (minor edits)
-    write_file(&repo_path, &p, v2);
+    write_file(&repo_path, "src/main.rs", v2);
     let h2 = record_change(&repo, "code style");
-    assert_content_matches(&repo, &p, v2);
+    assert_content_matches(&repo, "src/main.rs", v2);
 
     // Record version 3 (major refactor: extract function, add warmup, replace inline code)
-    write_file(&repo_path, &p, v3);
+    write_file(&repo_path, "src/main.rs", v3);
     let h3 = record_change(&repo, "extract helper and add warmup");
 
     // This is the critical assertion — after the multi-hunk refactor,
     // the graph content should exactly match v3 with no duplication.
-    assert_content_matches(&repo, &p, v3);
+    assert_content_matches(&repo, "src/main.rs", v3);
 
     // Also verify state-based retrieval at each point
-    assert_content_after_change(&repo, &p, &h1, v1);
-    assert_content_after_change(&repo, &p, &h2, v2);
-    assert_content_after_change(&repo, &p, &h3, v3);
+    assert_content_after_change(&repo, "src/main.rs", &h1, v1);
+    assert_content_after_change(&repo, "src/main.rs", &h2, v2);
+    assert_content_after_change(&repo, "src/main.rs", &h3, v3);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -347,12 +333,10 @@ fn test_hyperfine_content_duplication_bug() {
         "68fdc2c",  // Add --warmup option
     ];
 
-    let git_file = "src/main.rs";
-    let local_file = test_path(git_file);
     let mut versions: Vec<Vec<u8>> = Vec::new();
     for sha in &commits {
         let output = Command::new("git")
-            .args(["show", &format!("{}:{}", sha, git_file)])
+            .args(["show", &format!("{}:src/main.rs", sha)])
             .current_dir(&git_path)
             .output()
             .expect("Failed to run git show");
@@ -366,14 +350,14 @@ fn test_hyperfine_content_duplication_bug() {
     // Commit 1: add file
     write_file(
         &repo_path,
-        &local_file,
+        "src/main.rs",
         &String::from_utf8_lossy(&versions[0]),
     );
-    repo.add(&local_file, Default::default()).unwrap();
+    repo.add("src/main.rs", Default::default()).unwrap();
     let _ = record_change(&repo, "Initial commit");
 
     let content = repo
-        .get_file_content_on_view(&local_file, repo.current_view())
+        .get_file_content_on_view("src/main.rs", repo.current_view())
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -383,11 +367,11 @@ fn test_hyperfine_content_duplication_bug() {
 
     // Commits 2-4: modify file
     for (i, version) in versions[1..].iter().enumerate() {
-        write_file(&repo_path, &local_file, &String::from_utf8_lossy(version));
+        write_file(&repo_path, "src/main.rs", &String::from_utf8_lossy(version));
         let _ = record_change(&repo, &format!("Commit {}", i + 2));
 
         let content = repo
-            .get_file_content_on_view(&local_file, repo.current_view())
+            .get_file_content_on_view("src/main.rs", repo.current_view())
             .unwrap()
             .unwrap();
 
@@ -449,9 +433,6 @@ fn test_hyperfine_extended_commit_sequence() {
         }
     }
 
-    let git_file = "src/main.rs";
-    let local_file = test_path(git_file);
-
     // Commits that touch src/main.rs in the first 15 commits.
     // We skip commits that don't change src/main.rs (README, licenses, metadata).
     let commits: Vec<&str> = vec![
@@ -469,7 +450,7 @@ fn test_hyperfine_extended_commit_sequence() {
     let mut versions: Vec<(String, Vec<u8>)> = Vec::new();
     for sha in &commits {
         let output = Command::new("git")
-            .args(["show", &format!("{}:{}", sha, git_file)])
+            .args(["show", &format!("{}:src/main.rs", sha)])
             .current_dir(&git_path)
             .output()
             .expect("Failed to run git show");
@@ -492,14 +473,14 @@ fn test_hyperfine_extended_commit_sequence() {
     // First version: add file
     write_file(
         &repo_path,
-        &local_file,
+        "src/main.rs",
         &String::from_utf8_lossy(&versions[0].1),
     );
-    repo.add(&local_file, Default::default()).unwrap();
+    repo.add("src/main.rs", Default::default()).unwrap();
     let _ = record_change(&repo, &format!("Commit 1 ({})", versions[0].0));
 
     let content = repo
-        .get_file_content_on_view(&local_file, repo.current_view())
+        .get_file_content_on_view("src/main.rs", repo.current_view())
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -510,11 +491,11 @@ fn test_hyperfine_extended_commit_sequence() {
 
     // Subsequent versions: modify file
     for (i, (sha, version)) in versions[1..].iter().enumerate() {
-        write_file(&repo_path, &local_file, &String::from_utf8_lossy(version));
+        write_file(&repo_path, "src/main.rs", &String::from_utf8_lossy(version));
         let _ = record_change(&repo, &format!("Commit {} ({})", i + 2, sha));
 
         let content = repo
-            .get_file_content_on_view(&local_file, repo.current_view())
+            .get_file_content_on_view("src/main.rs", repo.current_view())
             .unwrap()
             .unwrap();
 
@@ -554,9 +535,6 @@ fn test_hyperfine_extended_commit_sequence() {
 #[test]
 fn test_hyperfine_pairwise_transitions() {
     use std::process::Command;
-    let git_file = "src/main.rs";
-    let local_file = test_path(git_file);
-
     let git_temp = TempDir::new().expect("Failed to create temp dir for git");
     let git_path = git_temp.path().to_path_buf();
     let clone_status = Command::new("git")
@@ -591,7 +569,7 @@ fn test_hyperfine_pairwise_transitions() {
     for (before_sha, after_sha, description) in &pairs {
         // Get file at before and after
         let before_output = Command::new("git")
-            .args(["show", &format!("{}:{}", before_sha, git_file)])
+            .args(["show", &format!("{}:src/main.rs", before_sha)])
             .current_dir(&git_path)
             .output()
             .expect("Failed to run git show");
@@ -602,7 +580,7 @@ fn test_hyperfine_pairwise_transitions() {
         );
 
         let after_output = Command::new("git")
-            .args(["show", &format!("{}:{}", after_sha, git_file)])
+            .args(["show", &format!("{}:src/main.rs", after_sha)])
             .current_dir(&git_path)
             .output()
             .expect("Failed to run git show");
@@ -618,14 +596,14 @@ fn test_hyperfine_pairwise_transitions() {
         // Add the "before" version
         write_file(
             &repo_path,
-            &local_file,
+            "src/main.rs",
             &String::from_utf8_lossy(&before_output.stdout),
         );
-        repo.add(&local_file, Default::default()).unwrap();
+        repo.add("src/main.rs", Default::default()).unwrap();
         let _ = record_change(&repo, &format!("before: {}", before_sha));
 
         let content = repo
-            .get_file_content_on_view(&local_file, repo.current_view())
+            .get_file_content_on_view("src/main.rs", repo.current_view())
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -637,13 +615,13 @@ fn test_hyperfine_pairwise_transitions() {
         // Apply the "after" version
         write_file(
             &repo_path,
-            &local_file,
+            "src/main.rs",
             &String::from_utf8_lossy(&after_output.stdout),
         );
         let _ = record_change(&repo, &format!("after: {}", after_sha));
 
         let content = repo
-            .get_file_content_on_view(&local_file, repo.current_view())
+            .get_file_content_on_view("src/main.rs", repo.current_view())
             .unwrap()
             .unwrap();
 
@@ -931,17 +909,16 @@ fn main() {
 }
 ";
 
-    let p = test_path("src/main.rs");
-    write_file(&repo_path, &p, v1);
-    repo.add(&p, Default::default()).unwrap();
+    write_file(&repo_path, "src/main.rs", v1);
+    repo.add("src/main.rs", Default::default()).unwrap();
     let _h1 = record_change(&repo, "initial");
-    assert_content_matches(&repo, &p, v1);
+    assert_content_matches(&repo, "src/main.rs", v1);
 
     // This is the critical step — a single-line middle insertion must
     // successfully record and produce correct content.
-    write_file(&repo_path, &p, v2);
+    write_file(&repo_path, "src/main.rs", v2);
     let _h2 = record_change(&repo, "add stdin null");
-    assert_content_matches(&repo, &p, v2);
+    assert_content_matches(&repo, "src/main.rs", v2);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1046,19 +1023,18 @@ fn main() {
 }
 ";
 
-    let p = test_path("src/main.rs");
-    write_file(&repo_path, &p, v1);
-    repo.add(&p, Default::default()).unwrap();
+    write_file(&repo_path, "src/main.rs", v1);
+    repo.add("src/main.rs", Default::default()).unwrap();
     let _h1 = record_change(&repo, "initial");
 
-    write_file(&repo_path, &p, v2);
+    write_file(&repo_path, "src/main.rs", v2);
     let _h2 = record_change(&repo, "refactor imports");
 
-    write_file(&repo_path, &p, v3);
+    write_file(&repo_path, "src/main.rs", v3);
     let _h3 = record_change(&repo, "add error handling");
 
     // The critical single-line middle insertion
-    write_file(&repo_path, &p, v4);
+    write_file(&repo_path, "src/main.rs", v4);
     let _h4 = record_change(&repo, "close stdin for child processes");
-    assert_content_matches(&repo, &p, v4);
+    assert_content_matches(&repo, "src/main.rs", v4);
 }
