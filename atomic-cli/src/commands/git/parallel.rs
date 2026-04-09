@@ -824,9 +824,33 @@ impl ParallelImporter {
         }
 
         let step_start = Instant::now();
-        let (mut change, hash) = repo
-            .assemble_and_hash(header, &recorded_files)
-            .map_err(|e| CliError::Internal(e.into()))?;
+        let (mut change, hash) = match repo.assemble_and_hash(header.clone(), &recorded_files) {
+            Ok(result) => result,
+            Err(e) => {
+                // Globalization may strip all hunks (e.g., pure deletion commits
+                // where find_content_vertices returns empty for already-deleted
+                // files).  Fall back to an empty change — the explicit
+                // repo.remove() cleanup below still handles the TREE entries.
+                let err_msg = e.to_string();
+                if err_msg.contains("empty") || err_msg.contains("AllEmpty") {
+                    let mut empty = Change::empty(header);
+                    empty.unhashed = Some(self.build_git_metadata(parsed, false, true));
+                    let h = empty.hash().map_err(|e| CliError::Internal(e.into()))?;
+                    repo.save_change(&empty)
+                        .map_err(|e| CliError::Internal(e.into()))?;
+                    repo.insert_change(&h, Default::default())
+                        .map_err(|e| CliError::Internal(e.into()))?;
+
+                    // Still clean up deleted files from TREE
+                    for del_path in &deleted_paths {
+                        let _ = repo.remove(del_path, atomic_repository::TrackingOptions::forced());
+                    }
+
+                    return Ok(true);
+                }
+                return Err(CliError::Internal(e.into()));
+            }
+        };
         let assemble_ms = step_start.elapsed().as_millis();
 
         change.unhashed = Some(self.build_git_metadata(parsed, false, false));
