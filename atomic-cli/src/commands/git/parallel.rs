@@ -331,7 +331,39 @@ impl ParallelImporter {
             },
         ));
 
-        // Phase 3: Finalization (just verification for now)
+        // Phase 3: Reconciliation — remove TREE entries for files that
+        // don't exist on disk.
+        //
+        // Merge commits can implicitly delete files by not including them
+        // from a second parent.  Our per-commit diff only sees explicit
+        // deletions (FileOperation::Deleted), so files dropped during
+        // merge resolution leave orphaned TREE entries.
+        //
+        // Fix: after all batches complete, compare every tracked path
+        // against the working copy and remove orphans.
+        let reconcile_start = Instant::now();
+        let tracked = repo.list_tracked_files().unwrap_or_default();
+        let repo_root = repo.root().to_path_buf();
+        let mut orphan_count = 0usize;
+
+        for file in &tracked {
+            let abs = repo_root.join(&file.path);
+            if !abs.exists() {
+                let _ = repo.remove(&file.path, atomic_repository::TrackingOptions::forced());
+                let _ = repo.del_file_index(&file.path.to_string_lossy());
+                orphan_count += 1;
+            }
+        }
+
+        if orphan_count > 0 {
+            print_info(&format!(
+                "Reconciliation: removed {} orphaned TREE entries ({:.1}s)",
+                orphan_count,
+                reconcile_start.elapsed().as_secs_f64()
+            ));
+        }
+
+        // Phase 4: Finalization (verification)
         self.phase3_finalize(&stats)?;
 
         Ok(stats)
