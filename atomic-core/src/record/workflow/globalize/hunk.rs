@@ -333,75 +333,7 @@ where
     find_content_vertices_global(txn, inode_pos)
 }
 
-/// Fast path: scan INODE_GRAPH for this file's vertices only.
-fn find_content_vertices_via_inode<T>(
-    txn: &T,
-    inode: Inode,
-    inode_pos: Position<NodeId>,
-) -> GlobalizeResult<Vec<GraphNode<NodeId>>>
-where
-    T: GraphTxnT + InodeGraphOps,
-{
-    use crate::types::EdgeFlags;
-
-    let mut out = Vec::new();
-
-    // Iterate all forward (non-PARENT) edges in this file's INODE_GRAPH.
-    // Each unique destination vertex that is alive is a content vertex.
-    let mut seen = std::collections::HashSet::new();
-
-    // Start from the inode vertex — follow its forward edges
-    let mut stack = vec![inode_pos.inode_node()];
-    seen.insert(inode_pos.inode_node());
-
-    while let Some(node) = stack.pop() {
-        // Get forward (non-deleted, non-parent) edges for this node
-        // within the inode scope.
-        let min_flag = EdgeFlags::BLOCK;
-        let max_flag = EdgeFlags::all()
-            .difference(EdgeFlags::PARENT)
-            .difference(EdgeFlags::DELETED);
-
-        let mut adj = match txn.init_inode_adj(inode, node, min_flag, max_flag) {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
-
-        while let Some(edge_result) = txn.next_inode_adj(&mut adj) {
-            let edge = match edge_result {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let dest_pos = edge.dest();
-            let resolved = match txn.find_block(dest_pos) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            if seen.contains(&resolved) {
-                continue;
-            }
-            seen.insert(resolved);
-
-            // Skip ROOT
-            if resolved.change.is_root() {
-                continue;
-            }
-            // Skip inode marker (empty vertex at inode position)
-            if resolved.start == resolved.end && resolved.start == inode_pos.pos {
-                continue;
-            }
-
-            out.push(resolved);
-            stack.push(resolved);
-        }
-    }
-
-    Ok(out)
-}
-
-/// Fallback: retrieve content vertices via global GRAPH DFS.
+/// Retrieve content vertices via global GRAPH DFS.
 fn find_content_vertices_global<T>(
     txn: &T,
     inode_pos: Position<NodeId>,
