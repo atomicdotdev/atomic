@@ -240,8 +240,8 @@ make_temp_repo "git-import-errors"
 atomic init >/dev/null 2>&1
 
 # Should fail with clear error about not being a git repo
-out="$(atomic git import 2>&1)"
-status=$?
+status=0
+out="$(atomic git import 2>&1)" || status=$?
 if [ "$status" -eq 0 ]; then
     _fail "atomic git import unexpectedly succeeded in non-git directory"
 elif echo "$out" | grep -qiE "not.*git|no.*repository|git.*not found"; then
@@ -253,8 +253,8 @@ fi
 # Now make it a git repo and test invalid branch
 init_git_repo
 git_commit "test" "test.txt" "test"
-out="$(atomic git import --branch nonexistent 2>&1)"
-status=$?
+status=0
+out="$(atomic git import --branch nonexistent 2>&1)" || status=$?
 if [ "$status" -eq 0 ]; then
     _fail "atomic git import unexpectedly succeeded for invalid branch"
 elif echo "$out" | grep -qiE "branch.*not found|no.*branch|invalid.*branch|unknown.*branch"; then
@@ -335,12 +335,14 @@ make_temp_repo "git-import-merges"
 init_git_repo
 
 # Create a merge scenario
+# Detect the default branch name (may be "main" or "master" depending on git config)
+_default_branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo main)"
 git_commit "Base commit" "base.txt" "base"
 git checkout -b feature --quiet
 git_commit "Feature commit" "feature.txt" "feature"
-git checkout main --quiet 2>/dev/null || git checkout master --quiet
+git checkout "$_default_branch" --quiet 2>/dev/null
 git_commit "Main commit" "main2.txt" "main2"
-git merge feature --no-ff -m "Merge feature into main" --quiet
+git merge feature --no-ff -m "Merge feature into main" --quiet 2>/dev/null
 
 atomic init >/dev/null 2>&1
 atomic git import >/dev/null 2>&1
