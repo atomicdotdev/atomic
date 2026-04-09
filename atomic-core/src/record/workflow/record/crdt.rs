@@ -358,8 +358,8 @@ pub(super) fn build_crdt_ops_for_modified_file(
                     }
 
                     // Walk old lines: unpaired → Delete
-                    for oi in 0..*old_len {
-                        if paired_old[oi].is_some() {
+                    for (oi, paired_old_item) in paired_old.iter().enumerate().take(*old_len) {
+                        if paired_old_item.is_some() {
                             continue;
                         }
                         let old_line_idx = old_pos + oi;
@@ -507,8 +507,9 @@ pub(super) fn build_crdt_ops_for_modified_file(
             set
         };
 
-        let mut del_entries: Vec<(usize, String, std::collections::HashSet<(u8, u8)>)> = Vec::new();
-        let mut ins_entries: Vec<(usize, String, std::collections::HashSet<(u8, u8)>)> = Vec::new();
+        type BigramEntry = (usize, String, std::collections::HashSet<(u8, u8)>);
+        let mut del_entries: Vec<BigramEntry> = Vec::new();
+        let mut ins_entries: Vec<BigramEntry> = Vec::new();
 
         for (idx, op) in collected_line_ops.iter().enumerate() {
             if op.is_modify() {

@@ -49,9 +49,9 @@ use crate::pristine::InodeGraphOps;
 /// * `inode`          – the file's stable identifier
 /// * `inode_pos`      – the graph position of the file's inode vertex
 /// * `content`        – the content bytes this hunk should insert (the hunk's
-///                      own slice for Insert, the full new file for Replace)
+///   own slice for Insert, the full new file for Replace)
 /// * `old_line_count` – number of lines in the old file (for insert-position
-///                      classification)
+///   classification)
 pub fn globalize_hunk<T>(
     ctx: &mut GlobalizeContext<'_, T>,
     built: &BuiltHunk,
@@ -99,6 +99,7 @@ where
 ///
 /// Any other position means the upstream consolidation was bypassed, and we
 /// return an error instead of silently producing duplicate content.
+#[allow(clippy::too_many_arguments)]
 fn globalize_insert<T>(
     ctx: &mut GlobalizeContext<'_, T>,
     built: &BuiltHunk,
