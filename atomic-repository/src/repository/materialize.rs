@@ -125,6 +125,12 @@ impl Repository {
         let result = materialize_view(&txn, &self.change_store, &working_copy, options)
             .map_err(|e| RepositoryError::Output(format!("{}", e)))?;
 
+        // Populate the mtime cache for all written files so that subsequent
+        // `status` calls can compare file metadata (stat) instead of
+        // reconstructing graph content.  This makes status after materialize
+        // or server-side push instantaneous.
+        self.populate_mtime_cache(&result);
+
         Ok(result)
     }
 
@@ -140,6 +146,35 @@ impl Repository {
     /// # Returns
     ///
     /// Statistics about the materialize operation.
+    /// Populate the mtime cache for all files in a materialize result.
+    ///
+    /// Stats each written file from disk and stores its mtime + size in the
+    /// pristine database.  Errors are silently ignored (best-effort).
+    fn populate_mtime_cache(&self, result: &MaterializeResult) {
+        use std::time::SystemTime;
+
+        let mut entries: Vec<(String, i64, u32, u64)> = Vec::new();
+
+        for path in result.file_results.keys() {
+            let abs_path = self.root.join(path);
+            if let Ok(metadata) = std::fs::metadata(&abs_path) {
+                let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                let duration = mtime
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let secs = duration.as_secs() as i64;
+                let nanos = duration.subsec_nanos();
+                let size = metadata.len();
+                let normalized = path.replace('\\', "/");
+                entries.push((normalized, secs, nanos, size));
+            }
+        }
+
+        if !entries.is_empty() {
+            let _ = self.update_file_mtimes(&entries);
+        }
+    }
+
     pub fn materialize_prefix(&self, prefix: &str) -> Result<MaterializeResult, RepositoryError> {
         let txn = self
             .pristine
@@ -163,6 +198,8 @@ impl Repository {
 
         let result = materialize_view(&txn, &self.change_store, &working_copy, options)
             .map_err(|e| RepositoryError::Output(format!("{}", e)))?;
+
+        self.populate_mtime_cache(&result);
 
         Ok(result)
     }
