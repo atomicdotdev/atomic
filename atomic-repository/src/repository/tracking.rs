@@ -437,29 +437,6 @@ impl Repository {
         Ok(self.list_tracked_files()?.len())
     }
 
-    /// Get all tracked files under a directory prefix.
-    ///
-    /// # Arguments
-    ///
-    /// * `prefix` - Directory prefix to search under
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let src_files = repo.tracked_files_under("src")?;
-    /// println!("Files in src/: {}", src_files.len());
-    /// ```
-    /// Store mtime + size + content hash for a batch of files in a single transaction.
-    ///
-    /// This populates the file index so that `status` can compare
-    /// file metadata instead of reconstructing graph content for every
-    /// file.  Call this after git import (or any bulk write that puts
-    /// files on disk without going through `record`).
-    ///
-    /// # Arguments
-    ///
-    /// * `files` - Slice of `(path, mtime_secs, mtime_nanos, file_size, content_hash)` tuples.
-    ///   Paths should be repo-relative with forward slashes.
     /// Remove a file from the FILE_INDEX.
     ///
     /// Call this when a file is deleted (e.g., during git import cleanup)
@@ -480,6 +457,17 @@ impl Repository {
         Ok(())
     }
 
+    /// Store mtime + size + content hash for a batch of files in a single transaction.
+    ///
+    /// This populates the file index so that `status` can compare
+    /// file metadata instead of reconstructing graph content for every
+    /// file.  Call this after git import (or any bulk write that puts
+    /// files on disk without going through `record`).
+    ///
+    /// # Arguments
+    ///
+    /// * `files` - Slice of `(path, mtime_secs, mtime_nanos, file_size, content_hash)` tuples.
+    ///   Paths should be repo-relative with forward slashes.
     pub fn update_file_index(
         &self,
         files: &[(String, i64, u32, u64, Hash)],
@@ -504,6 +492,18 @@ impl Repository {
         Ok(())
     }
 
+    /// Get all tracked files under a directory prefix.
+    ///
+    /// # Arguments
+    ///
+    /// * `prefix` - Directory prefix to search under
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let src_files = repo.tracked_files_under("src")?;
+    /// println!("Files in src/: {}", src_files.len());
+    /// ```
     pub fn tracked_files_under<P: AsRef<Path>>(
         &self,
         prefix: P,
