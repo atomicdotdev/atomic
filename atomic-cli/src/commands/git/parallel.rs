@@ -845,9 +845,10 @@ impl ParallelImporter {
                     repo.insert_change(&h, Default::default())
                         .map_err(|e| CliError::Internal(e.into()))?;
 
-                    // Still clean up deleted files from TREE
+                    // Still clean up deleted files from TREE and FILE_INDEX
                     for del_path in &deleted_paths {
                         let _ = repo.remove(del_path, atomic_repository::TrackingOptions::forced());
+                        let _ = repo.del_file_index(del_path);
                     }
 
                     return Ok(true);
@@ -888,8 +889,10 @@ impl ParallelImporter {
         // produce GraphOp::Replacement, not GraphOp::FileDel, so insert_change
         // never removes their TREE entries.  Explicitly untrack them now so that
         // `atomic status` after import matches the git working copy.
+        // Also remove from FILE_INDEX so status doesn't show them as deleted.
         for del_path in &deleted_paths {
             let _ = repo.remove(del_path, atomic_repository::TrackingOptions::forced());
+            let _ = repo.del_file_index(del_path);
         }
 
         Ok(true)

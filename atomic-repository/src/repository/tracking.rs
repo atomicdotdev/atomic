@@ -460,6 +460,26 @@ impl Repository {
     ///
     /// * `files` - Slice of `(path, mtime_secs, mtime_nanos, file_size, content_hash)` tuples.
     ///   Paths should be repo-relative with forward slashes.
+    /// Remove a file from the FILE_INDEX.
+    ///
+    /// Call this when a file is deleted (e.g., during git import cleanup)
+    /// so that `status` doesn't show it as a stale entry.
+    pub fn del_file_index(&self, path: &str) -> Result<(), RepositoryError> {
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let normalized = path.replace('\\', "/");
+        txn.del_file_index(&normalized)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
     pub fn update_file_index(
         &self,
         files: &[(String, i64, u32, u64, Hash)],
