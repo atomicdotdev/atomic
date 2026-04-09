@@ -148,7 +148,7 @@ impl Repository {
             // convert it to a relative path. This handles cases where paths were
             // incorrectly stored with absolute paths (e.g., on macOS where /tmp
             // resolves to /private/tmp).
-            let normalized_path = if path_buf.is_absolute() {
+            let stripped = if path_buf.is_absolute() {
                 if let Ok(rel) = path_buf.strip_prefix(&self.root) {
                     rel.to_path_buf()
                 } else {
@@ -167,6 +167,10 @@ impl Repository {
             } else {
                 path_buf
             };
+
+            // Normalize to forward slashes for consistent comparison with
+            // disk paths (also normalized to '/') on all platforms.
+            let normalized_path = PathBuf::from(stripped.to_string_lossy().replace('\\', "/"));
 
             tracked_paths.insert(normalized_path);
         }
@@ -207,6 +211,11 @@ impl Repository {
             } else {
                 path_buf
             };
+
+            // Normalize to forward slashes for consistent comparison with
+            // disk paths (also normalized to '/') on all platforms.
+            let normalized_path =
+                PathBuf::from(normalized_path.to_string_lossy().replace('\\', "/"));
 
             // Use the original path for database lookup since that's what's stored.
             // Apply the same view-awareness filter here: skip inodes whose

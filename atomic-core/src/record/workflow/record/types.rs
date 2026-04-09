@@ -140,6 +140,9 @@ pub struct RecordedFile {
     /// Path of the file.
     path: String,
 
+    /// Previous path (for moves/renames).
+    old_path: Option<String>,
+
     /// Hunks generated for this file.
     hunks: Vec<BuiltHunk>,
 
@@ -192,6 +195,7 @@ impl RecordedFile {
     pub fn new(path: impl Into<String>) -> Self {
         Self {
             path: path.into(),
+            old_path: None,
             hunks: Vec::new(),
             content: Vec::new(),
             encoding: None,
@@ -315,6 +319,11 @@ impl RecordedFile {
         self.inode = Some(inode);
     }
 
+    /// Set the old path (for moves/renames).
+    pub fn set_old_path(&mut self, path: String) {
+        self.old_path = Some(path);
+    }
+
     /// Set the CRDT operations for this file.
     pub fn set_crdt_ops(&mut self, ops: FileOps) {
         self.crdt_ops = Some(ops);
@@ -329,6 +338,12 @@ impl RecordedFile {
     #[must_use]
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// Get the old path (for moves/renames).
+    #[must_use]
+    pub fn old_path(&self) -> Option<&str> {
+        self.old_path.as_deref()
     }
 
     /// Get the hunks.
@@ -392,8 +407,14 @@ impl RecordedFile {
     }
 
     /// Check if empty (no hunks).
+    ///
+    /// Note: Moved files are never considered empty even if they have no hunks,
+    /// because the move itself is a meaningful operation that must be recorded.
     #[must_use]
     pub fn is_empty(&self) -> bool {
+        if matches!(self.kind, Some(DetectionKind::Moved)) {
+            return false;
+        }
         self.hunks.is_empty()
     }
 

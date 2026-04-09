@@ -244,7 +244,8 @@ impl Pristine {
     /// must be explicitly committed with `commit()` or it will be rolled back
     /// when dropped.
     pub fn write_txn(&self) -> PristineResult<WriteTxn<'_>> {
-        let txn = self.db.begin_write()?;
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(redb::Durability::Eventual);
         Ok(WriteTxn::new(
             txn,
             &self.next_node_id,

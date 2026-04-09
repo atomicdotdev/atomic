@@ -140,7 +140,7 @@ fn write_new_edge<T: MutTxnT>(
     change: &Change,
 ) -> Result<(), LocalApplyError> {
     // Resolve the introduced_by change
-    let _introduced_by = resolve_introduced_by(txn, &edge.introduced_by, change_id)?;
+    let introduced_by = resolve_introduced_by(txn, &edge.introduced_by, change_id)?;
 
     // Find source span — predecessor context (ending at position).
     let source_pos = resolve_position(txn, &edge.from, change_id)?;
@@ -179,18 +179,25 @@ fn write_new_edge<T: MutTxnT>(
         collect_pseudo_edges_for_reconnection(txn, workspace, target)?;
     }
 
-    // In the ambient graph model, we NEVER delete edges from GRAPH.
-    // The original edge (introduced by a prior change) stays in place.
-    // We only ADD the new edge alongside it.  The view filter determines
-    // which edge is "active" for any given view:
+    // Remove the old edge before adding the new one.
     //
-    //   - If the new edge's introducing change is IN the view's filter,
-    //     the new edge (e.g., BLOCK|DELETED) takes precedence.
-    //   - If the new edge's introducing change is OUTSIDE the filter,
-    //     the original edge remains visible.
-    //
-    // This is what makes views work as true projections over a single
-    // graph — no view can destroy information that another view depends on.
+    // The `previous` field records the flags of the edge being superseded
+    // (e.g., BLOCK for a live edge that is now being marked DELETED).
+    // Without this deletion the old alive edge remains in the B-tree
+    // multimap alongside the new DELETED edge, causing `is_vertex_alive`
+    // to find the stale alive parent and incorrectly report the vertex as
+    // alive — which breaks subsequent Replace operations on the same file.
+    del_edge_with_reverse(
+        txn,
+        resolved_inode,
+        edge.previous,
+        source,
+        target,
+        introduced_by,
+    )?;
+
+    // Add the new edge (e.g., BLOCK|DELETED to mark content as removed,
+    // or BLOCK to wire in new content).
     add_edge_with_reverse(txn, resolved_inode, edge.flag, source, target, change_id)?;
 
     // For non-folder deletions, check for zombie context
@@ -275,6 +282,34 @@ pub fn find_target_vertex<T: GraphTxnT>(
 
 // Edge Operations
 
+/// Remove a forward edge and its reverse (PARENT) counterpart from
+/// GRAPH and INODE_GRAPH.
+///
+/// Errors are silently ignored (the edge may not exist if this is the
+/// first time the graph is being written).
+fn del_edge_with_reverse<T: MutTxnT>(
+    txn: &mut T,
+    inode: Option<Inode>,
+    flag: EdgeFlags,
+    source: GraphNode<NodeId>,
+    dest: GraphNode<NodeId>,
+    introduced_by: NodeId,
+) -> Result<(), LocalApplyError> {
+    let forward_edge = SerializedGraphEdge::new(flag, dest.start_pos(), introduced_by);
+    let reverse_flag = flag | EdgeFlags::PARENT;
+    let reverse_edge = SerializedGraphEdge::new(reverse_flag, source.end_pos(), introduced_by);
+
+    let _ = txn.del_graph(source, forward_edge);
+    let _ = txn.del_graph(dest, reverse_edge);
+
+    if let Some(inode_val) = inode {
+        let _ = txn.del_inode_graph(inode_val, source, forward_edge);
+        let _ = txn.del_inode_graph(inode_val, dest, reverse_edge);
+    }
+
+    Ok(())
+}
+
 /// Write an edge and its reverse to the graph.
 ///
 /// In the Atomic graph model, edges come in pairs:
@@ -283,15 +318,6 @@ pub fn find_target_vertex<T: GraphTxnT>(
 ///
 /// Writes both edges to the global GRAPH table and, when an inode is
 /// provided, to the INODE_GRAPH secondary index.
-///
-/// # Arguments
-///
-/// * `txn` - Write transaction
-/// * `inode` - Optional inode for inode_graph indexing
-/// * `flag` - Edge flags for the forward edge
-/// * `source` - Source span
-/// * `dest` - Destination span
-/// * `introduced_by` - Change that introduced this edge
 fn add_edge_with_reverse<T: MutTxnT>(
     txn: &mut T,
     inode: Option<Inode>,

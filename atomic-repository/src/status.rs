@@ -809,7 +809,11 @@ pub fn collect_working_copy_files_with_rules(
                 }
             }
 
-            files.insert(rel_path.to_path_buf());
+            // Normalize to forward slashes so paths match TREE entries
+            // (which always use '/'). On Windows, walkdir returns paths
+            // with '\' separators, but TREE stores '/'.
+            let normalized = PathBuf::from(rel_path.to_string_lossy().replace('\\', "/"));
+            files.insert(normalized);
         }
     }
 

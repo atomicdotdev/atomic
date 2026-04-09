@@ -321,7 +321,7 @@ pub fn assemble_change<T>(
     options: &AssemblyOptions,
 ) -> types::AssemblyResult<AssemblyResult_>
 where
-    T: GraphTxnT + TreeTxnT,
+    T: GraphTxnT + TreeTxnT + crate::pristine::InodeGraphOps,
 {
     // Validate input
     if files.is_empty() {

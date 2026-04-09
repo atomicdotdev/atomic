@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::pristine::{GraphTxnT, PristineError, TreeTxnT};
+use crate::pristine::{GraphTxnT, InodeAdjState, InodeGraphOps, PristineError, TreeTxnT};
 use crate::types::{EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge};
 
 /// A view-scoped graph wrapper that filters edge traversal by visibility.
@@ -68,6 +68,47 @@ impl<'a, T> ViewGraph<'a, T> {
     #[cfg(test)]
     fn is_visible(&self, change_id: NodeId) -> bool {
         change_id == NodeId::ROOT || self.visible.contains(&change_id)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// InodeGraphOps — delegate to inner txn (INODE_GRAPH is unfiltered)
+// ─────────────────────────────────────────────────────────────────────────
+
+impl<'a, T: InodeGraphOps> InodeGraphOps for ViewGraph<'a, T> {
+    type InodeError = T::InodeError;
+
+    fn init_inode_adj(
+        &self,
+        inode: Inode,
+        node: GraphNode<NodeId>,
+        min_flag: EdgeFlags,
+        max_flag: EdgeFlags,
+    ) -> Result<InodeAdjState, Self::InodeError> {
+        self.inner.init_inode_adj(inode, node, min_flag, max_flag)
+    }
+
+    fn next_inode_adj(
+        &self,
+        adj: &mut InodeAdjState,
+    ) -> Option<Result<SerializedGraphEdge, Self::InodeError>> {
+        self.inner.next_inode_adj(adj)
+    }
+
+    fn find_block_in_inode(
+        &self,
+        inode: Inode,
+        pos: Position<NodeId>,
+    ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
+        self.inner.find_block_in_inode(inode, pos)
+    }
+
+    fn count_inode_vertices(&self, inode: Inode) -> Result<usize, Self::InodeError> {
+        self.inner.count_inode_vertices(inode)
+    }
+
+    fn inode_graph_is_populated(&self, inode: Inode) -> Result<bool, Self::InodeError> {
+        self.inner.inode_graph_is_populated(inode)
     }
 }
 
