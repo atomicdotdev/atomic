@@ -66,6 +66,7 @@ use rayon::prelude::*;
 
 use atomic_core::change::{Author, Change, ChangeHeader};
 use atomic_core::record::workflow::GitDiffLine;
+use atomic_core::types::Hash as ContentHash;
 use atomic_repository::Repository;
 
 use crate::error::{CliError, CliResult};
@@ -339,13 +340,26 @@ impl ParallelImporter {
         // deletions (FileOperation::Deleted), so files dropped during
         // merge resolution leave orphaned TREE entries.
         //
-        // Fix: after all batches complete, compare every tracked path
-        // against the working copy and remove orphans.
+        // The reverse also happens: merge commits can implicitly ADD files
+        // from a second parent without an explicit FileOperation::Added in
+        // the first-parent diff.  These files exist on disk but have no
+        // TREE entry.
+        //
+        // Fix: after all batches complete, reconcile TREE ↔ working copy
+        // in both directions.
         let reconcile_start = Instant::now();
         let tracked = repo.list_tracked_files().unwrap_or_default();
         let repo_root = repo.root().to_path_buf();
         let mut orphan_count = 0usize;
+        let mut phantom_count = 0usize;
 
+        // Build a set of tracked paths for fast lookup
+        let tracked_set: std::collections::HashSet<String> = tracked
+            .iter()
+            .map(|f| f.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        // Direction 1: remove TREE entries for files NOT on disk
         for file in &tracked {
             let abs = repo_root.join(&file.path);
             if !abs.exists() {
@@ -355,10 +369,51 @@ impl ParallelImporter {
             }
         }
 
-        if orphan_count > 0 {
+        // Direction 2: add TREE entries for files on disk NOT in TREE
+        // Walk the working copy (respecting .atomicignore / .gitignore)
+        // and track any untracked files.  Also populate FILE_INDEX.
+
+        let mut new_index_entries: Vec<(String, i64, u32, u64, ContentHash)> = Vec::new();
+
+        // Use status to find untracked files — it already handles
+        // ignore rules and filesystem walking.
+        if let Ok(status) = repo.status(atomic_repository::StatusOptions::default()) {
+            for entry in status.untracked() {
+                let path_str = entry.path().to_string_lossy().replace('\\', "/");
+
+                // Add to tracking
+                let _ = repo.add(&path_str, atomic_repository::TrackingOptions::default());
+
+                // Collect FILE_INDEX entry
+                let abs = repo_root.join(entry.path());
+                if let Ok(metadata) = std::fs::metadata(&abs) {
+                    use std::time::SystemTime;
+                    let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    let duration = mtime
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    let secs = duration.as_secs() as i64;
+                    let nanos = duration.subsec_nanos();
+                    let size = metadata.len();
+                    if let Ok(bytes) = std::fs::read(&abs) {
+                        let hash = ContentHash::of(&bytes);
+                        new_index_entries.push((path_str.clone(), secs, nanos, size, hash));
+                    }
+                }
+
+                phantom_count += 1;
+            }
+        }
+
+        if !new_index_entries.is_empty() {
+            let _ = repo.update_file_index(&new_index_entries);
+        }
+
+        if orphan_count > 0 || phantom_count > 0 {
             print_info(&format!(
-                "Reconciliation: removed {} orphaned TREE entries ({:.1}s)",
+                "Reconciliation: removed {} orphaned, added {} untracked ({:.1}s)",
                 orphan_count,
+                phantom_count,
                 reconcile_start.elapsed().as_secs_f64()
             ));
         }
