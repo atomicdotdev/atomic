@@ -511,12 +511,13 @@ impl ParallelImporter {
             }
         }
 
-        // Populate the mtime cache for all files written during this batch.
-        // This lets `atomic status` compare file metadata (stat) instead of
-        // reconstructing graph content for every file — reducing post-import
-        // status from O(files × graph_traversal) to O(files × stat).
+        // Populate the file index for all files written during this batch.
+        // This lets `atomic status` compare file metadata (stat + content hash)
+        // instead of reconstructing graph content for every file — reducing
+        // post-import status from O(files × graph_traversal) to O(files × stat).
+        use atomic_core::types::Hash;
         let repo_root = repo.root().to_path_buf();
-        let mut mtime_entries: Vec<(String, i64, u32, u64)> = Vec::new();
+        let mut index_entries: Vec<(String, i64, u32, u64, Hash)> = Vec::new();
 
         for parsed in commits {
             for file in &parsed.files {
@@ -533,15 +534,18 @@ impl ParallelImporter {
                     let secs = duration.as_secs() as i64;
                     let nanos = duration.subsec_nanos();
                     let size = metadata.len();
+                    let content_hash = std::fs::read(&abs_path)
+                        .map(|bytes| Hash::of(&bytes))
+                        .unwrap_or(Hash::ZERO);
                     // Normalize path to forward slashes for TREE compatibility
                     let normalized = file.path.replace('\\', "/");
-                    mtime_entries.push((normalized, secs, nanos, size));
+                    index_entries.push((normalized, secs, nanos, size, content_hash));
                 }
             }
         }
 
-        if !mtime_entries.is_empty() {
-            let _ = repo.update_file_mtimes(&mtime_entries);
+        if !index_entries.is_empty() {
+            let _ = repo.update_file_index(&index_entries);
         }
 
         Ok(stats)

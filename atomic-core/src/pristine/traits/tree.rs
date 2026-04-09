@@ -3,7 +3,7 @@
 //! `TreeTxnT` maps file paths to inodes (stable file identifiers) and
 //! inodes to graph positions, enabling efficient file-level operations.
 
-use crate::types::{GraphNode, Inode, NodeId, Position, SerializedGraphEdge};
+use crate::types::{GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge};
 
 use crate::pristine::error::PristineError;
 
@@ -145,16 +145,18 @@ pub trait TreeTxnT: GraphTxnT {
         PristineError,
     >;
 
-    /// Get the cached file metadata (mtime + size) for a tracked file.
+    /// Get the cached file index entry (mtime + size + content hash) for a tracked file.
     ///
-    /// Returns the filesystem metadata snapshot taken at the time the file
-    /// was last recorded or applied. During status, if the current `stat()`
-    /// values match, we skip the expensive graph content comparison.
+    /// Returns the filesystem metadata and content hash snapshot taken at the
+    /// time the file was last recorded or applied. During status, if the
+    /// current `stat()` values match, we skip hashing. If they don't match,
+    /// we hash the disk file and compare with the stored content hash —
+    /// avoiding the expensive graph content reconstruction.
     ///
     /// # Returns
     ///
-    /// * `Ok(Some((mtime_secs, mtime_nanos, file_size)))` - Cached metadata
-    /// * `Ok(None)` - No cached metadata for this path
+    /// * `Ok(Some((mtime_secs, mtime_nanos, file_size, content_hash)))` - Cached index entry
+    /// * `Ok(None)` - No cached entry for this path
     /// * `Err(_)` - Database error
-    fn get_file_mtime(&self, path: &str) -> Result<Option<(i64, u32, u64)>, PristineError>;
+    fn get_file_index(&self, path: &str) -> Result<Option<(i64, u32, u64, Hash)>, PristineError>;
 }

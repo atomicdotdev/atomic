@@ -244,8 +244,8 @@ impl<'a, T: TreeTxnT> TreeTxnT for ViewGraph<'a, T> {
         self.inner.iter_inode_vertices(inode)
     }
 
-    fn get_file_mtime(&self, path: &str) -> Result<Option<(i64, u32, u64)>, PristineError> {
-        self.inner.get_file_mtime(path)
+    fn get_file_index(&self, path: &str) -> Result<Option<(i64, u32, u64, Hash)>, PristineError> {
+        self.inner.get_file_index(path)
     }
 }
 

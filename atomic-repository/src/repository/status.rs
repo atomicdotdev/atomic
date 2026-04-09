@@ -304,59 +304,42 @@ impl Repository {
                 }
 
                 if options.hash_contents {
-                    // Fast path: check filesystem mtime + size against cached values.
-                    // If they match, the file hasn't been modified since the last record,
-                    // and we can skip the expensive graph content reconstruction entirely.
-                    // This reduces incremental status from O(files × graph_size) to O(files × stat).
-                    let mut mtime_matched = false;
+                    // Fast path: check file index (mtime + size + content hash).
+                    // If mtime+size match, the file hasn't changed and we skip hashing.
+                    // If they don't match, we hash the disk file and compare with the
+                    // stored content hash — no graph content reconstruction needed.
+                    let mut content_resolved = false;
 
                     if has_graph_content {
-                        if let Ok(metadata) = std::fs::metadata(&abs_path) {
-                            use std::time::SystemTime;
-                            let current_mtime =
-                                metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                            let current_size = metadata.len();
+                        let path_str = path.to_string_lossy();
+                        if let Ok(Some((cached_secs, cached_nanos, cached_size, cached_hash))) =
+                            txn.get_file_index(&path_str)
+                        {
+                            if let Ok(metadata) = std::fs::metadata(&abs_path) {
+                                use std::time::SystemTime;
+                                let current_mtime =
+                                    metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                                let current_size = metadata.len();
 
-                            // Convert to (secs, nanos) for comparison
-                            let duration = current_mtime
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default();
-                            let current_secs = duration.as_secs() as i64;
-                            let current_nanos = duration.subsec_nanos();
+                                let duration = current_mtime
+                                    .duration_since(SystemTime::UNIX_EPOCH)
+                                    .unwrap_or_default();
+                                let current_secs = duration.as_secs() as i64;
+                                let current_nanos = duration.subsec_nanos();
 
-                            // Check the mtime cache
-                            let path_str = path.to_string_lossy();
-                            if let Ok(Some((cached_secs, cached_nanos, cached_size))) =
-                                txn.get_file_mtime(&path_str)
-                            {
                                 if current_secs == cached_secs
                                     && current_nanos == cached_nanos
                                     && current_size == cached_size
                                 {
                                     // mtime + size match — file hasn't changed.
-                                    // Keep as Clean, skip the expensive content comparison.
-                                    mtime_matched = true;
-                                }
-                            }
-                        }
-                    }
-
-                    if !mtime_matched {
-                        // Slow path: hash the working copy file and compare with graph content.
-                        match hash_file_contents(&abs_path) {
-                            Ok(current_hash) => {
-                                entry.set_current_hash(current_hash);
-
-                                // If file has graph content, compare with recorded content
-                                if has_graph_content {
-                                    // Retrieve the recorded content from the graph and hash it.
-                                    // Use get_file_content which builds a change filter
-                                    // so that the view's content is correctly scoped.
-                                    match self.get_file_content(path) {
-                                        Ok(Some(recorded_content)) => {
-                                            let recorded_hash = Hash::of(&recorded_content);
-                                            if current_hash != recorded_hash {
-                                                // Content differs - file is modified
+                                    content_resolved = true;
+                                } else {
+                                    // mtime or size differ — hash disk file and compare
+                                    // with stored content hash (no graph reconstruction).
+                                    match hash_file_contents(&abs_path) {
+                                        Ok(current_hash) => {
+                                            entry.set_current_hash(current_hash);
+                                            if current_hash != cached_hash {
                                                 entry = FileStatusEntry::new(
                                                     path.clone(),
                                                     FileStatus::Modified,
@@ -366,37 +349,9 @@ impl Repository {
                                                 }
                                                 entry.set_current_hash(current_hash);
                                             }
-                                            // Otherwise keep as Clean
-                                        }
-                                        Ok(None) => {
-                                            // No recorded content retrieved.
-                                            // If the file has graph content but retrieval returned None,
-                                            // this indicates a retrieval issue - mark as Modified to be safe.
-                                            // This ensures git import doesn't miss changes when content
-                                            // retrieval fails (e.g., due to change filter issues).
-                                            if has_graph_content {
-                                                let is_empty_file = std::fs::metadata(&abs_path)
-                                                    .map(|m| m.len() == 0)
-                                                    .unwrap_or(false);
-                                                if !is_empty_file {
-                                                    // File has graph content but retrieval failed - treat as modified
-                                                    entry = FileStatusEntry::new(
-                                                        path.clone(),
-                                                        FileStatus::Modified,
-                                                    );
-                                                    if let Some(inode) = inode {
-                                                        entry.set_inode(inode);
-                                                    }
-                                                    entry.set_current_hash(current_hash);
-                                                    entry.set_details(
-                                                        "Content retrieval failed".to_string(),
-                                                    );
-                                                }
-                                            }
-                                            // For files without graph content, keep as Clean
+                                            content_resolved = true;
                                         }
                                         Err(_) => {
-                                            // Error retrieving content - assume modified to be safe
                                             entry = FileStatusEntry::new(
                                                 path.clone(),
                                                 FileStatus::Modified,
@@ -404,26 +359,22 @@ impl Repository {
                                             if let Some(inode) = inode {
                                                 entry.set_inode(inode);
                                             }
-                                            entry.set_current_hash(current_hash);
                                             entry.set_details(
-                                                "Unable to retrieve recorded content".to_string(),
+                                                "Unable to read file contents".to_string(),
                                             );
+                                            content_resolved = true;
                                         }
                                     }
                                 }
-                                // Files marked as Added stay as Added regardless of content
                             }
-                            Err(_) => {
-                                // Can't read file - might be a permission issue
-                                if has_graph_content {
-                                    entry =
-                                        FileStatusEntry::new(path.clone(), FileStatus::Modified);
-                                    if let Some(inode) = inode {
-                                        entry.set_inode(inode);
-                                    }
-                                    entry.set_details("Unable to read file contents".to_string());
-                                }
-                            }
+                        }
+                    }
+
+                    if !content_resolved {
+                        // No file index entry (newly added file or index not yet
+                        // populated). Hash for display; keep initial status.
+                        if let Ok(hash) = hash_file_contents(&abs_path) {
+                            entry.set_current_hash(hash);
                         }
                     }
                 }

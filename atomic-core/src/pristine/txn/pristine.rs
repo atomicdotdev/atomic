@@ -96,8 +96,8 @@ impl Pristine {
             write_txn.open_table(REV_INODES)?;
             write_txn.open_table(DIRECTORIES)?;
 
-            // File mtime cache (for fast status detection)
-            write_txn.open_table(FILE_MTIMES)?;
+            // File index cache (mtime + size + content hash for fast status detection)
+            write_txn.open_table(FILE_INDEX)?;
 
             // Dependency tables
             write_txn.open_multimap_table(DEPS)?;

@@ -129,7 +129,7 @@ impl Repository {
         // `status` calls can compare file metadata (stat) instead of
         // reconstructing graph content.  This makes status after materialize
         // or server-side push instantaneous.
-        self.populate_mtime_cache(&result);
+        self.populate_file_index(&result);
 
         Ok(result)
     }
@@ -146,14 +146,15 @@ impl Repository {
     /// # Returns
     ///
     /// Statistics about the materialize operation.
-    /// Populate the mtime cache for all files in a materialize result.
+    /// Populate the file index for all files in a materialize result.
     ///
-    /// Stats each written file from disk and stores its mtime + size in the
-    /// pristine database.  Errors are silently ignored (best-effort).
-    fn populate_mtime_cache(&self, result: &MaterializeResult) {
+    /// Stats each written file from disk and stores its mtime + size +
+    /// content hash in the pristine database.  Errors are silently ignored
+    /// (best-effort).
+    fn populate_file_index(&self, result: &MaterializeResult) {
         use std::time::SystemTime;
 
-        let mut entries: Vec<(String, i64, u32, u64)> = Vec::new();
+        let mut entries: Vec<(String, i64, u32, u64, Hash)> = Vec::new();
 
         for path in result.file_results.keys() {
             let abs_path = self.root.join(path);
@@ -165,13 +166,16 @@ impl Repository {
                 let secs = duration.as_secs() as i64;
                 let nanos = duration.subsec_nanos();
                 let size = metadata.len();
+                let content_hash = std::fs::read(&abs_path)
+                    .map(|bytes| Hash::of(&bytes))
+                    .unwrap_or(Hash::ZERO);
                 let normalized = path.replace('\\', "/");
-                entries.push((normalized, secs, nanos, size));
+                entries.push((normalized, secs, nanos, size, content_hash));
             }
         }
 
         if !entries.is_empty() {
-            let _ = self.update_file_mtimes(&entries);
+            let _ = self.update_file_index(&entries);
         }
     }
 
@@ -199,7 +203,7 @@ impl Repository {
         let result = materialize_view(&txn, &self.change_store, &working_copy, options)
             .map_err(|e| RepositoryError::Output(format!("{}", e)))?;
 
-        self.populate_mtime_cache(&result);
+        self.populate_file_index(&result);
 
         Ok(result)
     }

@@ -448,12 +448,12 @@ impl TreeTxnT for ReadTxn {
         Ok(Box::new(results.into_iter()))
     }
 
-    fn get_file_mtime(&self, path: &str) -> PristineResult<Option<(i64, u32, u64)>> {
-        let table = self.txn.open_table(FILE_MTIMES)?;
+    fn get_file_index(&self, path: &str) -> PristineResult<Option<(i64, u32, u64, Hash)>> {
+        let table = self.txn.open_table(FILE_INDEX)?;
         match table.get(path)? {
             Some(value) => {
-                let (secs, nanos, size) = decode_file_mtime(value.value());
-                Ok(Some((secs, nanos, size)))
+                let (secs, nanos, size, hash) = decode_file_index(value.value());
+                Ok(Some((secs, nanos, size, hash)))
             }
             None => Ok(None),
         }

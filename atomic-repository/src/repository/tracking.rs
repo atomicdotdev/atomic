@@ -449,20 +449,20 @@ impl Repository {
     /// let src_files = repo.tracked_files_under("src")?;
     /// println!("Files in src/: {}", src_files.len());
     /// ```
-    /// Store mtime + size for a batch of files in a single transaction.
+    /// Store mtime + size + content hash for a batch of files in a single transaction.
     ///
-    /// This populates the mtime cache so that `status` can compare
+    /// This populates the file index so that `status` can compare
     /// file metadata instead of reconstructing graph content for every
     /// file.  Call this after git import (or any bulk write that puts
     /// files on disk without going through `record`).
     ///
     /// # Arguments
     ///
-    /// * `files` - Slice of `(path, mtime_secs, mtime_nanos, file_size)` tuples.
+    /// * `files` - Slice of `(path, mtime_secs, mtime_nanos, file_size, content_hash)` tuples.
     ///   Paths should be repo-relative with forward slashes.
-    pub fn update_file_mtimes(
+    pub fn update_file_index(
         &self,
-        files: &[(String, i64, u32, u64)],
+        files: &[(String, i64, u32, u64, Hash)],
     ) -> Result<(), RepositoryError> {
         if files.is_empty() {
             return Ok(());
@@ -473,8 +473,8 @@ impl Repository {
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        for (path, secs, nanos, size) in files {
-            txn.put_file_mtime(path, *secs, *nanos, *size)
+        for (path, secs, nanos, size, hash) in files {
+            txn.put_file_index(path, *secs, *nanos, *size, hash)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
         }
 

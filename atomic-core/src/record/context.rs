@@ -879,7 +879,10 @@ mod tests {
             Ok(Box::new(std::iter::empty()))
         }
 
-        fn get_file_mtime(&self, _path: &str) -> Result<Option<(i64, u32, u64)>, PristineError> {
+        fn get_file_index(
+            &self,
+            _path: &str,
+        ) -> Result<Option<(i64, u32, u64, Hash)>, PristineError> {
             Ok(None)
         }
     }

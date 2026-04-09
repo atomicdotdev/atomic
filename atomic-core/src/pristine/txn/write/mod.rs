@@ -960,21 +960,22 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         Ok(inode)
     }
 
-    fn put_file_mtime(
+    fn put_file_index(
         &mut self,
         path: &str,
         mtime_secs: i64,
         mtime_nanos: u32,
         file_size: u64,
+        content_hash: &Hash,
     ) -> Result<(), PristineError> {
-        let value = encode_file_mtime(mtime_secs, mtime_nanos, file_size);
-        let mut table = self.txn.open_table(FILE_MTIMES)?;
+        let value = encode_file_index(mtime_secs, mtime_nanos, file_size, content_hash);
+        let mut table = self.txn.open_table(FILE_INDEX)?;
         table.insert(path, &value)?;
         Ok(())
     }
 
-    fn del_file_mtime(&mut self, path: &str) -> Result<(), PristineError> {
-        let mut table = self.txn.open_table(FILE_MTIMES)?;
+    fn del_file_index(&mut self, path: &str) -> Result<(), PristineError> {
+        let mut table = self.txn.open_table(FILE_INDEX)?;
         table.remove(path)?;
         Ok(())
     }
