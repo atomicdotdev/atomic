@@ -183,20 +183,22 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT {
     /// Remove a file from the tree (removes path↔inode mappings).
     fn del_tree(&mut self, path: &str) -> Result<Option<Inode>, PristineError>;
 
-    /// Store file metadata (mtime + size) for fast status detection.
+    /// Store file index entry (mtime + size + content hash) for fast status detection.
     ///
     /// Called after a file is recorded or applied. Subsequent `status()` calls
-    /// can skip the expensive graph content comparison for unchanged files.
-    fn put_file_mtime(
+    /// can skip hashing when mtime+size match, and avoid graph reconstruction
+    /// when they don't (by comparing the stored content hash instead).
+    fn put_file_index(
         &mut self,
         path: &str,
         mtime_secs: i64,
         mtime_nanos: u32,
         file_size: u64,
+        content_hash: &Hash,
     ) -> Result<(), PristineError>;
 
-    /// Remove cached file metadata.
-    fn del_file_mtime(&mut self, path: &str) -> Result<(), PristineError>;
+    /// Remove cached file index entry.
+    fn del_file_index(&mut self, path: &str) -> Result<(), PristineError>;
 
     /// Map an inode to a graph position (creates inode↔position mappings).
     fn put_inode(&mut self, inode: Inode, pos: Position<NodeId>) -> Result<(), PristineError>;

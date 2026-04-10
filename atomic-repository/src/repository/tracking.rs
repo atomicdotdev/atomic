@@ -437,6 +437,61 @@ impl Repository {
         Ok(self.list_tracked_files()?.len())
     }
 
+    /// Remove a file from the FILE_INDEX.
+    ///
+    /// Call this when a file is deleted (e.g., during git import cleanup)
+    /// so that `status` doesn't show it as a stale entry.
+    pub fn del_file_index(&self, path: &str) -> Result<(), RepositoryError> {
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let normalized = path.replace('\\', "/");
+        txn.del_file_index(&normalized)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Store mtime + size + content hash for a batch of files in a single transaction.
+    ///
+    /// This populates the file index so that `status` can compare
+    /// file metadata instead of reconstructing graph content for every
+    /// file.  Call this after git import (or any bulk write that puts
+    /// files on disk without going through `record`).
+    ///
+    /// # Arguments
+    ///
+    /// * `files` - Slice of `(path, mtime_secs, mtime_nanos, file_size, content_hash)` tuples.
+    ///   Paths should be repo-relative with forward slashes.
+    pub fn update_file_index(
+        &self,
+        files: &[(String, i64, u32, u64, Hash)],
+    ) -> Result<(), RepositoryError> {
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        for (path, secs, nanos, size, hash) in files {
+            txn.put_file_index(path, *secs, *nanos, *size, hash)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Get all tracked files under a directory prefix.
     ///
     /// # Arguments

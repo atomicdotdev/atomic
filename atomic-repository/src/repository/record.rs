@@ -584,10 +584,12 @@ impl Repository {
                 Ok(apply_outcome) => {
                     outcome.set_applied(apply_outcome.new_state);
 
-                    // Update mtime cache for all recorded/added files.
-                    // This snapshots the filesystem metadata AFTER the record,
-                    // so subsequent status() calls can skip unchanged files.
-                    if let Ok(mut mtime_txn) = self.pristine.write_txn() {
+                    // Update file index for all recorded/added files.
+                    // This snapshots the filesystem metadata + content hash AFTER
+                    // the record, so subsequent status() calls can skip unchanged
+                    // files (mtime+size match) or avoid graph reconstruction
+                    // (compare stored content hash instead).
+                    if let Ok(mut idx_txn) = self.pristine.write_txn() {
                         for path_str in outcome.recorded_files() {
                             // Strip directory markers like "dir/ (directory)"
                             let clean_path =
@@ -599,15 +601,19 @@ impl Repository {
                                 let duration = mtime
                                     .duration_since(SystemTime::UNIX_EPOCH)
                                     .unwrap_or_default();
-                                let _ = mtime_txn.put_file_mtime(
+                                let content_hash = std::fs::read(&abs_path)
+                                    .map(|bytes| Hash::of(&bytes))
+                                    .unwrap_or(Hash::ZERO);
+                                let _ = idx_txn.put_file_index(
                                     clean_path,
                                     duration.as_secs() as i64,
                                     duration.subsec_nanos(),
                                     metadata.len(),
+                                    &content_hash,
                                 );
                             }
                         }
-                        let _ = mtime_txn.commit();
+                        let _ = idx_txn.commit();
                     }
                 }
                 Err(e) => {

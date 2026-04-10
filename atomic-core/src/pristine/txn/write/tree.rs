@@ -110,14 +110,14 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
         Ok(Box::new(results.into_iter()))
     }
 
-    fn get_file_mtime(&self, path: &str) -> PristineResult<Option<(i64, u32, u64)>> {
-        let table = self.txn.open_table(FILE_MTIMES)?;
+    fn get_file_index(&self, path: &str) -> PristineResult<Option<(i64, u32, u64, Hash)>> {
+        let table = self.txn.open_table(FILE_INDEX)?;
         let guard = table.get(path)?;
         match guard {
             Some(value) => {
                 let bytes = value.value();
-                let (secs, nanos, size) = decode_file_mtime(bytes);
-                Ok(Some((secs, nanos, size)))
+                let (secs, nanos, size, hash) = decode_file_index(bytes);
+                Ok(Some((secs, nanos, size, hash)))
             }
             None => Ok(None),
         }

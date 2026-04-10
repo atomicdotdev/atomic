@@ -277,32 +277,46 @@ pub const TAGS: TableDefinition<&[u8; 16], &[u8; 32]> = TableDefinition::new("ta
 /// - Content edits change mtime (and usually size)
 /// - Truncation changes size
 /// - `touch` changes mtime
-/// - The only false positive is modifying a file back to its original
-///   content within the same mtime granularity — we accept this as
-///   an extremely rare edge case that just causes one extra comparison
-pub const FILE_MTIMES: TableDefinition<&str, &[u8; 20]> = TableDefinition::new("file_mtimes");
-
-/// Encode file metadata for the FILE_MTIMES table.
 ///
-/// Packs (mtime_secs, mtime_nanos, file_size) into 20 bytes.
+/// When mtime+size don't match, the stored content hash is compared with
+/// the on-disk hash to detect true modifications without reconstructing
+/// graph content.
+pub const FILE_INDEX: TableDefinition<&str, &[u8; 52]> = TableDefinition::new("file_index");
+
+/// Encode file metadata for the FILE_INDEX table.
+///
+/// Packs (mtime_secs, mtime_nanos, file_size, content_hash) into 52 bytes.
 #[inline]
-pub fn encode_file_mtime(mtime_secs: i64, mtime_nanos: u32, file_size: u64) -> [u8; 20] {
-    let mut value = [0u8; 20];
+pub fn encode_file_index(
+    mtime_secs: i64,
+    mtime_nanos: u32,
+    file_size: u64,
+    content_hash: &crate::types::Hash,
+) -> [u8; 52] {
+    let mut value = [0u8; 52];
     value[0..8].copy_from_slice(&mtime_secs.to_le_bytes());
     value[8..12].copy_from_slice(&mtime_nanos.to_le_bytes());
     value[12..20].copy_from_slice(&file_size.to_le_bytes());
+    value[20..52].copy_from_slice(&content_hash.0);
     value
 }
 
-/// Decode file metadata from the FILE_MTIMES table.
+/// Decode file metadata from the FILE_INDEX table.
 ///
-/// Returns (mtime_secs, mtime_nanos, file_size).
+/// Returns (mtime_secs, mtime_nanos, file_size, content_hash).
 #[inline]
-pub fn decode_file_mtime(value: &[u8; 20]) -> (i64, u32, u64) {
+pub fn decode_file_index(value: &[u8; 52]) -> (i64, u32, u64, crate::types::Hash) {
     let mtime_secs = i64::from_le_bytes(value[0..8].try_into().unwrap());
     let mtime_nanos = u32::from_le_bytes(value[8..12].try_into().unwrap());
     let file_size = u64::from_le_bytes(value[12..20].try_into().unwrap());
-    (mtime_secs, mtime_nanos, file_size)
+    let mut hash_bytes = [0u8; 32];
+    hash_bytes.copy_from_slice(&value[20..52]);
+    (
+        mtime_secs,
+        mtime_nanos,
+        file_size,
+        crate::types::Merkle(hash_bytes),
+    )
 }
 
 // V3 Change Storage Tables

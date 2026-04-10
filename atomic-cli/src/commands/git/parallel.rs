@@ -66,6 +66,7 @@ use rayon::prelude::*;
 
 use atomic_core::change::{Author, Change, ChangeHeader};
 use atomic_core::record::workflow::GitDiffLine;
+use atomic_core::types::Hash as ContentHash;
 use atomic_repository::Repository;
 
 use crate::error::{CliError, CliResult};
@@ -331,7 +332,93 @@ impl ParallelImporter {
             },
         ));
 
-        // Phase 3: Finalization (just verification for now)
+        // Phase 3: Reconciliation — remove TREE entries for files that
+        // don't exist on disk.
+        //
+        // Merge commits can implicitly delete files by not including them
+        // from a second parent.  Our per-commit diff only sees explicit
+        // deletions (FileOperation::Deleted), so files dropped during
+        // merge resolution leave orphaned TREE entries.
+        //
+        // The reverse also happens: merge commits can implicitly ADD files
+        // from a second parent without an explicit FileOperation::Added in
+        // the first-parent diff.  These files exist on disk but have no
+        // TREE entry.
+        //
+        // Fix: after all batches complete, reconcile TREE ↔ working copy
+        // in both directions.
+        let reconcile_start = Instant::now();
+        let tracked = repo.list_tracked_files().unwrap_or_default();
+        let repo_root = repo.root().to_path_buf();
+        let mut orphan_count = 0usize;
+        let mut phantom_count = 0usize;
+
+        // Build a set of tracked paths for fast lookup
+        let tracked_set: std::collections::HashSet<String> = tracked
+            .iter()
+            .map(|f| f.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        // Direction 1: remove TREE entries for files NOT on disk
+        for file in &tracked {
+            let abs = repo_root.join(&file.path);
+            if !abs.exists() {
+                let _ = repo.remove(&file.path, atomic_repository::TrackingOptions::forced());
+                let _ = repo.del_file_index(&file.path.to_string_lossy());
+                orphan_count += 1;
+            }
+        }
+
+        // Direction 2: add TREE entries for files on disk NOT in TREE
+        // Walk the working copy (respecting .atomicignore / .gitignore)
+        // and track any untracked files.  Also populate FILE_INDEX.
+
+        let mut new_index_entries: Vec<(String, i64, u32, u64, ContentHash)> = Vec::new();
+
+        // Use status to find untracked files — it already handles
+        // ignore rules and filesystem walking.
+        if let Ok(status) = repo.status(atomic_repository::StatusOptions::default()) {
+            for entry in status.untracked() {
+                let path_str = entry.path().to_string_lossy().replace('\\', "/");
+
+                // Add to tracking
+                let _ = repo.add(&path_str, atomic_repository::TrackingOptions::default());
+
+                // Collect FILE_INDEX entry
+                let abs = repo_root.join(entry.path());
+                if let Ok(metadata) = std::fs::metadata(&abs) {
+                    use std::time::SystemTime;
+                    let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    let duration = mtime
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    let secs = duration.as_secs() as i64;
+                    let nanos = duration.subsec_nanos();
+                    let size = metadata.len();
+                    if let Ok(bytes) = std::fs::read(&abs) {
+                        let hash = ContentHash::of(&bytes);
+                        new_index_entries.push((path_str.clone(), secs, nanos, size, hash));
+                    }
+                }
+
+                phantom_count += 1;
+            }
+        }
+
+        if !new_index_entries.is_empty() {
+            let _ = repo.update_file_index(&new_index_entries);
+        }
+
+        if orphan_count > 0 || phantom_count > 0 {
+            print_info(&format!(
+                "Reconciliation: removed {} orphaned, added {} untracked ({:.1}s)",
+                orphan_count,
+                phantom_count,
+                reconcile_start.elapsed().as_secs_f64()
+            ));
+        }
+
+        // Phase 4: Finalization (verification)
         self.phase3_finalize(&stats)?;
 
         Ok(stats)
@@ -509,6 +596,43 @@ impl ParallelImporter {
                     print_warning(&format!("Failed to write {}: {}", parsed.short_sha, e));
                 }
             }
+        }
+
+        // Populate the file index for all files written during this batch.
+        // This lets `atomic status` compare file metadata (stat + content hash)
+        // instead of reconstructing graph content for every file — reducing
+        // post-import status from O(files × graph_traversal) to O(files × stat).
+        use atomic_core::types::Hash;
+        let repo_root = repo.root().to_path_buf();
+        let mut index_entries: Vec<(String, i64, u32, u64, Hash)> = Vec::new();
+
+        for parsed in commits {
+            for file in &parsed.files {
+                if file.operation == FileOperation::Deleted {
+                    continue;
+                }
+                let abs_path = repo_root.join(&file.path);
+                if let Ok(metadata) = std::fs::metadata(&abs_path) {
+                    use std::time::SystemTime;
+                    let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    let duration = mtime
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    let secs = duration.as_secs() as i64;
+                    let nanos = duration.subsec_nanos();
+                    let size = metadata.len();
+                    let content_hash = std::fs::read(&abs_path)
+                        .map(|bytes| Hash::of(&bytes))
+                        .unwrap_or(Hash::ZERO);
+                    // Normalize path to forward slashes for TREE compatibility
+                    let normalized = file.path.replace('\\', "/");
+                    index_entries.push((normalized, secs, nanos, size, content_hash));
+                }
+            }
+        }
+
+        if !index_entries.is_empty() {
+            let _ = repo.update_file_index(&index_entries);
         }
 
         Ok(stats)
@@ -791,9 +915,34 @@ impl ParallelImporter {
         }
 
         let step_start = Instant::now();
-        let (mut change, hash) = repo
-            .assemble_and_hash(header, &recorded_files)
-            .map_err(|e| CliError::Internal(e.into()))?;
+        let (mut change, hash) = match repo.assemble_and_hash(header.clone(), &recorded_files) {
+            Ok(result) => result,
+            Err(e) => {
+                // Globalization may strip all hunks (e.g., pure deletion commits
+                // where find_content_vertices returns empty for already-deleted
+                // files).  Fall back to an empty change — the explicit
+                // repo.remove() cleanup below still handles the TREE entries.
+                let err_msg = e.to_string();
+                if err_msg.contains("empty") || err_msg.contains("AllEmpty") {
+                    let mut empty = Change::empty(header);
+                    empty.unhashed = Some(self.build_git_metadata(parsed, false, true));
+                    let h = empty.hash().map_err(|e| CliError::Internal(e.into()))?;
+                    repo.save_change(&empty)
+                        .map_err(|e| CliError::Internal(e.into()))?;
+                    repo.insert_change(&h, Default::default())
+                        .map_err(|e| CliError::Internal(e.into()))?;
+
+                    // Still clean up deleted files from TREE and FILE_INDEX
+                    for del_path in &deleted_paths {
+                        let _ = repo.remove(del_path, atomic_repository::TrackingOptions::forced());
+                        let _ = repo.del_file_index(del_path);
+                    }
+
+                    return Ok(true);
+                }
+                return Err(CliError::Internal(e.into()));
+            }
+        };
         let assemble_ms = step_start.elapsed().as_millis();
 
         change.unhashed = Some(self.build_git_metadata(parsed, false, false));
@@ -827,8 +976,10 @@ impl ParallelImporter {
         // produce GraphOp::Replacement, not GraphOp::FileDel, so insert_change
         // never removes their TREE entries.  Explicitly untrack them now so that
         // `atomic status` after import matches the git working copy.
+        // Also remove from FILE_INDEX so status doesn't show them as deleted.
         for del_path in &deleted_paths {
             let _ = repo.remove(del_path, atomic_repository::TrackingOptions::forced());
+            let _ = repo.del_file_index(del_path);
         }
 
         Ok(true)
