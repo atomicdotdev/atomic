@@ -622,6 +622,29 @@ impl Repository {
             }
         }
 
+        // Deflate vault working copy changes (if vault is initialized)
+        if self.has_vault().unwrap_or(false) {
+            match self.vault_record_working_copy() {
+                Ok(vault_paths) if !vault_paths.is_empty() => {
+                    outcome.set_vault_paths(vault_paths);
+                }
+                Ok(_) => {} // No vault changes
+                Err(e) => {
+                    // Log the error but don't fail the record — vault sync
+                    // is best-effort during record
+                    log::warn!("Failed to sync vault working copy: {}", e);
+                }
+            }
+        }
+
+        // Auto-enrich KG with the new change (best-effort)
+        if outcome.was_saved() {
+            let hash = outcome.hash().clone();
+            if let Err(e) = self.kg_enrich_change(&hash) {
+                log::debug!("KG enrich for change: {}", e);
+            }
+        }
+
         Ok(outcome)
     }
 

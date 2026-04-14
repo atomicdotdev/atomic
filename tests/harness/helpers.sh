@@ -472,6 +472,13 @@ require_network() {
     fi
 }
 
+# Check if network is available without exiting.
+# Returns 0 (true) if reachable, 1 (false) otherwise.
+# Usage:  if require_network_quiet; then ... fi
+require_network_quiet() {
+    curl --silent --head --max-time 5 https://github.com &>/dev/null
+}
+
 # Clone a git repo to a temp directory
 # Usage: clone_git_repo <url> [ref]
 # Sets: GIT_REPO_DIR

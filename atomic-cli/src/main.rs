@@ -56,7 +56,7 @@ use clap::{Parser, Subcommand};
 
 use commands::{
     Add, Agent, ChangeCmd, Clone, Command, Diff, Git, Identity, Init, Insert, Log, Move, Pull,
-    Push, Record, Remote, Remove, Reset, Revise, Split, Stash, Status, Tag, Unrecord, View,
+    Push, Record, Remote, Remove, Reset, Revise, Split, Stash, Status, Tag, Unrecord, Vault, View,
 };
 use output::{print_error, print_hint};
 
@@ -483,6 +483,25 @@ enum Commands {
     /// ```
     Tag(Tag),
 
+    /// Manage the vault (shared project knowledge store).
+    ///
+    /// The vault stores sessions, memory, skills, intents, and scratch
+    /// notes as versioned markdown files in `.vault/`.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # List vault entries
+    /// atomic vault list
+    ///
+    /// # Start a session
+    /// atomic vault session start
+    ///
+    /// # Create an intent
+    /// atomic vault intent create --title "Fix auth"
+    /// ```
+    Vault(Vault),
+
     /// Remove the last change from the current view.
     ///
     /// The change is removed from the view's change log but NOT deleted
@@ -565,6 +584,8 @@ fn main() {
         Commands::Tag(tag) => tag.run(),
 
         Commands::Unrecord(unrecord) => unrecord.run(),
+
+        Commands::Vault(vault) => vault.run(),
     };
 
     // Handle errors with user-friendly output

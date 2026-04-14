@@ -475,6 +475,118 @@ pub const SESSION_PHASES: TableDefinition<&[u8; 16], &[u8]> =
 /// Intent metadata for the turn. One entry per provenance graph.
 pub const SESSION_INTENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("session_intents");
 
+// Vault Tables (shared project knowledge store)
+//
+// The vault stores project knowledge (sessions, memory, skills, intents)
+// in redb. Markdown files in `.vault/` are materialized views of
+// this data. See `atomic-core/src/pristine/vault.rs` for type definitions.
+
+/// Vault entries: vault_path → VaultEntry (serialized)
+///
+/// Key: vault-relative path (e.g. "sessions/abc123/_session.md")
+/// Value: postcard-serialized VaultEntry (metadata + content bytes)
+///
+/// This is the canonical store for all vault content. The markdown files
+/// on disk are generated from these entries.
+pub const VAULT_ENTRIES: TableDefinition<&str, &[u8]> = TableDefinition::new("vault_entries");
+
+/// Vault manifest: singleton key → JSON blob
+///
+/// Key: always "manifest"
+/// Value: JSON-serialized VaultManifest
+///
+/// The manifest indexes the entire vault for cold-start, sync, and selective
+/// fetch. Updated atomically with every vault write.
+pub const VAULT_MANIFEST: TableDefinition<&str, &[u8]> = TableDefinition::new("vault_manifest");
+
+// Knowledge Graph Tables
+//
+// Stores nodes and edges for the full repository knowledge graph:
+// changes, files, entities, views, vault (goals, intents, memory).
+// Replaces the earlier triple-only store with richer typed nodes.
+
+/// KG nodes: node_id → KgNode (serialized)
+///
+/// Key: structured node ID (e.g., "change:abc123", "file:src/auth.rs")
+/// Value: postcard-serialized KgNode
+pub const KG_NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("kg_nodes");
+
+/// KG edges: composite key → KgEdge (serialized)
+///
+/// Key: "from_id\0to_id\0kind" (unique edge identifier)
+/// Value: postcard-serialized KgEdge
+pub const KG_EDGES: TableDefinition<&str, &[u8]> = TableDefinition::new("kg_edges");
+
+/// KG edge index by source: from_id → [edge_key] (multimap)
+///
+/// Enables efficient "outgoing edges from node X" queries.
+pub const KG_EDGES_FROM: MultimapTableDefinition<&str, &str> =
+    MultimapTableDefinition::new("kg_edges_from");
+
+/// KG edge index by target: to_id → [edge_key] (multimap)
+///
+/// Enables efficient "incoming edges to node X" queries.
+pub const KG_EDGES_TO: MultimapTableDefinition<&str, &str> =
+    MultimapTableDefinition::new("kg_edges_to");
+
+/// KG full-text search inverted index: token → [node_id] (multimap)
+///
+/// Simple inverted index for keyword search over node labels and summaries.
+/// Tokens are lowercase, alphanumeric words extracted from label + summary.
+pub const KG_FTS: MultimapTableDefinition<&str, &str> = MultimapTableDefinition::new("kg_fts");
+
+// Embedding Tables (vector similarity search)
+
+/// Vector embeddings: vault_path → EmbeddingRecord (serialized)
+///
+/// Key: composite string "vault_path\0chunk_idx" (e.g., "memory/arch.md\00")
+/// Value: postcard-serialized EmbeddingRecord
+///
+/// Stores embeddings for semantic similarity search over vault content.
+pub const EMBEDDINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("embeddings");
+
+// KG Edge Key / FTS Helpers
+
+/// Encode a KG edge key as "from_id\0to_id\0kind".
+#[inline]
+pub fn encode_edge_key(from_id: &str, to_id: &str, kind: &str) -> String {
+    format!("{}\0{}\0{}", from_id, to_id, kind)
+}
+
+/// Decode a KG edge key into (from_id, to_id, kind).
+#[inline]
+pub fn decode_edge_key(key: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = key.splitn(3, '\0');
+    let from_id = parts.next()?;
+    let to_id = parts.next()?;
+    let kind = parts.next()?;
+    Some((from_id, to_id, kind))
+}
+
+/// Tokenize text for the FTS inverted index.
+///
+/// Extracts lowercase alphanumeric words of length >= 2.
+pub fn tokenize_for_fts(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| w.len() >= 2)
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+
+/// Encode an embedding key as "path\0chunk_idx".
+#[inline]
+pub fn encode_embedding_key(path: &str, chunk_idx: u32) -> String {
+    format!("{}\0{}", path, chunk_idx)
+}
+
+/// Decode an embedding key into (path, chunk_idx).
+#[inline]
+pub fn decode_embedding_key(key: &str) -> Option<(&str, u32)> {
+    let (path, idx_str) = key.split_once('\0')?;
+    let idx = idx_str.parse().ok()?;
+    Some((path, idx))
+}
+
 // V3 Change Storage Key Encoding
 
 /// Encode a change-hash + file-index as 36 bytes for CHANGE_GRAPH / CHANGE_SEMANTIC / CHANGE_CHUNKS keys.
@@ -784,5 +896,61 @@ mod tests {
 
         assert!(is_explicit(0b11));
         assert!(is_empty(0b11));
+    }
+
+    // KG Edge Key / FTS Tests
+
+    #[test]
+    fn test_edge_key_roundtrip() {
+        let key = encode_edge_key("change:abc", "file:auth.rs", "MODIFIES");
+        let (from, to, kind) = decode_edge_key(&key).unwrap();
+        assert_eq!(from, "change:abc");
+        assert_eq!(to, "file:auth.rs");
+        assert_eq!(kind, "MODIFIES");
+    }
+
+    #[test]
+    fn test_tokenize_for_fts() {
+        let tokens = tokenize_for_fts("Fix authentication bug in auth.rs");
+        assert!(tokens.contains(&"fix".to_string()));
+        assert!(tokens.contains(&"authentication".to_string()));
+        assert!(tokens.contains(&"bug".to_string()));
+        assert!(tokens.contains(&"auth".to_string()));
+        assert!(tokens.contains(&"rs".to_string()));
+        // Single char "in" is >= 2 chars, so it's included
+        assert!(tokens.contains(&"in".to_string()));
+    }
+
+    #[test]
+    fn test_tokenize_for_fts_filters_short() {
+        let tokens = tokenize_for_fts("I a am the one");
+        // "I" and "a" are < 2 chars, filtered out
+        assert!(!tokens.contains(&"i".to_string()));
+        assert!(!tokens.contains(&"a".to_string()));
+        assert!(tokens.contains(&"am".to_string()));
+        assert!(tokens.contains(&"the".to_string()));
+    }
+
+    #[test]
+    fn test_embedding_key_roundtrip() {
+        let key = encode_embedding_key("memory/arch.md", 3);
+        let (path, idx) = decode_embedding_key(&key).unwrap();
+        assert_eq!(path, "memory/arch.md");
+        assert_eq!(idx, 3);
+    }
+
+    #[test]
+    fn test_embedding_key_zero_chunk() {
+        let key = encode_embedding_key("memory/arch.md", 0);
+        let (path, idx) = decode_embedding_key(&key).unwrap();
+        assert_eq!(path, "memory/arch.md");
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn test_embedding_key_decode_invalid() {
+        assert!(decode_embedding_key("no-separator").is_none());
+        // Non-numeric chunk index
+        assert!(decode_embedding_key("path\0abc").is_none());
     }
 }

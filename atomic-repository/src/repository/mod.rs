@@ -101,6 +101,23 @@ mod remotes;
 mod status;
 mod tags;
 mod tracking;
+mod vault;
+mod vault_defaults;
+mod vault_embeddings;
+mod vault_goal;
+mod vault_identity;
+mod vault_intent;
+mod vault_kg_enrich;
+mod vault_names;
+mod vault_triples;
+pub use vault_embeddings::{hash_embed, EmbedConfig, TextChunk};
+pub use vault_goal::{
+    GoalInfo, GoalStartOptions, GoalStartResult, GoalStopOptions, GoalStopResult,
+};
+pub use vault_identity::VaultIdentity;
+pub use vault_intent::{IntentCreateOptions, IntentCreateResult, IntentInfo, IntentUpdateOptions};
+pub use vault_kg_enrich::KgEnrichStats;
+pub use vault_names::{derive_intent_prefix, generate_goal_name};
 
 #[cfg(test)]
 mod tests;

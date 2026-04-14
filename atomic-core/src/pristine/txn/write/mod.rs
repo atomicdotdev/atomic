@@ -286,8 +286,11 @@ fn format_timestamp_ms(epoch_ms: i64) -> String {
         .unwrap_or_else(|| format!("{}", epoch_ms))
 }
 
+mod embeddings;
 mod graph;
 mod tree;
+mod triples;
+mod vault;
 mod view;
 
 #[cfg(test)]

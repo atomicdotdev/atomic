@@ -296,6 +296,14 @@ pub struct Init {
     /// javascript, typescript, go, java, kotlin, c, cpp.
     #[arg(long, short = 'k')]
     pub kind: Option<String>,
+
+    /// Initialize with a vault (shared project knowledge store).
+    ///
+    /// Creates `.vault/` with subdirectories for goals, memory,
+    /// skills, intents, and scratch notes. The vault stores project knowledge
+    /// as versioned markdown files with cryptographic provenance.
+    #[arg(long)]
+    pub vault: bool,
 }
 
 impl Init {
@@ -314,6 +322,7 @@ impl Init {
             path: PathBuf::from("."),
             view: DEFAULT_VIEW_NAME.to_string(),
             kind: None,
+            vault: false,
         }
     }
 
@@ -323,6 +332,7 @@ impl Init {
             path: path.into(),
             view: DEFAULT_VIEW_NAME.to_string(),
             kind: None,
+            vault: false,
         }
     }
 
@@ -335,6 +345,12 @@ impl Init {
     /// Builder: set the project kind for .atomicignore template.
     pub fn with_kind(mut self, kind: impl Into<String>) -> Self {
         self.kind = Some(kind.into());
+        self
+    }
+
+    /// Builder: enable vault initialization.
+    pub fn with_vault(mut self) -> Self {
+        self.vault = true;
         self
     }
 
@@ -492,12 +508,21 @@ impl Command for Init {
                 .map_err(CliError::Repository)?;
         }
 
+        // Initialize vault if requested
+        if self.vault {
+            repo.init_vault().map_err(CliError::Repository)?;
+        }
+
         // Print success message
         print_success(&format!(
             "Initialized empty Atomic repository in {}",
             dot_dir.display()
         ));
         println!("Created view: {}", self.view);
+
+        if self.vault {
+            println!("Initialized vault at {}", repo.vault_dir().display());
+        }
 
         // Create .atomicignore if kind specified
         if let Ok(true) = self.create_ignore_file(&target_path) {
@@ -535,6 +560,7 @@ mod tests {
         assert_eq!(init.path, PathBuf::from("."));
         assert_eq!(init.view, DEFAULT_VIEW_NAME);
         assert!(init.kind.is_none());
+        assert!(!init.vault);
     }
 
     #[test]
@@ -572,6 +598,18 @@ mod tests {
         assert_eq!(init.path, PathBuf::from("/project"));
         assert_eq!(init.view, "main");
         assert_eq!(init.kind, Some("python".to_string()));
+    }
+
+    #[test]
+    fn test_init_with_vault_flag() {
+        let init = Init::new().with_vault();
+        assert!(init.vault);
+    }
+
+    #[test]
+    fn test_init_without_vault_flag() {
+        let init = Init::new();
+        assert!(!init.vault);
     }
 
     // -------------------------------------------------------------------------
@@ -936,5 +974,21 @@ mod tests {
     #[test]
     fn test_default_view_name_constant() {
         assert_eq!(DEFAULT_VIEW_NAME, "dev");
+    }
+
+    #[test]
+    fn test_init_with_vault_creates_vault_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = Init::at_path(dir.path()).with_vault();
+        init.run().unwrap();
+
+        // Verify vault directory structure exists at project root (.vault/)
+        let vault_dir = dir.path().join(".vault");
+        assert!(vault_dir.exists());
+        assert!(vault_dir.join("goals").exists());
+        assert!(vault_dir.join("memory").exists());
+        assert!(vault_dir.join("skills").exists());
+        assert!(vault_dir.join("intents").exists());
+        assert!(vault_dir.join("scratch").exists());
     }
 }

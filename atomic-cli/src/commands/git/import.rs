@@ -311,6 +311,15 @@ impl Command for Import {
                 total_imported += count;
             }
 
+            // Auto-enrich the knowledge graph from all imported VCS data
+            if repo.has_vault().unwrap_or(false) {
+                print_info("Enriching knowledge graph...");
+                match repo.kg_enrich_from_vcs() {
+                    Ok(stats) => print_info(&format!("KG enriched: {}", stats)),
+                    Err(e) => log::warn!("KG enrichment failed: {}", e),
+                }
+            }
+
             print_success(&format!(
                 "Imported {} total changes across all branches",
                 total_imported
@@ -341,6 +350,15 @@ impl Command for Import {
 
             // Import
             let count = self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas)?;
+
+            // Auto-enrich the knowledge graph from imported VCS data
+            if repo.has_vault().unwrap_or(false) {
+                print_info("Enriching knowledge graph...");
+                match repo.kg_enrich_from_vcs() {
+                    Ok(stats) => print_info(&format!("KG enriched: {}", stats)),
+                    Err(e) => log::warn!("KG enrichment failed: {}", e),
+                }
+            }
 
             print_success(&format!(
                 "Imported {} changes from branch '{}'",

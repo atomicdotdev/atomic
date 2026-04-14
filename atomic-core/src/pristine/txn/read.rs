@@ -3,8 +3,12 @@
 //! This module provides the `ReadTxn` struct which implements read-only
 //! access to the pristine database.
 
-use redb::{ReadTransaction, ReadableTable};
+use redb::{ReadTransaction, ReadableTable, ReadableTableMetadata};
 
+use crate::pristine::tables::{VAULT_ENTRIES, VAULT_MANIFEST};
+use crate::pristine::traits::{EmbeddingsTxnT, KgTxnT, VaultEntryMeta, VaultTxnT};
+use crate::pristine::vault::{EmbeddingRecord, KgEdge, KgNode, SearchResult};
+use crate::pristine::{VaultEntry, VaultEntryType, VaultManifest};
 use crate::types::{
     ChangePosition, EdgeFlags, GraphNode, Hash, Inode, Merkle, NodeId, Position,
     SerializedGraphEdge,
@@ -577,6 +581,412 @@ impl ReadTxn {
             },
             None => Ok(None),
         }
+    }
+}
+
+// VaultTxnT Implementation
+
+impl VaultTxnT for ReadTxn {
+    fn get_vault_entry(&self, path: &str) -> PristineResult<Option<VaultEntry>> {
+        let table = match self.txn.open_table(VAULT_ENTRIES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+
+        let result = match table.get(path)? {
+            Some(guard) => {
+                let bytes = guard.value();
+                let entry: VaultEntry =
+                    postcard::from_bytes(bytes).map_err(|e| PristineError::Serialization {
+                        message: format!("failed to deserialize VaultEntry at '{}': {}", path, e),
+                    })?;
+                Ok(Some(entry))
+            }
+            None => Ok(None),
+        };
+        result
+    }
+
+    fn list_vault_entries(
+        &self,
+        prefix: &str,
+        entry_type_filter: Option<VaultEntryType>,
+    ) -> PristineResult<Vec<VaultEntryMeta>> {
+        let table = match self.txn.open_table(VAULT_ENTRIES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+
+        let mut results = Vec::new();
+
+        let iter = if prefix.is_empty() {
+            table.iter()?
+        } else {
+            table.range(prefix..)?
+        };
+
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = key.value();
+
+            // Stop iterating once we pass the prefix range
+            if !prefix.is_empty() && !key_str.starts_with(prefix) {
+                break;
+            }
+
+            let entry: VaultEntry =
+                postcard::from_bytes(value.value()).map_err(|e| PristineError::Serialization {
+                    message: format!("failed to deserialize VaultEntry at '{}': {}", key_str, e),
+                })?;
+
+            // Apply type filter
+            if let Some(ref filter) = entry_type_filter {
+                if entry.entry_type != *filter {
+                    continue;
+                }
+            }
+
+            results.push(VaultEntryMeta {
+                path: key_str.to_string(),
+                entry_type: entry.entry_type,
+                content_hash: entry.content_hash,
+                content_size: entry.content_bytes.len(),
+                updated_at: entry.updated_at,
+            });
+        }
+
+        Ok(results)
+    }
+
+    fn get_vault_manifest(&self) -> PristineResult<VaultManifest> {
+        let table = match self.txn.open_table(VAULT_MANIFEST) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(VaultManifest::default()),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+
+        let result = match table.get("manifest")? {
+            Some(guard) => {
+                let bytes = guard.value();
+                let manifest: VaultManifest =
+                    serde_json::from_slice(bytes).map_err(|e| PristineError::Serialization {
+                        message: format!("failed to deserialize VaultManifest: {}", e),
+                    })?;
+                Ok(manifest)
+            }
+            None => Ok(VaultManifest::default()),
+        };
+        result
+    }
+
+    fn has_vault(&self) -> PristineResult<bool> {
+        let table = match self.txn.open_table(VAULT_MANIFEST) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+
+        let result = match table.get("manifest")? {
+            Some(_) => Ok(true),
+            None => Ok(false),
+        };
+        result
+    }
+}
+
+// KgTxnT Implementation
+
+impl KgTxnT for ReadTxn {
+    fn get_kg_node(&self, id: &str) -> PristineResult<Option<KgNode>> {
+        let table = match self.txn.open_table(KG_NODES) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+        match table.get(id)? {
+            Some(value) => {
+                let node: KgNode = serde_json::from_slice(value.value()).map_err(|e| {
+                    PristineError::Serialization {
+                        message: e.to_string(),
+                    }
+                })?;
+                Ok(Some(node))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn get_kg_edges_from(&self, node_id: &str) -> PristineResult<Vec<KgEdge>> {
+        let from_table = match self.txn.open_multimap_table(KG_EDGES_FROM) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+        let edges_table = match self.txn.open_table(KG_EDGES) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+
+        let mut edges = Vec::new();
+        let iter = from_table.get(node_id)?;
+        for result in iter {
+            let edge_key_guard = result?;
+            let edge_key = edge_key_guard.value();
+            if let Some(edge_data) = edges_table.get(edge_key)? {
+                let edge: KgEdge = serde_json::from_slice(edge_data.value()).map_err(|e| {
+                    PristineError::Serialization {
+                        message: e.to_string(),
+                    }
+                })?;
+                edges.push(edge);
+            }
+        }
+        Ok(edges)
+    }
+
+    fn get_kg_edges_to(&self, node_id: &str) -> PristineResult<Vec<KgEdge>> {
+        let to_table = match self.txn.open_multimap_table(KG_EDGES_TO) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+        let edges_table = match self.txn.open_table(KG_EDGES) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+
+        let mut edges = Vec::new();
+        let iter = to_table.get(node_id)?;
+        for result in iter {
+            let edge_key_guard = result?;
+            let edge_key = edge_key_guard.value();
+            if let Some(edge_data) = edges_table.get(edge_key)? {
+                let edge: KgEdge = serde_json::from_slice(edge_data.value()).map_err(|e| {
+                    PristineError::Serialization {
+                        message: e.to_string(),
+                    }
+                })?;
+                edges.push(edge);
+            }
+        }
+        Ok(edges)
+    }
+
+    fn kg_fts_search(&self, query: &str, limit: usize) -> PristineResult<Vec<KgNode>> {
+        let fts_table = match self.txn.open_multimap_table(KG_FTS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+
+        let tokens = tokenize_for_fts(query);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Collect node IDs that match any token, count matches per node
+        let mut hit_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for token in &tokens {
+            let iter = match fts_table.get(token.as_str()) {
+                Ok(iter) => iter,
+                Err(_) => continue,
+            };
+            for result in iter {
+                let node_id_guard = result?;
+                let node_id = node_id_guard.value().to_string();
+                *hit_counts.entry(node_id).or_insert(0) += 1;
+            }
+        }
+
+        // Sort by hit count descending, take top `limit`
+        let mut ranked: Vec<(String, usize)> = hit_counts.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.truncate(limit);
+
+        // Fetch full nodes
+        let mut nodes = Vec::new();
+        for (id, _) in &ranked {
+            if let Some(node) = self.get_kg_node(id)? {
+                nodes.push(node);
+            }
+        }
+        Ok(nodes)
+    }
+
+    fn count_kg_nodes(&self) -> PristineResult<usize> {
+        let table = match self.txn.open_table(KG_NODES) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+        Ok(table.len()? as usize)
+    }
+
+    fn count_kg_edges(&self) -> PristineResult<usize> {
+        let table = match self.txn.open_table(KG_EDGES) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+        Ok(table.len()? as usize)
+    }
+}
+
+// EmbeddingsTxnT Implementation
+
+/// Compute cosine similarity between two vectors.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom == 0.0 {
+        0.0
+    } else {
+        dot / denom
+    }
+}
+
+impl EmbeddingsTxnT for ReadTxn {
+    fn get_embedding(&self, path: &str, chunk_idx: u32) -> PristineResult<Option<EmbeddingRecord>> {
+        let table = match self.txn.open_table(EMBEDDINGS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+
+        let key = encode_embedding_key(path, chunk_idx);
+        let result = match table.get(key.as_str())? {
+            Some(guard) => {
+                let bytes = guard.value();
+                let record: EmbeddingRecord =
+                    postcard::from_bytes(bytes).map_err(|e| PristineError::Serialization {
+                        message: format!(
+                            "failed to deserialize EmbeddingRecord at '{}': {}",
+                            key, e
+                        ),
+                    })?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        };
+        result
+    }
+
+    fn list_embeddings(&self, path: &str) -> PristineResult<Vec<(u32, EmbeddingRecord)>> {
+        let table = match self.txn.open_table(EMBEDDINGS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+
+        let mut results = Vec::new();
+        let prefix = format!("{}\0", path);
+
+        let iter = table.range::<&str>(prefix.as_str()..)?;
+
+        for item in iter {
+            let (key_guard, value_guard) = item?;
+            let key_str = key_guard.value();
+
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+
+            let (_, chunk_idx) = match decode_embedding_key(key_str) {
+                Some(decoded) => decoded,
+                None => continue,
+            };
+
+            let bytes = value_guard.value();
+            let record: EmbeddingRecord =
+                postcard::from_bytes(bytes).map_err(|e| PristineError::Serialization {
+                    message: format!(
+                        "failed to deserialize EmbeddingRecord at '{}': {}",
+                        key_str, e
+                    ),
+                })?;
+            results.push((chunk_idx, record));
+        }
+
+        Ok(results)
+    }
+
+    fn count_embeddings(&self) -> PristineResult<usize> {
+        let table = match self.txn.open_table(EMBEDDINGS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+
+        let count = table.len()? as usize;
+        Ok(count)
+    }
+
+    fn search_embeddings(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+    ) -> PristineResult<Vec<SearchResult>> {
+        let table = match self.txn.open_table(EMBEDDINGS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+
+        let mut scored: Vec<SearchResult> = Vec::new();
+
+        for item in table.iter()? {
+            let (key_guard, value_guard) = item?;
+            let key_str = key_guard.value();
+
+            let (path, chunk_idx) = match decode_embedding_key(key_str) {
+                Some(decoded) => decoded,
+                None => continue,
+            };
+
+            let bytes = value_guard.value();
+            let record: EmbeddingRecord =
+                postcard::from_bytes(bytes).map_err(|e| PristineError::Serialization {
+                    message: format!(
+                        "failed to deserialize EmbeddingRecord at '{}': {}",
+                        key_str, e
+                    ),
+                })?;
+
+            let score = cosine_similarity(query_vector, &record.vector);
+
+            scored.push(SearchResult {
+                path: path.to_string(),
+                chunk_idx,
+                score,
+                preview: record.preview,
+            });
+        }
+
+        // Sort by descending score
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Return top-k
+        scored.truncate(top_k);
+        Ok(scored)
     }
 }
 

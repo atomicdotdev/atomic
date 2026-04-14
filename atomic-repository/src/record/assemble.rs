@@ -70,6 +70,9 @@ pub struct RecordStats {
 
     /// Number of tokens replaced (CRDT LeafOp::Replace - preserves ID for blame).
     pub tokens_replaced: usize,
+
+    /// Number of vault files deflated (synced from disk to redb).
+    pub vault_files_deflated: usize,
 }
 
 impl RecordStats {
@@ -187,6 +190,9 @@ pub struct RecordOutcome {
     /// Non-fatal errors that occurred.
     errors: Vec<(String, String)>,
 
+    /// Vault paths that were deflated (synced from disk to redb).
+    vault_paths: Vec<String>,
+
     /// The original serialized V3 bytes from the first serialize() call.
     ///
     /// Stored so that `save_change` can write the exact bytes to disk
@@ -212,6 +218,7 @@ impl RecordOutcome {
             deleted_files: Vec::new(),
             skipped_files: Vec::new(),
             errors: Vec::new(),
+            vault_paths: Vec::new(),
             v3_bytes: None,
         }
     }
@@ -340,6 +347,16 @@ impl RecordOutcome {
     /// Add an error.
     pub fn add_error(&mut self, path: String, error: String) {
         self.errors.push((path, error));
+    }
+
+    /// Set the vault paths that were deflated during this record.
+    pub fn set_vault_paths(&mut self, paths: Vec<String>) {
+        self.vault_paths = paths;
+    }
+
+    /// Get the vault paths that were deflated.
+    pub fn vault_paths(&self) -> &[String] {
+        &self.vault_paths
     }
 }
 

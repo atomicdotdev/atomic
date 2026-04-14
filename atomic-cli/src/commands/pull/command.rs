@@ -591,6 +591,18 @@ impl Pull {
             }
         }
 
+        // Auto-enrich the knowledge graph from pulled VCS data
+        if stats.changes_applied > 0 && repo.has_vault().unwrap_or(false) {
+            match repo.kg_enrich_from_vcs() {
+                Ok(kg_stats) => log::info!("KG enriched after pull: {}", kg_stats),
+                Err(e) => log::warn!("KG enrichment after pull failed: {}", e),
+            }
+            // Materialize any new vault entries pulled
+            if let Err(e) = repo.vault_materialize_all() {
+                log::warn!("Vault materialization after pull failed: {}", e);
+            }
+        }
+
         // Final summary
         print_blank();
         if stats.has_failures() {
