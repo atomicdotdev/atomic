@@ -299,11 +299,20 @@ pub struct Init {
 
     /// Initialize with a vault (shared project knowledge store).
     ///
-    /// Creates `.vault/` with subdirectories for goals, memory,
-    /// skills, intents, and scratch notes. The vault stores project knowledge
-    /// as versioned markdown files with cryptographic provenance.
-    #[arg(long)]
+    /// Enabled by default. Creates `.vault/` with subdirectories for goals,
+    /// memory, skills, intents, and scratch notes. The vault stores project
+    /// knowledge as versioned markdown files with cryptographic provenance.
+    ///
+    /// Use `--no-vault` to skip vault initialization.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::SetTrue)]
     pub vault: bool,
+
+    /// Skip vault initialization.
+    ///
+    /// Creates a repository without the `.vault/` knowledge store.
+    /// Useful for minimal repos that don't need goals, intents, or memory.
+    #[arg(long, default_value_t = false)]
+    pub no_vault: bool,
 }
 
 impl Init {
@@ -322,7 +331,8 @@ impl Init {
             path: PathBuf::from("."),
             view: DEFAULT_VIEW_NAME.to_string(),
             kind: None,
-            vault: false,
+            vault: true,
+            no_vault: false,
         }
     }
 
@@ -332,7 +342,8 @@ impl Init {
             path: path.into(),
             view: DEFAULT_VIEW_NAME.to_string(),
             kind: None,
-            vault: false,
+            vault: true,
+            no_vault: false,
         }
     }
 
@@ -351,6 +362,14 @@ impl Init {
     /// Builder: enable vault initialization.
     pub fn with_vault(mut self) -> Self {
         self.vault = true;
+        self.no_vault = false;
+        self
+    }
+
+    /// Builder: disable vault initialization.
+    pub fn without_vault(mut self) -> Self {
+        self.vault = false;
+        self.no_vault = true;
         self
     }
 
@@ -508,8 +527,8 @@ impl Command for Init {
                 .map_err(CliError::Repository)?;
         }
 
-        // Initialize vault if requested
-        if self.vault {
+        // Initialize vault (default on, skip with --no-vault)
+        if self.vault && !self.no_vault {
             repo.init_vault().map_err(CliError::Repository)?;
         }
 
@@ -520,7 +539,7 @@ impl Command for Init {
         ));
         println!("Created view: {}", self.view);
 
-        if self.vault {
+        if self.vault && !self.no_vault {
             println!("Initialized vault at {}", repo.vault_dir().display());
         }
 
@@ -560,7 +579,8 @@ mod tests {
         assert_eq!(init.path, PathBuf::from("."));
         assert_eq!(init.view, DEFAULT_VIEW_NAME);
         assert!(init.kind.is_none());
-        assert!(!init.vault);
+        assert!(init.vault);
+        assert!(!init.no_vault);
     }
 
     #[test]
@@ -604,12 +624,21 @@ mod tests {
     fn test_init_with_vault_flag() {
         let init = Init::new().with_vault();
         assert!(init.vault);
+        assert!(!init.no_vault);
     }
 
     #[test]
-    fn test_init_without_vault_flag() {
+    fn test_init_vault_is_default() {
         let init = Init::new();
+        assert!(init.vault);
+        assert!(!init.no_vault);
+    }
+
+    #[test]
+    fn test_init_without_vault() {
+        let init = Init::new().without_vault();
         assert!(!init.vault);
+        assert!(init.no_vault);
     }
 
     // -------------------------------------------------------------------------
@@ -977,12 +1006,12 @@ mod tests {
     }
 
     #[test]
-    fn test_init_with_vault_creates_vault_dir() {
+    fn test_init_creates_vault_dir_by_default() {
         let dir = tempfile::tempdir().unwrap();
-        let init = Init::at_path(dir.path()).with_vault();
+        let init = Init::at_path(dir.path());
         init.run().unwrap();
 
-        // Verify vault directory structure exists at project root (.vault/)
+        // Vault is created by default
         let vault_dir = dir.path().join(".vault");
         assert!(vault_dir.exists());
         assert!(vault_dir.join("goals").exists());
