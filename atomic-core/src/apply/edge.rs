@@ -45,7 +45,8 @@
 use crate::change::{Change, EdgeUpdate, NewEdge};
 use crate::pristine::{GraphTxnT, MutTxnT};
 use crate::types::{
-    EdgeFlags, EdgeKind, GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge,
+    ChangePosition, EdgeFlags, EdgeKind, GraphNode, Hash, Inode, NodeId, Position,
+    SerializedGraphEdge,
 };
 
 use super::error::LocalApplyError;
@@ -139,6 +140,13 @@ fn write_new_edge<T: MutTxnT>(
     edge: &NewEdge<Option<Hash>>,
     change: &Change,
 ) -> Result<(), LocalApplyError> {
+    log::debug!(
+        "write_new_edge: flag={:?} from={:?} to={:?}",
+        edge.flag,
+        edge.from,
+        edge.to
+    );
+
     // Resolve the introduced_by change
     let introduced_by = resolve_introduced_by(txn, &edge.introduced_by, change_id)?;
 
@@ -176,7 +184,9 @@ fn write_new_edge<T: MutTxnT>(
 
     // Handle deletion: collect pseudo-edges for reconnection
     if kind.is_some_and(|k| k.is_deleted()) {
+        log::debug!("write_new_edge: collect_pseudo_edges starting");
         collect_pseudo_edges_for_reconnection(txn, workspace, target)?;
+        log::debug!("write_new_edge: collect_pseudo_edges complete");
     }
 
     // Remove the old edge before adding the new one.
@@ -187,6 +197,7 @@ fn write_new_edge<T: MutTxnT>(
     // multimap alongside the new DELETED edge, causing `is_vertex_alive`
     // to find the stale alive parent and incorrectly report the vertex as
     // alive — which breaks subsequent Replace operations on the same file.
+    log::debug!("write_new_edge: del_edge_with_reverse");
     del_edge_with_reverse(
         txn,
         resolved_inode,
@@ -198,11 +209,14 @@ fn write_new_edge<T: MutTxnT>(
 
     // Add the new edge (e.g., BLOCK|DELETED to mark content as removed,
     // or BLOCK to wire in new content).
+    log::debug!("write_new_edge: add_edge_with_reverse");
     add_edge_with_reverse(txn, resolved_inode, edge.flag, source, target, change_id)?;
 
     // For non-folder deletions, check for zombie context
     if kind.is_some_and(|k| k.is_deleted() && !k.is_folder()) {
+        log::debug!("write_new_edge: collect_zombie_context starting");
         collect_zombie_context(txn, workspace, change, edge, change_id)?;
+        log::debug!("write_new_edge: collect_zombie_context complete");
     }
 
     Ok(())
@@ -444,7 +458,21 @@ fn collect_zombie_context<T: GraphTxnT>(
 
         // Move to next span in range
         if node.end < end_pos.pos {
-            pos.pos = node.end;
+            let next_pos = if node.end == node.start {
+                // Empty vertex (e.g., inode marker) — skip past it
+                ChangePosition::new(node.end.get() + 1)
+            } else {
+                node.end
+            };
+            if next_pos <= pos.pos {
+                // Safety: avoid infinite loop if we can't advance
+                log::warn!(
+                    "collect_zombie_context: pos not advancing at {:?}, breaking",
+                    pos
+                );
+                break;
+            }
+            pos.pos = next_pos;
         } else {
             break;
         }

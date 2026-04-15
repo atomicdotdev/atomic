@@ -563,13 +563,119 @@ pub fn decode_edge_key(key: &str) -> Option<(&str, &str, &str)> {
     Some((from_id, to_id, kind))
 }
 
+/// Stop words filtered from FTS queries and indexing.
+///
+/// Includes common English words plus common programming/project terms
+/// that match too many nodes to be useful for ranking.
+const FTS_STOP_WORDS: &[&str] = &[
+    // English
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "but",
+    "by",
+    "do",
+    "does",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "he",
+    "her",
+    "his",
+    "how",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "let",
+    "my",
+    "no",
+    "not",
+    "of",
+    "on",
+    "or",
+    "our",
+    "own",
+    "say",
+    "she",
+    "so",
+    "than",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "to",
+    "us",
+    "was",
+    "we",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "will",
+    "with",
+    "would",
+    "you",
+    "your",
+    // Programming
+    "use",
+    "fn",
+    "pub",
+    "mod",
+    "impl",
+    "struct",
+    "enum",
+    "trait",
+    "const",
+    "let",
+    "mut",
+    "self",
+    "super",
+    "crate",
+    "return",
+    "true",
+    "false",
+    "import",
+    "export",
+    "function",
+    "class",
+    "new",
+    "async",
+    "await",
+    "type",
+    "interface",
+    "var",
+    "def",
+    "src",
+    "test",
+    "tests",
+];
+
 /// Tokenize text for the FTS inverted index.
 ///
-/// Extracts lowercase alphanumeric words of length >= 2.
+/// Extracts lowercase alphanumeric words of length >= 3, filtering out
+/// stop words (common English + programming terms) that match too many
+/// nodes to be useful for ranking.
 pub fn tokenize_for_fts(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|w| w.len() >= 2)
+        .filter(|w| w.len() >= 3)
         .map(|w| w.to_lowercase())
+        .filter(|w| !FTS_STOP_WORDS.contains(&w.as_str()))
         .collect()
 }
 

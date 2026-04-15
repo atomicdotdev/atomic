@@ -646,6 +646,8 @@ impl ParallelImporter {
             RecordedFile, RecordingOptions,
         };
 
+        let commit_start = std::time::Instant::now();
+
         // Build change header
         let mut header_builder = ChangeHeader::builder()
             .message(&parsed.metadata.message)
@@ -668,15 +670,22 @@ impl ParallelImporter {
 
         // Track new files so the pristine knows about them before we record.
         // Also collect deleted paths so we can remove them from TREE after insert.
+        // Use batch operations to avoid a separate write txn + fsync per file.
+        let mut added_paths: Vec<&str> = Vec::new();
         let mut deleted_paths: Vec<String> = Vec::new();
         for file in &parsed.files {
             if file.operation == FileOperation::Added || file.operation == FileOperation::Copied {
-                let _ = repo.add(&file.path, atomic_repository::TrackingOptions::default());
+                added_paths.push(&file.path);
             }
             if file.operation == FileOperation::Deleted {
                 deleted_paths.push(file.path.clone());
             }
         }
+        let step = std::time::Instant::now();
+        if !added_paths.is_empty() {
+            let _ = repo.add_batch(&added_paths);
+        }
+        let add_batch_ms = step.elapsed().as_millis();
 
         // ── Fast path: build RecordedFiles directly from parsed content ──
         //
@@ -694,7 +703,11 @@ impl ParallelImporter {
             RecordingOptions::new().algorithm(atomic_core::diff::Algorithm::Patience);
         let mut recorded_files: Vec<RecordedFile> = Vec::new();
 
+        let record_start = std::time::Instant::now();
+        let mut slow_files: Vec<(String, u128)> = Vec::new();
+
         for file in &parsed.files {
+            let file_start = std::time::Instant::now();
             let memory_wc = Memory::new();
 
             match file.operation {
@@ -708,6 +721,10 @@ impl ParallelImporter {
                     match record_added_file(&memory_wc, &detected, &core_options) {
                         Ok(rec) if !rec.is_empty() => recorded_files.push(rec),
                         _ => {}
+                    }
+                    let file_ms = file_start.elapsed().as_millis();
+                    if file_ms > 100 {
+                        slow_files.push((file.path.clone(), file_ms));
                     }
                 }
 
@@ -801,12 +818,15 @@ impl ParallelImporter {
                     let old_content = file.old_content.as_deref().unwrap_or(&[]).to_vec();
 
                     // Look up inode + position for this file
+                    let lookup_start = std::time::Instant::now();
                     let mut detected = DetectedFile::modified(&file.path);
                     if let Ok(Some((inode, pos))) = repo.get_inode_and_position(&file.path) {
                         detected.inode = Some(inode);
                         detected.position = Some(pos);
                     }
+                    let lookup_ms = lookup_start.elapsed().as_millis();
 
+                    let diff_start = std::time::Instant::now();
                     match record_modified_file(&memory_wc, &detected, &old_content, &core_options) {
                         Ok(mut rec) if !rec.is_empty() => {
                             // Override CRDT ops with git's exact diff lines when available.
@@ -821,6 +841,21 @@ impl ParallelImporter {
                             recorded_files.push(rec);
                         }
                         _ => {}
+                    }
+                    let diff_ms = diff_start.elapsed().as_millis();
+                    let file_ms = file_start.elapsed().as_millis();
+                    if file_ms > 100 {
+                        slow_files.push((
+                            format!(
+                                "{} (lookup={}ms diff={}ms old={}b new={}b)",
+                                file.path,
+                                lookup_ms,
+                                diff_ms,
+                                old_content.len(),
+                                new_content.len()
+                            ),
+                            file_ms,
+                        ));
                     }
                 }
 
@@ -902,6 +937,22 @@ impl ParallelImporter {
             }
         }
 
+        let record_ms = record_start.elapsed().as_millis();
+        for (path, ms) in &slow_files {
+            log::warn!(
+                "write_commit {}: SLOW file recording: {} took {}ms",
+                parsed.short_sha,
+                path,
+                ms
+            );
+        }
+        if record_ms > 200 {
+            log::warn!(
+                "write_commit {}: recording phase took {}ms ({} files, add_batch={}ms, {} slow files)",
+                parsed.short_sha, record_ms, parsed.files.len(), add_batch_ms, slow_files.len()
+            );
+        }
+
         // Assemble the change from recorded files
         if recorded_files.is_empty() {
             let mut change = Change::empty(header);
@@ -933,9 +984,11 @@ impl ParallelImporter {
                         .map_err(|e| CliError::Internal(e.into()))?;
 
                     // Still clean up deleted files from TREE and FILE_INDEX
-                    for del_path in &deleted_paths {
-                        let _ = repo.remove(del_path, atomic_repository::TrackingOptions::forced());
-                        let _ = repo.del_file_index(del_path);
+                    if !deleted_paths.is_empty() {
+                        let del_refs: Vec<&str> =
+                            deleted_paths.iter().map(|s| s.as_str()).collect();
+                        let _ = repo.remove_batch(&del_refs);
+                        let _ = repo.del_file_index_batch(&del_refs);
                     }
 
                     return Ok(true);
@@ -977,9 +1030,11 @@ impl ParallelImporter {
         // never removes their TREE entries.  Explicitly untrack them now so that
         // `atomic status` after import matches the git working copy.
         // Also remove from FILE_INDEX so status doesn't show them as deleted.
-        for del_path in &deleted_paths {
-            let _ = repo.remove(del_path, atomic_repository::TrackingOptions::forced());
-            let _ = repo.del_file_index(del_path);
+        // Batch-remove deleted files from TREE and FILE_INDEX in single write txns.
+        if !deleted_paths.is_empty() {
+            let del_refs: Vec<&str> = deleted_paths.iter().map(|s| s.as_str()).collect();
+            let _ = repo.remove_batch(&del_refs);
+            let _ = repo.del_file_index_batch(&del_refs);
         }
 
         Ok(true)

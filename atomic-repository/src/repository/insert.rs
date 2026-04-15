@@ -260,8 +260,20 @@ impl Repository {
         .map_err(|e| RepositoryError::Apply(e.to_string()))?;
 
         // Commit the transaction
+        log::debug!("insert_change: committing transaction...");
+        let commit_start = std::time::Instant::now();
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let commit_ms = commit_start.elapsed().as_millis();
+        if commit_ms > 50 {
+            log::warn!(
+                "insert_change: SLOW txn.commit() took {}ms (change_id={:?})",
+                commit_ms,
+                change_id
+            );
+        } else {
+            log::debug!("insert_change: txn.commit() took {}ms", commit_ms);
+        }
 
         Ok(outcome)
     }

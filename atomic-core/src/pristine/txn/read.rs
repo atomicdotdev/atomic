@@ -803,9 +803,27 @@ impl KgTxnT for ReadTxn {
             }
         }
 
-        // Sort by hit count descending, take top `limit`
+        // Sort by relevance: boost entity nodes (3x) and file nodes (2x)
+        // over change nodes (1x). Entities and files are more useful for
+        // code exploration than individual change records.
         let mut ranked: Vec<(String, usize)> = hit_counts.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.sort_by(|a, b| {
+            let boost_a = if a.0.starts_with("entity:") {
+                a.1 * 3
+            } else if a.0.starts_with("file:") {
+                a.1 * 2
+            } else {
+                a.1
+            };
+            let boost_b = if b.0.starts_with("entity:") {
+                b.1 * 3
+            } else if b.0.starts_with("file:") {
+                b.1 * 2
+            } else {
+                b.1
+            };
+            boost_b.cmp(&boost_a)
+        });
         ranked.truncate(limit);
 
         // Fetch full nodes

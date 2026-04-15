@@ -146,8 +146,52 @@ fn globalize_replace<T>(
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
+    let step = std::time::Instant::now();
     let content_vertices = find_content_vertices(ctx.txn(), inode, inode_pos)?;
-    let deletion_edges = build_deletion_edges(ctx, &content_vertices)?;
+    let find_ms = step.elapsed().as_millis();
+
+    let step = std::time::Instant::now();
+    let deletion_edges = match build_deletion_edges(ctx, &content_vertices) {
+        Ok(edges) => edges,
+        Err(e) => {
+            // The INODE_GRAPH fast path may return vertices whose PARENT
+            // edges are missing/stale in the global GRAPH (e.g. after
+            // many Replaces).  Retry with the global DFS which walks the
+            // full alive graph and produces consistent vertices.
+            log::debug!(
+                "globalize_replace: build_deletion_edges failed for inode={:?} ({} vertices), \
+                 retrying with global DFS: {}",
+                inode,
+                content_vertices.len(),
+                e,
+            );
+            let global_vertices = find_content_vertices_global(ctx.txn(), inode_pos)?;
+            match build_deletion_edges(ctx, &global_vertices) {
+                Ok(edges) => edges,
+                Err(e2) => {
+                    log::debug!(
+                        "globalize_replace: global DFS also failed for inode={:?}: {}",
+                        inode,
+                        e2,
+                    );
+                    return Err(e2);
+                }
+            }
+        }
+    };
+    let del_ms = step.elapsed().as_millis();
+
+    if find_ms + del_ms > 50 {
+        log::warn!(
+            "globalize_replace: inode={:?} find_content={}ms ({} vertices) build_deletion={}ms ({} edges)",
+            inode, find_ms, content_vertices.len(), del_ms, deletion_edges.len(),
+        );
+    } else {
+        log::debug!(
+            "globalize_replace: inode={:?} find_content={}ms ({} vertices) build_deletion={}ms ({} edges)",
+            inode, find_ms, content_vertices.len(), del_ms, deletion_edges.len(),
+        );
+    }
 
     let deletion = EdgeUpdate {
         edges: deletion_edges,
@@ -179,7 +223,33 @@ fn globalize_delete<T>(
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    let deletion = delete_all_content(ctx, inode, inode_pos)?;
+    let step = std::time::Instant::now();
+    let deletion = match delete_all_content(ctx, inode, inode_pos) {
+        Ok(d) => d,
+        Err(e) => {
+            // Same fallback as globalize_replace: retry via global DFS.
+            log::debug!(
+                "globalize_delete: delete_all_content failed for inode={:?}, \
+                 retrying with global DFS: {}",
+                inode,
+                e,
+            );
+            let global_vertices = find_content_vertices_global(ctx.txn(), inode_pos)?;
+            let deletion_edges = build_deletion_edges(ctx, &global_vertices)?;
+            EdgeUpdate {
+                edges: deletion_edges,
+                inode: position_to_option_hash(inode_pos),
+            }
+        }
+    };
+    let del_ms = step.elapsed().as_millis();
+    if del_ms > 50 {
+        log::warn!(
+            "globalize_delete: inode={:?} delete_all_content took {}ms",
+            inode,
+            del_ms
+        );
+    }
 
     Ok(GraphOp::Edit {
         change: Atom::EdgeUpdate(deletion),
@@ -322,15 +392,139 @@ where
 /// path.  The INODE_GRAPH optimisation is safe only when there is no
 /// filter (e.g. `assemble_and_hash` for git import, which passes a bare
 /// `&txn`).  For the general case we must go through `retrieve_graph`.
+///
+/// **Fast path**: When the INODE_GRAPH secondary index is populated for
+/// this inode, we use it directly — O(m) where m = edges for THIS file,
+/// instead of O(V+E) global DFS.  This is safe for git import which uses
+/// a bare `ReadTxn` (no view filter).
+///
+/// If the INODE_GRAPH path succeeds but a downstream consumer (e.g.
+/// `build_deletion_edges` → `find_predecessor_end`) fails because the
+/// returned vertices lack PARENT edges in the global GRAPH, the caller
+/// will see a `GlobalizeError`.  To handle this transparently we expose
+/// a `_with_fallback` wrapper that retries via the global DFS.
 fn find_content_vertices<T>(
     txn: &T,
-    _inode: Inode,
+    inode: Inode,
     inode_pos: Position<NodeId>,
 ) -> GlobalizeResult<Vec<GraphNode<NodeId>>>
 where
     T: GraphTxnT + InodeGraphOps,
 {
+    // Try the INODE_GRAPH fast path first.  This is O(m) in edges for
+    // this file vs O(V+E) for the global DFS.
+    let populated = txn.inode_graph_is_populated(inode).unwrap_or(false);
+
+    if populated {
+        let inode_result = find_content_vertices_inode(txn, inode, inode_pos)?;
+        if !inode_result.is_empty() {
+            return Ok(inode_result);
+        }
+        // INODE_GRAPH returned empty — fall through to global DFS.
+        log::debug!(
+            "find_content_vertices: INODE_GRAPH returned empty for inode={:?}, falling back to global DFS",
+            inode,
+        );
+    }
+
+    // Fall back to global DFS when the secondary index isn't populated
+    // or returned no vertices.
     find_content_vertices_global(txn, inode_pos)
+}
+
+/// Retrieve content vertices via the INODE_GRAPH secondary index.
+///
+/// This is the fast path: iterates only edges belonging to this specific
+/// file, giving O(m) performance where m is the number of edges for the
+/// file, regardless of total graph size.
+fn find_content_vertices_inode<T>(
+    txn: &T,
+    inode: Inode,
+    inode_pos: Position<NodeId>,
+) -> GlobalizeResult<Vec<GraphNode<NodeId>>>
+where
+    T: GraphTxnT + InodeGraphOps,
+{
+    use crate::types::EdgeFlags;
+    use std::collections::HashSet;
+
+    let step = std::time::Instant::now();
+
+    // Walk forward edges from the inode vertex to discover all alive
+    // content vertices.  We use a BFS/DFS through the inode-scoped index.
+    let mut visited: HashSet<GraphNode<NodeId>> = HashSet::new();
+    let mut stack: Vec<GraphNode<NodeId>> = vec![inode_pos.inode_node()];
+    let mut content_vertices: Vec<GraphNode<NodeId>> = Vec::new();
+
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node) {
+            continue;
+        }
+
+        // Get forward edges (BLOCK, not PARENT, not DELETED) for this vertex
+        // within the inode scope.
+        let min_flag = EdgeFlags::BLOCK;
+        let max_flag = EdgeFlags::all();
+        let mut adj = match txn.init_inode_adj(inode, node, min_flag, max_flag) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+
+        while let Some(edge_result) = txn.next_inode_adj(&mut adj) {
+            let edge = match edge_result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let flags = edge.flag();
+            // Skip PARENT edges (reverse), DELETED edges, and PSEUDO edges
+            if flags.contains(EdgeFlags::PARENT)
+                || flags.contains(EdgeFlags::DELETED)
+                || flags.contains(EdgeFlags::PSEUDO)
+            {
+                continue;
+            }
+
+            // Resolve destination vertex
+            let dest_pos = edge.dest();
+            let dest_node = match txn.find_block(dest_pos) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if !visited.contains(&dest_node) {
+                stack.push(dest_node);
+
+                // Collect non-root, non-inode content vertices
+                if !dest_node.change.is_root()
+                    && !(dest_node.start == dest_node.end && dest_node.start == inode_pos.pos)
+                {
+                    content_vertices.push(dest_node);
+                }
+            }
+        }
+    }
+
+    let elapsed_ms = step.elapsed().as_millis();
+    if elapsed_ms > 50 {
+        log::warn!(
+            "find_content_vertices_inode: inode={:?} took {}ms ({} content vertices, {} visited)",
+            inode,
+            elapsed_ms,
+            content_vertices.len(),
+            visited.len(),
+        );
+    } else {
+        log::debug!(
+            "find_content_vertices_inode: inode={:?} took {}ms ({} content vertices, {} visited)",
+            inode,
+            elapsed_ms,
+            content_vertices.len(),
+            visited.len(),
+        );
+    }
+
+    Ok(content_vertices)
 }
 
 /// Retrieve content vertices via global GRAPH DFS.
@@ -342,10 +536,29 @@ where
     T: GraphTxnT,
 {
     let options = RetrieveOptions::default();
+    let step = std::time::Instant::now();
     let result = match retrieve_graph(txn, inode_pos, options) {
         Ok(r) => r,
         Err(_) => return Ok(Vec::new()),
     };
+    let retrieve_ms = step.elapsed().as_millis();
+    if retrieve_ms > 50 {
+        log::warn!(
+            "find_content_vertices_global: retrieve_graph took {}ms ({} vertices, {} edges traversed, {} positions visited)",
+            retrieve_ms,
+            result.graph.len_vertices(),
+            result.edges_traversed,
+            result.positions_visited,
+        );
+    } else {
+        log::debug!(
+            "find_content_vertices_global: retrieve_graph took {}ms ({} vertices, {} edges, {} positions)",
+            retrieve_ms,
+            result.graph.len_vertices(),
+            result.edges_traversed,
+            result.positions_visited,
+        );
+    }
 
     let mut out = Vec::new();
     for vid in 0..result.graph.len_vertices() {

@@ -42,6 +42,7 @@
 //! ```
 
 pub mod goal;
+pub mod init;
 pub mod intent;
 pub mod list;
 pub mod materialize;
@@ -54,6 +55,7 @@ pub mod sync;
 use clap::Subcommand;
 
 pub use goal::Goal;
+pub use init::Init;
 pub use intent::Intent;
 pub use list::List;
 pub use materialize::Materialize;
@@ -74,6 +76,17 @@ use crate::error::CliResult;
 /// memory, skills, intents, and scratch notes as versioned markdown.
 #[derive(Subcommand, Debug)]
 pub enum VaultCommands {
+    /// Initialize the vault in an existing repository.
+    ///
+    /// Creates `.vault/` with default skills, prompts, and memory.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic vault init
+    /// ```
+    Init(Init),
+
     /// Print a vault entry's content.
     ///
     /// Retrieves and displays the content of a vault entry by its
@@ -211,6 +224,7 @@ pub struct Vault {
 impl Command for Vault {
     fn run(&self) -> CliResult<()> {
         match &self.command {
+            VaultCommands::Init(cmd) => cmd.run(),
             VaultCommands::Show(cmd) => cmd.run(),
             VaultCommands::List(cmd) => cmd.run(),
             VaultCommands::Materialize(cmd) => cmd.run(),

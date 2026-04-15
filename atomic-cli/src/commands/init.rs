@@ -85,7 +85,7 @@ pub const DEFAULT_VIEW_NAME: &str = "dev";
 /// - `go`: Ignores `bin/`, `*.exe`
 /// - `java`: Ignores `target/`, `*.class`, `*.jar`
 /// - `c` / `cpp`: Ignores `*.o`, `*.a`, `*.so`, `build/`
-fn get_ignore_template(kind: &str) -> Option<&'static str> {
+pub fn get_ignore_template(kind: &str) -> Option<&'static str> {
     match kind.to_lowercase().as_str() {
         "rust" => Some(
             r#"# Rust
@@ -505,53 +505,93 @@ impl Command for Init {
             return Err(CliError::repository_exists(&target_path));
         }
 
-        // Initialize the repository
-        let mut repo = Repository::init(&target_path).map_err(|e| {
-            // Convert repository error to CLI error with better message
-            match e {
-                atomic_repository::RepositoryError::AlreadyExists { .. } => {
-                    CliError::repository_exists(&target_path)
-                }
-                other => CliError::Repository(other),
+        // ── Step 1: Create .atomic/ and the pristine database ────────
+        let mut repo = Repository::init(&target_path).map_err(|e| match e {
+            atomic_repository::RepositoryError::AlreadyExists { .. } => {
+                CliError::repository_exists(&target_path)
             }
+            other => CliError::Repository(other),
         })?;
 
         // Create the initial view if it's different from the default
-        // Repository::init() already creates a "dev" view by default
         if self.view != atomic_repository::DEFAULT_VIEW {
-            // Create the requested view
             repo.create_view(&self.view).map_err(CliError::Repository)?;
-
-            // Set it as the current view
             repo.set_current_view(&self.view)
                 .map_err(CliError::Repository)?;
         }
 
-        // Initialize vault (default on, skip with --no-vault)
-        if self.vault && !self.no_vault {
-            repo.init_vault().map_err(CliError::Repository)?;
-        }
-
-        // Print success message
         print_success(&format!(
             "Initialized empty Atomic repository in {}",
             dot_dir.display()
         ));
         println!("Created view: {}", self.view);
 
-        if self.vault && !self.no_vault {
-            println!("Initialized vault at {}", repo.vault_dir().display());
-        }
+        // ── Step 2: Create .atomicignore → add → record ─────────────
+        //
+        // The .atomicignore MUST contain ".atomic" so the VCS internals
+        // are never tracked. Create it even without --kind (with a minimal
+        // default), then add and record it as the first change.
+        {
+            let ignore_path = target_path.join(".atomicignore");
+            if !ignore_path.exists() {
+                if let Some(ref kind) = self.kind {
+                    // Use the language-specific template
+                    if let Some(template) = get_ignore_template(kind) {
+                        std::fs::write(&ignore_path, template).map_err(CliError::Io)?;
+                        println!("Created .atomicignore for {} project", kind);
+                    } else {
+                        // Unknown kind — write minimal default
+                        std::fs::write(&ignore_path, ".atomic\n.git\n").map_err(CliError::Io)?;
+                    }
+                } else {
+                    // No --kind specified — write minimal default
+                    std::fs::write(&ignore_path, ".atomic\n.git\n").map_err(CliError::Io)?;
+                }
+            }
 
-        // Create .atomicignore if kind specified
-        if let Ok(true) = self.create_ignore_file(&target_path) {
-            println!(
-                "Created .atomicignore for {} project",
-                self.kind.as_ref().unwrap()
+            // Add and record .atomicignore
+            let _ = repo.add(
+                ".atomicignore",
+                atomic_repository::TrackingOptions::default(),
             );
+            let header = atomic_core::change::ChangeHeader::new("Initialize repository");
+            match repo.record(header, atomic_repository::RecordOptions::default()) {
+                Ok(_) => {}
+                Err(atomic_repository::RecordError::NothingToRecord) => {}
+                Err(e) => log::warn!("Failed to record .atomicignore: {}", e),
+            }
         }
 
-        // Print next steps to guide the user
+        // ── Step 3: Create .vault/ → install defaults → add → record ─
+        if self.vault && !self.no_vault {
+            // Create vault tables + directory structure + default files
+            repo.init_vault().map_err(CliError::Repository)?;
+
+            println!("Initialized vault at {}", repo.vault_dir().display());
+
+            // Add all vault files to tracking
+            let vault_dir = repo.vault_dir();
+            if vault_dir.exists() {
+                add_vault_files_recursive(&repo, &vault_dir)?;
+            }
+
+            // Record vault files as their own change
+            let header = atomic_core::change::ChangeHeader::new("Initialize vault");
+            match repo.record(header, atomic_repository::RecordOptions::default()) {
+                Ok(outcome) => {
+                    println!(
+                        "Recorded vault defaults ({} files)",
+                        outcome.stats().files_recorded
+                    );
+                }
+                Err(atomic_repository::RecordError::NothingToRecord) => {}
+                Err(e) => log::warn!("Failed to record vault files: {}", e),
+            }
+        }
+
+        // ── Status should be clean at this point ─────────────────────
+
+        // Print next steps
         print_next_steps(&[
             ("atomic add <files>", "Add files to track"),
             ("atomic record -m \"...\"", "Record your first change"),
@@ -560,6 +600,24 @@ impl Command for Init {
 
         Ok(())
     }
+}
+
+/// Recursively add all files under a directory to Atomic tracking.
+fn add_vault_files_recursive(repo: &Repository, dir: &std::path::Path) -> CliResult<()> {
+    let entries = std::fs::read_dir(dir).map_err(CliError::Io)?;
+    for entry in entries {
+        let entry = entry.map_err(CliError::Io)?;
+        let path = entry.path();
+        if path.is_dir() {
+            add_vault_files_recursive(repo, &path)?;
+        } else if path.is_file() {
+            if let Ok(rel) = path.strip_prefix(repo.root()) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                let _ = repo.add(&rel_str, atomic_repository::TrackingOptions::default());
+            }
+        }
+    }
+    Ok(())
 }
 
 // Tests

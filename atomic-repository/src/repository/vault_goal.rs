@@ -3,6 +3,10 @@
 //! Goals are the vault's conversation transcripts — who ran what,
 //! what tools were called, what was found. They use haikunator-style
 //! names like "swift-meadow-a3f2" for easy reference.
+//!
+//! Goals are pure vault operations — they manage vault entries (redb +
+//! markdown) but do NOT touch views. View creation, switching, and
+//! merging are the agent's responsibility via the AtomicTool.
 
 use super::*;
 use atomic_core::pristine::vault::{GoalSummary, TokenCounts, VaultEntry, VaultEntryType};
@@ -71,6 +75,9 @@ impl Repository {
     ///
     /// Goal names are Docker-style haikunator names (e.g., "swift-meadow-a3f2")
     /// unless overridden with `options.name`.
+    ///
+    /// This is a pure vault operation — it does NOT create or switch views.
+    /// View management is the agent's responsibility via the AtomicTool.
     pub fn vault_goal_start(
         &self,
         options: GoalStartOptions,
@@ -204,6 +211,9 @@ impl Repository {
     /// With `promote: true`: marks the goal as "completed".
     /// With `discard: true`: deletes the goal entirely.
     /// Default (neither flag): marks as "suspended".
+    ///
+    /// This is a pure vault operation — it does NOT switch or delete views.
+    /// View management is the agent's responsibility via the AtomicTool.
     pub fn vault_goal_stop(
         &self,
         goal_name: &str,
@@ -216,6 +226,10 @@ impl Repository {
                 .ok_or_else(|| RepositoryError::InvalidOperation {
                     message: format!("Goal '{}' not found", goal_name),
                 })?;
+
+        // Parse frontmatter
+        let fm: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&entry.frontmatter_json).unwrap_or_default();
 
         if options.discard {
             // Delete all entries under this goal directory
@@ -264,24 +278,23 @@ impl Repository {
         let now = chrono::Utc::now().to_rfc3339();
 
         // Update the entry's frontmatter
-        let mut fm: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&entry.frontmatter_json).unwrap_or_default();
-        fm.insert(
+        let mut new_fm = fm.clone();
+        new_fm.insert(
             "status".to_string(),
             serde_json::Value::String(new_status.to_string()),
         );
-        fm.insert(
+        new_fm.insert(
             "ended_at".to_string(),
             serde_json::Value::String(now.clone()),
         );
-        let new_fm = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
+        let new_fm_json = serde_json::to_string(&new_fm).unwrap_or_else(|_| "{}".to_string());
 
         // Re-store with updated frontmatter
         self.vault_store(
             &goal_file,
             VaultEntryType::Session,
             entry.content_bytes.clone(),
-            new_fm,
+            new_fm_json,
         )?;
 
         // Update manifest
@@ -316,6 +329,9 @@ impl Repository {
     ///
     /// Sets the goal status back to "active" and returns the goal
     /// metadata for loading into context.
+    ///
+    /// This is a pure vault operation — it does NOT switch views.
+    /// View management is the agent's responsibility via the AtomicTool.
     pub fn vault_goal_resume(&self, goal_name: &str) -> Result<GoalInfo, RepositoryError> {
         let goal_file = format!("goals/{}/_goal.md", goal_name);
 
@@ -592,6 +608,10 @@ mod tests {
             .vault_goal_stop("test-suspend", GoalStopOptions::default())
             .unwrap();
         assert_eq!(stop.status, "suspended");
+
+        // Manifest should reflect suspended
+        let manifest = repo.vault_manifest().unwrap();
+        assert_eq!(manifest.goals["test-suspend"].status, "suspended");
     }
 
     #[test]
@@ -705,5 +725,35 @@ mod tests {
         repo.init_vault().unwrap();
 
         assert!(repo.vault_goal_show("nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_goal_frontmatter_has_core_fields() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        repo.vault_goal_start(GoalStartOptions {
+            name: Some("fm-check".to_string()),
+            developer: Some("alice".to_string()),
+            intent: Some("PIMO-1".to_string()),
+            model: Some("claude-4".to_string()),
+        })
+        .unwrap();
+
+        let entry = repo.vault_goal_show("fm-check").unwrap();
+        let fm: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&entry.frontmatter_json).unwrap();
+
+        assert_eq!(fm.get("goal_id").and_then(|v| v.as_str()), Some("fm-check"),);
+        assert_eq!(fm.get("developer").and_then(|v| v.as_str()), Some("alice"),);
+        assert_eq!(fm.get("intent").and_then(|v| v.as_str()), Some("PIMO-1"),);
+        assert_eq!(fm.get("model").and_then(|v| v.as_str()), Some("claude-4"),);
+        assert_eq!(fm.get("status").and_then(|v| v.as_str()), Some("active"),);
+        assert!(fm.get("started_at").is_some());
+
+        // View fields should NOT be in frontmatter (views are agent-managed)
+        assert!(fm.get("view").is_none());
+        assert!(fm.get("previous_view").is_none());
     }
 }

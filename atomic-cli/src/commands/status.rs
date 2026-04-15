@@ -111,7 +111,8 @@ use crate::commands::{find_repository_root, Command, DEFAULT_HASH_LENGTH};
 use crate::error::{CliError, CliResult};
 use crate::output::{
     added, deleted, hash, hint, info, modified, path as style_path, print_blank, print_hint,
-    print_section, untracked as style_untracked, view as style_view, warning,
+    print_info, print_section, print_warning, untracked as style_untracked, view as style_view,
+    warning,
 };
 
 // Status Output Configuration
@@ -183,6 +184,17 @@ pub struct Status {
     /// or aren't being ignored.
     #[arg(long = "debug-ignore", hide = true)]
     pub debug_ignore: bool,
+
+    /// Rebuild the FILE_INDEX before computing status.
+    ///
+    /// Walks every tracked file, hashes its content, and updates the
+    /// FILE_INDEX cache so that subsequent `status` calls use the fast
+    /// stat-comparison path instead of reconstructing graph content.
+    ///
+    /// This is useful after `git import` where file mtimes are reset,
+    /// invalidating the cached entries.
+    #[arg(long = "reindex")]
+    pub reindex: bool,
 }
 
 impl Status {
@@ -193,6 +205,7 @@ impl Status {
             short: false,
             no_untracked: false,
             debug_ignore: false,
+            reindex: false,
         }
     }
 
@@ -462,6 +475,28 @@ impl Command for Status {
     fn run(&self) -> CliResult<()> {
         // Find the repository root
         let repo_root = find_repository_root()?;
+
+        // Reindex first if requested (needs read-write access)
+        if self.reindex {
+            let rw_repo =
+                Repository::open(&repo_root).map_err(|e| CliError::InvalidRepository {
+                    reason: e.to_string(),
+                })?;
+            let start = std::time::Instant::now();
+            match rw_repo.reindex_working_copy() {
+                Ok(count) => {
+                    print_info(&format!(
+                        "Reindexed {} files in {:.1}s",
+                        count,
+                        start.elapsed().as_secs_f64()
+                    ));
+                }
+                Err(e) => {
+                    print_warning(&format!("Reindex failed: {}", e));
+                }
+            }
+            drop(rw_repo);
+        }
 
         // Open the repository
         let repo =

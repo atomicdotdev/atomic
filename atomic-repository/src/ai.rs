@@ -102,7 +102,8 @@ pub fn resolve_llm_provider() -> Option<LlmProvider> {
         if !key.is_empty() {
             return Some(LlmProvider {
                 provider: AiProvider::Anthropic,
-                model: "claude-haiku-4-5".to_string(),
+                model: std::env::var("LLM_MODEL")
+                    .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string()),
                 api_key: key,
                 base_url: std::env::var("ANTHROPIC_BASE_URL")
                     .unwrap_or_else(|_| "https://api.anthropic.com/v1".to_string()),
@@ -114,7 +115,7 @@ pub fn resolve_llm_provider() -> Option<LlmProvider> {
         if !key.is_empty() {
             return Some(LlmProvider {
                 provider: AiProvider::OpenAi,
-                model: "gpt-4o-mini".to_string(),
+                model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
                 api_key: key,
                 base_url: std::env::var("OPENAI_BASE_URL")
                     .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
@@ -287,7 +288,12 @@ impl LlmProvider {
         let body = serde_json::json!({
             "model": self.model,
             "max_tokens": 1024,
-            "system": "You are a code assistant. Answer questions about the repository using only the provided context. Be concise and precise.",
+            "system": "You are a code assistant for a repository tracked by Atomic VCS (not git). \
+                        The context includes: entities (functions, structs, traits extracted by AST), \
+                        files, changes (these ARE the commit history — each has a date, sequence number, and message), \
+                        views (like branches), goals (development sessions), and intents (work items). \
+                        Change nodes show the project's history — use their dates and messages to answer questions about \
+                        recent modifications. Answer using only the provided context. Be concise and precise.",
             "messages": [{
                 "role": "user",
                 "content": format!("{}\n\nQuestion: {}", context, query)
@@ -343,7 +349,12 @@ impl LlmProvider {
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a code assistant. Answer questions about the repository using only the provided context. Be concise and precise."
+                    "content": "You are a code assistant for a repository tracked by Atomic VCS (not git). \
+                                The context includes: entities (functions, structs, traits extracted by AST), \
+                                files, changes (these ARE the commit history — each has a date, sequence number, and message), \
+                                views (like branches), goals (development sessions), and intents (work items). \
+                                Change nodes show the project's history — use their dates and messages to answer questions about \
+                                recent modifications. Answer using only the provided context. Be concise and precise."
                 },
                 {
                     "role": "user",
@@ -417,6 +428,40 @@ pub fn build_context_string(nodes: &[KgNode], edges: &[KgEdge], query: &str) -> 
             buf.push_str(&format!("- {}", node.label));
             if let Some(ref summary) = node.summary {
                 buf.push_str(&format!(": {}", summary));
+            }
+            // Render metadata for change nodes (timestamp, author, sequence)
+            if node.kind == "change" {
+                if let Some(ref meta) = node.metadata {
+                    let mut details = Vec::new();
+                    if let Some(ts) = meta.get("timestamp").and_then(|v| v.as_str()) {
+                        details.push(format!("date: {}", ts));
+                    }
+                    if let Some(seq) = meta.get("sequence").and_then(|v| v.as_u64()) {
+                        details.push(format!("#{}", seq));
+                    }
+                    if !details.is_empty() {
+                        buf.push_str(&format!(" ({})", details.join(", ")));
+                    }
+                }
+            }
+            // Render metadata for entity nodes (kind, file, line range)
+            if node.kind == "entity" {
+                if let Some(ref meta) = node.metadata {
+                    let mut details = Vec::new();
+                    if let Some(k) = meta.get("kind").and_then(|v| v.as_str()) {
+                        details.push(k.to_string());
+                    }
+                    if let Some(f) = meta.get("file").and_then(|v| v.as_str()) {
+                        if let Some(line) = meta.get("line").and_then(|v| v.as_u64()) {
+                            details.push(format!("{}:{}", f, line));
+                        } else {
+                            details.push(f.to_string());
+                        }
+                    }
+                    if !details.is_empty() {
+                        buf.push_str(&format!(" [{}]", details.join(", ")));
+                    }
+                }
             }
             buf.push('\n');
             if buf.len() >= MAX_CHARS {

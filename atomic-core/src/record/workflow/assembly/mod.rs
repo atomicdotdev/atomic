@@ -47,6 +47,7 @@ pub use helpers::{collect_dependencies, compute_content_offsets, finalize_hunks,
 pub use types::{AssemblyError, AssemblyOptions, AssemblyResult, AssemblyResult_};
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use crate::change::{Change, ChangeHeader, FileOps, GraphOp, Provenance};
 use crate::pristine::{GraphTxnT, TreeTxnT};
@@ -338,7 +339,10 @@ where
     let mut globalize_errors = Vec::new();
 
     // Process each file
-    for file in files {
+    let total_files = files.len();
+    let assembly_start = Instant::now();
+
+    for (file_idx, file) in files.iter().enumerate() {
         stats.record_file();
 
         // Skip empty files if configured, but never skip directories
@@ -348,6 +352,32 @@ where
             && !file.is_directory()
             && !file.is_deleted_directory()
         {
+            log::debug!(
+                "assemble_change: file {}/{} '{}' skipped (no hunks)",
+                file_idx + 1,
+                total_files,
+                file.path(),
+            );
+            stats.record_skip();
+            continue;
+        }
+
+        // Skip newly-added files with empty content (e.g., 0-byte files like
+        // .nojekyll, .gitkeep).  These have hunks from the recording phase but
+        // no actual content bytes, so globalization will produce nothing —
+        // avoid the expensive globalize_recorded_file call entirely.
+        if file.inode().is_none()
+            && file.content().is_empty()
+            && !file.is_directory()
+            && !file.is_deleted_directory()
+            && !options.get_include_empty_files()
+        {
+            log::debug!(
+                "assemble_change: file {}/{} '{}' skipped (0-byte added file, no inode)",
+                file_idx + 1,
+                total_files,
+                file.path(),
+            );
             stats.record_skip();
             continue;
         }
@@ -359,13 +389,29 @@ where
         }
 
         // Globalize the file
+        log::debug!(
+            "assemble_change: file {}/{} '{}' globalizing (hunks={} content_bytes={} kind={:?})",
+            file_idx + 1,
+            total_files,
+            file.path(),
+            file.hunks().len(),
+            file.content().len(),
+            file.kind(),
+        );
+        let glob_start = Instant::now();
+
         match globalize_recorded_file(&mut glob_ctx, file, options.get_globalize_options()) {
             Ok(globalized) => {
+                let glob_ms = glob_start.elapsed().as_millis();
+
                 if globalized.is_empty() {
                     log::debug!(
-                        "assemble_change: globalized file '{}' is empty (no hunks), skipping. \
+                        "assemble_change: file {}/{} '{}' globalized empty in {}ms, skipping. \
                          is_directory={} is_deleted={} has_content={} has_position={:?}",
+                        file_idx + 1,
+                        total_files,
                         file.path(),
+                        glob_ms,
                         file.is_directory(),
                         file.is_deleted_directory(),
                         !file.is_empty(),
@@ -375,18 +421,44 @@ where
                     continue;
                 }
 
+                let hunk_count = globalized.hunks().len();
                 // Add hunks from the globalized file
                 for graph_op in globalized.hunks() {
                     ctx.add_hunk(graph_op.clone());
+                }
+
+                if glob_ms > 100 {
+                    log::warn!(
+                        "assemble_change: SLOW file {}/{} '{}' took {}ms ({} hunks, {} bytes added)",
+                        file_idx + 1,
+                        total_files,
+                        file.path(),
+                        glob_ms,
+                        hunk_count,
+                        globalized.bytes_added(),
+                    );
+                } else {
+                    log::debug!(
+                        "assemble_change: file {}/{} '{}' globalized in {}ms ({} hunks)",
+                        file_idx + 1,
+                        total_files,
+                        file.path(),
+                        glob_ms,
+                        hunk_count,
+                    );
                 }
 
                 stats.add_content_bytes(globalized.bytes_added());
                 globalized_files.push(globalized);
             }
             Err(e) => {
+                let glob_ms = glob_start.elapsed().as_millis();
                 log::debug!(
-                    "assemble_change: globalize error for '{}': {}",
+                    "assemble_change: file {}/{} '{}' globalize error in {}ms: {}",
+                    file_idx + 1,
+                    total_files,
                     file.path(),
+                    glob_ms,
                     e,
                 );
                 stats.record_error();
@@ -394,6 +466,14 @@ where
             }
         }
     }
+
+    let assembly_elapsed = assembly_start.elapsed();
+    log::debug!(
+        "assemble_change: all {} files globalized in {:.1}s, {} total hunks",
+        total_files,
+        assembly_elapsed.as_secs_f64(),
+        ctx.hunk_count(),
+    );
 
     // Check if we have any hunks
     if ctx.hunk_count() == 0 && !options.get_include_empty_files() {

@@ -56,7 +56,7 @@ impl Repository {
 
         // Create directory structure on disk
         let vault_dir = self.vault_dir();
-        let subdirs = ["goals", "memory", "skills", "intents", "scratch"];
+        let subdirs = ["goals", "memory", "skills", "intents", "scratch", "prompts"];
         for subdir in &subdirs {
             std::fs::create_dir_all(vault_dir.join(subdir))?;
         }
@@ -77,8 +77,15 @@ impl Repository {
         // Initialize embeddings table
         self.init_embeddings()?;
 
-        // Install default vault content (skills, memory index)
+        // Install default vault content (skills, memory index, system prompt)
         self.vault_install_defaults()?;
+
+        // NOTE: The vault files are NOT added+recorded here. The CLI init
+        // command handles that in the correct sequence:
+        //   1. Create .atomicignore → add → record
+        //   2. Create .vault/ defaults → add → record
+        // This avoids the TREE/status deadlock where add() marks files as
+        // tracked but status() doesn't see them without graph positions.
 
         Ok(())
     }
@@ -1110,9 +1117,9 @@ mod tests {
         )
         .unwrap();
 
-        // List all (3 defaults from init_vault + 2 test entries)
+        // List all (4 defaults from init_vault + 2 test entries)
         let all = repo.vault_list("", None).unwrap();
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 6);
 
         // Filter by type
         let sessions = repo.vault_list("", Some(VaultEntryType::Session)).unwrap();
@@ -1123,7 +1130,7 @@ mod tests {
         assert!(!repo.vault_delete("memory/arch.md").unwrap());
 
         let all = repo.vault_list("", None).unwrap();
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 5);
     }
 
     #[test]
@@ -1156,8 +1163,8 @@ mod tests {
         repo.vault_recompute_manifest_totals().unwrap();
 
         let manifest = repo.vault_manifest().unwrap();
-        // 5 test entries + 3 defaults (2 skills + memory index)
-        assert_eq!(manifest.file_count, 8);
+        // 5 test entries + 4 defaults (2 skills + system prompt + memory index)
+        assert_eq!(manifest.file_count, 9);
         assert!(manifest.total_bytes > 0);
     }
 
@@ -1254,9 +1261,9 @@ mod tests {
         )
         .unwrap();
 
-        // 2 test entries + 3 defaults from init_vault
+        // 2 test entries + 4 defaults from init_vault
         let count = repo.vault_materialize_all().unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, 6);
 
         assert!(repo.vault_dir().join("memory/arch.md").exists());
         assert!(repo.vault_dir().join("skills/run-tests.md").exists());

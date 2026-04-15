@@ -61,8 +61,26 @@ impl Repository {
             .status(StatusOptions::default())
             .map_err(RecordError::Repository)?;
 
+        log::debug!(
+            "record: status returned {} entries (modified={}, added={}, deleted={}, clean={}, untracked={})",
+            status.entries().len(),
+            status.modified_count(),
+            status.added_count(),
+            status.deleted_count(),
+            status.entries().iter().filter(|e| e.status() == FileStatus::Clean).count(),
+            status.untracked_count(),
+        );
+
         // Filter to recordable files
         let files_to_record = filter_files(status.entries(), &options);
+
+        log::debug!(
+            "record: filter_files returned {} recordable files",
+            files_to_record.len(),
+        );
+        for f in &files_to_record {
+            log::debug!("record:   {:?} {}", f.status(), f.path().display(),);
+        }
 
         if files_to_record.is_empty() {
             return Err(RecordError::NothingToRecord);
@@ -109,8 +127,14 @@ impl Repository {
 
                 FileStatus::Added => {
                     // Read file content
+                    log::debug!(
+                        "record: processing Added file '{}' (full_path={})",
+                        path,
+                        full_path.display()
+                    );
                     match std::fs::read(&full_path) {
                         Ok(content) => {
+                            log::debug!("record: read {} bytes from '{}'", content.len(), path);
                             // Check size limit
                             if content.len() as u64 > options.max_file_size() {
                                 if options.skip_binary() {
@@ -133,8 +157,13 @@ impl Repository {
                             let detected = DetectedFile::added(&path);
 
                             // Record the added file
+                            log::debug!("record: calling record_added_file for '{}'", path);
                             match record_added_file(&memory_wc, &detected, &core_options) {
                                 Ok(recorded) => {
+                                    log::debug!(
+                                        "record: record_added_file '{}' returned: is_empty={} hunks={} content_len={}",
+                                        path, recorded.is_empty(), recorded.hunk_count(), recorded.content_len()
+                                    );
                                     if !recorded.is_empty() {
                                         stats.files_recorded += 1;
                                         stats.hunks_created += recorded.hunk_count();
@@ -155,17 +184,27 @@ impl Repository {
                                         recorded_paths.push(path.clone());
                                         recorded_files.push(recorded);
                                     } else {
+                                        log::debug!(
+                                            "record: '{}' produced empty result, skipping",
+                                            path
+                                        );
                                         skipped_paths.push(path.clone());
                                         stats.files_skipped += 1;
                                     }
                                 }
                                 Err(e) => {
+                                    log::debug!(
+                                        "record: record_added_file '{}' error: {:?}",
+                                        path,
+                                        e
+                                    );
                                     errors.push((path.clone(), format!("{:?}", e)));
                                     stats.errors += 1;
                                 }
                             }
                         }
                         Err(e) => {
+                            log::debug!("record: failed to read '{}': {}", path, e);
                             errors.push((path.clone(), e.to_string()));
                             stats.errors += 1;
                         }
@@ -684,6 +723,8 @@ impl Repository {
         use atomic_core::record::workflow::assemble_change;
         use atomic_core::record::workflow::assembly::AssemblyOptions;
 
+        let overall_start = std::time::Instant::now();
+
         let txn = self
             .pristine
             .read_txn()
@@ -704,14 +745,42 @@ impl Repository {
         let assembly_result = assemble_change(&txn, recorded_files, header, &assembly_options)?;
 
         let change = assembly_result.into_change();
+        log::debug!(
+            "assemble_and_hash: assembly complete, content_size={} hunks={}",
+            change.contents.len(),
+            change.hunks().len(),
+        );
 
+        let step = std::time::Instant::now();
         let mut v3_bytes = Vec::new();
         let hash = change
             .serialize(&mut v3_bytes)
             .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+        let serialize_ms = step.elapsed().as_millis();
 
+        let step = std::time::Instant::now();
         let (final_change, _) = Change::deserialize(&mut v3_bytes.as_slice())
             .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+        let deserialize_ms = step.elapsed().as_millis();
+
+        let total_ms = overall_start.elapsed().as_millis();
+        if serialize_ms + deserialize_ms > 100 {
+            log::warn!(
+                "assemble_and_hash: serialize={}ms ({} bytes) deserialize={}ms total={}ms",
+                serialize_ms,
+                v3_bytes.len(),
+                deserialize_ms,
+                total_ms,
+            );
+        } else {
+            log::debug!(
+                "assemble_and_hash: serialize={}ms ({} bytes) deserialize={}ms total={}ms",
+                serialize_ms,
+                v3_bytes.len(),
+                deserialize_ms,
+                total_ms,
+            );
+        }
 
         Ok((final_change, hash))
     }

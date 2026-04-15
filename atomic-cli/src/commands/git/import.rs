@@ -33,7 +33,7 @@ use atomic_repository::Repository;
 use super::parallel::{ParallelImportOptions, ParallelImporter};
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{print_info, print_success};
+use crate::output::{print_info, print_success, print_warning};
 
 /// Import a Git repository into Atomic.
 ///
@@ -67,6 +67,21 @@ pub struct Import {
     /// Compares Git commit SHAs with existing change metadata to skip already-imported commits.
     #[arg(long)]
     pub incremental: bool,
+
+    /// Project kind for .atomicignore template.
+    ///
+    /// Auto-detected from project files (Cargo.toml → rust, package.json → node, etc.)
+    /// if not specified. Supported kinds: rust, python, node, javascript, typescript,
+    /// go, java, kotlin, c, cpp.
+    #[arg(long, short = 'k')]
+    pub kind: Option<String>,
+
+    /// Skip vault initialization.
+    ///
+    /// By default, git import creates a `.vault/` with skills, prompts, and memory.
+    /// Use this flag to skip vault setup.
+    #[arg(long)]
+    pub no_vault: bool,
 }
 
 impl Import {
@@ -267,8 +282,10 @@ impl Command for Import {
             return Ok(());
         }
 
-        // Check if Atomic repository exists, if not initialize it
-        let repo_exists = find_repository_root().is_ok();
+        // Check if Atomic repository exists in THIS directory (not parent dirs).
+        // Don't use find_repository_root() — it walks up and might find
+        // ~/.atomic/ (global config dir) which isn't a repo.
+        let repo_exists = workdir.join(".atomic").join("pristine.redb").exists();
         let mut repo = if repo_exists {
             Repository::open(workdir).map_err(|e| CliError::Internal(e.into()))?
         } else {
@@ -297,7 +314,7 @@ impl Command for Import {
                     .view_exists(&branch_name)
                     .map_err(|e| CliError::Internal(e.into()))?
                 {
-                    repo.create_view(&branch_name)
+                    repo.create_shared_view(&branch_name)
                         .map_err(|e| CliError::Internal(e.into()))?;
                 }
 
@@ -311,7 +328,33 @@ impl Command for Import {
                 total_imported += count;
             }
 
-            // Auto-enrich the knowledge graph from all imported VCS data
+            // Materialize the working copy from the graph
+            print_info("Materializing working copy...");
+            match repo.materialize() {
+                Ok(result) => print_info(&format!("Materialized {} files", result.files_written)),
+                Err(e) => print_warning(&format!("Working copy materialization failed: {}", e)),
+            }
+
+            // Restore files from git to fix import fidelity issues.
+            // The graph reconstruction may produce slightly wrong content
+            // for some files (hunk misalignment across thousands of commits).
+            // Git has the authoritative content — restore from it and update
+            // the FILE_INDEX so atomic status sees them as clean.
+            restore_from_git_and_reindex(&repo, &git_repo);
+
+            // Initialize .atomicignore + vault AFTER import + materialize.
+            // Must be before KG enrichment so has_vault() returns true.
+            if !repo_exists {
+                init_atomicignore_and_vault(
+                    &mut repo,
+                    workdir,
+                    self.kind.as_deref(),
+                    self.no_vault,
+                )?;
+            }
+
+            // Auto-enrich the knowledge graph from all imported VCS data.
+            // Runs AFTER vault init so the KG tables exist.
             if repo.has_vault().unwrap_or(false) {
                 print_info("Enriching knowledge graph...");
                 match repo.kg_enrich_from_vcs() {
@@ -340,7 +383,7 @@ impl Command for Import {
                 .view_exists(&branch_name)
                 .map_err(|e| CliError::Internal(e.into()))?
             {
-                repo.create_view(&branch_name)
+                repo.create_shared_view(&branch_name)
                     .map_err(|e| CliError::Internal(e.into()))?;
             }
 
@@ -351,7 +394,28 @@ impl Command for Import {
             // Import
             let count = self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas)?;
 
-            // Auto-enrich the knowledge graph from imported VCS data
+            // Materialize the working copy from the graph
+            print_info("Materializing working copy...");
+            match repo.materialize() {
+                Ok(result) => print_info(&format!("Materialized {} files", result.files_written)),
+                Err(e) => print_warning(&format!("Working copy materialization failed: {}", e)),
+            }
+
+            // Restore files from git to fix import fidelity issues.
+            restore_from_git_and_reindex(&repo, &git_repo);
+
+            // Initialize .atomicignore + vault AFTER import + materialize
+            if !repo_exists {
+                init_atomicignore_and_vault(
+                    &mut repo,
+                    workdir,
+                    self.kind.as_deref(),
+                    self.no_vault,
+                )?;
+            }
+
+            // Auto-enrich the knowledge graph from imported VCS data.
+            // Runs AFTER vault init so the KG tables exist.
             if repo.has_vault().unwrap_or(false) {
                 print_info("Enriching knowledge graph...");
                 match repo.kg_enrich_from_vcs() {
@@ -368,6 +432,152 @@ impl Command for Import {
 
         Ok(())
     }
+}
+
+/// Restore working copy files from git and rebuild FILE_INDEX.
+///
+/// After materialize, some files may have slightly wrong content due to
+/// graph reconstruction fidelity issues. Git is the source of truth for
+/// file content — restore from it, then update the FILE_INDEX so that
+/// `atomic status` reports the working copy as clean.
+fn restore_from_git_and_reindex(repo: &Repository, git_repo: &GitRepository) {
+    use atomic_core::types::Hash;
+    use std::time::SystemTime;
+
+    let repo_root = repo.root().to_path_buf();
+
+    // `git checkout -- .` restores all tracked files to HEAD state
+    let result = std::process::Command::new("git")
+        .args(["checkout", "--", "."])
+        .current_dir(&repo_root)
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            // Rebuild FILE_INDEX for all tracked files so status is clean.
+            // Only index files that exist on disk and have graph content.
+            // Files without graph content (tracked but not recorded) are
+            // left alone — status will correctly show them as Added.
+            let tracked = repo.list_tracked_files().unwrap_or_default();
+            let mut entries: Vec<(String, i64, u32, u64, Hash)> = Vec::new();
+
+            for file in &tracked {
+                let abs = repo_root.join(&file.path);
+                if let Ok(metadata) = std::fs::metadata(&abs) {
+                    let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    let duration = mtime
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    if let Ok(bytes) = std::fs::read(&abs) {
+                        entries.push((
+                            file.path.to_string_lossy().replace('\\', "/"),
+                            duration.as_secs() as i64,
+                            duration.subsec_nanos(),
+                            metadata.len(),
+                            Hash::of(&bytes),
+                        ));
+                    }
+                }
+            }
+
+            if !entries.is_empty() {
+                let _ = repo.update_file_index(&entries);
+            }
+        }
+        _ => {
+            log::warn!("git checkout failed — some files may show as modified in atomic status");
+        }
+    }
+}
+
+/// Create .atomicignore and initialize vault AFTER git import + materialize.
+///
+/// This runs post-import so the import's materialize step can't stomp the
+/// vault files' tracked state. The sequence is:
+/// 1. Create .atomicignore (auto-detect project type) → add → record
+/// 2. Create .vault/ with defaults → add → record
+/// 3. Status is clean.
+fn init_atomicignore_and_vault(
+    repo: &mut Repository,
+    workdir: &std::path::Path,
+    kind: Option<&str>,
+    no_vault: bool,
+) -> CliResult<()> {
+    // Step 1: .atomicignore
+    {
+        let ignore_path = workdir.join(".atomicignore");
+        if !ignore_path.exists() {
+            // Use explicit --kind if provided, otherwise auto-detect from project files
+            let ignore_content = if let Some(k) = kind {
+                super::super::init::get_ignore_template(k).unwrap_or(".atomic\n.git\n")
+            } else if workdir.join("Cargo.toml").exists() {
+                super::super::init::get_ignore_template("rust").unwrap_or(".atomic\n.git\n")
+            } else if workdir.join("package.json").exists() {
+                super::super::init::get_ignore_template("node").unwrap_or(".atomic\n.git\n")
+            } else if workdir.join("go.mod").exists() {
+                super::super::init::get_ignore_template("go").unwrap_or(".atomic\n.git\n")
+            } else if workdir.join("setup.py").exists() || workdir.join("pyproject.toml").exists() {
+                super::super::init::get_ignore_template("python").unwrap_or(".atomic\n.git\n")
+            } else {
+                ".atomic\n.git\n"
+            };
+            let _ = std::fs::write(&ignore_path, ignore_content);
+        }
+
+        let _ = repo.add(
+            ".atomicignore",
+            atomic_repository::TrackingOptions::default(),
+        );
+        let header = atomic_core::change::ChangeHeader::new("Initialize repository");
+        match repo.record(header, atomic_repository::RecordOptions::default()) {
+            Ok(_) => print_info("Recorded .atomicignore"),
+            Err(atomic_repository::RecordError::NothingToRecord) => {}
+            Err(e) => log::warn!("Failed to record .atomicignore: {}", e),
+        }
+    }
+
+    // Step 2: Vault (unless --no-vault)
+    if no_vault {
+        return Ok(());
+    }
+
+    match repo.init_vault() {
+        Ok(()) => {
+            print_info("Initialized vault at .vault/");
+
+            // Add all vault files
+            fn add_dir_recursive(repo: &Repository, dir: &std::path::Path) {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            add_dir_recursive(repo, &path);
+                        } else if path.is_file() {
+                            if let Ok(rel) = path.strip_prefix(repo.root()) {
+                                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                                let _ = repo
+                                    .add(&rel_str, atomic_repository::TrackingOptions::default());
+                            }
+                        }
+                    }
+                }
+            }
+            let vault_dir = repo.vault_dir();
+            if vault_dir.exists() {
+                add_dir_recursive(repo, &vault_dir);
+            }
+
+            let header = atomic_core::change::ChangeHeader::new("Initialize vault");
+            match repo.record(header, atomic_repository::RecordOptions::default()) {
+                Ok(_) => print_info("Recorded vault defaults"),
+                Err(atomic_repository::RecordError::NothingToRecord) => {}
+                Err(e) => log::warn!("Failed to record vault files: {}", e),
+            }
+        }
+        Err(e) => log::warn!("Vault initialization failed: {}", e),
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

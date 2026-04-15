@@ -89,6 +89,7 @@
 pub mod delete;
 pub mod list;
 pub mod new;
+pub mod promote;
 pub mod switch;
 
 use clap::Subcommand;
@@ -96,6 +97,7 @@ use clap::Subcommand;
 pub use delete::Delete;
 pub use list::List;
 pub use new::New;
+pub use promote::Promote;
 pub use switch::Switch;
 
 use crate::commands::Command;
@@ -109,6 +111,18 @@ use crate::error::CliResult;
 /// perspectives on the same underlying graph rather than divergent histories.
 #[derive(Subcommand, Debug)]
 pub enum ViewCommands {
+    /// Promote a view to shared root scope.
+    ///
+    /// Changes the view to Shared with no parent, enabling fast status.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic view promote
+    /// atomic view promote master
+    /// ```
+    Promote(Promote),
+
     /// Create a new view.
     ///
     /// Creates a new view, optionally based on the current view's state.
@@ -186,6 +200,7 @@ impl Command for View {
             ViewCommands::Switch(cmd) => cmd.run(),
             ViewCommands::Delete(cmd) => cmd.run(),
             ViewCommands::List(cmd) => cmd.run(),
+            ViewCommands::Promote(cmd) => cmd.run(),
         }
     }
 }

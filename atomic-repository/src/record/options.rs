@@ -360,7 +360,7 @@ impl Default for RecordOptions {
             metadata_bytes: Vec::new(),
             max_file_size: Self::DEFAULT_MAX_FILE_SIZE,
             skip_binary: false,
-            record_empty_files: false,
+            record_empty_files: true,
             context_lines: Self::DEFAULT_CONTEXT_LINES,
             view: None,
             message: None,

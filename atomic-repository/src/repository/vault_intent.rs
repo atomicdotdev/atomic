@@ -3,6 +3,11 @@
 //! Intents are units of work (like JIRA issues) with auto-generated
 //! IDs in the format PREFIX-N (e.g., "PIMO-1", "ATOM-42").
 //! The prefix is derived from the project directory name.
+//!
+//! The intent scaffold template lives at `atomic-repository/vault/templates/intent.md`.
+
+/// Intent scaffold template. `{{title}}` is replaced with the actual title.
+const INTENT_TEMPLATE: &str = include_str!("../../vault/templates/intent.md");
 
 use super::*;
 use atomic_core::pristine::vault::{IntentSummary, VaultEntry, VaultEntryType, VaultManifest};
@@ -175,11 +180,13 @@ impl Repository {
 
         let frontmatter_json = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
 
-        // Build scaffold content
-        let content = format!(
-            "# {}\n\n## Context\n\n(Describe the problem or feature here)\n\n## Acceptance Criteria\n\n- [ ] (First criterion)\n\n## Notes\n\n",
-            options.title
-        );
+        // Build scaffold content from template — fill in all placeholders
+        let content = INTENT_TEMPLATE
+            .replace("{{title}}", &options.title)
+            .replace("{{id}}", &intent_id)
+            .replace("{{priority}}", &priority)
+            .replace("{{created_by}}", &identity.to_string())
+            .replace("{{created_at}}", &now);
 
         // Store in vault
         self.vault_store(

@@ -38,6 +38,7 @@
 //! }
 //! ```
 
+pub mod cpp;
 pub mod go;
 pub mod java;
 pub mod python;
@@ -67,6 +68,10 @@ pub enum Language {
     Go,
     /// Java (.java)
     Java,
+    /// C++ (.cpp, .cc, .cxx, .hpp, .hxx, .h)
+    Cpp,
+    /// C (.c)
+    C,
 }
 
 impl Language {
@@ -88,6 +93,18 @@ impl Language {
             Some(Language::Go)
         } else if lower.ends_with(".java") {
             Some(Language::Java)
+        } else if lower.ends_with(".cpp")
+            || lower.ends_with(".cc")
+            || lower.ends_with(".cxx")
+            || lower.ends_with(".hpp")
+            || lower.ends_with(".hxx")
+        {
+            Some(Language::Cpp)
+        } else if lower.ends_with(".h") {
+            // .h could be C or C++ — default to C++ as it's a superset
+            Some(Language::Cpp)
+        } else if lower.ends_with(".c") {
+            Some(Language::C)
         } else {
             None
         }
@@ -102,6 +119,8 @@ impl Language {
             Language::Rust => "Rust",
             Language::Go => "Go",
             Language::Java => "Java",
+            Language::Cpp => "C++",
+            Language::C => "C",
         }
     }
 
@@ -114,6 +133,8 @@ impl Language {
             Language::Rust => &[".rs"],
             Language::Go => &[".go"],
             Language::Java => &[".java"],
+            Language::Cpp => &[".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".h"],
+            Language::C => &[".c"],
         }
     }
 }
@@ -131,7 +152,8 @@ pub fn is_supported(path: &str) -> bool {
 
 /// All supported file extensions across all languages.
 pub const ALL_EXTENSIONS: &[&str] = &[
-    ".ts", ".mts", ".cts", ".tsx", ".py", ".pyi", ".rs", ".go", ".java",
+    ".ts", ".mts", ".cts", ".tsx", ".py", ".pyi", ".rs", ".go", ".java", ".cpp", ".cc", ".cxx",
+    ".hpp", ".hxx", ".h", ".c",
 ];
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -234,6 +256,8 @@ impl ParserRegistry {
         parsers.insert(Language::Rust, Box::new(rust::RustParser::new()));
         parsers.insert(Language::Go, Box::new(go::GoParser::new()));
         parsers.insert(Language::Java, Box::new(java::JavaParser::new()));
+        parsers.insert(Language::Cpp, Box::new(cpp::CppParser::new()));
+        parsers.insert(Language::C, Box::new(cpp::CppParser::new_c()));
 
         Self { parsers }
     }
@@ -364,6 +388,22 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_cpp() {
+        assert_eq!(Language::detect("main.cpp"), Some(Language::Cpp));
+        assert_eq!(Language::detect("lib.cc"), Some(Language::Cpp));
+        assert_eq!(Language::detect("util.cxx"), Some(Language::Cpp));
+        assert_eq!(Language::detect("header.hpp"), Some(Language::Cpp));
+        assert_eq!(Language::detect("header.hxx"), Some(Language::Cpp));
+        assert_eq!(Language::detect("header.h"), Some(Language::Cpp));
+    }
+
+    #[test]
+    fn test_detect_c() {
+        assert_eq!(Language::detect("main.c"), Some(Language::C));
+        assert_eq!(Language::detect("src/util.c"), Some(Language::C));
+    }
+
+    #[test]
     fn test_detect_unsupported() {
         assert_eq!(Language::detect("README.md"), None);
         assert_eq!(Language::detect("Cargo.toml"), None);
@@ -386,6 +426,9 @@ mod tests {
         assert!(is_supported("main.rs"));
         assert!(is_supported("main.go"));
         assert!(is_supported("Main.java"));
+        assert!(is_supported("main.cpp"));
+        assert!(is_supported("main.c"));
+        assert!(is_supported("header.h"));
         assert!(!is_supported("README.md"));
     }
 
@@ -399,6 +442,8 @@ mod tests {
         assert_eq!(Language::Rust.name(), "Rust");
         assert_eq!(Language::Go.name(), "Go");
         assert_eq!(Language::Java.name(), "Java");
+        assert_eq!(Language::Cpp.name(), "C++");
+        assert_eq!(Language::C.name(), "C");
     }
 
     #[test]
@@ -408,6 +453,8 @@ mod tests {
         assert!(Language::Rust.extensions().contains(&".rs"));
         assert!(Language::Go.extensions().contains(&".go"));
         assert!(Language::Java.extensions().contains(&".java"));
+        assert!(Language::Cpp.extensions().contains(&".cpp"));
+        assert!(Language::C.extensions().contains(&".c"));
     }
 
     #[test]
@@ -428,7 +475,9 @@ mod tests {
         assert!(langs.contains(&Language::Rust));
         assert!(langs.contains(&Language::Go));
         assert!(langs.contains(&Language::Java));
-        assert_eq!(langs.len(), 6);
+        assert!(langs.contains(&Language::Cpp));
+        assert!(langs.contains(&Language::C));
+        assert_eq!(langs.len(), 8);
     }
 
     #[test]
@@ -439,6 +488,8 @@ mod tests {
         assert!(registry.is_supported("main.rs"));
         assert!(registry.is_supported("main.go"));
         assert!(registry.is_supported("Main.java"));
+        assert!(registry.is_supported("main.cpp"));
+        assert!(registry.is_supported("main.c"));
         assert!(!registry.is_supported("README.md"));
     }
 
@@ -453,6 +504,8 @@ mod tests {
         assert_eq!(registry.detect_language("lib.rs"), Some(Language::Rust));
         assert_eq!(registry.detect_language("main.go"), Some(Language::Go));
         assert_eq!(registry.detect_language("App.java"), Some(Language::Java));
+        assert_eq!(registry.detect_language("main.cpp"), Some(Language::Cpp));
+        assert_eq!(registry.detect_language("util.c"), Some(Language::C));
         assert_eq!(registry.detect_language("style.css"), None);
     }
 
@@ -543,7 +596,15 @@ mod tests {
     #[test]
     fn test_extract_empty_source() {
         let mut registry = ParserRegistry::new();
-        for path in &["empty.ts", "empty.py", "empty.rs", "empty.go", "Empty.java"] {
+        for path in &[
+            "empty.ts",
+            "empty.py",
+            "empty.rs",
+            "empty.go",
+            "Empty.java",
+            "empty.cpp",
+            "empty.c",
+        ] {
             let entities = registry.extract(path, "");
             assert!(
                 entities.is_empty(),

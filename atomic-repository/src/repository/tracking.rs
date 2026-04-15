@@ -115,6 +115,88 @@ impl Repository {
         Ok(stats)
     }
 
+    /// Add multiple files to tracking in a single write transaction.
+    ///
+    /// This is much faster than calling `add()` in a loop because it avoids
+    /// opening a separate write transaction (and fsync) for each file.
+    /// For git import of a commit adding 20 files, this reduces from 20
+    /// fsyncs to 1.
+    ///
+    /// # Arguments
+    ///
+    /// * `paths` - Paths to add (relative to repository root)
+    ///
+    /// # Returns
+    ///
+    /// Number of files actually added (skips already-tracked files).
+    pub fn add_batch(&self, paths: &[&str]) -> Result<usize, RepositoryError> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut count = 0usize;
+        for path in paths {
+            let normalized = normalize_path(Path::new(path));
+            if is_tracked(&txn, &normalized)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                continue;
+            }
+            add_to_tree(&mut txn, &normalized, false)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            count += 1;
+        }
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(count)
+    }
+
+    /// Remove multiple files from tracking in a single write transaction.
+    ///
+    /// This is much faster than calling `remove()` in a loop because it
+    /// avoids a separate write transaction (and fsync) for each file.
+    ///
+    /// # Arguments
+    ///
+    /// * `paths` - Paths to remove (relative to repository root)
+    ///
+    /// # Returns
+    ///
+    /// Number of files actually removed.
+    pub fn remove_batch(&self, paths: &[&str]) -> Result<usize, RepositoryError> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut count = 0usize;
+        for path in paths {
+            let normalized = normalize_path(Path::new(path));
+            if remove_from_tree(&mut txn, &normalized)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .is_some()
+            {
+                count += 1;
+            }
+        }
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(count)
+    }
+
     /// Add an empty directory to tracking explicitly.
     ///
     /// Unlike `add()` which only tracks files (directories are created implicitly),
@@ -457,6 +539,35 @@ impl Repository {
         Ok(())
     }
 
+    /// Remove multiple files from the FILE_INDEX in a single write transaction.
+    ///
+    /// This is much faster than calling `del_file_index()` in a loop because
+    /// it avoids a separate write transaction (and fsync) for each file.
+    ///
+    /// # Arguments
+    ///
+    /// * `paths` - Paths to remove from the index
+    pub fn del_file_index_batch(&self, paths: &[&str]) -> Result<(), RepositoryError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        for path in paths {
+            let normalized = path.replace('\\', "/");
+            let _ = txn.del_file_index(&normalized);
+        }
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Store mtime + size + content hash for a batch of files in a single transaction.
     ///
     /// This populates the file index so that `status` can compare
@@ -492,6 +603,67 @@ impl Repository {
         Ok(())
     }
 
+    /// Rebuild the FILE_INDEX from the current working copy.
+    ///
+    /// Walks every tracked file, stats it on disk, hashes its content,
+    /// and stores (mtime, size, content_hash) in the FILE_INDEX.  After
+    /// this call, `status` can use the fast stat-comparison path instead
+    /// of reconstructing graph content for every file.
+    ///
+    /// This is essential after `git import` where `restore_from_git`
+    /// resets all file mtimes, invalidating any FILE_INDEX entries
+    /// written during batch processing.
+    ///
+    /// # Returns
+    ///
+    /// The number of files indexed.
+    pub fn reindex_working_copy(&self) -> Result<usize, RepositoryError> {
+        use std::time::SystemTime;
+
+        let tracked = self.list_tracked_files().unwrap_or_default();
+        let repo_root = self.root.clone();
+
+        let mut entries: Vec<(String, i64, u32, u64, Hash)> = Vec::with_capacity(tracked.len());
+
+        for file in &tracked {
+            let abs = repo_root.join(&file.path);
+            if !abs.exists() || abs.is_dir() {
+                continue;
+            }
+
+            let metadata = match std::fs::metadata(&abs) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let duration = mtime
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = duration.as_secs() as i64;
+            let nanos = duration.subsec_nanos();
+            let size = metadata.len();
+
+            let content_hash = match std::fs::read(&abs) {
+                Ok(bytes) => Hash::of(&bytes),
+                Err(_) => continue,
+            };
+
+            let path_str = file.path.to_string_lossy().replace('\\', "/");
+            entries.push((path_str, secs, nanos, size, content_hash));
+        }
+
+        let count = entries.len();
+
+        // Write in batches of 5000 to avoid holding the write txn too long
+        for chunk in entries.chunks(5000) {
+            self.update_file_index(chunk)?;
+        }
+
+        Ok(count)
+    }
+
+    /// List tracked files under a given path prefix.
     /// Get all tracked files under a directory prefix.
     ///
     /// # Arguments
