@@ -72,19 +72,19 @@ $ atomic agent attest
 Total: $0.12 · 3 changes covered · 20.5k tokens
 ```
 
-### Stacks, Not Branches
+### Views, Not Branches
 
-Agents work on isolated stacks — lightweight views of the same underlying graph. No branch divergence, no merge commits, no orphaned history.
+Agents work on isolated views of the same underlying graph. No branch divergence, no merge commits, no orphaned history.
 
 ```bash
 # Agent session creates an isolated stack automatically
 # Stack: agent-ses_3781fc7a6ffet5c6r1ILy1BEbv (Local, parent: dev)
 
 # When done, apply changes to the parent stack
-atomic apply @~1 --to dev
+atomic insert @~1 --to dev
 
 # Delete the agent stack — cascade-deletes its edges, zero orphans
-atomic stack delete agent-ses_3781fc7a6ffet5c6r1ILy1BEbv
+atomic view delete agent-ses_3781fc7a6ffet5c6r1ILy1BEbv
 ```
 
 ### Token-Level Diff
