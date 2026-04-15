@@ -437,7 +437,7 @@ impl Command for PlanExec {
 /// # Architecture
 ///
 /// 1. **Tokenize** the question → extract meaningful search terms
-/// 2. **KG search** per term → collect results, bucket into HashMap<kind, Vec<Node>>
+/// 2. **KG search** per term → collect results, bucket into `HashMap<kind, Vec<Node>>`
 /// 3. **Grep source files** for the search terms with surrounding context lines
 /// 4. **Build structured prompt** with KG structure + grep'd source context
 /// 5. **Send to LLM** for synthesis

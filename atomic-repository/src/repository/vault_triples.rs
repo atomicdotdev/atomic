@@ -25,7 +25,7 @@ impl Repository {
     /// Extract KG nodes and edges from a vault entry.
     ///
     /// Returns `(Vec<KgNode>, Vec<KgEdge>)`. Does **not** store them —
-    /// call [`vault_store_kg`] for persistence.
+    /// call `vault_store_kg` for persistence.
     pub fn vault_extract_kg(
         &self,
         path: &str,

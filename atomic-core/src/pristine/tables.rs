@@ -517,19 +517,19 @@ pub const KG_NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("kg_node
 /// Value: postcard-serialized KgEdge
 pub const KG_EDGES: TableDefinition<&str, &[u8]> = TableDefinition::new("kg_edges");
 
-/// KG edge index by source: from_id → [edge_key] (multimap)
+/// KG edge index by source: from_id → \[edge_key\] (multimap)
 ///
 /// Enables efficient "outgoing edges from node X" queries.
 pub const KG_EDGES_FROM: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("kg_edges_from");
 
-/// KG edge index by target: to_id → [edge_key] (multimap)
+/// KG edge index by target: to_id → \[edge_key\] (multimap)
 ///
 /// Enables efficient "incoming edges to node X" queries.
 pub const KG_EDGES_TO: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("kg_edges_to");
 
-/// KG full-text search inverted index: token → [node_id] (multimap)
+/// KG full-text search inverted index: token → \[node_id\] (multimap)
 ///
 /// Simple inverted index for keyword search over node labels and summaries.
 /// Tokens are lowercase, alphanumeric words extracted from label + summary.
