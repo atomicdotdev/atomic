@@ -18,7 +18,7 @@ fn test_options_new_returns_defaults() {
     assert_eq!(opts.default_encoding(), Encoding::Utf8);
     assert_eq!(opts.max_file_size(), RecordOptions::DEFAULT_MAX_FILE_SIZE);
     assert!(!opts.skip_binary());
-    assert!(!opts.get_record_empty_files());
+    assert!(opts.get_record_empty_files());
     assert_eq!(
         opts.get_context_lines(),
         RecordOptions::DEFAULT_CONTEXT_LINES

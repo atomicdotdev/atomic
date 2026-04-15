@@ -1318,13 +1318,21 @@ mod tests {
             "config.toml should be deleted"
         );
 
-        // Verify lib.rs is clean (unchanged)
-        let clean_paths: Vec<_> = status.clean().map(|e| e.path().to_path_buf()).collect();
+        // Verify lib.rs is clean (unchanged).
+        // Note: status() is an exception-reporter — clean files are omitted
+        // for performance, so their absence from all non-clean lists is the
+        // correct way to verify cleanliness.
         assert!(
-            clean_paths
+            !modified_paths
                 .iter()
                 .any(|p| p.to_string_lossy().contains("lib.rs")),
-            "src/lib.rs should be clean (unchanged)"
+            "src/lib.rs should not be modified (unchanged)"
+        );
+        assert!(
+            !deleted_paths
+                .iter()
+                .any(|p| p.to_string_lossy().contains("lib.rs")),
+            "src/lib.rs should not be deleted (unchanged)"
         );
 
         // Drop the repository to release the database lock before running more diff commands

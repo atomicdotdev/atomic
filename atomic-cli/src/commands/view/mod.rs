@@ -220,6 +220,7 @@ mod tests {
                 ViewCommands::Switch(_) => "switch",
                 ViewCommands::Delete(_) => "delete",
                 ViewCommands::List(_) => "list",
+                ViewCommands::Promote(_) => "promote",
             }
         }
 
@@ -229,9 +230,12 @@ mod tests {
         let delete = Delete::default();
         let list = List::default();
 
+        let promote = Promote { name: None };
+
         assert_eq!(check_variant(&ViewCommands::Create(new)), "create");
         assert_eq!(check_variant(&ViewCommands::Switch(switch)), "switch");
         assert_eq!(check_variant(&ViewCommands::Delete(delete)), "delete");
         assert_eq!(check_variant(&ViewCommands::List(list)), "list");
+        assert_eq!(check_variant(&ViewCommands::Promote(promote)), "promote");
     }
 }

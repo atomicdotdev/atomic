@@ -249,6 +249,7 @@ mod tests {
         // Ensure all variants exist and can be matched
         fn check_variant(cmd: &VaultCommands) -> &'static str {
             match cmd {
+                VaultCommands::Init(_) => "init",
                 VaultCommands::Show(_) => "show",
                 VaultCommands::List(_) => "list",
                 VaultCommands::Materialize(_) => "materialize",
@@ -263,6 +264,7 @@ mod tests {
 
         // Verify variant name extraction works for each variant name string
         let names = [
+            "init",
             "show",
             "list",
             "materialize",
@@ -273,6 +275,6 @@ mod tests {
             "summaries",
             "query",
         ];
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 10);
     }
 }
