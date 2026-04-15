@@ -1022,19 +1022,22 @@ mod tests {
         assert!(tokens.contains(&"authentication".to_string()));
         assert!(tokens.contains(&"bug".to_string()));
         assert!(tokens.contains(&"auth".to_string()));
-        assert!(tokens.contains(&"rs".to_string()));
-        // Single char "in" is >= 2 chars, so it's included
-        assert!(tokens.contains(&"in".to_string()));
+        // "rs" and "in" are < 3 chars, filtered out
+        assert!(!tokens.contains(&"rs".to_string()));
+        assert!(!tokens.contains(&"in".to_string()));
     }
 
     #[test]
     fn test_tokenize_for_fts_filters_short() {
         let tokens = tokenize_for_fts("I a am the one");
-        // "I" and "a" are < 2 chars, filtered out
+        // "I", "a", and "am" are < 3 chars, filtered out
         assert!(!tokens.contains(&"i".to_string()));
         assert!(!tokens.contains(&"a".to_string()));
-        assert!(tokens.contains(&"am".to_string()));
-        assert!(tokens.contains(&"the".to_string()));
+        assert!(!tokens.contains(&"am".to_string()));
+        // "the" is a stop word, filtered out
+        assert!(!tokens.contains(&"the".to_string()));
+        // "one" is 3 chars and not a stop word
+        assert!(tokens.contains(&"one".to_string()));
     }
 
     #[test]
