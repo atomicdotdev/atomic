@@ -678,7 +678,7 @@ impl Repository {
 
         // Auto-enrich KG with the new change (best-effort)
         if outcome.was_saved() {
-            let hash = outcome.hash().clone();
+            let hash = *outcome.hash();
             if let Err(e) = self.kg_enrich_change(&hash) {
                 log::debug!("KG enrich for change: {}", e);
             }

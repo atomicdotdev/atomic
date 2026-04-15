@@ -229,10 +229,7 @@ impl<'a> KgMutTxnT for WriteTxn<'a> {
         // deleted nodes so they're filtered out at query time. A full reindex
         // cleans them up.
 
-        let result = match table.remove(id)? {
-            Some(_) => true,
-            None => false,
-        };
+        let result = table.remove(id)?.is_some();
         drop(table);
         Ok(result)
     }

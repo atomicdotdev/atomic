@@ -206,8 +206,7 @@ fn chunk_by_heading(content: &str, max_tokens: usize) -> Vec<TextChunk> {
 
     for (line_idx, line) in content.lines().enumerate() {
         // Check if this line is a heading
-        let is_heading =
-            line.starts_with('#') && line.chars().skip_while(|&c| c == '#').next() == Some(' ');
+        let is_heading = line.starts_with('#') && line.chars().find(|&c| c != '#') == Some(' ');
 
         if is_heading && !current_text.is_empty() {
             // Flush current chunk

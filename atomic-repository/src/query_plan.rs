@@ -210,7 +210,7 @@ pub fn execute_plan(repo: &Repository, plan: &QueryPlan) -> Result<PlanResult, R
                 // Use the resolved embedding provider
                 let provider = crate::ai::resolve_embedding_provider();
                 let query_vec = provider
-                    .embed_sync(&[query.clone()])
+                    .embed_sync(std::slice::from_ref(query))
                     .ok()
                     .and_then(|v| v.into_iter().next())
                     .unwrap_or_else(|| crate::hash_embed(query, provider.dimensions));

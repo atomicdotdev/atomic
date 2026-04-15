@@ -496,8 +496,8 @@ where
                 stack.push(dest_node);
 
                 // Collect non-root, non-inode content vertices
-                if !dest_node.change.is_root()
-                    && !(dest_node.start == dest_node.end && dest_node.start == inode_pos.pos)
+                if !(dest_node.change.is_root()
+                    || (dest_node.start == dest_node.end && dest_node.start == inode_pos.pos))
                 {
                     content_vertices.push(dest_node);
                 }

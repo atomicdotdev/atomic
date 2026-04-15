@@ -688,11 +688,10 @@ impl VaultTxnT for ReadTxn {
             Err(e) => return Err(PristineError::from(e)),
         };
 
-        let result = match table.get("manifest")? {
+        match table.get("manifest")? {
             Some(_) => Ok(true),
             None => Ok(false),
-        };
-        result
+        }
     }
 }
 

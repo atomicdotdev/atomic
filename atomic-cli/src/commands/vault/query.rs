@@ -896,7 +896,7 @@ fn extract_search_terms(question: &str) -> Vec<String> {
 
     // Individual keywords (most specific first — longer words)
     let mut sorted_words = words.clone();
-    sorted_words.sort_by(|a, b| b.len().cmp(&a.len()));
+    sorted_words.sort_by_key(|b| std::cmp::Reverse(b.len()));
     sorted_words.dedup();
     for word in &sorted_words {
         terms.push(word.clone());

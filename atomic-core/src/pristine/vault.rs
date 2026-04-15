@@ -31,15 +31,23 @@ impl VaultEntryType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
+        s.parse().ok()
+    }
+}
+
+impl std::str::FromStr for VaultEntryType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "session" => Some(Self::Session),
-            "tool_result" => Some(Self::ToolResult),
-            "memory" => Some(Self::Memory),
-            "intent" => Some(Self::Intent),
-            "skill" => Some(Self::Skill),
-            "scratch" => Some(Self::Scratch),
-            _ => None,
+            "session" => Ok(Self::Session),
+            "tool_result" => Ok(Self::ToolResult),
+            "memory" => Ok(Self::Memory),
+            "intent" => Ok(Self::Intent),
+            "skill" => Ok(Self::Skill),
+            "scratch" => Ok(Self::Scratch),
+            _ => Err(format!("unknown vault entry type: {s}")),
         }
     }
 }
@@ -481,10 +489,10 @@ mod tests {
         for (ty, expected_str) in &types {
             assert_eq!(ty.as_str(), *expected_str);
             assert_eq!(ty.to_string(), *expected_str);
-            assert_eq!(VaultEntryType::from_str(expected_str), Some(*ty));
+            assert_eq!(VaultEntryType::parse(expected_str), Some(*ty));
         }
 
-        assert_eq!(VaultEntryType::from_str("unknown"), None);
+        assert_eq!(VaultEntryType::parse("unknown"), None);
     }
 
     #[test]

@@ -20,16 +20,21 @@ impl Repository {
     ///
     /// Returns statistics about the number of nodes and edges created.
     pub fn kg_enrich_from_vcs(&self) -> Result<KgEnrichStats, RepositoryError> {
-        let mut stats = KgEnrichStats::default();
-
         // Phase 1: Views → nodes + parent edges
-        stats.views = self.kg_enrich_views()?;
+        let views = self.kg_enrich_views()?;
 
         // Phase 2: Tracked files → nodes
-        stats.files = self.kg_enrich_files()?;
+        let files = self.kg_enrich_files()?;
 
         // Phase 3: Changes → nodes + edges (modifies, authored_by, on_view, depends_on)
-        stats.changes = self.kg_enrich_changes()?;
+        let changes = self.kg_enrich_changes()?;
+
+        let mut stats = KgEnrichStats {
+            views,
+            files,
+            changes,
+            ..Default::default()
+        };
 
         // Phase 4: AST entities → nodes + DEFINES edges
         #[cfg(feature = "ast")]

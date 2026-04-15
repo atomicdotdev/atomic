@@ -884,10 +884,9 @@ fn infer_entry_type(path: &str) -> VaultEntryType {
         VaultEntryType::Skill
     } else if path.starts_with("intents/") {
         VaultEntryType::Intent
-    } else if path.starts_with("scratch/") {
-        VaultEntryType::Scratch
     } else {
-        VaultEntryType::Scratch // default for unknown paths
+        // scratch/ prefix or any unknown path
+        VaultEntryType::Scratch
     }
 }
 
