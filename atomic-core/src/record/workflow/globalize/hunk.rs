@@ -195,7 +195,7 @@ where
 
     let deletion = EdgeUpdate {
         edges: deletion_edges,
-        inode: position_to_option_hash(inode_pos),
+        inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
     };
 
     let insertion = create_content_vertex(ctx, inode, inode_pos, vec![inode_pos], vec![], content)?;
@@ -238,7 +238,7 @@ where
             let deletion_edges = build_deletion_edges(ctx, &global_vertices)?;
             EdgeUpdate {
                 edges: deletion_edges,
-                inode: position_to_option_hash(inode_pos),
+                inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
             }
         }
     };
@@ -281,7 +281,7 @@ where
 
     Ok(EdgeUpdate {
         edges: deletion_edges,
-        inode: position_to_option_hash(inode_pos),
+        inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
     })
 }
 

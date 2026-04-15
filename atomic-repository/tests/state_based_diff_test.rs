@@ -375,19 +375,36 @@ fn test_empty_file() {
     repo.add("empty.txt", Default::default())
         .expect("Failed to add empty file");
 
-    // Attempting to record should fail with NothingToRecord
-    // because empty files have no content changes to record
+    // With the default options (record_empty_files: true), recording an
+    // empty file should succeed — the change captures the file's existence
+    // even though it has no content bytes.
     let header = ChangeHeader::builder()
         .message("Add empty file")
         .author(Author::new("Test", Some("test@example.com")))
         .build();
 
     let result = repo.record(header, RecordOptions::default());
-
-    // Empty files should result in NothingToRecord error
     assert!(
-        result.is_err(),
-        "Recording empty file should fail with NothingToRecord"
+        result.is_ok(),
+        "Recording empty file should succeed with record_empty_files=true (default)"
+    );
+
+    // With record_empty_files explicitly disabled, recording an empty file
+    // should fail with NothingToRecord because there are no content changes.
+    let file_path2 = repo_path.join("empty2.txt");
+    fs::write(&file_path2, "").expect("Failed to write empty file");
+    repo.add("empty2.txt", Default::default())
+        .expect("Failed to add empty file");
+
+    let header2 = ChangeHeader::builder()
+        .message("Add another empty file")
+        .author(Author::new("Test", Some("test@example.com")))
+        .build();
+
+    let result2 = repo.record(header2, RecordOptions::default().record_empty_files(false));
+    assert!(
+        result2.is_err(),
+        "Recording empty file should fail with record_empty_files=false"
     );
 }
 

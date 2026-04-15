@@ -625,6 +625,7 @@ fn add_vault_files_recursive(repo: &Repository, dir: &std::path::Path) -> CliRes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     // -------------------------------------------------------------------------
@@ -998,6 +999,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_path_relative() {
         let temp = TempDir::new().unwrap();
         let original_dir = std::env::current_dir().unwrap();
@@ -1013,6 +1015,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_path_dot() {
         let temp = TempDir::new().unwrap();
         let original_dir = std::env::current_dir().unwrap();

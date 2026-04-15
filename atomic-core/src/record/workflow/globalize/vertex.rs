@@ -169,7 +169,7 @@ where
         flag: EdgeFlags::BLOCK,
         start,
         end,
-        inode: position_to_option_hash(inode_pos),
+        inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
     })
 }
 
@@ -230,6 +230,6 @@ where
 
     Ok(EdgeUpdate {
         edges,
-        inode: position_to_option_hash(inode_pos),
+        inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
     })
 }
