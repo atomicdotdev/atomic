@@ -91,6 +91,84 @@ atomic stack delete agent-ses_3781fc7a6ffet5c6r1ILy1BEbv
 
 Atomic's CRDT semantic layer (Trunk → Branch → Leaf) tracks changes at the token level. Two agents editing different words on the same line produce independent patches that merge cleanly — Git would flag this as a conflict.
 
+### Vault — Shared Project Brain
+
+Every repository has a **vault** — a versioned knowledge store that persists what your team and your agents learn across sessions. Goals, decisions, architecture context, and working memory all live in `.vault/` as structured markdown with cryptographic provenance.
+
+```bash
+# Initialize the vault in your repo
+atomic vault init
+
+# Start a goal (a focused work session — human or agent)
+atomic vault goal start --intent PIMO-3 --title "Fix token validation"
+
+# Agents and humans accumulate tool results, decisions, and context
+# When done, stop the goal — optionally promote it for team review
+atomic vault goal stop --promote
+
+# Add persistent project knowledge (conventions, architecture, etc.)
+atomic vault memory add "Auth tokens use Ed25519 signatures, never HMAC"
+
+# Track planned work items
+atomic vault intent add --title "Migrate to async runtime" --priority high
+```
+
+The vault stores five kinds of content:
+
+| Entry Type | What It Captures |
+|------------|------------------|
+| **Goals** | Work sessions — each tracks a developer/agent, linked intent, model, status, and tool results |
+| **Intents** | Planned work items with priority, status, assignee, and labels |
+| **Memory** | Persistent knowledge — architecture decisions, conventions, reference material |
+| **Skills** | Reusable capability definitions for agents |
+| **Scratch** | Temporary notes and working state |
+
+Everything is content-addressed and version-controlled. When an agent starts a session, it reads the vault for context. When it finishes, its learnings go back into the vault for the next session — human or machine.
+
+### Knowledge Graph Queries with LLM Assist
+
+The vault builds a **knowledge graph** from your repository's version control data — changes, files, views, code entities, and their relationships. You can search it directly, explore neighborhoods, or ask natural-language questions that get answered by an LLM grounded in your actual codebase.
+
+```bash
+# Ask a question about your project — RAG-powered, grounded in your KG
+atomic vault query ask "who fixed the auth bug?"
+
+# Search the knowledge graph directly
+atomic vault query search "payment service"
+
+# Explore relationships around a node (1-2 hops)
+atomic vault query neighbors "file:src/auth.rs"
+```
+
+When you run `ask`, Atomic executes a six-step RAG pipeline:
+
+```
+Question: "who fixed the auth bug?"
+  │
+  ├─ 1. Tokenize     → extract keywords + bigrams
+  ├─ 2. KG Search    → find matching nodes (changes, files, entities)
+  ├─ 3. File Paths   → collect source files from matched nodes
+  ├─ 4. Grep Source   → search source files for terms with context
+  ├─ 5. Build Prompt  → KG nodes + edges + source snippets
+  └─ 6. LLM Call      → synthesize answer grounded in real data
+
+Answer: "The token validation bug in src/auth.rs was fixed by
+        @alice in change XMJZ3IPF on Jan 15. The change modified
+        verify_token() to check expiration before signature..."
+```
+
+The knowledge graph contains nodes for changes, files, code entities (functions, structs), and views — connected by edges like `modifies`, `authored_by`, `depends_on`, and `defines`. The LLM sees real KG relationships and source code, not hallucinated context.
+
+For programmatic or agent use, structured query plans let you chain KG search, graph traversal, vector search, and content reads in a single JSON document — the LLM emits ~100 tokens of query plan, the executor runs it for free against the local database, and only the compact results go back.
+
+```bash
+# Execute a structured query plan (from stdin or an agent)
+echo '{"steps":[{"type":"kg_search","query":"auth","limit":5,"bind":"r"}]}' \
+  | atomic vault query plan
+```
+
+No API key required for search and graph exploration. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` to enable LLM-assisted answers.
+
 ## Quick Start
 
 ```bash
@@ -200,6 +278,29 @@ Every change stores two parallel representations:
 | `atomic agent status` | Show active sessions and hook status |
 | `atomic agent explain <id>` | Generate AI reasoning summary for a session |
 | `atomic agent attest` | List and inspect attestations |
+
+### Vault Commands
+
+| Command | Description |
+|---------|-------------|
+| `atomic vault init` | Initialize the vault in an existing repository |
+| `atomic vault goal start` | Start a new goal (work session) |
+| `atomic vault goal stop` | End the current goal (`--promote` for team review) |
+| `atomic vault goal list` | List goals |
+| `atomic vault intent add` | Create a planned work item |
+| `atomic vault intent list` | List intents |
+| `atomic vault memory add` | Add persistent project knowledge |
+| `atomic vault memory list` | List memory entries |
+| `atomic vault list` | List all vault entries (filter with `--type`) |
+| `atomic vault show <path>` | Print a vault entry's content |
+| `atomic vault sync` | Sync vault entries between disk and database |
+| `atomic vault query search <query>` | Keyword search over the knowledge graph |
+| `atomic vault query neighbors <id>` | Explore the graph around a node |
+| `atomic vault query ask <question>` | Natural-language Q&A with LLM assist |
+| `atomic vault query plan` | Execute a structured JSON query plan |
+| `atomic vault query embed` | Rebuild vector embeddings |
+| `atomic vault query enrich` | Rebuild KG from VCS data |
+| `atomic vault query reindex` | Rebuild KG index from vault entries |
 
 #### Supported Agents
 
