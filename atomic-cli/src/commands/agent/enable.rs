@@ -195,23 +195,12 @@ impl Command for Enable {
                 Ok(count) => {
                     if count > 0 {
                         print_success(&format!(
-                            "Installed {} file{} for {}",
+                            "Installed {} hook{} for {}",
                             count,
                             if count == 1 { "" } else { "s" },
                             agent.display_name(),
                         ));
                         total_installed += count;
-
-                        // OpenCode gets vault integration — show details
-                        if *agent_name == "opencode" && count > 1 {
-                            println!("  • Hooks plugin (.opencode/plugins/atomic/)");
-                            println!(
-                                "  • 3 skills (atomic-vault, code-intelligence, atomic-record)"
-                            );
-                            println!("  • 20 custom tools (vault, kg, vcs)");
-                            println!("  • Atomic agent (.opencode/agents/atomic.md)");
-                            println!("  • Config (opencode.json)");
-                        }
                     } else {
                         println!(
                             "  ✓ already up to date for {}. Use --force to reinstall.",
@@ -239,9 +228,8 @@ impl Command for Enable {
             println!("  • Optional transcript (full conversation)");
             if has_opencode {
                 println!();
-                println!("OpenCode vault integration is ready:");
-                println!("  Run 'opencode' and press Tab to switch to the Atomic agent.");
-                println!("  The agent knows your vault workflow — intents, goals, views, KG.");
+                println!("For the full OpenCode integration (agent, skills, provenance):");
+                println!("  npm install -g atomic-opencode && npx atomic-opencode");
             }
             println!();
             println!("Use 'atomic agent status' to check integration status.");

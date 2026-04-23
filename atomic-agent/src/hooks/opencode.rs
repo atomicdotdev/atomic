@@ -57,20 +57,6 @@
 //!
 //! Unlike Claude Code / Gemini CLI which modify a settings JSON file,
 //! OpenCode plugin installation is simply file presence in the plugin dir.
-//!
-//! # Vault Integration
-//!
-//! Beyond hooks, `atomic agent enable --agent opencode` also installs:
-//!
-//! - **Skills** (`.opencode/skills/*/SKILL.md`) — teach the agent vault workflow,
-//!   KG navigation, and VCS operations
-//! - **Custom tools** (`.opencode/tools/*.ts`) — typed wrappers around `atomic vault`,
-//!   `atomic vault query`, and `atomic` VCS commands (20 tools total)
-//! - **Agent** (`.opencode/agents/atomic.md`) — intent-driven development persona
-//! - **Config** (`opencode.json`) — permissions for custom tools
-//! - **Package manifest** (`.opencode/package.json`) — `@opencode-ai/plugin` dependency
-//!
-//! All templates are embedded at compile time from `templates/opencode/`.
 
 use std::path::{Path, PathBuf};
 
@@ -79,38 +65,6 @@ use serde::Deserialize;
 use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
 use crate::hooks::AgentHook;
-
-// Vault integration templates (embedded at compile time)
-
-const SKILL_ATOMIC_VAULT: &str =
-    include_str!("../../templates/opencode/skills/atomic-vault/SKILL.md");
-const SKILL_CODE_INTELLIGENCE: &str =
-    include_str!("../../templates/opencode/skills/code-intelligence/SKILL.md");
-const SKILL_ATOMIC_RECORD: &str =
-    include_str!("../../templates/opencode/skills/atomic-record/SKILL.md");
-const TOOL_VAULT: &str = include_str!("../../templates/opencode/tools/vault.ts");
-const TOOL_KG: &str = include_str!("../../templates/opencode/tools/kg.ts");
-const TOOL_VCS: &str = include_str!("../../templates/opencode/tools/vcs.ts");
-const AGENT_ATOMIC: &str = include_str!("../../templates/opencode/agents/atomic.md");
-const OPENCODE_CONFIG: &str = include_str!("../../templates/opencode/opencode.json");
-const OPENCODE_PACKAGE_JSON: &str = include_str!("../../templates/opencode/package.json");
-const OPENCODE_GITIGNORE: &str = include_str!("../../templates/opencode/gitignore");
-
-/// Files installed by vault integration, relative to `.opencode/`.
-const VAULT_FILES: &[(&str, &str)] = &[
-    ("skills/atomic-vault/SKILL.md", "SKILL_ATOMIC_VAULT"),
-    (
-        "skills/code-intelligence/SKILL.md",
-        "SKILL_CODE_INTELLIGENCE",
-    ),
-    ("skills/atomic-record/SKILL.md", "SKILL_ATOMIC_RECORD"),
-    ("tools/vault.ts", "TOOL_VAULT"),
-    ("tools/kg.ts", "TOOL_KG"),
-    ("tools/vcs.ts", "TOOL_VCS"),
-    ("agents/atomic.md", "AGENT_ATOMIC"),
-    ("package.json", "OPENCODE_PACKAGE_JSON"),
-    (".gitignore", "OPENCODE_GITIGNORE"),
-];
 
 /// The OpenCode config directory name.
 const OPENCODE_DIR: &str = ".opencode";
@@ -538,159 +492,6 @@ impl OpenCodeHook {
             .map(|d| Self::is_installed_at(&d))
             .unwrap_or(false)
     }
-
-    // --- Vault integration (skills, tools, agents, config) ---
-
-    /// Resolve a template constant name to its content.
-    fn template_content(name: &str) -> &'static str {
-        match name {
-            "SKILL_ATOMIC_VAULT" => SKILL_ATOMIC_VAULT,
-            "SKILL_CODE_INTELLIGENCE" => SKILL_CODE_INTELLIGENCE,
-            "SKILL_ATOMIC_RECORD" => SKILL_ATOMIC_RECORD,
-            "TOOL_VAULT" => TOOL_VAULT,
-            "TOOL_KG" => TOOL_KG,
-            "TOOL_VCS" => TOOL_VCS,
-            "AGENT_ATOMIC" => AGENT_ATOMIC,
-            "OPENCODE_PACKAGE_JSON" => OPENCODE_PACKAGE_JSON,
-            "OPENCODE_GITIGNORE" => OPENCODE_GITIGNORE,
-            _ => "",
-        }
-    }
-
-    /// Install vault integration files into a project's `.opencode/` directory.
-    ///
-    /// Writes skills, custom tools, agent config, package.json, and
-    /// opencode.json. Returns the number of files written (0 if all
-    /// already present and unchanged).
-    fn install_vault_integration(repo_root: &Path) -> AgentResult<usize> {
-        let opencode_dir = repo_root.join(OPENCODE_DIR);
-        let mut written = 0usize;
-
-        // Write each file under .opencode/ — these paths are ours, so
-        // we overwrite unconditionally (skip only if content matches).
-        for &(rel_path, template_name) in VAULT_FILES {
-            let dest = opencode_dir.join(rel_path);
-            let content = Self::template_content(template_name);
-
-            // Skip if already up to date
-            if dest.exists() {
-                let existing = std::fs::read_to_string(&dest).unwrap_or_default();
-                if existing == content {
-                    continue;
-                }
-            }
-
-            // Ensure parent directory exists
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| AgentError::ConfigError {
-                    operation: "create directory".to_string(),
-                    path: parent.to_path_buf(),
-                    reason: e.to_string(),
-                })?;
-            }
-
-            std::fs::write(&dest, content).map_err(|e| AgentError::ConfigError {
-                operation: "write vault integration file".to_string(),
-                path: dest.clone(),
-                reason: e.to_string(),
-            })?;
-            written += 1;
-        }
-
-        // Write opencode.json at the repo root (only if missing — user
-        // may have added their own configuration on top of ours).
-        let config_path = repo_root.join("opencode.json");
-        if !config_path.exists() {
-            std::fs::write(&config_path, OPENCODE_CONFIG).map_err(|e| AgentError::ConfigError {
-                operation: "write opencode.json".to_string(),
-                path: config_path,
-                reason: e.to_string(),
-            })?;
-            written += 1;
-        }
-
-        Ok(written)
-    }
-
-    /// Remove vault integration files from a project.
-    ///
-    /// All files in [`VAULT_FILES`] are removed unconditionally — they
-    /// live under `.opencode/` in paths we own. The `opencode.json` at
-    /// the repo root is only removed if it exactly matches our template
-    /// (the user may have added their own configuration).
-    fn uninstall_vault_integration(repo_root: &Path) -> AgentResult<usize> {
-        let opencode_dir = repo_root.join(OPENCODE_DIR);
-        let mut removed = 0usize;
-
-        // Remove each file we installed under .opencode/ — these paths
-        // are ours unconditionally (skills/atomic-vault/, tools/vault.ts,
-        // agents/atomic.md, etc.). No content check needed.
-        for &(rel_path, _) in VAULT_FILES {
-            let dest = opencode_dir.join(rel_path);
-            if !dest.exists() {
-                continue;
-            }
-
-            let _ = std::fs::remove_file(&dest);
-            removed += 1;
-
-            // Clean up empty parent directories (e.g., skills/atomic-vault/)
-            if let Some(parent) = dest.parent() {
-                let _ = std::fs::remove_dir(parent); // Only succeeds if empty
-            }
-        }
-
-        // Clean up node_modules and bun.lock if we created them
-        let node_modules = opencode_dir.join("node_modules");
-        if node_modules.is_dir() {
-            let _ = std::fs::remove_dir_all(&node_modules);
-        }
-        let bun_lock = opencode_dir.join("bun.lock");
-        if bun_lock.exists() {
-            let _ = std::fs::remove_file(&bun_lock);
-        }
-
-        // Remove opencode.json at repo root only if it matches our template
-        let config_path = repo_root.join("opencode.json");
-        if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path).unwrap_or_default();
-            if content.trim() == OPENCODE_CONFIG.trim() {
-                let _ = std::fs::remove_file(&config_path);
-                removed += 1;
-            }
-        }
-
-        // Try to remove the .opencode/ directory itself if empty
-        let _ = std::fs::remove_dir(&opencode_dir);
-
-        Ok(removed)
-    }
-
-    /// Check whether vault integration files are installed.
-    fn is_vault_installed(repo_root: &Path) -> bool {
-        let opencode_dir = repo_root.join(OPENCODE_DIR);
-        // Check for at least one skill and one tool
-        opencode_dir.join("skills/atomic-vault/SKILL.md").exists()
-            && opencode_dir.join("tools/vault.ts").exists()
-            && opencode_dir.join("agents/atomic.md").exists()
-    }
-
-    /// Try to install the `@opencode-ai/plugin` npm dependency.
-    ///
-    /// Runs `bun install` in the `.opencode/` directory. This is
-    /// best-effort — if bun is not available, the tools may still work
-    /// because OpenCode resolves the import from its own runtime.
-    fn try_install_dependencies(repo_root: &Path) -> bool {
-        let opencode_dir = repo_root.join(OPENCODE_DIR);
-        std::process::Command::new("bun")
-            .args(["install", "--no-progress"])
-            .current_dir(&opencode_dir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
 }
 
 impl Default for OpenCodeHook {
@@ -894,26 +695,15 @@ impl AgentHook for OpenCodeHook {
     }
 
     fn install(&self, repo_root: &Path) -> AgentResult<usize> {
-        let mut count = Self::install_plugin_to(&Self::plugin_dir(repo_root))?;
-        let vault_count = Self::install_vault_integration(repo_root)?;
-        count += vault_count;
-
-        // Best-effort: install npm dependencies for custom tools
-        if vault_count > 0 {
-            Self::try_install_dependencies(repo_root);
-        }
-
-        Ok(count)
+        Self::install_plugin_to(&Self::plugin_dir(repo_root))
     }
 
     fn uninstall(&self, repo_root: &Path) -> AgentResult<()> {
-        Self::uninstall_plugin_from(&Self::plugin_dir(repo_root))?;
-        Self::uninstall_vault_integration(repo_root)?;
-        Ok(())
+        Self::uninstall_plugin_from(&Self::plugin_dir(repo_root))
     }
 
     fn is_installed(&self, repo_root: &Path) -> bool {
-        Self::is_installed_at(&Self::plugin_dir(repo_root)) || Self::is_vault_installed(repo_root)
+        Self::is_installed_at(&Self::plugin_dir(repo_root))
     }
 
     fn supported_hooks(&self) -> Vec<HookType> {
@@ -1424,11 +1214,7 @@ mod tests {
         let hook = make_hook();
 
         let count = hook.install(tmp.path()).unwrap();
-        // 6 hooks plugin + 9 vault files under .opencode/ + 1 opencode.json at root
-        assert!(
-            count >= 6,
-            "expected at least 6 files installed, got {count}"
-        );
+        assert_eq!(count, 6);
 
         let plugin_dir = tmp.path().join(".opencode").join("plugins").join("atomic");
         assert!(plugin_dir.is_dir());
@@ -1447,10 +1233,7 @@ mod tests {
         let hook = make_hook();
 
         let count1 = hook.install(tmp.path()).unwrap();
-        assert!(
-            count1 >= 6,
-            "first install should write at least 6 files, got {count1}"
-        );
+        assert_eq!(count1, 6);
 
         let count2 = hook.install(tmp.path()).unwrap();
         assert_eq!(count2, 0); // Already installed
@@ -1532,40 +1315,23 @@ mod tests {
 
         // Install
         let first_count = hook.install(tmp.path()).unwrap();
-        assert!(
-            first_count >= 6,
-            "first install should write at least 6 files, got {first_count}"
-        );
+        assert_eq!(first_count, 6);
         assert!(hook.is_installed(tmp.path()));
 
-        // Verify vault integration files exist
-        let oc = tmp.path().join(".opencode");
-        assert!(oc.join("skills/atomic-vault/SKILL.md").exists());
-        assert!(oc.join("skills/code-intelligence/SKILL.md").exists());
-        assert!(oc.join("skills/atomic-record/SKILL.md").exists());
-        assert!(oc.join("tools/vault.ts").exists());
-        assert!(oc.join("tools/kg.ts").exists());
-        assert!(oc.join("tools/vcs.ts").exists());
-        assert!(oc.join("agents/atomic.md").exists());
-        assert!(tmp.path().join("opencode.json").exists());
+        // Verify plugin file exists
+        let plugin_dir = tmp.path().join(".opencode").join("plugins").join("atomic");
+        assert!(plugin_dir.join("index.ts").exists());
 
         // Uninstall
         hook.uninstall(tmp.path()).unwrap();
         assert!(!hook.is_installed(tmp.path()));
-        assert!(!oc.join("skills/atomic-vault/SKILL.md").exists());
-        assert!(!oc.join("tools/vault.ts").exists());
-        assert!(!oc.join("agents/atomic.md").exists());
+        assert!(!plugin_dir.join("index.ts").exists());
 
         // Reinstall — should restore everything
         let reinstall_count = hook.install(tmp.path()).unwrap();
-        assert!(
-            reinstall_count >= 6,
-            "reinstall should write at least 6 files, got {reinstall_count}"
-        );
+        assert_eq!(reinstall_count, 6);
         assert!(hook.is_installed(tmp.path()));
-        assert!(oc.join("skills/atomic-vault/SKILL.md").exists());
-        assert!(oc.join("tools/vault.ts").exists());
-        assert!(oc.join("agents/atomic.md").exists());
+        assert!(plugin_dir.join("index.ts").exists());
     }
 
     // uuid_short tests
