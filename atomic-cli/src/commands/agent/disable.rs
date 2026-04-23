@@ -301,7 +301,7 @@ mod tests {
 
         // Install hooks first
         let count = agent.install(dir.path()).unwrap();
-        assert_eq!(count, 7);
+        assert_eq!(count, 8);
         assert!(agent.is_installed(dir.path()));
 
         // Uninstall

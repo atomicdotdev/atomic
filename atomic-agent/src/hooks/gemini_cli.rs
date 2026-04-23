@@ -409,7 +409,7 @@ impl GeminiCliHook {
 
         let mut count = 0;
         for (event_key, matcher, verb, hook_name) in &hook_defs {
-            let command = format!("{} {}", ATOMIC_HOOK_PREFIX, verb);
+            let command = format!("test -d .atomic && {} {} || true", ATOMIC_HOOK_PREFIX, verb);
 
             let matchers = match *event_key {
                 "session_start" => &mut hooks.session_start,
@@ -806,7 +806,7 @@ fn add_hook_to_matcher(
 
 /// Returns `true` if a hook command string is an Atomic hook.
 fn is_atomic_hook(command: &str) -> bool {
-    command.starts_with(ATOMIC_HOOK_PREFIX)
+    command.contains(ATOMIC_HOOK_PREFIX)
 }
 
 /// Check if any matcher in a hook list contains an Atomic hook.
@@ -1148,10 +1148,19 @@ mod tests {
 
     #[test]
     fn test_is_atomic_hook() {
+        // Bare (legacy) format
         assert!(is_atomic_hook(
             "atomic agent hooks gemini-cli session-start"
         ));
         assert!(is_atomic_hook("atomic agent hooks gemini-cli after-agent"));
+        // Guarded format
+        assert!(is_atomic_hook(
+            "test -d .atomic && atomic agent hooks gemini-cli session-start || true"
+        ));
+        assert!(is_atomic_hook(
+            "test -d .atomic && atomic agent hooks gemini-cli after-agent || true"
+        ));
+        // Non-atomic
         assert!(!is_atomic_hook("my-custom-hook --on-stop"));
         assert!(!is_atomic_hook("atomic agent hooks claude-code stop"));
         assert!(!is_atomic_hook(""));

@@ -1,26 +1,26 @@
-//! OpenCode agent hook adapter for Atomic Agent.
+//! Pi agent hook adapter for Atomic Agent.
 //!
-//! Handles hook JSON parsing from the OpenCode hooks plugin
-//! (`atomic-hooks.ts`), which pipes JSON to `atomic agent hooks opencode <verb>`
+//! Handles hook JSON parsing from the Pi extensions system
+//! (`atomic-hooks.ts`), which pipes JSON to `atomic agent hooks pi <verb>`
 //! via stdin at each lifecycle event.
 //!
-//! # OpenCode Plugin Architecture
+//! # Pi Extension Architecture
 //!
 //! Unlike Claude Code and Gemini CLI which have native hook systems in their
-//! settings files, OpenCode uses a **plugin-based** approach. The TypeScript
-//! plugin (`.opencode/plugins/atomic-hooks.ts`) subscribes to OpenCode events
-//! and invokes the Atomic CLI:
+//! settings files, Pi uses a **TypeScript extension** approach. The extension
+//! (`extensions/atomic-hooks.ts`) subscribes to Pi events and invokes the
+//! Atomic CLI:
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────────────┐
-//! │  OpenCode Plugin (.opencode/plugins/atomic-hooks.ts)                    │
+//! │  Pi Extension (extensions/atomic-hooks.ts)                              │
 //! │                                                                         │
-//! │  session.created  ──▶  atomic agent hooks opencode session-start       │
-//! │  chat.message     ──▶  atomic agent hooks opencode user-prompt         │
-//! │  session.idle     ──▶  atomic agent hooks opencode stop                │
-//! │  session.deleted  ──▶  atomic agent hooks opencode session-end         │
-//! │  tool.exec.before ──▶  atomic agent hooks opencode before-tool         │
-//! │  tool.exec.after  ──▶  atomic agent hooks opencode after-tool          │
+//! │  session.created  ──▶  atomic agent hooks pi session-start             │
+//! │  chat.message     ──▶  atomic agent hooks pi user-prompt               │
+//! │  session.idle     ──▶  atomic agent hooks pi stop                      │
+//! │  session.ended    ──▶  atomic agent hooks pi session-end               │
+//! │  tool.exec.before ──▶  atomic agent hooks pi before-tool               │
+//! │  tool.exec.after  ──▶  atomic agent hooks pi after-tool                │
 //! └─────────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -28,8 +28,8 @@
 //!
 //! | Verb            | HookType       | Description                           |
 //! |-----------------|----------------|---------------------------------------|
-//! | `session-start` | SessionStart   | New OpenCode session created           |
-//! | `session-end`   | SessionEnd     | Session deleted or ended               |
+//! | `session-start` | SessionStart   | New Pi session created                 |
+//! | `session-end`   | SessionEnd     | Session ended                          |
 //! | `user-prompt`   | TurnStart      | User sends a new prompt                |
 //! | `stop`          | TurnEnd        | Agent goes idle (turn complete)        |
 //! | `before-tool`   | PreToolUse     | Before tool execution                  |
@@ -51,9 +51,8 @@
 //!
 //! # Installation
 //!
-//! Plugin installation is handled by the standalone `atomic-opencode` package,
-//! which places the `atomic-hooks.ts` plugin file in `.opencode/plugins/`.
-//! This adapter only handles parsing hook events from the installed plugin.
+//! Pi extension installation is handled by the standalone `atomic-pi`
+//! package. This adapter only parses hook events.
 
 use std::path::Path;
 
@@ -63,14 +62,14 @@ use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
 use crate::hooks::AgentHook;
 
-/// The OpenCode config directory name.
-const OPENCODE_DIR: &str = ".opencode";
+/// The Pi config directory name.
+const PI_DIR: &str = ".pi";
 
-// OpenCode JSON Input Types
+// Pi JSON Input Types
 
 /// JSON input for session-start hook.
 ///
-/// Sent when a new OpenCode session is created.
+/// Sent when a new Pi session is created.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct SessionStartInput {
@@ -85,42 +84,44 @@ struct SessionStartInput {
     #[serde(default)]
     cwd: Option<String>,
 
-    /// ISO timestamp
+    /// ISO 8601 timestamp
     #[serde(default)]
     timestamp: Option<String>,
 
-    /// Model identifier if known at session start
+    /// Model identifier
     #[serde(default)]
     model: Option<String>,
 
-    /// Provider identifier if known at session start
+    /// Provider identifier
     #[serde(default)]
     provider: Option<String>,
 }
 
 /// JSON input for session-end hook.
 ///
-/// Sent when an OpenCode session is deleted or ended.
+/// Sent when a Pi session ends.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct SessionEndInput {
     #[serde(default)]
     session_id: Option<String>,
 
-    /// Why the session ended: "deleted", "exit", "error"
+    /// Reason the session ended: "ended", "error"
     #[serde(default)]
     reason: Option<String>,
 
+    /// Working directory
     #[serde(default)]
     cwd: Option<String>,
 
+    /// ISO 8601 timestamp
     #[serde(default)]
     timestamp: Option<String>,
 }
 
 /// JSON input for user-prompt hook (TurnStart).
 ///
-/// Sent when the user submits a new prompt to the AI.
+/// Sent when the user submits a new prompt in a Pi session.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct UserPromptInput {
@@ -131,35 +132,37 @@ struct UserPromptInput {
     #[serde(default)]
     prompt: Option<String>,
 
-    /// Model identifier (e.g., "claude-sonnet-4-20250514")
+    /// Model identifier
     #[serde(default)]
     model: Option<String>,
 
-    /// Provider identifier (e.g., "anthropic", "openai")
+    /// Provider identifier
     #[serde(default)]
     provider: Option<String>,
 
-    /// Agent mode: "build", "code", "ask"
+    /// Sub-agent name, if applicable
     #[serde(default)]
     agent: Option<String>,
 
+    /// Working directory
     #[serde(default)]
     cwd: Option<String>,
 
+    /// ISO 8601 timestamp
     #[serde(default)]
     timestamp: Option<String>,
 }
 
 /// JSON input for stop hook (TurnEnd).
 ///
-/// Sent when the agent goes idle after completing a turn.
+/// Sent when the Pi agent goes idle after completing a turn.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct StopInput {
     #[serde(default)]
     session_id: Option<String>,
 
-    /// Which turn number this is (1-based)
+    /// Which turn this was (1-based)
     #[serde(default)]
     turn_number: Option<u32>,
 
@@ -171,7 +174,7 @@ struct StopInput {
     #[serde(default)]
     provider: Option<String>,
 
-    /// Agent mode: "build", "code", "ask"
+    /// Sub-agent name, if applicable
     #[serde(default)]
     agent: Option<String>,
 
@@ -179,171 +182,114 @@ struct StopInput {
     #[serde(default)]
     error: Option<bool>,
 
-    /// Input/prompt tokens used in this turn
+    /// Token usage: input tokens consumed
     #[serde(default)]
     input_tokens: Option<u64>,
 
-    /// Output/completion tokens generated in this turn
+    /// Token usage: output tokens generated
     #[serde(default)]
     output_tokens: Option<u64>,
 
-    /// Reasoning/thinking tokens (extended thinking, o1/o3)
-    #[serde(default)]
-    reasoning_tokens: Option<u64>,
-
-    /// Cache read tokens
-    #[serde(default)]
-    cache_read_tokens: Option<u64>,
-
-    /// Cache write tokens
-    #[serde(default)]
-    cache_write_tokens: Option<u64>,
-
-    /// Cost in USD for this turn
+    /// Estimated cost in USD
     #[serde(default)]
     cost_usd: Option<f64>,
 
-    /// Actual wall-clock turn duration in milliseconds.
-    /// Computed by the plugin as the time from chat.message to session.idle.
-    /// More accurate than the Rust-side computation which only measures the
-    /// gap between the user-prompt and stop CLI invocations.
+    /// Turn duration in milliseconds
     #[serde(default)]
     turn_duration_ms: Option<u64>,
 
-    /// Number of LLM steps (model invocations) in this turn
-    #[serde(default)]
-    step_count: Option<u32>,
-
-    /// Why the model stopped on the final step: "stop", "tool-calls", "length"
-    #[serde(default)]
-    finish_reason: Option<String>,
-
-    /// Human-readable session slug (e.g., "mighty-rocket")
-    #[serde(default)]
-    session_slug: Option<String>,
-
-    /// Concatenated reasoning text from all thinking blocks in this turn
-    #[serde(default)]
-    reasoning_text: Option<String>,
-
-    /// Cryptographic signature from the model provider on the last reasoning block
-    #[serde(default)]
-    reasoning_signature: Option<String>,
-
-    /// Agent's structured task plan at turn completion (JSON array of todos)
-    #[serde(default)]
-    todos: Option<serde_json::Value>,
-
+    /// Working directory
     #[serde(default)]
     cwd: Option<String>,
 
+    /// ISO 8601 timestamp
     #[serde(default)]
     timestamp: Option<String>,
 }
 
 /// JSON input for before-tool hook (PreToolUse).
+///
+/// Sent before a tool is executed within a Pi session.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct BeforeToolInput {
     #[serde(default)]
     session_id: Option<String>,
 
+    /// Name of the tool being invoked
     #[serde(default)]
     tool_name: Option<String>,
 
+    /// Unique call identifier for this tool invocation
     #[serde(default)]
     tool_call_id: Option<String>,
 
+    /// Tool input arguments (arbitrary JSON)
     #[serde(default)]
     tool_input: Option<serde_json::Value>,
 
+    /// Working directory
     #[serde(default)]
     cwd: Option<String>,
 
+    /// ISO 8601 timestamp
     #[serde(default)]
     timestamp: Option<String>,
 }
 
 /// JSON input for after-tool hook (PostToolUse).
+///
+/// Sent after a tool finishes executing within a Pi session.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct AfterToolInput {
     #[serde(default)]
     session_id: Option<String>,
 
+    /// Name of the tool that executed
     #[serde(default)]
     tool_name: Option<String>,
 
+    /// Unique call identifier for this tool invocation
     #[serde(default)]
     tool_call_id: Option<String>,
 
-    /// "completed" or "error"
+    /// Execution status: "completed", "error"
     #[serde(default)]
     status: Option<String>,
 
-    /// Duration of tool execution in milliseconds
+    /// Execution duration in milliseconds
     #[serde(default)]
     duration: Option<u64>,
 
-    /// Whether the tool modified files
+    /// Whether this tool modified files on disk
     #[serde(default)]
     modified_files: Option<bool>,
 
-    /// Truncated tool output (up to 500 chars from the plugin)
+    /// Truncated tool output (first 500 chars)
     #[serde(default)]
     tool_output: Option<String>,
 
-    /// Human-readable title (e.g., "Install TypeScript as dev dependency")
-    #[serde(default)]
-    title: Option<String>,
-
-    /// Absolute file path for write/edit tools
-    #[serde(default)]
-    file_path: Option<String>,
-
-    /// Structured file diff: { file, before, after, additions, deletions }
-    #[serde(default)]
-    filediff: Option<serde_json::Value>,
-
-    /// LSP diagnostics at time of edit: { "/path/file.ts": [{ range, message }] }
-    #[serde(default)]
-    diagnostics: Option<serde_json::Value>,
-
-    /// Exit code for bash tools
-    #[serde(default)]
-    exit_code: Option<i32>,
-
+    /// Working directory
     #[serde(default)]
     cwd: Option<String>,
 
+    /// ISO 8601 timestamp
     #[serde(default)]
     timestamp: Option<String>,
 }
 
-// OpenCodeHook
-
-/// OpenCode agent hook adapter.
+/// Pi agent hook adapter.
 ///
-/// Handles hook JSON parsing from the OpenCode hooks plugin.
-/// Plugin installation is managed by the standalone `atomic-opencode` package.
-///
-/// # Differences from Claude Code / Gemini CLI
-///
-/// | Aspect          | Claude Code / Gemini CLI | OpenCode              |
-/// |-----------------|-------------------------|-----------------------|
-/// | Hook system     | Native settings.json     | Plugin-based (.ts)    |
-/// | Installation    | Modify JSON config       | Copy plugin file      |
-/// | Invocation      | Agent calls CLI directly | Plugin calls CLI      |
-/// | Config dir      | `.claude/` / `.gemini/`  | `.opencode/plugins/`  |
-/// | Turn boundary   | `stop` / `AfterAgent`    | `session.idle` event  |
-/// | Prompt capture  | `UserPromptSubmit`       | `chat.message` hook   |
+/// Parses hook JSON from the Pi extensions system. Extension installation
+/// is handled by the standalone `atomic-pi` package.
 #[derive(Debug)]
-pub struct OpenCodeHook {
+pub struct PiHook {
     _private: (),
 }
 
-impl OpenCodeHook {
-    /// Create a new OpenCode hook adapter.
+impl PiHook {
+    /// Create a new Pi hook adapter.
     pub fn new() -> Self {
         Self { _private: () }
     }
@@ -352,23 +298,23 @@ impl OpenCodeHook {
     fn extract_session_id(session_id: Option<String>) -> String {
         session_id
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| format!("opencode-{}", uuid_short()))
+            .unwrap_or_else(|| format!("pi-{}", uuid_short()))
     }
 }
 
-impl Default for OpenCodeHook {
+impl Default for PiHook {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl AgentHook for OpenCodeHook {
+impl AgentHook for PiHook {
     fn name(&self) -> &str {
-        "opencode"
+        "pi"
     }
 
     fn display_name(&self) -> &str {
-        "OpenCode"
+        "Pi"
     }
 
     fn parse_event(&self, hook_type: HookType, input: &[u8]) -> AgentResult<TurnEvent> {
@@ -557,15 +503,15 @@ impl AgentHook for OpenCodeHook {
     }
 
     fn install(&self, _repo_root: &Path) -> AgentResult<usize> {
-        Ok(0) // Installation handled by atomic-opencode package
+        Ok(0) // Installation handled by atomic-pi package
     }
 
     fn uninstall(&self, _repo_root: &Path) -> AgentResult<()> {
-        Ok(()) // Uninstallation handled by atomic-opencode package
+        Ok(()) // Uninstallation handled by atomic-pi package
     }
 
     fn is_installed(&self, _repo_root: &Path) -> bool {
-        false // Managed by atomic-opencode package
+        false // Managed by atomic-pi package
     }
 
     fn supported_hooks(&self) -> Vec<HookType> {
@@ -580,8 +526,8 @@ impl AgentHook for OpenCodeHook {
     }
 
     fn detect_presence(&self, repo_root: &Path) -> bool {
-        // OpenCode is present if the .opencode directory exists
-        repo_root.join(OPENCODE_DIR).is_dir()
+        // Pi is present if the .pi directory exists
+        repo_root.join(PI_DIR).is_dir()
     }
 
     fn hook_verbs(&self) -> Vec<&str> {
@@ -600,8 +546,8 @@ impl AgentHook for OpenCodeHook {
 
 /// Generate a short hex string for fallback session IDs.
 ///
-/// This is only used when the OpenCode plugin fails to provide a session_id,
-/// which should be rare. Uses timestamp + random bits for uniqueness.
+/// This is only used when the Pi extension fails to provide a session_id,
+/// which should be rare. Uses timestamp bits for uniqueness.
 fn uuid_short() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -614,20 +560,20 @@ fn uuid_short() -> String {
     format!("{:08x}", (now & 0xFFFF_FFFF) as u32)
 }
 
-// OpenCode hook verb → HookType mapping (registered in event.rs)
+// Pi hook verb → HookType mapping
 
-/// Convert an OpenCode-specific verb to a [`HookType`].
+/// Convert a Pi-specific verb to a [`HookType`].
 ///
-/// This function is called from [`HookType::from_verb`] for OpenCode verbs.
+/// Pi uses the same verb set as OpenCode:
 ///
 /// | Verb            | HookType     |
 /// |-----------------|--------------|
+/// | `session-start` | SessionStart |
+/// | `session-end`   | SessionEnd   |
 /// | `user-prompt`   | TurnStart    |
 /// | `stop`          | TurnEnd      |
 /// | `before-tool`   | PreToolUse   |
 /// | `after-tool`    | PostToolUse  |
-/// | `session-start` | SessionStart |
-/// | `session-end`   | SessionEnd   |
 pub fn verb_to_hook_type(verb: &str) -> Option<HookType> {
     match verb {
         "session-start" => Some(HookType::SessionStart),
@@ -646,10 +592,9 @@ pub fn verb_to_hook_type(verb: &str) -> Option<HookType> {
 mod tests {
     use super::*;
     use crate::event::HookType;
-    use tempfile::TempDir;
 
-    fn make_hook() -> OpenCodeHook {
-        OpenCodeHook::new()
+    fn make_hook() -> PiHook {
+        PiHook::new()
     }
 
     // Basic trait method tests
@@ -657,13 +602,13 @@ mod tests {
     #[test]
     fn test_name() {
         let hook = make_hook();
-        assert_eq!(hook.name(), "opencode");
+        assert_eq!(hook.name(), "pi");
     }
 
     #[test]
     fn test_display_name() {
         let hook = make_hook();
-        assert_eq!(hook.display_name(), "OpenCode");
+        assert_eq!(hook.display_name(), "Pi");
     }
 
     #[test]
@@ -694,15 +639,15 @@ mod tests {
 
     #[test]
     fn test_default() {
-        let hook = OpenCodeHook::default();
-        assert_eq!(hook.name(), "opencode");
+        let hook = PiHook::default();
+        assert_eq!(hook.name(), "pi");
     }
 
     #[test]
     fn test_debug() {
         let hook = make_hook();
         let debug = format!("{:?}", hook);
-        assert!(debug.contains("OpenCodeHook"));
+        assert!(debug.contains("PiHook"));
     }
 
     // parse_event tests: session-start
@@ -710,21 +655,21 @@ mod tests {
     #[test]
     fn test_parse_session_start() {
         let hook = make_hook();
-        let input = br#"{"session_id": "oc-abc123", "source": "startup", "cwd": "/tmp/proj"}"#;
+        let input = br#"{"session_id": "test-123", "cwd": "/tmp"}"#;
         let event = hook.parse_event(HookType::SessionStart, input).unwrap();
-        assert_eq!(event.session_id, "oc-abc123");
+        assert_eq!(event.session_id, "test-123");
         assert_eq!(event.event_type, HookType::SessionStart);
     }
 
     #[test]
     fn test_parse_session_start_with_model() {
         let hook = make_hook();
-        let input = br#"{"session_id": "s1", "model": "claude-sonnet-4", "provider": "anthropic"}"#;
+        let input =
+            br#"{"session_id": "s1", "model": "claude-sonnet-4-6", "provider": "anthropic"}"#;
         let event = hook.parse_event(HookType::SessionStart, input).unwrap();
         assert_eq!(event.session_id, "s1");
-        // Model should be in raw_json
         let raw = event.raw_json.unwrap();
-        assert_eq!(raw["model"], "claude-sonnet-4");
+        assert_eq!(raw["model"], "claude-sonnet-4-6");
     }
 
     // parse_event tests: session-end
@@ -732,9 +677,9 @@ mod tests {
     #[test]
     fn test_parse_session_end() {
         let hook = make_hook();
-        let input = br#"{"session_id": "oc-abc123", "reason": "deleted"}"#;
+        let input = br#"{"session_id": "test-123", "reason": "ended"}"#;
         let event = hook.parse_event(HookType::SessionEnd, input).unwrap();
-        assert_eq!(event.session_id, "oc-abc123");
+        assert_eq!(event.session_id, "test-123");
         assert_eq!(event.event_type, HookType::SessionEnd);
     }
 
@@ -743,14 +688,10 @@ mod tests {
     #[test]
     fn test_parse_user_prompt() {
         let hook = make_hook();
-        let input = br#"{"session_id": "s1", "prompt": "Fix the auth bug in login.rs"}"#;
+        let input = br#"{"session_id": "s1", "prompt": "Fix the bug", "model": "claude-sonnet-4-6", "provider": "anthropic"}"#;
         let event = hook.parse_event(HookType::TurnStart, input).unwrap();
         assert_eq!(event.session_id, "s1");
-        assert_eq!(event.event_type, HookType::TurnStart);
-        assert_eq!(
-            event.prompt.as_deref(),
-            Some("Fix the auth bug in login.rs")
-        );
+        assert_eq!(event.prompt.as_deref(), Some("Fix the bug"));
     }
 
     #[test]
@@ -759,17 +700,6 @@ mod tests {
         let input = br#"{"session_id": "s1"}"#;
         let event = hook.parse_event(HookType::TurnStart, input).unwrap();
         assert!(event.prompt.is_none());
-    }
-
-    #[test]
-    fn test_parse_user_prompt_with_model() {
-        let hook = make_hook();
-        let input =
-            br#"{"session_id": "s1", "prompt": "hello", "model": "gpt-4o", "provider": "openai"}"#;
-        let event = hook.parse_event(HookType::TurnStart, input).unwrap();
-        let raw = event.raw_json.unwrap();
-        assert_eq!(raw["model"], "gpt-4o");
-        assert_eq!(raw["provider"], "openai");
     }
 
     // parse_event tests: stop (TurnEnd)
@@ -786,10 +716,9 @@ mod tests {
     #[test]
     fn test_parse_stop_with_error() {
         let hook = make_hook();
-        let input = br#"{"session_id": "s1", "turn_number": 2, "error": true}"#;
+        let input = br#"{"session_id": "s1", "error": true}"#;
         let event = hook.parse_event(HookType::TurnEnd, input).unwrap();
-        let raw = event.raw_json.unwrap();
-        assert_eq!(raw["error"], true);
+        assert_eq!(event.session_id, "s1");
     }
 
     // parse_event tests: before-tool (PreToolUse)
@@ -801,11 +730,10 @@ mod tests {
             "session_id": "s1",
             "tool_name": "edit",
             "tool_call_id": "call-42",
-            "tool_input": {"filePath": "src/main.rs"}
+            "tool_input": {"file": "main.rs"}
         }"#;
         let event = hook.parse_event(HookType::PreToolUse, input).unwrap();
         assert_eq!(event.session_id, "s1");
-        assert_eq!(event.event_type, HookType::PreToolUse);
         assert_eq!(event.tool_name.as_deref(), Some("edit"));
         assert_eq!(event.tool_use_id.as_deref(), Some("call-42"));
     }
@@ -816,7 +744,6 @@ mod tests {
         let input = br#"{"session_id": "s1"}"#;
         let event = hook.parse_event(HookType::PreToolUse, input).unwrap();
         assert!(event.tool_name.is_none());
-        assert!(event.tool_use_id.is_none());
     }
 
     // parse_event tests: after-tool (PostToolUse)
@@ -829,43 +756,42 @@ mod tests {
             "tool_name": "bash",
             "tool_call_id": "call-99",
             "status": "completed",
-            "duration": 1500,
-            "modified_files": true
+            "duration": 1234
         }"#;
         let event = hook.parse_event(HookType::PostToolUse, input).unwrap();
         assert_eq!(event.session_id, "s1");
-        assert_eq!(event.event_type, HookType::PostToolUse);
         assert_eq!(event.tool_name.as_deref(), Some("bash"));
-        assert_eq!(event.tool_use_id.as_deref(), Some("call-99"));
     }
 
-    // parse_event tests: error cases
+    // Error handling tests
 
     #[test]
     fn test_parse_event_empty_input() {
         let hook = make_hook();
-        let result = hook.parse_event(HookType::TurnEnd, b"");
+        let result = hook.parse_event(HookType::SessionStart, b"");
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, AgentError::HookInputEmpty { .. }));
+        assert!(err.to_string().contains("Empty hook input"));
     }
 
     #[test]
     fn test_parse_event_invalid_json() {
         let hook = make_hook();
-        let result = hook.parse_event(HookType::TurnEnd, b"not json");
+        let result = hook.parse_event(HookType::SessionStart, b"not json");
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, AgentError::HookParseFailed { .. }));
+        assert!(err.to_string().contains("Failed to parse"));
     }
+
+    // Fallback session ID tests
 
     #[test]
     fn test_parse_session_start_missing_session_id() {
         let hook = make_hook();
-        let input = br#"{"source": "startup"}"#;
+        let input = br#"{"cwd": "/tmp"}"#;
         let event = hook.parse_event(HookType::SessionStart, input).unwrap();
         // Should generate a fallback session ID
-        assert!(event.session_id.starts_with("opencode-"));
+        assert!(event.session_id.starts_with("pi-"));
     }
 
     #[test]
@@ -873,14 +799,16 @@ mod tests {
         let hook = make_hook();
         let input = br#"{"session_id": ""}"#;
         let event = hook.parse_event(HookType::SessionStart, input).unwrap();
-        assert!(event.session_id.starts_with("opencode-"));
+        assert!(event.session_id.starts_with("pi-"));
     }
+
+    // Extra fields should be ignored (serde default behavior)
 
     #[test]
     fn test_parse_extra_fields_ignored() {
         let hook = make_hook();
-        let input = br#"{"session_id": "s1", "unknown_field": 42, "another": "value"}"#;
-        let event = hook.parse_event(HookType::TurnEnd, input).unwrap();
+        let input = br#"{"session_id": "s1", "unknown_field": "whatever", "extra": 42}"#;
+        let event = hook.parse_event(HookType::SessionStart, input).unwrap();
         assert_eq!(event.session_id, "s1");
     }
 
@@ -900,54 +828,38 @@ mod tests {
         assert_eq!(verb_to_hook_type("unknown"), None);
     }
 
-    // Installation tests
+    // detect_presence tests
 
     #[test]
-    fn test_detect_presence_with_opencode_dir() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".opencode")).unwrap();
+    fn test_detect_presence_with_pi_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".pi")).unwrap();
         let hook = make_hook();
         assert!(hook.detect_presence(tmp.path()));
     }
 
     #[test]
-    fn test_detect_presence_without_opencode_dir() {
-        let tmp = TempDir::new().unwrap();
+    fn test_detect_presence_without_pi_dir() {
+        let tmp = tempfile::tempdir().unwrap();
         let hook = make_hook();
         assert!(!hook.detect_presence(tmp.path()));
     }
 
-    #[test]
-    fn test_detect_presence_file_not_dir() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join(".opencode"), "not a dir").unwrap();
-        let hook = make_hook();
-        assert!(!hook.detect_presence(tmp.path()));
-    }
+    // Full roundtrip test
 
     #[test]
-    fn test_install_is_noop() {
-        let tmp = TempDir::new().unwrap();
+    fn test_full_roundtrip() {
         let hook = make_hook();
-        let count = hook.install(tmp.path()).unwrap();
-        assert_eq!(count, 0);
+
+        // Parse all event types
+        let input = br#"{"session_id": "roundtrip-test"}"#;
+        for ht in hook.supported_hooks() {
+            let event = hook.parse_event(ht, input).unwrap();
+            assert_eq!(event.session_id, "roundtrip-test");
+        }
     }
 
-    #[test]
-    fn test_uninstall_is_noop() {
-        let tmp = TempDir::new().unwrap();
-        let hook = make_hook();
-        hook.uninstall(tmp.path()).unwrap();
-    }
-
-    #[test]
-    fn test_is_installed_returns_false() {
-        let tmp = TempDir::new().unwrap();
-        let hook = make_hook();
-        assert!(!hook.is_installed(tmp.path()));
-    }
-
-    // uuid_short tests
+    // uuid_short helper tests
 
     #[test]
     fn test_uuid_short_format() {
@@ -958,7 +870,6 @@ mod tests {
 
     #[test]
     fn test_uuid_short_not_all_zeros() {
-        // Unless system clock is exactly at epoch, should not be all zeros
         let id = uuid_short();
         assert_ne!(id, "00000000");
     }

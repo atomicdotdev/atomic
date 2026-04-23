@@ -303,6 +303,7 @@ impl AgentHook for ClaudeCodeHook {
             "pre-task",
             "post-task",
             "post-todo",
+            "post-tool",
         ]
     }
 }
@@ -320,6 +321,7 @@ const HOOK_DEFS: &[(&str, &str, &str)] = &[
     ("pre-task", "Task", "pre-task"),
     ("post-task", "Task", "post-task"),
     ("post-todo", "TodoWrite", "post-todo"),
+    ("post-tool", "", "post-tool"),
 ];
 
 /// Install all hook definitions into a `ClaudeHooks` struct.
@@ -328,7 +330,7 @@ const HOOK_DEFS: &[(&str, &str, &str)] = &[
 fn install_hooks_into(hooks: &mut ClaudeHooks, _settings_path: &Path) -> AgentResult<usize> {
     let mut count = 0;
     for (_label, matcher, verb) in HOOK_DEFS {
-        let command = format!("{} {}", ATOMIC_HOOK_PREFIX, verb);
+        let command = format!("test -d .atomic && {} {} || true", ATOMIC_HOOK_PREFIX, verb);
 
         let matchers = match *verb {
             "session-start" => &mut hooks.session_start,
@@ -336,7 +338,7 @@ fn install_hooks_into(hooks: &mut ClaudeHooks, _settings_path: &Path) -> AgentRe
             "stop" => &mut hooks.stop,
             "user-prompt-submit" => &mut hooks.user_prompt_submit,
             "pre-task" => &mut hooks.pre_tool_use,
-            "post-task" | "post-todo" => &mut hooks.post_tool_use,
+            "post-task" | "post-todo" | "post-tool" => &mut hooks.post_tool_use,
             _ => continue,
         };
 

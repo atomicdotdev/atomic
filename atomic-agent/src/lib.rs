@@ -143,6 +143,46 @@ mod tests {
     }
 
     #[test]
+    fn test_default_registry_has_cursor() {
+        let registry = AgentRegistry::with_defaults();
+        let agent = registry.get("cursor");
+        assert!(agent.is_some(), "Default registry should include cursor");
+        assert_eq!(agent.unwrap().display_name(), "Cursor");
+    }
+
+    #[test]
+    fn test_default_registry_has_cline() {
+        let registry = AgentRegistry::with_defaults();
+        let agent = registry.get("cline");
+        assert!(agent.is_some(), "Default registry should include cline");
+        assert_eq!(agent.unwrap().display_name(), "Cline");
+    }
+
+    #[test]
+    fn test_default_registry_has_copilot() {
+        let registry = AgentRegistry::with_defaults();
+        let agent = registry.get("copilot");
+        assert!(agent.is_some(), "Default registry should include copilot");
+        assert_eq!(agent.unwrap().display_name(), "GitHub Copilot");
+    }
+
+    #[test]
+    fn test_default_registry_has_codex() {
+        let registry = AgentRegistry::with_defaults();
+        let agent = registry.get("codex");
+        assert!(agent.is_some(), "Default registry should include codex");
+        assert_eq!(agent.unwrap().display_name(), "Codex");
+    }
+
+    #[test]
+    fn test_default_registry_has_pi() {
+        let registry = AgentRegistry::with_defaults();
+        let agent = registry.get("pi");
+        assert!(agent.is_some(), "Default registry should include pi");
+        assert_eq!(agent.unwrap().display_name(), "Pi");
+    }
+
+    #[test]
     fn test_claude_code_parse_roundtrip() {
         let registry = AgentRegistry::with_defaults();
         let claude = registry.require("claude-code").unwrap();

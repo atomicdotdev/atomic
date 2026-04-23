@@ -309,6 +309,9 @@ impl TurnOrchestrator {
 pub(crate) fn vendor_from_agent_name(agent_name: &str) -> &'static str {
     match agent_name {
         "claude-code" => "anthropic",
+        "cline" => "unknown", // Cline supports multiple providers; real vendor comes from hook payload
+        "copilot" => "github",
+        "cursor" => "anthropic",
         "gemini-cli" => "google",
         "codex" => "openai",
         "opencode" => "openai",

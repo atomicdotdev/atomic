@@ -409,7 +409,7 @@ mod tests {
 
         // Install hooks
         let count = agent.install(dir.path()).unwrap();
-        assert_eq!(count, 7);
+        assert_eq!(count, 8);
         assert!(agent.is_installed(dir.path()));
 
         // Verify .claude/settings.json was created
@@ -431,7 +431,7 @@ mod tests {
 
         // First install
         let count1 = agent.install(dir.path()).unwrap();
-        assert_eq!(count1, 7);
+        assert_eq!(count1, 8);
 
         // Second install without force — should be 0
         let count2 = agent.install(dir.path()).unwrap();
@@ -442,7 +442,7 @@ mod tests {
         assert!(!agent.is_installed(dir.path()));
 
         let count3 = agent.install(dir.path()).unwrap();
-        assert_eq!(count3, 7);
+        assert_eq!(count3, 8);
         assert!(agent.is_installed(dir.path()));
     }
 }

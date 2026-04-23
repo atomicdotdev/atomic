@@ -190,13 +190,17 @@ pub(crate) fn has_any_atomic_hook(matchers: &[ClaudeHookMatcher]) -> bool {
     matchers.iter().any(|m| {
         m.hooks
             .iter()
-            .any(|h| h.command.starts_with(ATOMIC_HOOK_PREFIX))
+            .any(|h| h.command.contains(ATOMIC_HOOK_PREFIX))
     })
 }
 
 /// Returns `true` if a hook command string is an Atomic hook.
+///
+/// Uses `contains` rather than `starts_with` so that guarded commands
+/// like `test -d .atomic && atomic agent hooks claude-code … || true`
+/// are still recognized.
 pub(crate) fn is_atomic_hook(command: &str) -> bool {
-    command.starts_with(ATOMIC_HOOK_PREFIX)
+    command.contains(ATOMIC_HOOK_PREFIX)
 }
 
 /// Remove all Atomic hooks from a matcher list.
