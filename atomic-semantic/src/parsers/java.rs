@@ -121,10 +121,8 @@ impl JavaParser {
                     entities.push(entity);
                 }
             }
-            "field_declaration" => {
-                if in_class.is_some() {
-                    self.extract_fields(node, source, file_path, entities);
-                }
+            "field_declaration" if in_class.is_some() => {
+                self.extract_fields(node, source, file_path, entities);
             }
             "import_declaration" => {
                 if let Some(entity) = self.extract_import(node, source, file_path) {

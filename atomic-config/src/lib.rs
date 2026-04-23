@@ -4,7 +4,7 @@
 //! repositories at three levels:
 //!
 //! 1. **System** - `/etc/atomic/config.toml` (Unix) or system-wide location
-//! 2. **User** - `~/.config/atomic/config.toml` (XDG) or `~/.atomic/config.toml`
+//! 2. **User** - `~/.atomic/config.toml` in the user's home directory
 //! 3. **Repository** - `.atomic/config.toml` in the repository root
 //!
 //! Configuration is merged with later levels overriding earlier ones.
@@ -74,6 +74,13 @@ pub struct GlobalConfig {
     /// Use pager for long output
     #[serde(default)]
     pub pager: Option<bool>,
+
+    /// Global workspace configuration.
+    ///
+    /// Expose patterns defined here apply to ALL repositories.
+    /// Repo-local `[workspace] expose` patterns are merged on top.
+    #[serde(default)]
+    pub workspace: WorkspaceConfig,
 }
 
 fn default_channel_name() -> String {
@@ -87,6 +94,7 @@ impl Default for GlobalConfig {
             default_channel: default_channel_name(),
             colors: None,
             pager: None,
+            workspace: WorkspaceConfig::default(),
         }
     }
 }
@@ -114,6 +122,35 @@ pub struct RepoConfig {
     /// Remote repositories
     #[serde(default)]
     pub remotes: Vec<RemoteConfig>,
+
+    /// Workspace configuration for view switching behavior.
+    #[serde(default)]
+    pub workspace: WorkspaceConfig,
+}
+
+/// Controls how ignored files are handled during view switches.
+///
+/// By default, all ignored files (`.atomicignore`) are shelved per-view
+/// when switching — build artifacts get isolated so each view has its own
+/// `node_modules/`, `target/`, etc. Paths listed in `expose` are the
+/// exception: they persist across all views and are never shelved.
+///
+/// This keeps tool configs (`.opencode/`, `.vscode/`, `.idea/`) stable
+/// while build artifacts are managed per-view automatically.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    /// Paths that persist across all views (never shelved).
+    ///
+    /// Everything in `.atomicignore` is shelved per-view on switch,
+    /// EXCEPT paths matching these patterns — those are left alone.
+    ///
+    /// Example:
+    /// ```toml
+    /// [workspace]
+    /// expose = [".opencode", ".vscode", ".idea"]
+    /// ```
+    #[serde(default)]
+    pub expose: Vec<String>,
 }
 
 /// Remote repository configuration
@@ -132,7 +169,7 @@ pub struct RemoteConfig {
 
 /// Get the global configuration directory
 pub fn global_config_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|p| p.join("atomic"))
+    dirs::home_dir().map(|p| p.join(".atomic"))
 }
 
 /// Get the global configuration file path

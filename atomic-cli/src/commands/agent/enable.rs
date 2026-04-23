@@ -195,14 +195,28 @@ impl Command for Enable {
                 Ok(count) => {
                     if count > 0 {
                         print_success(&format!(
-                            "Installed {} hook{} for {}",
+                            "Installed {} file{} for {}",
                             count,
                             if count == 1 { "" } else { "s" },
                             agent.display_name(),
                         ));
                         total_installed += count;
+
+                        // OpenCode gets vault integration — show details
+                        if *agent_name == "opencode" && count > 1 {
+                            println!("  • Hooks plugin (.opencode/plugins/atomic/)");
+                            println!(
+                                "  • 3 skills (atomic-vault, code-intelligence, atomic-record)"
+                            );
+                            println!("  • 20 custom tools (vault, kg, vcs)");
+                            println!("  • Atomic agent (.opencode/agents/atomic.md)");
+                            println!("  • Config (opencode.json)");
+                        }
                     } else {
-                        println!("  ✓ hooks already up to date for {}.", agent.display_name(),);
+                        println!(
+                            "  ✓ already up to date for {}. Use --force to reinstall.",
+                            agent.display_name(),
+                        );
                     }
                 }
                 Err(e) => {
@@ -217,11 +231,18 @@ impl Command for Enable {
 
         // Summary
         if total_installed > 0 {
+            let has_opencode = agents_to_install.contains(&"opencode");
             println!();
             println!("Each agent turn will be recorded as an Atomic change with:");
             println!("  • AI provenance (vendor, model, tokens, cost)");
             println!("  • Session metadata (turn number, timing, files)");
             println!("  • Optional transcript (full conversation)");
+            if has_opencode {
+                println!();
+                println!("OpenCode vault integration is ready:");
+                println!("  Run 'opencode' and press Tab to switch to the Atomic agent.");
+                println!("  The agent knows your vault workflow — intents, goals, views, KG.");
+            }
             println!();
             println!("Use 'atomic agent status' to check integration status.");
             println!("Use 'atomic log' to view recorded turns.");

@@ -17,12 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -48,12 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -66,26 +56,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-test-
 
-      - name: Run tests (atomic-core)
-        run: cargo test -p atomic-core
-
-      - name: Run tests (atomic-config)
-        run: cargo test -p atomic-config
-
-      - name: Run tests (atomic-identity)
-        run: cargo test -p atomic-identity
-
-      - name: Run tests (atomic-repository)
-        run: cargo test -p atomic-repository
-
-      - name: Run tests (atomic-agent)
-        run: cargo test -p atomic-agent
-
-      - name: Run tests (atomic-remote)
-        run: cargo test -p atomic-remote
-
-      - name: Run tests (atomic-cli)
-        run: cargo test -p atomic-cli
+      - name: Run tests
+        run: cargo test --workspace
 
   fmt:
     name: Format
@@ -93,13 +65,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          profile: minimal
           components: rustfmt
-          override: true
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -110,13 +78,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          profile: minimal
           components: clippy
-          override: true
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -138,12 +102,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -167,12 +126,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install MSRV toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: "1.87"
-          profile: minimal
-          override: true
+      - uses: dtolnay/rust-toolchain@1.87
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4

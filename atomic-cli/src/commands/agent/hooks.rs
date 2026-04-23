@@ -173,28 +173,22 @@ impl Command for Hooks {
             Ok::<_, CliError>(dispatch_result)
         })?;
 
-        // Log warnings to stderr
+        // Log warnings via log crate (not stderr — that leaks into agent TUIs)
         for warning in &result.warnings {
-            eprintln!("[atomic] Warning: {}", warning);
+            log::warn!("{}", warning);
         }
 
-        // Log recording info to stderr
+        // Log recording info at debug level
         if let Some(ref outcome) = result.change_recorded {
-            eprintln!("[atomic] {}", outcome);
+            log::debug!("{}", outcome);
         }
 
-        // Write JSON response to stdout if the agent expects one.
-        //
-        // Agents like Claude Code read JSON from hook stdout. If we have a
-        // message (e.g., "Atomic is tracking this session"), we wrap it in
-        // the expected JSON format. If we have no message, we write nothing
-        // (some hooks don't expect a response).
+        // Log the system message instead of printing to stdout.
+        // Claude Code expects JSON on stdout, but OpenCode's plugin $
+        // captures stdout and displays it in the TUI as noise.
+        // Use log::debug so it's available in RUST_LOG but silent otherwise.
         if let Some(ref message) = result.message {
-            let response = serde_json::json!({
-                "systemMessage": message
-            });
-            // Write to stdout — the agent reads this
-            println!("{}", serde_json::to_string(&response).unwrap_or_default());
+            log::debug!("Hook response: {}", message);
         }
 
         Ok(())

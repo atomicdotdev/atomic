@@ -373,7 +373,7 @@ where
     T: GraphTxnT + InodeGraphOps,
 {
     let mut vertices = find_content_vertices(txn, inode, inode_pos)?;
-    vertices.sort_by(|a, b| a.start.cmp(&b.start));
+    vertices.sort_by_key(|a| a.start);
     Ok(vertices)
 }
 

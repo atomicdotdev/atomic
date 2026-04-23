@@ -185,6 +185,23 @@ impl TurnOrchestrator {
                 let mut session =
                     AgentSession::new(session_id, &self.agent_name, &self.agent_display_name);
 
+                // Use the repo's current view instead of the generated
+                // haikunator name.  session-start already created a view
+                // and switched to it — if we're here from a stop/turn-end
+                // event, the current view IS the session view.  Generating
+                // a new name would create a second orphan view.
+                if let Ok(repo) = atomic_repository::Repository::open(&self.repo_root) {
+                    let current = repo.current_view().to_string();
+                    if current != "dev" && current != "main" && current != "release" {
+                        log::info!(
+                            "Fallback session {} adopting current view '{}' instead of generating new view",
+                            session_id,
+                            current,
+                        );
+                        session.view_name = current;
+                    }
+                }
+
                 let vendor = vendor_from_agent_name(&self.agent_name);
                 session.agent_vendor = vendor.to_string();
 

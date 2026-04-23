@@ -70,11 +70,18 @@ pub struct ChangeCmd {
     #[arg(long = "full-hash")]
     pub full_hash: bool,
 
-    /// Show AI provenance details.
+    /// Show AI attestation details.
     ///
-    /// When enabled, displays detailed information about AI assistance
-    /// used in creating this change, including vendor, model, token usage,
-    /// and cost information.
+    /// When enabled, displays inline AI metadata from the change header:
+    /// vendor, model, token usage, cost, and session information.
+    #[arg(short = 'a', long = "attest")]
+    pub show_attest: bool,
+
+    /// Show the provenance decision graph.
+    ///
+    /// When enabled, displays the causal decision DAG stored in the
+    /// `.provenance` file: goals, tool executions, explorations,
+    /// commitments, and patch proposals that led to this change.
     #[arg(short = 'p', long = "provenance")]
     pub show_provenance: bool,
 }
@@ -89,6 +96,7 @@ impl ChangeCmd {
             show_deps: false,
             show_hunks: false,
             full_hash: false,
+            show_attest: false,
             show_provenance: false,
         }
     }
@@ -126,6 +134,12 @@ impl ChangeCmd {
     /// Builder: set full-hash flag.
     pub fn with_full_hash(mut self, full_hash: bool) -> Self {
         self.full_hash = full_hash;
+        self
+    }
+
+    /// Builder: set show-attest flag.
+    pub fn with_show_attest(mut self, show_attest: bool) -> Self {
+        self.show_attest = show_attest;
         self
     }
 
@@ -446,19 +460,24 @@ impl ChangeCmd {
             }
         }
 
-        // Provenance
+        // Attestation (inline AI metadata from change header)
         if change.has_provenance() {
             output.push('\n');
-            if self.show_provenance {
+            if self.show_attest {
                 if let Some(prov) = change.hashed.provenance.first() {
                     output.push_str(&self.format_provenance(prov));
                 }
             } else {
                 output.push_str(&format!(
                     "{}\n",
-                    hint("This change has AI provenance information (use -p to view)")
+                    hint("This change has AI attestation data (use -a to view)")
                 ));
             }
+        }
+
+        // Provenance graph (causal decision DAG from .provenance file)
+        if self.show_provenance {
+            output.push_str(&self.format_provenance_graph(hash, repo));
         }
 
         output
@@ -574,6 +593,89 @@ impl ChangeCmd {
         output
     }
 
+    /// Format the provenance decision graph for display.
+    fn format_provenance_graph(&self, change_hash: &Hash, repo: &Repository) -> String {
+        let mut output = String::new();
+
+        let graphs = match repo.find_provenance_for_change(change_hash) {
+            Ok(g) if !g.is_empty() => g,
+            Ok(_) => {
+                output.push_str(&format!(
+                    "{}\n",
+                    hint("No provenance graph found for this change.")
+                ));
+                return output;
+            }
+            Err(e) => {
+                output.push_str(&format!(
+                    "{}\n",
+                    hint(&format!("Failed to load provenance: {}", e))
+                ));
+                return output;
+            }
+        };
+
+        for (_graph_hash, graph) in &graphs {
+            output.push_str(&format!("{}\n", emphasis("Provenance Graph:")));
+            output.push_str(&format!("  Session: {}\n", info(&graph.session_id)));
+            output.push_str(&format!(
+                "  Agent:   {} ({})\n",
+                info(&graph.agent_display_name),
+                hint(&graph.agent_vendor)
+            ));
+            output.push_str(&format!(
+                "  Nodes:   {}  Edges: {}  Changes: {}\n",
+                graph.node_count(),
+                graph.edge_count(),
+                graph.change_count()
+            ));
+            output.push('\n');
+
+            // Display nodes
+            for node in &graph.nodes {
+                let kind_str = format!("{}", node.kind);
+                let kind_colored = match node.kind {
+                    _ => {}
+                };
+                let kind_colored = &kind_str;
+                let duration = node
+                    .duration_ms
+                    .map(|ms| format!(" ({}ms)", ms))
+                    .unwrap_or_default();
+                let tool = node.tool_name.as_deref().unwrap_or("");
+                let tool_str = if tool.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", tool)
+                };
+
+                output.push_str(&format!(
+                    "  {} {}{}{}\n",
+                    kind_colored,
+                    node.summary,
+                    tool_str,
+                    hint(&duration)
+                ));
+            }
+
+            // Show edges
+            if graph.edge_count() > 0 {
+                output.push('\n');
+                output.push_str(&format!("  {}\n", hint("Edges:")));
+                for edge in &graph.edges {
+                    output.push_str(&format!(
+                        "    {} → {} ({})\n",
+                        hint(&edge.from),
+                        hint(&edge.to),
+                        hint(&format!("{}", edge.kind))
+                    ));
+                }
+            }
+        }
+
+        output
+    }
+
     /// Format the change for JSON output.
     pub(crate) fn format_json(
         &self,
@@ -581,7 +683,7 @@ impl ChangeCmd {
         hash: &Hash,
         sequence: Option<u64>,
     ) -> String {
-        let json_change = if self.show_provenance {
+        let json_change = if self.show_attest {
             JsonChange::from_change_with_provenance(change, hash, sequence)
         } else {
             JsonChange::from_change(change, hash, sequence)

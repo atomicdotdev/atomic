@@ -484,7 +484,7 @@ impl Revise {
                 .into_iter()
                 .filter(|e| e.sequence >= sequence)
                 .collect();
-            entries_to_show.sort_by(|a, b| b.sequence.cmp(&a.sequence));
+            entries_to_show.sort_by_key(|x| std::cmp::Reverse(x.sequence));
 
             for e in entries_to_show {
                 let marker = if e.sequence == sequence {

@@ -164,11 +164,9 @@ impl CloneProgress {
 
     /// Get download progress as a percentage (0-100).
     pub fn download_percent(&self) -> usize {
-        if self.total_changes == 0 {
-            0
-        } else {
-            (self.downloaded * 100) / self.total_changes
-        }
+        (self.downloaded * 100)
+            .checked_div(self.total_changes)
+            .unwrap_or(0)
     }
 }
 

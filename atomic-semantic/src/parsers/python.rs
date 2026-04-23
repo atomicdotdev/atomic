@@ -65,15 +65,12 @@ impl PythonParser {
                     return; // Don't recurse into class again below
                 }
             }
-            "expression_statement" => {
-                // Module-level assignments: `X = 42` or `X: int = 42`
-                if in_class.is_none() {
-                    if let Some(child) = node.child(0) {
-                        if child.kind() == "assignment" || child.kind() == "augmented_assignment" {
-                            if let Some(entity) = self.extract_assignment(&child, source, file_path)
-                            {
-                                entities.push(entity);
-                            }
+            // Module-level assignments: `X = 42` or `X: int = 42`
+            "expression_statement" if in_class.is_none() => {
+                if let Some(child) = node.child(0) {
+                    if child.kind() == "assignment" || child.kind() == "augmented_assignment" {
+                        if let Some(entity) = self.extract_assignment(&child, source, file_path) {
+                            entities.push(entity);
                         }
                     }
                 }

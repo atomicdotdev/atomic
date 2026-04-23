@@ -87,6 +87,39 @@ atomic insert @~1 --to dev
 atomic view delete agent-ses_3781fc7a6ffet5c6r1ILy1BEbv
 ```
 
+### Workspace Shelving
+
+When you switch views, Atomic automatically isolates build artifacts per view — each view gets its own `node_modules/`, `target/`, etc. But tool configs like `.opencode/`, `.vscode/`, and `.idea/` are project-wide and should persist across all views.
+
+Atomic handles this with `[workspace] expose`:
+
+```toml
+# .atomic/config.toml
+[workspace]
+expose = [".opencode", ".vscode", ".idea", ".claude", ".gemini"]
+```
+
+- **`.atomicignore`** = "don't track" (same as `.gitignore`). By default, all ignored files are **shelved per-view** on switch.
+- **`[workspace] expose`** = "persist across views". These paths are never shelved — they stay on disk through every view switch.
+
+| File | `.atomicignore` | `expose` | On view switch |
+|------|:-:|:-:|---|
+| `.opencode/`, `.vscode/` | ✓ | ✓ | **Left alone** — persists across views |
+| `node_modules/`, `target/` | ✓ | ✗ | **Shelved** per view (O(1) rename) |
+| `src/main.rs` | ✗ | — | **Tracked** — materialized from the graph |
+
+`atomic init` seeds a default `expose` list with common tool configs. Build artifacts in `.atomicignore` are shelved automatically — no per-language configuration needed.
+
+You can also set `expose` globally in `~/.atomic/config.toml` so it applies to every repository on your machine:
+
+```toml
+# ~/.atomic/config.toml
+[workspace]
+expose = [".opencode", ".vscode", ".idea", ".claude", ".gemini"]
+```
+
+Global and repo-local patterns are merged — a repo can add project-specific entries without repeating the global ones.
+
 ### Token-Level Diff
 
 Atomic's CRDT semantic layer (Trunk → Branch → Leaf) tracks changes at the token level. Two agents editing different words on the same line produce independent patches that merge cleanly — Git would flag this as a conflict.

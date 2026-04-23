@@ -222,14 +222,13 @@ impl AgentSession {
         }
     }
 
-    /// Derive the Atomic view name from a session ID.
+    /// Derive the Atomic view name for an agent session.
     ///
-    /// Format: `agent-{session_id}`
-    ///
-    /// Uses `-` as the separator because `/` is forbidden in view names
-    /// (it would create nested directories in `.atomic/workspaces/`).
-    pub fn make_view_name(session_id: &str) -> String {
-        format!("agent-{}", session_id)
+    /// Uses haikunator-style names (e.g., "bold-creek-a3f2") from the
+    /// same generator as vault goals. The `session_id` is not used in the
+    /// name — it's stored separately on the session struct.
+    pub fn make_view_name(_session_id: &str) -> String {
+        atomic_repository::generate_goal_name()
     }
 
     /// Set the AI vendor and model.
@@ -557,7 +556,7 @@ impl SessionStore {
         }
 
         // Sort by started_at, newest first
-        sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
 
         Ok(sessions)
     }
@@ -662,7 +661,15 @@ mod tests {
         assert_eq!(s.session_id, "sess-abc-123");
         assert_eq!(s.agent_name, "claude-code");
         assert_eq!(s.agent_display_name, "Claude Code");
-        assert_eq!(s.view_name, "agent-sess-abc-123");
+        // View name is haikunator-style: adjective-noun-hex
+        let parts: Vec<&str> = s.view_name.split('-').collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "view name '{}' should be adj-noun-hex",
+            s.view_name
+        );
+        assert_eq!(parts[2].len(), 4);
         assert_eq!(s.phase, Phase::Idle);
         assert_eq!(s.turn_count, 0);
         assert!(s.last_interaction.is_some());
@@ -675,11 +682,22 @@ mod tests {
 
     #[test]
     fn test_make_view_name() {
-        assert_eq!(AgentSession::make_view_name("sess-123"), "agent-sess-123");
+        let name = AgentSession::make_view_name("sess-123");
+        let parts: Vec<&str> = name.split('-').collect();
         assert_eq!(
-            AgentSession::make_view_name("2026-01-15-abc"),
-            "agent-2026-01-15-abc"
+            parts.len(),
+            3,
+            "view name '{}' should be adj-noun-hex",
+            name
         );
+        assert_eq!(parts[2].len(), 4);
+        assert!(parts[2].chars().all(|c| c.is_ascii_hexdigit()));
+        // Different calls produce different names
+        let name2 = AgentSession::make_view_name("sess-456");
+        // Could theoretically collide but astronomically unlikely
+        // Just verify format is correct
+        let parts2: Vec<&str> = name2.split('-').collect();
+        assert_eq!(parts2.len(), 3);
     }
 
     // Model info
@@ -942,7 +960,7 @@ mod tests {
         // Simulate an older session file missing optional fields
         let json = r#"{
             "session_id": "old-sess",
-            "view_name": "agent-old-sess",
+            "view_name": "bold-creek-a3f2",
             "phase": "idle",
             "turn_count": 5,
             "agent_name": "claude-code",

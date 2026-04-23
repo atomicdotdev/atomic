@@ -126,7 +126,7 @@ impl Attest {
         }
 
         // Sort by timestamp descending (newest first)
-        attestations.sort_by(|a, b| b.1.timestamp.cmp(&a.1.timestamp));
+        attestations.sort_by_key(|a| std::cmp::Reverse(a.1.timestamp));
 
         println!(
             "{} attestation{}",

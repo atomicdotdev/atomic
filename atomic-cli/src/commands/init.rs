@@ -64,6 +64,12 @@ pub const DEFAULT_VIEW_NAME: &str = "dev";
 
 // Project Kind Templates
 
+/// Default paths that persist across all views (never shelved).
+///
+/// These are tool/editor configs that are project-wide, not per-view.
+/// Everything else in `.atomicignore` gets shelved per-view on switch.
+pub const DEFAULT_EXPOSE: &[&str] = &[".opencode", ".vscode", ".idea", ".claude", ".gemini"];
+
 /// Get the .atomicignore content for a given project kind.
 ///
 /// This function returns appropriate ignore patterns for common project
@@ -546,6 +552,26 @@ impl Command for Init {
                 } else {
                     // No --kind specified — write minimal default
                     std::fs::write(&ignore_path, ".atomic\n.git\n").map_err(CliError::Io)?;
+                }
+            }
+
+            // Write [workspace] expose to config.toml so tool configs
+            // persist across view switches. Build artifacts in .atomicignore
+            // are shelved per-view by default; exposed paths are the exception.
+            {
+                let config_path = dot_dir.join("config.toml");
+                if let Ok(existing) = std::fs::read_to_string(&config_path) {
+                    let expose_array = DEFAULT_EXPOSE
+                        .iter()
+                        .map(|p| format!("\"{}\"", p))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let updated = format!(
+                        "{}\n[workspace]\nexpose = [{}]\n",
+                        existing.trim_end(),
+                        expose_array
+                    );
+                    std::fs::write(&config_path, updated).map_err(CliError::Io)?;
                 }
             }
 
