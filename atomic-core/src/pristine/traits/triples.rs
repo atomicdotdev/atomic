@@ -70,6 +70,13 @@ pub trait KgTxnT {
     /// Full-text search over node labels and summaries.
     fn kg_fts_search(&self, query: &str, limit: usize) -> Result<Vec<KgNode>, PristineError>;
 
+    /// Return ALL matching node IDs with hit counts (no truncation, no node fetching).
+    ///
+    /// This is the low-level primitive for callers that need to rank results
+    /// themselves before fetching full nodes.  Returns `(node_id, hit_count)`
+    /// pairs for every node that matches at least one query token.
+    fn kg_fts_match_ids(&self, query: &str) -> Result<Vec<(String, usize)>, PristineError>;
+
     /// Count total nodes in the KG.
     fn count_kg_nodes(&self) -> Result<usize, PristineError>;
 

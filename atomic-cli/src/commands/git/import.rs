@@ -424,6 +424,13 @@ impl Command for Import {
                 }
             }
 
+            // Build the content search index (syntext)
+            print_info("Building content search index...");
+            match atomic_repository::build_content_index(workdir) {
+                Ok(()) => print_info("Content index built."),
+                Err(e) => log::warn!("Content index build failed: {}", e),
+            }
+
             print_success(&format!(
                 "Imported {} changes from branch '{}'",
                 count, branch_name

@@ -126,6 +126,10 @@ pub mod edge_kind {
     pub const AUTHORED_BY: &str = "AUTHORED_BY";
     /// Entity has a tag/label.
     pub const HAS_LABEL: &str = "HAS_LABEL";
+    /// File belongs to a module (directory).
+    pub const PART_OF: &str = "PART_OF";
+    /// File includes/imports another file (via #include or import statement).
+    pub const INCLUDES: &str = "INCLUDES";
 }
 
 /// Check if a predicate string is a known predicate.
@@ -241,6 +245,8 @@ mod tests {
             edge_kind::BLOCKED_BY,
             edge_kind::AUTHORED_BY,
             edge_kind::HAS_LABEL,
+            edge_kind::PART_OF,
+            edge_kind::INCLUDES,
         ];
         for kind in &kinds {
             assert_eq!(

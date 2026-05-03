@@ -1,5 +1,8 @@
 //! AI provider resolution for embeddings and LLM.
 //!
+//! Submodules:
+//! - [`tools`] — provider-agnostic tool-use types, agentic loop, and repository tool executor.
+//!
 //! Resolves the best available AI provider from environment variables:
 //!
 //! | Env var              | Embedding provider             | LLM provider     |
@@ -7,6 +10,8 @@
 //! | `ANTHROPIC_API_KEY` | Voyage (voyage-3, 1024d)       | Claude Haiku     |
 //! | `OPENAI_API_KEY`    | text-embedding-3-small (1536d) | GPT-4o-mini      |
 //! | Neither             | hash_embed placeholder         | None (search only) |
+
+pub mod tools;
 
 use serde::{Deserialize, Serialize};
 
@@ -35,8 +40,8 @@ pub struct EmbeddingProvider {
 pub struct LlmProvider {
     pub provider: AiProvider,
     pub model: String,
-    api_key: String,
-    base_url: String,
+    pub(crate) api_key: String,
+    pub(crate) base_url: String,
 }
 
 /// Result of an LLM call.
@@ -150,6 +155,11 @@ impl EmbeddingProvider {
     }
 
     /// Synchronous embed using a throwaway tokio runtime (for use in non-async contexts).
+    ///
+    /// When called from within an existing Tokio runtime (e.g., from hook handlers
+    /// that call `vault_store` → `vault_auto_index` → `embed_sync`), spawns a
+    /// separate thread to avoid the "cannot start a runtime from within a runtime"
+    /// panic.
     pub fn embed_sync(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, AiError> {
         match self.provider {
             AiProvider::Local | AiProvider::None => Ok(texts
@@ -157,12 +167,28 @@ impl EmbeddingProvider {
                 .map(|t| crate::hash_embed(t, self.dimensions))
                 .collect()),
             _ => {
-                // Use a blocking runtime for API calls
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| AiError::Runtime(e.to_string()))?;
-                rt.block_on(self.embed(texts))
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    // Already inside an async runtime — run the API call on a
+                    // separate thread with its own runtime to avoid nesting.
+                    let provider = self.clone();
+                    let texts = texts.to_vec();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| AiError::Runtime(e.to_string()))?;
+                        rt.block_on(provider.embed(&texts))
+                    })
+                    .join()
+                    .unwrap_or_else(|_| Err(AiError::Runtime("Embedding thread panicked".into())))
+                } else {
+                    // Not inside a runtime — create a throwaway one directly.
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| AiError::Runtime(e.to_string()))?;
+                    rt.block_on(self.embed(texts))
+                }
             }
         }
     }

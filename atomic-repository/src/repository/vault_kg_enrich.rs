@@ -3,8 +3,12 @@
 //! Populates the knowledge graph from repository data:
 //! - Changes → `change:{hash}` nodes + `AUTHORED_BY`, `MODIFIES` edges
 //! - Files → `file:{path}` nodes
+//! - Modules → `module:{dir}` nodes + `PART_OF` edges
 //! - Views → `view:{name}` nodes + `CHILD_OF`, `ON_VIEW` edges
 //! - Dependencies → `DEPENDS_ON` edges between change nodes
+//! - Includes → `INCLUDES` edges between files (from import entities)
+
+use std::collections::{HashMap, HashSet};
 
 use super::*;
 use atomic_core::pristine::ontology::edge_kind;
@@ -26,12 +30,16 @@ impl Repository {
         // Phase 2: Tracked files → nodes
         let files = self.kg_enrich_files()?;
 
+        // Phase 2b: Module nodes + PART_OF edges
+        let modules = self.kg_enrich_modules()?;
+
         // Phase 3: Changes → nodes + edges (modifies, authored_by, on_view, depends_on)
         let changes = self.kg_enrich_changes()?;
 
         let mut stats = KgEnrichStats {
             views,
             files,
+            modules,
             changes,
             ..Default::default()
         };
@@ -42,6 +50,12 @@ impl Repository {
             stats.entities = self.kg_enrich_entities()?;
         }
 
+        // Phase 4b: INCLUDES edges (from import entities)
+        #[cfg(feature = "ast")]
+        {
+            stats.includes = self.kg_enrich_includes()?;
+        }
+
         Ok(stats)
     }
 
@@ -49,7 +63,7 @@ impl Repository {
     ///
     /// For each view in the repository, creates a `view:{name}` node and
     /// a `CHILD_OF` edge to its parent view (if any).
-    fn kg_enrich_views(&self) -> Result<usize, RepositoryError> {
+    pub fn kg_enrich_views(&self) -> Result<usize, RepositoryError> {
         let view_names = self
             .list_views()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -105,10 +119,91 @@ impl Repository {
         Ok(count)
     }
 
+    /// Enrich the KG with module (directory) nodes and `PART_OF` edges.
+    ///
+    /// For each directory that directly contains at least one tracked file,
+    /// creates a `module:{dir}` node. Then creates `PART_OF` edges from
+    /// file → module and module → parent module (only between modules that
+    /// were created, not every intermediate directory).
+    pub fn kg_enrich_modules(&self) -> Result<usize, RepositoryError> {
+        let files = self
+            .list_tracked_files()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Collect directories that directly contain at least one file.
+        let mut dirs_with_files: HashSet<String> = HashSet::new();
+        // Map each file path to its parent directory.
+        let mut file_to_dir: Vec<(String, String)> = Vec::new();
+
+        for file in &files {
+            if file.is_directory {
+                continue;
+            }
+            let path = file.path.to_string_lossy().to_string();
+            if let Some(dir) = path.rsplit_once('/').map(|(d, _)| d.to_string()) {
+                dirs_with_files.insert(dir.clone());
+                file_to_dir.push((path, dir));
+            }
+            // Files at the root level (no '/') don't belong to a module.
+        }
+
+        if dirs_with_files.is_empty() {
+            return Ok(0);
+        }
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut count = 0;
+
+        // Create module nodes for each directory that has direct files.
+        for dir in &dirs_with_files {
+            let label = dir.rsplit('/').next().unwrap_or(dir);
+            let node = KgNode::new(format!("module:{}", dir), "module", label, "vcs")
+                .with_summary(dir.as_str());
+
+            txn.upsert_kg_node(&node)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            count += 1;
+        }
+
+        // PART_OF edges: file → module
+        for (file_path, dir) in &file_to_dir {
+            let edge = KgEdge::new(
+                format!("file:{}", file_path),
+                format!("module:{}", dir),
+                edge_kind::PART_OF,
+            );
+            txn.upsert_kg_edge(&edge)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
+
+        // PART_OF edges: child module → parent module (only between existing modules).
+        for dir in &dirs_with_files {
+            if let Some((parent, _)) = dir.rsplit_once('/') {
+                if dirs_with_files.contains(parent) {
+                    let edge = KgEdge::new(
+                        format!("module:{}", dir),
+                        format!("module:{}", parent),
+                        edge_kind::PART_OF,
+                    );
+                    txn.upsert_kg_edge(&edge)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                }
+            }
+        }
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(count)
+    }
+
     /// Enrich the KG with tracked file nodes.
     ///
     /// Creates a `file:{path}` node for each file tracked in the repository.
-    fn kg_enrich_files(&self) -> Result<usize, RepositoryError> {
+    pub fn kg_enrich_files(&self) -> Result<usize, RepositoryError> {
         let files = self
             .list_tracked_files()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -143,7 +238,7 @@ impl Repository {
     /// - Creates `ON_VIEW` edge to the current view
     /// - Creates `DEPENDS_ON` edges to dependency changes
     /// - Creates `MODIFIES` edges to files (via `FileOps` in the change)
-    fn kg_enrich_changes(&self) -> Result<usize, RepositoryError> {
+    pub fn kg_enrich_changes(&self) -> Result<usize, RepositoryError> {
         use crate::history::HistoryOptions;
 
         let history = self
@@ -437,12 +532,137 @@ impl Repository {
 
     /// Enrich the KG with AST entities from tracked files.
     ///
+    /// Enrich the KG with `INCLUDES` edges derived from import entities.
+    ///
+    /// Re-parses tracked source files for import statements and attempts to
+    /// resolve each import path to an existing `file:{path}` node in the KG.
+    /// If a match is found, creates an `INCLUDES` edge from the source file
+    /// to the included file. Best-effort — unresolvable imports are skipped.
+    #[cfg(feature = "ast")]
+    pub fn kg_enrich_includes(&self) -> Result<usize, RepositoryError> {
+        let files = self
+            .list_tracked_files()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Build a lookup set of tracked file paths for resolution.
+        let tracked_paths: HashSet<String> = files
+            .iter()
+            .filter(|f| !f.is_directory)
+            .map(|f| f.path.to_string_lossy().to_string())
+            .collect();
+
+        // Also build a map from filename → full paths for fuzzy resolution.
+        let mut basename_to_paths: HashMap<String, Vec<String>> = HashMap::new();
+        for path in &tracked_paths {
+            if let Some(basename) = path.rsplit('/').next() {
+                basename_to_paths
+                    .entry(basename.to_string())
+                    .or_default()
+                    .push(path.clone());
+            }
+        }
+
+        let mut parser_registry = atomic_semantic::ParserRegistry::new();
+        let mut count = 0;
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        for file in &files {
+            if file.is_directory {
+                continue;
+            }
+
+            let path_str = file.path.to_string_lossy().to_string();
+
+            if !atomic_semantic::is_supported(&path_str) {
+                continue;
+            }
+
+            let abs_path = self.root().join(&file.path);
+            let source = match std::fs::read_to_string(&abs_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            let entities = parser_registry.extract(&path_str, &source);
+
+            for entity in &entities {
+                if entity.kind != atomic_semantic::EntityKind::Import {
+                    continue;
+                }
+
+                // Try to resolve the import name to a tracked file.
+                let import_name = &entity.name;
+
+                // Strategy 1: treat as a relative path from the source file's directory.
+                let resolved = if let Some((src_dir, _)) = path_str.rsplit_once('/') {
+                    let candidate = format!("{}/{}", src_dir, import_name);
+                    if tracked_paths.contains(&candidate) {
+                        Some(candidate)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Strategy 2: treat as an absolute project path.
+                let resolved = resolved.or_else(|| {
+                    if tracked_paths.contains(import_name) {
+                        Some(import_name.clone())
+                    } else {
+                        None
+                    }
+                });
+
+                // Strategy 3: match by basename (e.g., "header.h" → "src/header.h").
+                let resolved = resolved.or_else(|| {
+                    let basename = import_name.rsplit('/').next().unwrap_or(import_name);
+                    if let Some(candidates) = basename_to_paths.get(basename) {
+                        if candidates.len() == 1 {
+                            Some(candidates[0].clone())
+                        } else {
+                            // Ambiguous — try to pick the candidate whose path ends with the import.
+                            candidates
+                                .iter()
+                                .find(|c| c.ends_with(import_name))
+                                .cloned()
+                        }
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(target_path) = resolved {
+                    if target_path == path_str {
+                        continue; // skip self-includes
+                    }
+                    let edge = KgEdge::new(
+                        format!("file:{}", path_str),
+                        format!("file:{}", target_path),
+                        edge_kind::INCLUDES,
+                    );
+                    txn.upsert_kg_edge(&edge)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    count += 1;
+                }
+            }
+        }
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(count)
+    }
+
     /// Parses all supported source files in the working copy and creates
     /// `entity:{file}:{name}:{line}` nodes with `DEFINES` edges from
     /// the corresponding file nodes. Runs during bulk enrichment
     /// (`atomic vault query enrich`, `atomic git import`).
     #[cfg(feature = "ast")]
-    fn kg_enrich_entities(&self) -> Result<usize, RepositoryError> {
+    pub fn kg_enrich_entities(&self) -> Result<usize, RepositoryError> {
         let files = self
             .list_tracked_files()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -517,16 +737,20 @@ pub struct KgEnrichStats {
     pub views: usize,
     /// Number of file nodes created.
     pub files: usize,
+    /// Number of module nodes created.
+    pub modules: usize,
     /// Number of change nodes created.
     pub changes: usize,
     /// Number of AST entity nodes created.
     pub entities: usize,
+    /// Number of INCLUDES edges created.
+    pub includes: usize,
 }
 
 impl KgEnrichStats {
     /// Total number of nodes created across all phases.
     pub fn total(&self) -> usize {
-        self.views + self.files + self.changes + self.entities
+        self.views + self.files + self.modules + self.changes + self.entities + self.includes
     }
 }
 
@@ -534,8 +758,8 @@ impl std::fmt::Display for KgEnrichStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} views, {} files, {} changes, {} entities",
-            self.views, self.files, self.changes, self.entities
+            "{} views, {} files, {} modules, {} changes, {} entities, {} includes",
+            self.views, self.files, self.modules, self.changes, self.entities, self.includes
         )
     }
 }
@@ -558,12 +782,14 @@ mod tests {
         let stats = KgEnrichStats {
             views: 3,
             files: 10,
+            modules: 2,
             changes: 5,
             entities: 8,
+            includes: 4,
         };
         assert_eq!(
             stats.to_string(),
-            "3 views, 10 files, 5 changes, 8 entities"
+            "3 views, 10 files, 2 modules, 5 changes, 8 entities, 4 includes"
         );
     }
 
@@ -572,10 +798,12 @@ mod tests {
         let stats = KgEnrichStats {
             views: 2,
             files: 7,
+            modules: 3,
             changes: 3,
             entities: 4,
+            includes: 1,
         };
-        assert_eq!(stats.total(), 16);
+        assert_eq!(stats.total(), 20);
     }
 
     #[test]
@@ -583,10 +811,15 @@ mod tests {
         let stats = KgEnrichStats::default();
         assert_eq!(stats.views, 0);
         assert_eq!(stats.files, 0);
+        assert_eq!(stats.modules, 0);
         assert_eq!(stats.changes, 0);
         assert_eq!(stats.entities, 0);
+        assert_eq!(stats.includes, 0);
         assert_eq!(stats.total(), 0);
-        assert_eq!(stats.to_string(), "0 views, 0 files, 0 changes, 0 entities");
+        assert_eq!(
+            stats.to_string(),
+            "0 views, 0 files, 0 modules, 0 changes, 0 entities, 0 includes"
+        );
     }
 
     #[test]

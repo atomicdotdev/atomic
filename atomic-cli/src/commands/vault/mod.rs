@@ -47,7 +47,6 @@ pub mod intent;
 pub mod list;
 pub mod materialize;
 pub mod memory;
-pub mod query;
 pub mod show;
 pub mod summaries;
 pub mod sync;
@@ -60,10 +59,13 @@ pub use intent::Intent;
 pub use list::List;
 pub use materialize::Materialize;
 pub use memory::Memory;
-pub use query::Query;
 pub use show::Show;
 pub use summaries::Summaries;
 pub use sync::Sync;
+
+// Query is a top-level command (atomic query), re-imported here for
+// backward compatibility (atomic vault query).
+pub use crate::commands::query::Query;
 
 use crate::commands::Command;
 use crate::error::CliResult;
@@ -195,16 +197,12 @@ pub enum VaultCommands {
     /// ```
     Summaries(Summaries),
 
-    /// Query the vault knowledge graph.
-    ///
-    /// Search nodes, explore neighborhoods, and rebuild the KG index.
+    /// Query the knowledge graph (alias for `atomic query`).
     ///
     /// # Examples
     ///
     /// ```text
     /// atomic vault query search "authentication"
-    /// atomic vault query neighbors "goal:abc" -d 1
-    /// atomic vault query reindex
     /// ```
     Query(Query),
 }

@@ -19,7 +19,7 @@ Atomic is version control that understands AI-assisted development from the grou
 | **Provenance** | Not tracked | Causal decision graph: goal → exploration → commitment → verification |
 | **Attestation** | Not tracked | Session-level audit nodes with cost, token breakdown, and change coverage |
 | **Turn recording** | Manual commits or wrapper scripts | Automatic — each agent turn is a change with full metadata |
-| **Agent isolation** | Branches diverge and need merging | Stacks are views of the same graph — isolated agent work, zero-orphan cleanup |
+| **Agent isolation** | Branches diverge and need merging | Views are filtered perspectives of the same graph — isolated agent work, zero-orphan cleanup |
 | **Conflict granularity** | Whole lines | Token-level — two agents editing different tokens on the same line don't conflict |
 | **Identity** | Name + email string | Ed25519 cryptographic identity with agent delegation scopes |
 | **Merge correctness** | Heuristic 3-way merge | Mathematical — commutative when changes are independent, precise when they're not |
@@ -77,13 +77,13 @@ Total: $0.12 · 3 changes covered · 20.5k tokens
 Agents work on isolated views of the same underlying graph. No branch divergence, no merge commits, no orphaned history.
 
 ```bash
-# Agent session creates an isolated stack automatically
-# Stack: agent-ses_3781fc7a6ffet5c6r1ILy1BEbv (Local, parent: dev)
+# Agent session creates an isolated view automatically
+# View: agent-ses_3781fc7a6ffet5c6r1ILy1BEbv (Draft, parent: dev)
 
-# When done, apply changes to the parent stack
+# When done, insert changes into the parent view
 atomic insert @~1 --to dev
 
-# Delete the agent stack — cascade-deletes its edges, zero orphans
+# Delete the agent view — cascade-deletes its edges, zero orphans
 atomic view delete agent-ses_3781fc7a6ffet5c6r1ILy1BEbv
 ```
 
@@ -158,49 +158,59 @@ The vault stores five kinds of content:
 
 Everything is content-addressed and version-controlled. When an agent starts a session, it reads the vault for context. When it finishes, its learnings go back into the vault for the next session — human or machine.
 
-### Knowledge Graph Queries with LLM Assist
+### Knowledge Graph — Code Intelligence at Scale
 
-The vault builds a **knowledge graph** from your repository's version control data — changes, files, views, code entities, and their relationships. You can search it directly, explore neighborhoods, or ask natural-language questions that get answered by an LLM grounded in your actual codebase.
+Atomic builds a **knowledge graph** from your entire codebase — source code content, file structure, tree-sitter entities (functions, classes, types), module hierarchy, change history, and their relationships. Search it, traverse it, visualize it, or let an LLM explore it with tools.
 
 ```bash
-# Ask a question about your project — RAG-powered, grounded in your KG
-atomic vault query ask "who fixed the auth bug?"
+# Search the knowledge graph — unified structural + content search
+atomic query search "replication"
 
-# Search the knowledge graph directly
-atomic vault query search "payment service"
+# Search source code content (powered by syntext trigram index)
+atomic query code "replication" -t cpp -g src/mongo/db/repl/
+
+# List tree-sitter entities in a file (functions, classes, types)
+atomic query entities src/mongo/db/repl/replication_coordinator_impl.cpp
 
 # Explore relationships around a node (1-2 hops)
-atomic vault query neighbors "file:src/auth.rs"
+atomic query neighbors "module:src/mongo/db/repl"
+
+# Visualize the graph — opens interactive D3 force-directed layout
+atomic query graph "replication" -k 20 --depth 2
 ```
 
-When you run `ask`, Atomic executes a six-step RAG pipeline:
+The KG contains seven node types connected by typed edges:
 
 ```
-Question: "who fixed the auth bug?"
-  │
-  ├─ 1. Tokenize     → extract keywords + bigrams
-  ├─ 2. KG Search    → find matching nodes (changes, files, entities)
-  ├─ 3. File Paths   → collect source files from matched nodes
-  ├─ 4. Grep Source   → search source files for terms with context
-  ├─ 5. Build Prompt  → KG nodes + edges + source snippets
-  └─ 6. LLM Call      → synthesize answer grounded in real data
-
-Answer: "The token validation bug in src/auth.rs was fixed by
-        @alice in change XMJZ3IPF on Jan 15. The change modified
-        verify_token() to check expiration before signature..."
+module:src/mongo/db/repl          ← directory-level grouping
+  ├─ PART_OF ← file:replication_coordinator.h    ← tracked files
+  │              ├─ DEFINES → entity:ReplicationCoordinator (class, L42-890)
+  │              └─ INCLUDES → file:replication_process.h
+  ├─ PART_OF ← file:bgsync.cpp
+  │              └─ MODIFIES ← change:R4YQUAS2 ("fix replication lag")
+  │                              ├─ AUTHORED_BY → identity:alice
+  │                              └─ DEPENDS_ON → change:XMJZ3IPF
+  └─ PART_OF → module:src/mongo/db  (parent module)
 ```
 
-The knowledge graph contains nodes for changes, files, code entities (functions, structs), and views — connected by edges like `modifies`, `authored_by`, `depends_on`, and `defines`. The LLM sees real KG relationships and source code, not hallucinated context.
+Search is powered by two indexes that work together:
+- **KG FTS** — searches node labels, summaries, and metadata (structural search)
+- **syntext** — trigram-indexed content search across all source files, ~20x faster than grep
 
-For programmatic or agent use, structured query plans let you chain KG search, graph traversal, vector search, and content reads in a single JSON document — the LLM emits ~100 tokens of query plan, the executor runs it for free against the local database, and only the compact results go back.
+Results are ranked: `src/` files above tests, modules above flat files, content match counts as a signal. A bounded min-heap ensures the top N results surface from thousands of matches without sorting the full set.
+
+For agents (Claude Code, Gemini, etc.), the CLI commands ARE the tools. An agent calls `atomic query search`, `atomic query neighbors`, `atomic query entities`, and its own `read_file` — the same path a human follows. No grep, no find, no LLM-calling-LLM overhead.
+
+For humans on the terminal, `ask` provides an agentic loop with tool use:
 
 ```bash
-# Execute a structured query plan (from stdin or an agent)
-echo '{"steps":[{"type":"kg_search","query":"auth","limit":5,"bind":"r"}]}' \
-  | atomic vault query plan
+# LLM explores the KG with tools and answers your question
+atomic query ask "who fixed the auth bug?"
 ```
 
-No API key required for search and graph exploration. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` to enable LLM-assisted answers.
+The `ask` command gives the LLM six tools (`kg_search`, `kg_neighbors`, `read_file`, `list_entities`, `code_search`, `vault_read`) and lets it decide what to look up. Provider-agnostic — works with Anthropic or OpenAI. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` to enable.
+
+No API key required for `search`, `code`, `entities`, `neighbors`, `graph`, or `enrich`.
 
 ## Quick Start
 
@@ -215,8 +225,8 @@ atomic record -m "Initial commit"
 # Enable AI agent hooks
 atomic agent enable
 
-# Create a stack
-atomic stack new feature-x
+# Create a view
+atomic view create feature-x
 
 # Push to a remote
 atomic push origin
@@ -260,15 +270,29 @@ Every change stores two parallel representations:
 | `atomic log` | Show change history |
 | `atomic change [hash]` | Show details for a specific change |
 
-### Stack Commands
+### Query Commands
 
 | Command | Description |
 |---------|-------------|
-| `atomic stack new <name>` | Create a new stack |
-| `atomic stack switch <name>` | Switch to a stack |
-| `atomic stack list` | List all stacks |
-| `atomic stack delete <name>` | Delete a stack |
-| `atomic split <name>` | Create a new stack from the current one |
+| `atomic query search <query>` | Search the knowledge graph (structural + content) |
+| `atomic query code <pattern>` | Search source code content (trigram-indexed, `-t` for file type, `-g` for path filter) |
+| `atomic query entities <path>` | List tree-sitter entities in a file (functions, classes, types with line ranges) |
+| `atomic query neighbors <id>` | Explore the graph around a node (DEFINES, MODIFIES, PART_OF, INCLUDES edges) |
+| `atomic query graph <query>` | Visualize the knowledge graph as interactive HTML (D3 force-directed, `-k` seeds, `--depth`, `--kinds`) |
+| `atomic query ask <question>` | Natural-language Q&A with agentic tool loop (requires API key) |
+| `atomic query enrich` | Build/rebuild KG from VCS data + content index (modules, entities, includes) |
+| `atomic query index` | Build/update the content search index (`--rebuild` for full, `--stats` for info) |
+| `atomic query reindex` | Rebuild the KG index from vault entries |
+
+### View Commands
+
+| Command | Description |
+|---------|-------------|
+| `atomic view create <name>` | Create a new view (`--draft` for isolated, `--parent` to set parent) |
+| `atomic view switch <name>` | Switch to a view |
+| `atomic view list` | List all views (`--verbose` for scope and parent) |
+| `atomic view delete <name>` | Delete a view |
+| `atomic split <name>` | Create a new view from the current one |
 | `atomic stash` | Temporarily save uncommitted changes |
 
 ### Remote Commands
@@ -327,13 +351,6 @@ Every change stores two parallel representations:
 | `atomic vault list` | List all vault entries (filter with `--type`) |
 | `atomic vault show <path>` | Print a vault entry's content |
 | `atomic vault sync` | Sync vault entries between disk and database |
-| `atomic vault query search <query>` | Keyword search over the knowledge graph |
-| `atomic vault query neighbors <id>` | Explore the graph around a node |
-| `atomic vault query ask <question>` | Natural-language Q&A with LLM assist |
-| `atomic vault query plan` | Execute a structured JSON query plan |
-| `atomic vault query embed` | Rebuild vector embeddings |
-| `atomic vault query enrich` | Rebuild KG from VCS data |
-| `atomic vault query reindex` | Rebuild KG index from vault entries |
 
 #### Supported Agents
 

@@ -4,6 +4,7 @@
 //! memory, skills) and stores them in the pristine KG tables.
 
 use super::*;
+use crate::content_search::{has_content_index, search_content, ContentSearchOptions};
 use atomic_core::pristine::ontology::edge_kind;
 use atomic_core::pristine::vault::{KgEdge, KgNode, KgSubgraph, VaultEntry, VaultEntryType};
 use atomic_core::pristine::{KgMutTxnT, KgTxnT};
@@ -137,14 +138,273 @@ impl Repository {
         query: &str,
         limit: usize,
     ) -> Result<Vec<KgNode>, RepositoryError> {
+        use std::cmp::Reverse;
+        use std::collections::{BinaryHeap, HashMap, HashSet};
+
         let txn = self
             .pristine
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        txn.kg_fts_search(query, limit)
-            .map_err(|e| RepositoryError::Database(e.to_string()))
+
+        // ── Phase 1: Collect ALL matching node IDs (cheap — no node fetching) ──
+
+        // KG FTS: every node ID that matches any query token, with hit counts.
+        let kg_matches: HashMap<String, usize> = txn
+            .kg_fts_match_ids(query)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .into_iter()
+            .collect();
+
+        // Content search: file-level matches from syntext, grouped by path.
+        let mut content_counts: HashMap<String, usize> = HashMap::new();
+        if has_content_index(self.root()) {
+            let opts = ContentSearchOptions {
+                max_results: Some(2000),
+                ..Default::default()
+            };
+            if let Ok(content_results) = search_content(self.root(), query, opts) {
+                for m in &content_results.matches {
+                    *content_counts.entry(m.path.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // ── Phase 2: Stream candidates through a bounded min-heap ──────────
+        //
+        // As each candidate arrives, score it and bubble it into the heap.
+        // The heap holds at most `limit` items — weakest score at the top.
+        // If a new candidate beats the weakest, it replaces it.
+        // We never allocate more than `limit` entries.
+
+        // Min-heap: Reverse so BinaryHeap (max-heap) gives us min-score at top.
+        // Tuple: (score, node_id, content_match_count)
+        let mut heap: BinaryHeap<Reverse<(u64, String, usize)>> =
+            BinaryHeap::with_capacity(limit + 1);
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // Helper: push a candidate into the bounded heap
+        let mut push_candidate =
+            |id: String,
+             kg_hits: usize,
+             content_matches: usize,
+             heap: &mut BinaryHeap<Reverse<(u64, String, usize)>>| {
+                let score = id_rank_score(&id, kg_hits, content_matches);
+                if heap.len() < limit {
+                    heap.push(Reverse((score, id, content_matches)));
+                } else if let Some(&Reverse((min_score, _, _))) = heap.peek() {
+                    if score > min_score {
+                        heap.pop();
+                        heap.push(Reverse((score, id, content_matches)));
+                    }
+                }
+            };
+
+        // Stream KG matches through the heap
+        for (id, kg_hits) in &kg_matches {
+            let cm = id
+                .strip_prefix("file:")
+                .and_then(|p| content_counts.get(p))
+                .copied()
+                .unwrap_or(0);
+            seen.insert(id.clone());
+            push_candidate(id.clone(), *kg_hits, cm, &mut heap);
+        }
+
+        // Stream content-only files (not already seen from KG)
+        for (path, &count) in &content_counts {
+            let file_id = format!("file:{}", path);
+            if seen.contains(&file_id) {
+                continue;
+            }
+            push_candidate(file_id, 0, count, &mut heap);
+        }
+
+        // ── Phase 3: Extract top N in descending score order ───────────────
+
+        let mut ranked: Vec<(u64, String, usize)> =
+            heap.into_iter().map(|Reverse(entry)| entry).collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0)); // highest score first
+
+        // ── Phase 4: Fetch full nodes only for the top N ───────────────────
+
+        let mut results: Vec<KgNode> = Vec::with_capacity(ranked.len());
+        for (_score, id, content_match_count) in &ranked {
+            let node = match txn.get_kg_node(id) {
+                Ok(Some(mut n)) => {
+                    if *content_match_count > 0 {
+                        let md = n.metadata.get_or_insert_with(|| serde_json::json!({}));
+                        if let Some(obj) = md.as_object_mut() {
+                            obj.insert(
+                                "content_matches".to_string(),
+                                serde_json::json!(content_match_count),
+                            );
+                        }
+                    }
+                    n
+                }
+                _ => {
+                    // Node not in KG — create a stub (content-only file)
+                    let label = id
+                        .strip_prefix("file:")
+                        .and_then(|p| p.rsplit_once('/').map(|(_, name)| name))
+                        .unwrap_or(id);
+                    let mut n = KgNode::new(id, "file", label, "content_search");
+                    if *content_match_count > 0 {
+                        n = n.with_metadata(
+                            serde_json::json!({"content_matches": content_match_count}),
+                        );
+                    }
+                    n
+                }
+            };
+            results.push(node);
+        }
+
+        Ok(results)
+    }
+}
+
+/// Compute a ranking score from a node ID and match counts.
+///
+/// Higher score = more relevant.  Works on IDs only (no node fetching needed).
+/// Combines: node kind weight, path tier, KG hit count, content match count.
+fn id_rank_score(id: &str, kg_hits: usize, content_matches: usize) -> u64 {
+    // Base score by node kind (inferred from ID prefix)
+    let kind_score: u64 = if id.starts_with("module:") {
+        500
+    } else if id.starts_with("file:") {
+        400
+    } else if id.starts_with("entity:") {
+        300
+    } else if id.starts_with("change:") {
+        100
+    } else {
+        200
+    };
+
+    // Extract path from the ID for tier ranking
+    let path = extract_path_from_id(id);
+    let tier_penalty: u64 = match path_tier(path) {
+        0 => 0,   // src/ — no penalty
+        1 => 20,  // other code files
+        2 => 80,  // test files
+        3 => 120, // docs
+        4 => 200, // config/build/CI
+        _ => 150,
+    };
+
+    // KG hit bonus: multi-token matches are more relevant
+    let kg_bonus: u64 = (kg_hits as u64).saturating_sub(1) * 50;
+
+    // Content match bonus: files with many content hits are more relevant
+    let content_bonus: u64 = (content_matches as u64).min(100);
+
+    kind_score.saturating_sub(tier_penalty) + kg_bonus + content_bonus
+}
+
+/// Extract a file path from a node ID for ranking purposes.
+fn extract_path_from_id(id: &str) -> &str {
+    if let Some(path) = id.strip_prefix("file:") {
+        return path;
+    }
+    if let Some(path) = id.strip_prefix("module:") {
+        return path;
+    }
+    // entity:file:name:line — extract the file portion
+    if let Some(rest) = id.strip_prefix("entity:") {
+        // e.g., "src/mongo/db/repl/repl.cpp:ReplicationCoordinator:42"
+        // Find the second-to-last colon to get the file path
+        let parts: Vec<&str> = rest.rsplitn(3, ':').collect();
+        if parts.len() == 3 {
+            return parts[2];
+        }
+    }
+    id
+}
+
+/// Assign a ranking tier to a file path.
+///
+/// Lower tier = higher priority (less penalty).
+fn path_tier(path: &str) -> u8 {
+    // Tier 0: primary source directories
+    let source_prefixes = ["src/", "lib/", "pkg/", "internal/", "cmd/", "app/"];
+    for prefix in &source_prefixes {
+        if path.starts_with(prefix) {
+            if is_test_path(path) {
+                return 2;
+            }
+            return 0;
+        }
     }
 
+    // Tier 1: other code files
+    let code_extensions = [
+        ".rs", ".go", ".py", ".ts", ".js", ".cpp", ".cc", ".c", ".h", ".hpp", ".java", ".kt",
+        ".swift", ".rb", ".cs",
+    ];
+    if code_extensions.iter().any(|ext| path.ends_with(ext)) {
+        if is_test_path(path) {
+            return 2;
+        }
+        return 1;
+    }
+
+    // Tier 2: test paths
+    if is_test_path(path) {
+        return 2;
+    }
+
+    // Tier 3: docs
+    if path.ends_with(".md") || path.starts_with("docs/") || path.starts_with("doc/") {
+        return 3;
+    }
+
+    // Tier 4: build scripts, config, CI, generated files
+    let low_priority = [
+        "buildscripts/",
+        "build/",
+        ".github/",
+        "ci/",
+        "scripts/",
+        "debian/",
+        "rpm/",
+        "packaging/",
+        "vendor/",
+        "third_party/",
+        "node_modules/",
+        "target/",
+    ];
+    if low_priority.iter().any(|p| path.starts_with(p)) {
+        return 4;
+    }
+    if path.ends_with(".yml")
+        || path.ends_with(".yaml")
+        || path.ends_with(".toml")
+        || path.ends_with(".json")
+        || path.ends_with(".xml")
+        || path.ends_with(".cfg")
+    {
+        return 4;
+    }
+
+    3
+}
+
+/// Heuristic: is this path a test file?
+fn is_test_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.contains("/test/")
+        || lower.contains("/tests/")
+        || lower.contains("_test.")
+        || lower.contains("_test_")
+        || lower.contains(".test.")
+        || lower.starts_with("test/")
+        || lower.starts_with("tests/")
+        || lower.starts_with("jstests/")
+        || lower.starts_with("testdata/")
+}
+
+impl Repository {
     /// Get the neighborhood subgraph around a node.
     pub fn vault_kg_neighbors(
         &self,

@@ -606,8 +606,8 @@ mod tests {
         let entry = create_test_entry_with_header();
         let output = log.format_default(&[entry], 8);
 
-        // Should contain change header
-        assert!(output.contains("change"));
+        // Should contain === header markers
+        assert!(output.contains("==="));
         // Should contain author
         assert!(output.contains("Author:"));
         assert!(output.contains("Test User"));
@@ -635,7 +635,7 @@ mod tests {
         let output = log.format_default(&[entry], 8);
 
         // Should have change line but no author/date/message
-        assert!(output.contains("change"));
+        assert!(output.contains("==="));
         // Should not panic, should handle missing info gracefully
     }
 

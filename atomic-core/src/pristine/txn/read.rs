@@ -835,6 +835,35 @@ impl KgTxnT for ReadTxn {
         Ok(nodes)
     }
 
+    fn kg_fts_match_ids(&self, query: &str) -> PristineResult<Vec<(String, usize)>> {
+        let fts_table = match self.txn.open_multimap_table(KG_FTS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+
+        let tokens = tokenize_for_fts(query);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut hit_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for token in &tokens {
+            let iter = match fts_table.get(token.as_str()) {
+                Ok(iter) => iter,
+                Err(_) => continue,
+            };
+            for result in iter {
+                let node_id_guard = result?;
+                let node_id = node_id_guard.value().to_string();
+                *hit_counts.entry(node_id).or_insert(0) += 1;
+            }
+        }
+
+        Ok(hit_counts.into_iter().collect())
+    }
+
     fn count_kg_nodes(&self) -> PristineResult<usize> {
         let table = match self.txn.open_table(KG_NODES) {
             Ok(t) => t,

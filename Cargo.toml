@@ -9,6 +9,7 @@ members = [
     "atomic-remote",
     "atomic-repository",
     "atomic-semantic",
+    "atomic-teams",
 ]
 
 [workspace.package]
@@ -29,6 +30,7 @@ atomic-identity = { path = "atomic-identity" }
 atomic-remote = { path = "atomic-remote" }
 atomic-repository = { path = "atomic-repository" }
 atomic-semantic = { path = "atomic-semantic" }
+atomic-teams = { path = "atomic-teams" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -70,6 +72,9 @@ url = "2.5"
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
+# IDs
+uuid = { version = "1.0", features = ["serde", "v4"] }
+
 # Utilities
 thiserror = "1.0"
 anyhow = "1.0"
@@ -86,6 +91,9 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Diff algorithms
 similar = "2.4"
+
+# Content search index
+syntext = { version = "1.1", default-features = false, features = ["memmap2", "rayon", "fs2", "ignore"] }
 
 # Git interop
 # vendored-openssl compiles OpenSSL from source, which is required for

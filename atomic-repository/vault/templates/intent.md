@@ -5,34 +5,38 @@
 
 ---
 
-## Description
+## Problem
 
-REPLACE THIS with a clear description of the problem or feature.
+REPLACE with what is broken or missing, and why it matters. Not a solution description.
 
 ## Acceptance Criteria
 
 - [ ] REPLACE with first testable criterion
 - [ ] REPLACE with second testable criterion
-- [ ] REPLACE with third testable criterion
 
-## Files to Modify
+## Scope
 
-| File | Change | Reason |
-|------|--------|--------|
-| REPLACE with file path | REPLACE with what changes | REPLACE with why |
+**In:**
+- REPLACE with specific crate, module, or component
 
-## Approach
+**Out:**
+- REPLACE with what is explicitly excluded
 
-**Step 1:** REPLACE with first action
-- Key functions: REPLACE with function names from KG
+## Constraints
 
-**Step 2:** REPLACE with second action
-- Key functions: REPLACE with function names from KG
+- REPLACE with technical limits, compatibility requirements, or design decisions
 
-## Test Strategy
+## Dependencies
 
-REPLACE with how you will verify each acceptance criterion.
+None
 
-## Notes
+## TODOs
 
-REPLACE with findings from code exploration, trade-offs, and open questions.
+- [ ] `{{id}}/1` REPLACE with first independently executable task
+  **Files:** REPLACE with specific file paths from codebase search
+  **Criteria:** REPLACE with how to verify this TODO is done
+
+- [ ] `{{id}}/2` REPLACE with second task
+  **Files:** REPLACE with specific file paths
+  **Criteria:** REPLACE with verification criteria
+  **Depends:** `{{id}}/1` (if dependent, otherwise omit this line)
