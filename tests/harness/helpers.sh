@@ -71,7 +71,9 @@ atomic() {
 _HARNESS_TMPDIRS=()
 
 cleanup_tempdirs() {
-    for d in "${_HARNESS_TMPDIRS[@]}"; do
+    # ${arr[@]+...} guards against "unbound variable" on bash <4.4 when the
+    # array is empty and `set -u` (nounset) is active.
+    for d in ${_HARNESS_TMPDIRS[@]+"${_HARNESS_TMPDIRS[@]}"}; do
         rm -rf "$d" 2>/dev/null || true
     done
 }
