@@ -76,58 +76,7 @@ impl Repository {
         let options = if view.kind.is_shared() && view.parent.is_none() {
             RetrieveOptions::default()
         } else {
-            let mut change_filter = collect_view_change_ids(&txn, &view)?;
-
-            // Expand with dependencies from change FILES (not the DEPS
-            // table which is for attestations).
-            let direct_ids: Vec<NodeId> = change_filter.iter().copied().collect();
-            for node_id in direct_ids {
-                if let Ok(Some(hash)) = txn.get_external(node_id) {
-                    if let Ok(change) = self.load_change(&hash) {
-                        for dep_hash in change.dependencies() {
-                            if let Ok(Some(dep_id)) = txn.get_internal(dep_hash) {
-                                change_filter.insert(dep_id);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // For draft views, include parent chain changes.
-            if view.kind.is_draft() {
-                let chain = txn
-                    .resolve_view_chain(&view)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                for &ancestor_id in &chain {
-                    if ancestor_id == view.id {
-                        continue;
-                    }
-                    if let Some(ancestor) = txn
-                        .get_view_by_id(ancestor_id)
-                        .map_err(|e| RepositoryError::Database(e.to_string()))?
-                    {
-                        let ancestor_ids = collect_view_change_ids(&txn, &ancestor)?;
-                        change_filter.extend(ancestor_ids);
-                    }
-                }
-
-                let mut cursor = view.parent;
-                while let Some(pid) = cursor {
-                    let parent = txn
-                        .get_view_by_id(pid)
-                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                    match parent {
-                        Some(p) if p.kind.is_shared() => {
-                            let shared_ids = collect_view_change_ids(&txn, &p)?;
-                            change_filter.extend(shared_ids);
-                            break;
-                        }
-                        Some(p) => cursor = p.parent,
-                        None => break,
-                    }
-                }
-            }
-
+            let change_filter = collect_visible_change_ids_with_deps(&txn, &view)?;
             RetrieveOptions::new().with_change_filter(change_filter)
         };
 
@@ -188,41 +137,11 @@ impl Repository {
             Err(e) => return Err(RepositoryError::Database(e.to_string())),
         };
 
-        let mut change_filter = collect_view_change_ids(&txn, &view)?;
-
-        if view.kind.is_draft() {
-            let chain = txn
-                .resolve_view_chain(&view)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            for &ancestor_id in &chain {
-                if ancestor_id == view.id {
-                    continue;
-                }
-                if let Some(ancestor) = txn
-                    .get_view_by_id(ancestor_id)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?
-                {
-                    let ancestor_ids = collect_view_change_ids(&txn, &ancestor)?;
-                    change_filter.extend(ancestor_ids);
-                }
-            }
-
-            let mut cursor = view.parent;
-            while let Some(pid) = cursor {
-                let parent = txn
-                    .get_view_by_id(pid)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                match parent {
-                    Some(p) if p.kind.is_shared() => {
-                        let shared_ids = collect_view_change_ids(&txn, &p)?;
-                        change_filter.extend(shared_ids);
-                        break;
-                    }
-                    Some(p) => cursor = p.parent,
-                    None => break,
-                }
-            }
-        }
+        let mut change_filter = if view.kind.is_shared() && view.parent.is_none() {
+            collect_view_change_ids(&txn, &view)?
+        } else {
+            collect_visible_change_ids_with_deps(&txn, &view)?
+        };
 
         // Remove the excluded change from the filter
         if let Ok(Some(exclude_id)) = txn.get_internal(exclude_hash) {
@@ -383,7 +302,11 @@ impl Repository {
                 name: view_name.to_string(),
             })?;
 
-        let change_filter = collect_view_change_ids(&txn, &view)?;
+        let change_filter = if view.kind.is_shared() && view.parent.is_none() {
+            collect_view_change_ids(&txn, &view)?
+        } else {
+            collect_visible_change_ids_with_deps(&txn, &view)?
+        };
 
         // Use the filtered retrieval method
         self.get_file_content_with_filter(&txn, &normalized, change_filter, true)

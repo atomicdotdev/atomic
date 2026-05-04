@@ -122,4 +122,20 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
             None => Ok(None),
         }
     }
+
+    fn iter_file_index(&self) -> PristineResult<Vec<(String, i64, u32, u64, Hash)>> {
+        let table = match self.txn.open_table(FILE_INDEX) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+        let mut entries = Vec::new();
+        for result in table.iter()? {
+            let (key, value) = result?;
+            let path = key.value().to_string();
+            let (secs, nanos, size, hash) = decode_file_index(value.value());
+            entries.push((path, secs, nanos, size, hash));
+        }
+        Ok(entries)
+    }
 }

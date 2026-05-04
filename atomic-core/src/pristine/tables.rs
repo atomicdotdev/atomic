@@ -7,7 +7,8 @@
 //! - **Graph**: `GRAPH`, `INODE_GRAPH` - store vertices and edges
 //! - **Views**: `VIEWS`, `VIEW_CHANGES`, `REV_VIEW_CHANGES` - view metadata
 //! - **File Tree**: `TREE`, `REV_TREE`, `INODES`, `REV_INODES`, `DIRECTORIES` - file system mappings
-//! - **Dependencies**: `DEPS`, `REV_DEPS` - change dependency tracking
+//! - **Dependencies**: `DEPS`, `REV_DEPS` - node dependency tracking for attestations/provenance
+//! - **Change Dependencies**: `CHANGE_DEPS`, `REV_CHANGE_DEPS`, `CHANGE_DEPS_INDEXED` - normal change dependency index
 //! - **State**: `STATES`, `TAGS` - view state and tag tracking
 
 use redb::{MultimapTableDefinition, TableDefinition};
@@ -209,21 +210,52 @@ pub mod directory_flags {
 
 // Dependency Tables
 
-/// Dependencies: change_id → `dep_id` (multimap)
+/// Node dependencies: node_id → `dep_id` (multimap)
 ///
-/// Key: change NodeId
+/// Key: node NodeId
 /// Value: dependency NodeId
 ///
-/// Tracks which changes a given change depends on.
+/// Tracks internal node relationships for attestations and provenance. Normal
+/// change dependencies are indexed separately in `CHANGE_DEPS` so missing
+/// dependencies can be represented by hash during pull/clone.
 pub const DEPS: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new("deps");
 
-/// Reverse dependencies: dep_id → `change_id` (multimap)
+/// Reverse node dependencies: dep_id → `node_id` (multimap)
 ///
 /// Key: dependency NodeId
+/// Value: dependent node NodeId
+///
+/// Tracks which nodes depend on a given node (reverse of DEPS).
+pub const REV_DEPS: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new("rev_deps");
+
+/// Normal change dependencies: change_id → dependency hash (multimap)
+///
+/// Key: change NodeId
+/// Value: dependency Hash ([u8; 32])
+///
+/// This is the redb-backed dependency index used by interactive commands to
+/// build view filter dependency closures without loading `.change` files.
+pub const CHANGE_DEPS: MultimapTableDefinition<u64, &[u8; 32]> =
+    MultimapTableDefinition::new("change_deps");
+
+/// Reverse normal change dependencies: dependency hash → change_id (multimap)
+///
+/// Key: dependency Hash ([u8; 32])
 /// Value: dependent change NodeId
 ///
-/// Tracks which changes depend on a given change (reverse of DEPS).
-pub const REV_DEPS: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new("rev_deps");
+/// Hash keys allow pull/clone to represent dependencies that are not locally
+/// registered yet.
+pub const REV_CHANGE_DEPS: MultimapTableDefinition<&[u8; 32], u64> =
+    MultimapTableDefinition::new("rev_change_deps");
+
+/// Marker that a change's dependency list has been indexed.
+///
+/// Key: change NodeId
+/// Value: dependency count
+///
+/// A marker is needed because zero dependencies is distinct from "not indexed".
+pub const CHANGE_DEPS_INDEXED: TableDefinition<u64, u64> =
+    TableDefinition::new("change_deps_indexed");
 
 // State Tables
 

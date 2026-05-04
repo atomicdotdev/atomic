@@ -231,6 +231,13 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT {
     /// Get all changes that the given change depends on.
     fn get_deps(&self, change_id: NodeId) -> Result<Vec<NodeId>, PristineError>;
 
+    /// Replace the redb-backed normal dependency index for a change.
+    ///
+    /// Dependencies are stored by hash, not `NodeId`, so partially pulled or
+    /// cloned repositories can represent missing dependencies without creating
+    /// placeholder local IDs.
+    fn put_change_deps(&mut self, change_id: NodeId, deps: &[Hash]) -> Result<(), PristineError>;
+
     // ── Allocation ──────────────────────────────────────────────
 
     /// Allocate a new unique inode identifier.

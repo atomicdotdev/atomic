@@ -885,6 +885,10 @@ mod tests {
         ) -> Result<Option<(i64, u32, u64, Hash)>, PristineError> {
             Ok(None)
         }
+
+        fn iter_file_index(&self) -> Result<Vec<(String, i64, u32, u64, Hash)>, PristineError> {
+            Ok(Vec::new())
+        }
     }
 
     impl ViewTxnT for MockTxn {

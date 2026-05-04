@@ -108,7 +108,7 @@ pub fn resolve_llm_provider() -> Option<LlmProvider> {
             return Some(LlmProvider {
                 provider: AiProvider::Anthropic,
                 model: std::env::var("LLM_MODEL")
-                    .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string()),
+                    .unwrap_or_else(|_| "claude-haiku-4-5".to_string()),
                 api_key: key,
                 base_url: std::env::var("ANTHROPIC_BASE_URL")
                     .unwrap_or_else(|_| "https://api.anthropic.com/v1".to_string()),

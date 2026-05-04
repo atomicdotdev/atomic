@@ -170,6 +170,72 @@ impl Repository {
         self.change_store.has_change(hash)
     }
 
+    /// Backfill the pristine normal-change dependency index from stored changes.
+    ///
+    /// This is intended for legacy repositories that predate the `CHANGE_DEPS`
+    /// index. It is deliberately explicit: interactive commands such as
+    /// `status` should not repair the index by scanning `.change` files.
+    ///
+    /// Returns `(indexed, skipped, failed)` counts.
+    pub fn repair_change_dependency_index(
+        &self,
+        force: bool,
+    ) -> Result<(usize, usize, usize), RepositoryError> {
+        let registered = {
+            let txn = self
+                .pristine
+                .read_txn()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            txn.list_registered_changes()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+        };
+
+        let mut indexed = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = 0usize;
+
+        for (change_id, hash) in registered {
+            if !force {
+                let txn = self
+                    .pristine
+                    .read_txn()
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                if txn
+                    .is_change_deps_indexed(change_id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                {
+                    skipped += 1;
+                    continue;
+                }
+            }
+
+            let change = match self.load_change(&hash) {
+                Ok(change) => change,
+                Err(e) => {
+                    log::warn!(
+                        "failed to load change {} while repairing dependency index: {}",
+                        hash.to_base32(),
+                        e
+                    );
+                    failed += 1;
+                    continue;
+                }
+            };
+
+            let mut txn = self
+                .pristine
+                .write_txn()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            txn.put_change_deps(change_id, change.dependencies())
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            txn.commit()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            indexed += 1;
+        }
+
+        Ok((indexed, skipped, failed))
+    }
+
     // Attestation Methods
 
     /// Save an attestation to the repository.

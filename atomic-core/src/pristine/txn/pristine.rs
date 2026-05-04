@@ -106,6 +106,9 @@ impl Pristine {
             // Dependency tables
             write_txn.open_multimap_table(DEPS)?;
             write_txn.open_multimap_table(REV_DEPS)?;
+            write_txn.open_multimap_table(CHANGE_DEPS)?;
+            write_txn.open_multimap_table(REV_CHANGE_DEPS)?;
+            write_txn.open_table(CHANGE_DEPS_INDEXED)?;
 
             // State tables
             write_txn.open_table(STATES)?;

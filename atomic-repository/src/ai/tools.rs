@@ -25,6 +25,10 @@ const MAX_PREVIEW_CHARS: usize = 200;
 /// Maximum bytes for `read_file` tool output.
 const MAX_READ_FILE_BYTES: usize = 50 * 1024;
 
+/// If a file exceeds this size and no line range was given, return a
+/// structured outline instead of dumping the whole file.
+const READ_FILE_PREVIEW_THRESHOLD: usize = 32 * 1024; // 32KB ≈ 8k tokens
+
 // ── Types ───────────────────────────────────────────────────────
 
 /// A tool that the LLM can invoke.
@@ -87,6 +91,10 @@ pub struct ToolAwareResponse {
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Tokens read from Anthropic's prompt cache (much cheaper).
+    pub cache_read_tokens: u64,
+    /// Tokens written to cache on this request.
+    pub cache_creation_tokens: u64,
 }
 
 /// Configuration for the agentic loop.
@@ -95,6 +103,8 @@ pub struct AgentConfig {
     pub system_prompt: String,
     pub max_turns: u8,
     pub max_tokens: u32,
+    /// Print live tool call output to stderr.
+    pub verbose: bool,
 }
 
 impl Default for AgentConfig {
@@ -103,6 +113,7 @@ impl Default for AgentConfig {
             system_prompt: String::new(),
             max_turns: 5,
             max_tokens: 4096,
+            verbose: false,
         }
     }
 }
@@ -206,7 +217,16 @@ impl LlmProvider {
         });
 
         if !system_text.is_empty() {
-            body["system"] = json!(system_text);
+            // Use content block format with cache_control for prompt caching.
+            // The system prompt + tools are static across turns — caching them
+            // means turns 2+ pay ~0 for the system prompt.
+            body["system"] = json!([
+                {
+                    "type": "text",
+                    "text": system_text,
+                    "cache_control": { "type": "ephemeral" }
+                }
+            ]);
         }
         if !api_tools.is_empty() {
             body["tools"] = json!(api_tools);
@@ -268,6 +288,12 @@ impl LlmProvider {
         let usage = TokenUsage {
             input_tokens: json["usage"]["input_tokens"].as_u64().unwrap_or(0),
             output_tokens: json["usage"]["output_tokens"].as_u64().unwrap_or(0),
+            cache_read_tokens: json["usage"]["cache_read_input_tokens"]
+                .as_u64()
+                .unwrap_or(0),
+            cache_creation_tokens: json["usage"]["cache_creation_input_tokens"]
+                .as_u64()
+                .unwrap_or(0),
         };
 
         Ok(ToolAwareResponse {
@@ -367,6 +393,8 @@ impl LlmProvider {
         let usage = TokenUsage {
             input_tokens: json["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
             output_tokens: json["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
         };
 
         Ok(ToolAwareResponse {
@@ -521,13 +549,29 @@ pub async fn run_tool_loop(
     let mut total_usage = TokenUsage::default();
     let mut tool_trace: Vec<ToolTraceEntry> = Vec::new();
     let mut turn: u8 = 0;
+    let mut last_text = String::new(); // accumulate text across turns
 
     loop {
         turn += 1;
         let at_limit = turn > config.max_turns;
 
-        // If we've exhausted turns, make one final call without tools.
-        let tools_for_call = if at_limit { &[][..] } else { &tool_defs };
+        // If we've exhausted turns, inject a prompt telling the LLM to
+        // answer now with what it has, rather than removing tools (which
+        // confuses the conversation flow after tool_use/tool_result pairs).
+        if at_limit {
+            messages.push(ToolMessage::User {
+                content: "You have used all available tool turns. Please provide your \
+                          answer now based on what you have found so far. Be concise \
+                          and cite file paths and line numbers."
+                    .to_string(),
+            });
+        }
+        let tools_for_call = &tool_defs; // always provide tools
+        let tokens_for_call = if at_limit {
+            config.max_tokens.max(8192)
+        } else {
+            config.max_tokens
+        };
 
         debug!(
             "tool loop turn {turn}/{} (tools={})",
@@ -536,11 +580,13 @@ pub async fn run_tool_loop(
         );
 
         let resp = provider
-            .chat_with_tools(&messages, tools_for_call, config.max_tokens)
+            .chat_with_tools(&messages, tools_for_call, tokens_for_call)
             .await?;
 
         total_usage.input_tokens += resp.usage.input_tokens;
         total_usage.output_tokens += resp.usage.output_tokens;
+        total_usage.cache_read_tokens += resp.usage.cache_read_tokens;
+        total_usage.cache_creation_tokens += resp.usage.cache_creation_tokens;
 
         // Extract tool calls and text from the assistant message.
         let (text, calls) = match &resp.message {
@@ -551,13 +597,26 @@ pub async fn run_tool_loop(
             _ => (String::new(), Vec::new()),
         };
 
+        // Keep the latest non-empty text — the LLM may produce text on
+        // intermediate turns (thinking aloud) or only on the final turn.
+        if !text.trim().is_empty() {
+            last_text = text.clone();
+        }
+
         // Append the assistant message to history.
         messages.push(resp.message);
 
         // If no tool calls or we've hit the limit, we're done.
         if calls.is_empty() || resp.stop_reason != StopReason::ToolUse || at_limit {
+            // Use the current turn's text if non-empty, otherwise fall back
+            // to the last non-empty text from a previous turn.
+            let answer = if text.trim().is_empty() {
+                last_text
+            } else {
+                text
+            };
             return Ok(AgentResult {
-                answer: text,
+                answer,
                 model: resp.model,
                 total_usage,
                 turns: turn,
@@ -569,10 +628,28 @@ pub async fn run_tool_loop(
         for call in &calls {
             debug!("executing tool: {} args={}", call.name, call.arguments);
 
+            if config.verbose {
+                // Show the tool call as an atomic CLI command equivalent
+                let cmd_preview = format_tool_as_command(&call.name, &call.arguments);
+                eprint!(
+                    "  \x1b[2m[turn {}]\x1b[0m \x1b[36m{}\x1b[0m",
+                    turn, cmd_preview
+                );
+            }
+
             let (result_content, is_error) = match executor.execute(call) {
                 Ok(output) => (truncate_result(&output), false),
                 Err(err) => (truncate_result(&err), true),
             };
+
+            if config.verbose {
+                if is_error {
+                    eprintln!(" \x1b[31m✗\x1b[0m");
+                } else {
+                    let chars = result_content.chars().count();
+                    eprintln!(" \x1b[32m✓\x1b[0m \x1b[2m({} chars)\x1b[0m", chars);
+                }
+            }
 
             tool_trace.push(ToolTraceEntry {
                 turn,
@@ -669,8 +746,10 @@ impl<'a> ToolExecutor for RepoToolExecutor<'a> {
             },
             ToolDefinition {
                 name: "read_file".into(),
-                description: "Read a file from the working copy. Optionally restrict to a \
-                              line range. Output is capped at 50 KB."
+                description: "Read a file from the working copy. For files over 8KB, \
+                              returns a 50-line preview unless you specify start_line/end_line. \
+                              Always use list_entities or code_search first to find the \
+                              right line range instead of reading entire large files."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -819,6 +898,22 @@ impl<'a> RepoToolExecutor<'a> {
         let start_line = args["start_line"].as_u64().map(|n| n as usize);
         let end_line = args["end_line"].as_u64().map(|n| n as usize);
 
+        let has_line_range = start_line.is_some() || end_line.is_some();
+        let total_lines = content.lines().count();
+
+        // If no line range and file is large, refuse and redirect.
+        // The LLM should use list_entities or code_search to find the
+        // right line range first.
+        if !has_line_range && content.len() > READ_FILE_PREVIEW_THRESHOLD {
+            return Err(format!(
+                "File is too large to read without line ranges ({} lines, {} bytes). \
+                 Use list_entities to see the file structure, or code_search to find \
+                 specific lines, then call read_file with start_line and end_line.",
+                total_lines,
+                content.len()
+            ));
+        }
+
         let output = match (start_line, end_line) {
             (Some(s), Some(e)) => {
                 let s = s.saturating_sub(1); // 1-based to 0-based
@@ -831,13 +926,18 @@ impl<'a> RepoToolExecutor<'a> {
             }
             (Some(s), None) => {
                 let s = s.saturating_sub(1);
-                content.lines().skip(s).collect::<Vec<_>>().join("\n")
+                content
+                    .lines()
+                    .skip(s)
+                    .take(200) // cap open-ended reads at 200 lines
+                    .collect::<Vec<_>>()
+                    .join("\n")
             }
             (None, Some(e)) => content.lines().take(e).collect::<Vec<_>>().join("\n"),
             (None, None) => content,
         };
 
-        // Cap output size.
+        // Final cap on output size.
         if output.len() > MAX_READ_FILE_BYTES {
             Ok(format!(
                 "{}\n\n... truncated ({} bytes total)",
@@ -944,6 +1044,117 @@ impl<'a> RepoToolExecutor<'a> {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
+
+/// Build a structured outline of a large file instead of returning all content.
+///
+/// For markdown: extracts headings with line numbers.
+/// For code: extracts function/class signatures using simple heuristics.
+/// Always includes the first 20 lines as context.
+fn build_file_outline(path: &str, content: &str, total_lines: usize) -> String {
+    let mut out = format!(
+        "File: {} ({} lines, {} bytes)\n\
+         Use read_file with start_line/end_line to read specific sections.\n\n",
+        path,
+        total_lines,
+        content.len()
+    );
+
+    let is_markdown = path.ends_with(".md") || path.ends_with(".mdx");
+
+    if is_markdown {
+        // Extract headings with line numbers
+        out.push_str("Outline (headings):\n");
+        for (i, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                out.push_str(&format!("  L{}: {}\n", i + 1, trimmed));
+            }
+        }
+    } else {
+        // For code files, show the first 30 lines + any lines that look like
+        // definitions (fn, class, struct, def, func, impl, etc.)
+        out.push_str("First 20 lines:\n");
+        for (i, line) in content.lines().take(20).enumerate() {
+            out.push_str(&format!("  {:>4}: {}\n", i + 1, line));
+        }
+        out.push_str("\nDefinitions found:\n");
+        let def_patterns = [
+            "fn ",
+            "pub fn ",
+            "async fn ",
+            "def ",
+            "func ",
+            "function ",
+            "class ",
+            "struct ",
+            "enum ",
+            "trait ",
+            "impl ",
+            "interface ",
+            "type ",
+            "const ",
+            "#define ",
+            "namespace ",
+        ];
+        for (i, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if def_patterns.iter().any(|p| trimmed.starts_with(p)) {
+                let short = if trimmed.len() > 100 {
+                    format!("{}...", &trimmed[..97])
+                } else {
+                    trimmed.to_string()
+                };
+                out.push_str(&format!("  L{}: {}\n", i + 1, short));
+            }
+        }
+    }
+
+    out
+}
+
+/// Format a tool call as the equivalent `atomic query` CLI command.
+fn format_tool_as_command(name: &str, args: &serde_json::Value) -> String {
+    match name {
+        "kg_search" => {
+            let query = args["query"].as_str().unwrap_or("?");
+            let limit = args["limit"].as_u64().unwrap_or(10);
+            format!("atomic query search \"{}\" -k {}", query, limit)
+        }
+        "kg_neighbors" => {
+            let id = args["node_id"].as_str().unwrap_or("?");
+            let depth = args["depth"].as_u64().unwrap_or(1);
+            format!("atomic query neighbors \"{}\" -d {}", id, depth)
+        }
+        "read_file" => {
+            let path = args["path"].as_str().unwrap_or("?");
+            match (args["start_line"].as_u64(), args["end_line"].as_u64()) {
+                (Some(s), Some(e)) => format!("read_file {} L{}-{}", path, s, e),
+                (Some(s), None) => format!("read_file {} L{}+", path, s),
+                _ => format!("read_file {}", path),
+            }
+        }
+        "code_search" => {
+            let pattern = args["pattern"].as_str().unwrap_or("?");
+            let mut cmd = format!("atomic query code \"{}\"", pattern);
+            if let Some(t) = args["file_type"].as_str() {
+                cmd.push_str(&format!(" -t {}", t));
+            }
+            if let Some(g) = args["path_filter"].as_str() {
+                cmd.push_str(&format!(" -g {}", g));
+            }
+            cmd
+        }
+        "list_entities" => {
+            let path = args["path"].as_str().unwrap_or("?");
+            format!("atomic query entities {}", path)
+        }
+        "vault_read" => {
+            let path = args["path"].as_str().unwrap_or("?");
+            format!("atomic vault show {}", path)
+        }
+        _ => format!("{}({})", name, args),
+    }
+}
 
 /// Truncate a tool result to [`MAX_TOOL_RESULT_BYTES`].
 fn truncate_result(s: &str) -> String {

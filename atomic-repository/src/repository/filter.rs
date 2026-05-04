@@ -96,3 +96,66 @@ pub fn collect_visible_change_ids<T: ViewTxnT>(
 
     Ok(ids)
 }
+
+/// Collect all change `NodeId`s visible from a view and expand their indexed
+/// dependency closure without loading `.change` files.
+///
+/// This is the dependency-aware helper interactive commands should use when
+/// they need a graph change filter. The dependency data comes from pristine's
+/// `CHANGE_DEPS` index, which is populated when changes are recorded or
+/// inserted. Missing dependency hashes are ignored for filtering because no
+/// local graph edges can exist for an unregistered dependency.
+///
+/// If a visible change predates the dependency index, this helper deliberately
+/// does **not** fall back to loading the `.change` file. Bulk object-store reads
+/// belong in an explicit repair/backfill path, not in `status`.
+pub fn collect_visible_change_ids_with_deps<T: ViewTxnT>(
+    txn: &T,
+    view: &atomic_core::pristine::ViewState,
+) -> Result<HashSet<NodeId>, RepositoryError> {
+    let mut ids = collect_visible_change_ids(txn, view)?;
+    expand_indexed_dependency_closure(txn, &mut ids)?;
+    Ok(ids)
+}
+
+/// Expand `ids` in-place using the pristine change dependency index only.
+pub fn expand_indexed_dependency_closure<T: GraphTxnT>(
+    txn: &T,
+    ids: &mut HashSet<NodeId>,
+) -> Result<(), RepositoryError> {
+    let mut queue: std::collections::VecDeque<NodeId> = ids.iter().copied().collect();
+    let mut unindexed_count = 0usize;
+
+    while let Some(change_id) = queue.pop_front() {
+        let indexed = txn
+            .is_change_deps_indexed(change_id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        if !indexed {
+            unindexed_count += 1;
+            continue;
+        }
+
+        let deps = txn
+            .get_change_deps(change_id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        for dep_hash in deps {
+            if let Some(dep_id) = txn
+                .get_internal(&dep_hash)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                if ids.insert(dep_id) {
+                    queue.push_back(dep_id);
+                }
+            }
+        }
+    }
+
+    if unindexed_count > 0 {
+        log::debug!(
+            "view filter dependency closure skipped {} unindexed changes; run dependency-index repair to backfill legacy repos",
+            unindexed_count
+        );
+    }
+
+    Ok(())
+}

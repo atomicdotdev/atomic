@@ -187,6 +187,11 @@ impl<'a, T: GraphTxnT> GraphTxnT for ViewGraph<'a, T> {
         self.inner.get_internal(hash)
     }
 
+    /// Registered change listing — no filtering. Delegates to inner.
+    fn list_registered_changes(&self) -> Result<Vec<(NodeId, Hash)>, PristineError> {
+        self.inner.list_registered_changes()
+    }
+
     /// Node type lookup — no filtering. Delegates to inner.
     fn get_node_type(&self, node_id: NodeId) -> Result<Option<u8>, PristineError> {
         self.inner.get_node_type(node_id)
@@ -195,6 +200,21 @@ impl<'a, T: GraphTxnT> GraphTxnT for ViewGraph<'a, T> {
     /// Reverse dependency lookup — no filtering. Delegates to inner.
     fn get_rev_deps(&self, dep_id: NodeId) -> Result<Vec<NodeId>, PristineError> {
         self.inner.get_rev_deps(dep_id)
+    }
+
+    /// Indexed normal change dependency lookup — no filtering. Delegates to inner.
+    fn get_change_deps(&self, change_id: NodeId) -> Result<Vec<Hash>, PristineError> {
+        self.inner.get_change_deps(change_id)
+    }
+
+    /// Indexed dependency marker lookup — no filtering. Delegates to inner.
+    fn is_change_deps_indexed(&self, change_id: NodeId) -> Result<bool, PristineError> {
+        self.inner.is_change_deps_indexed(change_id)
+    }
+
+    /// Reverse indexed normal change dependency lookup — no filtering. Delegates to inner.
+    fn get_rev_change_deps(&self, dep_hash: &Hash) -> Result<Vec<NodeId>, PristineError> {
+        self.inner.get_rev_change_deps(dep_hash)
     }
 
     /// Graph presence check — no filtering. Delegates to inner.
@@ -246,6 +266,10 @@ impl<'a, T: TreeTxnT> TreeTxnT for ViewGraph<'a, T> {
 
     fn get_file_index(&self, path: &str) -> Result<Option<(i64, u32, u64, Hash)>, PristineError> {
         self.inner.get_file_index(path)
+    }
+
+    fn iter_file_index(&self) -> Result<Vec<(String, i64, u32, u64, Hash)>, PristineError> {
+        self.inner.iter_file_index()
     }
 }
 

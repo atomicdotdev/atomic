@@ -145,9 +145,12 @@ pub fn record_turn(
             reason: format!("Failed to open repository: {}", e),
         })?;
 
-    // Step 2: Status — find out what the agent changed
+    // Step 2: Status — find out what the agent changed.
+    // Use fast mode + tracked only: mtime-based detection, no content
+    // hashing, no filesystem walk for untracked. The full hash check
+    // happens inside record() itself.
     let status = repo
-        .status(atomic_repository::status::StatusOptions::default())
+        .status(atomic_repository::status::StatusOptions::fast().with_untracked(false))
         .map_err(|e| AgentError::RecordFailed {
             session_id: options.session.session_id.clone(),
             turn_number: options.turn_number,

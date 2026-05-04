@@ -61,6 +61,7 @@ use commands::{
     Clone,
     Command,
     Diff,
+    Doctor,
     Git,
     Identity,
     Init,
@@ -357,6 +358,12 @@ enum Commands {
     /// atomic diff --algorithm patience
     /// ```
     Diff(Diff),
+
+    /// Diagnose and repair repository indexes.
+    ///
+    /// Use this for explicit maintenance tasks that may scan stored changes,
+    /// such as backfilling the dependency index for legacy repositories.
+    Doctor(Doctor),
 
     /// Git interoperability commands.
     ///
@@ -704,6 +711,8 @@ fn main() {
         Commands::Change(change) => change.run(),
 
         Commands::Diff(diff) => diff.run(),
+
+        Commands::Doctor(doctor) => doctor.run(),
 
         Commands::Git(git) => git.run(),
 

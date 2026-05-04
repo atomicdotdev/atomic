@@ -159,4 +159,10 @@ pub trait TreeTxnT: GraphTxnT {
     /// * `Ok(None)` - No cached entry for this path
     /// * `Err(_)` - Database error
     fn get_file_index(&self, path: &str) -> Result<Option<(i64, u32, u64, Hash)>, PristineError>;
+
+    /// Iterate all FILE_INDEX entries as (path, mtime_secs, mtime_nanos, file_size, content_hash).
+    ///
+    /// This is a sequential B-tree scan — much faster than individual get_file_index
+    /// lookups for bulk operations like status.
+    fn iter_file_index(&self) -> Result<Vec<(String, i64, u32, u64, Hash)>, PristineError>;
 }

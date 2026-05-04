@@ -53,23 +53,11 @@ impl Repository {
             if view.kind.is_shared() && view.parent.is_none() {
                 (HashSet::new(), true)
             } else {
-                let mut ids = collect_view_change_ids(&txn, view)?;
-
-                // Expand with dependencies so that files introduced by a
-                // dependency (e.g. after content revise) stay visible.
-                let direct_ids: Vec<NodeId> = ids.iter().copied().collect();
-                for node_id in direct_ids {
-                    if let Ok(Some(hash)) = txn.get_external(node_id) {
-                        if let Ok(change) = self.load_change(&hash) {
-                            for dep_hash in change.dependencies() {
-                                if let Ok(Some(dep_id)) = txn.get_internal(dep_hash) {
-                                    ids.insert(dep_id);
-                                }
-                            }
-                        }
-                    }
-                }
-
+                // Build the effective view filter entirely from pristine
+                // indexes. Do not load `.change` files here: status must stay
+                // proportional to working-copy/index state, not object-store
+                // history size.
+                let ids = collect_visible_change_ids_with_deps(&txn, view)?;
                 (ids, false)
             }
         } else {
@@ -151,14 +139,31 @@ impl Repository {
             directory_inodes.len()
         );
 
-        // ── Classify tracked files via FILE_INDEX fast path ────────────
+        // ── Batch-load FILE_INDEX ───────────────────────────────────────
         //
-        // For each tracked file: stat the file, compare with FILE_INDEX.
-        // Clean files (mtime+size match) are SKIPPED entirely — no
-        // allocation, no hashing.
+        // One sequential B-tree scan loads the entire FILE_INDEX into memory.
+        // This replaces 43k individual B-tree lookups with 43k HashMap lookups
+        // (nanoseconds each).
+        let index_start = std::time::Instant::now();
+        let file_index_entries = txn
+            .iter_file_index()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let file_index: HashMap<String, (i64, u32, u64, Hash)> = file_index_entries
+            .into_iter()
+            .map(|(path, secs, nanos, size, hash)| (path, (secs, nanos, size, hash)))
+            .collect();
+        let index_ms = index_start.elapsed().as_millis();
+        log::debug!(
+            "status: FILE_INDEX loaded {}ms ({} entries)",
+            index_ms,
+            file_index.len()
+        );
+
+        // ── Classify tracked files ──────────────────────────────────────
         //
-        // We consume tracked_paths here: files found on disk are removed
-        // from the set.  Whatever remains after this loop = deleted.
+        // For each tracked file: check in-memory FILE_INDEX HashMap
+        // (mtime+size), stat if needed, hash only when mtime changed.
+        // Clean files are skipped.
         let classify_start = std::time::Instant::now();
         let mut found_on_disk: HashSet<PathBuf> = HashSet::new();
         let mut stat_count = 0u64;
@@ -233,30 +238,35 @@ impl Repository {
                 continue;
             }
 
-            // ── FILE_INDEX fast path ───────────────────────────────────
-            if options.hash_contents {
-                let path_str = path.to_string_lossy();
-                if let Ok(Some((cached_secs, cached_nanos, cached_size, cached_hash))) =
-                    txn.get_file_index(&path_str)
+            // ── FILE_INDEX fast path (ALWAYS runs, not gated on hash_contents) ──
+            //
+            // Check mtime+size against the in-memory FILE_INDEX HashMap.
+            // This is the critical performance path: 99%+ of files in a
+            // large repo are clean, and this catches them with just a stat
+            // + HashMap lookup (nanoseconds, not B-tree milliseconds).
+            let path_str = path.to_string_lossy();
+            if let Some(&(cached_secs, cached_nanos, cached_size, cached_hash)) =
+                file_index.get(path_str.as_ref())
+            {
+                let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                let duration = mtime
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let current_secs = duration.as_secs() as i64;
+                let current_nanos = duration.subsec_nanos();
+                let current_size = metadata.len();
+
+                if current_secs == cached_secs
+                    && current_nanos == cached_nanos
+                    && current_size == cached_size
                 {
-                    let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                    let duration = mtime
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default();
-                    let current_secs = duration.as_secs() as i64;
-                    let current_nanos = duration.subsec_nanos();
-                    let current_size = metadata.len();
+                    // mtime + size match → Clean — skip entirely
+                    index_hit_count += 1;
+                    continue;
+                }
 
-                    if current_secs == cached_secs
-                        && current_nanos == cached_nanos
-                        && current_size == cached_size
-                    {
-                        // mtime + size match → Clean — skip entirely
-                        index_hit_count += 1;
-                        continue;
-                    }
-
-                    // mtime or size differ — hash disk file and compare
+                // mtime or size differ — hash to confirm
+                if options.hash_contents {
                     hash_count += 1;
                     match hash_file_contents(&abs_path) {
                         Ok(current_hash) => {
@@ -285,21 +295,20 @@ impl Repository {
                             continue;
                         }
                     }
+                } else {
+                    // No hash requested but mtime changed → assume Modified
+                    let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Modified);
+                    if let Some(inode) = inode {
+                        entry.set_inode(inode);
+                    }
+                    status.add_entry(entry);
+                    continue;
                 }
-
-                // No FILE_INDEX entry — hash and assume clean if graph
-                // content exists (we can't compare without the index).
-                // Mark as Added if no graph content.
-                if let Ok(hash) = hash_file_contents(&abs_path) {
-                    // We have graph content but no FILE_INDEX entry.
-                    // We can't tell if it's modified without reconstructing
-                    // graph content, which is expensive.  Assume clean for
-                    // the fast path — the user can run --reindex to fix.
-                    let _ = hash; // content hash computed but not compared
-                }
-                // Fall through as clean (skip)
             }
-            // If !hash_contents, tracked file on disk with graph content = clean → skip
+
+            // No FILE_INDEX entry — file is tracked with graph content
+            // but was never indexed. Assume clean (can't compare without
+            // reconstructing graph content, which is expensive).
         }
 
         let classify_ms = classify_start.elapsed().as_millis();
@@ -350,19 +359,21 @@ impl Repository {
         let total_ms = overall_start.elapsed().as_millis();
         if total_ms > 100 {
             log::warn!(
-                "status: total={}ms (view_filter={}ms tree_scan={}ms classify={}ms untracked={}ms)",
+                "status: total={}ms (view_filter={}ms tree_scan={}ms index_load={}ms classify={}ms untracked={}ms)",
                 total_ms,
                 phase1_ms,
                 tree_ms,
+                index_ms,
                 classify_ms,
                 untracked_ms
             );
         } else {
             log::debug!(
-                "status: total={}ms (view_filter={}ms tree_scan={}ms classify={}ms untracked={}ms)",
+                "status: total={}ms (view_filter={}ms tree_scan={}ms index_load={}ms classify={}ms untracked={}ms)",
                 total_ms,
                 phase1_ms,
                 tree_ms,
+                index_ms,
                 classify_ms,
                 untracked_ms
             );

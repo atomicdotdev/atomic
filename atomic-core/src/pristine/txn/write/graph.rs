@@ -26,6 +26,24 @@ impl<'a> GraphTxnT for WriteTxn<'a> {
         }
     }
 
+    fn list_registered_changes(&self) -> PristineResult<Vec<(NodeId, Hash)>> {
+        let external = self.txn.open_table(EXTERNAL)?;
+        let node_types = self.txn.open_table(NODE_TYPES)?;
+        let mut changes = Vec::new();
+        for result in external.iter()? {
+            let (key, value) = result?;
+            let node_id = NodeId::new(key.value());
+            let is_change = node_types
+                .get(node_id.get())?
+                .map(|node_type| node_type.value() == node_type::CHANGE)
+                .unwrap_or(true);
+            if is_change {
+                changes.push((node_id, Hash::from_bytes(*value.value())));
+            }
+        }
+        Ok(changes)
+    }
+
     fn iter_adjacent(
         &self,
         node: GraphNode<NodeId>,
@@ -211,6 +229,34 @@ impl<'a> GraphTxnT for WriteTxn<'a> {
         let table = self.txn.open_multimap_table(REV_DEPS)?;
         let mut result = Vec::new();
         let iter = table.get(dep_id.get())?;
+        for item in iter {
+            let value = item?;
+            result.push(NodeId::new(value.value()));
+        }
+        Ok(result)
+    }
+
+    fn get_change_deps(&self, change_id: NodeId) -> PristineResult<Vec<Hash>> {
+        let table = self.txn.open_multimap_table(CHANGE_DEPS)?;
+        let mut result = Vec::new();
+        let iter = table.get(change_id.get())?;
+        for item in iter {
+            let value = item?;
+            result.push(Hash::from_bytes(*value.value()));
+        }
+        Ok(result)
+    }
+
+    fn is_change_deps_indexed(&self, change_id: NodeId) -> PristineResult<bool> {
+        let table = self.txn.open_table(CHANGE_DEPS_INDEXED)?;
+        let indexed = table.get(change_id.get())?.is_some();
+        Ok(indexed)
+    }
+
+    fn get_rev_change_deps(&self, dep_hash: &Hash) -> PristineResult<Vec<NodeId>> {
+        let table = self.txn.open_multimap_table(REV_CHANGE_DEPS)?;
+        let mut result = Vec::new();
+        let iter = table.get(dep_hash.as_bytes())?;
         for item in iter {
             let value = item?;
             result.push(NodeId::new(value.value()));

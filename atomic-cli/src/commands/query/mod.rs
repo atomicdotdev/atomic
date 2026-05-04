@@ -1628,12 +1628,16 @@ pub struct QueryAsk {
     pub question: String,
 
     /// Maximum agentic tool-use turns (default 5).
-    #[arg(long, default_value = "5")]
+    #[arg(long, short = 't', default_value = "5")]
     pub max_turns: u8,
 
     /// Output as JSON (includes tool trace).
     #[arg(long)]
     pub json: bool,
+
+    /// Show live tool calls as they execute.
+    #[arg(long, short = 'v')]
+    pub verbose: bool,
 }
 
 /// System prompt for the agentic query loop.
@@ -1649,11 +1653,11 @@ You have tools to explore the repository:
 - vault_read: read vault entries (goals, intents, memories)
 
 Strategy:
-1. Start by searching the KG or reading the file if the user names one directly.
-2. Use kg_neighbors to follow relationships (e.g., which changes modified a file, \
-   what entities a file defines).
-3. Use code_search to find patterns across the codebase (requires content index).
-4. Use read_file and list_entities to get actual source code when needed.
+1. Search first: use kg_search or code_search to find relevant files and line numbers.
+2. Use list_entities to see what functions/classes a file contains and their line ranges.
+3. Use kg_neighbors to follow relationships (which changes modified a file, what it depends on).
+4. NEVER call read_file without start_line and end_line. Always use list_entities or \
+   code_search first to find the exact line range you need, then read just that range.
 5. Answer concisely using what you found. Cite file paths and line numbers.
 
 The knowledge graph contains:
@@ -1680,11 +1684,14 @@ impl Command for QueryAsk {
             system_prompt: ASK_SYSTEM_PROMPT.to_string(),
             max_turns: self.max_turns,
             max_tokens: 4096,
+            verbose: self.verbose,
         };
 
+        let start = std::time::Instant::now();
         let result =
             atomic_repository::run_tool_loop_sync(&llm, &executor, &self.question, &config)
                 .map_err(|e| CliError::Internal(anyhow::anyhow!("LLM error: {e}")))?;
+        let elapsed = start.elapsed();
 
         if self.json {
             let json = serde_json::json!({
@@ -1699,12 +1706,28 @@ impl Command for QueryAsk {
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
             println!("{}\n", result.answer);
+            let cache_info = if result.total_usage.cache_read_tokens > 0 {
+                format!(
+                    ", {} cache read + {} cache write",
+                    result.total_usage.cache_read_tokens, result.total_usage.cache_creation_tokens
+                )
+            } else {
+                String::new()
+            };
+            let secs = elapsed.as_secs_f64();
+            let duration = if secs < 60.0 {
+                format!("{:.1}s", secs)
+            } else {
+                format!("{}m {:.0}s", (secs / 60.0) as u64, secs % 60.0)
+            };
             println!(
-                "  — {} ({} turns, {} in + {} out tokens)",
+                "  — {} ({} turns, {}, {} in + {} out tokens{})",
                 result.model,
                 result.turns,
+                duration,
                 result.total_usage.input_tokens,
                 result.total_usage.output_tokens,
+                cache_info,
             );
         }
 

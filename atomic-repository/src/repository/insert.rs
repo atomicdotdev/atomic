@@ -155,6 +155,8 @@ impl Repository {
         let change_id = txn
             .register_change(hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.put_change_deps(change_id, change.dependencies())
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Determine which view to use
         let view_name = options.view.as_deref().unwrap_or(&self.current_view);
@@ -439,6 +441,8 @@ impl Repository {
         // Register the change to get an internal ID
         let change_id = txn
             .register_change(hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.put_change_deps(change_id, change.dependencies())
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Determine which view to use

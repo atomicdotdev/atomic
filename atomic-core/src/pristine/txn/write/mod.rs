@@ -1044,6 +1044,52 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         Ok(())
     }
 
+    fn put_change_deps(&mut self, change_id: NodeId, deps: &[Hash]) -> PristineResult<()> {
+        let existing: Vec<[u8; 32]> = {
+            let table = self.txn.open_multimap_table(CHANGE_DEPS)?;
+            let iter = table.get(change_id.get())?;
+            let mut hashes = Vec::new();
+            for item in iter {
+                hashes.push(*item?.value());
+            }
+            hashes
+        };
+
+        if !existing.is_empty() {
+            {
+                let mut table = self.txn.open_multimap_table(CHANGE_DEPS)?;
+                for dep in &existing {
+                    table.remove(change_id.get(), dep)?;
+                }
+            }
+            {
+                let mut table = self.txn.open_multimap_table(REV_CHANGE_DEPS)?;
+                for dep in &existing {
+                    table.remove(dep, change_id.get())?;
+                }
+            }
+        }
+
+        {
+            let mut table = self.txn.open_multimap_table(CHANGE_DEPS)?;
+            for dep in deps {
+                table.insert(change_id.get(), dep.as_bytes())?;
+            }
+        }
+        {
+            let mut table = self.txn.open_multimap_table(REV_CHANGE_DEPS)?;
+            for dep in deps {
+                table.insert(dep.as_bytes(), change_id.get())?;
+            }
+        }
+        {
+            let mut table = self.txn.open_table(CHANGE_DEPS_INDEXED)?;
+            table.insert(change_id.get(), deps.len() as u64)?;
+        }
+
+        Ok(())
+    }
+
     fn alloc_inode(&mut self) -> PristineResult<Inode> {
         let id = self.next_inode.fetch_add(1, Ordering::SeqCst);
         Ok(Inode::new(id))

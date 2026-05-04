@@ -82,7 +82,10 @@ mod views;
 
 // Re-export public items so external callers and sibling sub-modules that
 // use `use super::*;` continue to resolve them at `crate::repository::…`.
-pub use filter::{collect_view_change_ids, collect_visible_change_ids};
+pub use filter::{
+    collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,
+    expand_indexed_dependency_closure,
+};
 pub use views::ViewInfo;
 
 // Re-import workspace helpers from `switch` so they are available to
