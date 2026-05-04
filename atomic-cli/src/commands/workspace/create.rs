@@ -102,11 +102,8 @@ impl Command for WorkspaceCreate {
             let table = KeyValueTable::new()
                 .add("Name", &ws.name)
                 .add("Slug", &ws.slug)
-                .add("Visibility", &ws.visibility.to_string())
-                .add(
-                    "Created",
-                    &crate::commands::format_timestamp(&ws.created_at),
-                );
+                .add("Visibility", ws.visibility.to_string())
+                .add("Created", crate::commands::format_timestamp(&ws.created_at));
 
             println!("{}", table);
 

@@ -21,7 +21,9 @@ use crate::types::{
 
 use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
-use crate::pristine::traits::{GraphTxnT, MutTxnT, TreeTxnT, ViewScope, ViewState, ViewTxnT};
+use crate::pristine::traits::{
+    FileIndexEntry, FileIndexMetadata, GraphTxnT, MutTxnT, TreeTxnT, ViewScope, ViewState, ViewTxnT,
+};
 
 use super::helpers::{
     deserialize_edge, deserialize_view_state, serialize_edge, serialize_view_state, AdjIterator,

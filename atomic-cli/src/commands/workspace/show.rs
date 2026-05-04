@@ -81,11 +81,11 @@ impl Command for WorkspaceShow {
             let table = KeyValueTable::new()
                 .add("Name", &ws.name)
                 .add("Slug", &ws.slug)
-                .add("Visibility", &ws.visibility.to_string())
+                .add("Visibility", ws.visibility.to_string())
                 .add("Description", &description)
-                .add("Owner ID", &ws.owner_id.to_string())
-                .add("Created", &format_timestamp(&ws.created_at))
-                .add("Updated", &format_timestamp(&ws.updated_at));
+                .add("Owner ID", ws.owner_id.to_string())
+                .add("Created", format_timestamp(&ws.created_at))
+                .add("Updated", format_timestamp(&ws.updated_at));
 
             println!("{}", table);
 

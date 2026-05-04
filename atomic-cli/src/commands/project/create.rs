@@ -145,7 +145,7 @@ impl Command for ProjectCreate {
             let details = KeyValueTable::new()
                 .add("Workspace", &self.workspace)
                 .add("Default view", &project.default_view)
-                .add("Visibility", &project.visibility.to_string())
+                .add("Visibility", project.visibility.to_string())
                 .add("VCS URL", &vcs_url);
 
             println!("{}", details);

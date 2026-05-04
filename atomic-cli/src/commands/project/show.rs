@@ -105,13 +105,13 @@ impl Command for ProjectShow {
             let table = KeyValueTable::new()
                 .add("Name", &project.name)
                 .add("Slug", &project.slug)
-                .add("Workspace", &project.workspace_id.to_string())
+                .add("Workspace", project.workspace_id.to_string())
                 .add("View", &project.default_view)
-                .add("Visibility", &project.visibility.to_string())
+                .add("Visibility", project.visibility.to_string())
                 .add("Description", project.description.as_deref().unwrap_or("—"))
                 .add("VCS URL", &vcs_url)
-                .add("Created", &format_timestamp(&project.created_at))
-                .add("Updated", &format_timestamp(&project.updated_at));
+                .add("Created", format_timestamp(&project.created_at))
+                .add("Updated", format_timestamp(&project.updated_at));
 
             println!("{}", table);
             Ok(())

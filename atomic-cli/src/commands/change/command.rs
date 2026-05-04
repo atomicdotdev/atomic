@@ -634,9 +634,6 @@ impl ChangeCmd {
             // Display nodes
             for node in &graph.nodes {
                 let kind_str = format!("{}", node.kind);
-                let kind_colored = match node.kind {
-                    _ => {}
-                };
                 let kind_colored = &kind_str;
                 let duration = node
                     .duration_ms

@@ -107,8 +107,8 @@ impl OrgList {
                 table
             };
             let table = table
-                .add("ID", &info.id.to_string())
-                .add("Created", &info.created_at.to_rfc3339());
+                .add("ID", info.id.to_string())
+                .add("Created", info.created_at.to_rfc3339());
 
             println!("{table}");
             println!();

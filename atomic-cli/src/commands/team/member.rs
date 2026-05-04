@@ -305,10 +305,10 @@ impl TeamMemberAdd {
         println!();
 
         let table = KeyValueTable::new()
-            .add("Identity", &member.identity_id.to_string())
-            .add("Role", &member.role.to_string())
+            .add("Identity", member.identity_id.to_string())
+            .add("Role", member.role.to_string())
             .add("Team", &self.team_slug)
-            .add("Added", &member.added_at.to_rfc3339());
+            .add("Added", member.added_at.to_rfc3339());
 
         println!("{table}");
 
@@ -395,8 +395,8 @@ impl TeamMemberUpdate {
         println!();
 
         let table = KeyValueTable::new()
-            .add("Identity", &member.identity_id.to_string())
-            .add("Role", &member.role.to_string())
+            .add("Identity", member.identity_id.to_string())
+            .add("Role", member.role.to_string())
             .add("Team", &self.team_slug);
 
         println!("{table}");

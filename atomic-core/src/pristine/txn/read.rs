@@ -16,7 +16,9 @@ use crate::types::{
 
 use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
-use crate::pristine::traits::{GraphTxnT, TreeTxnT, ViewState, ViewTxnT};
+use crate::pristine::traits::{
+    FileIndexEntry, FileIndexMetadata, GraphTxnT, TreeTxnT, ViewState, ViewTxnT,
+};
 
 use super::helpers::{deserialize_edge, deserialize_view_state, AdjIterator};
 
@@ -498,7 +500,7 @@ impl TreeTxnT for ReadTxn {
         Ok(Box::new(results.into_iter()))
     }
 
-    fn get_file_index(&self, path: &str) -> PristineResult<Option<(i64, u32, u64, Hash)>> {
+    fn get_file_index(&self, path: &str) -> PristineResult<Option<FileIndexMetadata>> {
         let table = self.txn.open_table(FILE_INDEX)?;
         match table.get(path)? {
             Some(value) => {
@@ -509,7 +511,7 @@ impl TreeTxnT for ReadTxn {
         }
     }
 
-    fn iter_file_index(&self) -> PristineResult<Vec<(String, i64, u32, u64, Hash)>> {
+    fn iter_file_index(&self) -> PristineResult<Vec<FileIndexEntry>> {
         let table = match self.txn.open_table(FILE_INDEX) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),

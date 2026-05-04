@@ -139,7 +139,7 @@ impl TeamCreate {
         let table = KeyValueTable::new()
             .add("Name", &info.name)
             .add("Slug", &info.slug)
-            .add("Visibility", &info.visibility.to_string());
+            .add("Visibility", info.visibility.to_string());
         let table = if let Some(desc) = &info.description {
             table.add("Description", desc)
         } else {
@@ -147,7 +147,7 @@ impl TeamCreate {
         };
         let table = table
             .add("Organization", &org_slug)
-            .add("ID", &info.id.to_string());
+            .add("ID", info.id.to_string());
 
         println!("{table}");
 

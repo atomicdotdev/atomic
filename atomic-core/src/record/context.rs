@@ -882,11 +882,11 @@ mod tests {
         fn get_file_index(
             &self,
             _path: &str,
-        ) -> Result<Option<(i64, u32, u64, Hash)>, PristineError> {
+        ) -> Result<Option<crate::pristine::FileIndexMetadata>, PristineError> {
             Ok(None)
         }
 
-        fn iter_file_index(&self) -> Result<Vec<(String, i64, u32, u64, Hash)>, PristineError> {
+        fn iter_file_index(&self) -> Result<Vec<crate::pristine::FileIndexEntry>, PristineError> {
             Ok(Vec::new())
         }
     }

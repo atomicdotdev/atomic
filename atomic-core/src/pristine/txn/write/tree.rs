@@ -110,7 +110,7 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
         Ok(Box::new(results.into_iter()))
     }
 
-    fn get_file_index(&self, path: &str) -> PristineResult<Option<(i64, u32, u64, Hash)>> {
+    fn get_file_index(&self, path: &str) -> PristineResult<Option<FileIndexMetadata>> {
         let table = self.txn.open_table(FILE_INDEX)?;
         let guard = table.get(path)?;
         match guard {
@@ -123,7 +123,7 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
         }
     }
 
-    fn iter_file_index(&self) -> PristineResult<Vec<(String, i64, u32, u64, Hash)>> {
+    fn iter_file_index(&self) -> PristineResult<Vec<FileIndexEntry>> {
         let table = match self.txn.open_table(FILE_INDEX) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),

@@ -15,7 +15,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::pristine::{GraphTxnT, InodeAdjState, InodeGraphOps, PristineError, TreeTxnT};
+use crate::pristine::{
+    FileIndexEntry, FileIndexMetadata, GraphTxnT, InodeAdjState, InodeGraphOps, PristineError,
+    TreeTxnT,
+};
 use crate::types::{EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge};
 
 /// A view-scoped graph wrapper that filters edge traversal by visibility.
@@ -264,11 +267,11 @@ impl<'a, T: TreeTxnT> TreeTxnT for ViewGraph<'a, T> {
         self.inner.iter_inode_vertices(inode)
     }
 
-    fn get_file_index(&self, path: &str) -> Result<Option<(i64, u32, u64, Hash)>, PristineError> {
+    fn get_file_index(&self, path: &str) -> Result<Option<FileIndexMetadata>, PristineError> {
         self.inner.get_file_index(path)
     }
 
-    fn iter_file_index(&self) -> Result<Vec<(String, i64, u32, u64, Hash)>, PristineError> {
+    fn iter_file_index(&self) -> Result<Vec<FileIndexEntry>, PristineError> {
         self.inner.iter_file_index()
     }
 }

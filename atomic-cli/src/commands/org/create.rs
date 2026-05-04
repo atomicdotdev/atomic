@@ -103,7 +103,7 @@ impl OrgCreate {
         } else {
             table
         };
-        let table = table.add("ID", &info.id.to_string());
+        let table = table.add("ID", info.id.to_string());
 
         println!("{table}");
 

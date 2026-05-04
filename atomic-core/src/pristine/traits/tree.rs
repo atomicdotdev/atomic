@@ -9,6 +9,12 @@ use crate::pristine::error::PristineError;
 
 use super::graph::GraphTxnT;
 
+/// Cached filesystem metadata and content hash for a tracked file.
+pub type FileIndexMetadata = (i64, u32, u64, Hash);
+
+/// File index entry including the repository-relative path.
+pub type FileIndexEntry = (String, i64, u32, u64, Hash);
+
 /// File tree operations
 ///
 /// This trait provides access to the file tree mappings that connect:
@@ -158,11 +164,11 @@ pub trait TreeTxnT: GraphTxnT {
     /// * `Ok(Some((mtime_secs, mtime_nanos, file_size, content_hash)))` - Cached index entry
     /// * `Ok(None)` - No cached entry for this path
     /// * `Err(_)` - Database error
-    fn get_file_index(&self, path: &str) -> Result<Option<(i64, u32, u64, Hash)>, PristineError>;
+    fn get_file_index(&self, path: &str) -> Result<Option<FileIndexMetadata>, PristineError>;
 
     /// Iterate all FILE_INDEX entries as (path, mtime_secs, mtime_nanos, file_size, content_hash).
     ///
     /// This is a sequential B-tree scan — much faster than individual get_file_index
     /// lookups for bulk operations like status.
-    fn iter_file_index(&self) -> Result<Vec<(String, i64, u32, u64, Hash)>, PristineError>;
+    fn iter_file_index(&self) -> Result<Vec<FileIndexEntry>, PristineError>;
 }

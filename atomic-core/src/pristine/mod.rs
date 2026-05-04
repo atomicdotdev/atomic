@@ -163,8 +163,9 @@ pub use inode_graph::{
 pub use tables::directory_flags;
 pub use tables::*;
 pub use traits::{
-    EmbeddingsMutTxnT, EmbeddingsTxnT, GraphTxnT, KgMutTxnT, KgTxnT, MutTxnT, TreeTxnT,
-    VaultEntryMeta, VaultMutTxnT, VaultTxnT, VertexExt, ViewScope, ViewState, ViewTxnT,
+    EmbeddingsMutTxnT, EmbeddingsTxnT, FileIndexEntry, FileIndexMetadata, GraphTxnT, KgMutTxnT,
+    KgTxnT, MutTxnT, TreeTxnT, VaultEntryMeta, VaultMutTxnT, VaultTxnT, VertexExt, ViewScope,
+    ViewState, ViewTxnT,
 };
 pub use txn::{AdjIterator, Pristine, ReadTxn, WriteTxn};
 pub use vault::{

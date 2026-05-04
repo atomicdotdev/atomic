@@ -98,7 +98,7 @@ impl Command for WorkspaceUpdate {
             let table = KeyValueTable::new()
                 .add("Name", &ws.name)
                 .add("Slug", &ws.slug)
-                .add("Visibility", &ws.visibility.to_string())
+                .add("Visibility", ws.visibility.to_string())
                 .add("Description", ws.description.as_deref().unwrap_or("—"));
 
             println!("{}", table);

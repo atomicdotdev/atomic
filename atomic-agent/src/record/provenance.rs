@@ -343,10 +343,11 @@ pub(crate) fn should_ignore_untracked(path: &str) -> bool {
                 return true;
             }
             // Skip hidden directories (starting with .) unless whitelisted
-            if name_str.starts_with('.') && name_str.len() > 1 {
-                if !HIDDEN_DIR_WHITELIST.contains(&name_str.as_ref()) {
-                    return true;
-                }
+            if name_str.starts_with('.')
+                && name_str.len() > 1
+                && !HIDDEN_DIR_WHITELIST.contains(&name_str.as_ref())
+            {
+                return true;
             }
         }
     }

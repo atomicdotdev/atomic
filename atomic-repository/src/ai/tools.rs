@@ -901,17 +901,11 @@ impl<'a> RepoToolExecutor<'a> {
         let has_line_range = start_line.is_some() || end_line.is_some();
         let total_lines = content.lines().count();
 
-        // If no line range and file is large, refuse and redirect.
+        // If no line range and file is large, return a structured outline.
         // The LLM should use list_entities or code_search to find the
         // right line range first.
         if !has_line_range && content.len() > READ_FILE_PREVIEW_THRESHOLD {
-            return Err(format!(
-                "File is too large to read without line ranges ({} lines, {} bytes). \
-                 Use list_entities to see the file structure, or code_search to find \
-                 specific lines, then call read_file with start_line and end_line.",
-                total_lines,
-                content.len()
-            ));
+            return Ok(build_file_outline(path_str, &content, total_lines));
         }
 
         let output = match (start_line, end_line) {

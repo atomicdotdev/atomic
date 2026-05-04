@@ -278,10 +278,10 @@ impl MemberAdd {
         println!();
 
         let table = KeyValueTable::new()
-            .add("Identity", &member.identity_id.to_string())
-            .add("Role", &member.role.to_string())
+            .add("Identity", member.identity_id.to_string())
+            .add("Role", member.role.to_string())
             .add("Organization", &slug)
-            .add("Joined", &member.joined_at.to_rfc3339());
+            .add("Joined", member.joined_at.to_rfc3339());
 
         println!("{table}");
 
@@ -355,8 +355,8 @@ impl MemberUpdate {
         println!();
 
         let table = KeyValueTable::new()
-            .add("Identity", &member.identity_id.to_string())
-            .add("Role", &member.role.to_string())
+            .add("Identity", member.identity_id.to_string())
+            .add("Role", member.role.to_string())
             .add("Organization", &slug);
 
         println!("{table}");

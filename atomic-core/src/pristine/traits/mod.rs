@@ -37,7 +37,7 @@ mod tests;
 pub use embeddings::{EmbeddingsMutTxnT, EmbeddingsTxnT};
 pub use graph::GraphTxnT;
 pub use mutate::MutTxnT;
-pub use tree::TreeTxnT;
+pub use tree::{FileIndexEntry, FileIndexMetadata, TreeTxnT};
 pub use triples::{KgMutTxnT, KgTxnT};
 pub use vault::{VaultEntryMeta, VaultMutTxnT, VaultTxnT};
 pub use vertex_ext::VertexExt;

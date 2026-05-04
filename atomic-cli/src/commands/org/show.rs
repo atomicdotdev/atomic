@@ -122,9 +122,9 @@ impl OrgShow {
             };
 
             let table = table
-                .add("ID", &info.id.to_string())
-                .add("Created", &info.created_at.to_rfc3339())
-                .add("Updated", &info.updated_at.to_rfc3339());
+                .add("ID", info.id.to_string())
+                .add("Created", info.created_at.to_rfc3339())
+                .add("Updated", info.updated_at.to_rfc3339());
 
             println!("{table}");
         }

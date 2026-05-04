@@ -183,7 +183,7 @@ impl Repository {
         let mut seen: HashSet<String> = HashSet::new();
 
         // Helper: push a candidate into the bounded heap
-        let mut push_candidate =
+        let push_candidate =
             |id: String,
              kg_hits: usize,
              content_matches: usize,
