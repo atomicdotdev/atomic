@@ -38,8 +38,10 @@ pub struct ApiError {
 #[serde(rename_all = "camelCase")]
 pub struct ResponseMetadata {
     pub page: u32,
+    #[serde(alias = "per_page")]
     pub per_page: u32,
     pub total: u64,
+    #[serde(alias = "total_pages")]
     pub total_pages: u32,
 }
 
@@ -83,13 +85,17 @@ impl std::str::FromStr for Visibility {
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceInfo {
     pub id: uuid::Uuid,
+    #[serde(alias = "tenant_id")]
     pub tenant_id: uuid::Uuid,
     pub name: String,
     pub slug: String,
     pub description: Option<String>,
+    #[serde(alias = "owner_id")]
     pub owner_id: uuid::Uuid,
     pub visibility: Visibility,
+    #[serde(alias = "created_at")]
     pub created_at: DateTime<Utc>,
+    #[serde(alias = "updated_at")]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -98,13 +104,17 @@ pub struct WorkspaceInfo {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectInfo {
     pub id: uuid::Uuid,
+    #[serde(alias = "workspace_id")]
     pub workspace_id: uuid::Uuid,
     pub name: String,
     pub slug: String,
     pub description: Option<String>,
+    #[serde(alias = "default_view")]
     pub default_view: String,
     pub visibility: Visibility,
+    #[serde(alias = "created_at")]
     pub created_at: DateTime<Utc>,
+    #[serde(alias = "updated_at")]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -149,7 +159,7 @@ pub struct UpdateWorkspaceRequest {
 
 /// Request body for creating a new project within a workspace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct CreateProjectRequest {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,7 +175,7 @@ pub struct CreateProjectRequest {
 /// All fields are optional — only the fields that are present (non-`None`)
 /// will be sent to the server.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct UpdateProjectRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -363,7 +373,7 @@ mod tests {
             visibility: Visibility::Private,
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"defaultView\""));
+        assert!(json.contains("\"default_view\""));
         let back: CreateProjectRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.default_view, "main");
         assert_eq!(back.kind.as_deref(), Some("rust"));
@@ -396,7 +406,7 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("\"name\""));
         assert!(!json.contains("description"));
-        assert!(json.contains("\"defaultView\""));
+        assert!(json.contains("\"default_view\""));
         assert!(json.contains("\"visibility\""));
     }
 

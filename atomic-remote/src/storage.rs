@@ -217,19 +217,30 @@ impl StorageClient {
     }
 
     fn parse_error_body(&self, status: u16, body: &str) -> RemoteError {
-        // Try to parse as ApiResponse or ApiError first.
+        // Try to parse as ApiResponse first.
         if let Ok(api_resp) = serde_json::from_str::<ApiResponse<serde_json::Value>>(body) {
             if let Some(err) = api_resp.error {
-                return match status {
-                    401 => RemoteError::unauthorized(err.message),
-                    403 => RemoteError::forbidden(err.message),
-                    404 => RemoteError::not_found(err.message),
-                    409 => RemoteError::conflict(err.message),
-                    _ => RemoteError::server_error(status, err.message),
-                };
+                return self.status_error(status, err.message);
             }
         }
+
+        // Some endpoints return a direct ApiError body instead of the
+        // ApiResponse envelope on validation/auth failures.
+        if let Ok(err) = serde_json::from_str::<crate::storage_types::ApiError>(body) {
+            return self.status_error(status, err.message);
+        }
+
         RemoteError::server_error(status, format!("HTTP {}", status))
+    }
+
+    fn status_error(&self, status: u16, message: String) -> RemoteError {
+        match status {
+            401 => RemoteError::unauthorized(message),
+            403 => RemoteError::forbidden(message),
+            404 => RemoteError::not_found(message),
+            409 => RemoteError::conflict(message),
+            _ => RemoteError::server_error(status, message),
+        }
     }
 
     // -----------------------------------------------------------------------

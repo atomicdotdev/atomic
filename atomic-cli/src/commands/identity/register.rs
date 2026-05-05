@@ -46,6 +46,7 @@ use chrono::Utc;
 use clap::Parser;
 use data_encoding::BASE32_NOPAD;
 
+use atomic_config::GlobalConfig;
 use atomic_identity::IdentityStore;
 
 use crate::commands::Command;
@@ -186,6 +187,15 @@ impl Register {
                 .get("base_url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("(unknown)");
+
+            let mut config = GlobalConfig::load().map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to load global config: {e}"))
+            })?;
+            config.server.url = Some(self.server_url.trim_end_matches('/').to_string());
+            config.server.default_org = Some(slug.to_string());
+            config.save().map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to save global config: {e}"))
+            })?;
 
             print_success(&format!("Registered as {slug}"));
             println!();

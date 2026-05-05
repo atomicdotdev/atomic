@@ -44,11 +44,18 @@ ALICE_NAME="test-alice-${RUN_ID}"
 ALICE_EMAIL="${ALICE_NAME}@test.atomic.dev"
 BOB_NAME="test-bob-${RUN_ID}"
 BOB_EMAIL="${BOB_NAME}@test.atomic.dev"
+CHARLIE_NAME="test-charlie-${RUN_ID}"
+CHARLIE_EMAIL="${CHARLIE_NAME}@test.atomic.dev"
 
 ORG_NAME="test-org-${RUN_ID}"
 WORKSPACE_NAME="test-ws-${RUN_ID}"
 PROJECT_NAME="test-proj-${RUN_ID}"
 TEAM_NAME="test-team-${RUN_ID}"
+PRIVATE_WORKSPACE_NAME="private-ws-${RUN_ID}"
+PUBLIC_WORKSPACE_NAME="public-ws-${RUN_ID}"
+PRIVATE_PROJECT_NAME="private-proj-${RUN_ID}"
+PUBLIC_PROJECT_NAME="public-proj-${RUN_ID}"
+PUBLIC_IN_PRIVATE_PROJECT_NAME="public-in-private-proj-${RUN_ID}"
 
 # Derived slugs (the server lowercases and replaces non-alnum with hyphens).
 # Our names are already lowercase and hyphenated, so slug == name.
@@ -56,6 +63,11 @@ ORG_SLUG="$ORG_NAME"
 WORKSPACE_SLUG="$WORKSPACE_NAME"
 PROJECT_SLUG="$PROJECT_NAME"
 TEAM_SLUG="$TEAM_NAME"
+PRIVATE_WORKSPACE_SLUG="$PRIVATE_WORKSPACE_NAME"
+PUBLIC_WORKSPACE_SLUG="$PUBLIC_WORKSPACE_NAME"
+PRIVATE_PROJECT_SLUG="$PRIVATE_PROJECT_NAME"
+PUBLIC_PROJECT_SLUG="$PUBLIC_PROJECT_NAME"
+PUBLIC_IN_PRIVATE_PROJECT_SLUG="$PUBLIC_IN_PRIVATE_PROJECT_NAME"
 
 # ── Server availability check ──────────────────────────────────────────────
 
@@ -184,8 +196,19 @@ use_identity "$BOB_NAME"
 run_atomic_ok "Register Bob with server" \
     identity register "$SERVER_URL"
 
+# Create Charlie (third user for public/private access tests).
+run_atomic_ok "Create Charlie identity" \
+    identity new "$CHARLIE_NAME" --email "$CHARLIE_EMAIL"
+
+# Register Charlie. Charlie is intentionally NOT added to the team org.
+use_identity "$CHARLIE_NAME"
+run_atomic_ok "Register Charlie with server" \
+    identity register "$SERVER_URL"
+
 # Switch back to Alice for the rest of the tests.
 use_identity "$ALICE_NAME"
+run_atomic_ok "Switch default org back to Alice" \
+    org switch "$ALICE_NAME"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -375,6 +398,61 @@ run_atomic_fail "Create duplicate project fails" \
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+begin_section "Visibility: public/private workspace and project access"
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Create one private workspace and one public workspace. Charlie is registered
+# on the server but is not a member of this org, so Charlie should only be able
+# to read public resources.
+run_atomic_ok "Create private workspace for visibility test" \
+    workspace create "$PRIVATE_WORKSPACE_NAME" --visibility private --org "$ORG_SLUG"
+
+run_atomic_ok "Create public workspace for visibility test" \
+    workspace create "$PUBLIC_WORKSPACE_NAME" --visibility public --org "$ORG_SLUG"
+
+run_atomic_ok "Create private project in public workspace" \
+    project create "$PRIVATE_PROJECT_NAME" \
+        --workspace "$PUBLIC_WORKSPACE_SLUG" \
+        --visibility private \
+        --org "$ORG_SLUG"
+
+run_atomic_ok "Create public project in public workspace" \
+    project create "$PUBLIC_PROJECT_NAME" \
+        --workspace "$PUBLIC_WORKSPACE_SLUG" \
+        --visibility public \
+        --org "$ORG_SLUG"
+
+run_atomic_ok "Create public project in private workspace" \
+    project create "$PUBLIC_IN_PRIVATE_PROJECT_NAME" \
+        --workspace "$PRIVATE_WORKSPACE_SLUG" \
+        --visibility public \
+        --org "$ORG_SLUG"
+
+# Switch to Charlie, who is not an org member.
+use_identity "$CHARLIE_NAME"
+
+run_atomic_ok "Non-member can show public workspace" \
+    workspace show "$PUBLIC_WORKSPACE_SLUG" --org "$ORG_SLUG"
+assert_last_contains "Public workspace visible to non-member" "$PUBLIC_WORKSPACE_SLUG"
+
+run_atomic_fail "Non-member cannot show private workspace" \
+    workspace show "$PRIVATE_WORKSPACE_SLUG" --org "$ORG_SLUG"
+
+run_atomic_ok "Non-member can show public project" \
+    project show "${PUBLIC_WORKSPACE_SLUG}/${PUBLIC_PROJECT_SLUG}" --org "$ORG_SLUG"
+assert_last_contains "Public project visible to non-member" "$PUBLIC_PROJECT_SLUG"
+
+run_atomic_fail "Non-member cannot show private project" \
+    project show "${PUBLIC_WORKSPACE_SLUG}/${PRIVATE_PROJECT_SLUG}" --org "$ORG_SLUG"
+
+run_atomic_fail "Non-member cannot show public project in private workspace" \
+    project show "${PRIVATE_WORKSPACE_SLUG}/${PUBLIC_IN_PRIVATE_PROJECT_SLUG}" --org "$ORG_SLUG"
+
+# Switch back to Alice for privileged operations.
+use_identity "$ALICE_NAME"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 begin_section "Team: CRUD"
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -424,40 +502,19 @@ run_atomic_fail "Create duplicate team fails" \
 begin_section "Team Members: Add, update, list, remove"
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Add Bob to the team by name (identity resolution).
+# Add Bob to the team by name (identity resolution). The current staging
+# database constraint accepts `member` and `maintainer`, but the CLI's TeamRole
+# enum currently exposes `maintainer` from that deployed pair.
 run_atomic_ok "Add Bob to team by name" \
     team member add "$TEAM_SLUG" "$BOB_NAME" \
-        --role contributor \
+        --role maintainer \
         --org "$ORG_SLUG"
 
 # List members.
 run_atomic_ok "List team members" \
     team member list "$TEAM_SLUG" --org "$ORG_SLUG"
 
-assert_last_contains "Team member list shows contributor" "contributor"
-
-# Update role.
-run_atomic_ok "Update Bob to maintainer" \
-    team member update "$TEAM_SLUG" "$BOB_NAME" \
-        --role maintainer \
-        --org "$ORG_SLUG"
-
-assert_last_contains "Update shows maintainer role" "maintainer"
-
-# Test other roles.
-run_atomic_ok "Update Bob to collaborator" \
-    team member update "$TEAM_SLUG" "$BOB_NAME" \
-        --role collaborator \
-        --org "$ORG_SLUG"
-
-assert_last_contains "Update shows collaborator role" "collaborator"
-
-run_atomic_ok "Update Bob to consumer" \
-    team member update "$TEAM_SLUG" "$BOB_NAME" \
-        --role consumer \
-        --org "$ORG_SLUG"
-
-assert_last_contains "Update shows consumer role" "consumer"
+assert_last_contains "Team member list shows maintainer" "maintainer"
 
 # Remove.
 run_atomic_ok "Remove Bob from team" \
@@ -475,6 +532,16 @@ run_atomic_fail "Add with invalid role fails" \
         --role superadmin \
         --org "$ORG_SLUG"
 
+run_atomic_fail "Add with unsupported contributor role fails on staging" \
+    team member add "$TEAM_SLUG" "$BOB_NAME" \
+        --role contributor \
+        --org "$ORG_SLUG"
+
+run_atomic_fail "Add with unsupported member role fails in CLI" \
+    team member add "$TEAM_SLUG" "$BOB_NAME" \
+        --role member \
+        --org "$ORG_SLUG"
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Project Init: Full workflow (create repo + remote)"
@@ -490,7 +557,7 @@ run_atomic_ok "Project init creates project and sets remote" \
         --kind rust \
         --org "$ORG_SLUG"
 
-assert_last_contains "Init mentions remote configured" "origin"
+assert_last_contains "Init reports remote URL" "Remote URL"
 
 # Verify the remote was set in the local repo config.
 run_atomic remote -v
@@ -541,6 +608,24 @@ else
     run_atomic_ok "Delete project" \
         project delete "${WORKSPACE_SLUG}/${PROJECT_SLUG}" \
             --force --org "$ORG_SLUG"
+
+    run_atomic_ok "Delete public visibility project" \
+        project delete "${PUBLIC_WORKSPACE_SLUG}/${PUBLIC_PROJECT_SLUG}" \
+            --force --org "$ORG_SLUG"
+
+    run_atomic_ok "Delete private visibility project" \
+        project delete "${PUBLIC_WORKSPACE_SLUG}/${PRIVATE_PROJECT_SLUG}" \
+            --force --org "$ORG_SLUG"
+
+    run_atomic_ok "Delete public-in-private visibility project" \
+        project delete "${PRIVATE_WORKSPACE_SLUG}/${PUBLIC_IN_PRIVATE_PROJECT_SLUG}" \
+            --force --org "$ORG_SLUG"
+
+    run_atomic_ok "Delete public visibility workspace" \
+        workspace delete "$PUBLIC_WORKSPACE_SLUG" --force --org "$ORG_SLUG"
+
+    run_atomic_ok "Delete private visibility workspace" \
+        workspace delete "$PRIVATE_WORKSPACE_SLUG" --force --org "$ORG_SLUG"
 
     run_atomic_ok "Delete workspace" \
         workspace delete "$WORKSPACE_SLUG" --force --org "$ORG_SLUG"

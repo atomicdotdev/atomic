@@ -216,8 +216,10 @@ pub struct OrgInfo {
     /// Billing plan (e.g. `"free"`, `"team"`, `"enterprise"`).
     pub plan: String,
     /// When the organization was created.
+    #[serde(alias = "created_at")]
     pub created_at: DateTime<Utc>,
     /// When the organization was last updated.
+    #[serde(alias = "updated_at")]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -226,14 +228,18 @@ pub struct OrgInfo {
 #[serde(rename_all = "camelCase")]
 pub struct OrgMemberInfo {
     /// Organization this membership belongs to.
+    #[serde(alias = "org_id")]
     pub org_id: Uuid,
     /// Identity of the member.
+    #[serde(alias = "identity_id")]
     pub identity_id: Uuid,
     /// Role within the organization.
     pub role: OrgRole,
     /// When the member joined.
+    #[serde(alias = "joined_at")]
     pub joined_at: DateTime<Utc>,
     /// Identity that sent the invitation, if applicable.
+    #[serde(alias = "invited_by")]
     pub invited_by: Option<Uuid>,
 }
 
@@ -244,6 +250,7 @@ pub struct TeamInfo {
     /// Unique identifier.
     pub id: Uuid,
     /// Organization this team belongs to.
+    #[serde(alias = "org_id")]
     pub org_id: Uuid,
     /// URL-safe slug (e.g. `"backend-eng"`).
     pub slug: String,
@@ -254,8 +261,10 @@ pub struct TeamInfo {
     /// Visibility within the organization.
     pub visibility: TeamVisibility,
     /// When the team was created.
+    #[serde(alias = "created_at")]
     pub created_at: DateTime<Utc>,
     /// When the team was last updated.
+    #[serde(alias = "updated_at")]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -264,14 +273,18 @@ pub struct TeamInfo {
 #[serde(rename_all = "camelCase")]
 pub struct TeamMemberInfo {
     /// Team this membership belongs to.
+    #[serde(alias = "team_id")]
     pub team_id: Uuid,
     /// Identity of the member.
+    #[serde(alias = "identity_id")]
     pub identity_id: Uuid,
     /// Role within the team.
     pub role: TeamRole,
     /// When the member was added.
+    #[serde(alias = "added_at")]
     pub added_at: DateTime<Utc>,
     /// Identity that added this member.
+    #[serde(alias = "added_by")]
     pub added_by: Uuid,
 }
 
@@ -319,6 +332,7 @@ pub struct DomainAliasInfo {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CreateOrgRequest<'a> {
+    pub slug: &'a str,
     pub name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<&'a str>,
@@ -336,7 +350,7 @@ pub(crate) struct UpdateOrgRequest<'a> {
 
 /// Body for adding an organization member.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub(crate) struct AddMemberRequest {
     pub identity_id: Uuid,
     pub role: OrgRole,
@@ -374,7 +388,7 @@ pub(crate) struct UpdateTeamRequest<'a> {
 
 /// Body for adding a team member.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub(crate) struct AddTeamMemberRequest {
     pub identity_id: Uuid,
     pub role: TeamRole,

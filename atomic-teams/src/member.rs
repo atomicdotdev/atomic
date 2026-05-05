@@ -130,7 +130,7 @@ mod tests {
             role: OrgRole::Member,
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("identityId"));
+        assert!(json.contains("identity_id"));
         assert!(json.contains("member"));
     }
 
