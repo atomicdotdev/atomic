@@ -164,9 +164,9 @@ pub fn list_tags_filtered(tags_dir: &Path, filter: &TagFilter) -> TagResult<Vec<
 
     // Sort
     match filter.sort {
-        TagSort::Name => tags.sort_by(|a, b| a.name.cmp(&b.name)),
-        TagSort::Timestamp => tags.sort_by(|a, b| b.timestamp.cmp(&a.timestamp)),
-        TagSort::Sequence => tags.sort_by(|a, b| b.sequence.cmp(&a.sequence)),
+        TagSort::Name => tags.sort_by_key(|t| t.name.clone()),
+        TagSort::Timestamp => tags.sort_by_key(|t| std::cmp::Reverse(t.timestamp)),
+        TagSort::Sequence => tags.sort_by_key(|t| std::cmp::Reverse(t.sequence)),
     }
 
     // Limit

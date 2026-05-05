@@ -118,6 +118,22 @@ impl TurnOrchestrator {
     ) -> AgentResult<DispatchResult> {
         let session_id = &event.session_id;
 
+        // Fast gate: check if anything changed since the last record.
+        // This bypasses the entire status machinery (TREE scan, filesystem
+        // walk, etc.) and just checks the pristine database mtime.
+        // If the DB hasn't been written since the last record, nothing
+        // in the working copy could have been recorded — but files may
+        // have been edited. We check the working copy for recent mtimes
+        // by scanning only the repo root (not recursively) and common
+        // source directories.
+        if !self.has_working_copy_changes() {
+            log::info!(
+                "Turn end for session {} — no changes detected, skipping record",
+                session_id
+            );
+            return Ok(DispatchResult::new(session_id, phase::Phase::Idle));
+        }
+
         let mut session = self.load_or_create_session(session_id, &event)?;
 
         // Extract model/provider from the TurnEnd event's raw_json.

@@ -19,7 +19,7 @@ Atomic is version control that understands AI-assisted development from the grou
 | **Provenance** | Not tracked | Causal decision graph: goal → exploration → commitment → verification |
 | **Attestation** | Not tracked | Session-level audit nodes with cost, token breakdown, and change coverage |
 | **Turn recording** | Manual commits or wrapper scripts | Automatic — each agent turn is a change with full metadata |
-| **Agent isolation** | Branches diverge and need merging | Stacks are views of the same graph — isolated agent work, zero-orphan cleanup |
+| **Agent isolation** | Branches diverge and need merging | Views are filtered perspectives of the same graph — isolated agent work, zero-orphan cleanup |
 | **Conflict granularity** | Whole lines | Token-level — two agents editing different tokens on the same line don't conflict |
 | **Identity** | Name + email string | Ed25519 cryptographic identity with agent delegation scopes |
 | **Merge correctness** | Heuristic 3-way merge | Mathematical — commutative when changes are independent, precise when they're not |
@@ -72,24 +72,145 @@ $ atomic agent attest
 Total: $0.12 · 3 changes covered · 20.5k tokens
 ```
 
-### Stacks, Not Branches
+### Views, Not Branches
 
-Agents work on isolated stacks — lightweight views of the same underlying graph. No branch divergence, no merge commits, no orphaned history.
+Agents work on isolated views of the same underlying graph. No branch divergence, no merge commits, no orphaned history.
 
 ```bash
-# Agent session creates an isolated stack automatically
-# Stack: agent-ses_3781fc7a6ffet5c6r1ILy1BEbv (Local, parent: dev)
+# Agent session creates an isolated view automatically
+# View: agent-ses_3781fc7a6ffet5c6r1ILy1BEbv (Draft, parent: dev)
 
-# When done, apply changes to the parent stack
-atomic apply @~1 --to dev
+# When done, insert changes into the parent view
+atomic insert @~1 --to dev
 
-# Delete the agent stack — cascade-deletes its edges, zero orphans
-atomic stack delete agent-ses_3781fc7a6ffet5c6r1ILy1BEbv
+# Delete the agent view — cascade-deletes its edges, zero orphans
+atomic view delete agent-ses_3781fc7a6ffet5c6r1ILy1BEbv
 ```
+
+### Workspace Shelving
+
+When you switch views, Atomic automatically isolates build artifacts per view — each view gets its own `node_modules/`, `target/`, etc. But tool configs like `.opencode/`, `.vscode/`, and `.idea/` are project-wide and should persist across all views.
+
+Atomic handles this with `[workspace] expose`:
+
+```toml
+# .atomic/config.toml
+[workspace]
+expose = [".opencode", ".vscode", ".idea", ".claude", ".gemini"]
+```
+
+- **`.atomicignore`** = "don't track" (same as `.gitignore`). By default, all ignored files are **shelved per-view** on switch.
+- **`[workspace] expose`** = "persist across views". These paths are never shelved — they stay on disk through every view switch.
+
+| File | `.atomicignore` | `expose` | On view switch |
+|------|:-:|:-:|---|
+| `.opencode/`, `.vscode/` | ✓ | ✓ | **Left alone** — persists across views |
+| `node_modules/`, `target/` | ✓ | ✗ | **Shelved** per view (O(1) rename) |
+| `src/main.rs` | ✗ | — | **Tracked** — materialized from the graph |
+
+`atomic init` seeds a default `expose` list with common tool configs. Build artifacts in `.atomicignore` are shelved automatically — no per-language configuration needed.
+
+You can also set `expose` globally in `~/.atomic/config.toml` so it applies to every repository on your machine:
+
+```toml
+# ~/.atomic/config.toml
+[workspace]
+expose = [".opencode", ".vscode", ".idea", ".claude", ".gemini"]
+```
+
+Global and repo-local patterns are merged — a repo can add project-specific entries without repeating the global ones.
 
 ### Token-Level Diff
 
 Atomic's CRDT semantic layer (Trunk → Branch → Leaf) tracks changes at the token level. Two agents editing different words on the same line produce independent patches that merge cleanly — Git would flag this as a conflict.
+
+### Vault — Shared Project Brain
+
+Every repository has a **vault** — a versioned knowledge store that persists what your team and your agents learn across sessions. Goals, decisions, architecture context, and working memory all live in `.vault/` as structured markdown with cryptographic provenance.
+
+```bash
+# Initialize the vault in your repo
+atomic vault init
+
+# Start a goal (a focused work session — human or agent)
+atomic vault goal start --intent PIMO-3 --title "Fix token validation"
+
+# Agents and humans accumulate tool results, decisions, and context
+# When done, stop the goal — optionally promote it for team review
+atomic vault goal stop --promote
+
+# Add persistent project knowledge (conventions, architecture, etc.)
+atomic vault memory add "Auth tokens use Ed25519 signatures, never HMAC"
+
+# Track planned work items
+atomic vault intent add --title "Migrate to async runtime" --priority high
+```
+
+The vault stores five kinds of content:
+
+| Entry Type | What It Captures |
+|------------|------------------|
+| **Goals** | Work sessions — each tracks a developer/agent, linked intent, model, status, and tool results |
+| **Intents** | Planned work items with priority, status, assignee, and labels |
+| **Memory** | Persistent knowledge — architecture decisions, conventions, reference material |
+| **Skills** | Reusable capability definitions for agents |
+| **Scratch** | Temporary notes and working state |
+
+Everything is content-addressed and version-controlled. When an agent starts a session, it reads the vault for context. When it finishes, its learnings go back into the vault for the next session — human or machine.
+
+### Knowledge Graph — Code Intelligence at Scale
+
+Atomic builds a **knowledge graph** from your entire codebase — source code content, file structure, tree-sitter entities (functions, classes, types), module hierarchy, change history, and their relationships. Search it, traverse it, visualize it, or let an LLM explore it with tools.
+
+```bash
+# Search the knowledge graph — unified structural + content search
+atomic query search "replication"
+
+# Search source code content (powered by syntext trigram index)
+atomic query code "replication" -t cpp -g src/mongo/db/repl/
+
+# List tree-sitter entities in a file (functions, classes, types)
+atomic query entities src/mongo/db/repl/replication_coordinator_impl.cpp
+
+# Explore relationships around a node (1-2 hops)
+atomic query neighbors "module:src/mongo/db/repl"
+
+# Visualize the graph — opens interactive D3 force-directed layout
+atomic query graph "replication" -k 20 --depth 2
+```
+
+The KG contains seven node types connected by typed edges:
+
+```
+module:src/mongo/db/repl          ← directory-level grouping
+  ├─ PART_OF ← file:replication_coordinator.h    ← tracked files
+  │              ├─ DEFINES → entity:ReplicationCoordinator (class, L42-890)
+  │              └─ INCLUDES → file:replication_process.h
+  ├─ PART_OF ← file:bgsync.cpp
+  │              └─ MODIFIES ← change:R4YQUAS2 ("fix replication lag")
+  │                              ├─ AUTHORED_BY → identity:alice
+  │                              └─ DEPENDS_ON → change:XMJZ3IPF
+  └─ PART_OF → module:src/mongo/db  (parent module)
+```
+
+Search is powered by two indexes that work together:
+- **KG FTS** — searches node labels, summaries, and metadata (structural search)
+- **syntext** — trigram-indexed content search across all source files, ~20x faster than grep
+
+Results are ranked: `src/` files above tests, modules above flat files, content match counts as a signal. A bounded min-heap ensures the top N results surface from thousands of matches without sorting the full set.
+
+For agents (Claude Code, Gemini, etc.), the CLI commands ARE the tools. An agent calls `atomic query search`, `atomic query neighbors`, `atomic query entities`, and its own `read_file` — the same path a human follows. No grep, no find, no LLM-calling-LLM overhead.
+
+For humans on the terminal, `ask` provides an agentic loop with tool use:
+
+```bash
+# LLM explores the KG with tools and answers your question
+atomic query ask "who fixed the auth bug?"
+```
+
+The `ask` command gives the LLM six tools (`kg_search`, `kg_neighbors`, `read_file`, `list_entities`, `code_search`, `vault_read`) and lets it decide what to look up. Provider-agnostic — works with Anthropic or OpenAI. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` to enable.
+
+No API key required for `search`, `code`, `entities`, `neighbors`, `graph`, or `enrich`.
 
 ## Quick Start
 
@@ -104,8 +225,8 @@ atomic record -m "Initial commit"
 # Enable AI agent hooks
 atomic agent enable
 
-# Create a stack
-atomic stack new feature-x
+# Create a view
+atomic view create feature-x
 
 # Push to a remote
 atomic push origin
@@ -149,15 +270,29 @@ Every change stores two parallel representations:
 | `atomic log` | Show change history |
 | `atomic change [hash]` | Show details for a specific change |
 
-### Stack Commands
+### Query Commands
 
 | Command | Description |
 |---------|-------------|
-| `atomic stack new <name>` | Create a new stack |
-| `atomic stack switch <name>` | Switch to a stack |
-| `atomic stack list` | List all stacks |
-| `atomic stack delete <name>` | Delete a stack |
-| `atomic split <name>` | Create a new stack from the current one |
+| `atomic query search <query>` | Search the knowledge graph (structural + content) |
+| `atomic query code <pattern>` | Search source code content (trigram-indexed, `-t` for file type, `-g` for path filter) |
+| `atomic query entities <path>` | List tree-sitter entities in a file (functions, classes, types with line ranges) |
+| `atomic query neighbors <id>` | Explore the graph around a node (DEFINES, MODIFIES, PART_OF, INCLUDES edges) |
+| `atomic query graph <query>` | Visualize the knowledge graph as interactive HTML (D3 force-directed, `-k` seeds, `--depth`, `--kinds`) |
+| `atomic query ask <question>` | Natural-language Q&A with agentic tool loop (requires API key) |
+| `atomic query enrich` | Build/rebuild KG from VCS data + content index (modules, entities, includes) |
+| `atomic query index` | Build/update the content search index (`--rebuild` for full, `--stats` for info) |
+| `atomic query reindex` | Rebuild the KG index from vault entries |
+
+### View Commands
+
+| Command | Description |
+|---------|-------------|
+| `atomic view create <name>` | Create a new view (`--draft` for isolated, `--parent` to set parent) |
+| `atomic view switch <name>` | Switch to a view |
+| `atomic view list` | List all views (`--verbose` for scope and parent) |
+| `atomic view delete <name>` | Delete a view |
+| `atomic split <name>` | Create a new view from the current one |
 | `atomic stash` | Temporarily save uncommitted changes |
 
 ### Remote Commands
@@ -200,6 +335,22 @@ Every change stores two parallel representations:
 | `atomic agent status` | Show active sessions and hook status |
 | `atomic agent explain <id>` | Generate AI reasoning summary for a session |
 | `atomic agent attest` | List and inspect attestations |
+
+### Vault Commands
+
+| Command | Description |
+|---------|-------------|
+| `atomic vault init` | Initialize the vault in an existing repository |
+| `atomic vault goal start` | Start a new goal (work session) |
+| `atomic vault goal stop` | End the current goal (`--promote` for team review) |
+| `atomic vault goal list` | List goals |
+| `atomic vault intent add` | Create a planned work item |
+| `atomic vault intent list` | List intents |
+| `atomic vault memory add` | Add persistent project knowledge |
+| `atomic vault memory list` | List memory entries |
+| `atomic vault list` | List all vault entries (filter with `--type`) |
+| `atomic vault show <path>` | Print a vault entry's content |
+| `atomic vault sync` | Sync vault entries between disk and database |
 
 #### Supported Agents
 

@@ -542,6 +542,86 @@ mod tests {
     }
 
     #[test]
+    fn test_change_dependency_index_operations() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+        let pristine = Pristine::open(&db_path).unwrap();
+
+        let change_hash = Hash::of(b"change");
+        let dep1 = Hash::of(b"dep1");
+        let dep2 = Hash::of(b"dep2");
+
+        let change_id = {
+            let mut txn = pristine.write_txn().unwrap();
+            let change_id = txn.register_change(&change_hash).unwrap();
+            txn.put_change_deps(change_id, &[dep1, dep2]).unwrap();
+
+            assert!(txn.is_change_deps_indexed(change_id).unwrap());
+            let deps = txn.get_change_deps(change_id).unwrap();
+            assert_eq!(deps.len(), 2);
+            assert!(deps.contains(&dep1));
+            assert!(deps.contains(&dep2));
+            assert!(txn.get_rev_change_deps(&dep1).unwrap().contains(&change_id));
+            assert!(txn.get_rev_change_deps(&dep2).unwrap().contains(&change_id));
+
+            txn.commit().unwrap();
+            change_id
+        };
+
+        let txn = pristine.read_txn().unwrap();
+        assert!(txn.is_change_deps_indexed(change_id).unwrap());
+        let deps = txn.get_change_deps(change_id).unwrap();
+        assert_eq!(deps.len(), 2);
+        assert!(deps.contains(&dep1));
+        assert!(deps.contains(&dep2));
+        assert!(txn.get_rev_change_deps(&dep1).unwrap().contains(&change_id));
+    }
+
+    #[test]
+    fn test_change_dependency_index_zero_deps_marker() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+        let pristine = Pristine::open(&db_path).unwrap();
+
+        let mut txn = pristine.write_txn().unwrap();
+        let change_id = txn.register_change(&Hash::of(b"zero deps")).unwrap();
+        assert!(!txn.is_change_deps_indexed(change_id).unwrap());
+
+        txn.put_change_deps(change_id, &[]).unwrap();
+        assert!(txn.is_change_deps_indexed(change_id).unwrap());
+        assert!(txn.get_change_deps(change_id).unwrap().is_empty());
+
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn test_change_dependency_index_replaces_old_rows() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+        let pristine = Pristine::open(&db_path).unwrap();
+
+        let mut txn = pristine.write_txn().unwrap();
+        let change_id = txn.register_change(&Hash::of(b"replace deps")).unwrap();
+        let old_dep = Hash::of(b"old");
+        let new_dep = Hash::of(b"new");
+
+        txn.put_change_deps(change_id, &[old_dep]).unwrap();
+        txn.put_change_deps(change_id, &[new_dep]).unwrap();
+
+        assert_eq!(txn.get_change_deps(change_id).unwrap(), vec![new_dep]);
+        assert!(!txn
+            .get_rev_change_deps(&old_dep)
+            .unwrap()
+            .contains(&change_id));
+        assert!(txn
+            .get_rev_change_deps(&new_dep)
+            .unwrap()
+            .contains(&change_id));
+
+        txn.commit().unwrap();
+    }
+
+    #[test]
     fn test_inode_operations() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("pristine");

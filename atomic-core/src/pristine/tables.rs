@@ -7,7 +7,8 @@
 //! - **Graph**: `GRAPH`, `INODE_GRAPH` - store vertices and edges
 //! - **Views**: `VIEWS`, `VIEW_CHANGES`, `REV_VIEW_CHANGES` - view metadata
 //! - **File Tree**: `TREE`, `REV_TREE`, `INODES`, `REV_INODES`, `DIRECTORIES` - file system mappings
-//! - **Dependencies**: `DEPS`, `REV_DEPS` - change dependency tracking
+//! - **Dependencies**: `DEPS`, `REV_DEPS` - node dependency tracking for attestations/provenance
+//! - **Change Dependencies**: `CHANGE_DEPS`, `REV_CHANGE_DEPS`, `CHANGE_DEPS_INDEXED` - normal change dependency index
 //! - **State**: `STATES`, `TAGS` - view state and tag tracking
 
 use redb::{MultimapTableDefinition, TableDefinition};
@@ -209,21 +210,52 @@ pub mod directory_flags {
 
 // Dependency Tables
 
-/// Dependencies: change_id → `dep_id` (multimap)
+/// Node dependencies: node_id → `dep_id` (multimap)
 ///
-/// Key: change NodeId
+/// Key: node NodeId
 /// Value: dependency NodeId
 ///
-/// Tracks which changes a given change depends on.
+/// Tracks internal node relationships for attestations and provenance. Normal
+/// change dependencies are indexed separately in `CHANGE_DEPS` so missing
+/// dependencies can be represented by hash during pull/clone.
 pub const DEPS: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new("deps");
 
-/// Reverse dependencies: dep_id → `change_id` (multimap)
+/// Reverse node dependencies: dep_id → `node_id` (multimap)
 ///
 /// Key: dependency NodeId
+/// Value: dependent node NodeId
+///
+/// Tracks which nodes depend on a given node (reverse of DEPS).
+pub const REV_DEPS: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new("rev_deps");
+
+/// Normal change dependencies: change_id → dependency hash (multimap)
+///
+/// Key: change NodeId
+/// Value: dependency Hash ([u8; 32])
+///
+/// This is the redb-backed dependency index used by interactive commands to
+/// build view filter dependency closures without loading `.change` files.
+pub const CHANGE_DEPS: MultimapTableDefinition<u64, &[u8; 32]> =
+    MultimapTableDefinition::new("change_deps");
+
+/// Reverse normal change dependencies: dependency hash → change_id (multimap)
+///
+/// Key: dependency Hash ([u8; 32])
 /// Value: dependent change NodeId
 ///
-/// Tracks which changes depend on a given change (reverse of DEPS).
-pub const REV_DEPS: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new("rev_deps");
+/// Hash keys allow pull/clone to represent dependencies that are not locally
+/// registered yet.
+pub const REV_CHANGE_DEPS: MultimapTableDefinition<&[u8; 32], u64> =
+    MultimapTableDefinition::new("rev_change_deps");
+
+/// Marker that a change's dependency list has been indexed.
+///
+/// Key: change NodeId
+/// Value: dependency count
+///
+/// A marker is needed because zero dependencies is distinct from "not indexed".
+pub const CHANGE_DEPS_INDEXED: TableDefinition<u64, u64> =
+    TableDefinition::new("change_deps_indexed");
 
 // State Tables
 
@@ -277,32 +309,46 @@ pub const TAGS: TableDefinition<&[u8; 16], &[u8; 32]> = TableDefinition::new("ta
 /// - Content edits change mtime (and usually size)
 /// - Truncation changes size
 /// - `touch` changes mtime
-/// - The only false positive is modifying a file back to its original
-///   content within the same mtime granularity — we accept this as
-///   an extremely rare edge case that just causes one extra comparison
-pub const FILE_MTIMES: TableDefinition<&str, &[u8; 20]> = TableDefinition::new("file_mtimes");
-
-/// Encode file metadata for the FILE_MTIMES table.
 ///
-/// Packs (mtime_secs, mtime_nanos, file_size) into 20 bytes.
+/// When mtime+size don't match, the stored content hash is compared with
+/// the on-disk hash to detect true modifications without reconstructing
+/// graph content.
+pub const FILE_INDEX: TableDefinition<&str, &[u8; 52]> = TableDefinition::new("file_index");
+
+/// Encode file metadata for the FILE_INDEX table.
+///
+/// Packs (mtime_secs, mtime_nanos, file_size, content_hash) into 52 bytes.
 #[inline]
-pub fn encode_file_mtime(mtime_secs: i64, mtime_nanos: u32, file_size: u64) -> [u8; 20] {
-    let mut value = [0u8; 20];
+pub fn encode_file_index(
+    mtime_secs: i64,
+    mtime_nanos: u32,
+    file_size: u64,
+    content_hash: &crate::types::Hash,
+) -> [u8; 52] {
+    let mut value = [0u8; 52];
     value[0..8].copy_from_slice(&mtime_secs.to_le_bytes());
     value[8..12].copy_from_slice(&mtime_nanos.to_le_bytes());
     value[12..20].copy_from_slice(&file_size.to_le_bytes());
+    value[20..52].copy_from_slice(&content_hash.0);
     value
 }
 
-/// Decode file metadata from the FILE_MTIMES table.
+/// Decode file metadata from the FILE_INDEX table.
 ///
-/// Returns (mtime_secs, mtime_nanos, file_size).
+/// Returns (mtime_secs, mtime_nanos, file_size, content_hash).
 #[inline]
-pub fn decode_file_mtime(value: &[u8; 20]) -> (i64, u32, u64) {
+pub fn decode_file_index(value: &[u8; 52]) -> (i64, u32, u64, crate::types::Hash) {
     let mtime_secs = i64::from_le_bytes(value[0..8].try_into().unwrap());
     let mtime_nanos = u32::from_le_bytes(value[8..12].try_into().unwrap());
     let file_size = u64::from_le_bytes(value[12..20].try_into().unwrap());
-    (mtime_secs, mtime_nanos, file_size)
+    let mut hash_bytes = [0u8; 32];
+    hash_bytes.copy_from_slice(&value[20..52]);
+    (
+        mtime_secs,
+        mtime_nanos,
+        file_size,
+        crate::types::Merkle(hash_bytes),
+    )
 }
 
 // V3 Change Storage Tables
@@ -460,6 +506,224 @@ pub const SESSION_PHASES: TableDefinition<&[u8; 16], &[u8]> =
 ///
 /// Intent metadata for the turn. One entry per provenance graph.
 pub const SESSION_INTENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("session_intents");
+
+// Vault Tables (shared project knowledge store)
+//
+// The vault stores project knowledge (sessions, memory, skills, intents)
+// in redb. Markdown files in `.vault/` are materialized views of
+// this data. See `atomic-core/src/pristine/vault.rs` for type definitions.
+
+/// Vault entries: vault_path → VaultEntry (serialized)
+///
+/// Key: vault-relative path (e.g. "sessions/abc123/_session.md")
+/// Value: postcard-serialized VaultEntry (metadata + content bytes)
+///
+/// This is the canonical store for all vault content. The markdown files
+/// on disk are generated from these entries.
+pub const VAULT_ENTRIES: TableDefinition<&str, &[u8]> = TableDefinition::new("vault_entries");
+
+/// Vault manifest: singleton key → JSON blob
+///
+/// Key: always "manifest"
+/// Value: JSON-serialized VaultManifest
+///
+/// The manifest indexes the entire vault for cold-start, sync, and selective
+/// fetch. Updated atomically with every vault write.
+pub const VAULT_MANIFEST: TableDefinition<&str, &[u8]> = TableDefinition::new("vault_manifest");
+
+// Knowledge Graph Tables
+//
+// Stores nodes and edges for the full repository knowledge graph:
+// changes, files, entities, views, vault (goals, intents, memory).
+// Replaces the earlier triple-only store with richer typed nodes.
+
+/// KG nodes: node_id → KgNode (serialized)
+///
+/// Key: structured node ID (e.g., "change:abc123", "file:src/auth.rs")
+/// Value: postcard-serialized KgNode
+pub const KG_NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("kg_nodes");
+
+/// KG edges: composite key → KgEdge (serialized)
+///
+/// Key: "from_id\0to_id\0kind" (unique edge identifier)
+/// Value: postcard-serialized KgEdge
+pub const KG_EDGES: TableDefinition<&str, &[u8]> = TableDefinition::new("kg_edges");
+
+/// KG edge index by source: from_id → \[edge_key\] (multimap)
+///
+/// Enables efficient "outgoing edges from node X" queries.
+pub const KG_EDGES_FROM: MultimapTableDefinition<&str, &str> =
+    MultimapTableDefinition::new("kg_edges_from");
+
+/// KG edge index by target: to_id → \[edge_key\] (multimap)
+///
+/// Enables efficient "incoming edges to node X" queries.
+pub const KG_EDGES_TO: MultimapTableDefinition<&str, &str> =
+    MultimapTableDefinition::new("kg_edges_to");
+
+/// KG full-text search inverted index: token → \[node_id\] (multimap)
+///
+/// Simple inverted index for keyword search over node labels and summaries.
+/// Tokens are lowercase, alphanumeric words extracted from label + summary.
+pub const KG_FTS: MultimapTableDefinition<&str, &str> = MultimapTableDefinition::new("kg_fts");
+
+// Embedding Tables (vector similarity search)
+
+/// Vector embeddings: vault_path → EmbeddingRecord (serialized)
+///
+/// Key: composite string "vault_path\0chunk_idx" (e.g., "memory/arch.md\00")
+/// Value: postcard-serialized EmbeddingRecord
+///
+/// Stores embeddings for semantic similarity search over vault content.
+pub const EMBEDDINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("embeddings");
+
+// KG Edge Key / FTS Helpers
+
+/// Encode a KG edge key as "from_id\0to_id\0kind".
+#[inline]
+pub fn encode_edge_key(from_id: &str, to_id: &str, kind: &str) -> String {
+    format!("{}\0{}\0{}", from_id, to_id, kind)
+}
+
+/// Decode a KG edge key into (from_id, to_id, kind).
+#[inline]
+pub fn decode_edge_key(key: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = key.splitn(3, '\0');
+    let from_id = parts.next()?;
+    let to_id = parts.next()?;
+    let kind = parts.next()?;
+    Some((from_id, to_id, kind))
+}
+
+/// Stop words filtered from FTS queries and indexing.
+///
+/// Includes common English words plus common programming/project terms
+/// that match too many nodes to be useful for ranking.
+const FTS_STOP_WORDS: &[&str] = &[
+    // English
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "but",
+    "by",
+    "do",
+    "does",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "he",
+    "her",
+    "his",
+    "how",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "let",
+    "my",
+    "no",
+    "not",
+    "of",
+    "on",
+    "or",
+    "our",
+    "own",
+    "say",
+    "she",
+    "so",
+    "than",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "to",
+    "us",
+    "was",
+    "we",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "will",
+    "with",
+    "would",
+    "you",
+    "your",
+    // Programming
+    "use",
+    "fn",
+    "pub",
+    "mod",
+    "impl",
+    "struct",
+    "enum",
+    "trait",
+    "const",
+    "let",
+    "mut",
+    "self",
+    "super",
+    "crate",
+    "return",
+    "true",
+    "false",
+    "import",
+    "export",
+    "function",
+    "class",
+    "new",
+    "async",
+    "await",
+    "type",
+    "interface",
+    "var",
+    "def",
+    "src",
+    "test",
+    "tests",
+];
+
+/// Tokenize text for the FTS inverted index.
+///
+/// Extracts lowercase alphanumeric words of length >= 3, filtering out
+/// stop words (common English + programming terms) that match too many
+/// nodes to be useful for ranking.
+pub fn tokenize_for_fts(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| w.len() >= 3)
+        .map(|w| w.to_lowercase())
+        .filter(|w| !FTS_STOP_WORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// Encode an embedding key as "path\0chunk_idx".
+#[inline]
+pub fn encode_embedding_key(path: &str, chunk_idx: u32) -> String {
+    format!("{}\0{}", path, chunk_idx)
+}
+
+/// Decode an embedding key into (path, chunk_idx).
+#[inline]
+pub fn decode_embedding_key(key: &str) -> Option<(&str, u32)> {
+    let (path, idx_str) = key.split_once('\0')?;
+    let idx = idx_str.parse().ok()?;
+    Some((path, idx))
+}
 
 // V3 Change Storage Key Encoding
 
@@ -770,5 +1034,64 @@ mod tests {
 
         assert!(is_explicit(0b11));
         assert!(is_empty(0b11));
+    }
+
+    // KG Edge Key / FTS Tests
+
+    #[test]
+    fn test_edge_key_roundtrip() {
+        let key = encode_edge_key("change:abc", "file:auth.rs", "MODIFIES");
+        let (from, to, kind) = decode_edge_key(&key).unwrap();
+        assert_eq!(from, "change:abc");
+        assert_eq!(to, "file:auth.rs");
+        assert_eq!(kind, "MODIFIES");
+    }
+
+    #[test]
+    fn test_tokenize_for_fts() {
+        let tokens = tokenize_for_fts("Fix authentication bug in auth.rs");
+        assert!(tokens.contains(&"fix".to_string()));
+        assert!(tokens.contains(&"authentication".to_string()));
+        assert!(tokens.contains(&"bug".to_string()));
+        assert!(tokens.contains(&"auth".to_string()));
+        // "rs" and "in" are < 3 chars, filtered out
+        assert!(!tokens.contains(&"rs".to_string()));
+        assert!(!tokens.contains(&"in".to_string()));
+    }
+
+    #[test]
+    fn test_tokenize_for_fts_filters_short() {
+        let tokens = tokenize_for_fts("I a am the one");
+        // "I", "a", and "am" are < 3 chars, filtered out
+        assert!(!tokens.contains(&"i".to_string()));
+        assert!(!tokens.contains(&"a".to_string()));
+        assert!(!tokens.contains(&"am".to_string()));
+        // "the" is a stop word, filtered out
+        assert!(!tokens.contains(&"the".to_string()));
+        // "one" is 3 chars and not a stop word
+        assert!(tokens.contains(&"one".to_string()));
+    }
+
+    #[test]
+    fn test_embedding_key_roundtrip() {
+        let key = encode_embedding_key("memory/arch.md", 3);
+        let (path, idx) = decode_embedding_key(&key).unwrap();
+        assert_eq!(path, "memory/arch.md");
+        assert_eq!(idx, 3);
+    }
+
+    #[test]
+    fn test_embedding_key_zero_chunk() {
+        let key = encode_embedding_key("memory/arch.md", 0);
+        let (path, idx) = decode_embedding_key(&key).unwrap();
+        assert_eq!(path, "memory/arch.md");
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn test_embedding_key_decode_invalid() {
+        assert!(decode_embedding_key("no-separator").is_none());
+        // Non-numeric chunk index
+        assert!(decode_embedding_key("path\0abc").is_none());
     }
 }

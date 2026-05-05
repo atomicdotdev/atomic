@@ -262,8 +262,16 @@ pub fn write_change_to_graph<T: MutTxnT + ViewTxnT>(
     );
 
     if should_apply_hunks {
+        let hunks = change.hunks();
+        let total_hunks = hunks.len();
         // Process each graph_op (graph layer)
-        for graph_op in change.hunks() {
+        for (hunk_idx, graph_op) in hunks.iter().enumerate() {
+            log::debug!(
+                "write_change_to_graph: hunk {}/{} starting: {:?}",
+                hunk_idx + 1,
+                total_hunks,
+                std::mem::discriminant(graph_op)
+            );
             write_hunk(
                 txn,
                 &mut workspace,
@@ -274,17 +282,43 @@ pub fn write_change_to_graph<T: MutTxnT + ViewTxnT>(
                 options,
                 &mut stats,
             )?;
+            log::debug!(
+                "write_change_to_graph: hunk {}/{} complete",
+                hunk_idx + 1,
+                total_hunks
+            );
         }
 
         // Apply FileOps to CRDT tables (semantic layer)
         // This enables human-readable diffs and token-level blame
         if change.has_file_ops() {
-            let _crdt_stats = apply_file_ops(txn, change_id, change.file_ops())
+            let file_ops = change.file_ops();
+            let file_ops_count = file_ops.len();
+            log::debug!(
+                "write_change_to_graph: applying {} FileOps to CRDT tables",
+                file_ops_count
+            );
+            let crdt_start = std::time::Instant::now();
+            let _crdt_stats = apply_file_ops(txn, change_id, file_ops)
                 .map_err(|e| InsertError::Database(e.to_string()))?;
+            let crdt_ms = crdt_start.elapsed().as_millis();
+            if crdt_ms > 50 {
+                log::warn!(
+                    "write_change_to_graph: SLOW apply_file_ops took {}ms ({} FileOps)",
+                    crdt_ms,
+                    file_ops_count
+                );
+            } else {
+                log::debug!("write_change_to_graph: apply_file_ops took {}ms", crdt_ms);
+            }
+        } else {
+            log::debug!("write_change_to_graph: no FileOps to apply");
         }
     }
 
     // Compute new state
+    log::debug!("write_change_to_graph: computing new state + updating view");
+    let step_start = std::time::Instant::now();
     let new_state = compute_new_state(&view.state, change_hash);
 
     // Update the view
@@ -297,6 +331,10 @@ pub fn write_change_to_graph<T: MutTxnT + ViewTxnT>(
     view.change_count = sequence;
     txn.update_view(&view)
         .map_err(|e| InsertError::Database(e.to_string()))?;
+    log::debug!(
+        "write_change_to_graph: view update took {}ms",
+        step_start.elapsed().as_millis()
+    );
 
     // Build conflict summary
     let has_conflicts = conflict_tracker.has_conflicts();

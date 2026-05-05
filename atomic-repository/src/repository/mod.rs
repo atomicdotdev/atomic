@@ -82,7 +82,10 @@ mod views;
 
 // Re-export public items so external callers and sibling sub-modules that
 // use `use super::*;` continue to resolve them at `crate::repository::…`.
-pub use filter::{collect_view_change_ids, collect_visible_change_ids};
+pub use filter::{
+    collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,
+    expand_indexed_dependency_closure,
+};
 pub use views::ViewInfo;
 
 // Re-import workspace helpers from `switch` so they are available to
@@ -101,6 +104,23 @@ mod remotes;
 mod status;
 mod tags;
 mod tracking;
+mod vault;
+mod vault_defaults;
+mod vault_embeddings;
+mod vault_goal;
+mod vault_identity;
+mod vault_intent;
+mod vault_kg_enrich;
+mod vault_names;
+mod vault_triples;
+pub use vault_embeddings::{hash_embed, EmbedConfig, TextChunk};
+pub use vault_goal::{
+    GoalInfo, GoalStartOptions, GoalStartResult, GoalStopOptions, GoalStopResult,
+};
+pub use vault_identity::VaultIdentity;
+pub use vault_intent::{IntentCreateOptions, IntentCreateResult, IntentInfo, IntentUpdateOptions};
+pub use vault_kg_enrich::KgEnrichStats;
+pub use vault_names::{derive_intent_prefix, generate_goal_name};
 
 #[cfg(test)]
 mod tests;

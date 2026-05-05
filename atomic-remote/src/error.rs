@@ -247,6 +247,46 @@ impl RemoteError {
         Self::Other(message.into())
     }
 
+    /// Create an unauthorized (401) error.
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::HttpError {
+            status: 401,
+            message: message.into(),
+        }
+    }
+
+    /// Create a forbidden (403) error.
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::HttpError {
+            status: 403,
+            message: message.into(),
+        }
+    }
+
+    /// Create a not-found (404) error.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::HttpError {
+            status: 404,
+            message: message.into(),
+        }
+    }
+
+    /// Create a conflict (409) error.
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::HttpError {
+            status: 409,
+            message: message.into(),
+        }
+    }
+
+    /// Create a server error with an arbitrary status code.
+    pub fn server_error(status: u16, message: impl Into<String>) -> Self {
+        Self::HttpError {
+            status,
+            message: message.into(),
+        }
+    }
+
     /// Check if this is a retryable error.
     ///
     /// Some errors (like timeouts or temporary network issues) may succeed
@@ -257,7 +297,12 @@ impl RemoteError {
 
     /// Check if this is an authentication error.
     pub fn is_auth_error(&self) -> bool {
-        matches!(self, Self::AuthenticationFailed { .. })
+        matches!(
+            self,
+            Self::AuthenticationFailed { .. }
+                | Self::HttpError { status: 401, .. }
+                | Self::HttpError { status: 403, .. }
+        )
     }
 
     /// Check if this is a "not found" error.
@@ -268,6 +313,7 @@ impl RemoteError {
                 | Self::ViewNotFound { .. }
                 | Self::ChangeNotFound { .. }
                 | Self::TagNotFound { .. }
+                | Self::HttpError { status: 404, .. }
         )
     }
 

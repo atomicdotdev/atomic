@@ -116,7 +116,7 @@ impl Command for List {
                             "changes"
                         };
                         let kind_tag = match info.kind_label() {
-                            "local" => "[draft]",
+                            "draft" => "[draft]",
                             _ => "[shared]",
                         };
                         let parent_info = match &info.parent_name {

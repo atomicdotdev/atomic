@@ -110,16 +110,32 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
         Ok(Box::new(results.into_iter()))
     }
 
-    fn get_file_mtime(&self, path: &str) -> PristineResult<Option<(i64, u32, u64)>> {
-        let table = self.txn.open_table(FILE_MTIMES)?;
+    fn get_file_index(&self, path: &str) -> PristineResult<Option<FileIndexMetadata>> {
+        let table = self.txn.open_table(FILE_INDEX)?;
         let guard = table.get(path)?;
         match guard {
             Some(value) => {
                 let bytes = value.value();
-                let (secs, nanos, size) = decode_file_mtime(bytes);
-                Ok(Some((secs, nanos, size)))
+                let (secs, nanos, size, hash) = decode_file_index(bytes);
+                Ok(Some((secs, nanos, size, hash)))
             }
             None => Ok(None),
         }
+    }
+
+    fn iter_file_index(&self) -> PristineResult<Vec<FileIndexEntry>> {
+        let table = match self.txn.open_table(FILE_INDEX) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+        let mut entries = Vec::new();
+        for result in table.iter()? {
+            let (key, value) = result?;
+            let path = key.value().to_string();
+            let (secs, nanos, size, hash) = decode_file_index(value.value());
+            entries.push((path, secs, nanos, size, hash));
+        }
+        Ok(entries)
     }
 }

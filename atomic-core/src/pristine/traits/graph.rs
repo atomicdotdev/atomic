@@ -51,6 +51,15 @@ pub trait GraphTxnT {
     /// This is the inverse of `get_external`.
     fn get_internal(&self, hash: &Hash) -> Result<Option<NodeId>, PristineError>;
 
+    /// List registered normal changes as `(NodeId, Hash)` pairs.
+    ///
+    /// Implementations backed by pristine should filter out tags,
+    /// attestations, and provenance nodes. The default is empty for tests and
+    /// lightweight mocks that do not model registration tables.
+    fn list_registered_changes(&self) -> Result<Vec<(NodeId, Hash)>, PristineError> {
+        Ok(Vec::new())
+    }
+
     /// Initialize an adjacency iterator for a span.
     ///
     /// Returns an iterator over edges from the given span that have flags
@@ -144,6 +153,28 @@ pub trait GraphTxnT {
     /// the given node. Used to find attestations that cover a change
     /// (filter results by `node_type::ATTESTATION`).
     fn get_rev_deps(&self, dep_id: NodeId) -> Result<Vec<NodeId>, PristineError>;
+
+    /// Get normal change dependencies from the redb dependency index.
+    ///
+    /// Dependencies are stored as hashes so pull/clone can represent missing
+    /// dependencies before they have local `NodeId`s. Interactive commands use
+    /// this instead of loading `.change` files while building view filters.
+    fn get_change_deps(&self, _change_id: NodeId) -> Result<Vec<Hash>, PristineError> {
+        Ok(Vec::new())
+    }
+
+    /// Return whether a change's dependency list has been indexed.
+    ///
+    /// This distinguishes a legitimate zero-dependency change from a change
+    /// whose dependency metadata predates the index and needs repair.
+    fn is_change_deps_indexed(&self, _change_id: NodeId) -> Result<bool, PristineError> {
+        Ok(false)
+    }
+
+    /// Get all local changes whose indexed dependencies include `dep_hash`.
+    fn get_rev_change_deps(&self, _dep_hash: &Hash) -> Result<Vec<NodeId>, PristineError> {
+        Ok(Vec::new())
+    }
 
     /// Check whether a change has any vertices in the global GRAPH.
     ///

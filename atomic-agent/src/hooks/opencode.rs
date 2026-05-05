@@ -51,14 +51,11 @@
 //!
 //! # Installation
 //!
-//! OpenCode hooks are installed by placing the `atomic-hooks.ts` plugin file
-//! in `.opencode/plugins/`. The `install()` method copies the plugin file
-//! from the Atomic distribution into the project's plugin directory.
-//!
-//! Unlike Claude Code / Gemini CLI which modify a settings JSON file,
-//! OpenCode plugin installation is simply file presence in the plugin dir.
+//! Plugin installation is handled by the standalone `atomic-opencode` package,
+//! which places the `atomic-hooks.ts` plugin file in `.opencode/plugins/`.
+//! This adapter only handles parsing hook events from the installed plugin.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Deserialize;
 
@@ -68,18 +65,6 @@ use crate::hooks::AgentHook;
 
 /// The OpenCode config directory name.
 const OPENCODE_DIR: &str = ".opencode";
-
-/// The plugins subdirectory within the OpenCode config directory.
-const PLUGINS_DIR: &str = "plugins";
-
-/// The directory name of the Atomic hooks plugin.
-const PLUGIN_DIR: &str = "atomic";
-
-/// The entry point file within the plugin directory.
-const PLUGIN_ENTRY: &str = "index.ts";
-
-/// Command prefix used to identify Atomic hooks in the plugin file.
-const ATOMIC_HOOK_PREFIX: &str = "atomic agent hooks opencode";
 
 // OpenCode JSON Input Types
 
@@ -339,8 +324,8 @@ struct AfterToolInput {
 
 /// OpenCode agent hook adapter.
 ///
-/// Handles hook JSON parsing from the OpenCode hooks plugin and manages
-/// plugin installation in `.opencode/plugins/`.
+/// Handles hook JSON parsing from the OpenCode hooks plugin.
+/// Plugin installation is managed by the standalone `atomic-opencode` package.
 ///
 /// # Differences from Claude Code / Gemini CLI
 ///
@@ -363,134 +348,11 @@ impl OpenCodeHook {
         Self { _private: () }
     }
 
-    /// Returns the path to `.opencode/plugins/atomic/` directory relative to repo root.
-    fn plugin_dir(repo_root: &Path) -> PathBuf {
-        repo_root
-            .join(OPENCODE_DIR)
-            .join(PLUGINS_DIR)
-            .join(PLUGIN_DIR)
-    }
-
-    /// Returns the path to `.opencode/plugins/atomic/index.ts` relative to repo root.
-    #[allow(dead_code)]
-    fn plugin_entry(repo_root: &Path) -> PathBuf {
-        Self::plugin_dir(repo_root).join(PLUGIN_ENTRY)
-    }
-
-    /// Returns the path to the global OpenCode plugin directory.
-    ///
-    /// Global plugins live in `~/.config/opencode/plugins/atomic/`.
-    pub fn global_plugin_dir() -> Option<PathBuf> {
-        dirs::config_dir().map(|config| config.join("opencode").join(PLUGINS_DIR).join(PLUGIN_DIR))
-    }
-
-    /// Returns the path to the global plugin entry point.
-    pub fn global_plugin_entry() -> Option<PathBuf> {
-        Self::global_plugin_dir().map(|d| d.join(PLUGIN_ENTRY))
-    }
-
     /// Extract a session ID from an optional field, generating a fallback if missing.
     fn extract_session_id(session_id: Option<String>) -> String {
         session_id
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("opencode-{}", uuid_short()))
-    }
-
-    /// Install the plugin to a specific directory.
-    ///
-    /// Creates the plugin directory if needed and writes the `index.ts`
-    /// entry point file.
-    fn install_plugin_to(plugin_dir: &Path) -> AgentResult<usize> {
-        // Ensure plugin directory exists
-        std::fs::create_dir_all(plugin_dir).map_err(|e| AgentError::ConfigError {
-            operation: "create plugin directory".to_string(),
-            path: plugin_dir.to_path_buf(),
-            reason: e.to_string(),
-        })?;
-
-        let entry_path = plugin_dir.join(PLUGIN_ENTRY);
-
-        // Check if plugin is already installed
-        if entry_path.exists() {
-            let content = std::fs::read_to_string(&entry_path).unwrap_or_default();
-            if content.contains(ATOMIC_HOOK_PREFIX) {
-                return Ok(0); // Already installed
-            }
-        }
-
-        // Write the entry point file
-        std::fs::write(&entry_path, PLUGIN_TEMPLATE).map_err(|e| AgentError::ConfigError {
-            operation: "write plugin entry point".to_string(),
-            path: entry_path.clone(),
-            reason: e.to_string(),
-        })?;
-
-        // 6 hooks installed (session-start, session-end, user-prompt, stop,
-        // before-tool, after-tool)
-        Ok(6)
-    }
-
-    /// Uninstall the plugin from a specific directory.
-    ///
-    /// Removes the entire plugin directory if the entry point contains
-    /// our hook prefix. Preserves the directory if it belongs to someone else.
-    fn uninstall_plugin_from(plugin_dir: &Path) -> AgentResult<()> {
-        let entry_path = plugin_dir.join(PLUGIN_ENTRY);
-
-        if !entry_path.exists() {
-            return Ok(());
-        }
-
-        // Only remove if it's our plugin (contains our hook prefix)
-        let content = std::fs::read_to_string(&entry_path).unwrap_or_default();
-        if content.contains(ATOMIC_HOOK_PREFIX) {
-            std::fs::remove_dir_all(plugin_dir).map_err(|e| AgentError::ConfigError {
-                operation: "remove plugin directory".to_string(),
-                path: plugin_dir.to_path_buf(),
-                reason: e.to_string(),
-            })?;
-        }
-
-        Ok(())
-    }
-
-    /// Check whether the plugin is installed at a specific directory.
-    fn is_installed_at(plugin_dir: &Path) -> bool {
-        let entry_path = plugin_dir.join(PLUGIN_ENTRY);
-
-        if !entry_path.exists() {
-            return false;
-        }
-
-        let content = std::fs::read_to_string(&entry_path).unwrap_or_default();
-        content.contains(ATOMIC_HOOK_PREFIX)
-    }
-
-    /// Install the plugin globally in `~/.config/opencode/plugins/atomic/`.
-    pub fn install_global() -> AgentResult<usize> {
-        let dir = Self::global_plugin_dir().ok_or_else(|| AgentError::ConfigError {
-            operation: "locate global config".to_string(),
-            path: PathBuf::from("~/.config/opencode/plugins/atomic"),
-            reason: "could not determine home directory".to_string(),
-        })?;
-        Self::install_plugin_to(&dir)
-    }
-
-    /// Uninstall the plugin globally.
-    pub fn uninstall_global() -> AgentResult<()> {
-        let dir = Self::global_plugin_dir().ok_or_else(|| AgentError::ConfigError {
-            operation: "locate global config".to_string(),
-            path: PathBuf::from("~/.config/opencode/plugins/atomic"),
-            reason: "could not determine home directory".to_string(),
-        })?;
-        Self::uninstall_plugin_from(&dir)
-    }
-
-    /// Check whether the plugin is installed globally.
-    pub fn is_installed_global() -> bool {
-        Self::global_plugin_dir()
-            .map(|d| Self::is_installed_at(&d))
-            .unwrap_or(false)
     }
 }
 
@@ -694,16 +556,16 @@ impl AgentHook for OpenCodeHook {
         }
     }
 
-    fn install(&self, repo_root: &Path) -> AgentResult<usize> {
-        Self::install_plugin_to(&Self::plugin_dir(repo_root))
+    fn install(&self, _repo_root: &Path) -> AgentResult<usize> {
+        Ok(0) // Installation handled by atomic-opencode package
     }
 
-    fn uninstall(&self, repo_root: &Path) -> AgentResult<()> {
-        Self::uninstall_plugin_from(&Self::plugin_dir(repo_root))
+    fn uninstall(&self, _repo_root: &Path) -> AgentResult<()> {
+        Ok(()) // Uninstallation handled by atomic-opencode package
     }
 
-    fn is_installed(&self, repo_root: &Path) -> bool {
-        Self::is_installed_at(&Self::plugin_dir(repo_root))
+    fn is_installed(&self, _repo_root: &Path) -> bool {
+        false // Managed by atomic-opencode package
     }
 
     fn supported_hooks(&self) -> Vec<HookType> {
@@ -777,151 +639,6 @@ pub fn verb_to_hook_type(verb: &str) -> Option<HookType> {
         _ => None,
     }
 }
-
-// Embedded Plugin Template
-
-/// The TypeScript plugin source that gets installed into `.opencode/plugins/`.
-///
-/// This is the same content as the standalone `atomic-hooks.ts` file but
-/// embedded here so that `atomic agent enable --agent opencode` can install
-/// it without requiring a separate file distribution.
-const PLUGIN_TEMPLATE: &str = r#"/**
- * Atomic VCS Hooks Plugin for OpenCode
- *
- * Integrates OpenCode with Atomic's agent hook system by translating
- * OpenCode lifecycle events into `atomic agent hooks opencode <verb>`
- * CLI calls — the same pattern used by Claude Code and Gemini CLI.
- *
- * Installed by: atomic agent enable --agent opencode
- * Remove with:  atomic agent disable --agent opencode
- */
-
-const ATOMIC_CMD = "atomic"
-const HOOK_ARGS = ["agent", "hooks", "opencode"]
-const EDIT_TOOLS = new Set(["edit", "write", "multiedit", "patch", "bash"])
-
-const sessions = new Map()
-
-async function invokeHook($, verb, payload, directory) {
-  const json = JSON.stringify(payload)
-  try {
-    const result = await $`echo ${json} | ${ATOMIC_CMD} ${HOOK_ARGS.join(" ")} ${verb}`
-      .cwd(directory)
-      .quiet()
-      .nothrow()
-    if (result.exitCode !== 0) {
-      const stderr = result.stderr.toString().trim()
-      if (stderr) console.error(`[atomic-hooks] ${verb} failed (exit ${result.exitCode}): ${stderr}`)
-    }
-  } catch (err) {
-    console.error(`[atomic-hooks] failed to invoke ${verb}:`, err)
-  }
-}
-
-async function isAtomicAvailable($, directory) {
-  try {
-    const result = await $`${ATOMIC_CMD} --version`.cwd(directory).quiet().nothrow()
-    if (result.exitCode !== 0) return false
-    const check = await $`test -d .atomic`.cwd(directory).quiet().nothrow()
-    return check.exitCode === 0
-  } catch { return false }
-}
-
-function getSession(sessionID) {
-  if (!sessions.has(sessionID)) {
-    sessions.set(sessionID, { startTime: Date.now(), turnCount: 0, toolStartTimes: new Map() })
-  }
-  return sessions.get(sessionID)
-}
-
-export const AtomicHooksPlugin = async ({ project, client, $, directory, worktree }) => {
-  const available = await isAtomicAvailable($, directory)
-  if (!available) return {}
-
-  await client.app.log({ body: { service: "atomic-hooks", level: "info", message: "Atomic hooks plugin activated" } })
-
-  return {
-    event: async ({ event }) => {
-      if (event.type === "session.created") {
-        const props = event.properties
-        const sessionID = props.id
-        getSession(sessionID)
-        await invokeHook($, "session-start", {
-          session_id: sessionID, source: "startup", cwd: directory,
-          timestamp: new Date().toISOString(),
-        }, directory)
-      } else if (event.type === "session.idle") {
-        const props = event.properties
-        const sessionID = props.id
-        const session = getSession(sessionID)
-        session.turnCount++
-        const metadata = { session_id: sessionID, turn_number: session.turnCount, cwd: directory, timestamp: new Date().toISOString() }
-        if (session.model) metadata.model = session.model
-        if (session.provider) metadata.provider = session.provider
-        await invokeHook($, "stop", metadata, directory)
-      } else if (event.type === "session.deleted") {
-        const props = event.properties
-        await invokeHook($, "session-end", {
-          session_id: props.id, reason: "deleted", cwd: directory,
-          timestamp: new Date().toISOString(),
-        }, directory)
-        sessions.delete(props.id)
-      } else if (event.type === "session.error") {
-        const props = event.properties
-        const session = sessions.get(props.id)
-        if (session && session.turnCount > 0) {
-          await invokeHook($, "stop", {
-            session_id: props.id, turn_number: session.turnCount,
-            error: true, cwd: directory, timestamp: new Date().toISOString(),
-          }, directory)
-        }
-      }
-    },
-
-    "chat.message": async (input, output) => {
-      const session = getSession(input.sessionID)
-      if (input.model) { session.provider = input.model.providerID; session.model = input.model.modelID }
-      const promptParts = output.parts.filter(p => p.type === "text").map(p => p.text)
-      const prompt = promptParts.join("\n").trim()
-      if (prompt) session.lastPrompt = prompt
-      await invokeHook($, "user-prompt", {
-        session_id: input.sessionID, prompt: prompt || undefined,
-        model: session.model, provider: session.provider,
-        cwd: directory, timestamp: new Date().toISOString(),
-      }, directory)
-    },
-
-    "tool.execute.before": async (input, output) => {
-      const session = getSession(input.sessionID)
-      session.toolStartTimes.set(input.callID, Date.now())
-      await invokeHook($, "before-tool", {
-        session_id: input.sessionID, tool_name: input.tool,
-        tool_call_id: input.callID, tool_input: output.args,
-        cwd: directory, timestamp: new Date().toISOString(),
-      }, directory)
-    },
-
-    "tool.execute.after": async (input, output) => {
-      const session = sessions.get(input.sessionID)
-      const startTime = session?.toolStartTimes.get(input.callID)
-      const duration = startTime ? Date.now() - startTime : undefined
-      if (session) session.toolStartTimes.delete(input.callID)
-      await invokeHook($, "after-tool", {
-        session_id: input.sessionID, tool_name: input.tool,
-        tool_call_id: input.callID, status: "completed", duration,
-        modified_files: EDIT_TOOLS.has(input.tool),
-        tool_output: output.output?.substring(0, 500),
-        cwd: directory, timestamp: new Date().toISOString(),
-      }, directory)
-    },
-
-    "shell.env": async (_input, output) => {
-      output.env.ATOMIC_AGENT = "opencode"
-      output.env.ATOMIC_AGENT_VERSION = "1.0.0"
-    },
-  }
-}
-"#;
 
 // Tests
 
@@ -1209,123 +926,25 @@ mod tests {
     }
 
     #[test]
-    fn test_install_creates_plugin_directory() {
+    fn test_install_is_noop() {
         let tmp = TempDir::new().unwrap();
         let hook = make_hook();
-
         let count = hook.install(tmp.path()).unwrap();
-        assert_eq!(count, 6); // 6 hooks
-
-        let plugin_dir = tmp.path().join(".opencode").join("plugins").join("atomic");
-        assert!(plugin_dir.is_dir());
-
-        let entry_path = plugin_dir.join("index.ts");
-        assert!(entry_path.exists());
-
-        let content = std::fs::read_to_string(&entry_path).unwrap();
-        assert!(content.contains(ATOMIC_HOOK_PREFIX));
-        assert!(content.contains("AtomicHooksPlugin"));
+        assert_eq!(count, 0);
     }
 
     #[test]
-    fn test_install_idempotent() {
+    fn test_uninstall_is_noop() {
         let tmp = TempDir::new().unwrap();
         let hook = make_hook();
-
-        let count1 = hook.install(tmp.path()).unwrap();
-        assert_eq!(count1, 6);
-
-        let count2 = hook.install(tmp.path()).unwrap();
-        assert_eq!(count2, 0); // Already installed
+        hook.uninstall(tmp.path()).unwrap();
     }
 
     #[test]
-    fn test_is_installed_true() {
-        let tmp = TempDir::new().unwrap();
-        let hook = make_hook();
-        hook.install(tmp.path()).unwrap();
-        assert!(hook.is_installed(tmp.path()));
-    }
-
-    #[test]
-    fn test_is_installed_false_no_file() {
+    fn test_is_installed_returns_false() {
         let tmp = TempDir::new().unwrap();
         let hook = make_hook();
         assert!(!hook.is_installed(tmp.path()));
-    }
-
-    #[test]
-    fn test_is_installed_false_different_plugin() {
-        let tmp = TempDir::new().unwrap();
-        let atomic_dir = tmp.path().join(".opencode").join("plugins").join("atomic");
-        std::fs::create_dir_all(&atomic_dir).unwrap();
-        std::fs::write(
-            atomic_dir.join("index.ts"),
-            "// Some other plugin\nexport const Other = async () => {}",
-        )
-        .unwrap();
-
-        let hook = make_hook();
-        assert!(!hook.is_installed(tmp.path()));
-    }
-
-    #[test]
-    fn test_uninstall_removes_plugin_directory() {
-        let tmp = TempDir::new().unwrap();
-        let hook = make_hook();
-
-        hook.install(tmp.path()).unwrap();
-        assert!(hook.is_installed(tmp.path()));
-
-        hook.uninstall(tmp.path()).unwrap();
-        let plugin_dir = tmp.path().join(".opencode").join("plugins").join("atomic");
-        assert!(!plugin_dir.exists());
-    }
-
-    #[test]
-    fn test_uninstall_preserves_non_atomic_plugin() {
-        let tmp = TempDir::new().unwrap();
-        let atomic_dir = tmp.path().join(".opencode").join("plugins").join("atomic");
-        std::fs::create_dir_all(&atomic_dir).unwrap();
-        std::fs::write(
-            atomic_dir.join("index.ts"),
-            "// Not an atomic plugin\nexport const Other = async () => {}",
-        )
-        .unwrap();
-
-        let hook = make_hook();
-        hook.uninstall(tmp.path()).unwrap();
-
-        // Directory should still exist since it's not our plugin
-        assert!(atomic_dir.join("index.ts").exists());
-    }
-
-    #[test]
-    fn test_uninstall_nonexistent_is_ok() {
-        let tmp = TempDir::new().unwrap();
-        let hook = make_hook();
-        // Should not error when there's nothing to uninstall
-        hook.uninstall(tmp.path()).unwrap();
-    }
-
-    #[test]
-    fn test_full_roundtrip() {
-        let tmp = TempDir::new().unwrap();
-        let hook = make_hook();
-
-        // Install
-        let count = hook.install(tmp.path()).unwrap();
-        assert_eq!(count, 6);
-        assert!(hook.is_installed(tmp.path()));
-
-        // Uninstall
-        hook.uninstall(tmp.path()).unwrap();
-        assert!(!hook.is_installed(tmp.path()));
-
-        // Reinstall
-        let count = hook.install(tmp.path()).unwrap();
-        assert_eq!(count, 6);
-        assert!(hook.is_installed(tmp.path()));
     }
 
     // uuid_short tests

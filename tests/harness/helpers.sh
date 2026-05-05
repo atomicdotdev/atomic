@@ -71,7 +71,9 @@ atomic() {
 _HARNESS_TMPDIRS=()
 
 cleanup_tempdirs() {
-    for d in "${_HARNESS_TMPDIRS[@]}"; do
+    # ${arr[@]+...} guards against "unbound variable" on bash <4.4 when the
+    # array is empty and `set -u` (nounset) is active.
+    for d in ${_HARNESS_TMPDIRS[@]+"${_HARNESS_TMPDIRS[@]}"}; do
         rm -rf "$d" 2>/dev/null || true
     done
 }
@@ -470,6 +472,13 @@ require_network() {
         echo "${YELLOW}SKIPPING: network unavailable${RESET}"
         exit 0
     fi
+}
+
+# Check if network is available without exiting.
+# Returns 0 (true) if reachable, 1 (false) otherwise.
+# Usage:  if require_network_quiet; then ... fi
+require_network_quiet() {
+    curl --silent --head --max-time 5 https://github.com &>/dev/null
 }
 
 # Clone a git repo to a temp directory

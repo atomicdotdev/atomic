@@ -2,7 +2,7 @@
 //!
 //! This module defines the [`AgentHook`] trait that each agent adapter implements,
 //! and the [`AgentRegistry`] that manages available adapters. The trait normalizes
-//! agent-specific hook formats (Claude Code, Gemini CLI, Codex, OpenCode) into
+//! agent-specific hook formats (Claude Code, Copilot, Gemini CLI, Codex, OpenCode) into
 //! the common [`TurnEvent`] type.
 //!
 //! # Architecture
@@ -57,8 +57,13 @@
 //! ```
 
 pub mod claude_code;
+pub mod cline;
+pub mod codex;
+pub mod copilot;
+pub mod cursor;
 pub mod gemini_cli;
 pub mod opencode;
+pub mod pi;
 pub mod sherpa;
 
 use std::fmt;
@@ -237,16 +242,24 @@ impl AgentRegistry {
     ///
     /// Currently includes:
     /// - Claude Code (`claude-code`)
+    /// - Cline (`cline`)
+    /// - Codex (`codex`)
+    /// - Copilot (`copilot`)
+    /// - Cursor (`cursor`)
     /// - Gemini CLI (`gemini-cli`)
     /// - OpenCode (`opencode`)
-    ///
-    /// Future adapters (Codex, etc.) will be added here as they are
-    /// implemented.
+    /// - Pi (`pi`)
+    /// - Sherpa (`sherpa`)
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
         registry.register(Box::new(claude_code::ClaudeCodeHook::new()));
+        registry.register(Box::new(cline::ClineHook::new()));
+        registry.register(Box::new(codex::CodexHook::new()));
+        registry.register(Box::new(copilot::CopilotHook::new()));
+        registry.register(Box::new(cursor::CursorHook::new()));
         registry.register(Box::new(gemini_cli::GeminiCliHook::new()));
         registry.register(Box::new(opencode::OpenCodeHook::new()));
+        registry.register(Box::new(pi::PiHook::new()));
         registry.register(Box::new(sherpa::SherpaHook::new()));
         registry
     }

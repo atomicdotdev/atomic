@@ -15,7 +15,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::pristine::{GraphTxnT, PristineError, TreeTxnT};
+use crate::pristine::{
+    FileIndexEntry, FileIndexMetadata, GraphTxnT, InodeAdjState, InodeGraphOps, PristineError,
+    TreeTxnT,
+};
 use crate::types::{EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge};
 
 /// A view-scoped graph wrapper that filters edge traversal by visibility.
@@ -68,6 +71,47 @@ impl<'a, T> ViewGraph<'a, T> {
     #[cfg(test)]
     fn is_visible(&self, change_id: NodeId) -> bool {
         change_id == NodeId::ROOT || self.visible.contains(&change_id)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// InodeGraphOps — delegate to inner txn (INODE_GRAPH is unfiltered)
+// ─────────────────────────────────────────────────────────────────────────
+
+impl<'a, T: InodeGraphOps> InodeGraphOps for ViewGraph<'a, T> {
+    type InodeError = T::InodeError;
+
+    fn init_inode_adj(
+        &self,
+        inode: Inode,
+        node: GraphNode<NodeId>,
+        min_flag: EdgeFlags,
+        max_flag: EdgeFlags,
+    ) -> Result<InodeAdjState, Self::InodeError> {
+        self.inner.init_inode_adj(inode, node, min_flag, max_flag)
+    }
+
+    fn next_inode_adj(
+        &self,
+        adj: &mut InodeAdjState,
+    ) -> Option<Result<SerializedGraphEdge, Self::InodeError>> {
+        self.inner.next_inode_adj(adj)
+    }
+
+    fn find_block_in_inode(
+        &self,
+        inode: Inode,
+        pos: Position<NodeId>,
+    ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
+        self.inner.find_block_in_inode(inode, pos)
+    }
+
+    fn count_inode_vertices(&self, inode: Inode) -> Result<usize, Self::InodeError> {
+        self.inner.count_inode_vertices(inode)
+    }
+
+    fn inode_graph_is_populated(&self, inode: Inode) -> Result<bool, Self::InodeError> {
+        self.inner.inode_graph_is_populated(inode)
     }
 }
 
@@ -146,6 +190,11 @@ impl<'a, T: GraphTxnT> GraphTxnT for ViewGraph<'a, T> {
         self.inner.get_internal(hash)
     }
 
+    /// Registered change listing — no filtering. Delegates to inner.
+    fn list_registered_changes(&self) -> Result<Vec<(NodeId, Hash)>, PristineError> {
+        self.inner.list_registered_changes()
+    }
+
     /// Node type lookup — no filtering. Delegates to inner.
     fn get_node_type(&self, node_id: NodeId) -> Result<Option<u8>, PristineError> {
         self.inner.get_node_type(node_id)
@@ -154,6 +203,21 @@ impl<'a, T: GraphTxnT> GraphTxnT for ViewGraph<'a, T> {
     /// Reverse dependency lookup — no filtering. Delegates to inner.
     fn get_rev_deps(&self, dep_id: NodeId) -> Result<Vec<NodeId>, PristineError> {
         self.inner.get_rev_deps(dep_id)
+    }
+
+    /// Indexed normal change dependency lookup — no filtering. Delegates to inner.
+    fn get_change_deps(&self, change_id: NodeId) -> Result<Vec<Hash>, PristineError> {
+        self.inner.get_change_deps(change_id)
+    }
+
+    /// Indexed dependency marker lookup — no filtering. Delegates to inner.
+    fn is_change_deps_indexed(&self, change_id: NodeId) -> Result<bool, PristineError> {
+        self.inner.is_change_deps_indexed(change_id)
+    }
+
+    /// Reverse indexed normal change dependency lookup — no filtering. Delegates to inner.
+    fn get_rev_change_deps(&self, dep_hash: &Hash) -> Result<Vec<NodeId>, PristineError> {
+        self.inner.get_rev_change_deps(dep_hash)
     }
 
     /// Graph presence check — no filtering. Delegates to inner.
@@ -203,8 +267,12 @@ impl<'a, T: TreeTxnT> TreeTxnT for ViewGraph<'a, T> {
         self.inner.iter_inode_vertices(inode)
     }
 
-    fn get_file_mtime(&self, path: &str) -> Result<Option<(i64, u32, u64)>, PristineError> {
-        self.inner.get_file_mtime(path)
+    fn get_file_index(&self, path: &str) -> Result<Option<FileIndexMetadata>, PristineError> {
+        self.inner.get_file_index(path)
+    }
+
+    fn iter_file_index(&self) -> Result<Vec<FileIndexEntry>, PristineError> {
+        self.inner.iter_file_index()
     }
 }
 

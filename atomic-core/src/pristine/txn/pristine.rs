@@ -22,7 +22,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use redb::{Database, ReadableTable};
+use redb::{Builder, Database, ReadableTable};
 
 use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
@@ -70,7 +70,11 @@ impl Pristine {
     ///
     /// This will create all necessary tables if they don't exist.
     pub fn open<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
-        let db = Database::create(path)?;
+        // Use 8 GB cache for machines with plenty of RAM.  The default
+        // redb cache is 1 GB which causes excessive page eviction when
+        // the GRAPH table grows beyond that during large imports.
+        let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
+        let db = Builder::new().set_cache_size(cache_bytes).create(path)?;
 
         // Initialize all tables
         let write_txn = db.begin_write()?;
@@ -96,12 +100,15 @@ impl Pristine {
             write_txn.open_table(REV_INODES)?;
             write_txn.open_table(DIRECTORIES)?;
 
-            // File mtime cache (for fast status detection)
-            write_txn.open_table(FILE_MTIMES)?;
+            // File index cache (mtime + size + content hash for fast status detection)
+            write_txn.open_table(FILE_INDEX)?;
 
             // Dependency tables
             write_txn.open_multimap_table(DEPS)?;
             write_txn.open_multimap_table(REV_DEPS)?;
+            write_txn.open_multimap_table(CHANGE_DEPS)?;
+            write_txn.open_multimap_table(REV_CHANGE_DEPS)?;
+            write_txn.open_table(CHANGE_DEPS_INDEXED)?;
 
             // State tables
             write_txn.open_table(STATES)?;
@@ -182,7 +189,9 @@ impl Pristine {
     /// ```
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
         // Open database without creating (read-only mode)
-        let db = Database::open(path)?;
+        // Use the same 8 GiB cache as open() for consistent performance.
+        let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
+        let db = Builder::new().set_cache_size(cache_bytes).open(path)?;
 
         // Determine the next available IDs by scanning existing data.
         // Errors are propagated (not silently skipped) so that open()
@@ -244,7 +253,8 @@ impl Pristine {
     /// must be explicitly committed with `commit()` or it will be rolled back
     /// when dropped.
     pub fn write_txn(&self) -> PristineResult<WriteTxn<'_>> {
-        let txn = self.db.begin_write()?;
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(redb::Durability::Eventual);
         Ok(WriteTxn::new(
             txn,
             &self.next_node_id,

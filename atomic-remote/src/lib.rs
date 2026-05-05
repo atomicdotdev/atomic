@@ -123,6 +123,8 @@
 
 pub mod error;
 pub mod http;
+pub mod storage;
+pub mod storage_types;
 pub mod streaming;
 pub mod sync;
 pub mod types;
@@ -134,6 +136,13 @@ pub use error::{RemoteError, RemoteResult};
 
 // HTTP client
 pub use http::{HttpRemote, HttpRemoteConfig};
+
+// Storage management client
+pub use storage::StorageClient;
+pub use storage_types::{
+    ApiError, ApiResponse, CreateProjectRequest, CreateWorkspaceRequest, IdentityInfo, ProjectInfo,
+    ResponseMetadata, UpdateProjectRequest, UpdateWorkspaceRequest, Visibility, WorkspaceInfo,
+};
 
 // Protocol types
 pub use types::{

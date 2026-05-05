@@ -739,7 +739,7 @@ impl TreeCollectResult {
 
     /// Sort items by depth (shallowest first).
     pub fn sort_by_depth(&mut self) {
-        self.items.sort_by(|a, b| a.depth.cmp(&b.depth));
+        self.items.sort_by_key(|a| a.depth);
     }
 }
 

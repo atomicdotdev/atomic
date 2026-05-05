@@ -536,6 +536,28 @@ impl Clone {
             finish_success(&spinner, "Remote 'origin' configured");
         }
 
+        // Build content search index and enrich KG
+        if stats.has_applied() {
+            let spinner = create_spinner("Building search index...");
+
+            // KG enrichment
+            if repo.has_vault().unwrap_or(false) {
+                match repo.kg_enrich_from_vcs() {
+                    Ok(kg_stats) => log::info!("KG enriched: {}", kg_stats),
+                    Err(e) => log::warn!("KG enrichment failed: {}", e),
+                }
+            }
+
+            // Content search index (syntext)
+            match atomic_repository::build_content_index(&target_path) {
+                Ok(()) => finish_success(&spinner, "Search index built"),
+                Err(e) => {
+                    finish_error(&spinner, "Search index failed");
+                    log::warn!("Content index build failed: {}", e);
+                }
+            }
+        }
+
         progress.phase = ClonePhase::Complete;
 
         // Final summary

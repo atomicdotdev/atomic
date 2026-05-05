@@ -153,9 +153,14 @@ impl HookType {
     /// ```
     pub fn from_verb(verb: &str) -> Option<Self> {
         match verb {
-            // Session boundaries (shared by Claude Code, Gemini CLI, OpenCode, Sherpa)
+            // Session boundaries (shared by Claude Code, Copilot, Gemini CLI, OpenCode, Pi, Sherpa)
             "session-start" => Some(HookType::SessionStart),
             "session-end" => Some(HookType::SessionEnd),
+
+            // Cline task lifecycle
+            "task-start" | "task-resume" => Some(HookType::SessionStart),
+            "task-complete" => Some(HookType::TurnEnd),
+            "task-cancel" => Some(HookType::SessionEnd),
 
             // Claude Code turn boundaries
             "user-prompt-submit" => Some(HookType::TurnStart),
@@ -165,9 +170,10 @@ impl HookType {
             "before-agent" => Some(HookType::TurnStart),
             "after-agent" => Some(HookType::TurnEnd),
 
-            // OpenCode turn boundaries
+            // Copilot + OpenCode + Pi turn boundaries
             "user-prompt" => Some(HookType::TurnStart),
-            // OpenCode also uses "stop" for TurnEnd (handled above)
+            // OpenCode + Pi also use "stop" for TurnEnd (handled above)
+            // Copilot has no stop/TurnEnd event — records on sessionEnd
 
             // Sherpa TUI turn boundaries
             "turn-start" => Some(HookType::TurnStart),
@@ -177,9 +183,15 @@ impl HookType {
 
             // Claude Code tool use
             "pre-task" => Some(HookType::PreToolUse),
-            "post-task" | "post-todo" => Some(HookType::PostToolUse),
+            "post-task" | "post-todo" | "post-tool" => Some(HookType::PostToolUse),
 
-            // Gemini CLI / OpenCode tool use (shared verbs)
+            // Codex + Copilot pre-tool use
+            "pre-tool" => Some(HookType::PreToolUse),
+
+            // Cursor thinking blocks
+            "after-thought" => Some(HookType::PostToolUse),
+
+            // Gemini CLI / OpenCode / Pi tool use (shared verbs)
             "before-tool" => Some(HookType::PreToolUse),
             "after-tool" => Some(HookType::PostToolUse),
 
@@ -631,6 +643,10 @@ mod tests {
         );
         assert_eq!(
             HookType::from_verb("post-todo"),
+            Some(HookType::PostToolUse)
+        );
+        assert_eq!(
+            HookType::from_verb("post-tool"),
             Some(HookType::PostToolUse)
         );
     }

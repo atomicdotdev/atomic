@@ -37,13 +37,23 @@ fn test_status_clean_after_record() {
         modified_files.iter().map(|e| e.path()).collect::<Vec<_>>()
     );
 
-    // The file should be Clean
-    let clean_files: Vec<_> = status.clean().collect();
+    // The file should not appear in any non-clean category.
+    // Note: status() is an exception-reporter — clean files are omitted
+    // for performance, so their absence from all non-clean lists is the
+    // correct way to verify cleanliness.
+    let added_files: Vec<_> = status.added().collect();
     assert!(
-        clean_files
+        !added_files
             .iter()
             .any(|e| e.path().to_string_lossy().contains("status_test.txt")),
-        "status_test.txt should be Clean after recording"
+        "status_test.txt should not be Added after recording"
+    );
+    let deleted_files: Vec<_> = status.deleted().collect();
+    assert!(
+        !deleted_files
+            .iter()
+            .any(|e| e.path().to_string_lossy().contains("status_test.txt")),
+        "status_test.txt should not be Deleted after recording"
     );
 
     // Step 3: Verify the recorded content matches the file

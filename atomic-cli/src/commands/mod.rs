@@ -70,6 +70,7 @@ use crate::error::{CliError, CliResult};
 pub mod add;
 pub mod change;
 pub mod diff;
+pub mod doctor;
 pub mod init;
 pub mod insert;
 pub mod log;
@@ -83,6 +84,7 @@ pub mod stash;
 pub mod status;
 pub mod tag;
 pub mod unrecord;
+pub mod vault;
 pub mod view;
 
 // Phase 6: Agent Integration
@@ -101,20 +103,37 @@ pub mod identity;
 // Git Interoperability
 pub mod git;
 
+// Knowledge graph query (top-level command)
+pub mod query;
+
+// Storage management commands (always available)
+pub mod client;
+pub mod project;
+pub mod workspace;
+
+// Team collaboration commands (feature-gated)
+#[cfg(feature = "teams")]
+pub mod org;
+#[cfg(feature = "teams")]
+pub mod team;
+
 // Re-export command structs for convenience
 pub use add::Add;
 pub use agent::Agent;
 pub use change::ChangeCmd;
 pub use clone::Clone;
 pub use diff::Diff;
+pub use doctor::Doctor;
 pub use git::Git;
 pub use identity::Identity;
 pub use init::Init;
 pub use insert::Insert;
 pub use log::Log;
 pub use mv::Move;
+pub use project::ProjectCmd;
 pub use pull::Pull;
 pub use push::Push;
+pub use query::Query;
 pub use record::Record;
 pub use remote::Remote;
 pub use remove::Remove;
@@ -125,7 +144,14 @@ pub use stash::Stash;
 pub use status::Status;
 pub use tag::Tag;
 pub use unrecord::Unrecord;
+pub use vault::Vault;
 pub use view::View;
+pub use workspace::WorkspaceCmd;
+
+#[cfg(feature = "teams")]
+pub use org::OrgCmd;
+#[cfg(feature = "teams")]
+pub use team::TeamCmd;
 
 // Command Trait
 
@@ -350,14 +376,14 @@ pub const DEFAULT_HASH_LENGTH: usize = 12;
 /// println!("{}", format_hash(&hash, false)); // "ABCDEFGHIJKL"
 ///
 /// // Full
-/// println!("{}", format_hash(&hash, true));  // "ABCDEFGHIJKLMNOP..."
+/// println!("{}", format_hash(&hash, true));  // "ABCDEFGHIJKLMNOP"
 /// ```
 pub fn format_hash(hash: &Hash, full: bool) -> String {
     let base32 = hash.to_base32();
     if full || base32.len() <= DEFAULT_HASH_LENGTH {
         base32
     } else {
-        format!("{}...", &base32[..DEFAULT_HASH_LENGTH])
+        base32[..DEFAULT_HASH_LENGTH].to_string()
     }
 }
 
@@ -378,7 +404,7 @@ pub fn format_hash_with_length(hash: &Hash, length: usize) -> String {
     if length == 0 || base32.len() <= length {
         base32
     } else {
-        format!("{}...", &base32[..length])
+        base32[..length].to_string()
     }
 }
 
@@ -644,8 +670,8 @@ mod tests {
         let hash = Hash::from_bytes(bytes);
 
         let formatted = format_hash(&hash, false);
-        assert!(formatted.len() <= DEFAULT_HASH_LENGTH + 3); // +3 for "..."
-        assert!(formatted.ends_with("...") || formatted.len() <= DEFAULT_HASH_LENGTH);
+        assert!(formatted.len() <= DEFAULT_HASH_LENGTH);
+        assert!(!formatted.ends_with("..."));
     }
 
     #[test]

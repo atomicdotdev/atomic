@@ -104,21 +104,47 @@ impl Repository {
 
         // ── Phase 1: Shelve ignored files into the OLD view's workspace ──
         //
-        // Ignored files (node_modules/, dist/, .next/, etc.) are build
-        // artifacts that belong to the view that created them.  We move
-        // them into `.atomic/workspaces/<old_view>/` so they can be
-        // restored when the user switches back.
+        // All ignored files are shelved per-view EXCEPT paths listed in
+        // `[workspace] expose` in `.atomic/config.toml`.  Exposed paths
+        // persist across all views (tool configs like .opencode/, .vscode/).
         //
         // This uses `rename()` which is O(1) on the same filesystem —
         // no data is copied, just inode pointers are updated.
         //
         // The rule:
         //   - Tracked files      → managed by the graph (phases 2-4)
-        //   - Untracked, ignored → shelved/restored per-view (phases 1 & 5)
+        //   - Untracked, ignored, exposed  → left alone (persists across views)
+        //   - Untracked, ignored, NOT exposed → shelved/restored per-view (phases 1 & 5)
         //   - Untracked, novel   → user's undecided work, left alone
         let old_ws = workspace_path(&self.dot_dir, &old_view_name);
         ensure_workspace_dir(&self.dot_dir, &old_view_name)?;
-        let ignored_paths = self.collect_ignored_paths_on_disk();
+
+        let repo_expose = atomic_config::RepoConfig::load(&self.config_path())
+            .unwrap_or_default()
+            .workspace
+            .expose;
+        let global_expose = atomic_config::GlobalConfig::load()
+            .map(|c| c.workspace.expose)
+            .unwrap_or_default();
+
+        // Merge global + repo-local expose patterns (deduplicated)
+        let mut expose_patterns = global_expose;
+        for p in repo_expose {
+            if !expose_patterns.contains(&p) {
+                expose_patterns.push(p);
+            }
+        }
+
+        let ignored_paths: Vec<String> = self
+            .collect_ignored_paths_on_disk()
+            .into_iter()
+            .filter(|path| {
+                // Keep paths that are NOT exposed (those get shelved)
+                !expose_patterns
+                    .iter()
+                    .any(|pattern| path == pattern || path.starts_with(&format!("{}/", pattern)))
+            })
+            .collect();
         if !ignored_paths.is_empty() {
             // Clear old workspace content, then move current ignored files in.
             // We clear first because the workspace may contain stale state

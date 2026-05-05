@@ -879,8 +879,15 @@ mod tests {
             Ok(Box::new(std::iter::empty()))
         }
 
-        fn get_file_mtime(&self, _path: &str) -> Result<Option<(i64, u32, u64)>, PristineError> {
+        fn get_file_index(
+            &self,
+            _path: &str,
+        ) -> Result<Option<crate::pristine::FileIndexMetadata>, PristineError> {
             Ok(None)
+        }
+
+        fn iter_file_index(&self) -> Result<Vec<crate::pristine::FileIndexEntry>, PristineError> {
+            Ok(Vec::new())
         }
     }
 

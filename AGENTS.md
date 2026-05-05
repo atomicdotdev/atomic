@@ -366,8 +366,24 @@ This simplifies the codebase while maintaining semantic clarity.
 │   └── AB/CDEF...         # Two-level directory structure
 ├── config.toml            # Repository configuration
 ├── current_view           # Active view name
-└── working_copy_id        # Working copy state
+├── working_copy_id        # Working copy state
+└── workspaces/            # Per-view shelved artifacts
+    └── <view_name>/       # Shelved build artifacts for this view
 ```
+
+### Workspace Shelving
+
+See [README.md § Workspace Shelving](README.md#workspace-shelving) for the
+user-facing explanation of how `.atomicignore` vs `[workspace] shelve` work.
+
+Relevant code: `atomic-config/src/lib.rs` (`WorkspaceConfig`, `RepoConfig`),
+`atomic-repository/src/repository/switch.rs` (`switch_view`, `collect_ignored_paths_on_disk`),
+`atomic-cli/src/commands/init.rs` (`get_shelve_patterns`).
+
+**Summary**: All ignored files are shelved per-view by default. Paths in
+`[workspace] expose` are the exception — they persist across all views.
+`atomic init` seeds `expose` with common tool configs (`.opencode`, `.vscode`,
+`.idea`, `.claude`, `.gemini`). No per-language shelve lists needed.
 
 ### Single GRAPH Architecture
 

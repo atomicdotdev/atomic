@@ -45,7 +45,8 @@
 use crate::change::{Change, EdgeUpdate, NewEdge};
 use crate::pristine::{GraphTxnT, MutTxnT};
 use crate::types::{
-    EdgeFlags, EdgeKind, GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge,
+    ChangePosition, EdgeFlags, EdgeKind, GraphNode, Hash, Inode, NodeId, Position,
+    SerializedGraphEdge,
 };
 
 use super::error::LocalApplyError;
@@ -139,8 +140,15 @@ fn write_new_edge<T: MutTxnT>(
     edge: &NewEdge<Option<Hash>>,
     change: &Change,
 ) -> Result<(), LocalApplyError> {
+    log::debug!(
+        "write_new_edge: flag={:?} from={:?} to={:?}",
+        edge.flag,
+        edge.from,
+        edge.to
+    );
+
     // Resolve the introduced_by change
-    let _introduced_by = resolve_introduced_by(txn, &edge.introduced_by, change_id)?;
+    let introduced_by = resolve_introduced_by(txn, &edge.introduced_by, change_id)?;
 
     // Find source span — predecessor context (ending at position).
     let source_pos = resolve_position(txn, &edge.from, change_id)?;
@@ -176,26 +184,39 @@ fn write_new_edge<T: MutTxnT>(
 
     // Handle deletion: collect pseudo-edges for reconnection
     if kind.is_some_and(|k| k.is_deleted()) {
+        log::debug!("write_new_edge: collect_pseudo_edges starting");
         collect_pseudo_edges_for_reconnection(txn, workspace, target)?;
+        log::debug!("write_new_edge: collect_pseudo_edges complete");
     }
 
-    // In the ambient graph model, we NEVER delete edges from GRAPH.
-    // The original edge (introduced by a prior change) stays in place.
-    // We only ADD the new edge alongside it.  The view filter determines
-    // which edge is "active" for any given view:
+    // Remove the old edge before adding the new one.
     //
-    //   - If the new edge's introducing change is IN the view's filter,
-    //     the new edge (e.g., BLOCK|DELETED) takes precedence.
-    //   - If the new edge's introducing change is OUTSIDE the filter,
-    //     the original edge remains visible.
-    //
-    // This is what makes views work as true projections over a single
-    // graph — no view can destroy information that another view depends on.
+    // The `previous` field records the flags of the edge being superseded
+    // (e.g., BLOCK for a live edge that is now being marked DELETED).
+    // Without this deletion the old alive edge remains in the B-tree
+    // multimap alongside the new DELETED edge, causing `is_vertex_alive`
+    // to find the stale alive parent and incorrectly report the vertex as
+    // alive — which breaks subsequent Replace operations on the same file.
+    log::debug!("write_new_edge: del_edge_with_reverse");
+    del_edge_with_reverse(
+        txn,
+        resolved_inode,
+        edge.previous,
+        source,
+        target,
+        introduced_by,
+    )?;
+
+    // Add the new edge (e.g., BLOCK|DELETED to mark content as removed,
+    // or BLOCK to wire in new content).
+    log::debug!("write_new_edge: add_edge_with_reverse");
     add_edge_with_reverse(txn, resolved_inode, edge.flag, source, target, change_id)?;
 
     // For non-folder deletions, check for zombie context
     if kind.is_some_and(|k| k.is_deleted() && !k.is_folder()) {
+        log::debug!("write_new_edge: collect_zombie_context starting");
         collect_zombie_context(txn, workspace, change, edge, change_id)?;
+        log::debug!("write_new_edge: collect_zombie_context complete");
     }
 
     Ok(())
@@ -275,6 +296,34 @@ pub fn find_target_vertex<T: GraphTxnT>(
 
 // Edge Operations
 
+/// Remove a forward edge and its reverse (PARENT) counterpart from
+/// GRAPH and INODE_GRAPH.
+///
+/// Errors are silently ignored (the edge may not exist if this is the
+/// first time the graph is being written).
+fn del_edge_with_reverse<T: MutTxnT>(
+    txn: &mut T,
+    inode: Option<Inode>,
+    flag: EdgeFlags,
+    source: GraphNode<NodeId>,
+    dest: GraphNode<NodeId>,
+    introduced_by: NodeId,
+) -> Result<(), LocalApplyError> {
+    let forward_edge = SerializedGraphEdge::new(flag, dest.start_pos(), introduced_by);
+    let reverse_flag = flag | EdgeFlags::PARENT;
+    let reverse_edge = SerializedGraphEdge::new(reverse_flag, source.end_pos(), introduced_by);
+
+    let _ = txn.del_graph(source, forward_edge);
+    let _ = txn.del_graph(dest, reverse_edge);
+
+    if let Some(inode_val) = inode {
+        let _ = txn.del_inode_graph(inode_val, source, forward_edge);
+        let _ = txn.del_inode_graph(inode_val, dest, reverse_edge);
+    }
+
+    Ok(())
+}
+
 /// Write an edge and its reverse to the graph.
 ///
 /// In the Atomic graph model, edges come in pairs:
@@ -283,15 +332,6 @@ pub fn find_target_vertex<T: GraphTxnT>(
 ///
 /// Writes both edges to the global GRAPH table and, when an inode is
 /// provided, to the INODE_GRAPH secondary index.
-///
-/// # Arguments
-///
-/// * `txn` - Write transaction
-/// * `inode` - Optional inode for inode_graph indexing
-/// * `flag` - Edge flags for the forward edge
-/// * `source` - Source span
-/// * `dest` - Destination span
-/// * `introduced_by` - Change that introduced this edge
 fn add_edge_with_reverse<T: MutTxnT>(
     txn: &mut T,
     inode: Option<Inode>,
@@ -418,7 +458,21 @@ fn collect_zombie_context<T: GraphTxnT>(
 
         // Move to next span in range
         if node.end < end_pos.pos {
-            pos.pos = node.end;
+            let next_pos = if node.end == node.start {
+                // Empty vertex (e.g., inode marker) — skip past it
+                ChangePosition::new(node.end.get() + 1)
+            } else {
+                node.end
+            };
+            if next_pos <= pos.pos {
+                // Safety: avoid infinite loop if we can't advance
+                log::warn!(
+                    "collect_zombie_context: pos not advancing at {:?}, breaking",
+                    pos
+                );
+                break;
+            }
+            pos.pos = next_pos;
         } else {
             break;
         }

@@ -61,8 +61,26 @@ impl Repository {
             .status(StatusOptions::default())
             .map_err(RecordError::Repository)?;
 
+        log::debug!(
+            "record: status returned {} entries (modified={}, added={}, deleted={}, clean={}, untracked={})",
+            status.entries().len(),
+            status.modified_count(),
+            status.added_count(),
+            status.deleted_count(),
+            status.entries().iter().filter(|e| e.status() == FileStatus::Clean).count(),
+            status.untracked_count(),
+        );
+
         // Filter to recordable files
         let files_to_record = filter_files(status.entries(), &options);
+
+        log::debug!(
+            "record: filter_files returned {} recordable files",
+            files_to_record.len(),
+        );
+        for f in &files_to_record {
+            log::debug!("record:   {:?} {}", f.status(), f.path().display(),);
+        }
 
         if files_to_record.is_empty() {
             return Err(RecordError::NothingToRecord);
@@ -109,8 +127,14 @@ impl Repository {
 
                 FileStatus::Added => {
                     // Read file content
+                    log::debug!(
+                        "record: processing Added file '{}' (full_path={})",
+                        path,
+                        full_path.display()
+                    );
                     match std::fs::read(&full_path) {
                         Ok(content) => {
+                            log::debug!("record: read {} bytes from '{}'", content.len(), path);
                             // Check size limit
                             if content.len() as u64 > options.max_file_size() {
                                 if options.skip_binary() {
@@ -133,8 +157,13 @@ impl Repository {
                             let detected = DetectedFile::added(&path);
 
                             // Record the added file
+                            log::debug!("record: calling record_added_file for '{}'", path);
                             match record_added_file(&memory_wc, &detected, &core_options) {
                                 Ok(recorded) => {
+                                    log::debug!(
+                                        "record: record_added_file '{}' returned: is_empty={} hunks={} content_len={}",
+                                        path, recorded.is_empty(), recorded.hunk_count(), recorded.content_len()
+                                    );
                                     if !recorded.is_empty() {
                                         stats.files_recorded += 1;
                                         stats.hunks_created += recorded.hunk_count();
@@ -155,17 +184,27 @@ impl Repository {
                                         recorded_paths.push(path.clone());
                                         recorded_files.push(recorded);
                                     } else {
+                                        log::debug!(
+                                            "record: '{}' produced empty result, skipping",
+                                            path
+                                        );
                                         skipped_paths.push(path.clone());
                                         stats.files_skipped += 1;
                                     }
                                 }
                                 Err(e) => {
+                                    log::debug!(
+                                        "record: record_added_file '{}' error: {:?}",
+                                        path,
+                                        e
+                                    );
                                     errors.push((path.clone(), format!("{:?}", e)));
                                     stats.errors += 1;
                                 }
                             }
                         }
                         Err(e) => {
+                            log::debug!("record: failed to read '{}': {}", path, e);
                             errors.push((path.clone(), e.to_string()));
                             stats.errors += 1;
                         }
@@ -584,10 +623,12 @@ impl Repository {
                 Ok(apply_outcome) => {
                     outcome.set_applied(apply_outcome.new_state);
 
-                    // Update mtime cache for all recorded/added files.
-                    // This snapshots the filesystem metadata AFTER the record,
-                    // so subsequent status() calls can skip unchanged files.
-                    if let Ok(mut mtime_txn) = self.pristine.write_txn() {
+                    // Update file index for all recorded/added files.
+                    // This snapshots the filesystem metadata + content hash AFTER
+                    // the record, so subsequent status() calls can skip unchanged
+                    // files (mtime+size match) or avoid graph reconstruction
+                    // (compare stored content hash instead).
+                    if let Ok(mut idx_txn) = self.pristine.write_txn() {
                         for path_str in outcome.recorded_files() {
                             // Strip directory markers like "dir/ (directory)"
                             let clean_path =
@@ -599,20 +640,47 @@ impl Repository {
                                 let duration = mtime
                                     .duration_since(SystemTime::UNIX_EPOCH)
                                     .unwrap_or_default();
-                                let _ = mtime_txn.put_file_mtime(
+                                let content_hash = std::fs::read(&abs_path)
+                                    .map(|bytes| Hash::of(&bytes))
+                                    .unwrap_or(Hash::ZERO);
+                                let _ = idx_txn.put_file_index(
                                     clean_path,
                                     duration.as_secs() as i64,
                                     duration.subsec_nanos(),
                                     metadata.len(),
+                                    &content_hash,
                                 );
                             }
                         }
-                        let _ = mtime_txn.commit();
+                        let _ = idx_txn.commit();
                     }
                 }
                 Err(e) => {
                     outcome.add_error("apply".to_string(), e.to_string());
                 }
+            }
+        }
+
+        // Deflate vault working copy changes (if vault is initialized)
+        if self.has_vault().unwrap_or(false) {
+            match self.vault_record_working_copy() {
+                Ok(vault_paths) if !vault_paths.is_empty() => {
+                    outcome.set_vault_paths(vault_paths);
+                }
+                Ok(_) => {} // No vault changes
+                Err(e) => {
+                    // Log the error but don't fail the record — vault sync
+                    // is best-effort during record
+                    log::warn!("Failed to sync vault working copy: {}", e);
+                }
+            }
+        }
+
+        // Auto-enrich KG with the new change (best-effort)
+        if outcome.was_saved() {
+            let hash = *outcome.hash();
+            if let Err(e) = self.kg_enrich_change(&hash) {
+                log::debug!("KG enrich for change: {}", e);
             }
         }
 
@@ -641,6 +709,113 @@ impl Repository {
     ) -> Result<RecordOutcome, RecordError> {
         let header = ChangeHeader::builder().message(message).build();
         self.record(header, options)
+    }
+
+    /// Fast path for external importers (e.g. git-import) that already have
+    /// pre-built `RecordedFile`s and just need globalization + assembly + hashing.
+    ///
+    /// Returns `(Change, Hash)`.
+    pub fn assemble_and_hash(
+        &self,
+        header: ChangeHeader,
+        recorded_files: &[atomic_core::record::workflow::RecordedFile],
+    ) -> Result<(Change, Hash), RecordError> {
+        use atomic_core::record::workflow::assemble_change;
+        use atomic_core::record::workflow::assembly::AssemblyOptions;
+
+        let overall_start = std::time::Instant::now();
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RecordError::Database(e.to_string()))?;
+
+        // Use a bare transaction — no ViewGraph filter needed.
+        //
+        // This method is the fast path for git import, where every change
+        // is written to a shared view and all edges land in the global
+        // GRAPH table.  A bare ReadTxn sees every edge directly.
+        //
+        // Wrapping in ViewGraph + collect_visible_change_ids would scan
+        // the entire view change log on every call (O(N) per commit,
+        // O(N²) total for N commits), which makes large imports
+        // progressively slower.
+        let assembly_options = AssemblyOptions::default();
+
+        let assembly_result = assemble_change(&txn, recorded_files, header, &assembly_options)?;
+
+        let change = assembly_result.into_change();
+        log::debug!(
+            "assemble_and_hash: assembly complete, content_size={} hunks={}",
+            change.contents.len(),
+            change.hunks().len(),
+        );
+
+        let step = std::time::Instant::now();
+        let mut v3_bytes = Vec::new();
+        let hash = change
+            .serialize(&mut v3_bytes)
+            .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+        let serialize_ms = step.elapsed().as_millis();
+
+        let step = std::time::Instant::now();
+        let (final_change, _) = Change::deserialize(&mut v3_bytes.as_slice())
+            .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+        let deserialize_ms = step.elapsed().as_millis();
+
+        let total_ms = overall_start.elapsed().as_millis();
+        if serialize_ms + deserialize_ms > 100 {
+            log::warn!(
+                "assemble_and_hash: serialize={}ms ({} bytes) deserialize={}ms total={}ms",
+                serialize_ms,
+                v3_bytes.len(),
+                deserialize_ms,
+                total_ms,
+            );
+        } else {
+            log::debug!(
+                "assemble_and_hash: serialize={}ms ({} bytes) deserialize={}ms total={}ms",
+                serialize_ms,
+                v3_bytes.len(),
+                deserialize_ms,
+                total_ms,
+            );
+        }
+
+        Ok((final_change, hash))
+    }
+
+    /// Look up a file's inode and graph position from the pristine.
+    ///
+    /// Returns `None` if the file is not tracked or has no graph position.
+    pub fn get_inode_and_position(
+        &self,
+        path: &str,
+    ) -> Result<Option<(Inode, Position<NodeId>)>, RepositoryError> {
+        use atomic_core::pristine::TreeTxnT;
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let inode = match txn
+            .get_inode(path)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+
+        let position = match txn
+            .inode_position(inode)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        Ok(Some((inode, position)))
     }
 
     /// Record all changes with a message.

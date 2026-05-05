@@ -155,6 +155,8 @@ impl Repository {
         let change_id = txn
             .register_change(hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.put_change_deps(change_id, change.dependencies())
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Determine which view to use
         let view_name = options.view.as_deref().unwrap_or(&self.current_view);
@@ -210,6 +212,38 @@ impl Repository {
                             }
                         }
                     }
+                    GraphOp::FileMove { add, path, .. } => {
+                        // A FileMove reuses the existing inode — look it up via
+                        // the inode position stored in add.inode, then update
+                        // TREE: remove the old path mapping and insert the new one.
+                        //
+                        // add.inode is Position<Option<Hash>>; resolve it to
+                        // Position<NodeId> so we can call position_inode().
+                        let inode_change_id = match &add.inode.change {
+                            None => change_id, // self-reference (shouldn't happen for FileMove)
+                            Some(h) if *h == Hash::NONE => NodeId::ROOT,
+                            Some(h) => txn.get_internal(h).unwrap_or(None).unwrap_or(NodeId::ROOT),
+                        };
+                        let inode_pos = Position::new(inode_change_id, add.inode.pos);
+
+                        if let Ok(Some(inode)) = txn.position_inode(inode_pos) {
+                            // Remove the old TREE entry (old path → inode)
+                            if let Ok(Some(old_path)) = txn.get_path(inode) {
+                                // Guard: only delete the old path if it differs
+                                // from the new path.  When multiple files share
+                                // the same inode position (a rare data-integrity
+                                // edge case), position_inode may resolve to an
+                                // inode whose current path was already updated
+                                // by a prior FileMove in this same change.
+                                // Deleting it would undo that earlier rename.
+                                if old_path != *path {
+                                    let _ = txn.del_tree(&old_path);
+                                }
+                            }
+                            // Insert the new TREE entry (new path → inode)
+                            let _ = txn.put_tree(path, inode);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -228,8 +262,20 @@ impl Repository {
         .map_err(|e| RepositoryError::Apply(e.to_string()))?;
 
         // Commit the transaction
+        log::debug!("insert_change: committing transaction...");
+        let commit_start = std::time::Instant::now();
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let commit_ms = commit_start.elapsed().as_millis();
+        if commit_ms > 50 {
+            log::warn!(
+                "insert_change: SLOW txn.commit() took {}ms (change_id={:?})",
+                commit_ms,
+                change_id
+            );
+        } else {
+            log::debug!("insert_change: txn.commit() took {}ms", commit_ms);
+        }
 
         Ok(outcome)
     }
@@ -396,6 +442,8 @@ impl Repository {
         let change_id = txn
             .register_change(hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.put_change_deps(change_id, change.dependencies())
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Determine which view to use
         let view_name = options.view.as_deref().unwrap_or(&self.current_view);
@@ -480,6 +528,26 @@ impl Repository {
                             let _ = txn.del_inode(inode);
                             let _ = txn.del_directory(inode);
                         }
+                    }
+                }
+                GraphOp::FileMove { add, path, .. } => {
+                    // A FileMove reuses the existing inode — look it up via
+                    // the inode position stored in add.inode, then update
+                    // TREE: remove the old path mapping and insert the new one.
+                    let inode_change_id = match &add.inode.change {
+                        None => change_id,
+                        Some(h) if *h == Hash::NONE => NodeId::ROOT,
+                        Some(h) => txn.get_internal(h).unwrap_or(None).unwrap_or(NodeId::ROOT),
+                    };
+                    let inode_pos = Position::new(inode_change_id, add.inode.pos);
+
+                    if let Ok(Some(inode)) = txn.position_inode(inode_pos) {
+                        if let Ok(Some(old_path)) = txn.get_path(inode) {
+                            if old_path != *path {
+                                let _ = txn.del_tree(&old_path);
+                            }
+                        }
+                        let _ = txn.put_tree(path, inode);
                     }
                 }
                 _ => {}

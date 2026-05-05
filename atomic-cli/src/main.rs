@@ -55,9 +55,42 @@ mod output;
 use clap::{Parser, Subcommand};
 
 use commands::{
-    Add, Agent, ChangeCmd, Clone, Command, Diff, Git, Identity, Init, Insert, Log, Move, Pull,
-    Push, Record, Remote, Remove, Reset, Revise, Split, Stash, Status, Tag, Unrecord, View,
+    Add,
+    Agent,
+    ChangeCmd,
+    Clone,
+    Command,
+    Diff,
+    Doctor,
+    Git,
+    Identity,
+    Init,
+    Insert,
+    Log,
+    Move,
+    ProjectCmd,
+    Pull,
+    Push,
+    Query,
+    Record,
+    Remote,
+    Remove,
+    Reset,
+    Revise,
+    Split,
+    Stash,
+    Status,
+    Tag,
+    Unrecord,
+    Vault,
+    View,
+    // Storage management (always available)
+    WorkspaceCmd,
 };
+
+// Team features (conditional)
+#[cfg(feature = "teams")]
+use commands::{OrgCmd, TeamCmd};
 use output::{print_error, print_hint};
 
 // CLI Argument Definitions
@@ -326,6 +359,12 @@ enum Commands {
     /// ```
     Diff(Diff),
 
+    /// Diagnose and repair repository indexes.
+    ///
+    /// Use this for explicit maintenance tasks that may scan stored changes,
+    /// such as backfilling the dependency index for legacy repositories.
+    Doctor(Doctor),
+
     /// Git interoperability commands.
     ///
     /// Import Git repositories into Atomic, preserving history, authorship,
@@ -430,6 +469,87 @@ enum Commands {
     /// ```
     Remote(Remote),
 
+    /// Manage remote workspaces.
+    ///
+    /// Workspaces are organizational containers for projects on a remote
+    /// atomic-storage server.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # List workspaces
+    /// atomic workspace list
+    ///
+    /// # Create a workspace
+    /// atomic workspace create "My Team"
+    ///
+    /// # Show details
+    /// atomic workspace show my-team
+    /// ```
+    Workspace(WorkspaceCmd),
+
+    /// Manage remote projects.
+    ///
+    /// Projects live inside workspaces and represent a single Atomic VCS
+    /// repository hosted on a remote server.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # List projects
+    /// atomic project list --workspace my-ws
+    ///
+    /// # Create a project
+    /// atomic project create my-app --workspace my-ws
+    ///
+    /// # Initialize local repo as remote project
+    /// atomic project init my-app --workspace my-ws
+    /// ```
+    Project(ProjectCmd),
+
+    /// Manage organizations and members.
+    ///
+    /// Organizations group teams, workspaces, and projects. Each user has
+    /// a personal organization created at registration. Team organizations
+    /// enable multi-user collaboration.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Show current org
+    /// atomic org show
+    ///
+    /// # Create a team org
+    /// atomic org create "Acme Corp"
+    ///
+    /// # Switch default org
+    /// atomic org switch acme-corp
+    ///
+    /// # Manage members
+    /// atomic org member list
+    /// ```
+    #[cfg(feature = "teams")]
+    Org(OrgCmd),
+
+    /// Manage teams within an organization.
+    ///
+    /// Teams are groups of identities used to manage access via grants.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # List teams
+    /// atomic team list
+    ///
+    /// # Create a team
+    /// atomic team create "Backend Eng"
+    ///
+    /// # Manage members
+    /// atomic team member list backend-eng
+    /// ```
+    #[cfg(feature = "teams")]
+    Team(TeamCmd),
+
     /// Temporarily save uncommitted changes.
     ///
     /// Stash saves your uncommitted working copy changes to a temporary
@@ -482,6 +602,54 @@ enum Commands {
     /// atomic tag delete v1.0.0
     /// ```
     Tag(Tag),
+
+    /// Query the knowledge graph.
+    ///
+    /// Search code, explore relationships, visualize the codebase graph,
+    /// and ask questions using the full knowledge graph — files, entities,
+    /// modules, changes, views, goals, intents, and memories.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Search the knowledge graph
+    /// atomic query search "replication"
+    ///
+    /// # Explore a node's connections
+    /// atomic query neighbors "module:src/mongo/db/repl"
+    ///
+    /// # List entities in a file
+    /// atomic query entities src/main.rs
+    ///
+    /// # Search source code content
+    /// atomic query code "replication" -t cpp
+    ///
+    /// # Visualize the graph
+    /// atomic query graph "replication" -k 20 --depth 2
+    ///
+    /// # Build/update the search index
+    /// atomic query enrich
+    /// ```
+    Query(Query),
+
+    /// Manage the vault (shared project knowledge store).
+    ///
+    /// The vault stores sessions, memory, skills, intents, and scratch
+    /// notes as versioned markdown files in `.vault/`.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # List vault entries
+    /// atomic vault list
+    ///
+    /// # Start a session
+    /// atomic vault session start
+    ///
+    /// # Create an intent
+    /// atomic vault intent create --title "Fix auth"
+    /// ```
+    Vault(Vault),
 
     /// Remove the last change from the current view.
     ///
@@ -544,6 +712,8 @@ fn main() {
 
         Commands::Diff(diff) => diff.run(),
 
+        Commands::Doctor(doctor) => doctor.run(),
+
         Commands::Git(git) => git.run(),
 
         Commands::Insert(insert) => insert.run(),
@@ -562,9 +732,23 @@ fn main() {
 
         Commands::Remote(remote) => remote.run(),
 
+        Commands::Workspace(workspace) => workspace.run(),
+
+        Commands::Project(project) => project.run(),
+
+        #[cfg(feature = "teams")]
+        Commands::Org(org) => org.run(),
+
+        #[cfg(feature = "teams")]
+        Commands::Team(team) => team.run(),
+
         Commands::Tag(tag) => tag.run(),
 
         Commands::Unrecord(unrecord) => unrecord.run(),
+
+        Commands::Query(query) => query.run(),
+
+        Commands::Vault(vault) => vault.run(),
     };
 
     // Handle errors with user-friendly output

@@ -64,6 +64,12 @@ pub const DEFAULT_VIEW_NAME: &str = "dev";
 
 // Project Kind Templates
 
+/// Default paths that persist across all views (never shelved).
+///
+/// These are tool/editor configs that are project-wide, not per-view.
+/// Everything else in `.atomicignore` gets shelved per-view on switch.
+pub const DEFAULT_EXPOSE: &[&str] = &[".opencode", ".vscode", ".idea", ".claude", ".gemini"];
+
 /// Get the .atomicignore content for a given project kind.
 ///
 /// This function returns appropriate ignore patterns for common project
@@ -85,7 +91,7 @@ pub const DEFAULT_VIEW_NAME: &str = "dev";
 /// - `go`: Ignores `bin/`, `*.exe`
 /// - `java`: Ignores `target/`, `*.class`, `*.jar`
 /// - `c` / `cpp`: Ignores `*.o`, `*.a`, `*.so`, `build/`
-fn get_ignore_template(kind: &str) -> Option<&'static str> {
+pub fn get_ignore_template(kind: &str) -> Option<&'static str> {
     match kind.to_lowercase().as_str() {
         "rust" => Some(
             r#"# Rust
@@ -296,6 +302,23 @@ pub struct Init {
     /// javascript, typescript, go, java, kotlin, c, cpp.
     #[arg(long, short = 'k')]
     pub kind: Option<String>,
+
+    /// Initialize with a vault (shared project knowledge store).
+    ///
+    /// Enabled by default. Creates `.vault/` with subdirectories for goals,
+    /// memory, skills, intents, and scratch notes. The vault stores project
+    /// knowledge as versioned markdown files with cryptographic provenance.
+    ///
+    /// Use `--no-vault` to skip vault initialization.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::SetTrue)]
+    pub vault: bool,
+
+    /// Skip vault initialization.
+    ///
+    /// Creates a repository without the `.vault/` knowledge store.
+    /// Useful for minimal repos that don't need goals, intents, or memory.
+    #[arg(long, default_value_t = false)]
+    pub no_vault: bool,
 }
 
 impl Init {
@@ -314,6 +337,8 @@ impl Init {
             path: PathBuf::from("."),
             view: DEFAULT_VIEW_NAME.to_string(),
             kind: None,
+            vault: true,
+            no_vault: false,
         }
     }
 
@@ -323,6 +348,8 @@ impl Init {
             path: path.into(),
             view: DEFAULT_VIEW_NAME.to_string(),
             kind: None,
+            vault: true,
+            no_vault: false,
         }
     }
 
@@ -335,6 +362,20 @@ impl Init {
     /// Builder: set the project kind for .atomicignore template.
     pub fn with_kind(mut self, kind: impl Into<String>) -> Self {
         self.kind = Some(kind.into());
+        self
+    }
+
+    /// Builder: enable vault initialization.
+    pub fn with_vault(mut self) -> Self {
+        self.vault = true;
+        self.no_vault = false;
+        self
+    }
+
+    /// Builder: disable vault initialization.
+    pub fn without_vault(mut self) -> Self {
+        self.vault = false;
+        self.no_vault = true;
         self
     }
 
@@ -470,44 +511,113 @@ impl Command for Init {
             return Err(CliError::repository_exists(&target_path));
         }
 
-        // Initialize the repository
-        let mut repo = Repository::init(&target_path).map_err(|e| {
-            // Convert repository error to CLI error with better message
-            match e {
-                atomic_repository::RepositoryError::AlreadyExists { .. } => {
-                    CliError::repository_exists(&target_path)
-                }
-                other => CliError::Repository(other),
+        // ── Step 1: Create .atomic/ and the pristine database ────────
+        let mut repo = Repository::init(&target_path).map_err(|e| match e {
+            atomic_repository::RepositoryError::AlreadyExists { .. } => {
+                CliError::repository_exists(&target_path)
             }
+            other => CliError::Repository(other),
         })?;
 
         // Create the initial view if it's different from the default
-        // Repository::init() already creates a "dev" view by default
         if self.view != atomic_repository::DEFAULT_VIEW {
-            // Create the requested view
             repo.create_view(&self.view).map_err(CliError::Repository)?;
-
-            // Set it as the current view
             repo.set_current_view(&self.view)
                 .map_err(CliError::Repository)?;
         }
 
-        // Print success message
         print_success(&format!(
             "Initialized empty Atomic repository in {}",
             dot_dir.display()
         ));
         println!("Created view: {}", self.view);
 
-        // Create .atomicignore if kind specified
-        if let Ok(true) = self.create_ignore_file(&target_path) {
-            println!(
-                "Created .atomicignore for {} project",
-                self.kind.as_ref().unwrap()
+        // ── Step 2: Create .atomicignore → add → record ─────────────
+        //
+        // The .atomicignore MUST contain ".atomic" so the VCS internals
+        // are never tracked. Create it even without --kind (with a minimal
+        // default), then add and record it as the first change.
+        {
+            let ignore_path = target_path.join(".atomicignore");
+            if !ignore_path.exists() {
+                if let Some(ref kind) = self.kind {
+                    // Use the language-specific template
+                    if let Some(template) = get_ignore_template(kind) {
+                        std::fs::write(&ignore_path, template).map_err(CliError::Io)?;
+                        println!("Created .atomicignore for {} project", kind);
+                    } else {
+                        // Unknown kind — write minimal default
+                        std::fs::write(&ignore_path, ".atomic\n.git\n").map_err(CliError::Io)?;
+                    }
+                } else {
+                    // No --kind specified — write minimal default
+                    std::fs::write(&ignore_path, ".atomic\n.git\n").map_err(CliError::Io)?;
+                }
+            }
+
+            // Write [workspace] expose to config.toml so tool configs
+            // persist across view switches. Build artifacts in .atomicignore
+            // are shelved per-view by default; exposed paths are the exception.
+            {
+                let config_path = dot_dir.join("config.toml");
+                if let Ok(existing) = std::fs::read_to_string(&config_path) {
+                    let expose_array = DEFAULT_EXPOSE
+                        .iter()
+                        .map(|p| format!("\"{}\"", p))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let updated = format!(
+                        "{}\n[workspace]\nexpose = [{}]\n",
+                        existing.trim_end(),
+                        expose_array
+                    );
+                    std::fs::write(&config_path, updated).map_err(CliError::Io)?;
+                }
+            }
+
+            // Add and record .atomicignore
+            let _ = repo.add(
+                ".atomicignore",
+                atomic_repository::TrackingOptions::default(),
             );
+            let header = atomic_core::change::ChangeHeader::new("Initialize repository");
+            match repo.record(header, atomic_repository::RecordOptions::default()) {
+                Ok(_) => {}
+                Err(atomic_repository::RecordError::NothingToRecord) => {}
+                Err(e) => log::warn!("Failed to record .atomicignore: {}", e),
+            }
         }
 
-        // Print next steps to guide the user
+        // ── Step 3: Create .vault/ → install defaults → add → record ─
+        if self.vault && !self.no_vault {
+            // Create vault tables + directory structure + default files
+            repo.init_vault().map_err(CliError::Repository)?;
+
+            println!("Initialized vault at {}", repo.vault_dir().display());
+
+            // Add all vault files to tracking
+            let vault_dir = repo.vault_dir();
+            if vault_dir.exists() {
+                add_vault_files_recursive(&repo, &vault_dir)?;
+            }
+
+            // Record vault files as their own change
+            let header = atomic_core::change::ChangeHeader::new("Initialize vault");
+            match repo.record(header, atomic_repository::RecordOptions::default()) {
+                Ok(outcome) => {
+                    println!(
+                        "Recorded vault defaults ({} files)",
+                        outcome.stats().files_recorded
+                    );
+                }
+                Err(atomic_repository::RecordError::NothingToRecord) => {}
+                Err(e) => log::warn!("Failed to record vault files: {}", e),
+            }
+        }
+
+        // ── Status should be clean at this point ─────────────────────
+
+        // Print next steps
         print_next_steps(&[
             ("atomic add <files>", "Add files to track"),
             ("atomic record -m \"...\"", "Record your first change"),
@@ -518,11 +628,30 @@ impl Command for Init {
     }
 }
 
+/// Recursively add all files under a directory to Atomic tracking.
+fn add_vault_files_recursive(repo: &Repository, dir: &std::path::Path) -> CliResult<()> {
+    let entries = std::fs::read_dir(dir).map_err(CliError::Io)?;
+    for entry in entries {
+        let entry = entry.map_err(CliError::Io)?;
+        let path = entry.path();
+        if path.is_dir() {
+            add_vault_files_recursive(repo, &path)?;
+        } else if path.is_file() {
+            if let Ok(rel) = path.strip_prefix(repo.root()) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                let _ = repo.add(&rel_str, atomic_repository::TrackingOptions::default());
+            }
+        }
+    }
+    Ok(())
+}
+
 // Tests
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     // -------------------------------------------------------------------------
@@ -535,6 +664,8 @@ mod tests {
         assert_eq!(init.path, PathBuf::from("."));
         assert_eq!(init.view, DEFAULT_VIEW_NAME);
         assert!(init.kind.is_none());
+        assert!(init.vault);
+        assert!(!init.no_vault);
     }
 
     #[test]
@@ -572,6 +703,27 @@ mod tests {
         assert_eq!(init.path, PathBuf::from("/project"));
         assert_eq!(init.view, "main");
         assert_eq!(init.kind, Some("python".to_string()));
+    }
+
+    #[test]
+    fn test_init_with_vault_flag() {
+        let init = Init::new().with_vault();
+        assert!(init.vault);
+        assert!(!init.no_vault);
+    }
+
+    #[test]
+    fn test_init_vault_is_default() {
+        let init = Init::new();
+        assert!(init.vault);
+        assert!(!init.no_vault);
+    }
+
+    #[test]
+    fn test_init_without_vault() {
+        let init = Init::new().without_vault();
+        assert!(!init.vault);
+        assert!(init.no_vault);
     }
 
     // -------------------------------------------------------------------------
@@ -873,6 +1025,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_path_relative() {
         let temp = TempDir::new().unwrap();
         let original_dir = std::env::current_dir().unwrap();
@@ -888,6 +1041,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_path_dot() {
         let temp = TempDir::new().unwrap();
         let original_dir = std::env::current_dir().unwrap();
@@ -936,5 +1090,21 @@ mod tests {
     #[test]
     fn test_default_view_name_constant() {
         assert_eq!(DEFAULT_VIEW_NAME, "dev");
+    }
+
+    #[test]
+    fn test_init_creates_vault_dir_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = Init::at_path(dir.path());
+        init.run().unwrap();
+
+        // Vault is created by default
+        let vault_dir = dir.path().join(".vault");
+        assert!(vault_dir.exists());
+        assert!(vault_dir.join("goals").exists());
+        assert!(vault_dir.join("memory").exists());
+        assert!(vault_dir.join("skills").exists());
+        assert!(vault_dir.join("intents").exists());
+        assert!(vault_dir.join("scratch").exists());
     }
 }

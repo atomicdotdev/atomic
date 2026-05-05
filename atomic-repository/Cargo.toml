@@ -11,6 +11,8 @@ rust-version.workspace = true
 [dependencies]
 atomic-core = { workspace = true }
 atomic-config = { workspace = true }
+atomic-identity = { workspace = true }
+atomic-semantic = { workspace = true, optional = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -24,9 +26,17 @@ zstd = { workspace = true }
 dirs = "5.0"
 walkdir = { workspace = true }
 ignore = { workspace = true }
+syntext = { workspace = true }
 tempfile = { workspace = true }
 log = { workspace = true }
 chrono = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+tokio = { workspace = true }
+
+[features]
+default = ["ast"]
+ast = ["atomic-semantic"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

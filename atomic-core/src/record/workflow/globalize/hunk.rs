@@ -1,595 +1,676 @@
+//! Globalize a single built hunk into a graph operation.
+//!
+//! # Performance
+//!
+//! Content vertex discovery uses the `INODE_GRAPH` secondary index when the
+//! transaction implements [`InodeGraphOps`].  This gives O(m) traversal
+//! where m = edges for THIS file, instead of O(n) where n = all edges in
+//! the repository.  See the [Performance at Scale] documentation for the
+//! dual-index architecture.
+//!
+//! This module converts a local working-copy change (a [`BuiltHunk`]) into a
+//! graph-compatible [`GraphOp<Option<Hash>>`].
+//!
+//! # Design
+//!
+//! After the upstream consolidation in `record_modified_file`, every hunk that
+//! reaches this function belongs to exactly one of four operations:
+//!
+//! | Hunk kind | Condition | Graph operation |
+//! |-----------|-----------|-----------------|
+//! | `Insert`  | `old_start == 0` | **Prepend**: insert before first content |
+//! | `Insert`  | `old_start >= old_lines` | **Append**: insert after last content |
+//! | `Replace` | *(always)* | **Replace**: delete all old → insert new |
+//! | `Delete`  | *(always)* | **Delete**: delete all old content |
+//!
+//! Middle insertions (`0 < old_start < old_lines`) are collapsed into a
+//! single Replace by the upstream consolidation step. If one somehow
+//! reaches here (e.g. a future code path bypasses the consolidation), we
+//! return a clear error rather than silently duplicating content.
+//!
+//! Both `Replace` and `Delete` need the same "find every content vertex and
+//! build deletion edges" work, so that logic lives in one place:
+//! [`delete_all_content`].
+
 use super::*;
+use crate::change::Local;
+use crate::pristine::InodeGraphOps;
 
-// MAIN GLOBALIZATION FUNCTIONS
+// ───────────────────────────────────────────────────────────────────────────
+// Public entry point
+// ───────────────────────────────────────────────────────────────────────────
 
-/// Globalize a single built graph_op into a graph graph_op.
-///
-/// This is the core function that converts a local working copy change
-/// (represented as a `BuiltHunk`) into a graph-compatible `GraphOp<Option<Hash>>`.
+/// Globalize a single built hunk into a graph operation.
 ///
 /// # Arguments
 ///
-/// * `ctx` - The globalization context
-/// * `built` - The built graph_op from the recording phase
-/// * `inode` - The file's inode
-/// * `inode_pos` - The graph position of the file's inode
-/// * `content` - The content slice for this graph_op
-/// * `full_content` - The full file content (needed for NeedsReplace case)
-/// * `old_line_count` - Number of lines in the old content (for precise insert detection)
-///
-/// # Returns
-///
-/// A graph-compatible graph_op, or an error if globalization fails.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let graph_op = globalize_hunk(&mut ctx, &built_hunk, inode, inode_pos, content)?;
-/// change.add_hunk(graph_op);
-/// ```
+/// * `ctx`            – globalization context (content buffer, dependencies, txn)
+/// * `built`          – the built hunk from the recording phase
+/// * `inode`          – the file's stable identifier
+/// * `inode_pos`      – the graph position of the file's inode vertex
+/// * `content`        – the content bytes this hunk should insert (the hunk's
+///   own slice for Insert, the full new file for Replace)
+/// * `old_line_count` – number of lines in the old file (for insert-position
+///   classification)
 pub fn globalize_hunk<T>(
     ctx: &mut GlobalizeContext<'_, T>,
     built: &BuiltHunk,
     inode: Inode,
     inode_pos: Position<NodeId>,
     content: &[u8],
-    full_content: &[u8],
     old_line_count: Option<usize>,
 ) -> GlobalizeResult<GraphOp<Option<Hash>>>
 where
-    T: GraphTxnT + TreeTxnT,
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
     let local = built.local.clone();
     let encoding = built.encoding;
 
-    // For modifications to existing files, we need to find the correct context
-    // positions from the content graph. The predecessors should be the END of the
-    // span that comes before, and successors should be the START of the
-    // span that comes after.
-    //
-    // We use the line number information (old_start) to determine insertion position:
-    // - old_start == 0: Prepend (insert at beginning)
-    // - Otherwise: Check if we can insert in middle, or need to do a Replace
-    //
-    // The challenge is that without byte-to-span mapping (like original Atomic has),
-    // we can't reliably insert in the middle of a single span. So for middle insertions,
-    // we convert to Replace (delete all old content, insert all new content).
-
     match built.kind {
-        BuiltHunkKind::Insert => {
-            // Pure insertion - create a Insertion
-            // Determine predecessors and successors based on insertion position
-            // old_start tells us which line in the old content the insertion comes AFTER
-            let insert_result =
-                find_insert_context(ctx.txn(), inode_pos, built.old_start, old_line_count)?;
-
-            match insert_result {
-                InsertContext::Prepend { successors } => {
-                    // Prepend: connect to inode, with successors to first content
-                    let content_node = create_content_vertex(
-                        ctx,
-                        inode,
-                        inode_pos,
-                        vec![inode_pos],
-                        successors,
-                        content,
-                    )?;
-
-                    Ok(GraphOp::Edit {
-                        change: Atom::Insertion(content_node),
-                        local,
-                        encoding,
-                    })
-                }
-                InsertContext::Append { predecessors } => {
-                    // Append: connect after existing content
-                    let content_node = create_content_vertex(
-                        ctx,
-                        inode,
-                        inode_pos,
-                        predecessors,
-                        vec![],
-                        content,
-                    )?;
-
-                    Ok(GraphOp::Edit {
-                        change: Atom::Insertion(content_node),
-                        local,
-                        encoding,
-                    })
-                }
-                InsertContext::NeedsReplace => {
-                    // Middle insertion into a single span - we can't split it without
-                    // byte-to-span mapping. Convert this to a Replace operation:
-                    // 1. Delete all existing content
-                    // 2. Insert new content connected to the inode
-                    //
-                    // This is semantically correct: we're replacing the file content.
-                    let content_vertices = find_content_vertices(ctx.txn(), inode_pos)?;
-                    let deletion_edges =
-                        create_deletion_edges_for_vertices(ctx, &content_vertices)?;
-
-                    let deletion = EdgeUpdate {
-                        edges: deletion_edges,
-                        inode: position_to_option_hash(inode_pos),
-                    };
-
-                    // Insert the FULL file content connected to the inode (after deletion)
-                    // We use full_content because this is a complete file replacement
-                    let insertion = create_content_vertex(
-                        ctx,
-                        inode,
-                        inode_pos,
-                        vec![inode_pos], // predecessors: the inode span itself
-                        vec![],          // successors: nothing after
-                        full_content,
-                    )?;
-
-                    Ok(GraphOp::Replacement {
-                        change: deletion,
-                        replacement: insertion,
-                        local,
-                        encoding,
-                    })
-                }
-            }
-        }
-
-        BuiltHunkKind::Delete => {
-            // Pure deletion - create an EdgeUpdate
-            // Find all content vertices for this file and mark them as deleted
-            let content_vertices = find_content_vertices(ctx.txn(), inode_pos)?;
-            let deletion_edges = create_deletion_edges_for_vertices(ctx, &content_vertices)?;
-
-            let edge_update = EdgeUpdate {
-                edges: deletion_edges,
-                inode: position_to_option_hash(inode_pos),
-            };
-
-            Ok(GraphOp::Edit {
-                change: Atom::EdgeUpdate(edge_update),
-                local,
-                encoding,
-            })
-        }
-
+        BuiltHunkKind::Insert => globalize_insert(
+            ctx,
+            built,
+            inode,
+            inode_pos,
+            content,
+            old_line_count,
+            local,
+            encoding,
+        ),
         BuiltHunkKind::Replace => {
-            // Replacement - delete old content, insert new
-            // For a replacement, we need to:
-            // 1. Find and delete the old content vertices
-            // 2. Insert the FULL new file content connected to the inode span
-            //
-            // IMPORTANT: We must use `full_content` (the entire new file), not `content`
-            // (just the replacement portion). This is because we're deleting ALL old
-            // content vertices, so we need to replace with ALL new content.
-            //
-            // Bug fix: Previously this used `content` which only contained the changed
-            // lines, causing data loss of unchanged lines.
-            let content_vertices = find_content_vertices(ctx.txn(), inode_pos)?;
-            let deletion_edges = create_deletion_edges_for_vertices(ctx, &content_vertices)?;
-
-            let deletion = EdgeUpdate {
-                edges: deletion_edges,
-                inode: position_to_option_hash(inode_pos),
-            };
-
-            // For replacement, insert the FULL new file content connected to the inode
-            // (not just the graph_op content, since we're deleting ALL old content)
-            let insertion = create_content_vertex(
-                ctx,
-                inode,
-                inode_pos,
-                vec![inode_pos], // predecessors: the inode span itself
-                vec![],          // successors: nothing after
-                full_content,    // Use full file content, not just the graph_op portion
-            )?;
-
-            Ok(GraphOp::Replacement {
-                change: deletion,
-                replacement: insertion,
-                local,
-                encoding,
-            })
+            globalize_replace(ctx, inode, inode_pos, content, local, encoding)
         }
+        BuiltHunkKind::Delete => globalize_delete(ctx, inode, inode_pos, local, encoding),
     }
 }
 
-/// Find the end position of the last content span in a file.
+// ───────────────────────────────────────────────────────────────────────────
+// Insert: prepend / append (the only two safe positions)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Classify an Insert hunk and emit the corresponding graph operation.
 ///
-/// This traverses the file's content graph to find the span that represents
-/// the end of the current content. This position is used as predecessors when
-/// appending new content.
+/// Only two positions are supported:
 ///
-/// # Arguments
+/// * **Prepend** (`old_start == 0`): new content is wired between the inode
+///   vertex and the first existing content vertex.
+/// * **Append** (`old_start >= old_line_count`): new content is wired after
+///   the last existing content vertex.
 ///
-/// * `txn` - Transaction for graph lookups
-/// * `inode_pos` - The graph position of the file's inode
-///
-/// # Returns
-///
-/// The end position of the last content span, or the inode position if
-/// the file has no content.
-/// Result of finding insert context - determines how to handle the insertion.
-#[derive(Debug)]
-enum InsertContext {
-    /// Prepend: insert at the very beginning of the file.
-    /// predecessors should be the inode, successors is the start of first content.
-    Prepend { successors: Vec<Position<NodeId>> },
-    /// Append: insert at the end of the file.
-    /// predecessors is the end of last content, successors is empty.
-    Append { predecessors: Vec<Position<NodeId>> },
-    /// Middle insertion that requires a Replace operation.
-    /// This happens when we need to insert within a single span but don't have
-    /// byte-to-span mapping to find the exact position.
-    NeedsReplace,
+/// Any other position means the upstream consolidation was bypassed, and we
+/// return an error instead of silently producing duplicate content.
+#[allow(clippy::too_many_arguments)]
+fn globalize_insert<T>(
+    ctx: &mut GlobalizeContext<'_, T>,
+    built: &BuiltHunk,
+    inode: Inode,
+    inode_pos: Position<NodeId>,
+    content: &[u8],
+    old_line_count: Option<usize>,
+    local: Local,
+    encoding: Option<Encoding>,
+) -> GlobalizeResult<GraphOp<Option<Hash>>>
+where
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
+{
+    let position = classify_insert(ctx.txn(), inode, inode_pos, built.old_start, old_line_count)?;
+
+    let (predecessors, successors) = match position {
+        InsertPosition::Prepend { first_content } => (vec![inode_pos], vec![first_content]),
+        InsertPosition::Append { last_content_end } => (vec![last_content_end], vec![]),
+    };
+
+    let vertex = create_content_vertex(ctx, inode, inode_pos, predecessors, successors, content)?;
+
+    Ok(GraphOp::Edit {
+        change: Atom::Insertion(vertex),
+        local,
+        encoding,
+    })
 }
 
-/// Find the appropriate context for an insertion based on old_start line number.
+// ───────────────────────────────────────────────────────────────────────────
+// Replace: delete all old content, insert full new content
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Delete every existing content vertex and insert `content` (the full new
+/// file) as a single vertex connected to the inode.
+fn globalize_replace<T>(
+    ctx: &mut GlobalizeContext<'_, T>,
+    inode: Inode,
+    inode_pos: Position<NodeId>,
+    content: &[u8],
+    local: Local,
+    encoding: Option<Encoding>,
+) -> GlobalizeResult<GraphOp<Option<Hash>>>
+where
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
+{
+    let step = std::time::Instant::now();
+    let content_vertices = find_content_vertices(ctx.txn(), inode, inode_pos)?;
+    let find_ms = step.elapsed().as_millis();
+
+    let step = std::time::Instant::now();
+    let deletion_edges = match build_deletion_edges(ctx, &content_vertices) {
+        Ok(edges) => edges,
+        Err(e) => {
+            // The INODE_GRAPH fast path may return vertices whose PARENT
+            // edges are missing/stale in the global GRAPH (e.g. after
+            // many Replaces).  Retry with the global DFS which walks the
+            // full alive graph and produces consistent vertices.
+            log::debug!(
+                "globalize_replace: build_deletion_edges failed for inode={:?} ({} vertices), \
+                 retrying with global DFS: {}",
+                inode,
+                content_vertices.len(),
+                e,
+            );
+            let global_vertices = find_content_vertices_global(ctx.txn(), inode_pos)?;
+            match build_deletion_edges(ctx, &global_vertices) {
+                Ok(edges) => edges,
+                Err(e2) => {
+                    log::debug!(
+                        "globalize_replace: global DFS also failed for inode={:?}: {}",
+                        inode,
+                        e2,
+                    );
+                    return Err(e2);
+                }
+            }
+        }
+    };
+    let del_ms = step.elapsed().as_millis();
+
+    if find_ms + del_ms > 50 {
+        log::warn!(
+            "globalize_replace: inode={:?} find_content={}ms ({} vertices) build_deletion={}ms ({} edges)",
+            inode, find_ms, content_vertices.len(), del_ms, deletion_edges.len(),
+        );
+    } else {
+        log::debug!(
+            "globalize_replace: inode={:?} find_content={}ms ({} vertices) build_deletion={}ms ({} edges)",
+            inode, find_ms, content_vertices.len(), del_ms, deletion_edges.len(),
+        );
+    }
+
+    let deletion = EdgeUpdate {
+        edges: deletion_edges,
+        inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
+    };
+
+    let insertion = create_content_vertex(ctx, inode, inode_pos, vec![inode_pos], vec![], content)?;
+
+    Ok(GraphOp::Replacement {
+        change: deletion,
+        replacement: insertion,
+        local,
+        encoding,
+    })
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Delete: mark every content vertex as deleted
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Mark every content vertex for this file as deleted.
+fn globalize_delete<T>(
+    ctx: &mut GlobalizeContext<'_, T>,
+    inode: Inode,
+    inode_pos: Position<NodeId>,
+    local: Local,
+    encoding: Option<Encoding>,
+) -> GlobalizeResult<GraphOp<Option<Hash>>>
+where
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
+{
+    let step = std::time::Instant::now();
+    let deletion = match delete_all_content(ctx, inode, inode_pos) {
+        Ok(d) => d,
+        Err(e) => {
+            // Same fallback as globalize_replace: retry via global DFS.
+            log::debug!(
+                "globalize_delete: delete_all_content failed for inode={:?}, \
+                 retrying with global DFS: {}",
+                inode,
+                e,
+            );
+            let global_vertices = find_content_vertices_global(ctx.txn(), inode_pos)?;
+            let deletion_edges = build_deletion_edges(ctx, &global_vertices)?;
+            EdgeUpdate {
+                edges: deletion_edges,
+                inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
+            }
+        }
+    };
+    let del_ms = step.elapsed().as_millis();
+    if del_ms > 50 {
+        log::warn!(
+            "globalize_delete: inode={:?} delete_all_content took {}ms",
+            inode,
+            del_ms
+        );
+    }
+
+    Ok(GraphOp::Edit {
+        change: Atom::EdgeUpdate(deletion),
+        local,
+        encoding,
+    })
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Shared helpers
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Build an [`EdgeUpdate`] that marks every content vertex in the file as
+/// deleted.
 ///
-/// This determines where new content should be inserted:
-/// - old_start == 0: Prepend (insert before all existing content)
-/// - old_start >= total_lines: Append (insert after all existing content)
-/// - Otherwise: Middle insertion (needs Replace because we can't split vertices)
+/// This is the single place where "find all content vertices → create
+/// deletion edges" happens. Both [`globalize_replace`] and
+/// [`globalize_delete`] delegate here.
+fn delete_all_content<T>(
+    ctx: &mut GlobalizeContext<'_, T>,
+    inode: Inode,
+    inode_pos: Position<NodeId>,
+) -> GlobalizeResult<EdgeUpdate<Option<Hash>>>
+where
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
+{
+    let content_vertices = find_content_vertices(ctx.txn(), inode, inode_pos)?;
+    let deletion_edges = build_deletion_edges(ctx, &content_vertices)?;
+
+    Ok(EdgeUpdate {
+        edges: deletion_edges,
+        inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
+    })
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Insert position classification
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The two valid positions for an Insert hunk.
+#[derive(Debug)]
+enum InsertPosition {
+    /// Insert before all existing content.
+    ///
+    /// `first_content` is the start position of the first content vertex —
+    /// used as the successor of the new vertex.
+    Prepend { first_content: Position<NodeId> },
+
+    /// Insert after all existing content.
+    ///
+    /// `last_content_end` is the end position of the last content vertex —
+    /// used as the predecessor of the new vertex.
+    Append { last_content_end: Position<NodeId> },
+}
+
+/// Determine whether an Insert hunk is a Prepend or Append.
 ///
-/// # Arguments
-///
-/// * `txn` - Transaction for graph lookups
-/// * `inode_pos` - The graph position of the file's inode
-/// * `old_start` - The line number in old content AFTER which to insert (0 = prepend)
-///
-/// # Returns
-///
-/// An `InsertContext` indicating how to handle the insertion.
-fn find_insert_context<T>(
+/// Returns an error if `old_start` falls in the middle of the file — that
+/// case should have been consolidated into a Replace upstream.
+fn classify_insert<T>(
     txn: &T,
+    inode: Inode,
     inode_pos: Position<NodeId>,
     old_start: usize,
     old_line_count: Option<usize>,
-) -> GlobalizeResult<InsertContext>
+) -> GlobalizeResult<InsertPosition>
 where
-    T: GraphTxnT,
+    T: GraphTxnT + InodeGraphOps,
 {
-    // Retrieve the file's content graph
-    let result = match retrieve_graph(txn, inode_pos, RetrieveOptions::default()) {
-        Ok(r) => r,
-        Err(_) => {
-            // Empty file - treat as append (will connect to inode)
-            return Ok(InsertContext::Append {
-                predecessors: vec![inode_pos],
-            });
-        }
-    };
+    let vertices = collect_sorted_content_vertices(txn, inode, inode_pos)?;
 
-    // Collect content vertices with their positions
-    let mut content_vertices: Vec<(GraphNode<NodeId>, Position<NodeId>, Position<NodeId>)> =
-        Vec::new();
-
-    for vertex_id in 0..result.graph.len_vertices() {
-        if let Some(alive_vertex) = result.graph.try_get_vertex(vertex_id.into()) {
-            let alive_node = alive_vertex.node;
-
-            // Skip DUMMY and empty vertices
-            if alive_node.change.is_root() || alive_node.start == alive_node.end {
-                continue;
-            }
-
-            let start_pos = Position::new(alive_node.change, alive_node.start);
-            let end_pos = Position::new(alive_node.change, alive_node.end);
-            content_vertices.push((alive_node, start_pos, end_pos));
-        }
-    }
-
-    // If no content vertices, this is an empty file - append
-    if content_vertices.is_empty() {
-        return Ok(InsertContext::Append {
-            predecessors: vec![inode_pos],
+    // Empty file → append (predecessor is the inode itself).
+    if vertices.is_empty() {
+        return Ok(InsertPosition::Append {
+            last_content_end: inode_pos,
         });
     }
 
-    // Sort by start position to get proper ordering
-    content_vertices.sort_by(|a, b| a.1.pos.cmp(&b.1.pos));
-
-    // old_start == 0 means prepend (insert BEFORE line 0, i.e., at the very beginning)
+    // Prepend: insert before the very first line.
     if old_start == 0 {
-        let first_start = content_vertices[0].1;
-        return Ok(InsertContext::Prepend {
-            successors: vec![first_start],
+        let first_start = Position::new(vertices[0].change, vertices[0].start);
+        return Ok(InsertPosition::Prepend {
+            first_content: first_start,
         });
     }
 
-    // Determine if this is an append or middle insertion using the actual old line count.
-    //
-    // old_start indicates which line of OLD content the insertion comes AFTER.
-    // If old_start >= total_old_lines, it's an append (insert at end).
-    // If old_start < total_old_lines and we have a single span, we need Replace
-    // because we can't split a span without byte-to-span mapping.
-
-    // Use the actual old line count if available, otherwise fall back to span count
-    let total_old_lines = old_line_count.unwrap_or(content_vertices.len());
-
-    // If old_start >= total lines, it's an append
+    // Append: insert after the very last line.
+    let total_old_lines = old_line_count.unwrap_or(vertices.len());
     if old_start >= total_old_lines {
-        let last_end = content_vertices.last().unwrap().2;
-        return Ok(InsertContext::Append {
-            predecessors: vec![last_end],
+        let last = vertices.last().unwrap();
+        let last_end = Position::new(last.change, last.end);
+        return Ok(InsertPosition::Append {
+            last_content_end: last_end,
         });
     }
 
-    // For single span or middle insertion into multiple vertices,
-    // we need byte-level mapping to split correctly.
-    // Without it, signal that a Replace is needed.
-    Ok(InsertContext::NeedsReplace)
+    // Middle insertion — this should never arrive here after the upstream
+    // consolidation in `record_modified_file`.  Return a clear error so the
+    // caller knows something is wrong rather than silently triplicating
+    // content.
+    Err(GlobalizeError::MissingContext {
+        path: "(middle insertion reached globalize_hunk — upstream consolidation was bypassed)"
+            .to_string(),
+        line: old_start as u64,
+    })
 }
 
-#[allow(dead_code)]
-fn find_content_end_position<T>(
+// ───────────────────────────────────────────────────────────────────────────
+// Graph vertex / edge helpers
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Collect content vertices for a file, sorted by start position.
+///
+/// Returns non-empty, non-root, non-inode vertices from the alive graph.
+fn collect_sorted_content_vertices<T>(
     txn: &T,
+    inode: Inode,
     inode_pos: Position<NodeId>,
-) -> GlobalizeResult<Position<NodeId>>
+) -> GlobalizeResult<Vec<GraphNode<NodeId>>>
 where
-    T: GraphTxnT,
+    T: GraphTxnT + InodeGraphOps,
 {
-    // Retrieve the file's content graph starting from the inode position
-    let result = match retrieve_graph(txn, inode_pos, RetrieveOptions::default()) {
-        Ok(r) => r,
-        Err(_) => {
-            // If we can't retrieve the graph, fall back to inode position
-            // This can happen for empty files or files with no content yet
-            return Ok(inode_pos);
+    let mut vertices = find_content_vertices(txn, inode, inode_pos)?;
+    vertices.sort_by_key(|a| a.start);
+    Ok(vertices)
+}
+
+/// Retrieve every alive content vertex for a file.
+///
+/// This always uses `retrieve_graph` which traverses via the `GraphTxnT`
+/// implementation.  When the caller passes a `ViewGraph`, the traversal
+/// respects the view's change filter — only vertices from visible changes
+/// are returned.  When the caller passes a bare `ReadTxn`, all vertices
+/// are returned.
+///
+/// **Why not INODE_GRAPH?**  The `INODE_GRAPH` secondary index stores ALL
+/// edges regardless of view.  Using it directly would bypass the
+/// `ViewGraph` filter, returning vertices from changes that aren't visible
+/// in the current view — causing content duplication in the `record()`
+/// path.  The INODE_GRAPH optimisation is safe only when there is no
+/// filter (e.g. `assemble_and_hash` for git import, which passes a bare
+/// `&txn`).  For the general case we must go through `retrieve_graph`.
+///
+/// **Fast path**: When the INODE_GRAPH secondary index is populated for
+/// this inode, we use it directly — O(m) where m = edges for THIS file,
+/// instead of O(V+E) global DFS.  This is safe for git import which uses
+/// a bare `ReadTxn` (no view filter).
+///
+/// If the INODE_GRAPH path succeeds but a downstream consumer (e.g.
+/// `build_deletion_edges` → `find_predecessor_end`) fails because the
+/// returned vertices lack PARENT edges in the global GRAPH, the caller
+/// will see a `GlobalizeError`.  To handle this transparently we expose
+/// a `_with_fallback` wrapper that retries via the global DFS.
+fn find_content_vertices<T>(
+    txn: &T,
+    inode: Inode,
+    inode_pos: Position<NodeId>,
+) -> GlobalizeResult<Vec<GraphNode<NodeId>>>
+where
+    T: GraphTxnT + InodeGraphOps,
+{
+    // Try the INODE_GRAPH fast path first.  This is O(m) in edges for
+    // this file vs O(V+E) for the global DFS.
+    let populated = txn.inode_graph_is_populated(inode).unwrap_or(false);
+
+    if populated {
+        let inode_result = find_content_vertices_inode(txn, inode, inode_pos)?;
+        if !inode_result.is_empty() {
+            return Ok(inode_result);
         }
-    };
+        // INODE_GRAPH returned empty — fall through to global DFS.
+        log::debug!(
+            "find_content_vertices: INODE_GRAPH returned empty for inode={:?}, falling back to global DFS",
+            inode,
+        );
+    }
 
-    // Find the span with the highest end position
-    // This is the "last" content in the file
-    //
-    // We track content vertices separately from the inode because inode positions
-    // may be in a reserved high range (for CRDT compatibility) that would make
-    // simple comparisons fail. We want the content span with the highest end
-    // position in the normal content range.
-    let mut max_content_end: Option<Position<NodeId>> = None;
+    // Fall back to global DFS when the secondary index isn't populated
+    // or returned no vertices.
+    find_content_vertices_global(txn, inode_pos)
+}
 
-    for vertex_id in 0..result.graph.len_vertices() {
-        if let Some(alive_vertex) = result.graph.try_get_vertex(vertex_id.into()) {
-            let alive_node = &alive_vertex.node;
+/// Retrieve content vertices via the INODE_GRAPH secondary index.
+///
+/// This is the fast path: iterates only edges belonging to this specific
+/// file, giving O(m) performance where m is the number of edges for the
+/// file, regardless of total graph size.
+fn find_content_vertices_inode<T>(
+    txn: &T,
+    inode: Inode,
+    inode_pos: Position<NodeId>,
+) -> GlobalizeResult<Vec<GraphNode<NodeId>>>
+where
+    T: GraphTxnT + InodeGraphOps,
+{
+    use crate::types::EdgeFlags;
+    use std::collections::HashSet;
 
-            // Skip the DUMMY span (NodeId(0) / ROOT)
-            if alive_node.change.is_root() {
+    let step = std::time::Instant::now();
+
+    // Walk forward edges from the inode vertex to discover all alive
+    // content vertices.  We use a BFS/DFS through the inode-scoped index.
+    let mut visited: HashSet<GraphNode<NodeId>> = HashSet::new();
+    let mut stack: Vec<GraphNode<NodeId>> = vec![inode_pos.inode_node()];
+    let mut content_vertices: Vec<GraphNode<NodeId>> = Vec::new();
+
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node) {
+            continue;
+        }
+
+        // Get forward edges (BLOCK, not PARENT, not DELETED) for this vertex
+        // within the inode scope.
+        let min_flag = EdgeFlags::BLOCK;
+        let max_flag = EdgeFlags::all();
+        let mut adj = match txn.init_inode_adj(inode, node, min_flag, max_flag) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+
+        while let Some(edge_result) = txn.next_inode_adj(&mut adj) {
+            let edge = match edge_result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let flags = edge.flag();
+            // Skip PARENT edges (reverse), DELETED edges, and PSEUDO edges
+            if flags.contains(EdgeFlags::PARENT)
+                || flags.contains(EdgeFlags::DELETED)
+                || flags.contains(EdgeFlags::PSEUDO)
+            {
                 continue;
             }
 
-            // Skip empty vertices (like inode markers)
-            // Content vertices always have start < end
-            if alive_node.start == alive_node.end {
-                continue;
-            }
+            // Resolve destination vertex
+            let dest_pos = edge.dest();
+            let dest_node = match txn.find_block(dest_pos) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
 
-            // This is a content span - track the one with the highest end position
-            let end_pos = Position::new(alive_node.change, alive_node.end);
+            if !visited.contains(&dest_node) {
+                stack.push(dest_node);
 
-            match &max_content_end {
-                None => {
-                    // First content span found
-                    max_content_end = Some(end_pos);
-                }
-                Some(current_max) => {
-                    // Compare by position value - we want the highest end position
-                    if end_pos.pos > current_max.pos {
-                        max_content_end = Some(end_pos);
-                    }
+                // Collect non-root, non-inode content vertices
+                if !(dest_node.change.is_root()
+                    || (dest_node.start == dest_node.end && dest_node.start == inode_pos.pos))
+                {
+                    content_vertices.push(dest_node);
                 }
             }
         }
     }
 
-    // Return the highest content end position, or fall back to inode position
-    // if no content was found (empty file)
-    Ok(max_content_end.unwrap_or(inode_pos))
+    let elapsed_ms = step.elapsed().as_millis();
+    if elapsed_ms > 50 {
+        log::warn!(
+            "find_content_vertices_inode: inode={:?} took {}ms ({} content vertices, {} visited)",
+            inode,
+            elapsed_ms,
+            content_vertices.len(),
+            visited.len(),
+        );
+    } else {
+        log::debug!(
+            "find_content_vertices_inode: inode={:?} took {}ms ({} content vertices, {} visited)",
+            inode,
+            elapsed_ms,
+            content_vertices.len(),
+            visited.len(),
+        );
+    }
+
+    Ok(content_vertices)
 }
 
-/// Find all content vertices for a file.
-///
-/// This retrieves the file's graph and returns all non-inode content vertices.
-/// Used for deletion operations where we need to mark existing content as deleted.
-///
-/// # Arguments
-///
-/// * `txn` - Transaction for graph lookups
-/// * `inode_pos` - The graph position of the file's inode
-///
-/// # Returns
-///
-/// A vector of content vertices (excluding the inode span and DUMMY).
-fn find_content_vertices<T>(
+/// Retrieve content vertices via global GRAPH DFS.
+fn find_content_vertices_global<T>(
     txn: &T,
     inode_pos: Position<NodeId>,
 ) -> GlobalizeResult<Vec<GraphNode<NodeId>>>
 where
     T: GraphTxnT,
 {
-    use crate::output::alive::{retrieve_graph, RetrieveOptions};
-
-    let result = match retrieve_graph(txn, inode_pos, RetrieveOptions::default()) {
+    let options = RetrieveOptions::default();
+    let step = std::time::Instant::now();
+    let result = match retrieve_graph(txn, inode_pos, options) {
         Ok(r) => r,
-        Err(_) => {
-            // No graph content - return empty
-            return Ok(Vec::new());
-        }
+        Err(_) => return Ok(Vec::new()),
     };
-
-    let mut vertices = Vec::new();
-
-    for vertex_id in 0..result.graph.len_vertices() {
-        if let Some(alive_vertex) = result.graph.try_get_vertex(vertex_id.into()) {
-            let alive_node = alive_vertex.node;
-
-            // Skip DUMMY/ROOT span
-            if alive_node.change.is_root() {
-                continue;
-            }
-
-            // Skip the inode span (empty span at inode position)
-            if alive_node.start == alive_node.end && alive_node.start == inode_pos.pos {
-                continue;
-            }
-
-            // This is a content span
-            vertices.push(alive_node);
-        }
+    let retrieve_ms = step.elapsed().as_millis();
+    if retrieve_ms > 50 {
+        log::warn!(
+            "find_content_vertices_global: retrieve_graph took {}ms ({} vertices, {} edges traversed, {} positions visited)",
+            retrieve_ms,
+            result.graph.len_vertices(),
+            result.edges_traversed,
+            result.positions_visited,
+        );
+    } else {
+        log::debug!(
+            "find_content_vertices_global: retrieve_graph took {}ms ({} vertices, {} edges, {} positions)",
+            retrieve_ms,
+            result.graph.len_vertices(),
+            result.edges_traversed,
+            result.positions_visited,
+        );
     }
 
-    Ok(vertices)
+    let mut out = Vec::new();
+    for vid in 0..result.graph.len_vertices() {
+        let Some(alive) = result.graph.try_get_vertex(vid.into()) else {
+            continue;
+        };
+        let node = alive.node;
+
+        // Skip the virtual root.
+        if node.change.is_root() {
+            continue;
+        }
+        // Skip the inode marker (empty vertex at the inode position).
+        if node.start == node.end && node.start == inode_pos.pos {
+            continue;
+        }
+
+        out.push(node);
+    }
+    Ok(out)
 }
 
-/// Create deletion edges for a list of content vertices.
+/// Create [`NewEdge`] deletion entries for each vertex.
 ///
-/// For each span, creates a NewEdge that marks the edge TO that span as deleted.
-/// The edge goes from the predecessor's end position to the span being deleted.
-///
-/// # Arguments
-///
-/// * `ctx` - The globalization context (for tracking dependencies)
-/// * `inode_pos` - The inode position (used to find predecessor edges)
-/// * `vertices` - The vertices to mark as deleted
-///
-/// # Returns
-///
-/// A vector of NewEdge structures for the deletion.
-fn create_deletion_edges_for_vertices<T>(
+/// For every content vertex we:
+/// 1. Find its predecessor via PARENT edges.
+/// 2. Create a `BLOCK | DELETED` edge from that predecessor to the vertex.
+/// 3. Track the dependency on the change that introduced the vertex.
+fn build_deletion_edges<T>(
     ctx: &mut GlobalizeContext<'_, T>,
     vertices: &[GraphNode<NodeId>],
 ) -> GlobalizeResult<Vec<NewEdge<Option<Hash>>>>
 where
-    T: GraphTxnT + TreeTxnT,
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    use crate::change::NewEdge;
-    use crate::types::EdgeKind;
+    let mut edges = Vec::with_capacity(vertices.len());
 
-    let mut edges = Vec::new();
-
-    for v in vertices {
-        // Track dependency on the change that introduced this span
+    for &v in vertices {
         ctx.add_dependency_by_id(v.change)?;
 
-        // Find the predecessor of this span by looking for PARENT edges
-        // The deletion edge should go from the predecessor's end to this span
-        //
-        // For a content span that's a child of the inode, the predecessor
-        // is the inode span itself. We look up the parent edge to find
-        // the source position.
-        let from_pos = find_predecessor_end_position(ctx.txn(), *v)?;
+        let from_pos = find_predecessor_end(ctx.txn(), v)?;
 
-        // Create a deletion edge using typed EdgeKind.
-        // previous = Block (the existing live edge we expect)
-        // flag     = BlockDeleted (mark the edge as deleted)
-        let edge = NewEdge {
-            previous: EdgeKind::Block.to_flags(),
-            flag: EdgeKind::BlockDeleted.to_flags(),
-            // From: the end position of the predecessor span
+        edges.push(NewEdge {
+            previous: EdgeFlags::BLOCK,
+            flag: EdgeFlags::BLOCK | EdgeFlags::DELETED,
             from: position_to_option_hash_resolved(ctx.txn(), from_pos, None),
-            // To: the span being deleted
-            to: vertex_to_option_hash_resolved(ctx.txn(), *v, None),
-            // Introduced by: the change that originally created the edge
-            // We look this up from the graph
-            introduced_by: find_edge_introduced_by(ctx.txn(), from_pos, *v),
-        };
-
-        edges.push(edge);
+            to: vertex_to_option_hash_resolved(ctx.txn(), v, None),
+            introduced_by: find_edge_introduced_by(ctx.txn(), from_pos, v),
+        });
     }
 
     Ok(edges)
 }
 
-/// Find the end position of the predecessor of a span.
-///
-/// This looks up the PARENT edges of the span to find which span
-/// comes before it, then returns the end position of that predecessor.
-fn find_predecessor_end_position<T: GraphTxnT>(
+/// Walk PARENT edges of `node` to find the end position of its predecessor.
+fn find_predecessor_end<T: GraphTxnT + InodeGraphOps>(
     txn: &T,
     node: GraphNode<NodeId>,
 ) -> GlobalizeResult<Position<NodeId>> {
-    use crate::types::ParentEdgeKind;
+    let min_flag = EdgeFlags::BLOCK | EdgeFlags::PARENT;
+    let max_flag = EdgeFlags::BLOCK | EdgeFlags::PARENT | EdgeFlags::FOLDER;
 
-    // Use typed iter_parents to find BLOCK|PARENT or FOLDER|PARENT edges.
-    //
-    // NOTE: No change filter here.  This is a structural lookup — we need
-    // the predecessor vertex regardless of which view introduced the edge.
-    // The `introduced_by` on a parent edge records WHEN the connection was
-    // made, not WHETHER the predecessor exists.  Filtering here would reject
-    // edges introduced by sibling views and leave content vertices orphaned.
-    //
-    // include_deleted=false: we only want alive parent edges.
-    let parents = txn
-        .iter_parents(node, false)
+    let mut adj = txn
+        .iter_adjacent(node, min_flag, max_flag)
         .map_err(|e| GlobalizeError::Pristine(Box::new(e)))?;
 
-    for parent in parents {
-        match parent.kind {
-            // Block or Folder parent — the dest points to where the forward
-            // edge came FROM (remember, this is a reverse/PARENT edge).
-            ParentEdgeKind::Block | ParentEdgeKind::Folder => {
-                return Ok(parent.dest);
-            }
-            // Skip pseudo parents — they are synthetic connectivity edges,
-            // not real predecessors from stored changes.
-            _ => continue,
-        }
+    if let Some(edge) = adj.next() {
+        let edge = edge.map_err(|e| GlobalizeError::Pristine(Box::new(e)))?;
+        return Ok(edge.dest());
     }
 
-    // If no parent found, this shouldn't happen for content vertices
-    // Use NodeNotFound as the closest matching error type
     Err(GlobalizeError::NodeNotFound {
         position: node.start_pos(),
     })
 }
 
-/// Find the change that introduced an edge between two positions.
-fn find_edge_introduced_by<T: GraphTxnT>(
+/// Discover which change introduced the forward edge from `from_pos` to
+/// `to_vertex`.
+fn find_edge_introduced_by<T: GraphTxnT + InodeGraphOps>(
     txn: &T,
     from_pos: Position<NodeId>,
     to_vertex: GraphNode<NodeId>,
 ) -> Option<Hash> {
-    use crate::types::EdgeKind;
-
-    // Find the span at the from position
-    // (find_block_end resolves a position to a vertex — no filtering needed
-    // since the vertex exists regardless of which view introduced it)
     let from_vertex = match txn.find_block_end(from_pos) {
         Ok(v) => v,
         Err(_) => return None,
     };
 
-    // Use typed iter_forward to find Block or Folder edges.
-    // include_deleted=false: we want the alive edge that originally
-    // connected from_vertex to to_vertex.
-    //
-    // NOTE: No change filter here.  This is a structural lookup — we
-    // need to find the edge that connects from_vertex to to_vertex
-    // regardless of which view introduced it.  The original edge may
-    // have been replaced by a sibling view (e.g., agent-a deletes
-    // the C1 edge and adds a C2 edge).  We still need to find it so
-    // we can record the correct `introduced_by` in the new change.
-    let edges = match txn.iter_forward(from_vertex, false) {
-        Ok(e) => e,
+    let min_flag = EdgeFlags::BLOCK;
+    let max_flag = EdgeFlags::BLOCK | EdgeFlags::FOLDER;
+
+    let adj = match txn.iter_adjacent(from_vertex, min_flag, max_flag) {
+        Ok(a) => a,
         Err(_) => return None,
     };
 
-    for edge in edges {
-        match edge.kind {
-            EdgeKind::Block | EdgeKind::Folder => {
-                // Check if this edge points to our target span
-                if edge.dest == to_vertex.start_pos() {
-                    return txn.get_external(edge.introduced_by).ok().flatten();
-                }
-            }
-            _ => continue,
+    for edge_result in adj {
+        let edge = match edge_result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if edge.dest() == to_vertex.start_pos() {
+            return txn.get_external(edge.introduced_by()).ok().flatten();
         }
     }
 
     None
 }
 
-/// Convert a GraphNode<NodeId> to GraphNode<Option<Hash>>, resolving external change hashes.
-fn vertex_to_option_hash_resolved<T: GraphTxnT>(
+/// Convert a [`GraphNode<NodeId>`] to [`GraphNode<Option<Hash>>`], resolving
+/// external change hashes via the transaction.
+fn vertex_to_option_hash_resolved<T: GraphTxnT + InodeGraphOps>(
     txn: &T,
     node: GraphNode<NodeId>,
     current_change_id: Option<NodeId>,

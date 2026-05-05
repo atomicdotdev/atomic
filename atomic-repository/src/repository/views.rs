@@ -154,6 +154,39 @@ impl Repository {
         Ok(())
     }
 
+    /// Change a view's scope between Draft and Shared.
+    ///
+    /// This is useful after `git import` which creates Draft views by
+    /// default.  Changing to Shared enables the fast `filter_is_universal`
+    /// path in `status`, avoiding the O(N) change-loading slow path.
+    pub fn set_view_scope(&self, name: &str, scope: ViewScope) -> Result<(), RepositoryError> {
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut view = txn
+            .get_view(name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: name.to_string(),
+            })?;
+
+        view.kind = scope;
+        // Clear parent when promoting to Shared root view
+        if scope.is_shared() {
+            view.parent = None;
+        }
+
+        txn.update_view(&view)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Walk the parent chain from `view_name` and return the name of the
     /// first Shared view encountered.  If `view_name` is itself Shared,
     /// it is returned immediately.  This is used to determine the correct

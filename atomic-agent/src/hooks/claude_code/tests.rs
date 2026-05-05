@@ -46,7 +46,7 @@ mod tests {
     fn test_hook_verbs() {
         let hook = make_hook();
         let verbs = hook.hook_verbs();
-        assert_eq!(verbs.len(), 7);
+        assert_eq!(verbs.len(), 8);
         assert!(verbs.contains(&"session-start"));
         assert!(verbs.contains(&"session-end"));
         assert!(verbs.contains(&"stop"));
@@ -54,6 +54,7 @@ mod tests {
         assert!(verbs.contains(&"pre-task"));
         assert!(verbs.contains(&"post-task"));
         assert!(verbs.contains(&"post-todo"));
+        assert!(verbs.contains(&"post-tool"));
     }
 
     #[test]
@@ -264,10 +265,19 @@ mod tests {
 
     #[test]
     fn test_is_atomic_hook() {
+        // Bare format (legacy)
         assert!(is_atomic_hook("atomic agent hooks claude-code stop"));
         assert!(is_atomic_hook(
             "atomic agent hooks claude-code user-prompt-submit"
         ));
+        // Guarded format (current)
+        assert!(is_atomic_hook(
+            "test -d .atomic && atomic agent hooks claude-code stop || true"
+        ));
+        assert!(is_atomic_hook(
+            "test -d .atomic && atomic agent hooks claude-code user-prompt-submit || true"
+        ));
+        // Non-atomic commands
         assert!(!is_atomic_hook("entire hooks claude-code stop"));
         assert!(!is_atomic_hook("some other command"));
         assert!(!is_atomic_hook(""));
@@ -462,6 +472,30 @@ mod tests {
         assert!(matchers.is_empty());
     }
 
+    #[test]
+    fn test_remove_atomic_hooks_guarded_format() {
+        let mut matchers = vec![ClaudeHookMatcher {
+            matcher: "".to_string(),
+            hooks: vec![
+                ClaudeHookEntry {
+                    hook_type: "command".to_string(),
+                    command: "some other hook".to_string(),
+                },
+                ClaudeHookEntry {
+                    hook_type: "command".to_string(),
+                    command: "test -d .atomic && atomic agent hooks claude-code stop || true"
+                        .to_string(),
+                },
+            ],
+        }];
+
+        remove_atomic_hooks(&mut matchers);
+
+        assert_eq!(matchers.len(), 1);
+        assert_eq!(matchers[0].hooks.len(), 1);
+        assert_eq!(matchers[0].hooks[0].command, "some other hook");
+    }
+
     // Deny rule helpers
 
     #[test]
@@ -581,8 +615,8 @@ mod tests {
 
         let count = hook.install(dir.path()).unwrap();
 
-        // Should install 7 hooks
-        assert_eq!(count, 7);
+        // Should install 8 hooks
+        assert_eq!(count, 8);
 
         // Settings file should exist
         let settings_path = dir.path().join(".claude").join("settings.json");
@@ -597,6 +631,7 @@ mod tests {
         assert!(data.contains("atomic agent hooks claude-code pre-task"));
         assert!(data.contains("atomic agent hooks claude-code post-task"));
         assert!(data.contains("atomic agent hooks claude-code post-todo"));
+        assert!(data.contains("atomic agent hooks claude-code post-tool"));
         assert!(data.contains(METADATA_DENY_RULE));
     }
 
@@ -606,7 +641,7 @@ mod tests {
         let hook = make_hook();
 
         let count1 = hook.install(dir.path()).unwrap();
-        assert_eq!(count1, 7);
+        assert_eq!(count1, 8);
 
         // Second install should return 0 (nothing new to install)
         let count2 = hook.install(dir.path()).unwrap();
@@ -777,7 +812,7 @@ mod tests {
 
         // Install
         let count = hook.install(dir.path()).unwrap();
-        assert_eq!(count, 7);
+        assert_eq!(count, 8);
         assert!(hook.is_installed(dir.path()));
 
         // Idempotent install
@@ -791,7 +826,7 @@ mod tests {
 
         // Reinstall
         let count3 = hook.install(dir.path()).unwrap();
-        assert_eq!(count3, 7);
+        assert_eq!(count3, 8);
         assert!(hook.is_installed(dir.path()));
     }
 }

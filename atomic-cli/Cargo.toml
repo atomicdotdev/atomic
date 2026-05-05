@@ -1,5 +1,8 @@
 [features]
+default = ["ast", "teams"]
 remote = []
+ast = ["atomic-semantic", "atomic-repository/ast"]
+teams = ["atomic-teams"]
 
 [package]
 name = "atomic-cli"
@@ -26,6 +29,8 @@ atomic-config = { workspace = true }
 atomic-identity = { workspace = true }
 atomic-remote = { workspace = true }
 atomic-repository = { workspace = true }
+atomic-semantic = { workspace = true, optional = true }
+atomic-teams = { workspace = true, optional = true }
 
 # CLI
 clap = { workspace = true }
@@ -58,6 +63,9 @@ data-encoding = "2.6"
 
 # Open URLs in default browser (for device auth flow)
 open = "5"
+
+# UUID (for org/team member identity IDs)
+uuid = { version = "1.0", features = ["serde", "v4"] }
 
 # Utilities
 serde = { workspace = true }

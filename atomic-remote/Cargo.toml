@@ -31,6 +31,15 @@ url = { workspace = true }
 bytes = { workspace = true }
 log = { workspace = true }
 
+# Time
+chrono = { workspace = true }
+
+# IDs
+uuid = { version = "1.0", features = ["serde"] }
+
+# URL encoding
+urlencoding = "2"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = { workspace = true }

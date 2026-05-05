@@ -202,7 +202,10 @@ impl Command for Enable {
                         ));
                         total_installed += count;
                     } else {
-                        println!("  ✓ hooks already up to date for {}.", agent.display_name(),);
+                        println!(
+                            "  ✓ already up to date for {}. Use --force to reinstall.",
+                            agent.display_name(),
+                        );
                     }
                 }
                 Err(e) => {
@@ -217,11 +220,17 @@ impl Command for Enable {
 
         // Summary
         if total_installed > 0 {
+            let has_opencode = agents_to_install.contains(&"opencode");
             println!();
             println!("Each agent turn will be recorded as an Atomic change with:");
             println!("  • AI provenance (vendor, model, tokens, cost)");
             println!("  • Session metadata (turn number, timing, files)");
             println!("  • Optional transcript (full conversation)");
+            if has_opencode {
+                println!();
+                println!("For the full OpenCode integration (agent, skills, provenance):");
+                println!("  npm install -g atomic-opencode && npx atomic-opencode");
+            }
             println!();
             println!("Use 'atomic agent status' to check integration status.");
             println!("Use 'atomic log' to view recorded turns.");
@@ -400,7 +409,7 @@ mod tests {
 
         // Install hooks
         let count = agent.install(dir.path()).unwrap();
-        assert_eq!(count, 7);
+        assert_eq!(count, 8);
         assert!(agent.is_installed(dir.path()));
 
         // Verify .claude/settings.json was created
@@ -422,7 +431,7 @@ mod tests {
 
         // First install
         let count1 = agent.install(dir.path()).unwrap();
-        assert_eq!(count1, 7);
+        assert_eq!(count1, 8);
 
         // Second install without force — should be 0
         let count2 = agent.install(dir.path()).unwrap();
@@ -433,7 +442,7 @@ mod tests {
         assert!(!agent.is_installed(dir.path()));
 
         let count3 = agent.install(dir.path()).unwrap();
-        assert_eq!(count3, 7);
+        assert_eq!(count3, 8);
         assert!(agent.is_installed(dir.path()));
     }
 }

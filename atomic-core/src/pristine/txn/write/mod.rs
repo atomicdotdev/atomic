@@ -21,7 +21,9 @@ use crate::types::{
 
 use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
-use crate::pristine::traits::{GraphTxnT, MutTxnT, TreeTxnT, ViewScope, ViewState, ViewTxnT};
+use crate::pristine::traits::{
+    FileIndexEntry, FileIndexMetadata, GraphTxnT, MutTxnT, TreeTxnT, ViewScope, ViewState, ViewTxnT,
+};
 
 use super::helpers::{
     deserialize_edge, deserialize_view_state, serialize_edge, serialize_view_state, AdjIterator,
@@ -286,8 +288,11 @@ fn format_timestamp_ms(epoch_ms: i64) -> String {
         .unwrap_or_else(|| format!("{}", epoch_ms))
 }
 
+mod embeddings;
 mod graph;
 mod tree;
+mod triples;
+mod vault;
 mod view;
 
 #[cfg(test)]
@@ -960,21 +965,22 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         Ok(inode)
     }
 
-    fn put_file_mtime(
+    fn put_file_index(
         &mut self,
         path: &str,
         mtime_secs: i64,
         mtime_nanos: u32,
         file_size: u64,
+        content_hash: &Hash,
     ) -> Result<(), PristineError> {
-        let value = encode_file_mtime(mtime_secs, mtime_nanos, file_size);
-        let mut table = self.txn.open_table(FILE_MTIMES)?;
+        let value = encode_file_index(mtime_secs, mtime_nanos, file_size, content_hash);
+        let mut table = self.txn.open_table(FILE_INDEX)?;
         table.insert(path, &value)?;
         Ok(())
     }
 
-    fn del_file_mtime(&mut self, path: &str) -> Result<(), PristineError> {
-        let mut table = self.txn.open_table(FILE_MTIMES)?;
+    fn del_file_index(&mut self, path: &str) -> Result<(), PristineError> {
+        let mut table = self.txn.open_table(FILE_INDEX)?;
         table.remove(path)?;
         Ok(())
     }
@@ -1037,6 +1043,52 @@ impl<'a> MutTxnT for WriteTxn<'a> {
             let mut table = self.txn.open_multimap_table(REV_DEPS)?;
             table.insert(dep_id.get(), change_id.get())?;
         }
+        Ok(())
+    }
+
+    fn put_change_deps(&mut self, change_id: NodeId, deps: &[Hash]) -> PristineResult<()> {
+        let existing: Vec<[u8; 32]> = {
+            let table = self.txn.open_multimap_table(CHANGE_DEPS)?;
+            let iter = table.get(change_id.get())?;
+            let mut hashes = Vec::new();
+            for item in iter {
+                hashes.push(*item?.value());
+            }
+            hashes
+        };
+
+        if !existing.is_empty() {
+            {
+                let mut table = self.txn.open_multimap_table(CHANGE_DEPS)?;
+                for dep in &existing {
+                    table.remove(change_id.get(), dep)?;
+                }
+            }
+            {
+                let mut table = self.txn.open_multimap_table(REV_CHANGE_DEPS)?;
+                for dep in &existing {
+                    table.remove(dep, change_id.get())?;
+                }
+            }
+        }
+
+        {
+            let mut table = self.txn.open_multimap_table(CHANGE_DEPS)?;
+            for dep in deps {
+                table.insert(change_id.get(), dep.as_bytes())?;
+            }
+        }
+        {
+            let mut table = self.txn.open_multimap_table(REV_CHANGE_DEPS)?;
+            for dep in deps {
+                table.insert(dep.as_bytes(), change_id.get())?;
+            }
+        }
+        {
+            let mut table = self.txn.open_table(CHANGE_DEPS_INDEXED)?;
+            table.insert(change_id.get(), deps.len() as u64)?;
+        }
+
         Ok(())
     }
 

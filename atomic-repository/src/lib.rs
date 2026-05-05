@@ -116,6 +116,22 @@ pub mod redb_change_store;
 // Phase 6: Semantic regeneration (rebuild SEMANTIC from graph + content after thin pull)
 pub mod semantic_regen;
 
+// AI provider resolution (embeddings + LLM)
+pub mod ai;
+
+// Content search powered by syntext
+pub mod content_search;
+
+// Query plan schema and executor
+pub mod query_plan;
+
+// Content search re-exports
+pub use content_search::{
+    build_content_index, content_index_stats, has_content_index, search_content,
+    update_content_index, ContentIndexStats, ContentMatch, ContentSearchError,
+    ContentSearchOptions, ContentSearchResult,
+};
+
 // Re-export main types at crate root for convenience
 
 // Change store exports
@@ -126,6 +142,32 @@ pub use error::*;
 
 // Repository exports
 pub use repository::*;
+
+// Vault name generation
+pub use repository::generate_goal_name;
+
+// Vault goal exports
+pub use repository::{
+    GoalInfo, GoalStartOptions, GoalStartResult, GoalStopOptions, GoalStopResult,
+};
+
+// Vault intent exports
+pub use repository::{IntentCreateOptions, IntentCreateResult, IntentInfo, IntentUpdateOptions};
+
+// Vault embedding exports
+pub use repository::{hash_embed, EmbedConfig, TextChunk};
+
+// AI provider exports
+pub use ai::{
+    build_context_string, resolve_embedding_provider, resolve_llm_provider, AiError, AiProvider,
+    EmbeddingProvider, LlmProvider, LlmResponse,
+};
+
+// Tool-use agentic loop exports
+pub use ai::tools::{run_tool_loop_sync, AgentConfig, AgentResult, RepoToolExecutor, ToolExecutor};
+
+// Query plan exports
+pub use query_plan::{execute_plan, parse_plan, PlanResult, QueryPlan, QueryStep, StepStat};
 
 // Status exports
 pub use status::{

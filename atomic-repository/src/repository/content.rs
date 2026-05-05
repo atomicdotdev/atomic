@@ -63,71 +63,22 @@ impl Repository {
             Err(e) => return Err(RepositoryError::Database(e.to_string())),
         };
 
-        // Build a change filter starting from this view's own changes,
-        // then expand with their dependencies (from the change FILES,
-        // not the DEPS table which is for attestations).
+        // Build retrieve options.
         //
-        // After a content revise, the view has A' but not A.  A' depends
-        // on A (its hunks modify A's vertices).  Without including A's
-        // NodeId in the filter, the alive-graph traversal would exclude
-        // A's vertices and fail to produce content.
-        let mut change_filter = collect_view_change_ids(&txn, &view)?;
-
-        // Expand: for each view change, load its change file, resolve
-        // each dependency hash to a NodeId, and add to the filter.
-        let direct_ids: Vec<NodeId> = change_filter.iter().copied().collect();
-        for node_id in direct_ids {
-            if let Ok(Some(hash)) = txn.get_external(node_id) {
-                if let Ok(change) = self.load_change(&hash) {
-                    for dep_hash in change.dependencies() {
-                        if let Ok(Some(dep_id)) = txn.get_internal(dep_hash) {
-                            change_filter.insert(dep_id);
-                        }
-                    }
-                }
-            }
-        }
-
-        // For draft views, also include changes from parent views in the
-        // overlay chain, since those changes' vertices should be visible too.
-        if view.kind.is_draft() {
-            let chain = txn
-                .resolve_view_chain(&view)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            for &ancestor_id in &chain {
-                if ancestor_id == view.id {
-                    continue; // already included above
-                }
-                if let Some(ancestor) = txn
-                    .get_view_by_id(ancestor_id)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?
-                {
-                    let ancestor_ids = collect_view_change_ids(&txn, &ancestor)?;
-                    change_filter.extend(ancestor_ids);
-                }
-            }
-
-            // Also include changes from all shared ancestor views (the global
-            // graph base). Walk the parent chain past the overlay to find the
-            // shared view and include its changes.
-            let mut cursor = view.parent;
-            while let Some(pid) = cursor {
-                let parent = txn
-                    .get_view_by_id(pid)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                match parent {
-                    Some(p) if p.kind.is_shared() => {
-                        let shared_ids = collect_view_change_ids(&txn, &p)?;
-                        change_filter.extend(shared_ids);
-                        break;
-                    }
-                    Some(p) => cursor = p.parent,
-                    None => break,
-                }
-            }
-        }
-
-        let options = RetrieveOptions::new().with_change_filter(change_filter);
+        // Fast path: for a Shared view with no parent (the common case
+        // after `atomic init` or `atomic git import`), ALL changes in
+        // GRAPH are visible.  Skip the expensive O(N) change-log scan
+        // and N change-file disk reads — use default options (no filter).
+        //
+        // Slow path: for Draft views or views with parents, build the
+        // filter set so the alive-graph traversal only sees vertices
+        // from visible changes.
+        let options = if view.kind.is_shared() && view.parent.is_none() {
+            RetrieveOptions::default()
+        } else {
+            let change_filter = collect_visible_change_ids_with_deps(&txn, &view)?;
+            RetrieveOptions::new().with_change_filter(change_filter)
+        };
 
         // All edges are in GRAPH — raw transaction sees everything.
         // The change_filter handles view isolation.
@@ -186,41 +137,11 @@ impl Repository {
             Err(e) => return Err(RepositoryError::Database(e.to_string())),
         };
 
-        let mut change_filter = collect_view_change_ids(&txn, &view)?;
-
-        if view.kind.is_draft() {
-            let chain = txn
-                .resolve_view_chain(&view)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            for &ancestor_id in &chain {
-                if ancestor_id == view.id {
-                    continue;
-                }
-                if let Some(ancestor) = txn
-                    .get_view_by_id(ancestor_id)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?
-                {
-                    let ancestor_ids = collect_view_change_ids(&txn, &ancestor)?;
-                    change_filter.extend(ancestor_ids);
-                }
-            }
-
-            let mut cursor = view.parent;
-            while let Some(pid) = cursor {
-                let parent = txn
-                    .get_view_by_id(pid)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                match parent {
-                    Some(p) if p.kind.is_shared() => {
-                        let shared_ids = collect_view_change_ids(&txn, &p)?;
-                        change_filter.extend(shared_ids);
-                        break;
-                    }
-                    Some(p) => cursor = p.parent,
-                    None => break,
-                }
-            }
-        }
+        let mut change_filter = if view.kind.is_shared() && view.parent.is_none() {
+            collect_view_change_ids(&txn, &view)?
+        } else {
+            collect_visible_change_ids_with_deps(&txn, &view)?
+        };
 
         // Remove the excluded change from the filter
         if let Ok(Some(exclude_id)) = txn.get_internal(exclude_hash) {
@@ -381,10 +302,14 @@ impl Repository {
                 name: view_name.to_string(),
             })?;
 
-        let change_filter = collect_view_change_ids(&txn, &view)?;
+        let change_filter = if view.kind.is_shared() && view.parent.is_none() {
+            collect_view_change_ids(&txn, &view)?
+        } else {
+            collect_visible_change_ids_with_deps(&txn, &view)?
+        };
 
         // Use the filtered retrieval method
-        self.get_file_content_with_filter(&txn, &normalized, change_filter)
+        self.get_file_content_with_filter(&txn, &normalized, change_filter, true)
     }
 
     /// Get the recorded content for a tracked file with options.
@@ -598,8 +523,10 @@ impl Repository {
             get_changes_up_to_sequence(&txn, &view, state_info.parent_max_sequence_exclusive())
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Retrieve content with the change filter
-        self.get_file_content_with_filter(&txn, &normalized, change_set)
+        // Retrieve content with the change filter.
+        // Pass require_tracked=false: the file may have been deleted after
+        // this point, but we want its content as it existed before the change.
+        self.get_file_content_with_filter(&txn, &normalized, change_set, false)
     }
 
     /// Get file content as it was AFTER a specific change was applied.
@@ -665,8 +592,10 @@ impl Repository {
             None => return Ok(None), // Change not in this view
         };
 
-        // Retrieve content with the change filter
-        self.get_file_content_with_filter(&txn, &normalized, change_set)
+        // Retrieve content with the change filter.
+        // require_tracked=true: if the file was deleted before this point,
+        // there is no "after" content to return.
+        self.get_file_content_with_filter(&txn, &normalized, change_set, true)
     }
 
     /// Get file content at a specific sequence number.
@@ -723,7 +652,7 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Retrieve content with the change filter
-        self.get_file_content_with_filter(&txn, &normalized, change_set)
+        self.get_file_content_with_filter(&txn, &normalized, change_set, true)
     }
 
     /// Internal helper to retrieve file content with a change filter.
@@ -737,6 +666,7 @@ impl Repository {
         txn: &T,
         normalized_path: &str,
         change_set: std::collections::HashSet<NodeId>,
+        require_tracked: bool,
     ) -> Result<Option<Vec<u8>>, RepositoryError>
     where
         T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::TreeTxnT,
@@ -744,9 +674,11 @@ impl Repository {
         use atomic_core::output::alive::RetrieveOptions;
         use atomic_core::record::workflow::retrieve::retrieve_content_with_filter;
 
-        // Check if file is tracked
-        if !is_tracked(txn, normalized_path)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        // Check if file is tracked (skip for deleted files — they are no
+        // longer in the TREE but their inode/content is still in the graph).
+        if require_tracked
+            && !is_tracked(txn, normalized_path)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
             return Ok(None);
         }

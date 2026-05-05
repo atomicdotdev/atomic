@@ -58,9 +58,12 @@ pub use change::{
 };
 
 // Re-export pristine types
+pub use pristine::ontology;
+pub use pristine::{EmbeddingRecord, KgEdge, KgNode, KgQueryResponse, KgSubgraph, SearchResult};
 pub use pristine::{
-    GraphTxnT, MutTxnT, Pristine, PristineError, PristineResult, ReadTxn, TreeTxnT, VertexExt,
-    ViewState, ViewTxnT, WriteTxn,
+    EmbeddingsMutTxnT, EmbeddingsTxnT, GraphTxnT, KgMutTxnT, KgTxnT, MutTxnT, Pristine,
+    PristineError, PristineResult, ReadTxn, TreeTxnT, VaultEntry, VaultEntryMeta, VaultEntryType,
+    VaultManifest, VaultMutTxnT, VaultTxnT, VertexExt, ViewState, ViewTxnT, WriteTxn,
 };
 
 // Re-export diff types

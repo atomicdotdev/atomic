@@ -331,6 +331,10 @@ pub(crate) const AUTO_ADD_IGNORE_DIRS: &[&str] = &[
 ///
 /// Returns `true` if any path component matches one of the known large
 /// directories that should never be auto-tracked.
+/// Hidden directories that should NOT be ignored by the auto-add filter.
+/// These are Atomic-managed directories that contain tracked content.
+const HIDDEN_DIR_WHITELIST: &[&str] = &[".vault", ".atomicignore"];
+
 pub(crate) fn should_ignore_untracked(path: &str) -> bool {
     for component in std::path::Path::new(path).components() {
         if let std::path::Component::Normal(name) = component {
@@ -338,9 +342,11 @@ pub(crate) fn should_ignore_untracked(path: &str) -> bool {
             if AUTO_ADD_IGNORE_DIRS.contains(&name_str.as_ref()) {
                 return true;
             }
-            // Also skip hidden directories (starting with .) other than
-            // specific ones we already check above
-            if name_str.starts_with('.') && name_str.len() > 1 {
+            // Skip hidden directories (starting with .) unless whitelisted
+            if name_str.starts_with('.')
+                && name_str.len() > 1
+                && !HIDDEN_DIR_WHITELIST.contains(&name_str.as_ref())
+            {
                 return true;
             }
         }

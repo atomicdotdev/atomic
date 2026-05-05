@@ -149,9 +149,11 @@
 
 mod error;
 mod inode_graph;
+pub mod ontology;
 pub mod tables;
 mod traits;
 mod txn;
+pub mod vault;
 pub mod view_graph;
 
 pub use error::{PristineError, PristineResult};
@@ -160,6 +162,15 @@ pub use inode_graph::{
 };
 pub use tables::directory_flags;
 pub use tables::*;
-pub use traits::{GraphTxnT, MutTxnT, TreeTxnT, VertexExt, ViewScope, ViewState, ViewTxnT};
+pub use traits::{
+    EmbeddingsMutTxnT, EmbeddingsTxnT, FileIndexEntry, FileIndexMetadata, GraphTxnT, KgMutTxnT,
+    KgTxnT, MutTxnT, TreeTxnT, VaultEntryMeta, VaultMutTxnT, VaultTxnT, VertexExt, ViewScope,
+    ViewState, ViewTxnT,
+};
 pub use txn::{AdjIterator, Pristine, ReadTxn, WriteTxn};
+pub use vault::{
+    EmbeddingRecord, GoalSummary, IndexStats, IntentSummary, KgEdge, KgNode, KgQueryResponse,
+    KgSubgraph, MemorySummary, SearchResult, SkillSummary, TokenCounts, VaultEntry, VaultEntryType,
+    VaultManifest,
+};
 pub use view_graph::ViewGraph;

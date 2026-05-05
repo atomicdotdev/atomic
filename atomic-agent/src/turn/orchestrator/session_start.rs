@@ -20,10 +20,24 @@ impl TurnOrchestrator {
     ) -> AgentResult<DispatchResult> {
         let session_id = &event.session_id;
 
+        // Determine whether this is a resume/continue (reuse existing view)
+        // or a fresh startup (create a new view).
+        //
+        // Claude Code sends `source: "resume"` on `--continue` / `--resume`
+        // with a NEW session_id (UUID), so a direct load by ID won't find
+        // the previous session. We detect the resume intent and adopt the
+        // most recent ended session's view instead of creating a new one.
+        let is_resume = event
+            .raw_json
+            .as_ref()
+            .and_then(|r| r.get("source").and_then(|v| v.as_str()))
+            .map(|s| s == "resume" || s == "continue" || s == "compact" || s == "clear")
+            .unwrap_or(false);
+
         // Load or create session
         let mut session = match self.session_store.load(session_id)? {
             Some(mut existing) => {
-                // Re-entering an existing session
+                // Re-entering an existing session (same session_id)
                 let result = phase::transition(
                     existing.phase,
                     Event::SessionStart,
@@ -56,8 +70,46 @@ impl TurnOrchestrator {
                     if existing.turn_count == 1 { "" } else { "s" },
                 )));
             }
+            None if is_resume => {
+                // Resume/continue with a NEW session_id — find the most
+                // recent ended session and adopt its view so we don't
+                // create a second orphan view.
+                let recent = self
+                    .session_store
+                    .find_ended()?
+                    .into_iter()
+                    .max_by_key(|s| s.last_interaction);
+
+                if let Some(prev) = recent {
+                    log::info!(
+                        "Resuming: new session {} adopting view '{}' from previous session {}",
+                        session_id,
+                        prev.view_name,
+                        prev.session_id,
+                    );
+
+                    let mut session =
+                        AgentSession::new(session_id, &self.agent_name, &self.agent_display_name);
+                    session.view_name = prev.view_name.clone();
+                    session.parent_view = prev.parent_view.clone();
+                    session.turn_count = prev.turn_count;
+                    session.files_touched = prev.files_touched.clone();
+
+                    let vendor = vendor_from_agent_name(&self.agent_name);
+                    session.agent_vendor = vendor.to_string();
+
+                    session
+                } else {
+                    // No previous session found — fall through to new session
+                    let mut session =
+                        AgentSession::new(session_id, &self.agent_name, &self.agent_display_name);
+                    let vendor = vendor_from_agent_name(&self.agent_name);
+                    session.agent_vendor = vendor.to_string();
+                    session
+                }
+            }
             None => {
-                // New session — use the agent identity set by the CLI hook handler
+                // Brand new session (source: "startup")
                 let mut session =
                     AgentSession::new(session_id, &self.agent_name, &self.agent_display_name);
 
@@ -98,6 +150,9 @@ impl TurnOrchestrator {
         // of starting from an empty graph. Without this, files that only
         // exist in the current view (like .atomicignore) would be invisible
         // to the agent's status/record workflow.
+        //
+        // Skip view creation for resumed sessions — the view already exists
+        // from the previous session. We only need to switch to it.
         //
         // Best-effort: if the repo can't be opened or the view already
         // exists (resumed session), we log and continue — recording will
@@ -184,6 +239,23 @@ impl TurnOrchestrator {
                 );
                 let mut session =
                     AgentSession::new(session_id, &self.agent_name, &self.agent_display_name);
+
+                // Use the repo's current view instead of the generated
+                // haikunator name.  session-start already created a view
+                // and switched to it — if we're here from a stop/turn-end
+                // event, the current view IS the session view.  Generating
+                // a new name would create a second orphan view.
+                if let Ok(repo) = atomic_repository::Repository::open(&self.repo_root) {
+                    let current = repo.current_view().to_string();
+                    if current != "dev" && current != "main" && current != "release" {
+                        log::info!(
+                            "Fallback session {} adopting current view '{}' instead of generating new view",
+                            session_id,
+                            current,
+                        );
+                        session.view_name = current;
+                    }
+                }
 
                 let vendor = vendor_from_agent_name(&self.agent_name);
                 session.agent_vendor = vendor.to_string();

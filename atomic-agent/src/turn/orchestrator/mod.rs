@@ -309,6 +309,9 @@ impl TurnOrchestrator {
 pub(crate) fn vendor_from_agent_name(agent_name: &str) -> &'static str {
     match agent_name {
         "claude-code" => "anthropic",
+        "cline" => "unknown", // Cline supports multiple providers; real vendor comes from hook payload
+        "copilot" => "github",
+        "cursor" => "anthropic",
         "gemini-cli" => "google",
         "codex" => "openai",
         "opencode" => "openai",
@@ -333,6 +336,27 @@ pub(crate) fn truncate_prompt(prompt: &str, max_len: usize) -> String {
     }
 
     format!("{}...", truncated)
+}
+
+impl TurnOrchestrator {
+    /// Fast check for working copy changes.
+    ///
+    /// Uses `StatusOptions::fast().with_untracked(false)` — mtime-based
+    /// detection on tracked files only, no content hashing, no filesystem
+    /// walk for untracked files. This is O(tracked files) with just stat
+    /// calls, no hashing.
+    pub(crate) fn has_working_copy_changes(&self) -> bool {
+        let repo = match atomic_repository::Repository::open(&self.repo_root) {
+            Ok(r) => r,
+            Err(_) => return true, // can't check — assume changes
+        };
+
+        let opts = atomic_repository::status::StatusOptions::fast().with_untracked(false);
+        match repo.status(opts) {
+            Ok(status) => !status.is_clean(),
+            Err(_) => true, // can't check — assume changes
+        }
+    }
 }
 
 impl std::fmt::Debug for TurnOrchestrator {

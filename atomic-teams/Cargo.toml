@@ -1,0 +1,22 @@
+[package]
+name = "atomic-teams"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Team collaboration features for Atomic VCS"
+
+[dependencies]
+atomic-remote = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+uuid = { version = "1.0", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
