@@ -298,7 +298,7 @@ pub enum CliError {
     /// An unexpected internal error occurred.
     ///
     /// This indicates a bug in Atomic. If you encounter this error,
-    /// please report it at: <https://github.com/atomic-vcs/atomic/issues>
+    /// please report it at: <https://github.com/atomicdotdev/atomic/issues>
     #[error("Internal error: {0}")]
     Internal(#[from] anyhow::Error),
 
@@ -531,7 +531,7 @@ impl CliError {
                 Some("Run 'atomic <command> --help' for usage information.")
             }
             Self::Internal(_) => {
-                Some("This appears to be a bug. Please report it at: https://github.com/atomic-vcs/atomic/issues")
+                Some("This appears to be a bug. Please report it at: https://github.com/atomicdotdev/atomic/issues")
             }
             _ => None,
         }
