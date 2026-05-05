@@ -21,8 +21,10 @@ use crate::types::{
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::OrgNotFound`] if the org does not exist, or
-/// [`TeamsError::PermissionDenied`] if the caller lacks access.
+/// Returns [`TeamsError::OrgNotFound`](crate::error::TeamsError::OrgNotFound)
+/// if the org does not exist, or
+/// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// if the caller lacks access.
 pub async fn list_org_grants(
     client: &StorageClient,
     org_slug: &str,
@@ -41,8 +43,10 @@ pub async fn list_org_grants(
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::AlreadyExists`] if the grant already exists, or
-/// [`TeamsError::PermissionDenied`] if the caller is not an org admin/owner.
+/// Returns [`TeamsError::AlreadyExists`](crate::error::TeamsError::AlreadyExists)
+/// if the grant already exists, or
+/// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// if the caller is not an org admin/owner.
 pub async fn add_org_grant(
     client: &StorageClient,
     org_slug: &str,
@@ -68,8 +72,10 @@ pub async fn add_org_grant(
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::OrgNotFound`] if the org does not exist, or
-/// [`TeamsError::PermissionDenied`] if the caller is not an org admin/owner.
+/// Returns [`TeamsError::OrgNotFound`](crate::error::TeamsError::OrgNotFound)
+/// if the org does not exist, or
+/// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// if the caller is not an org admin/owner.
 pub async fn revoke_org_grant(
     client: &StorageClient,
     org_slug: &str,
@@ -96,8 +102,10 @@ pub async fn revoke_org_grant(
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::OrgNotFound`] if the workspace does not exist, or
-/// [`TeamsError::PermissionDenied`] if the caller lacks access.
+/// Returns [`TeamsError::OrgNotFound`](crate::error::TeamsError::OrgNotFound)
+/// if the workspace does not exist, or
+/// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// if the caller lacks access.
 pub async fn list_workspace_grants(
     client: &StorageClient,
     workspace_slug: &str,
@@ -116,9 +124,10 @@ pub async fn list_workspace_grants(
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::AlreadyExists`] if the grant already exists, or
-/// [`TeamsError::PermissionDenied`] if the caller is not an admin/owner of the
-/// workspace's parent organization.
+/// Returns [`TeamsError::AlreadyExists`](crate::error::TeamsError::AlreadyExists)
+/// if the grant already exists, or
+/// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// if the caller is not an admin/owner of the workspace's parent organization.
 pub async fn add_workspace_grant(
     client: &StorageClient,
     workspace_slug: &str,
@@ -144,9 +153,10 @@ pub async fn add_workspace_grant(
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::OrgNotFound`] if the workspace does not exist, or
-/// [`TeamsError::PermissionDenied`] if the caller is not an admin/owner of the
-/// workspace's parent organization.
+/// Returns [`TeamsError::OrgNotFound`](crate::error::TeamsError::OrgNotFound)
+/// if the workspace does not exist, or
+/// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// if the caller is not an admin/owner of the workspace's parent organization.
 pub async fn revoke_workspace_grant(
     client: &StorageClient,
     workspace_slug: &str,

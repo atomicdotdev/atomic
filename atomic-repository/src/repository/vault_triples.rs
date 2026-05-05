@@ -223,7 +223,7 @@ impl Repository {
 
         let mut ranked: Vec<(u64, String, usize)> =
             heap.into_iter().map(|Reverse(entry)| entry).collect();
-        ranked.sort_by(|a, b| b.0.cmp(&a.0)); // highest score first
+        ranked.sort_by_key(|entry| std::cmp::Reverse(entry.0)); // highest score first
 
         // ── Phase 4: Fetch full nodes only for the top N ───────────────────
 

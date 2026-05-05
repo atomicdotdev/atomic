@@ -97,7 +97,7 @@ pub fn search_content(
 
     // Sort directory facets by count (descending).
     let mut dir_facets: Vec<(String, usize)> = dir_counts.into_iter().collect();
-    dir_facets.sort_by(|a, b| b.1.cmp(&a.1));
+    dir_facets.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     dir_facets.truncate(10); // top 10 directories
 
     // Rank matches: source code files first, then everything else.

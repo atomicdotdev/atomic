@@ -15,8 +15,10 @@ use crate::types::{AddTeamMemberRequest, TeamMemberInfo, TeamRole, UpdateTeamMem
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::TeamNotFound`] if the team does not exist and
-/// [`TeamsError::PermissionDenied`] if the caller lacks access.
+/// Returns [`TeamsError::TeamNotFound`](crate::error::TeamsError::TeamNotFound)
+/// if the team does not exist and
+/// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// if the caller lacks access.
 pub async fn list_team_members(
     client: &StorageClient,
     org_slug: &str,
@@ -33,9 +35,12 @@ pub async fn list_team_members(
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::TeamNotFound`] if the team does not exist,
-/// [`TeamsError::AlreadyExists`] if the identity is already a member,
-/// and [`TeamsError::PermissionDenied`] if the caller lacks access.
+/// Returns [`TeamsError::TeamNotFound`](crate::error::TeamsError::TeamNotFound)
+/// if the team does not exist,
+/// [`TeamsError::AlreadyExists`](crate::error::TeamsError::AlreadyExists)
+/// if the identity is already a member, and
+/// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// if the caller lacks access.
 pub async fn add_team_member(
     client: &StorageClient,
     org_slug: &str,
@@ -55,8 +60,10 @@ pub async fn add_team_member(
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::MemberNotFound`] if the identity is not a member of
-/// the team and [`TeamsError::PermissionDenied`] if the caller lacks access.
+/// Returns [`TeamsError::MemberNotFound`](crate::error::TeamsError::MemberNotFound)
+/// if the identity is not a member of the team and
+/// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// if the caller lacks access.
 pub async fn update_team_member_role(
     client: &StorageClient,
     org_slug: &str,
@@ -78,8 +85,10 @@ pub async fn update_team_member_role(
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::MemberNotFound`] if the identity is not a member of
-/// the team and [`TeamsError::PermissionDenied`] if the caller lacks access.
+/// Returns [`TeamsError::MemberNotFound`](crate::error::TeamsError::MemberNotFound)
+/// if the identity is not a member of the team and
+/// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// if the caller lacks access.
 pub async fn remove_team_member(
     client: &StorageClient,
     org_slug: &str,

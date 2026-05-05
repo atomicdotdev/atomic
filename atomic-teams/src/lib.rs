@@ -2,8 +2,8 @@
 //!
 //! This crate provides domain logic for organization management, team
 //! membership, permission grants, and domain aliases. It communicates with
-//! the Atomic Storage API through the [`StorageClient`] type provided by
-//! `atomic-remote`.
+//! the Atomic Storage API through the [`StorageClient`](atomic_remote::storage::StorageClient)
+//! type provided by `atomic-remote`.
 //!
 //! # Modules
 //!
