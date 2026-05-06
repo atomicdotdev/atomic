@@ -764,19 +764,210 @@ Because Atomic has a change graph, semantic graph, and provenance graph, hooks a
 
 This enables a workflow where agents do not merely respond to failing PR checks. They operate on exact graph state transitions with semantic and provenance context.
 
+## Implementation Notes
+
+*Added May 6, 2026 — Aaron Ogle, Bradley Hilton*
+
+The following clarifies mechanics that came out of the first design review pass. These are refinements to the model above, not changes to it.
+
+### Hook Delivery
+
+The `view_changed` hook fires **asynchronously** after the insert commits and returns to the caller. The insert itself should not block on hook delivery. This matters for the outer loop: CI can take minutes; the insert should not.
+
+Hooks fire only for **Shared** views. Local view state changes are high-churn and should not produce server-side events — that is precisely the GitHub problem we are avoiding.
+
+Hook registration is per-project, stored in the database. Conceptually (CLI names TBD):
+
+```bash
+atomic hooks add \
+  --event view_changed \
+  --url https://cb.internal/webhooks/atomic \
+  --roles Shared
+```
+
+There is no separate webhook secret to manage. Authentication works in two directions using Ed25519, and it is important to understand each direction separately.
+
+**Direction 1 — atomic-storage → CB (the webhook)**
+
+When atomic-storage sends a `view_changed` payload to CB, CB needs to verify the payload is genuine and not spoofed. atomic-storage signs the payload with **its own private key**. CB verifies that signature using **atomic-storage's public key**. CB receives atomic-storage's public key once at CI runner registration time (see below). After that, every incoming webhook can be verified without any shared secret.
+
+**Direction 2 — CB → atomic-storage (evidence submission)**
+
+When CB POSTs evidence back, atomic-storage needs to verify the request is coming from the authorized runner for that project — not an arbitrary client. CB registers its own Ed25519 keypair as a **CI runner identity** on the project (see CI Runner Identity below). CB presents its public key as its identity on every request. atomic-storage looks it up, finds the registered CI runner, and checks it has permission to submit evidence for that project. This is the same mechanism used for all identities in atomic-storage today.
+
+The payload is structured as follows:
+
+```json
+{
+  "event": "view_changed",
+  "workspace": "acme",
+  "project": "api",
+  "view": {
+    "id": 12,
+    "name": "dev",
+    "role": "Shared",
+    "merkle_before": "aaa...",
+    "merkle_after": "bbb...",
+    "inserted_change_hashes": ["c1hash", "c2hash"]
+  },
+  "timestamp": "2026-05-06T11:37:00Z",
+  "signature": "ed25519:..."
+}
+```
+
+### Inner Loop Evidence Is Change-Hash-Bound, Not Merkle-Bound
+
+The PRD describes hooks emitting evidence with `applies_to: current_merkle`. This is correct for the **outer loop** (CI running against an integrated Shared view). It is not correct for the **inner loop**.
+
+Local views do not exist on the server. There is no server-side Merkle state for a local view, so inner loop evidence cannot be Merkle-bound. Instead, inner loop evidence is bound to the **change hashes** being inserted — the Blake3 content addresses of the records themselves. Change hashes are immutable and identical locally and on the server, so this evidence travels with the records regardless of which view they end up in.
+
+| | Inner loop | Outer loop |
+|---|---|---|
+| Runs where | Agent machine, locally | CI server / CB runner |
+| Triggered by | End of agent turn (local hook) | `view_changed` webhook on Shared view |
+| Evidence bound to | **Change hashes** | **View Merkle** |
+| Stale risk | None — hashes are content addresses | High — Merkle advances on every insert |
+| Evidence submitted | Before `atomic insert` | After receiving `view_changed` webhook |
+
+When the agent runs `atomic insert --to dev`, the request carries inner loop evidence inline, keyed to the change hashes being inserted. The server checks that those change hashes have the required inner loop evidence before writing anything to `dev`. No server-side agent view is created or persisted.
+
+### The Stale Evidence Guarantee
+
+The `applies_to` check is what makes Merkle-bound evidence safe. The concrete scenario:
+
+```
+T=0  Insert lands in dev → Merkle = bbb... → view_changed fires → outer loop CI starts
+T=1  Another insert lands → dev Merkle = ccc... → ViewMeta for ccc... = Unchecked
+T=2  CI from T=0 finishes → POST evidence: applies_to = bbb...
+     Server: bbb... ≠ ccc... → 409 Stale, rejected
+     ViewMeta for ccc... stays Unchecked
+     New view_changed already fired at T=1 → fresh CI run underway for ccc...
+```
+
+The evidence from the first run is stored historically but cannot advance the view state for `ccc...`. A Shared view cannot be promoted to the next view until CI completes against its **current** Merkle.
+
+### Evidence Submission Endpoint
+
+CI (or any authorized runner) submits evidence via:
+
+```
+POST /workspaces/{ws}/projects/{p}/views/{view}/evidence
+Authorization: Bearer <ci_runner_identity>
+
+{
+  "applies_to": "bbb...",          ← Merkle (outer loop); omit for inner loop
+  "change_hashes": null,           ← change hashes (inner loop); omit for outer loop
+  "requested_state": "Ready",
+  "evidence": [
+    {
+      "kind": "integration-ci",
+      "status": "passed",
+      "runner": "circuit-breaker",
+      "workflow": "dev-validation",
+      "duration_ms": 45000,
+      "exit_code": 0
+    }
+  ]
+}
+```
+
+Server validation:
+1. If `applies_to` is present: check it equals `view.current_merkle`. If not, return 409.
+2. Check the evidence kinds satisfy the view's policy requirements.
+3. Write to `view_evidence` table (stale evidence is stored historically, not discarded).
+4. Update `view_meta`: `state = requested_state, applies_to = bbb...`.
+
+### CI Runner Identity
+
+A CI runner (Circuit Breaker or any other system) must be registered with atomic-storage before it can submit evidence or pull project code. Registration produces two things:
+
+1. **A CI runner keypair** — an Ed25519 keypair generated for the runner. The public key is registered with atomic-storage as a project collaborator with `ci-runner` role. The private key is held by the runner and used to sign outgoing requests to atomic-storage.
+
+2. **atomic-storage's public key** — returned as part of the registration response. The runner stores this and uses it to verify the `signature` field on every incoming `view_changed` webhook.
+
+Conceptually (CLI names TBD):
+
+```bash
+atomic identity new --role ci-runner --project api
+# → generates Ed25519 keypair for the runner
+# → registers the runner's public key with atomic-storage (role: ci-runner)
+# → returns atomic-storage's public key for the runner to store
+# → outputs the runner's private key to configure in CB
+```
+
+After this, the two directions are fully covered:
+- **Incoming webhooks**: runner verifies payload signature using atomic-storage's public key
+- **Outgoing evidence**: runner presents its own public key as `Authorization: Bearer <ci_runner_pubkey>`; atomic-storage checks it matches the registered CI runner for the project
+
+The `ci-runner` role grants read access to the project (so CB can pull code and workflow definitions at a given Merkle) and permission to POST to the evidence endpoint. It cannot write records, create views, or modify project settings.
+
+### Where Workflow Definitions Live
+
+Circuit Breaker currently has no tenant concept — workflows are registered globally. In a multi-project, multi-tenant world this does not scale. The right answer is: **workflow definitions live in the atomic project repo**, checked in alongside the code.
+
+When CB receives a `view_changed` webhook, it:
+
+1. Uses the project's CI runner identity to authenticate to atomic-storage.
+2. Pulls the project at `merkle_after` — the exact state that was just inserted.
+3. Reads `.cb/config.toml` from the checkout to find which workflow to run for this view.
+4. Executes the workflow from the versioned definition.
+5. Posts evidence back via the evidence endpoint.
+
+```toml
+# .cb/config.toml — checked into the project repo
+[routing]
+[routing.dev]
+workflow = ".cb/workflows/dev-validation.ts"
+
+[routing.release]
+workflow = ".cb/workflows/release-validation.ts"
+```
+
+This means the workflow that validated a given Merkle is the one that existed at that Merkle — there is no version skew between the code being validated and the validation rules. It also means tenant isolation falls out naturally: CB is pulling from `acme.atomic.storage` with acme's CI runner credentials, never touching another tenant's data.
+
+### CLI: `atomic push` Becomes `atomic insert`
+
+`atomic push` as currently implemented — push a local view to a matching remote view — does not fit this model. Local views cannot persist on the server.
+
+The replacement for the local→shared case is `atomic insert --to dev`. The CLI collects inner loop evidence from the last harness run, attaches it to the request, and the server evaluates the policy and applies the insert atomically. If no inner loop evidence is present, the insert fails with a clear error.
+
+For shared-to-shared promotion:
+
+```bash
+atomic insert dev release   # explicit; policy-evaluated server-side
+```
+
+Promotion can also be configured to happen automatically when a Shared view reaches `Ready`:
+
+```toml
+[policies.dev_to_release]
+source_role      = "Shared"
+target_role      = "Release"
+required_evidence = ["integration-ci", "human-approval"]
+auto_insert      = true
+```
+
+### Human Approval as Evidence
+
+Human approval is modeled as an evidence kind, not a special gate. A Circuit Breaker workflow pauses at an approve transition, a human approves in the CB UI or via CLI token injection, and CB posts `human-approval` evidence to the evidence endpoint. The policy for `dev → release` lists `human-approval` as a required evidence kind alongside `integration-ci`. Both must be present for the effective state to be `Ready`.
+
+This keeps the policy model uniform — there is no special approval path, just another evidence kind that a workflow produces.
+
+---
+
 ## Open Questions
 
 1. Should `ViewMeta` live inside serialized `ViewState`, or in a separate `VIEW_META` table for compatibility?
 2. What is the minimal lifecycle state vocabulary for the first implementation?
-3. Should policies be stored as repository config, database rows, or both?
-4. What evidence kinds are required for agent-to-dev insertion in the first version?
-5. What evidence kinds are required for dev-to-release insertion?
-6. Should hooks be synchronous with insert/record, or asynchronous with later metadata updates?
+3. ~~Should policies be stored as repository config, database rows, or both?~~ **Resolved**: Database rows, configured via CLI (`atomic policy set`). This keeps policies server-authoritative and avoids a bootstrapping problem where the policy file must be readable before the policy is enforced.
+4. ~~What evidence kinds are required for agent-to-dev insertion in the first version?~~ **Resolved**: `inner-loop` (passed for all change hashes being inserted). Submitted inline with the insert request, keyed to change hashes not Merkle.
+5. ~~What evidence kinds are required for dev-to-release insertion?~~ **Resolved**: `integration-ci` (required); `human-approval` (optional, configurable per-project policy). Both are Merkle-bound evidence kinds submitted via the evidence endpoint after the outer loop CI run.
+6. ~~Should hooks be synchronous with insert/record, or asynchronous with later metadata updates?~~ **Resolved**: Asynchronous. The insert commits and returns to the caller before the hook fires. Hooks are fire-and-forget from the insert's perspective; reliability is the receiver's responsibility (CB should be idempotent on redelivery).
 7. Should failed hook execution transition a view to `Failed` or leave it `Unchecked` with failed evidence?
 8. How should manual override evidence be represented?
 9. Should release insertion be blocked when release is `Frozen`, or allowed with explicit override evidence?
 10. How should remote sync treat view metadata and evidence?
-11. How should teams configure allowed shared-to-shared insertion paths when they have `n` shared views?
+11. ~~How should teams configure allowed shared-to-shared insertion paths when they have `n` shared views?~~ **Resolved**: Policy rows keyed by `(project_id, source_role, target_role)`. Teams add as many rows as they need. Named shared views (e.g., `staging`, `release/acme`) are just views with `Shared` mobility and a configured policy path.
 12. Should real-time view sessions be ephemeral transport sessions, durable view metadata, or both?
 13. What is the minimum WebSocket event vocabulary for real-time views: join, leave, view_changed, evidence_added, state_transition_requested, insert_proposed, insert_completed?
 14. How should concurrent agents coordinate write authority inside a real-time view: optimistic record insertion, coordinator election, leases, or explicit turn-taking?
