@@ -947,6 +947,56 @@ required_evidence = ["integration-ci", "human-approval"]
 auto_insert      = true
 ```
 
+### Policy Evaluation and View Transitions
+
+A common question: is promoting a view (e.g., `dev` → `release`) driven by a policy check, a hook, or both — and in what order?
+
+**The policy check is the gate. The hook fires on the target view after the insert commits.**
+
+No external system is involved in deciding whether an insert is allowed. The policy is evaluated entirely server-side at the moment `atomic insert` is called. If the source view's effective state does not satisfy the target's policy, the insert is rejected before anything is written. If it passes, the insert is committed and the source view's records become visible in the target view.
+
+After the insert commits, the target view's Merkle has changed. This triggers a `view_changed` hook on the **target** view — not the source. That hook is what kicks off the next layer of CI or automation for the newly updated target. The source view is not involved at that point.
+
+The sequence for a full pipeline:
+
+```
+atomic insert local-view dev
+  → policy check: does local-view have required inner-loop evidence?
+  → passes → records land in dev → dev Merkle changes
+  → dev view_changed fires → outer loop CI kicks off for dev
+
+[CI runs, posts evidence for dev Merkle]
+  → dev ViewMeta becomes Ready
+
+atomic insert dev release
+  → policy check: does dev have required integration-ci evidence for current Merkle?
+  → passes → records land in release → release Merkle changes
+  → release view_changed fires → deploy workflow kicks off
+```
+
+The hook never fires *before* an insert. Evidence collected by the hook goes back into the target view's state, which gates the *next* downstream insert. Each stage drives the next through this cycle: insert → hook on target → CI runs → evidence posted → target becomes Ready → next insert allowed.
+
+Policies are configured per-project as database rows (CLI TBD):
+
+```bash
+atomic policy set --from Agent --to Shared \
+  --required-state Ready \
+  --required-evidence inner-loop
+
+atomic policy set --from Shared --to Release \
+  --required-state Ready \
+  --required-evidence integration-ci,human-approval
+```
+
+Teams with more complex pipelines add more rows. Shared view names like `staging` or `release/acme` are just views with `Shared` mobility — the policy path is what connects them:
+
+```
+service-auth → dev → staging → release
+customer-acme → dev → release/acme
+```
+
+Promotion can also be configured to trigger automatically once a view reaches `Ready`, so a passing CI run flows through to the next view without a manual `atomic insert` call. This is opt-in per policy row.
+
 ### Human Approval as Evidence
 
 Human approval is modeled as an evidence kind, not a special gate. A Circuit Breaker workflow pauses at an approve transition, a human approves in the CB UI or via CLI token injection, and CB posts `human-approval` evidence to the evidence endpoint. The policy for `dev → release` lists `human-approval` as a required evidence kind alongside `integration-ci`. Both must be present for the effective state to be `Ready`.
