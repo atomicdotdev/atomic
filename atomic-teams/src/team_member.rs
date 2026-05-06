@@ -13,6 +13,11 @@ use crate::types::{AddTeamMemberRequest, TeamMemberInfo, TeamRole, UpdateTeamMem
 
 /// List all members of a team.
 ///
+/// Team member routes are org-scoped by the client's base URL/subdomain. For
+/// example, `/teams/engineering/members` targets Delta's engineering team when
+/// the client base URL is `https://delta.<domain>` and Atomic's engineering
+/// team when it is `https://atomic.<domain>`.
+///
 /// # Errors
 ///
 /// Returns [`TeamsError::TeamNotFound`](crate::error::TeamsError::TeamNotFound)
@@ -24,7 +29,8 @@ pub async fn list_team_members(
     org_slug: &str,
     team_slug: &str,
 ) -> TeamsResult<Vec<TeamMemberInfo>> {
-    let path = format!("/orgs/{org_slug}/teams/{team_slug}/members");
+    debug_assert_eq!(client.org_slug(), org_slug);
+    let path = format!("/teams/{team_slug}/members");
     client
         .get(&path)
         .await
@@ -48,7 +54,8 @@ pub async fn add_team_member(
     identity_id: Uuid,
     role: TeamRole,
 ) -> TeamsResult<TeamMemberInfo> {
-    let path = format!("/orgs/{org_slug}/teams/{team_slug}/members");
+    debug_assert_eq!(client.org_slug(), org_slug);
+    let path = format!("/teams/{team_slug}/members");
     let body = AddTeamMemberRequest { identity_id, role };
     client
         .post(&path, &body)
@@ -71,7 +78,8 @@ pub async fn update_team_member_role(
     identity_id: Uuid,
     role: TeamRole,
 ) -> TeamsResult<TeamMemberInfo> {
-    let path = format!("/orgs/{org_slug}/teams/{team_slug}/members/{identity_id}");
+    debug_assert_eq!(client.org_slug(), org_slug);
+    let path = format!("/teams/{team_slug}/members/{identity_id}");
     let body = UpdateTeamMemberRoleRequest { role };
     client.put(&path, &body).await.map_err(|e| {
         map_remote_error(
@@ -95,7 +103,8 @@ pub async fn remove_team_member(
     team_slug: &str,
     identity_id: Uuid,
 ) -> TeamsResult<()> {
-    let path = format!("/orgs/{org_slug}/teams/{team_slug}/members/{identity_id}");
+    debug_assert_eq!(client.org_slug(), org_slug);
+    let path = format!("/teams/{team_slug}/members/{identity_id}");
     client.delete(&path).await.map_err(|e| {
         map_remote_error(
             e,
@@ -116,7 +125,7 @@ mod tests {
             role: TeamRole::Contributor,
         };
         let json = serde_json::to_string(&body).unwrap();
-        assert!(json.contains("identityId"));
+        assert!(json.contains("identity_id"));
         assert!(json.contains("contributor"));
     }
 
@@ -131,21 +140,19 @@ mod tests {
 
     #[test]
     fn path_construction_list() {
-        let org = "acme";
         let team = "backend";
-        let path = format!("/orgs/{org}/teams/{team}/members");
-        assert_eq!(path, "/orgs/acme/teams/backend/members");
+        let path = format!("/teams/{team}/members");
+        assert_eq!(path, "/teams/backend/members");
     }
 
     #[test]
     fn path_construction_member() {
-        let org = "acme";
         let team = "backend";
         let id = Uuid::nil();
-        let path = format!("/orgs/{org}/teams/{team}/members/{id}");
+        let path = format!("/teams/{team}/members/{id}");
         assert_eq!(
             path,
-            "/orgs/acme/teams/backend/members/00000000-0000-0000-0000-000000000000"
+            "/teams/backend/members/00000000-0000-0000-0000-000000000000"
         );
     }
 }

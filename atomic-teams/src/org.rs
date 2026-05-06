@@ -28,7 +28,12 @@ pub async fn create_org(
     email: Option<&str>,
 ) -> TeamsResult<OrgInfo> {
     debug!("Creating organization: name={name}");
-    let body = CreateOrgRequest { name, email };
+    let slug = slugify(name);
+    let body = CreateOrgRequest {
+        slug: &slug,
+        name,
+        email,
+    };
     let info: OrgInfo = client
         .post("/orgs", &body)
         .await
@@ -104,6 +109,27 @@ pub async fn delete_org(client: &StorageClient, slug: &str) -> TeamsResult<()> {
 ///
 /// The exact plan transition is determined server-side based on the
 /// organization's current plan and eligibility.
+fn slugify(name: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+
+    for ch in name.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash && !slug.is_empty() {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    slug
+}
+
 pub async fn upgrade_org(client: &StorageClient, slug: &str) -> TeamsResult<OrgInfo> {
     debug!("Upgrading organization: slug={slug}");
     let path = format!("/orgs/{slug}/upgrade");
@@ -133,10 +159,12 @@ mod tests {
     #[test]
     fn create_org_request_body() {
         let body = CreateOrgRequest {
+            slug: "acme-corp",
             name: "Acme Corp",
             email: Some("admin@acme.com"),
         };
         let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["slug"], "acme-corp");
         assert_eq!(json["name"], "Acme Corp");
         assert_eq!(json["email"], "admin@acme.com");
     }
@@ -144,6 +172,7 @@ mod tests {
     #[test]
     fn create_org_request_body_no_email() {
         let body = CreateOrgRequest {
+            slug: "acme-corp",
             name: "Acme Corp",
             email: None,
         };
