@@ -10,6 +10,8 @@ Atomic views already provide the core isolation and composition model for agenti
 
 This PRD proposes adding view-level metadata that describes the operational state of a view at a specific Merkle state. Hooks can observe view state changes, run external validation or automation, attach evidence, and update the view metadata. Inserts between views are then gated by policy rules that inspect the source view's effective metadata.
 
+This model also creates room for a third collaboration mode alongside local/private and shared/integration views: a **real-time view**. Teams may have any number of shared views for integration lanes, service boundaries, release trains, staging environments, or customer-specific delivery tracks. Shared views can insert only into other shared views, while local views cannot be pushed directly. A real-time view is the best of both worlds for complex integration work: it is collaborative and cross-machine like a shared view, but lightweight and session-oriented like a local agent workspace. Multiple agents can join it over WebSockets to exchange view-state events, evidence updates, semantic context, and insertion proposals against the same Merkle-bound state without turning every speculative step into a pushed shared view or outer-loop CI run.
+
 At a high level:
 
 1. Records are inserted into a view.
@@ -25,8 +27,11 @@ This keeps `release` as a final curated state, while intermediate validation and
 
 - Model workflow state at the **view** level instead of the change/tag/PR level.
 - Keep `release` clean and final; use `dev` or other integration views for intermediate inserts and CI.
-- Allow agent views to become eligible for insertion into `dev` only when their metadata satisfies policy.
-- Allow `dev` to become eligible for insertion into `release` only when its metadata satisfies release policy.
+- Allow local agent views to become eligible for insertion into shared views only when their metadata satisfies policy.
+- Allow shared views to insert into other shared views only when their metadata satisfies target policy.
+- Prevent local views from being pushed directly; local records cross the collaboration boundary through policy-gated insert into an eligible shared or real-time view.
+- Support `n` shared views per team rather than assuming a single `dev` and `release` pipeline.
+- Support real-time collaborative views where agents across machines can coordinate over WebSockets while preserving Merkle-bound state and policy gates.
 - Tie operational state to an exact Merkle state so stale validations cannot accidentally authorize new graph content.
 - Let end-of-turn/session hooks produce evidence and drive view metadata transitions.
 - Preserve Atomic's core model: records, views, graph state, inserts, provenance, and semantic graph intelligence.
@@ -39,6 +44,7 @@ This keeps `release` as a final curated state, while intermediate validation and
 - This does not require a Gerrit-style `Change-Id`.
 - This does not move workflow state into the `release` view's record stream.
 - This does not require a full policy engine in the first iteration.
+- This does not require a full real-time replication protocol in the first iteration.
 - This does not prescribe CLI command names.
 
 ## Background
@@ -50,6 +56,7 @@ Atomic currently has:
 - Agent-created views for isolated work.
 - Records generated from agent turns/sessions.
 - Cross-view insert operations that add record references to another view.
+- Any number of team-defined shared views such as `dev`, `release`, `staging`, service integration views, customer lanes, or deployment tracks.
 - Release-oriented shared views where final curated records should land.
 
 The current primitives support the data movement, but they do not describe the operational condition of a view. For example, after an agent records changes, the system needs a way to represent:
@@ -62,6 +69,26 @@ The current primitives support the data movement, but they do not describe the o
 - this `dev` state is releasable.
 
 That state should belong to the view because CI, integration, and release readiness are properties of the integrated view state, not isolated individual records.
+
+## View Sharing and Mobility Model
+
+Atomic has three collaboration/mobility categories for this workflow:
+
+| Category | Typical scope | Remote mobility | Insert rule | Purpose |
+|---|---|---|---|---|
+| `Local` | One machine or agent session | Cannot be pushed directly | May insert into eligible shared or real-time views by policy | Fast private work, speculative agent turns, local repair |
+| `Shared` | Team-visible, durable, remotely synchronized | Can be pushed/shared | May insert only into other shared views by policy | Integration lanes, release trains, staging, customer or service views |
+| `Realtime` | Multi-agent live session, possibly cross-machine | Shared over a live WebSocket session; durable push semantics are policy-defined | May receive local work and insert into shared views by policy | Complex integration work requiring multiple agents before formal shared insertion |
+
+The important distinction is that `Shared` is not a single view named `dev`. A team can define `n` shared views and use policies to control movement between them:
+
+```text
+service-auth -> dev -> staging -> release
+service-payments -> dev -> release
+customer-acme -> release/acme
+```
+
+Shared-to-shared movement is the durable team workflow. Local-to-shared movement is allowed only through policy-gated insert, not push. Real-time views exist for work that is too collaborative for a single local view but too speculative or fast-moving to become a durable pushed shared view immediately.
 
 ## Core Concepts
 
@@ -125,7 +152,7 @@ stateDiagram-v2
 
 ### View Roles
 
-The existing `ViewScope` describes lifecycle/deletion semantics such as `Draft` vs `Shared`. This PRD proposes adding an independent role dimension for operational semantics.
+The existing `ViewScope` describes lifecycle/deletion semantics such as `Draft` vs `Shared`. This PRD proposes adding an independent role dimension for operational semantics. Sharing/mobility is still a separate policy axis: local views cannot be pushed directly, shared views can be pushed, and real-time views use WebSocket session sharing before any durable insertion into shared views.
 
 Possible roles:
 
@@ -133,9 +160,10 @@ Possible roles:
 - `Dev`: integrated state from multiple views; CI and repair happen here.
 - `Release`: final curated state.
 - `Production`: optional deployment-facing state.
+- `Realtime`: low-latency collaborative state shared by multiple agents over a live session.
 - `Experiment`: optional unmanaged or manually governed view.
 
-Roles are not branches. Roles define policy expectations and hook behavior.
+Roles are not branches. Roles define policy expectations and hook behavior. Sharing semantics are governed by the view's mobility category and insert policy.
 
 ### View Lifecycle State
 
@@ -218,6 +246,46 @@ pub struct InsertPolicy {
 
 Policies should evaluate **effective state**, not raw metadata.
 
+### Real-Time View Session Metadata
+
+A real-time view is still an Atomic view. Its records, graph visibility, Merkle state, evidence, and insert eligibility follow the same rules as any other view. The real-time behavior is session metadata layered on top of the view.
+
+A real-time view should be treated as the integration workspace for work that is too complex for isolated local views but not yet appropriate for durable shared-view publication. Local views can contribute by policy-gated insert into the real-time view; the real-time view can later insert into an eligible shared view once its current Merkle has the required state and evidence.
+
+Conceptual structure:
+
+```rust
+pub struct RealtimeViewSession {
+    pub view_id: u64,
+    pub session_id: SessionId,
+    pub coordinator: Option<IdentityId>,
+    pub transport: RealtimeTransport,
+    pub current_merkle: Merkle,
+    pub participant_count: u32,
+    pub last_event_seq: u64,
+    pub opened_at: i64,
+    pub updated_at: i64,
+}
+
+pub struct RealtimeParticipant {
+    pub session_id: SessionId,
+    pub identity: IdentityId,
+    pub agent_id: Option<AgentId>,
+    pub machine_id: Option<MachineId>,
+    pub last_seen_event_seq: u64,
+    pub joined_at: i64,
+    pub last_seen_at: i64,
+}
+```
+
+Initial transport can be WebSocket-based, but the database should model the collaboration state independently from the transport so future transports can be added.
+
+Real-time session metadata should not replace `ViewMeta`. Instead:
+
+- `ViewMeta` answers: "What is the operational status of this Merkle?"
+- `ViewEvidence` answers: "Why is that status justified?"
+- `RealtimeViewSession` answers: "Who is currently coordinating around this view state, and what event stream have they observed?"
+
 ## Effective View State
 
 The system should derive an effective operational state before policy evaluation.
@@ -297,6 +365,38 @@ flowchart LR
     A3 -- policy-gated insert --> D
     D -- policy-gated insert --> R
 ```
+
+### Real-Time Agent Collaboration View
+
+A real-time view is useful when multiple agents need to coordinate on the same problem before records enter a durable shared view. For example, one agent may edit implementation code, another may update tests, another may run semantic analysis, and another may repair failures. They can all subscribe to the same view-state event stream and make decisions against the same Merkle-bound operational metadata.
+
+```mermaid
+flowchart TD
+    A[Agent on machine A joins realtime view] --> S[WebSocket session]
+    B[Agent on machine B joins realtime view] --> S
+    C[Agent on machine C joins realtime view] --> S
+    S --> D[Shared realtime view event stream]
+    D --> E[Records / evidence / proposals]
+    E --> F[Realtime view Merkle changes]
+    F --> G[Metadata becomes Unchecked for new Merkle]
+    G --> H[Inner loop or agent harness validates]
+    H --> I{Evidence passed?}
+    I -- yes --> J[Realtime view metadata becomes Ready]
+    I -- no --> K[Realtime view metadata becomes Failed]
+    J --> L{Dev insert policy satisfied?}
+    L -- yes --> M[Insert records into dev]
+    L -- no --> N[Continue realtime coordination]
+    K --> N
+```
+
+Key properties:
+
+- The real-time view is a view, not a chat room. Its authoritative state is still the Atomic graph and view Merkle.
+- The WebSocket session distributes events; it does not replace records, evidence, or policy evaluation.
+- Every event that claims a lifecycle transition or evidence result must name the Merkle it applies to.
+- Participants may be local agents, remote agents, humans, or automation harnesses, but each should be represented by identity/provenance metadata.
+- Inserts from a real-time view into a shared view should be policy-gated exactly like inserts from any other source role.
+- Real-time views provide collaboration without requiring every intermediate state to become a pushed shared view.
 
 ## Hook Model
 
@@ -449,9 +549,9 @@ In a GitHub-style workflow, high-volume agent work tends to create high-volume r
 
 Atomic can draw a different boundary.
 
-Agent views are high-churn execution contexts. They should usually be validated by the **inner loop** first: local scripts, local harnesses, targeted tests, semantic checks, provenance checks, or an agent runtime such as `circuit-breaker`. Only after an agent view reaches a policy-approved metadata state should its records be eligible for insertion into `dev`.
+Local agent views are high-churn execution contexts. They should usually be validated by the **inner loop** first: local scripts, local harnesses, targeted tests, semantic checks, provenance checks, or an agent runtime such as `circuit-breaker`. Local views cannot be pushed directly. Only after a local view reaches a policy-approved metadata state should its records be eligible for insertion into a shared or real-time view.
 
-The **outer loop** should validate shared integrated states, not every speculative agent state. In practice, that means full integration suites such as Jenkins, CircleCI, Bazel remote execution, or heavyweight cloud CI should run when shared views like `dev` or `release` change.
+The **outer loop** should validate shared integrated states, not every speculative agent state. In practice, that means full integration suites such as Jenkins, CircleCI, Bazel remote execution, or heavyweight cloud CI should run when team-defined shared views such as `dev`, `staging`, `release`, service integration views, or customer lanes change. Shared views can insert only into other shared views, so durable remote workflow remains explicit and policy-controlled.
 
 ```mermaid
 flowchart LR
@@ -480,14 +580,19 @@ flowchart LR
 | View role | Typical churn | Validation layer | Remote publication |
 |---|---:|---|---|
 | `Agent` | Very high | Inner loop: local harness, targeted tests, semantic/provenance checks | Usually local/private |
-| `Dev` | Medium | Outer loop: full integration CI over combined records | Pushed/shared |
+| `Realtime` | High | Shared inner loop: live agent coordination, targeted checks, evidence exchange | Shared over WebSocket; inserted into shared views only when policy-ready |
+| `Dev` | Medium | Outer loop: full integration CI over combined records | Pushed/shared; inserts only to shared views |
 | `Release` | Low | Release validation, signing, deployment checks | Pushed/shared/final |
 
-This suggests an important operational rule:
+This suggests three important operational rules:
 
-> Only shared integration/final views, such as `dev` and `release`, need to be pushed to the outer loop by default.
+> Local views cannot be pushed directly.
+>
+> Shared views can insert only into other shared views.
+>
+> Real-time views are the collaborative middle ground for complex integration work: cross-machine and multi-agent, but not equivalent to a durable pushed shared view.
 
-Agent views may remain local, private, and ephemeral. Their records only cross the shared boundary when their view metadata satisfies insert policy. This gives Atomic a scaling advantage for agentic development: agents can generate many local view states without forcing every state through remote CI.
+Agent views may remain local, private, and ephemeral. Their records only cross the shared boundary when their view metadata satisfies insert policy. Teams may have any number of shared views, and policies decide which shared-to-shared paths are allowed. This gives Atomic a scaling advantage for agentic development: agents can generate many local and real-time view states without forcing every state through remote CI.
 
 ### Local UI Requirement
 
@@ -520,22 +625,32 @@ This local UI becomes the agentic equivalent of a workflow dashboard, but it is 
 The recommended trigger model is:
 
 ```text
-agent view changes locally
+local view changes locally
   -> inner loop validates local view Merkle
   -> source view metadata becomes Ready
-  -> policy allows insert into dev
-  -> dev Merkle changes
-  -> dev is pushed/shared
-  -> full external CI validates dev Merkle
-  -> dev metadata becomes Ready/Releasable
-  -> policy allows insert into release
+  -> policy allows insert into realtime or shared integration view
+  -> realtime view may coordinate additional agents over WebSocket
+  -> policy allows insert into shared view
+  -> shared view Merkle changes
+  -> shared view is pushed/shared
+  -> full external CI validates shared Merkle
+  -> shared view metadata becomes Ready/Releasable
+  -> policy allows insert into the next shared view
 ```
 
-Under this model, expensive external CI runs on the integrated `dev` view, not on every speculative agent view. Release validation runs only after `dev` has produced an eligible state.
+Under this model, expensive external CI runs on durable shared integration views, not on every speculative local or real-time agent state. Release validation runs only after an upstream shared view has produced an eligible state.
 
 ## Policy-Gated Inserts
 
 An insert from source view to target view should evaluate policy before modifying the target view.
+
+Baseline movement rules:
+
+- `Local` views cannot be pushed directly.
+- `Local` views may insert into eligible real-time or shared views when source policy is satisfied.
+- `Realtime` views may insert into eligible shared views when source policy is satisfied.
+- `Shared` views may insert only into other shared views when source and target policy are satisfied.
+- Shared-to-shared policies are team-defined, so there may be many valid shared pipelines rather than one hard-coded `dev -> release` path.
 
 Conceptual logic:
 
@@ -573,11 +688,30 @@ requirements:
   - dependencies can be inserted
 ```
 
-### Dev -> Release Policy
+### Realtime -> Shared Policy
 
 ```text
-source role: Dev
-target role: Release
+source role: Realtime
+target role: Shared integration role, such as Dev / Staging / Release-candidate
+required source state: Ready
+required evidence:
+  - realtime-session-closed or coordinator-approved
+  - participant-provenance-complete
+  - basic-validation
+requirements:
+  - source metadata applies to source current Merkle
+  - every inserted record has valid identity/provenance
+  - session event stream is complete through source current Merkle
+  - dependencies can be inserted
+```
+
+A real-time view may allow multiple agents to produce records and evidence concurrently, but insert policy should evaluate the final source Merkle, not individual socket events.
+
+### Shared -> Shared Policy
+
+```text
+source role: Dev, Staging, Release-candidate, or another shared role
+target role: Release, Production, customer lane, or another shared role
 required source state: Ready or Releasable
 required evidence:
   - integration-ci-passed
@@ -642,6 +776,12 @@ This enables a workflow where agents do not merely respond to failing PR checks.
 8. How should manual override evidence be represented?
 9. Should release insertion be blocked when release is `Frozen`, or allowed with explicit override evidence?
 10. How should remote sync treat view metadata and evidence?
+11. How should teams configure allowed shared-to-shared insertion paths when they have `n` shared views?
+12. Should real-time view sessions be ephemeral transport sessions, durable view metadata, or both?
+13. What is the minimum WebSocket event vocabulary for real-time views: join, leave, view_changed, evidence_added, state_transition_requested, insert_proposed, insert_completed?
+14. How should concurrent agents coordinate write authority inside a real-time view: optimistic record insertion, coordinator election, leases, or explicit turn-taking?
+15. Should real-time views have their own role (`Realtime`) or be a collaboration mode on top of `Agent`/`Dev` roles?
+16. How should reconnect/resume work when an agent misses WebSocket events but the view Merkle has advanced?
 
 ## Suggested Initial Implementation Slice
 
@@ -652,9 +792,15 @@ This enables a workflow where agents do not merely respond to failing PR checks.
 5. Store lightweight `ViewEvidence` records keyed by `(view_id, merkle)`.
 6. Implement an effective-state check that treats stale metadata as `Unchecked`.
 7. Gate cross-view insert with simple source/target role policy.
-8. Start with two policies:
-   - Agent -> Dev requires `Ready`.
-   - Dev -> Release requires `Ready` or `Releasable`.
+8. Enforce that local views cannot be pushed directly.
+9. Enforce that shared views can insert only into other shared views.
+10. Allow team configuration for `n` shared views and their permitted shared-to-shared insertion paths.
+11. Define `Realtime` as either an initial role or reserved role, but defer full transport implementation unless needed for the first release.
+12. Start with two policies:
+   - Local Agent -> Shared requires `Ready`.
+   - Shared -> Shared requires `Ready` or `Releasable`, depending on the target role.
+13. Optionally add a preview policy:
+   - Realtime -> Shared requires `Ready` plus complete participant provenance.
 
 ## Success Criteria
 
@@ -664,3 +810,4 @@ This enables a workflow where agents do not merely respond to failing PR checks.
 - Inserts from dev into release can be blocked until dev satisfies release policy.
 - Release remains free of intermediate workflow status for agent records.
 - The model supports CI on integrated dev state before final release insertion.
+- The model can represent a real-time collaborative agent view without weakening Merkle-bound evidence or policy-gated inserts.
