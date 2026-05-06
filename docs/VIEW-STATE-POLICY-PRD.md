@@ -793,7 +793,7 @@ When atomic-storage sends a `view_changed` payload to CB, CB needs to verify the
 
 **Direction 2 — CB → atomic-storage (evidence submission)**
 
-When CB POSTs evidence back, atomic-storage needs to verify the request is coming from the authorized runner for that project — not an arbitrary client. CB registers its own Ed25519 keypair as a **CI runner identity** on the project (see CI Runner Identity below). CB presents its public key as its identity on every request. atomic-storage looks it up, finds the registered CI runner, and checks it has permission to submit evidence for that project. This is the same mechanism used for all identities in atomic-storage today.
+When CB POSTs evidence back, atomic-storage needs to verify the request is coming from the authorized runner for that project — not an arbitrary client. CB authenticates using a **signed JWT Bearer token**, the same mechanism the atomic CLI uses. The CI runner has a registered identity with `ci-runner` role; it authenticates to atomic-storage and receives a JWT that it presents on every request. atomic-storage validates the JWT, resolves the identity and its permissions, and checks the runner has permission to submit evidence for that project.
 
 The payload is structured as follows:
 
@@ -852,7 +852,7 @@ CI (or any authorized runner) submits evidence via:
 
 ```
 POST /workspaces/{ws}/projects/{p}/views/{view}/evidence
-Authorization: Bearer <ci_runner_identity>
+Authorization: Bearer <signed_jwt>
 
 {
   "applies_to": "bbb...",          ← Merkle (outer loop); omit for inner loop
@@ -881,7 +881,7 @@ Server validation:
 
 A CI runner (Circuit Breaker or any other system) must be registered with atomic-storage before it can submit evidence or pull project code. Registration produces two things:
 
-1. **A CI runner keypair** — an Ed25519 keypair generated for the runner. The public key is registered with atomic-storage as a project collaborator with `ci-runner` role. The private key is held by the runner and used to sign outgoing requests to atomic-storage.
+1. **A CI runner identity** — a registered identity in atomic-storage with `ci-runner` role. The runner authenticates to atomic-storage the same way the atomic CLI does: it holds a credential that it exchanges for a signed JWT, then presents `Authorization: Bearer <jwt>` on every request. atomic-storage validates the JWT, resolves the identity, and checks permissions.
 
 2. **atomic-storage's public key** — returned as part of the registration response. The runner stores this and uses it to verify the `signature` field on every incoming `view_changed` webhook.
 
@@ -889,15 +889,14 @@ Conceptually (CLI names TBD):
 
 ```bash
 atomic identity new --role ci-runner --project api
-# → generates Ed25519 keypair for the runner
-# → registers the runner's public key with atomic-storage (role: ci-runner)
-# → returns atomic-storage's public key for the runner to store
-# → outputs the runner's private key to configure in CB
+# → creates a ci-runner identity in atomic-storage for this project
+# → outputs a credential for the runner to store and use for authentication
+# → returns atomic-storage's public key for the runner to verify webhook signatures
 ```
 
 After this, the two directions are fully covered:
 - **Incoming webhooks**: runner verifies payload signature using atomic-storage's public key
-- **Outgoing evidence**: runner presents its own public key as `Authorization: Bearer <ci_runner_pubkey>`; atomic-storage checks it matches the registered CI runner for the project
+- **Outgoing requests**: runner authenticates with a JWT Bearer token — same auth flow as the atomic CLI
 
 The `ci-runner` role grants read access to the project (so CB can pull code and workflow definitions at a given Merkle) and permission to POST to the evidence endpoint. It cannot write records, create views, or modify project settings.
 
