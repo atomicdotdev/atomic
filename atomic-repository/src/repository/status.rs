@@ -320,6 +320,7 @@ impl Repository {
             // and skips it (record_modified_file returns is_empty()).
             // Subsequent records re-populate FILE_INDEX, returning the
             // file to the fast path.
+            status.add_stale_index_hit();
             if options.hash_contents {
                 hash_count += 1;
                 let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Modified);
