@@ -40,20 +40,17 @@ impl Repository {
 
         // ── View-aware filtering ───────────────────────────────────────
         //
-<<<<<<< Updated upstream
-        // Build the effective view filter entirely from pristine indexes.
-        // Do not load `.change` files here: status must stay proportional
-        // to working-copy/index state, not object-store history size.
+        // Always build the explicit change filter.  The TREE table is
+        // global — it contains entries from ALL views, including child
+        // views.  Without filtering, files recorded on child views leak
+        // into the parent's status as false "Deleted" entries.
         //
-        // We always compute the filter, even for shared root views. The
-        // previous "universal" fast-path (skip filter for is_shared() &&
-        // parent.is_none()) was unsound after `atomic split`: the dev view
-        // is still shared with no parent, but it no longer contains every
-        // change in the repo — sibling draft/shared views may have unique
-        // changes. Skipping the filter caused TREE entries created by
-        // those sibling changes to surface as phantom `Deleted` files in
-        // dev's status (their inode_position pointed to a change dev
-        // doesn't have).
+        // The previous "universal" fast-path (skip filter for
+        // is_shared() && parent.is_none()) was unsound: the dev view is
+        // shared with no parent, but child/sibling views may have unique
+        // changes.  Skipping the filter caused TREE entries created by
+        // those changes to surface as phantom `Deleted` files in dev's
+        // status.
         //
         // The filter computation is O(C) where C is changes on the view —
         // a single B-tree scan, fast even on large repos.
@@ -68,29 +65,6 @@ impl Repository {
             Some(collect_visible_change_ids_with_deps(&txn, view)?)
         } else {
             None
-=======
-        // Always build the explicit change filter.  The TREE table is
-        // global — it contains entries from ALL views, including child
-        // views.  Without filtering, files recorded on child views leak
-        // into the parent's status as false "Deleted" entries.
-        //
-        // Previously there was a fast path (`filter_is_universal = true`)
-        // for root shared views that skipped this scan.  That optimisation
-        // is invalid once child views can record files into the shared
-        // TREE table — every TREE entry was treated as belonging to the
-        // current view, causing the ghost-deletion bug.
-        let current_view_change_ids = if let Some(ref view) = txn
-            .get_view(&self.current_view)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-        {
-            // Build the effective view filter entirely from pristine
-            // indexes. Do not load `.change` files here: status must stay
-            // proportional to working-copy/index state, not object-store
-            // history size.
-            collect_visible_change_ids_with_deps(&txn, view)?
-        } else {
-            HashSet::new()
->>>>>>> Stashed changes
         };
 
         let phase1_ms = overall_start.elapsed().as_millis();
@@ -115,27 +89,16 @@ impl Repository {
             let (path, inode) = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
 
             // View filter: skip files whose creating change is not on
-<<<<<<< Updated upstream
-            // the current view. Files in TREE without a graph position
-            // must be classified as Added, not Clean (caller-side logic).
+            // the current view.  Files in TREE without a graph position
+            // must be classified as Added, not Clean.  Files whose
+            // creating change is not in the current view's filter are
+            // skipped entirely — they belong to other views and must not
+            // appear in this view's status.
             let has_graph = if let Ok(Some(position)) = txn.inode_position(inode) {
                 if let Some(ref ids) = current_view_change_ids {
                     if !position.change.is_root() && !ids.contains(&position.change) {
                         continue;
                     }
-=======
-            // the current view.
-            //
-            // Check inode_position for every file.  Files in TREE
-            // without a graph position must be classified as Added, not
-            // Clean.  Files whose creating change is not in the current
-            // view's filter are skipped entirely — they belong to other
-            // views and must not appear in this view's status.
-            let has_graph = if let Ok(Some(position)) = txn.inode_position(inode) {
-                if !position.change.is_root() && !current_view_change_ids.contains(&position.change)
-                {
-                    continue;
->>>>>>> Stashed changes
                 }
                 true
             } else {
