@@ -1039,5 +1039,111 @@ switch_view "staging" >/dev/null 2>&1 || true
 assert_file_exists "journey.txt on staging (final check)" "journey.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
+begin_section "Cross-View: Child view file NOT marked Deleted on parent (init -k rust)"
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Regression test for the bug:
+#
+#   1. atomic init -k rust  (creates dev with .vault/ and .atomicignore)
+#   2. Create child view "hola" (parented on dev)
+#   3. On hola, add a new file, record it → status clean ✓
+#   4. Switch to dev
+#   5. BUG: the file from hola shows as Deleted on dev
+#   6. EXPECTED: the file should NOT appear in dev's status at all
+#
+# Root cause: status() has a fast-path for root shared views
+# (filter_is_universal=true) that skips the change filter, so every
+# TREE entry — including files from child views — is treated as
+# belonging to the current view.  When the file doesn't exist on disk
+# (correctly removed by switch_view), status classifies it as Deleted.
+
+make_temp_repo "cross-child-not-deleted"
+init_repo -k rust
+
+# dev should have .vault and .atomicignore tracked after init
+assert_file_exists ".atomicignore exists on dev" ".atomicignore"
+assert_dir_exists ".vault exists on dev" ".vault"
+
+# Verify dev is clean (init records .vault + .atomicignore)
+assert_clean "dev is clean after init -k rust"
+
+# Create child view "hola" (parented on dev)
+new_view "hola" >/dev/null 2>&1 || true
+switch_view "hola" >/dev/null 2>&1 || true
+assert_current_view "on hola" "hola"
+
+# Add a new file on hola
+create_file "hola_only.txt" "this file belongs to hola"
+assert_success "add hola_only.txt on hola" atomic add hola_only.txt
+record_change "Add hola_only.txt on hola" >/dev/null 2>&1 || true
+
+# Status should be clean on hola
+assert_clean "hola is clean after record"
+assert_file_exists "hola_only.txt exists on hola" "hola_only.txt"
+
+# Switch back to dev
+switch_view "dev" >/dev/null 2>&1 || true
+assert_current_view "back on dev" "dev"
+
+# The file should NOT exist on disk (correctly handled by switch_view)
+assert_file_not_exists \
+    "hola_only.txt NOT on disk on dev" \
+    "hola_only.txt"
+
+# CRITICAL: the file must NOT appear in status at all — especially not as Deleted
+assert_status_no_entry \
+    "hola_only.txt NOT in dev status (must not be Deleted)" \
+    "hola_only.txt"
+
+# Double-check: dev's own files should be fine
+assert_file_exists ".atomicignore still on dev" ".atomicignore"
+assert_dir_exists ".vault still on dev" ".vault"
+assert_clean "dev is still clean (no false Deleted entries)"
+
+# Switch back to hola — file should reappear
+switch_view "hola" >/dev/null 2>&1 || true
+assert_file_exists "hola_only.txt back on hola" "hola_only.txt"
+assert_file_content "hola_only.txt has correct content" "hola_only.txt" "this file belongs to hola"
+assert_clean "hola still clean after round-trip"
+
+# ═══════════════════════════════════════════════════════════════════════════
+begin_section "Cross-View: Multiple child views, parent sees no ghost deletions"
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Extend the above: create TWO child views from dev, each with unique files.
+# Switching to dev should show zero Deleted entries from either child.
+
+make_temp_repo "cross-multi-child-no-ghost"
+init_repo -k rust
+
+# Child view alpha
+new_view "alpha" >/dev/null 2>&1 || true
+switch_view "alpha" >/dev/null 2>&1 || true
+create_file "alpha_file.txt" "alpha content"
+assert_success "add alpha_file.txt" atomic add alpha_file.txt
+record_change "Add alpha_file.txt" >/dev/null 2>&1 || true
+assert_clean "alpha is clean"
+
+# Child view beta
+switch_view "dev" >/dev/null 2>&1 || true
+new_view "beta" >/dev/null 2>&1 || true
+switch_view "beta" >/dev/null 2>&1 || true
+create_file "beta_file.txt" "beta content"
+assert_success "add beta_file.txt" atomic add beta_file.txt
+record_change "Add beta_file.txt" >/dev/null 2>&1 || true
+assert_clean "beta is clean"
+
+# Switch to dev — neither child's file should appear
+switch_view "dev" >/dev/null 2>&1 || true
+assert_current_view "on dev" "dev"
+
+assert_file_not_exists "alpha_file.txt NOT on dev" "alpha_file.txt"
+assert_file_not_exists "beta_file.txt NOT on dev" "beta_file.txt"
+
+assert_status_no_entry "alpha_file.txt NOT in dev status" "alpha_file.txt"
+assert_status_no_entry "beta_file.txt NOT in dev status" "beta_file.txt"
+assert_clean "dev has no ghost deletions from children"
+
+# ═══════════════════════════════════════════════════════════════════════════
 
 print_summary
