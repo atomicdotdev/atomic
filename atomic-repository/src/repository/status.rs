@@ -307,8 +307,49 @@ impl Repository {
             }
 
             // No FILE_INDEX entry — file is tracked with graph content
-            // but was never indexed. Assume clean (can't compare without
-            // reconstructing graph content, which is expensive).
+            // but was never indexed. This happens after `atomic insert`,
+            // `atomic clone`, or `atomic view switch` materializes a file
+            // into the working copy without going through `record()` (only
+            // record/materialize_view populate FILE_INDEX today).
+            //
+            // We CANNOT silently treat this as Clean: that would let real
+            // edits to such files become invisible to status/diff/record,
+            // and `record(all=true)` would silently drop them.
+            //
+            // Conservative correctness: mark Modified so the caller can
+            // run a full diff against pristine. If the file is actually
+            // unchanged, the recording workflow produces an empty hunk
+            // and skips it (record_modified_file returns is_empty()).
+            // Subsequent records re-populate FILE_INDEX, returning the
+            // file to the fast path.
+            if options.hash_contents {
+                hash_count += 1;
+                let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Modified);
+                if let Some(inode) = inode {
+                    entry.set_inode(inode);
+                }
+                match hash_file_contents(&abs_path) {
+                    Ok(current_hash) => {
+                        entry.set_current_hash(current_hash);
+                    }
+                    Err(_) => {
+                        entry.set_details("Unable to read file contents".to_string());
+                    }
+                }
+                entry.set_details("FILE_INDEX entry missing".to_string());
+                status.add_entry(entry);
+            } else {
+                // Fast mode: skip the hash but still surface the entry so
+                // it isn't silently dropped. Callers using fast mode (e.g.
+                // the agent record path) re-query with hash_contents=true
+                // before recording.
+                let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Modified);
+                if let Some(inode) = inode {
+                    entry.set_inode(inode);
+                }
+                entry.set_details("FILE_INDEX entry missing".to_string());
+                status.add_entry(entry);
+            }
         }
 
         let classify_ms = classify_start.elapsed().as_millis();

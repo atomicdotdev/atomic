@@ -373,3 +373,68 @@ fn test_repo_status_ignores_node_modules_no_trailing_newline() {
         "Should include app.js"
     );
 }
+
+#[test]
+fn test_status_detects_modification_when_file_index_missing() {
+    // Repro for the silent-data-loss bug: when a tracked file has no
+    // FILE_INDEX entry (e.g. after `atomic insert` / `atomic clone` /
+    // `atomic view switch` materialized it without going through `record`),
+    // `status()` falls through with the "Assume clean" comment and the
+    // file becomes invisible to `status`, `diff`, and `record -a`. Any
+    // edits the user (or an agent) makes to that file are silently
+    // dropped on the next record.
+    //
+    // This test pins the correct behavior: status() must detect the
+    // modification regardless of whether the index has been populated.
+    use crate::record::RecordOptions;
+    use crate::status::FileStatus;
+
+    let (temp_dir, repo) = create_temp_repo();
+
+    // Step 1: create + record a tracked file. Recording with
+    // apply_after_record (the default) populates FILE_INDEX for this file.
+    let file_path = temp_dir.path().join("tracked.txt");
+    std::fs::write(&file_path, b"original content").unwrap();
+    repo.add("tracked.txt", TrackingOptions::default()).unwrap();
+    let header = ChangeHeader::new("Add tracked.txt");
+    repo.record(header, RecordOptions::new().with_all(true))
+        .expect("initial record failed");
+
+    // Step 2: drop the FILE_INDEX entry to simulate the post-insert /
+    // post-clone / post-switch state. In production, those code paths
+    // materialize files into the working copy without writing FILE_INDEX
+    // entries — only `record()` and `materialize_view()` populate it.
+    repo.del_file_index("tracked.txt")
+        .expect("del_file_index failed");
+
+    // Step 3: modify the file on disk. mtime, size, and content all change.
+    std::fs::write(&file_path, b"modified content (different size)").unwrap();
+
+    // Step 4: status() must report it as Modified.
+    let status = repo
+        .status(StatusOptions::default())
+        .expect("status failed");
+
+    let modified_paths: Vec<String> = status
+        .entries()
+        .iter()
+        .filter(|e| e.status() == FileStatus::Modified)
+        .map(|e| e.path().to_string_lossy().to_string())
+        .collect();
+
+    assert!(
+        modified_paths.iter().any(|p| p == "tracked.txt"),
+        "status() must detect modifications to tracked files even when \
+         FILE_INDEX has no entry for them. \
+         entries={:?}",
+        status
+            .entries()
+            .iter()
+            .map(|e| (e.path().to_string_lossy().to_string(), e.status()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !status.is_clean(),
+        "status() must not be clean when a tracked file is modified"
+    );
+}
