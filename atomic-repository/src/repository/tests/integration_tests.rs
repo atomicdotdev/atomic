@@ -393,3 +393,103 @@ fn test_switch_view_shows_view_content() {
         "Content should be feature version after switching to feature"
     );
 }
+
+/// Repro for the post-switch phantom-Deleted / false-Modified bug.
+///
+/// Scenario:
+///   1. Record alpha.txt + bravo.txt on dev.
+///   2. Split feature off dev, switch to feature.
+///   3. On feature: edit alpha.txt and add delta.txt; record.
+///   4. Switch back to dev.
+///
+/// At step 4 the working copy is correct (alpha.txt has dev's original
+/// content, delta.txt is gone), and dev's recorded state is also correct.
+/// Yet `status()` reports `alpha.txt: Modified` and `delta.txt: Deleted`.
+///
+/// Cause: `switch_view` updates the disk via `materialize` and removes
+/// stale files from the working copy, but it does not reconcile TREE
+/// or FILE_INDEX with the destination view's recorded state.
+///   - delta.txt remains in TREE (it was added by feature's record on a
+///     globally-shared TREE), and dev's status filter is "universal" for
+///     a no-parent shared view, so iter_tree surfaces delta.txt → since
+///     it's not on disk, it's reported Deleted.
+///   - alpha.txt's FILE_INDEX entry still holds feature's hash; status
+///     hashes the disk content, sees it differs from the cached hash,
+///     and reports Modified.
+///
+/// The correct post-switch invariant is: if no working-copy edits have
+/// happened since the switch, `status().is_clean()` must hold and there
+/// must be no phantom Deleted or false Modified entries.
+#[test]
+fn test_status_clean_after_view_switch_with_sibling_changes() {
+    let (temp_dir, mut repo) = create_temp_repo();
+
+    // Step 1: record alpha.txt + bravo.txt on dev.
+    std::fs::write(temp_dir.path().join("alpha.txt"), b"alpha-original\n").unwrap();
+    std::fs::write(temp_dir.path().join("bravo.txt"), b"bravo-original\n").unwrap();
+    repo.add("alpha.txt", TrackingOptions::default()).unwrap();
+    repo.add("bravo.txt", TrackingOptions::default()).unwrap();
+    repo.record(
+        ChangeHeader::new("Add alpha + bravo on dev"),
+        RecordOptions::new().with_all(true),
+    )
+    .unwrap();
+
+    // Step 2: split feature off dev and switch to it.
+    repo.create_view_from("feature", "dev").unwrap();
+    repo.switch_view("feature").unwrap();
+
+    // Step 3: on feature, modify alpha.txt and add delta.txt; record.
+    std::fs::write(
+        temp_dir.path().join("alpha.txt"),
+        b"alpha-modified-on-feature\n",
+    )
+    .unwrap();
+    std::fs::write(temp_dir.path().join("delta.txt"), b"delta-feature\n").unwrap();
+    repo.add("delta.txt", TrackingOptions::default()).unwrap();
+    repo.record(
+        ChangeHeader::new("Edit alpha + add delta on feature"),
+        RecordOptions::new().with_all(true),
+    )
+    .unwrap();
+
+    // Step 4: switch back to dev.
+    repo.switch_view("dev").unwrap();
+
+    // Sanity-check the disk before checking status. The switch should
+    // have restored alpha.txt to dev's content and removed delta.txt.
+    let alpha_on_disk = std::fs::read(temp_dir.path().join("alpha.txt")).unwrap();
+    assert_eq!(
+        alpha_on_disk, b"alpha-original\n",
+        "switch_view must restore alpha.txt to dev's content"
+    );
+    assert!(
+        !temp_dir.path().join("delta.txt").exists(),
+        "switch_view must remove delta.txt (not in dev) from the working copy"
+    );
+
+    // The actual assertion: status must reflect the disk truth.
+    let status = repo
+        .status(StatusOptions::default())
+        .expect("status failed");
+
+    // Collect any non-clean entries for diagnostics.
+    let dirty: Vec<(String, crate::status::FileStatus)> = status
+        .entries()
+        .iter()
+        .filter(|e| e.status().is_dirty())
+        .map(|e| (e.path().to_string_lossy().to_string(), e.status()))
+        .collect();
+
+    assert!(
+        dirty.is_empty(),
+        "status() after view switch must be clean — disk and view state agree, \
+         but status reported phantom dirty entries: {:?}",
+        dirty
+    );
+    assert!(
+        status.is_clean(),
+        "status().is_clean() must hold immediately after a view switch with no \
+         working-copy edits"
+    );
+}

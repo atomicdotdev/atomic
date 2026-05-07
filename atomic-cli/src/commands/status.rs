@@ -345,6 +345,22 @@ impl Status {
             print_blank();
         }
 
+        // Hint: stale FILE_INDEX detected
+        if status.needs_reindex() {
+            println!(
+                "  {}",
+                hint(&format!(
+                    "hint: {} file(s) reported as modified due to a stale index.",
+                    status.stale_index_count()
+                ))
+            );
+            println!(
+                "  {}",
+                hint("Run \"atomic status --reindex\" to rebuild the file index.")
+            );
+            print_blank();
+        }
+
         // Print summary hint
         if has_changes {
             print_hint("Use \"atomic record\" to record your changes");

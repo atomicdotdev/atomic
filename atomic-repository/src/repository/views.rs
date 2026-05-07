@@ -157,8 +157,7 @@ impl Repository {
     /// Change a view's scope between Draft and Shared.
     ///
     /// This is useful after `git import` which creates Draft views by
-    /// default.  Changing to Shared enables the fast `filter_is_universal`
-    /// path in `status`, avoiding the O(N) change-loading slow path.
+    /// default.
     pub fn set_view_scope(&self, name: &str, scope: ViewScope) -> Result<(), RepositoryError> {
         let mut txn = self
             .pristine

@@ -146,32 +146,58 @@ impl Repository {
     /// # Returns
     ///
     /// Statistics about the materialize operation.
-    /// Populate the file index for all files in a materialize result.
+    /// Populate the file index for all tracked files after a materialize.
     ///
-    /// Stats each written file from disk and stores its mtime + size +
-    /// content hash in the pristine database.  Errors are silently ignored
+    /// Stats each tracked file from disk and stores its mtime + size +
+    /// content hash in the pristine database. Errors are silently ignored
     /// (best-effort).
-    fn populate_file_index(&self, result: &MaterializeResult) {
+    ///
+    /// Why we ignore `result.file_results` and walk the tracked set: the
+    /// `MaterializeResult.file_results` map is only populated when
+    /// `merge_file_result(_, store_result=true)` is called, and the
+    /// `materialize_view` call site in `atomic-core` passes `false`. As a
+    /// result `result.file_results.keys()` is empty in production, and the
+    /// previous implementation of this function silently no-op'd —
+    /// FILE_INDEX was never refreshed by materialize, leaving stale
+    /// per-view hashes after `view switch` and producing false `Modified`
+    /// reports from `status`.
+    ///
+    /// Walking `list_tracked_files()` is correct because materialize has
+    /// just brought the working copy into sync with the destination
+    /// view's recorded state — every tracked file's on-disk content is
+    /// the authoritative baseline FILE_INDEX should cache.
+    fn populate_file_index(&self, _result: &MaterializeResult) {
         use std::time::SystemTime;
 
-        let mut entries: Vec<(String, i64, u32, u64, Hash)> = Vec::new();
+        let tracked = match self.list_tracked_files() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
 
-        for path in result.file_results.keys() {
-            let abs_path = self.root.join(path);
-            if let Ok(metadata) = std::fs::metadata(&abs_path) {
-                let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                let duration = mtime
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default();
-                let secs = duration.as_secs() as i64;
-                let nanos = duration.subsec_nanos();
-                let size = metadata.len();
-                let content_hash = std::fs::read(&abs_path)
-                    .map(|bytes| Hash::of(&bytes))
-                    .unwrap_or(Hash::ZERO);
-                let normalized = path.replace('\\', "/");
-                entries.push((normalized, secs, nanos, size, content_hash));
-            }
+        let mut entries: Vec<(String, i64, u32, u64, Hash)> = Vec::with_capacity(tracked.len());
+
+        for file in &tracked {
+            let abs_path = self.root.join(&file.path);
+            let metadata = match std::fs::metadata(&abs_path) {
+                Ok(m) if m.is_file() => m,
+                _ => continue,
+            };
+
+            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let duration = mtime
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = duration.as_secs() as i64;
+            let nanos = duration.subsec_nanos();
+            let size = metadata.len();
+
+            let content_hash = match std::fs::read(&abs_path) {
+                Ok(bytes) => Hash::of(&bytes),
+                Err(_) => continue,
+            };
+
+            let normalized = file.path.to_string_lossy().replace('\\', "/");
+            entries.push((normalized, secs, nanos, size, content_hash));
         }
 
         if !entries.is_empty() {
