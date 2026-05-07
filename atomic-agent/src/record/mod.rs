@@ -146,11 +146,11 @@ pub fn record_turn(
         })?;
 
     // Step 2: Status — find out what the agent changed.
-    // Use fast mode + tracked only: mtime-based detection, no content
-    // hashing, no filesystem walk for untracked. The full hash check
-    // happens inside record() itself.
+    // Fast mode (no content hashing — record() itself does the full hash check)
+    // but include untracked files: agents create new files all the time and we
+    // need to see them here to add+record them in Step 3.
     let status = repo
-        .status(atomic_repository::status::StatusOptions::fast().with_untracked(false))
+        .status(atomic_repository::status::StatusOptions::fast().with_untracked(true))
         .map_err(|e| AgentError::RecordFailed {
             session_id: options.session.session_id.clone(),
             turn_number: options.turn_number,
