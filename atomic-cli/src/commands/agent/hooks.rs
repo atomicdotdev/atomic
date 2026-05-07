@@ -151,6 +151,11 @@ impl Command for Hooks {
         let agent_name = agent.name().to_string();
         let agent_display = agent.display_name().to_string();
 
+        eprintln!(
+            "[atomic-debug] hooks: agent={} display={} verb={}",
+            agent_name, agent_display, self.verb
+        );
+
         let result = rt.block_on(async {
             // Create the orchestrator
             let mut orchestrator =

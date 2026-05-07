@@ -1,6 +1,7 @@
 //! Tests for the turn orchestrator.
 
 use super::*;
+use atomic_repository::Repository;
 
 use crate::event::{HookType, TurnEvent};
 use crate::turn::phase::Phase;
@@ -198,6 +199,77 @@ async fn test_turn_end_with_no_changes() {
     // Turn count should be incremented
     let session = orch.session_store.load("sess-1").unwrap().unwrap();
     assert_eq!(session.turn_count, 1);
+}
+
+#[test]
+fn test_has_working_copy_changes_detects_untracked_files() {
+    let dir = TempDir::new().unwrap();
+    Repository::init(dir.path()).unwrap();
+    let orch = make_orchestrator(&dir);
+
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/index.ts"), "console.log('hello');\n").unwrap();
+
+    assert!(
+        orch.has_working_copy_changes(),
+        "untracked-only turns must reach record_turn so files can be auto-added with provenance"
+    );
+}
+
+#[tokio::test]
+async fn test_turn_end_records_untracked_only_files() {
+    let dir = TempDir::new().unwrap();
+    Repository::init(dir.path()).unwrap();
+    let mut orch = make_orchestrator(&dir);
+    orch.set_agent("codex", "Codex");
+
+    orch.dispatch(session_start_event("sess-untracked"))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event(
+        "sess-untracked",
+        "Create a TypeScript hello world project",
+    ))
+    .await
+    .unwrap();
+
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("package.json"), "{\"type\":\"module\"}\n").unwrap();
+    fs::write(
+        dir.path().join("tsconfig.json"),
+        "{\"compilerOptions\":{}}\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("src/index.ts"), "console.log('hello');\n").unwrap();
+
+    let result = orch
+        .dispatch(turn_end_event("sess-untracked"))
+        .await
+        .unwrap();
+
+    assert_eq!(result.new_phase, Phase::Idle);
+    assert!(
+        result.was_recorded(),
+        "turn with only new files should be auto-added and recorded"
+    );
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let status = repo
+        .status(atomic_repository::status::StatusOptions::default())
+        .unwrap();
+    assert_eq!(status.untracked_count(), 0);
+    assert!(
+        status.is_clean(),
+        "status after auto-record should be clean"
+    );
+
+    let recorded = result.change_recorded.as_ref().unwrap();
+    assert!(recorded
+        .recorded_file_list()
+        .contains(&"src/index.ts".to_string()));
+    assert!(recorded
+        .recorded_file_list()
+        .contains(&"package.json".to_string()));
 }
 
 #[tokio::test]
