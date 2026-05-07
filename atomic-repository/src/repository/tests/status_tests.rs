@@ -438,3 +438,165 @@ fn test_status_detects_modification_when_file_index_missing() {
         "status() must not be clean when a tracked file is modified"
     );
 }
+
+#[test]
+fn test_record_heals_file_index_for_phantom_modified_files() {
+    // The dd1d59b status fix's "self-healing" claim was wrong for the
+    // false-positive case. Concrete failure: a tracked file with no
+    // FILE_INDEX entry whose on-disk content actually matches pristine
+    // (e.g. landed in the working copy via insert/clone or via an old
+    // binary's view-switch that didn't populate FILE_INDEX) shows as
+    // Modified. record proves the content matches pristine, skips the
+    // file (empty hunks), and — without this heal — leaves FILE_INDEX
+    // empty for it. The next status() reports it Modified again.
+    // Forever, across arbitrarily many records.
+    //
+    // Repro observed in the wild: 22 phantom-Modified files persisted
+    // through an opencode agent record that touched 4 unrelated files.
+    //
+    // This test pins the heal: after a record where a phantom-Modified
+    // file is the only "Modified" entry, status() must report Clean.
+    use crate::record::RecordOptions;
+    use crate::status::FileStatus;
+
+    let (temp_dir, repo) = create_temp_repo();
+
+    // Step 1: record a tracked file (populates FILE_INDEX).
+    let path = temp_dir.path().join("phantom.txt");
+    std::fs::write(&path, b"unchanged content").unwrap();
+    repo.add("phantom.txt", TrackingOptions::default()).unwrap();
+    repo.record(
+        ChangeHeader::new("Add phantom.txt"),
+        RecordOptions::new().with_all(true),
+    )
+    .expect("initial record failed");
+
+    // Step 2: drop the FILE_INDEX entry to simulate the post-insert /
+    // post-clone / post-old-binary-view-switch state.
+    repo.del_file_index("phantom.txt")
+        .expect("del_file_index failed");
+
+    // Sanity check: status now flags the file as Modified (phantom).
+    let pre_status = repo
+        .status(StatusOptions::default())
+        .expect("pre-record status failed");
+    assert!(
+        pre_status
+            .entries()
+            .iter()
+            .any(|e| e.path().to_string_lossy() == "phantom.txt"
+                && e.status() == FileStatus::Modified),
+        "precondition: phantom.txt should be flagged Modified before record"
+    );
+
+    // Step 3: record(all=true) — content matches pristine, so this
+    // returns NothingToRecord. The heal should still run.
+    let record_result = repo.record(
+        ChangeHeader::new("would-be record"),
+        RecordOptions::new().with_all(true),
+    );
+    assert!(
+        matches!(record_result, Err(crate::record::RecordError::NothingToRecord)),
+        "record should report NothingToRecord when all 'modified' files are phantom; got {:?}",
+        record_result.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e))
+    );
+
+    // Step 4: status() must now be clean — FILE_INDEX should have an
+    // entry for phantom.txt that matches the on-disk state.
+    let post_status = repo
+        .status(StatusOptions::default())
+        .expect("post-record status failed");
+
+    assert!(
+        post_status.is_clean(),
+        "after record, phantom-Modified file should be clean. \
+         entries={:?}",
+        post_status
+            .entries()
+            .iter()
+            .map(|e| (
+                e.path().to_string_lossy().to_string(),
+                e.status(),
+                e.details().map(|s| s.to_string())
+            ))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_record_heals_file_index_alongside_real_changes() {
+    // Variant of the heal test that mirrors the real-world scenario:
+    // a record run that mixes one truly-modified file with several
+    // phantom-Modified ones. The recorded change should contain only
+    // the real edit, AND the phantom files must be healed so the
+    // post-record status is clean for them.
+    use crate::record::RecordOptions;
+    use crate::status::FileStatus;
+
+    let (temp_dir, repo) = create_temp_repo();
+
+    // Two tracked files, both with FILE_INDEX populated.
+    let phantom = temp_dir.path().join("phantom.txt");
+    let real = temp_dir.path().join("real.txt");
+    std::fs::write(&phantom, b"phantom original").unwrap();
+    std::fs::write(&real, b"real original").unwrap();
+    repo.add("phantom.txt", TrackingOptions::default()).unwrap();
+    repo.add("real.txt", TrackingOptions::default()).unwrap();
+    repo.record(
+        ChangeHeader::new("Add files"),
+        RecordOptions::new().with_all(true),
+    )
+    .expect("initial record failed");
+
+    // Drop FILE_INDEX for phantom.txt only.
+    repo.del_file_index("phantom.txt")
+        .expect("del_file_index failed");
+
+    // Real edit to real.txt.
+    std::fs::write(&real, b"real edited").unwrap();
+
+    // Record both. real.txt produces hunks; phantom.txt produces empty
+    // hunks and lands in skipped_paths.
+    let outcome = repo
+        .record(
+            ChangeHeader::new("Edit real, phantom is clean"),
+            RecordOptions::new().with_all(true),
+        )
+        .expect("mixed record failed");
+
+    let recorded: Vec<&str> = outcome.recorded_files().iter().map(|s| s.as_str()).collect();
+    assert!(
+        recorded.iter().any(|p| *p == "real.txt"),
+        "real.txt should be in recorded_files, got {:?}",
+        recorded
+    );
+    assert!(
+        !recorded.iter().any(|p| *p == "phantom.txt"),
+        "phantom.txt should NOT be in recorded_files (no real change), got {:?}",
+        recorded
+    );
+
+    // Post-record status: phantom.txt must be clean, no Modified
+    // entries should remain.
+    let post_status = repo
+        .status(StatusOptions::default())
+        .expect("post-record status failed");
+
+    let modified: Vec<String> = post_status
+        .entries()
+        .iter()
+        .filter(|e| e.status() == FileStatus::Modified)
+        .map(|e| e.path().to_string_lossy().to_string())
+        .collect();
+
+    assert!(
+        modified.is_empty(),
+        "no files should be Modified after record (phantom should be healed). \
+         modified={:?}",
+        modified
+    );
+    assert!(
+        post_status.is_clean(),
+        "status should be clean after record"
+    );
+}

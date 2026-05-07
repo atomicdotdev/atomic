@@ -93,6 +93,13 @@ impl Repository {
         let mut deleted_paths: Vec<String> = Vec::new();
         let mut skipped_paths: Vec<String> = Vec::new();
         let mut errors: Vec<(String, String)> = Vec::new();
+        // Files we proved match pristine during this record (either
+        // byte-equal to old_content or empty hunks from
+        // record_modified_file). We write FILE_INDEX entries for them
+        // after the loop so future status() calls take the fast path
+        // instead of repeatedly hitting the "FILE_INDEX entry missing"
+        // conservative branch and reporting them as Modified forever.
+        let mut confirmed_clean: Vec<(String, Hash)> = Vec::new();
 
         let core_options = options.to_core_options();
 
@@ -447,7 +454,9 @@ impl Repository {
 
                     // Step 3: Check if content actually changed
                     if old_content == new_content {
-                        // No actual change - skip
+                        // No actual change - skip, but cache the hash so
+                        // future status() calls take the fast path.
+                        confirmed_clean.push((path.clone(), Hash::of(&new_content)));
                         skipped_paths.push(path.clone());
                         stats.files_skipped += 1;
                         continue;
@@ -499,7 +508,10 @@ impl Repository {
                                 recorded_paths.push(path.clone());
                                 recorded_files.push(recorded);
                             } else {
-                                // No hunks generated - content might be identical
+                                // No hunks generated - content matches
+                                // pristine. Cache the hash so status()
+                                // doesn't keep flagging this file as Modified.
+                                confirmed_clean.push((path.clone(), Hash::of(&new_content)));
                                 skipped_paths.push(path.clone());
                                 stats.files_skipped += 1;
                             }
@@ -517,6 +529,40 @@ impl Repository {
                     stats.files_skipped += 1;
                 }
             }
+        }
+
+        // Heal FILE_INDEX for files we proved match pristine during this
+        // record (byte-equal to old_content, or empty hunks from
+        // record_modified_file). Without this, the dd1d59b status fix's
+        // "self-healing" claim breaks: status flags Modified for any
+        // tracked file lacking a FILE_INDEX entry, record proves the
+        // content matches pristine and skips the file, and the existing
+        // FILE_INDEX update at the bottom only writes entries for
+        // recorded_files — leaving a permanent dirty-status tail of
+        // phantom modifications surviving every record. Runs before the
+        // NothingToRecord early return so the heal still happens when
+        // every tracked file turns out to be clean.
+        if !confirmed_clean.is_empty() {
+            use std::time::SystemTime;
+            let mut entries: Vec<(String, i64, u32, u64, Hash)> =
+                Vec::with_capacity(confirmed_clean.len());
+            for (path, hash) in &confirmed_clean {
+                let abs_path = self.root.join(path);
+                if let Ok(metadata) = std::fs::metadata(&abs_path) {
+                    let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    let duration = mtime
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    entries.push((
+                        path.clone(),
+                        duration.as_secs() as i64,
+                        duration.subsec_nanos(),
+                        metadata.len(),
+                        *hash,
+                    ));
+                }
+            }
+            let _ = self.update_file_index(&entries);
         }
 
         // Check if we actually recorded anything
