@@ -146,11 +146,12 @@ pub fn record_turn(
         })?;
 
     // Step 2: Status — find out what the agent changed.
-    // Use fast mode + tracked only: mtime-based detection, no content
-    // hashing, no filesystem walk for untracked. The full hash check
-    // happens inside record() itself.
+    // Include untracked files because agent turns commonly create new source,
+    // config, and test files. Those must be auto-added before recording so the
+    // turn produces an Atomic change with provenance instead of leaving files
+    // untracked in the working copy.
     let status = repo
-        .status(atomic_repository::status::StatusOptions::fast().with_untracked(false))
+        .status(atomic_repository::status::StatusOptions::fast())
         .map_err(|e| AgentError::RecordFailed {
             session_id: options.session.session_id.clone(),
             turn_number: options.turn_number,
@@ -189,12 +190,37 @@ pub fn record_turn(
             if untracked_paths.len() == 1 { "" } else { "s" },
         );
 
-        let tracking_options = atomic_repository::tracking::TrackingOptions::default();
-        for path in &untracked_paths {
-            if let Err(e) = repo.add(path, tracking_options.clone()) {
-                log::warn!("Failed to add '{}': {} (skipping)", path, e);
+        let untracked_refs: Vec<&str> = untracked_paths.iter().map(String::as_str).collect();
+        if let Err(e) = repo.add_batch(&untracked_refs) {
+            log::warn!(
+                "Failed to add untracked files as a batch: {} (falling back to per-file add)",
+                e
+            );
+            let tracking_options = atomic_repository::tracking::TrackingOptions::default();
+            for path in &untracked_paths {
+                if let Err(e) = repo.add(path, tracking_options.clone()) {
+                    log::warn!("Failed to add '{}': {} (skipping)", path, e);
+                }
             }
         }
+    }
+
+    // Refresh status after auto-adding new files. The initial status sees them
+    // as Untracked, which `repo.record(all: true)` does not record directly;
+    // after add they become Added entries and are recordable.
+    let status = repo
+        .status(atomic_repository::status::StatusOptions::fast())
+        .map_err(|e| AgentError::RecordFailed {
+            session_id: options.session.session_id.clone(),
+            turn_number: options.turn_number,
+            reason: format!("Failed to refresh repository status after add: {}", e),
+        })?;
+
+    if status.is_clean() {
+        return Err(AgentError::EmptyTurn {
+            session_id: options.session.session_id.clone(),
+            turn_number: options.turn_number,
+        });
     }
 
     // Step 4: Build SessionEnvelope + Record the Atomic change

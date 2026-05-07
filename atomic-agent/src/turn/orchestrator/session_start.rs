@@ -222,8 +222,16 @@ impl TurnOrchestrator {
     /// Load an existing session or create a new one.
     ///
     /// This is the resilient path — if a hook arrives for an unknown session
-    /// (e.g., the session state was lost due to a crash), we create a new
-    /// session rather than failing.
+    /// (e.g., the session state was lost due to a crash, or `SessionStart`
+    /// never fired because the agent doesn't support it), we create a new
+    /// session and fork a proper draft view rather than failing.
+    ///
+    /// **Critical**: the fallback must fork a draft view parented on the
+    /// user's current view, just like `handle_session_start` does.  If we
+    /// skip the fork, `record()` later creates a shared/no-parent view
+    /// whose universal filter exposes files from other views (e.g.
+    /// `.atomicignore`, `.vault/*` from `dev`) that don't exist on disk,
+    /// causing false "deleted" entries in `atomic status`.
     pub(crate) fn load_or_create_session(
         &self,
         session_id: &str,
@@ -240,29 +248,73 @@ impl TurnOrchestrator {
                 let mut session =
                     AgentSession::new(session_id, &self.agent_name, &self.agent_display_name);
 
-                // Use the repo's current view instead of the generated
-                // haikunator name.  session-start already created a view
-                // and switched to it — if we're here from a stop/turn-end
-                // event, the current view IS the session view.  Generating
-                // a new name would create a second orphan view.
-                if let Ok(repo) = atomic_repository::Repository::open(&self.repo_root) {
-                    let current = repo.current_view().to_string();
-                    if current != "dev" && current != "main" && current != "release" {
-                        log::info!(
-                            "Fallback session {} adopting current view '{}' instead of generating new view",
-                            session_id,
-                            current,
-                        );
-                        session.view_name = current;
-                    }
-                }
-
                 let vendor = vendor_from_agent_name(&self.agent_name);
                 session.agent_vendor = vendor.to_string();
 
                 if let Some(ref path) = event.transcript_path {
                     session.set_transcript_path(path);
                 }
+
+                // Try to adopt the current view or fork a new draft view.
+                //
+                // If the current view looks like an agent view (not a
+                // well-known shared view), adopt it — session-start already
+                // created and switched to it.  Otherwise fork a new draft
+                // view from the user's view so that the agent's changes
+                // are isolated and the view filter only exposes the
+                // parent's files.
+                if let Ok(mut repo) = atomic_repository::Repository::open(&self.repo_root) {
+                    let current = repo.current_view().to_string();
+
+                    if current != "dev" && current != "main" && current != "release" {
+                        // Adopt the existing agent view (session-start
+                        // likely created it before this fallback ran).
+                        log::info!(
+                            "Fallback session {} adopting current view '{}'",
+                            session_id,
+                            current,
+                        );
+                        session.view_name = current;
+                    } else {
+                        // Fork a new draft view from the user's shared view.
+                        // This mirrors what handle_session_start does.
+                        session.set_parent_view(&current);
+
+                        match repo.create_view_from(&session.view_name, &current) {
+                            Ok(()) => {
+                                log::info!(
+                                    "Fallback session {} forked view '{}' from '{}'",
+                                    session_id,
+                                    session.view_name,
+                                    current,
+                                );
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "Fallback session {} could not fork view '{}' from '{}': {} (non-fatal)",
+                                    session_id,
+                                    session.view_name,
+                                    current,
+                                    e,
+                                );
+                            }
+                        }
+
+                        // Switch to the agent view so status/add/record
+                        // target the right view.
+                        if let Err(e) = repo.set_current_view(&session.view_name) {
+                            log::warn!(
+                                "Fallback session {} could not switch to '{}': {} (non-fatal)",
+                                session_id,
+                                session.view_name,
+                                e,
+                            );
+                        }
+                    }
+                }
+
+                // Persist so subsequent hooks find this session.
+                self.session_store.save(&session)?;
 
                 Ok(session)
             }
