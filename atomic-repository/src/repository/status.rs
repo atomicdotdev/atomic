@@ -40,28 +40,33 @@ impl Repository {
 
         // ── View-aware filtering ───────────────────────────────────────
         //
-        // Fast path: for a Shared view with no parent (the common case
-        // after `atomic init` or `atomic git import`), ALL changes in
-        // GRAPH are visible.  Skip the expensive O(N) scan entirely.
+        // Build the effective view filter entirely from pristine indexes.
+        // Do not load `.change` files here: status must stay proportional
+        // to working-copy/index state, not object-store history size.
         //
-        // Slow path: for Draft views or views with parents, we need the
-        // actual filter set to hide changes from other views.
-        let (current_view_change_ids, filter_is_universal) = if let Some(ref view) = txn
+        // We always compute the filter, even for shared root views. The
+        // previous "universal" fast-path (skip filter for is_shared() &&
+        // parent.is_none()) was unsound after `atomic split`: the dev view
+        // is still shared with no parent, but it no longer contains every
+        // change in the repo — sibling draft/shared views may have unique
+        // changes. Skipping the filter caused TREE entries created by
+        // those sibling changes to surface as phantom `Deleted` files in
+        // dev's status (their inode_position pointed to a change dev
+        // doesn't have).
+        //
+        // The filter computation is O(C) where C is changes on the view —
+        // a single B-tree scan, fast even on large repos.
+        //
+        // None means "no current view" (a misconfigured repo); preserve
+        // the legacy "show everything" behavior in that case rather than
+        // producing an empty status.
+        let current_view_change_ids: Option<HashSet<NodeId>> = if let Some(ref view) = txn
             .get_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
-            if view.kind.is_shared() && view.parent.is_none() {
-                (HashSet::new(), true)
-            } else {
-                // Build the effective view filter entirely from pristine
-                // indexes. Do not load `.change` files here: status must stay
-                // proportional to working-copy/index state, not object-store
-                // history size.
-                let ids = collect_visible_change_ids_with_deps(&txn, view)?;
-                (ids, false)
-            }
+            Some(collect_visible_change_ids_with_deps(&txn, view)?)
         } else {
-            (HashSet::new(), true)
+            None
         };
 
         let phase1_ms = overall_start.elapsed().as_millis();
@@ -86,21 +91,13 @@ impl Repository {
             let (path, inode) = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
 
             // View filter: skip files whose creating change is not on
-            // the current view.
-            // Check inode_position for every file:
-            // - For non-universal views: also apply the view filter
-            // - For universal views: just determine has_graph
-            //
-            // This is correct and required — files in TREE without a
-            // graph position must be classified as Added, not Clean.
+            // the current view. Files in TREE without a graph position
+            // must be classified as Added, not Clean (caller-side logic).
             let has_graph = if let Ok(Some(position)) = txn.inode_position(inode) {
-                // View filter: skip files whose creating change is not
-                // on the current view.
-                if !filter_is_universal
-                    && !position.change.is_root()
-                    && !current_view_change_ids.contains(&position.change)
-                {
-                    continue;
+                if let Some(ref ids) = current_view_change_ids {
+                    if !position.change.is_root() && !ids.contains(&position.change) {
+                        continue;
+                    }
                 }
                 true
             } else {
