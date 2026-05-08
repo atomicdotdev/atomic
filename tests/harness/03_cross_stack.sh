@@ -1039,5 +1039,242 @@ switch_view "staging" >/dev/null 2>&1 || true
 assert_file_exists "journey.txt on staging (final check)" "journey.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
+begin_section "Cross-View: Child view file NOT marked Deleted on parent (init -k rust)"
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Regression test for the bug:
+#
+#   1. atomic init -k rust  (creates dev with .vault/ and .atomicignore)
+#   2. Create child view "hola" (parented on dev)
+#   3. On hola, add a new file, record it → status clean ✓
+#   4. Switch to dev
+#   5. BUG: the file from hola shows as Deleted on dev
+#   6. EXPECTED: the file should NOT appear in dev's status at all
+#
+# Root cause: status() has a fast-path for root shared views
+# (filter_is_universal=true) that skips the change filter, so every
+# TREE entry — including files from child views — is treated as
+# belonging to the current view.  When the file doesn't exist on disk
+# (correctly removed by switch_view), status classifies it as Deleted.
+
+make_temp_repo "cross-child-not-deleted"
+init_repo -k rust
+
+# dev should have .vault and .atomicignore tracked after init
+assert_file_exists ".atomicignore exists on dev" ".atomicignore"
+assert_dir_exists ".vault exists on dev" ".vault"
+
+# Verify dev is clean (init records .vault + .atomicignore)
+assert_clean "dev is clean after init -k rust"
+
+# Create child view "hola" (parented on dev)
+new_view "hola" >/dev/null 2>&1 || true
+switch_view "hola" >/dev/null 2>&1 || true
+assert_current_view "on hola" "hola"
+
+# Add a new file on hola
+create_file "hola_only.txt" "this file belongs to hola"
+assert_success "add hola_only.txt on hola" atomic add hola_only.txt
+record_change "Add hola_only.txt on hola" >/dev/null 2>&1 || true
+
+# Status should be clean on hola
+assert_clean "hola is clean after record"
+assert_file_exists "hola_only.txt exists on hola" "hola_only.txt"
+
+# Switch back to dev
+switch_view "dev" >/dev/null 2>&1 || true
+assert_current_view "back on dev" "dev"
+
+# The file should NOT exist on disk (correctly handled by switch_view)
+assert_file_not_exists \
+    "hola_only.txt NOT on disk on dev" \
+    "hola_only.txt"
+
+# CRITICAL: the file must NOT appear in status at all — especially not as Deleted
+assert_status_no_entry \
+    "hola_only.txt NOT in dev status (must not be Deleted)" \
+    "hola_only.txt"
+
+# Double-check: dev's own files should be fine
+assert_file_exists ".atomicignore still on dev" ".atomicignore"
+assert_dir_exists ".vault still on dev" ".vault"
+assert_clean "dev is still clean (no false Deleted entries)"
+
+# Switch back to hola — file should reappear
+switch_view "hola" >/dev/null 2>&1 || true
+assert_file_exists "hola_only.txt back on hola" "hola_only.txt"
+assert_file_content "hola_only.txt has correct content" "hola_only.txt" "this file belongs to hola"
+assert_clean "hola still clean after round-trip"
+
+# ═══════════════════════════════════════════════════════════════════════════
+begin_section "Cross-View: Multiple child views, parent sees no ghost deletions"
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Extend the above: create TWO child views from dev, each with unique files.
+# Switching to dev should show zero Deleted entries from either child.
+
+make_temp_repo "cross-multi-child-no-ghost"
+init_repo -k rust
+
+# Child view alpha
+new_view "alpha" >/dev/null 2>&1 || true
+switch_view "alpha" >/dev/null 2>&1 || true
+create_file "alpha_file.txt" "alpha content"
+assert_success "add alpha_file.txt" atomic add alpha_file.txt
+record_change "Add alpha_file.txt" >/dev/null 2>&1 || true
+assert_clean "alpha is clean"
+
+# Child view beta
+switch_view "dev" >/dev/null 2>&1 || true
+new_view "beta" >/dev/null 2>&1 || true
+switch_view "beta" >/dev/null 2>&1 || true
+create_file "beta_file.txt" "beta content"
+assert_success "add beta_file.txt" atomic add beta_file.txt
+record_change "Add beta_file.txt" >/dev/null 2>&1 || true
+assert_clean "beta is clean"
+
+# Switch to dev — neither child's file should appear
+switch_view "dev" >/dev/null 2>&1 || true
+assert_current_view "on dev" "dev"
+
+assert_file_not_exists "alpha_file.txt NOT on dev" "alpha_file.txt"
+assert_file_not_exists "beta_file.txt NOT on dev" "beta_file.txt"
+
+assert_status_no_entry "alpha_file.txt NOT in dev status" "alpha_file.txt"
+assert_status_no_entry "beta_file.txt NOT in dev status" "beta_file.txt"
+assert_clean "dev has no ghost deletions from children"
+
+# ═══════════════════════════════════════════════════════════════════════════
+begin_section "Cross-View: Parent's own files NOT falsely Modified after child records"
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Regression test for the false-Modified bug:
+#
+# After fixing the ghost-deletion bug (filter_is_universal removal),
+# the view change filter must include ALL changes that belong to the
+# current view.  If the filter is incomplete (e.g. dependency closure
+# misses some changes), files whose inode was created by a missing
+# change are skipped during the TREE scan and then fall through to
+# the "no FILE_INDEX entry" path, where they are conservatively
+# classified as Modified.
+#
+# This test verifies that dev's own recorded files remain Clean after
+# a child view records new content.  The child's record must not
+# disturb the parent's change filter completeness.
+#
+# Scenario:
+#   1. atomic init -k rust → dev has .atomicignore, .vault/*, etc.
+#   2. Record additional files on dev → status clean
+#   3. Create child view, record a file there
+#   4. Switch back to dev
+#   5. EXPECTED: dev is fully clean (no Deleted, no Modified)
+
+make_temp_repo "cross-no-false-modified"
+init_repo -k rust
+
+# dev has .atomicignore and .vault tracked after init
+assert_clean "dev is clean after init"
+
+# Record a couple more files on dev to increase surface area
+create_file "src/main.rs" 'fn main() { println!("hello"); }'
+create_file "Cargo.toml" '[package]\nname = "test"'
+assert_success "add src/main.rs" atomic add src/main.rs
+assert_success "add Cargo.toml" atomic add Cargo.toml
+record_change "Add rust skeleton on dev" >/dev/null 2>&1 || true
+assert_clean "dev clean after recording rust skeleton"
+
+# Snapshot dev status: capture the short output to verify later
+dev_status_before="$(get_status_short)"
+
+# Create child view, record a file there
+new_view "child-feat" >/dev/null 2>&1 || true
+switch_view "child-feat" >/dev/null 2>&1 || true
+assert_current_view "on child-feat" "child-feat"
+
+create_file "feature.rs" "fn feature() {}"
+assert_success "add feature.rs on child" atomic add feature.rs
+record_change "Add feature.rs on child-feat" >/dev/null 2>&1 || true
+assert_clean "child-feat is clean after record"
+
+# Switch back to dev
+switch_view "dev" >/dev/null 2>&1 || true
+assert_current_view "back on dev" "dev"
+
+# CRITICAL: dev's own files must NOT show as Modified
+assert_status_not_contains \
+    "no 'modified:' in dev status (no false Modified regression)" \
+    "modified:"
+
+assert_status_not_contains \
+    "no 'deleted:' in dev status (no ghost deletions)" \
+    "deleted:"
+
+# Assert specific files are NOT in short status output
+assert_status_no_entry ".atomicignore not dirty" ".atomicignore"
+assert_status_no_entry "src/main.rs not dirty" "src/main.rs"
+assert_status_no_entry "Cargo.toml not dirty" "Cargo.toml"
+assert_status_no_entry "feature.rs not in dev status" "feature.rs"
+
+# The gold standard: dev is fully clean
+assert_clean "dev is fully clean (no Deleted, no Modified)"
+
+# Verify files are on disk and correct
+assert_file_exists "src/main.rs on dev" "src/main.rs"
+assert_file_exists "Cargo.toml on dev" "Cargo.toml"
+assert_file_not_exists "feature.rs NOT on dev" "feature.rs"
+
+# Round-trip: child-feat still works
+switch_view "child-feat" >/dev/null 2>&1 || true
+assert_file_exists "feature.rs back on child-feat" "feature.rs"
+assert_file_exists "src/main.rs inherited on child-feat" "src/main.rs"
+assert_clean "child-feat still clean after round-trip"
+
+# ═══════════════════════════════════════════════════════════════════════════
+begin_section "Cross-View: Insert to parent does not cause false Modified"
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Simulate the pull scenario: insert changes from a child view into
+# dev (which is what pull does under the hood — apply + materialize).
+# After the insert + materialize, dev should be clean.
+
+make_temp_repo "cross-insert-no-false-modified"
+init_repo -k rust
+
+# Record a base file on dev
+create_file "base.rs" "fn base() {}"
+assert_success "add base.rs" atomic add base.rs
+record_change "Add base.rs on dev" >/dev/null 2>&1 || true
+assert_clean "dev clean with base.rs"
+
+# Create child view, record new files
+new_view "contributor" >/dev/null 2>&1 || true
+switch_view "contributor" >/dev/null 2>&1 || true
+
+create_file "new_feature.rs" "fn new_feature() {}"
+assert_success "add new_feature.rs" atomic add new_feature.rs
+record_change "Add new_feature.rs on contributor" >/dev/null 2>&1 || true
+assert_clean "contributor is clean"
+
+# Insert from contributor → dev (simulates what pull does)
+insert_from_view "contributor" "dev" >/dev/null 2>&1 || true
+
+# Switch to dev to trigger materialize
+switch_view "dev" >/dev/null 2>&1 || true
+assert_current_view "on dev after insert" "dev"
+
+# Both files should exist on dev now
+assert_file_exists "base.rs on dev" "base.rs"
+assert_file_exists "new_feature.rs on dev after insert" "new_feature.rs"
+
+# CRITICAL: dev must be fully clean after insert + switch
+assert_status_not_contains \
+    "no 'modified:' after insert" \
+    "modified:"
+assert_status_not_contains \
+    "no 'deleted:' after insert" \
+    "deleted:"
+assert_clean "dev is clean after insert from child"
+
+# ═══════════════════════════════════════════════════════════════════════════
 
 print_summary

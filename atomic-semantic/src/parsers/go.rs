@@ -156,7 +156,8 @@ impl GoParser {
                 let type_text = self.node_text(&type_node, source);
                 // Truncate long type definitions
                 let short = if type_text.len() > 60 {
-                    format!("{}…", &type_text[..60])
+                    let end = crate::truncate_to_char_boundary(&type_text, 60);
+                    format!("{}…", &type_text[..end])
                 } else {
                     type_text
                 };

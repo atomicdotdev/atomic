@@ -352,7 +352,7 @@ impl TurnOrchestrator {
             Err(_) => return true, // can't check — assume changes
         };
 
-        let opts = atomic_repository::status::StatusOptions::fast();
+        let opts = atomic_repository::status::StatusOptions::fast().with_untracked(true);
         match repo.status(opts) {
             Ok(status) => !status.is_clean() || status.has_untracked(),
             Err(_) => true, // can't check — assume changes

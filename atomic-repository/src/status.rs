@@ -399,6 +399,14 @@ pub struct RepositoryStatus {
 
     /// Index of entries by path for quick lookup.
     path_index: HashMap<PathBuf, usize>,
+
+    /// Number of tracked files that had no FILE_INDEX entry.
+    ///
+    /// These files are conservatively reported as Modified because we
+    /// cannot confirm they match the recorded graph content without
+    /// hashing.  A non-zero value means `atomic status --reindex`
+    /// would likely resolve the false positives.
+    stale_index_count: usize,
 }
 
 impl RepositoryStatus {
@@ -414,6 +422,7 @@ impl RepositoryStatus {
             state,
             entries: Vec::new(),
             path_index: HashMap::new(),
+            stale_index_count: 0,
         }
     }
 
@@ -430,6 +439,7 @@ impl RepositoryStatus {
             state,
             entries: Vec::with_capacity(capacity),
             path_index: HashMap::with_capacity(capacity),
+            stale_index_count: 0,
         }
     }
 
@@ -446,6 +456,23 @@ impl RepositoryStatus {
     /// Get the Merkle state of the current view.
     pub fn state(&self) -> Option<&Merkle> {
         self.state.as_ref()
+    }
+
+    /// Number of tracked files that were reported as Modified only because
+    /// their FILE_INDEX entry was missing.  When non-zero, running
+    /// `atomic status --re-index` will likely resolve the false positives.
+    pub fn stale_index_count(&self) -> usize {
+        self.stale_index_count
+    }
+
+    /// Whether the FILE_INDEX appears stale (some entries are missing).
+    pub fn needs_reindex(&self) -> bool {
+        self.stale_index_count > 0
+    }
+
+    /// Increment the stale-index counter.
+    pub fn add_stale_index_hit(&mut self) {
+        self.stale_index_count += 1;
     }
 
     /// Add a file status entry.

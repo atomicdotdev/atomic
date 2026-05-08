@@ -151,7 +151,7 @@ pub fn record_turn(
     // turn produces an Atomic change with provenance instead of leaving files
     // untracked in the working copy.
     let status = repo
-        .status(atomic_repository::status::StatusOptions::fast())
+        .status(atomic_repository::status::StatusOptions::fast().with_untracked(true))
         .map_err(|e| AgentError::RecordFailed {
             session_id: options.session.session_id.clone(),
             turn_number: options.turn_number,

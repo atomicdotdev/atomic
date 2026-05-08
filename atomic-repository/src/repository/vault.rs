@@ -90,6 +90,61 @@ impl Repository {
         Ok(())
     }
 
+    /// Bootstrap vault tables from an existing `.vault/` working copy.
+    ///
+    /// Called after pull/clone when `.vault/` files exist on disk (materialized
+    /// from the graph) but the redb vault tables haven't been initialized yet.
+    /// This happens when another user initialized the vault and pushed changes
+    /// that were then pulled by a new clone/collaborator.
+    ///
+    /// Unlike `init_vault()`, this does NOT install default content — the
+    /// pulled files are the authoritative source.
+    pub fn bootstrap_vault_from_working_copy(&self) -> Result<(), RepositoryError> {
+        log::info!("Bootstrapping vault tables from existing .vault/ working copy");
+
+        // 1. Initialize vault tables in redb
+        {
+            log::info!("Initializing vault redb tables");
+            let mut txn = self
+                .pristine
+                .write_txn()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            use atomic_core::pristine::VaultMutTxnT;
+            txn.init_vault()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            txn.commit()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
+
+        // 2. Initialize knowledge graph tables
+        {
+            log::info!("Initializing knowledge graph tables");
+            let mut txn = self
+                .pristine
+                .write_txn()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            use atomic_core::pristine::KgMutTxnT;
+            txn.init_kg()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            txn.commit()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
+
+        // 3. Initialize embeddings table
+        log::info!("Initializing embeddings table");
+        self.init_embeddings()?;
+
+        // 4. Deflate existing on-disk .vault/ markdown files into the redb tables
+        log::info!("Recording existing .vault/ files into redb");
+        let updated = self.vault_record_working_copy()?;
+        log::info!(
+            "Bootstrapped {} vault entries from working copy",
+            updated.len()
+        );
+
+        Ok(())
+    }
+
     /// Store content in the vault.
     ///
     /// Creates a `VaultEntry` from the given parameters, stores it in the
@@ -1528,5 +1583,93 @@ mod tests {
         let entry = repo.vault_retrieve("memory/test.md").unwrap().unwrap();
         let content = String::from_utf8_lossy(&entry.content_bytes);
         assert!(content.contains("# Modified"));
+    }
+
+    #[test]
+    fn test_bootstrap_vault_from_working_copy() {
+        // ── Repo 1: the original author who inited the vault ────────
+        let dir1 = tempdir().unwrap();
+        let repo1 = Repository::init(dir1.path()).unwrap();
+        repo1.init_vault().unwrap();
+
+        // Store some custom content in repo1's vault
+        repo1
+            .vault_store(
+                "memory/architecture.md",
+                VaultEntryType::Memory,
+                b"# Architecture\nWe use patch theory.".to_vec(),
+                r#"{"name":"architecture"}"#.to_string(),
+            )
+            .unwrap();
+        repo1
+            .vault_store(
+                "skills/rust.md",
+                VaultEntryType::Skill,
+                b"# Rust\nUse cargo build.".to_vec(),
+                r#"{"name":"rust"}"#.to_string(),
+            )
+            .unwrap();
+
+        // Materialize so we have on-disk markdown files to copy
+        repo1.vault_materialize("memory/architecture.md").unwrap();
+        repo1.vault_materialize("skills/rust.md").unwrap();
+
+        // ── Repo 2: simulates a collaborator after pull/clone ──────
+        // The repo is initialized but vault tables are NOT created.
+        // The .vault/ directory with markdown files exists on disk
+        // (as if materialized from the graph by the apply/pull path).
+        let dir2 = tempdir().unwrap();
+        let repo2 = Repository::init(dir2.path()).unwrap();
+
+        // Manually create .vault/ subdirs and copy markdown files
+        let vault2 = repo2.vault_dir();
+        std::fs::create_dir_all(vault2.join("memory")).unwrap();
+        std::fs::create_dir_all(vault2.join("skills")).unwrap();
+
+        let src_vault = repo1.vault_dir();
+        std::fs::copy(
+            src_vault.join("memory/architecture.md"),
+            vault2.join("memory/architecture.md"),
+        )
+        .unwrap();
+        std::fs::copy(
+            src_vault.join("skills/rust.md"),
+            vault2.join("skills/rust.md"),
+        )
+        .unwrap();
+
+        // Precondition: vault tables don't exist yet
+        assert!(!repo2.has_vault().unwrap());
+
+        // ── Bootstrap ──────────────────────────────────────────────
+        repo2.bootstrap_vault_from_working_copy().unwrap();
+
+        // ── Assertions ─────────────────────────────────────────────
+        assert!(repo2.has_vault().unwrap());
+
+        // Both entries should now be in repo2's redb
+        let arch = repo2
+            .vault_retrieve("memory/architecture.md")
+            .unwrap()
+            .expect("architecture entry should exist");
+        let arch_content = String::from_utf8_lossy(&arch.content_bytes);
+        assert!(
+            arch_content.contains("# Architecture") && arch_content.contains("patch theory"),
+            "architecture content mismatch: {arch_content:?}"
+        );
+
+        let rust = repo2
+            .vault_retrieve("skills/rust.md")
+            .unwrap()
+            .expect("rust entry should exist");
+        let rust_content = String::from_utf8_lossy(&rust.content_bytes);
+        assert!(
+            rust_content.contains("# Rust") && rust_content.contains("cargo build"),
+            "rust content mismatch: {rust_content:?}"
+        );
+
+        // vault_list should return both entries
+        let all = repo2.vault_list("", None).unwrap();
+        assert_eq!(all.len(), 2);
     }
 }

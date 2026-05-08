@@ -127,6 +127,7 @@ use crate::output::{
     author as style_author, emphasis, hash as style_hash, hint, info, path as style_path,
     timestamp as style_timestamp,
 };
+use console::style;
 
 // Output Format
 

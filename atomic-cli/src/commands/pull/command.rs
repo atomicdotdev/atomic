@@ -39,8 +39,8 @@ use crate::commands::{find_repository_root, format_hash, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{
     create_progress_bar, create_spinner, error, finish_error, finish_success, hash as style_hash,
-    hint, print_blank, print_hint, print_success, print_warning, success, view as style_view,
-    warning,
+    hint, print_blank, print_hint, print_info, print_success, print_warning, success,
+    view as style_view, warning,
 };
 
 use super::helpers::{
@@ -591,15 +591,40 @@ impl Pull {
             }
         }
 
-        // Auto-enrich the knowledge graph from pulled VCS data
-        if stats.changes_applied > 0 && repo.has_vault().unwrap_or(false) {
+        // Bootstrap vault if .vault/ files were pulled but redb tables don't exist.
+        // This happens when another user initialized the vault and pushed changes
+        // that were then pulled by a collaborator who hasn't run `vault init`.
+        if stats.has_applied() {
+            let vault_on_disk = repo.vault_dir().exists();
+            let vault_in_db = repo.has_vault().unwrap_or(false);
+            if vault_on_disk && !vault_in_db {
+                print_info(
+                    "Vault files detected \u{2014} initializing vault from pulled content...",
+                );
+                match repo.bootstrap_vault_from_working_copy() {
+                    Ok(()) => print_success("Vault initialized from pulled content"),
+                    Err(e) => print_warning(&format!("Failed to bootstrap vault: {}", e)),
+                }
+            }
+        }
+
+        // Enrich the knowledge graph from pulled VCS data (views, files, changes).
+        // This runs for every pull that applies changes, not just vaulted repos.
+        if stats.changes_applied > 0 {
+            // Ensure KG tables exist (idempotent — no-op if already created)
+            if let Err(e) = repo.init_kg() {
+                log::warn!("KG table init failed: {}", e);
+            }
             match repo.kg_enrich_from_vcs() {
                 Ok(kg_stats) => log::info!("KG enriched after pull: {}", kg_stats),
                 Err(e) => log::warn!("KG enrichment after pull failed: {}", e),
             }
-            // Materialize any new vault entries pulled
-            if let Err(e) = repo.vault_materialize_all() {
-                log::warn!("Vault materialization after pull failed: {}", e);
+
+            // Materialize any new vault entries pulled (only if vault exists)
+            if repo.has_vault().unwrap_or(false) {
+                if let Err(e) = repo.vault_materialize_all() {
+                    log::warn!("Vault materialization after pull failed: {}", e);
+                }
             }
         }
 

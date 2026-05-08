@@ -40,28 +40,31 @@ impl Repository {
 
         // ── View-aware filtering ───────────────────────────────────────
         //
-        // Fast path: for a Shared view with no parent (the common case
-        // after `atomic init` or `atomic git import`), ALL changes in
-        // GRAPH are visible.  Skip the expensive O(N) scan entirely.
+        // Always build the explicit change filter.  The TREE table is
+        // global — it contains entries from ALL views, including child
+        // views.  Without filtering, files recorded on child views leak
+        // into the parent's status as false "Deleted" entries.
         //
-        // Slow path: for Draft views or views with parents, we need the
-        // actual filter set to hide changes from other views.
-        let (current_view_change_ids, filter_is_universal) = if let Some(ref view) = txn
+        // The previous "universal" fast-path (skip filter for
+        // is_shared() && parent.is_none()) was unsound: the dev view is
+        // shared with no parent, but child/sibling views may have unique
+        // changes.  Skipping the filter caused TREE entries created by
+        // those changes to surface as phantom `Deleted` files in dev's
+        // status.
+        //
+        // The filter computation is O(C) where C is changes on the view —
+        // a single B-tree scan, fast even on large repos.
+        //
+        // None means "no current view" (a misconfigured repo); preserve
+        // the legacy "show everything" behavior in that case rather than
+        // producing an empty status.
+        let current_view_change_ids: Option<HashSet<NodeId>> = if let Some(ref view) = txn
             .get_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
-            if view.kind.is_shared() && view.parent.is_none() {
-                (HashSet::new(), true)
-            } else {
-                // Build the effective view filter entirely from pristine
-                // indexes. Do not load `.change` files here: status must stay
-                // proportional to working-copy/index state, not object-store
-                // history size.
-                let ids = collect_visible_change_ids_with_deps(&txn, view)?;
-                (ids, false)
-            }
+            Some(collect_visible_change_ids_with_deps(&txn, view)?)
         } else {
-            (HashSet::new(), true)
+            None
         };
 
         let phase1_ms = overall_start.elapsed().as_millis();
@@ -86,21 +89,16 @@ impl Repository {
             let (path, inode) = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
 
             // View filter: skip files whose creating change is not on
-            // the current view.
-            // Check inode_position for every file:
-            // - For non-universal views: also apply the view filter
-            // - For universal views: just determine has_graph
-            //
-            // This is correct and required — files in TREE without a
-            // graph position must be classified as Added, not Clean.
+            // the current view.  Files in TREE without a graph position
+            // must be classified as Added, not Clean.  Files whose
+            // creating change is not in the current view's filter are
+            // skipped entirely — they belong to other views and must not
+            // appear in this view's status.
             let has_graph = if let Ok(Some(position)) = txn.inode_position(inode) {
-                // View filter: skip files whose creating change is not
-                // on the current view.
-                if !filter_is_universal
-                    && !position.change.is_root()
-                    && !current_view_change_ids.contains(&position.change)
-                {
-                    continue;
+                if let Some(ref ids) = current_view_change_ids {
+                    if !position.change.is_root() && !ids.contains(&position.change) {
+                        continue;
+                    }
                 }
                 true
             } else {
@@ -307,8 +305,50 @@ impl Repository {
             }
 
             // No FILE_INDEX entry — file is tracked with graph content
-            // but was never indexed. Assume clean (can't compare without
-            // reconstructing graph content, which is expensive).
+            // but was never indexed. This happens after `atomic insert`,
+            // `atomic clone`, or `atomic view switch` materializes a file
+            // into the working copy without going through `record()` (only
+            // record/materialize_view populate FILE_INDEX today).
+            //
+            // We CANNOT silently treat this as Clean: that would let real
+            // edits to such files become invisible to status/diff/record,
+            // and `record(all=true)` would silently drop them.
+            //
+            // Conservative correctness: mark Modified so the caller can
+            // run a full diff against pristine. If the file is actually
+            // unchanged, the recording workflow produces an empty hunk
+            // and skips it (record_modified_file returns is_empty()).
+            // Subsequent records re-populate FILE_INDEX, returning the
+            // file to the fast path.
+            status.add_stale_index_hit();
+            if options.hash_contents {
+                hash_count += 1;
+                let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Modified);
+                if let Some(inode) = inode {
+                    entry.set_inode(inode);
+                }
+                match hash_file_contents(&abs_path) {
+                    Ok(current_hash) => {
+                        entry.set_current_hash(current_hash);
+                    }
+                    Err(_) => {
+                        entry.set_details("Unable to read file contents".to_string());
+                    }
+                }
+                entry.set_details("FILE_INDEX entry missing".to_string());
+                status.add_entry(entry);
+            } else {
+                // Fast mode: skip the hash but still surface the entry so
+                // it isn't silently dropped. Callers using fast mode (e.g.
+                // the agent record path) re-query with hash_contents=true
+                // before recording.
+                let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Modified);
+                if let Some(inode) = inode {
+                    entry.set_inode(inode);
+                }
+                entry.set_details("FILE_INDEX entry missing".to_string());
+                status.add_entry(entry);
+            }
         }
 
         let classify_ms = classify_start.elapsed().as_millis();

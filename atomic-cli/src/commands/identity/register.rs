@@ -215,16 +215,16 @@ impl Register {
                 );
             }
 
-            println!();
-            println!("{}", crate::output::hint("Next steps:"));
-            println!(
-                "  {}  Push a project",
-                crate::output::command("atomic push")
-            );
-            println!(
-                "  {}  Clone from the server",
-                crate::output::command(format!("atomic clone {base_url}/<project>"))
-            );
+            crate::output::print_next_steps(&[
+                (
+                    "atomic workspace create <name>",
+                    "Create your first workspace",
+                ),
+                (
+                    "atomic project create <name> --workspace <workspace>",
+                    "Create a project (prints the clone/push URL)",
+                ),
+            ]);
         } else {
             // Parse error response.
             let error_msg = serde_json::from_str::<serde_json::Value>(&response_text)

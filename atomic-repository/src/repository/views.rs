@@ -157,8 +157,7 @@ impl Repository {
     /// Change a view's scope between Draft and Shared.
     ///
     /// This is useful after `git import` which creates Draft views by
-    /// default.  Changing to Shared enables the fast `filter_is_universal`
-    /// path in `status`, avoiding the O(N) change-loading slow path.
+    /// default.
     pub fn set_view_scope(&self, name: &str, scope: ViewScope) -> Result<(), RepositoryError> {
         let mut txn = self
             .pristine
@@ -444,6 +443,45 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Get the parent view's change count for a given view.
+    ///
+    /// Returns `Some((parent_name, parent_change_count))` if the view has a
+    /// parent, or `None` if it is a root view.
+    ///
+    /// This is used by `atomic log` to determine the fork point: changes
+    /// with sequence numbers `>= parent_change_count` are local to the
+    /// draft view, while those below were inherited when the view was
+    /// created.
+    pub fn parent_change_count(
+        &self,
+        view_name: &str,
+    ) -> Result<Option<(String, u64)>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+
+        match view.parent {
+            Some(parent_id) => {
+                let parent = txn
+                    .get_view_by_id(parent_id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .ok_or_else(|| RepositoryError::ViewNotFound {
+                        name: format!("<parent id {}>", parent_id),
+                    })?;
+                Ok(Some((parent.name.clone(), parent.change_count)))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Get information about a view.
