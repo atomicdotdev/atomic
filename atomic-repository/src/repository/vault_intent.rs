@@ -4,6 +4,12 @@
 //! IDs in the format PREFIX-N (e.g., "PIMO-1", "ATOM-42").
 //! The prefix is derived from the project directory name.
 //!
+//! Intent paths are view-scoped and session-scoped:
+//! `intents/<view_name>/<session_id>/<turn_id>/intent.md`
+//!
+//! When session/turn info is unavailable (manual CLI usage),
+//! paths fall back to: `intents/<view_name>/_manual/<N>/intent.md`
+//!
 //! The intent scaffold template lives at `atomic-repository/vault/templates/intent.md`.
 
 /// Intent scaffold template. `{{title}}` is replaced with the actual title.
@@ -24,6 +30,10 @@ pub struct IntentCreateOptions {
     pub assignee: Option<String>,
     /// Labels/tags for categorization.
     pub labels: Vec<String>,
+    /// Agent session ID (if running inside an agent session).
+    pub session_id: Option<String>,
+    /// Turn number within the session (if running inside an agent session).
+    pub turn_id: Option<u32>,
 }
 
 /// Result of creating an intent.
@@ -35,6 +45,8 @@ pub struct IntentCreateResult {
     pub intent_dir: String,
     /// Vault-relative path to the intent.md file.
     pub intent_file: String,
+    /// The view the intent was created on.
+    pub view_name: String,
 }
 
 /// Options for updating an intent.
@@ -70,6 +82,9 @@ impl Repository {
     ///
     /// The prefix is derived from the project directory name on first use
     /// (first 4 alphanumeric chars, uppercased).
+    ///
+    /// Intent paths are view-scoped and session-scoped:
+    /// `intents/<view>/<session>/<turn>/intent.md`
     pub fn vault_intent_create(
         &self,
         options: IntentCreateOptions,
@@ -81,6 +96,11 @@ impl Repository {
         }
 
         let priority = options.priority.unwrap_or_else(|| "medium".to_string());
+        let view_name = self.current_view().to_string();
+
+        // Compute the session-scoped directory and file paths
+        let intent_dir = self.intent_dir_for(options.session_id.as_deref(), options.turn_id);
+        let intent_file = self.intent_file_for(options.session_id.as_deref(), options.turn_id);
 
         // Allocate ID inside a write transaction
         let intent_id;
@@ -118,6 +138,8 @@ impl Repository {
                     assignee: options.assignee.clone(),
                     goals: 0,
                     blocked_by: Vec::new(),
+                    title: options.title.clone(),
+                    vault_path: intent_file.clone(),
                 },
             );
 
@@ -128,10 +150,6 @@ impl Repository {
         }
 
         let now = chrono::Utc::now().to_rfc3339();
-
-        // Build paths using the intent_id as the directory name
-        let intent_dir = format!("intents/{}", intent_id.to_lowercase());
-        let intent_file = format!("{}/intent.md", intent_dir);
 
         // Build frontmatter
         let mut fm = serde_json::Map::new();
@@ -150,6 +168,10 @@ impl Repository {
         fm.insert(
             "priority".to_string(),
             serde_json::Value::String(priority.clone()),
+        );
+        fm.insert(
+            "view".to_string(),
+            serde_json::Value::String(view_name.clone()),
         );
         if let Some(ref assignee) = options.assignee {
             fm.insert(
@@ -203,6 +225,7 @@ impl Repository {
             id: intent_id,
             intent_dir,
             intent_file,
+            view_name,
         })
     }
 
@@ -223,16 +246,29 @@ impl Repository {
                 }
             }
 
-            // Get title from the stored entry's frontmatter
-            let intent_file = format!("intents/{}/intent.md", id.to_lowercase());
-            let title = self
-                .vault_retrieve(&intent_file)?
-                .and_then(|entry| {
-                    let fm: serde_json::Map<String, serde_json::Value> =
-                        serde_json::from_str(&entry.frontmatter_json).ok()?;
-                    fm.get("title")?.as_str().map(String::from)
-                })
-                .unwrap_or_else(|| id.clone());
+            // Use the title stored in the manifest summary.
+            // Fall back to path-based lookup only for legacy entries without a title.
+            let title = if !summary.title.is_empty() {
+                summary.title.clone()
+            } else if !summary.vault_path.is_empty() {
+                self.vault_retrieve(&summary.vault_path)?
+                    .and_then(|entry| {
+                        let fm: serde_json::Map<String, serde_json::Value> =
+                            serde_json::from_str(&entry.frontmatter_json).ok()?;
+                        fm.get("title")?.as_str().map(String::from)
+                    })
+                    .unwrap_or_else(|| id.clone())
+            } else {
+                // Legacy entry with neither title nor vault_path — try scanning
+                self.find_intent_path(id)?
+                    .and_then(|path| self.vault_retrieve(&path).ok().flatten())
+                    .and_then(|entry| {
+                        let fm: serde_json::Map<String, serde_json::Value> =
+                            serde_json::from_str(&entry.frontmatter_json).ok()?;
+                        fm.get("title")?.as_str().map(String::from)
+                    })
+                    .unwrap_or_else(|| id.clone())
+            };
 
             intents.push(IntentInfo {
                 id: id.clone(),
@@ -253,9 +289,12 @@ impl Repository {
 
     /// Show an intent's full content.
     pub fn vault_intent_show(&self, intent_id: &str) -> Result<VaultEntry, RepositoryError> {
-        // Normalize: accept "PIMO-1" or "1" (auto-prepend prefix)
         let full_id = self.normalize_intent_id(intent_id)?;
-        let intent_file = format!("intents/{}/intent.md", full_id.to_lowercase());
+        let intent_file =
+            self.find_intent_path(&full_id)?
+                .ok_or_else(|| RepositoryError::InvalidOperation {
+                    message: format!("Intent '{}' not found", full_id),
+                })?;
 
         self.vault_retrieve(&intent_file)?
             .ok_or_else(|| RepositoryError::InvalidOperation {
@@ -270,7 +309,11 @@ impl Repository {
         options: IntentUpdateOptions,
     ) -> Result<IntentInfo, RepositoryError> {
         let full_id = self.normalize_intent_id(intent_id)?;
-        let intent_file = format!("intents/{}/intent.md", full_id.to_lowercase());
+        let intent_file =
+            self.find_intent_path(&full_id)?
+                .ok_or_else(|| RepositoryError::InvalidOperation {
+                    message: format!("Intent '{}' not found", full_id),
+                })?;
 
         let entry = self.vault_retrieve(&intent_file)?.ok_or_else(|| {
             RepositoryError::InvalidOperation {
@@ -335,6 +378,9 @@ impl Repository {
                 if let Some(ref priority) = options.priority {
                     summary.priority = priority.clone();
                 }
+                if let Some(ref title) = options.title {
+                    summary.title = title.clone();
+                }
             }
             txn.put_vault_manifest(&manifest)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -370,7 +416,11 @@ impl Repository {
         goal_name: &str,
     ) -> Result<(), RepositoryError> {
         let full_id = self.normalize_intent_id(intent_id)?;
-        let intent_file = format!("intents/{}/intent.md", full_id.to_lowercase());
+        let intent_file =
+            self.find_intent_path(&full_id)?
+                .ok_or_else(|| RepositoryError::InvalidOperation {
+                    message: format!("Intent '{}' not found", full_id),
+                })?;
 
         let entry = self.vault_retrieve(&intent_file)?.ok_or_else(|| {
             RepositoryError::InvalidOperation {
@@ -431,6 +481,73 @@ impl Repository {
         Ok(())
     }
 
+    /// Build the vault-relative directory for an intent.
+    ///
+    /// Agent mode:  `intents/<view>/<session>/<turn>/`
+    /// Manual mode: `intents/manual/<identity>/<N>/`
+    fn intent_dir_for(&self, session_id: Option<&str>, turn_id: Option<u32>) -> String {
+        let view = self.current_view();
+        match (session_id, turn_id) {
+            (Some(sid), Some(tid)) => format!("intents/{}/{}/{}", view, sid, tid),
+            _ => {
+                // Manual usage — scope under the user's identity name
+                let identity = self.resolve_vault_identity();
+                let manifest = self.vault_manifest().unwrap_or_default();
+                format!(
+                    "intents/manual/{}/{}",
+                    identity.name, manifest.next_intent_id
+                )
+            }
+        }
+    }
+
+    /// Build the vault-relative path for an intent file.
+    fn intent_file_for(&self, session_id: Option<&str>, turn_id: Option<u32>) -> String {
+        format!("{}/intent.md", self.intent_dir_for(session_id, turn_id))
+    }
+
+    /// Find the vault path for an intent by its display ID.
+    ///
+    /// First checks the manifest's `vault_path` field (fast path), then
+    /// falls back to scanning vault entries under `intents/<current_view>/`
+    /// for a file whose frontmatter `id` field matches the normalized intent ID.
+    fn find_intent_path(&self, full_id: &str) -> Result<Option<String>, RepositoryError> {
+        // Fast path: check the manifest for a stored vault_path
+        let manifest = self.vault_manifest()?;
+        if let Some(summary) = manifest.intents.get(full_id) {
+            if !summary.vault_path.is_empty() {
+                // Verify the path still exists
+                if self.vault_retrieve(&summary.vault_path)?.is_some() {
+                    return Ok(Some(summary.vault_path.clone()));
+                }
+            }
+        }
+
+        // Slow path: scan vault entries under the current view + manual/
+        let prefixes = [
+            format!("intents/{}/", self.current_view()),
+            "intents/manual/".to_string(),
+        ];
+        for prefix in &prefixes {
+            let entries = self.vault_list(prefix, None)?;
+            for meta in entries {
+                if !meta.path.ends_with("/intent.md") {
+                    continue;
+                }
+                if let Some(entry) = self.vault_retrieve(&meta.path)? {
+                    if let Ok(fm) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                        &entry.frontmatter_json,
+                    ) {
+                        if fm.get("id").and_then(|v| v.as_str()) == Some(full_id) {
+                            return Ok(Some(meta.path));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Normalize an intent ID — accept "PIMO-1", "pimo-1", or just "1".
     fn normalize_intent_id(&self, id: &str) -> Result<String, RepositoryError> {
         // If it already looks like PREFIX-N, uppercase it
@@ -470,6 +587,46 @@ mod tests {
         repo
     }
 
+    /// Helper to build IntentCreateOptions with session info for tests.
+    fn create_opts(title: &str) -> IntentCreateOptions {
+        IntentCreateOptions {
+            title: title.to_string(),
+            priority: None,
+            assignee: None,
+            labels: vec![],
+            session_id: Some("test-session".to_string()),
+            turn_id: Some(1),
+        }
+    }
+
+    /// Helper to build IntentCreateOptions for a specific session/turn.
+    fn create_opts_with_session(
+        title: &str,
+        session_id: &str,
+        turn_id: u32,
+    ) -> IntentCreateOptions {
+        IntentCreateOptions {
+            title: title.to_string(),
+            priority: None,
+            assignee: None,
+            labels: vec![],
+            session_id: Some(session_id.to_string()),
+            turn_id: Some(turn_id),
+        }
+    }
+
+    /// Helper to build IntentCreateOptions for manual mode (no session info).
+    fn create_opts_manual(title: &str) -> IntentCreateOptions {
+        IntentCreateOptions {
+            title: title.to_string(),
+            priority: None,
+            assignee: None,
+            labels: vec![],
+            session_id: None,
+            turn_id: None,
+        }
+    }
+
     #[test]
     fn test_intent_create() {
         let dir = tempdir().unwrap();
@@ -481,17 +638,27 @@ mod tests {
                 priority: Some("high".to_string()),
                 assignee: Some("alice".to_string()),
                 labels: vec!["auth".to_string(), "security".to_string()],
+                session_id: Some("sess-abc".to_string()),
+                turn_id: Some(1),
             })
             .unwrap();
 
         // ID should be PREFIX-1
         assert!(result.id.ends_with("-1"), "ID was: {}", result.id);
-        assert!(result.intent_file.ends_with("/intent.md"));
+        // Path should be view-scoped and session-scoped
+        assert!(
+            result.intent_file.contains("/sess-abc/1/intent.md"),
+            "Path was: {}",
+            result.intent_file
+        );
+        assert_eq!(result.view_name, repo.current_view());
 
         // Should be in manifest
         let manifest = repo.vault_manifest().unwrap();
         assert!(manifest.intents.contains_key(&result.id));
         assert_eq!(manifest.intents[&result.id].priority, "high");
+        assert_eq!(manifest.intents[&result.id].title, "Fix authentication");
+        assert_eq!(manifest.intents[&result.id].vault_path, result.intent_file);
         assert_eq!(manifest.next_intent_id, 2);
 
         // File should exist on disk
@@ -504,25 +671,17 @@ mod tests {
         let repo = init_repo_with_vault(dir.path());
 
         let r1 = repo
-            .vault_intent_create(IntentCreateOptions {
-                title: "First".to_string(),
-                priority: None,
-                assignee: None,
-                labels: vec![],
-            })
+            .vault_intent_create(create_opts_with_session("First", "sess-1", 1))
             .unwrap();
 
         let r2 = repo
-            .vault_intent_create(IntentCreateOptions {
-                title: "Second".to_string(),
-                priority: None,
-                assignee: None,
-                labels: vec![],
-            })
+            .vault_intent_create(create_opts_with_session("Second", "sess-1", 2))
             .unwrap();
 
         assert!(r1.id.ends_with("-1"));
         assert!(r2.id.ends_with("-2"));
+        // Different turns → different paths
+        assert_ne!(r1.intent_file, r2.intent_file);
     }
 
     #[test]
@@ -530,20 +689,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = init_repo_with_vault(dir.path());
 
-        repo.vault_intent_create(IntentCreateOptions {
-            title: "Task A".to_string(),
-            priority: None,
-            assignee: None,
-            labels: vec![],
-        })
-        .unwrap();
-        repo.vault_intent_create(IntentCreateOptions {
-            title: "Task B".to_string(),
-            priority: None,
-            assignee: None,
-            labels: vec![],
-        })
-        .unwrap();
+        repo.vault_intent_create(create_opts_with_session("Task A", "sess-1", 1))
+            .unwrap();
+        repo.vault_intent_create(create_opts_with_session("Task B", "sess-1", 2))
+            .unwrap();
 
         let all = repo.vault_intent_list(None).unwrap();
         assert_eq!(all.len(), 2);
@@ -557,21 +706,11 @@ mod tests {
         let repo = init_repo_with_vault(dir.path());
 
         let r1 = repo
-            .vault_intent_create(IntentCreateOptions {
-                title: "Backlog item".to_string(),
-                priority: None,
-                assignee: None,
-                labels: vec![],
-            })
+            .vault_intent_create(create_opts_with_session("Backlog item", "s1", 1))
             .unwrap();
 
         let r2 = repo
-            .vault_intent_create(IntentCreateOptions {
-                title: "In progress item".to_string(),
-                priority: None,
-                assignee: None,
-                labels: vec![],
-            })
+            .vault_intent_create(create_opts_with_session("In progress item", "s1", 2))
             .unwrap();
 
         // Move second intent to in-progress
@@ -601,14 +740,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = init_repo_with_vault(dir.path());
 
-        let result = repo
-            .vault_intent_create(IntentCreateOptions {
-                title: "Show me".to_string(),
-                priority: None,
-                assignee: None,
-                labels: vec![],
-            })
-            .unwrap();
+        let result = repo.vault_intent_create(create_opts("Show me")).unwrap();
 
         let entry = repo.vault_intent_show(&result.id).unwrap();
         assert_eq!(entry.entry_type, VaultEntryType::Intent);
@@ -621,14 +753,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = init_repo_with_vault(dir.path());
 
-        let result = repo
-            .vault_intent_create(IntentCreateOptions {
-                title: "Update me".to_string(),
-                priority: None,
-                assignee: None,
-                labels: vec![],
-            })
-            .unwrap();
+        let result = repo.vault_intent_create(create_opts("Update me")).unwrap();
 
         let updated = repo
             .vault_intent_update(
@@ -655,14 +780,7 @@ mod tests {
         let repo = init_repo_with_vault(dir.path());
 
         // Create intent
-        let intent = repo
-            .vault_intent_create(IntentCreateOptions {
-                title: "Link test".to_string(),
-                priority: None,
-                assignee: None,
-                labels: vec![],
-            })
-            .unwrap();
+        let intent = repo.vault_intent_create(create_opts("Link test")).unwrap();
 
         // Manually store a goal entry so the link check passes
         repo.vault_store(
@@ -686,14 +804,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = init_repo_with_vault(dir.path());
 
-        let intent = repo
-            .vault_intent_create(IntentCreateOptions {
-                title: "Link test".to_string(),
-                priority: None,
-                assignee: None,
-                labels: vec![],
-            })
-            .unwrap();
+        let intent = repo.vault_intent_create(create_opts("Link test")).unwrap();
 
         assert!(repo.vault_intent_link(&intent.id, "nonexistent").is_err());
     }
@@ -704,13 +815,7 @@ mod tests {
         let repo = init_repo_with_vault(dir.path());
 
         // Create one intent to set the prefix
-        repo.vault_intent_create(IntentCreateOptions {
-            title: "Test".to_string(),
-            priority: None,
-            assignee: None,
-            labels: vec![],
-        })
-        .unwrap();
+        repo.vault_intent_create(create_opts("Test")).unwrap();
 
         let manifest = repo.vault_manifest().unwrap();
         let prefix = manifest.intent_prefix.clone();
@@ -747,6 +852,8 @@ mod tests {
             priority: None,
             assignee: None,
             labels: vec![],
+            session_id: None,
+            turn_id: None,
         });
         assert!(result.is_err());
     }
@@ -757,12 +864,7 @@ mod tests {
         let repo = init_repo_with_vault(dir.path());
 
         let result = repo
-            .vault_intent_create(IntentCreateOptions {
-                title: "Default priority".to_string(),
-                priority: None,
-                assignee: None,
-                labels: vec![],
-            })
+            .vault_intent_create(create_opts("Default priority"))
             .unwrap();
 
         let manifest = repo.vault_manifest().unwrap();
@@ -775,12 +877,7 @@ mod tests {
         let repo = init_repo_with_vault(dir.path());
 
         let intent = repo
-            .vault_intent_create(IntentCreateOptions {
-                title: "Idempotent link".to_string(),
-                priority: None,
-                assignee: None,
-                labels: vec![],
-            })
+            .vault_intent_create(create_opts("Idempotent link"))
             .unwrap();
 
         // Create a goal entry
@@ -815,5 +912,102 @@ mod tests {
 
         let result = repo.normalize_intent_id("notanumber");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_intent_create_manual_mode() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo
+            .vault_intent_create(create_opts_manual("Manual intent"))
+            .unwrap();
+
+        // Path should use manual/<identity>/ fallback
+        assert!(
+            result.intent_file.starts_with("intents/manual/"),
+            "Expected manual path, got: {}",
+            result.intent_file
+        );
+        assert!(result.intent_file.ends_with("/intent.md"));
+        // Should contain the identity name as a path segment
+        let identity = repo.resolve_vault_identity();
+        assert!(
+            result
+                .intent_file
+                .contains(&format!("manual/{}/", identity.name)),
+            "Expected identity '{}' in path: {}",
+            identity.name,
+            result.intent_file
+        );
+
+        // Should still be retrievable
+        let entry = repo.vault_intent_show(&result.id).unwrap();
+        let content = String::from_utf8_lossy(&entry.content_bytes);
+        assert!(content.contains("# Manual intent"));
+    }
+
+    #[test]
+    fn test_intent_create_view_name_in_result() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo.vault_intent_create(create_opts("View check")).unwrap();
+
+        // The view_name should match the repo's current view
+        assert_eq!(result.view_name, repo.current_view());
+        // The path should contain the view name
+        assert!(
+            result
+                .intent_file
+                .starts_with(&format!("intents/{}/", repo.current_view())),
+            "Path was: {}",
+            result.intent_file
+        );
+    }
+
+    #[test]
+    fn test_intent_create_view_in_frontmatter() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo
+            .vault_intent_create(create_opts("Frontmatter view"))
+            .unwrap();
+
+        let entry = repo.vault_intent_show(&result.id).unwrap();
+        let fm: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&entry.frontmatter_json).unwrap();
+        assert_eq!(
+            fm.get("view").and_then(|v| v.as_str()),
+            Some(repo.current_view())
+        );
+    }
+
+    #[test]
+    fn test_intent_update_syncs_title_to_manifest() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo
+            .vault_intent_create(create_opts("Original title"))
+            .unwrap();
+
+        repo.vault_intent_update(
+            &result.id,
+            IntentUpdateOptions {
+                title: Some("Updated title".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Manifest should have the updated title
+        let manifest = repo.vault_manifest().unwrap();
+        assert_eq!(manifest.intents[&result.id].title, "Updated title");
+
+        // List should show the updated title
+        let all = repo.vault_intent_list(None).unwrap();
+        assert_eq!(all[0].title, "Updated title");
     }
 }

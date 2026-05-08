@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use tree_sitter::{Node, Parser};
 
 use crate::entity::{Confidence, Entity, EntityKind, Reference};
+use crate::truncate_to_char_boundary;
 
 /// TypeScript entity extractor using tree-sitter
 pub struct TypeScriptExtractor {
@@ -1003,7 +1004,8 @@ impl TypeScriptExtractor {
             .map(|v| {
                 let text = self.node_text(&v, source).unwrap_or_default();
                 if text.len() > 50 {
-                    format!("{}...", &text[..50])
+                    let end = truncate_to_char_boundary(&text, 50);
+                    format!("{}...", &text[..end])
                 } else {
                     text
                 }
@@ -1157,7 +1159,8 @@ impl TypeScriptExtractor {
             .map(|v| {
                 let text = self.node_text(&v, source).unwrap_or_default();
                 if text.len() > 60 {
-                    format!("{}...", &text[..60])
+                    let end = truncate_to_char_boundary(&text, 60);
+                    format!("{}...", &text[..end])
                 } else {
                     text
                 }

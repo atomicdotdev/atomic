@@ -88,6 +88,13 @@ pub struct Log {
     /// flag to show the full 52-character Base32 hash.
     #[arg(long = "full-hash")]
     pub full_hash: bool,
+
+    /// Show full history including inherited changes.
+    ///
+    /// By default, draft views only show local changes (those recorded
+    /// after the fork). Use this flag to see the complete history.
+    #[arg(long = "all")]
+    pub all: bool,
 }
 
 impl Log {
@@ -113,6 +120,7 @@ impl Log {
             reverse: false,
             from: None,
             full_hash: false,
+            all: false,
         }
     }
 
@@ -161,6 +169,12 @@ impl Log {
     /// Builder: set full hash display.
     pub fn with_full_hash(mut self, full_hash: bool) -> Self {
         self.full_hash = full_hash;
+        self
+    }
+
+    /// Builder: set whether to show all history (including inherited).
+    pub fn with_all(mut self, all: bool) -> Self {
+        self.all = all;
         self
     }
 
@@ -411,6 +425,28 @@ impl Log {
             print_hint("Record changes with 'atomic record -m \"message\"'");
         }
     }
+
+    /// Print a fork-point separator indicating where the draft diverged.
+    fn print_fork_point(&self, parent_name: &str, inherited_count: u64) {
+        if self.format == LogFormat::Json {
+            // JSON output doesn't get decorative separators
+            return;
+        }
+        let changes_word = if inherited_count == 1 {
+            "change"
+        } else {
+            "changes"
+        };
+        println!(
+            "{}",
+            hint(format!(
+                "\n\u{2500}\u{2500} fork point: {} ({} {}) \u{2500}\u{2500}",
+                style_view(parent_name),
+                inherited_count,
+                changes_word
+            ))
+        );
+    }
 }
 
 impl Default for Log {
@@ -488,8 +524,61 @@ impl Command for Log {
             );
         }
 
+        // For draft views, filter to only local changes unless --all is set
+        let (display_entries, fork_point): (&[HistoryEntry], Option<(String, u64)>) = if self.all {
+            (&entries, None)
+        } else {
+            match repo.get_view_info(view_name) {
+                Ok(info) if info.scope == ViewScope::Draft => {
+                    match repo.parent_change_count(view_name) {
+                        Ok(Some((parent_name, inherited_count))) => {
+                            let local: Vec<&HistoryEntry> = entries
+                                .iter()
+                                .filter(|e| e.sequence >= inherited_count)
+                                .collect();
+                            if local.is_empty() {
+                                // All changes are inherited — show nothing
+                                // but still print the fork-point footer
+                                (&[], Some((parent_name, inherited_count)))
+                            } else {
+                                // We can't return a slice of a filtered
+                                // Vec, so we fall through and handle it
+                                // below with a separate print path.
+                                let local_entries: Vec<HistoryEntry> = entries
+                                    .iter()
+                                    .filter(|e| e.sequence >= inherited_count)
+                                    .cloned()
+                                    .collect();
+                                // Print the local entries
+                                self.print_entries(&local_entries);
+                                // Print fork-point separator
+                                self.print_fork_point(&parent_name, inherited_count);
+                                return Ok(());
+                            }
+                        }
+                        _ => (&entries, None),
+                    }
+                }
+                _ => (&entries, None),
+            }
+        };
+
         // Print entries
-        self.print_entries(&entries);
+        if display_entries.is_empty() {
+            if let Some((ref parent_name, inherited_count)) = fork_point {
+                // Draft view with only inherited changes
+                println!(
+                    "No local changes on draft view '{}'.\n",
+                    style_view(view_name)
+                );
+                self.print_fork_point(parent_name, inherited_count);
+            }
+        } else {
+            self.print_entries(display_entries);
+            if let Some((ref parent_name, inherited_count)) = fork_point {
+                self.print_fork_point(parent_name, inherited_count);
+            }
+        }
 
         Ok(())
     }

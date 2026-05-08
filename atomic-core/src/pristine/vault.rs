@@ -159,6 +159,12 @@ pub struct IntentSummary {
     pub goals: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_by: Vec<String>,
+    /// Intent title (stored for list display without path lookup).
+    #[serde(default)]
+    pub title: String,
+    /// The vault path to the intent file.
+    #[serde(default)]
+    pub vault_path: String,
 }
 
 /// Summary of a skill file in the manifest.

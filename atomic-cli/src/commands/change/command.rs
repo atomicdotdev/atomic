@@ -634,7 +634,7 @@ impl ChangeCmd {
             // Display nodes
             for node in &graph.nodes {
                 let kind_str = format!("{}", node.kind);
-                let kind_colored = &kind_str;
+                let kind_styled = format!("{}", style(&kind_str).bold().cyan());
                 let duration = node
                     .duration_ms
                     .map(|ms| format!(" ({}ms)", ms))
@@ -643,12 +643,13 @@ impl ChangeCmd {
                 let tool_str = if tool.is_empty() {
                     String::new()
                 } else {
-                    format!(" [{}]", tool)
+                    format!(" {}", hint(&format!("[{}]", tool)))
                 };
 
                 output.push_str(&format!(
-                    "  {} {}{}{}\n",
-                    kind_colored,
+                    "  {} {} {}{}{}\n",
+                    kind_styled,
+                    hint("\u{00bb}"),
                     node.summary,
                     tool_str,
                     hint(&duration)
