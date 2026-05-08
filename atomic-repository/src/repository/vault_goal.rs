@@ -84,7 +84,7 @@ impl Repository {
     ) -> Result<GoalStartResult, RepositoryError> {
         if !self.has_vault()? {
             return Err(RepositoryError::InvalidOperation {
-                message: "Vault not initialized. Run `atomic init --vault` first.".to_string(),
+                message: "Vault not initialized. Run `atomic vault init` first.".to_string(),
             });
         }
 
