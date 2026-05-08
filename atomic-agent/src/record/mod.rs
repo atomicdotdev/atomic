@@ -146,9 +146,9 @@ pub fn record_turn(
         })?;
 
     // Step 2: Status — find out what the agent changed.
-    // Fast mode (no content hashing — record() itself does the full hash check)
-    // but include untracked files: agents create new files all the time and we
-    // need to see them here to add+record them in Step 3.
+    // Include untracked files because agent turns commonly create new source,
+    // config, and test files. Those must be auto-added before recording so the
+    // turn produces an Atomic change with provenance instead of leaving files
     // untracked in the working copy.
     let status = repo
         .status(atomic_repository::status::StatusOptions::fast().with_untracked(true))

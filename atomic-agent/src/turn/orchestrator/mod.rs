@@ -341,11 +341,11 @@ pub(crate) fn truncate_prompt(prompt: &str, max_len: usize) -> String {
 impl TurnOrchestrator {
     /// Fast check for working copy changes.
     ///
-    /// Uses `StatusOptions::fast()` (mtime-based, no content hashing) with
-    /// `with_untracked(true)` so the gate also detects new files the agent
-    /// created — the most common case. Without untracked detection, turns
-    /// that only create new files (e.g., a fresh `Foo.tsx`) would be skipped
-    /// silently, never reaching `record_turn`.
+    /// Uses `StatusOptions::fast()` so turn-end recording sees both tracked
+    /// changes and untracked files created by the agent. This intentionally
+    /// includes the untracked filesystem walk: if we ignore untracked files
+    /// here, a turn that only creates new files exits before `record_turn()`
+    /// can auto-add and record them with provenance.
     pub(crate) fn has_working_copy_changes(&self) -> bool {
         let repo = match atomic_repository::Repository::open(&self.repo_root) {
             Ok(r) => r,
@@ -354,7 +354,7 @@ impl TurnOrchestrator {
 
         let opts = atomic_repository::status::StatusOptions::fast().with_untracked(true);
         match repo.status(opts) {
-            Ok(status) => !status.is_clean() || status.untracked_count() > 0,
+            Ok(status) => !status.is_clean() || status.has_untracked(),
             Err(_) => true, // can't check — assume changes
         }
     }
