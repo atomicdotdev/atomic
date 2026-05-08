@@ -261,6 +261,7 @@ jobs:
 
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
             --title "Atomic ${TAG}" \
             --notes-file release-notes.md \
             $PRERELEASE_FLAG \
