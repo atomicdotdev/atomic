@@ -45,6 +45,9 @@ log = { workspace = true }
 walkdir = { workspace = true }
 ignore = { workspace = true }
 
+# File locking (flock-based advisory locks for concurrent hook processes)
+fs2 = "0.4"
+
 # Home directory resolution (for ~/.atomic/identities/)
 dirs = { workspace = true }
 

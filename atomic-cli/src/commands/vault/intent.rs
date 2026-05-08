@@ -43,10 +43,27 @@
 
 use clap::{Parser, Subcommand};
 
+use atomic_agent::turn::session::SessionStore;
 use atomic_repository::{IntentCreateOptions, IntentUpdateOptions, Repository};
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
+
+/// Resolve the active agent session for the current view.
+///
+/// Scans `.atomic/sessions/` for a session whose `view_name` matches
+/// the repository's current view. Returns `(session_id, turn_count)`
+/// if found.
+fn resolve_active_session(repo: &Repository) -> Option<(String, u32)> {
+    let sessions_dir = repo.dot_dir().join("sessions");
+    let store = SessionStore::new(&sessions_dir).ok()?;
+    let current_view = repo.current_view();
+    let active = store.find_active().ok()?;
+    active
+        .into_iter()
+        .find(|s| s.view_name == current_view)
+        .map(|s| (s.session_id.clone(), s.turn_count))
+}
 
 // Intent Subcommands
 
@@ -178,12 +195,19 @@ impl Command for IntentCreate {
             .map(|l| l.split(',').map(|s| s.trim().to_string()).collect())
             .unwrap_or_default();
 
+        // Resolve session/turn from the active agent session (if any).
+        let (session_id, turn_id) = resolve_active_session(&repo)
+            .map(|(sid, tc)| (Some(sid), Some(tc + 1))) // next turn
+            .unwrap_or((None, None));
+
         let result = repo
             .vault_intent_create(IntentCreateOptions {
                 title: self.title.clone(),
                 priority: self.priority.clone(),
                 assignee: self.assignee.clone(),
                 labels,
+                session_id,
+                turn_id,
             })
             .map_err(CliError::Repository)?;
 
@@ -192,6 +216,7 @@ impl Command for IntentCreate {
                 "id": result.id,
                 "intent_dir": result.intent_dir,
                 "intent_file": result.intent_file,
+                "view_name": result.view_name,
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {

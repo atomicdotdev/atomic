@@ -540,12 +540,26 @@ impl Clone {
         if stats.has_applied() {
             let spinner = create_spinner("Building search index...");
 
-            // KG enrichment
-            if repo.has_vault().unwrap_or(false) {
-                match repo.kg_enrich_from_vcs() {
-                    Ok(kg_stats) => log::info!("KG enriched: {}", kg_stats),
-                    Err(e) => log::warn!("KG enrichment failed: {}", e),
+            // Bootstrap vault if .vault/ files were cloned but redb tables don't exist.
+            // This happens when the source repo had a vault initialized.
+            let vault_on_disk = repo.vault_dir().exists();
+            let vault_in_db = repo.has_vault().unwrap_or(false);
+            if vault_on_disk && !vault_in_db {
+                log::info!("Vault files detected — bootstrapping vault from cloned content");
+                match repo.bootstrap_vault_from_working_copy() {
+                    Ok(()) => log::info!("Vault bootstrapped from cloned content"),
+                    Err(e) => log::warn!("Failed to bootstrap vault: {}", e),
                 }
+            }
+
+            // KG enrichment — runs for every clone, not just vaulted repos.
+            // Ensure KG tables exist (idempotent — no-op if already created)
+            if let Err(e) = repo.init_kg() {
+                log::warn!("KG table init failed: {}", e);
+            }
+            match repo.kg_enrich_from_vcs() {
+                Ok(kg_stats) => log::info!("KG enriched: {}", kg_stats),
+                Err(e) => log::warn!("KG enrichment failed: {}", e),
             }
 
             // Content search index (syntext)
