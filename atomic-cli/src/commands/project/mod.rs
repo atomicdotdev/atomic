@@ -217,7 +217,7 @@ mod tests {
         }
 
         let list = list::ProjectList {
-            workspace: "ws".to_string(),
+            workspace: Some("ws".to_string()),
             org: None,
             format: "table".to_string(),
         };
@@ -225,7 +225,7 @@ mod tests {
 
         let create = create::ProjectCreate {
             name: "proj".to_string(),
-            workspace: "ws".to_string(),
+            workspace: Some("ws".to_string()),
             description: None,
             kind: None,
             default_view: "dev".to_string(),

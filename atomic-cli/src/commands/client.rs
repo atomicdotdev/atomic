@@ -45,24 +45,28 @@ use crate::error::{CliError, CliResult};
 /// - Identity store cannot be opened or no default identity set.
 /// - HTTP client construction failure.
 pub fn build_client(org_override: Option<&str>) -> CliResult<StorageClient> {
+    let (client, _org_slug) = build_client_with_org(org_override)?;
+    Ok(client)
+}
+
+/// Build a [`StorageClient`] and return the resolved org slug alongside it.
+///
+/// Useful for commands that also need to resolve org-scoped state (e.g.
+/// per-org default workspace lookup). Avoids resolving the org twice.
+pub fn build_client_with_org(
+    org_override: Option<&str>,
+) -> CliResult<(StorageClient, String)> {
     let config = GlobalConfig::load()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
 
     let server = &config.server;
-    if !server.is_configured() {
+    if server.url.is_none() {
         return Err(CliError::Internal(anyhow::anyhow!(
             "Server not configured. Run 'atomic identity register <server-url>' first."
         )));
     }
 
-    let org_slug = org_override
-        .map(|s| s.to_string())
-        .or_else(|| server.default_org.clone())
-        .ok_or_else(|| {
-            CliError::Internal(anyhow::anyhow!(
-                "No organization specified. Use --org or set a default with 'atomic org switch'."
-            ))
-        })?;
+    let org_slug = resolve_org(org_override)?;
 
     let base_url = server.org_base_url(&org_slug).ok_or_else(|| {
         CliError::Internal(anyhow::anyhow!(
@@ -86,8 +90,11 @@ pub fn build_client(org_override: Option<&str>) -> CliResult<StorageClient> {
 
     let bearer_token = identity.public_key_base32();
 
-    StorageClient::new(&base_url, &org_slug, &bearer_token)
-        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to create storage client: {}", e)))
+    let client = StorageClient::new(&base_url, &org_slug, &bearer_token).map_err(|e| {
+        CliError::Internal(anyhow::anyhow!("Failed to create storage client: {}", e))
+    })?;
+
+    Ok((client, org_slug))
 }
 
 /// Convenience: map a [`atomic_remote::RemoteError`] to a [`CliError`].
@@ -96,6 +103,82 @@ pub fn remote_err(e: atomic_remote::RemoteError) -> CliError {
         message: e.to_string(),
         url: None,
     }
+}
+
+/// Resolve the org slug for a command, with fallback to the configured default.
+///
+/// Resolution order:
+/// 1. `--org` override (if `Some(non-empty)`)
+/// 2. `server.default_org` from global config
+/// 3. Error with a hint to run `atomic org switch`
+///
+/// An explicit empty string (`--org ""`) is an error: the user asked for "no
+/// org" which never makes sense.
+pub fn resolve_org(org_override: Option<&str>) -> CliResult<String> {
+    if let Some(s) = org_override {
+        if s.is_empty() {
+            return Err(CliError::InvalidArgument {
+                message: "Organization slug cannot be empty.".to_string(),
+            });
+        }
+        return Ok(s.to_string());
+    }
+
+    let config = GlobalConfig::load()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
+
+    config.server.default_org.ok_or_else(|| {
+        CliError::InvalidArgument {
+            message: "No organization specified.\n  \
+                      Use --org or set a default with: atomic org switch <slug>"
+                .to_string(),
+        }
+    })
+}
+
+/// Resolve the workspace slug for a command, with fallback to the
+/// org-scoped default workspace from global config.
+///
+/// Workspaces are org-scoped, so the lookup is keyed by `org_slug`. The
+/// caller is responsible for resolving the org first (typically with
+/// [`resolve_org`]).
+///
+/// Resolution order:
+/// 1. `--workspace` override (if `Some(non-empty)`)
+/// 2. `server.default_workspaces[org_slug]` from global config
+/// 3. Error with a hint to run `atomic workspace switch`
+///
+/// An explicit empty string (`--workspace ""`) is an error: the user
+/// explicitly asked for "no workspace", which is meaningless. Distinguishing
+/// `None` (not provided → fall back to default) from `Some("")` (provided
+/// empty → error) prevents a class of confusing bugs.
+pub fn resolve_workspace(
+    org_slug: &str,
+    workspace_override: Option<&str>,
+) -> CliResult<String> {
+    if let Some(s) = workspace_override {
+        if s.is_empty() {
+            return Err(CliError::InvalidArgument {
+                message: "Workspace slug cannot be empty.".to_string(),
+            });
+        }
+        return Ok(s.to_string());
+    }
+
+    let config = GlobalConfig::load()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
+
+    config
+        .server
+        .default_workspaces
+        .get(org_slug)
+        .cloned()
+        .ok_or_else(|| CliError::InvalidArgument {
+            message: format!(
+                "No workspace specified for org '{org_slug}'.\n  \
+                 Use --workspace or set a default with: atomic workspace switch <slug>"
+            ),
+        })
 }
 
 /// Resolve a flexible identity reference to a UUID.
@@ -209,5 +292,43 @@ mod tests {
         // An identifier containing '@' should be treated as an email.
         assert!("alice@example.com".contains('@'));
         assert!(!"alice".contains('@'));
+    }
+
+    // -- resolve_org / resolve_workspace (override-branch only;
+    //    the config-fallback branch touches disk and is exercised by
+    //    integration tests). --
+
+    #[test]
+    fn resolve_org_passes_through_explicit_override() {
+        let result = resolve_org(Some("acme")).unwrap();
+        assert_eq!(result, "acme");
+    }
+
+    #[test]
+    fn resolve_org_rejects_explicit_empty_override() {
+        let err = resolve_org(Some("")).unwrap_err();
+        match err {
+            CliError::InvalidArgument { message } => {
+                assert!(message.contains("cannot be empty"));
+            }
+            other => panic!("expected InvalidArgument, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_workspace_passes_through_explicit_override() {
+        let result = resolve_workspace("acme", Some("backend")).unwrap();
+        assert_eq!(result, "backend");
+    }
+
+    #[test]
+    fn resolve_workspace_rejects_explicit_empty_override() {
+        let err = resolve_workspace("acme", Some("")).unwrap_err();
+        match err {
+            CliError::InvalidArgument { message } => {
+                assert!(message.contains("cannot be empty"));
+            }
+            other => panic!("expected InvalidArgument, got {:?}", other),
+        }
     }
 }

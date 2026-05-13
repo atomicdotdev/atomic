@@ -33,10 +33,12 @@
 
 use clap::Parser;
 
+use atomic_config::GlobalConfig;
+
 use crate::commands::client::build_client;
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
-use crate::output::{print_success, print_warning};
+use crate::output::{print_hint, print_success, print_warning};
 
 /// Delete an organization.
 ///
@@ -112,8 +114,61 @@ impl OrgDelete {
 
         print_success(&format!("Deleted organization: {}", self.slug));
 
+        // Clean up local config: if the deleted org was the current default
+        // or had a configured default workspace, those entries are now stale
+        // and would surface as confusing errors on subsequent commands.
+        // We log but do not fail on config errors here — the server-side
+        // deletion has already succeeded.
+        if let Err(e) = clean_up_local_config(&self.slug) {
+            log::warn!("Failed to clean up local config after org delete: {e}");
+        }
+
         Ok(())
     }
+}
+
+/// Remove references to a deleted org from the local global config.
+///
+/// Returns the side effects performed so the caller can print appropriate
+/// hints. Specifically:
+///   - If `server.default_org == Some(slug)`, set it to `None` and hint.
+///   - Remove `server.default_workspaces[slug]` if present.
+fn clean_up_local_config(deleted_slug: &str) -> CliResult<()> {
+    let mut config = GlobalConfig::load().map_err(|e| {
+        CliError::Internal(anyhow::anyhow!("Failed to load global config: {e}"))
+    })?;
+
+    let mut changed = false;
+    let was_default_org = config.server.default_org.as_deref() == Some(deleted_slug);
+    if was_default_org {
+        config.server.default_org = None;
+        changed = true;
+    }
+    if config
+        .server
+        .default_workspaces
+        .remove(deleted_slug)
+        .is_some()
+    {
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(());
+    }
+
+    config.save().map_err(|e| {
+        CliError::Internal(anyhow::anyhow!("Failed to save global config: {e}"))
+    })?;
+
+    if was_default_org {
+        print_hint(&format!(
+            "Default org was '{deleted_slug}' — run 'atomic org switch <slug>' \
+             to pick a new one."
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

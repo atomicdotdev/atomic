@@ -5,13 +5,15 @@
 //! # Usage
 //!
 //! ```text
-//! atomic project create <NAME> --workspace <SLUG> [OPTIONS]
+//! atomic project create <NAME> [--workspace <SLUG>] [OPTIONS]
 //!
 //! Arguments:
 //!   <NAME>  Name of the project to create
 //!
 //! Options:
-//!   -w, --workspace <SLUG>     Workspace to create the project in (required)
+//!   -w, --workspace <SLUG>     Workspace to create the project in.
+//!                              Falls back to the default workspace for the
+//!                              current org if omitted.
 //!       --description <TEXT>   Optional description
 //!       --kind <KIND>          Project kind (rust, python, node, go, java, ruby, zig)
 //!       --default-view <NAME>  Default view name (default: "dev")
@@ -22,7 +24,13 @@
 //! # Examples
 //!
 //! ```text
+//! # Explicit workspace
 //! $ atomic project create my-service --workspace backend
+//! ✓ Created project: my-service (slug: my-service)
+//!
+//! # Uses the default workspace for the current org
+//! $ atomic workspace switch backend
+//! $ atomic project create my-service
 //! ✓ Created project: my-service (slug: my-service)
 //!
 //!   Workspace:    backend
@@ -39,7 +47,7 @@ use clap::Parser;
 
 use atomic_remote::storage_types::{CreateProjectRequest, Visibility};
 
-use crate::commands::client::{build_client, remote_err};
+use crate::commands::client::{build_client_with_org, remote_err, resolve_workspace};
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_next_steps, print_success, KeyValueTable};
@@ -48,6 +56,9 @@ use crate::output::{print_next_steps, print_success, KeyValueTable};
 ///
 /// The project will be created on the configured atomic-storage server
 /// and can then be linked to a local repository with `atomic project init`.
+///
+/// If `--workspace` is not given, falls back to the default workspace for
+/// the current org (set via `atomic workspace switch <slug>`).
 #[derive(Debug, Parser, Default)]
 #[command(name = "create")]
 pub struct ProjectCreate {
@@ -56,8 +67,10 @@ pub struct ProjectCreate {
     pub name: String,
 
     /// Workspace slug to create the project in.
-    #[arg(long, short = 'w', default_value = "")]
-    pub workspace: String,
+    ///
+    /// Falls back to the default workspace for the current org if omitted.
+    #[arg(long, short = 'w')]
+    pub workspace: Option<String>,
 
     /// Optional description for the project.
     #[arg(long)]
@@ -102,18 +115,13 @@ impl Command for ProjectCreate {
             });
         }
 
-        if self.workspace.is_empty() {
-            return Err(CliError::InvalidArgument {
-                message: "Workspace slug is required (--workspace).".to_string(),
-            });
-        }
-
         let rt = tokio::runtime::Runtime::new().map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {}", e))
         })?;
 
         rt.block_on(async {
-            let client = build_client(self.org.as_deref())?;
+            let (client, org_slug) = build_client_with_org(self.org.as_deref())?;
+            let workspace = resolve_workspace(&org_slug, self.workspace.as_deref())?;
             let visibility = self.parse_visibility()?;
 
             let req = CreateProjectRequest {
@@ -125,7 +133,7 @@ impl Command for ProjectCreate {
             };
 
             let project = client
-                .create_project(&self.workspace, &req)
+                .create_project(&workspace, &req)
                 .await
                 .map_err(remote_err)?;
 
@@ -138,12 +146,12 @@ impl Command for ProjectCreate {
             let vcs_url = format!(
                 "{}/workspaces/{}/projects/{}/code",
                 client.base_url(),
-                self.workspace,
+                workspace,
                 project.slug,
             );
 
             let details = KeyValueTable::new()
-                .add("Workspace", &self.workspace)
+                .add("Workspace", &workspace)
                 .add("Default view", &project.default_view)
                 .add("Visibility", project.visibility.to_string())
                 .add("VCS URL", &vcs_url);
@@ -154,7 +162,7 @@ impl Command for ProjectCreate {
                 (
                     &format!(
                         "atomic project init {} --workspace {}",
-                        project.slug, self.workspace
+                        project.slug, workspace
                     ),
                     "Link a local repo to this project",
                 ),
@@ -174,7 +182,7 @@ mod tests {
     fn default_has_empty_fields() {
         let cmd = ProjectCreate::default();
         assert_eq!(cmd.name, "");
-        assert_eq!(cmd.workspace, "");
+        assert!(cmd.workspace.is_none());
         assert_eq!(cmd.default_view, "");
         assert!(cmd.description.is_none());
         assert!(cmd.kind.is_none());
@@ -185,7 +193,7 @@ mod tests {
     fn with_all_options() {
         let cmd = ProjectCreate {
             name: "svc".to_string(),
-            workspace: "backend".to_string(),
+            workspace: Some("backend".to_string()),
             description: Some("A microservice".to_string()),
             kind: Some("rust".to_string()),
             default_view: "main".to_string(),
@@ -193,7 +201,7 @@ mod tests {
             org: Some("acme".to_string()),
         };
         assert_eq!(cmd.name, "svc");
-        assert_eq!(cmd.workspace, "backend");
+        assert_eq!(cmd.workspace.as_deref(), Some("backend"));
         assert_eq!(cmd.description.as_deref(), Some("A microservice"));
         assert_eq!(cmd.kind.as_deref(), Some("rust"));
         assert_eq!(cmd.default_view, "main");
@@ -205,7 +213,7 @@ mod tests {
     fn parse_visibility_valid() {
         let cmd = ProjectCreate {
             name: "p".to_string(),
-            workspace: "w".to_string(),
+            workspace: Some("w".to_string()),
             visibility: "private".to_string(),
             ..Default::default()
         };
@@ -217,7 +225,7 @@ mod tests {
     fn parse_visibility_invalid() {
         let cmd = ProjectCreate {
             name: "p".to_string(),
-            workspace: "w".to_string(),
+            workspace: Some("w".to_string()),
             visibility: "bogus".to_string(),
             ..Default::default()
         };
@@ -232,22 +240,6 @@ mod tests {
         match result.unwrap_err() {
             CliError::InvalidArgument { message } => {
                 assert!(message.contains("required"));
-            }
-            other => panic!("expected InvalidArgument, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn empty_workspace_rejected() {
-        let cmd = ProjectCreate {
-            name: "proj".to_string(),
-            ..Default::default()
-        };
-        let result = cmd.run();
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            CliError::InvalidArgument { message } => {
-                assert!(message.contains("Workspace"));
             }
             other => panic!("expected InvalidArgument, got {:?}", other),
         }
