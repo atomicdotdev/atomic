@@ -134,9 +134,8 @@ impl OrgDelete {
 ///   - If `server.default_org == Some(slug)`, set it to `None` and hint.
 ///   - Remove `server.default_workspaces[slug]` if present.
 fn clean_up_local_config(deleted_slug: &str) -> CliResult<()> {
-    let mut config = GlobalConfig::load().map_err(|e| {
-        CliError::Internal(anyhow::anyhow!("Failed to load global config: {e}"))
-    })?;
+    let mut config = GlobalConfig::load()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {e}")))?;
 
     let mut changed = false;
     let was_default_org = config.server.default_org.as_deref() == Some(deleted_slug);
@@ -157,9 +156,9 @@ fn clean_up_local_config(deleted_slug: &str) -> CliResult<()> {
         return Ok(());
     }
 
-    config.save().map_err(|e| {
-        CliError::Internal(anyhow::anyhow!("Failed to save global config: {e}"))
-    })?;
+    config
+        .save()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to save global config: {e}")))?;
 
     if was_default_org {
         print_hint(&format!(

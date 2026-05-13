@@ -90,13 +90,15 @@ impl Command for WorkspaceSwitch {
                     message: "Organization slug cannot be empty.".to_string(),
                 });
             }
-            None => config.server.default_org.clone().ok_or_else(|| {
-                CliError::InvalidArgument {
+            None => config
+                .server
+                .default_org
+                .clone()
+                .ok_or_else(|| CliError::InvalidArgument {
                     message: "No default org set. Use --org or first run: \
                               atomic org switch <slug>"
                         .to_string(),
-                }
-            })?,
+                })?,
         };
 
         let previous = config

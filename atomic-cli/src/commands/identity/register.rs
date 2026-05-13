@@ -221,7 +221,11 @@ impl Register {
                     "Create your first workspace",
                 ),
                 (
-                    "atomic project create <name> --workspace <workspace>",
+                    "atomic workspace switch <name>",
+                    "Set as your default workspace",
+                ),
+                (
+                    "atomic project create <project-name>",
                     "Create a project (prints the clone/push URL)",
                 ),
             ]);

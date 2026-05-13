@@ -53,9 +53,7 @@ pub fn build_client(org_override: Option<&str>) -> CliResult<StorageClient> {
 ///
 /// Useful for commands that also need to resolve org-scoped state (e.g.
 /// per-org default workspace lookup). Avoids resolving the org twice.
-pub fn build_client_with_org(
-    org_override: Option<&str>,
-) -> CliResult<(StorageClient, String)> {
+pub fn build_client_with_org(org_override: Option<&str>) -> CliResult<(StorageClient, String)> {
     let config = GlobalConfig::load()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
 
@@ -127,13 +125,14 @@ pub fn resolve_org(org_override: Option<&str>) -> CliResult<String> {
     let config = GlobalConfig::load()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
 
-    config.server.default_org.ok_or_else(|| {
-        CliError::InvalidArgument {
+    config
+        .server
+        .default_org
+        .ok_or_else(|| CliError::InvalidArgument {
             message: "No organization specified.\n  \
                       Use --org or set a default with: atomic org switch <slug>"
                 .to_string(),
-        }
-    })
+        })
 }
 
 /// Resolve the workspace slug for a command, with fallback to the
@@ -152,10 +151,7 @@ pub fn resolve_org(org_override: Option<&str>) -> CliResult<String> {
 /// explicitly asked for "no workspace", which is meaningless. Distinguishing
 /// `None` (not provided → fall back to default) from `Some("")` (provided
 /// empty → error) prevents a class of confusing bugs.
-pub fn resolve_workspace(
-    org_slug: &str,
-    workspace_override: Option<&str>,
-) -> CliResult<String> {
+pub fn resolve_workspace(org_slug: &str, workspace_override: Option<&str>) -> CliResult<String> {
     if let Some(s) = workspace_override {
         if s.is_empty() {
             return Err(CliError::InvalidArgument {

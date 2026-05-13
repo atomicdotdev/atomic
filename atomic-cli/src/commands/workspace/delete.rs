@@ -115,9 +115,8 @@ impl Command for WorkspaceDelete {
 /// Remove a deleted workspace from `[server.default_workspaces]` if it was
 /// the configured default for its org.
 fn clean_up_local_config(org_slug: &str, deleted_workspace: &str) -> CliResult<()> {
-    let mut config = GlobalConfig::load().map_err(|e| {
-        CliError::Internal(anyhow::anyhow!("Failed to load global config: {e}"))
-    })?;
+    let mut config = GlobalConfig::load()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {e}")))?;
 
     let was_default = config
         .server
@@ -131,9 +130,9 @@ fn clean_up_local_config(org_slug: &str, deleted_workspace: &str) -> CliResult<(
     }
 
     config.server.default_workspaces.remove(org_slug);
-    config.save().map_err(|e| {
-        CliError::Internal(anyhow::anyhow!("Failed to save global config: {e}"))
-    })?;
+    config
+        .save()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to save global config: {e}")))?;
 
     print_hint(&format!(
         "Default workspace for '{org_slug}' was '{deleted_workspace}' — \
