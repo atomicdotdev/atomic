@@ -28,8 +28,6 @@ impl Repository {
         path: P,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
         use atomic_core::output::alive::RetrieveOptions;
-        use atomic_core::record::workflow::retrieve::retrieve_content_with_filter;
-
         let path = path.as_ref();
         let normalized = normalize_path(path);
 
@@ -95,7 +93,8 @@ impl Repository {
 
         // All edges are in GRAPH — raw transaction sees everything.
         // The change_filter handles view isolation.
-        let content = retrieve_content_with_filter(&txn, &self.change_store, position, options)
+        let content =
+            retrieve_content_with_filter_fast(&txn, &self.change_store, inode, position, options)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if content.is_empty() {
@@ -174,8 +173,6 @@ impl Repository {
         exclude_hash: &Hash,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
         use atomic_core::output::alive::RetrieveOptions;
-        use atomic_core::record::workflow::retrieve::retrieve_content_with_filter;
-
         let path = path.as_ref();
         let normalized = normalize_path(path);
 
@@ -220,7 +217,8 @@ impl Repository {
 
         let options = RetrieveOptions::new().with_change_filter(change_filter);
 
-        let content = retrieve_content_with_filter(&txn, &self.change_store, position, options)
+        let content =
+            retrieve_content_with_filter_fast(&txn, &self.change_store, inode, position, options)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if content.is_empty() {
@@ -739,11 +737,11 @@ impl Repository {
         require_tracked: bool,
     ) -> Result<Option<Vec<u8>>, RepositoryError>
     where
-        T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::TreeTxnT,
+        T: atomic_core::pristine::GraphTxnT
+            + atomic_core::pristine::TreeTxnT
+            + atomic_core::pristine::InodeGraphOps,
     {
         use atomic_core::output::alive::RetrieveOptions;
-        use atomic_core::record::workflow::retrieve::retrieve_content_with_filter;
-
         // Check if file is tracked (skip for deleted files — they are no
         // longer in the TREE but their inode/content is still in the graph).
         if require_tracked
@@ -771,8 +769,11 @@ impl Repository {
         let options = RetrieveOptions::new().with_change_filter(change_set.clone());
 
         // Retrieve content from the graph with the filter
-        let content = retrieve_content_with_filter(txn, &self.change_store, position, options)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let content =
+            retrieve_content_with_filter_fast(txn, &self.change_store, inode, position, options)
+            .map_err(|e: atomic_core::record::RecordError| {
+                RepositoryError::Database(e.to_string())
+            })?;
 
         if content.is_empty() {
             Ok(None)
@@ -813,4 +814,207 @@ impl Repository {
         // Archive with the tag's state
         self.archive(destination, options)
     }
+}
+
+fn retrieve_content_with_filter_fast<T, C>(
+    txn: &T,
+    changes: &C,
+    inode: Inode,
+    position: Position<NodeId>,
+    options: atomic_core::output::alive::RetrieveOptions,
+) -> atomic_core::record::RecordResult<Vec<u8>>
+where
+    T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::InodeGraphOps,
+    C: atomic_core::change::ChangeStore,
+{
+    let trace_retrieve = std::env::var_os("ATOMIC_TRACE_RETRIEVE").is_some();
+    if let Some(content) = try_retrieve_linear_content_with_filter(txn, changes, inode, position, &options)? {
+        if trace_retrieve {
+            eprintln!(
+                "[retrieve_content_with_filter_fast] inode fast path hit bytes={}",
+                content.len()
+            );
+        }
+        return Ok(content);
+    }
+
+    if trace_retrieve {
+        eprintln!("[retrieve_content_with_filter_fast] falling back to retrieve_graph");
+    }
+
+    atomic_core::record::workflow::retrieve::retrieve_content_with_filter(txn, changes, position, options)
+}
+
+fn try_retrieve_linear_content_with_filter<T, C>(
+    txn: &T,
+    changes: &C,
+    inode: Inode,
+    position: Position<NodeId>,
+    options: &atomic_core::output::alive::RetrieveOptions,
+) -> atomic_core::record::RecordResult<Option<Vec<u8>>>
+where
+    T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::InodeGraphOps,
+    C: atomic_core::change::ChangeStore,
+{
+    use atomic_core::types::EdgeFlags;
+    let trace_retrieve = std::env::var_os("ATOMIC_TRACE_RETRIEVE").is_some();
+
+    if position == Position::ROOT {
+        return Ok(Some(Vec::new()));
+    }
+
+    let inode_marker = position.inode_node();
+    let mut current = inode_marker;
+    let mut visited = std::collections::HashSet::new();
+    let mut vertices = Vec::new();
+
+    loop {
+        if !visited.insert(current) {
+            if trace_retrieve {
+                eprintln!(
+                    "[try_retrieve_linear_content_with_filter] cycle at {}",
+                    current
+                );
+            }
+            return Ok(None);
+        }
+
+        let mut adj = txn
+            .init_inode_adj(inode, current, EdgeFlags::BLOCK, EdgeFlags::all())
+            .map_err(|e| {
+                atomic_core::record::RecordError::Io(std::io::Error::other(format!(
+                    "Failed to init inode traversal: {}",
+                    e
+                )))
+            })?;
+
+        let mut next_vertex = None;
+
+        while let Some(edge_result) = txn.next_inode_adj(&mut adj) {
+            let edge = match edge_result {
+                Ok(edge) => edge,
+                Err(_) => {
+                    if trace_retrieve {
+                        eprintln!(
+                            "[try_retrieve_linear_content_with_filter] inode adj read error at {}",
+                            current
+                        );
+                    }
+                    return Ok(None);
+                }
+            };
+
+            let flags = edge.flag();
+            if flags.contains(EdgeFlags::PARENT)
+                || flags.contains(EdgeFlags::PSEUDO)
+                || flags.contains(EdgeFlags::FOLDER)
+            {
+                continue;
+            }
+
+            if !options.passes_filter(edge.introduced_by()) {
+                continue;
+            }
+
+            if flags.contains(EdgeFlags::DELETED) {
+                if trace_retrieve {
+                    eprintln!(
+                        "[try_retrieve_linear_content_with_filter] deleted edge from {} to {}",
+                        current,
+                        edge.dest()
+                    );
+                }
+                return Ok(None);
+            }
+
+            let Some(dest) = (match txn.find_block_in_inode(inode, edge.dest()) {
+                Ok(dest) => dest,
+                Err(_) => {
+                    if trace_retrieve {
+                        eprintln!(
+                            "[try_retrieve_linear_content_with_filter] find_block_in_inode error for {}",
+                            edge.dest()
+                        );
+                    }
+                    return Ok(None);
+                }
+            }) else {
+                if trace_retrieve {
+                    eprintln!(
+                        "[try_retrieve_linear_content_with_filter] no inode block for {}",
+                        edge.dest()
+                    );
+                }
+                return Ok(None);
+            };
+
+            if !options.passes_filter(dest.change) {
+                continue;
+            }
+
+            if next_vertex.replace(dest).is_some() {
+                if trace_retrieve {
+                    eprintln!(
+                        "[try_retrieve_linear_content_with_filter] multiple successors from {}",
+                        current
+                    );
+                }
+                return Ok(None);
+            }
+        }
+
+        let Some(dest) = next_vertex else {
+            break;
+        };
+
+        let is_inode_marker = dest.start == dest.end && dest.start == position.pos;
+        if !is_inode_marker && !dest.change.is_root() && dest.start != dest.end {
+            vertices.push(dest);
+        }
+
+        current = dest;
+    }
+
+    let mut content = Vec::new();
+    let mut change_contents = std::collections::HashMap::<Hash, Vec<u8>>::new();
+    for node in vertices {
+        let Some(hash) = txn.get_external(node.change).ok().flatten() else {
+            if trace_retrieve {
+                eprintln!(
+                    "[try_retrieve_linear_content_with_filter] missing hash for {}",
+                    node
+                );
+            }
+            return Ok(None);
+        };
+
+        if let std::collections::hash_map::Entry::Vacant(entry) = change_contents.entry(hash) {
+            let Ok(change) = changes.get_change(&hash) else {
+                if trace_retrieve {
+                    eprintln!(
+                        "[try_retrieve_linear_content_with_filter] load_change failed for {}",
+                        node
+                    );
+                }
+                return Ok(None);
+            };
+            entry.insert(change.contents);
+        }
+
+        let start = node.start.get() as usize;
+        let end = node.end.get() as usize;
+        let bytes = change_contents.get(&hash).expect("change contents cached");
+        if end > bytes.len() {
+            if trace_retrieve {
+                eprintln!(
+                    "[try_retrieve_linear_content_with_filter] span out of bounds for {}",
+                    node
+                );
+            }
+            return Ok(None);
+        }
+        content.extend_from_slice(&bytes[start..end]);
+    }
+
+    Ok(Some(content))
 }

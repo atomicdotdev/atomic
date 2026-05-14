@@ -256,4 +256,4 @@ pub use conflict::{
 };
 
 // Re-export FileOps application
-pub use file_ops::{apply_file_ops, ApplyFileOpsStats};
+pub use file_ops::{apply_file_ops, apply_file_ops_batched, ApplyFileOpsStats};

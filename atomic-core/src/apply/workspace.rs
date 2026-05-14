@@ -257,6 +257,18 @@ pub struct Workspace {
     /// Down-context positions (successors for new vertices).
     successors: Vec<Position<NodeId>>,
 
+    /// Resolved predecessor vertices for the current insertion.
+    predecessor_vertices: Vec<GraphNode<NodeId>>,
+
+    /// Resolved successor vertices for the current insertion.
+    successor_vertices: Vec<GraphNode<NodeId>>,
+
+    /// Vertices inserted during the current change, keyed by start position.
+    current_vertices_by_start: HashMap<Position<NodeId>, GraphNode<NodeId>>,
+
+    /// Vertices inserted during the current change, keyed by end position.
+    current_vertices_by_end: HashMap<Position<NodeId>, GraphNode<NodeId>>,
+
     // Edge Operations
     /// Pending edges to be added to the graph.
     pending_edges: Vec<PendingEdge>,
@@ -307,6 +319,10 @@ impl Workspace {
         Self {
             predecessors: Vec::new(),
             successors: Vec::new(),
+            predecessor_vertices: Vec::new(),
+            successor_vertices: Vec::new(),
+            current_vertices_by_start: HashMap::new(),
+            current_vertices_by_end: HashMap::new(),
             pending_edges: Vec::new(),
             deleted_edges: HashSet::new(),
             parents: HashMap::new(),
@@ -341,6 +357,10 @@ impl Workspace {
         Self {
             predecessors: Vec::with_capacity(context_capacity),
             successors: Vec::with_capacity(context_capacity),
+            predecessor_vertices: Vec::with_capacity(context_capacity),
+            successor_vertices: Vec::with_capacity(context_capacity),
+            current_vertices_by_start: HashMap::with_capacity(context_capacity),
+            current_vertices_by_end: HashMap::with_capacity(context_capacity),
             pending_edges: Vec::with_capacity(edge_capacity),
             deleted_edges: HashSet::with_capacity(edge_capacity / 10),
             parents: HashMap::with_capacity(context_capacity),
@@ -375,6 +395,10 @@ impl Workspace {
     pub fn clear(&mut self) {
         self.predecessors.clear();
         self.successors.clear();
+        self.predecessor_vertices.clear();
+        self.successor_vertices.clear();
+        self.current_vertices_by_start.clear();
+        self.current_vertices_by_end.clear();
         self.pending_edges.clear();
         self.deleted_edges.clear();
         self.parents.clear();
@@ -419,6 +443,16 @@ impl Workspace {
         self.successors.push(pos);
     }
 
+    /// Add a resolved predecessor vertex for the current insertion.
+    pub fn add_up_context_vertex(&mut self, node: GraphNode<NodeId>) {
+        self.predecessor_vertices.push(node);
+    }
+
+    /// Add a resolved successor vertex for the current insertion.
+    pub fn add_down_context_vertex(&mut self, node: GraphNode<NodeId>) {
+        self.successor_vertices.push(node);
+    }
+
     /// Get all up-context positions.
     pub fn predecessors(&self) -> &[Position<NodeId>] {
         &self.predecessors
@@ -427,6 +461,16 @@ impl Workspace {
     /// Get all down-context positions.
     pub fn successors(&self) -> &[Position<NodeId>] {
         &self.successors
+    }
+
+    /// Get all resolved predecessor vertices for the current insertion.
+    pub fn predecessor_vertices(&self) -> &[GraphNode<NodeId>] {
+        &self.predecessor_vertices
+    }
+
+    /// Get all resolved successor vertices for the current insertion.
+    pub fn successor_vertices(&self) -> &[GraphNode<NodeId>] {
+        &self.successor_vertices
     }
 
     /// Get the number of up-context positions.
@@ -443,6 +487,27 @@ impl Workspace {
     pub fn clear_context(&mut self) {
         self.predecessors.clear();
         self.successors.clear();
+        self.predecessor_vertices.clear();
+        self.successor_vertices.clear();
+    }
+
+    /// Register a vertex inserted during the current change.
+    pub fn register_current_vertex(&mut self, node: GraphNode<NodeId>) {
+        self.current_vertices_by_start.insert(node.start_pos(), node);
+        self.current_vertices_by_end.insert(node.end_pos(), node);
+    }
+
+    /// Resolve a previously inserted current-change vertex from workspace state.
+    pub fn get_current_vertex(
+        &self,
+        pos: Position<NodeId>,
+        is_predecessor: bool,
+    ) -> Option<GraphNode<NodeId>> {
+        if is_predecessor {
+            self.current_vertices_by_end.get(&pos).copied()
+        } else {
+            self.current_vertices_by_start.get(&pos).copied()
+        }
     }
 
     // Edge Management

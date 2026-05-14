@@ -121,6 +121,42 @@ impl InodeGraphOps for ReadTxn {
         let change_id = pos.change.get();
         let target_pos = pos.pos.get();
 
+        // Fast path: most inode-local edge destinations point at the exact
+        // start of the next span. Probe that narrow key range first so large
+        // single-change files do not rescan the whole inode slice per hop.
+        let exact_start_key = encode_inode_vertex(inode_id, change_id, target_pos, 0);
+        let exact_end_key = encode_inode_vertex(inode_id, change_id, target_pos, u64::MAX);
+        let mut empty_match = None;
+
+        for result in table.range::<&[u8; 32]>(&exact_start_key..=&exact_end_key)? {
+            let (key, _values) = result?;
+            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
+
+            if v_change != change_id || v_start != target_pos {
+                continue;
+            }
+
+            if v_start != v_end {
+                return Ok(Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                }));
+            }
+
+            if empty_match.is_none() {
+                empty_match = Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                });
+            }
+        }
+
+        if empty_match.is_some() {
+            return Ok(empty_match);
+        }
+
         let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
         let end_key = encode_inode_vertex(inode_id, change_id, u64::MAX, u64::MAX);
 
@@ -254,6 +290,42 @@ impl<'a> InodeGraphOps for WriteTxn<'a> {
         let inode_id = inode.get();
         let change_id = pos.change.get();
         let target_pos = pos.pos.get();
+
+        // Fast path: most inode-local edge destinations point at the exact
+        // start of the next span. Probe that narrow key range first so large
+        // single-change files do not rescan the whole inode slice per hop.
+        let exact_start_key = encode_inode_vertex(inode_id, change_id, target_pos, 0);
+        let exact_end_key = encode_inode_vertex(inode_id, change_id, target_pos, u64::MAX);
+        let mut empty_match = None;
+
+        for result in table.range::<&[u8; 32]>(&exact_start_key..=&exact_end_key)? {
+            let (key, _values) = result?;
+            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
+
+            if v_change != change_id || v_start != target_pos {
+                continue;
+            }
+
+            if v_start != v_end {
+                return Ok(Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                }));
+            }
+
+            if empty_match.is_none() {
+                empty_match = Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                });
+            }
+        }
+
+        if empty_match.is_some() {
+            return Ok(empty_match);
+        }
 
         let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
         let end_key = encode_inode_vertex(inode_id, change_id, u64::MAX, u64::MAX);

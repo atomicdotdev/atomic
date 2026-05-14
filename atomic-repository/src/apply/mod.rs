@@ -111,11 +111,12 @@ pub use types::{InsertError, InsertOptions, InsertOutcome, InsertResult, InsertS
 pub(crate) use types::format_hashes;
 
 use atomic_core::apply::{
-    apply_file_ops, compute_new_state, validate_can_apply, verify_dependencies, write_edge_map,
-    write_new_vertex, ConflictTracker, MissingContextConflict, Workspace, ZombieConflict,
+    apply_file_ops_batched, compute_new_state, validate_can_apply, verify_dependencies,
+    write_edge_map, write_new_vertex, ConflictTracker, MissingContextConflict, Workspace,
+    ZombieConflict,
 };
 use atomic_core::change::{Atom, AtomRef, Change, GraphOp};
-use atomic_core::pristine::{GraphTxnT, MutTxnT, ViewTxnT};
+use atomic_core::pristine::{GraphTxnT, MutTxnT, WriteTxn};
 use atomic_core::types::{Base32, Hash, NodeId};
 use std::collections::{HashSet, VecDeque};
 
@@ -225,8 +226,8 @@ pub fn compute_insert_order(
 /// # Returns
 ///
 /// The result of the insertion including new state and conflict info.
-pub fn write_change_to_graph<T: MutTxnT + ViewTxnT>(
-    txn: &mut T,
+pub fn write_change_to_graph(
+    txn: &mut WriteTxn<'_>,
     view_name: &str,
     change_id: NodeId,
     change_hash: &Hash,
@@ -237,6 +238,7 @@ pub fn write_change_to_graph<T: MutTxnT + ViewTxnT>(
     let mut workspace = Workspace::new();
     let mut conflict_tracker = ConflictTracker::new();
     let mut stats = InsertStats::new();
+    let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some();
 
     // Get the current view
     let mut view = txn
@@ -264,8 +266,17 @@ pub fn write_change_to_graph<T: MutTxnT + ViewTxnT>(
     if should_apply_hunks {
         let hunks = change.hunks();
         let total_hunks = hunks.len();
+        let hunk_phase_start = std::time::Instant::now();
         // Process each graph_op (graph layer)
         for (hunk_idx, graph_op) in hunks.iter().enumerate() {
+            if trace_record && (hunk_idx == 0 || (hunk_idx + 1) % 1_000 == 0) {
+                eprintln!(
+                    "[write_change_to_graph] applying hunk {}/{} elapsed={:?}",
+                    hunk_idx + 1,
+                    total_hunks,
+                    hunk_phase_start.elapsed()
+                );
+            }
             log::debug!(
                 "write_change_to_graph: hunk {}/{} starting: {:?}",
                 hunk_idx + 1,
@@ -288,6 +299,13 @@ pub fn write_change_to_graph<T: MutTxnT + ViewTxnT>(
                 total_hunks
             );
         }
+        if trace_record {
+            eprintln!(
+                "[write_change_to_graph] hunks complete count={} elapsed={:?}",
+                total_hunks,
+                hunk_phase_start.elapsed()
+            );
+        }
 
         // Apply FileOps to CRDT tables (semantic layer)
         // This enables human-readable diffs and token-level blame
@@ -299,9 +317,23 @@ pub fn write_change_to_graph<T: MutTxnT + ViewTxnT>(
                 file_ops_count
             );
             let crdt_start = std::time::Instant::now();
-            let _crdt_stats = apply_file_ops(txn, change_id, file_ops)
-                .map_err(|e| InsertError::Database(e.to_string()))?;
+            if trace_record {
+                eprintln!(
+                    "[write_change_to_graph] apply_file_ops start count={}",
+                    file_ops_count
+                );
+            }
+            let _crdt_stats = apply_file_ops_batched(txn, change_id, file_ops)
+                .map_err(|e: atomic_core::pristine::PristineError| {
+                    InsertError::Database(e.to_string())
+                })?;
             let crdt_ms = crdt_start.elapsed().as_millis();
+            if trace_record {
+                eprintln!(
+                    "[write_change_to_graph] apply_file_ops complete elapsed={:?}",
+                    crdt_start.elapsed()
+                );
+            }
             if crdt_ms > 50 {
                 log::warn!(
                     "write_change_to_graph: SLOW apply_file_ops took {}ms ({} FileOps)",

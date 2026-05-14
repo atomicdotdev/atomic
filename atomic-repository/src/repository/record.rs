@@ -47,6 +47,7 @@ impl Repository {
         header: ChangeHeader,
         options: RecordOptions,
     ) -> Result<RecordOutcome, RecordError> {
+        let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some();
         use atomic_core::output::Memory;
         use atomic_core::record::workflow::{
             assemble_change, record_added_file, record_deleted_file, record_modified_file,
@@ -698,6 +699,7 @@ impl Repository {
         // Use the original V3 bytes (not re-serialized) to ensure the hash
         // on disk matches the hash registered in the pristine graph.
         if options.get_save_to_store() {
+            let save_start = std::time::Instant::now();
             if let Some(v3_bytes) = outcome.v3_bytes() {
                 // Fast path: write the exact V3 bytes that produced computed_hash
                 self.save_change_bytes(&computed_hash, v3_bytes, outcome.change())
@@ -708,6 +710,12 @@ impl Repository {
                     .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
             }
             outcome.set_saved(true);
+            if trace_record {
+                eprintln!(
+                    "[record] save_change complete elapsed={:?}",
+                    save_start.elapsed()
+                );
+            }
         }
 
         // Apply if requested
@@ -729,6 +737,7 @@ impl Repository {
                     // files (mtime+size match) or avoid graph reconstruction
                     // (compare stored content hash instead).
                     if let Ok(mut idx_txn) = self.pristine.write_txn() {
+                        let file_index_start = std::time::Instant::now();
                         for path_str in outcome.recorded_files() {
                             // Strip directory markers like "dir/ (directory)"
                             let clean_path =
@@ -753,6 +762,12 @@ impl Repository {
                             }
                         }
                         let _ = idx_txn.commit();
+                        if trace_record {
+                            eprintln!(
+                                "[record] file_index_update complete elapsed={:?}",
+                                file_index_start.elapsed()
+                            );
+                        }
                     }
                 }
                 Err(e) => {

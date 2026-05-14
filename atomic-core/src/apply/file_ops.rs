@@ -58,11 +58,13 @@ use crate::change::{Encoding, FileOps, LineOps};
 use crate::crdt::tables::{
     encode_branch_id, encode_branch_value, encode_leaf_id, encode_leaf_value, encode_trunk_id,
     encode_trunk_value, encode_vertex_position, SerializedBranch, SerializedLeaf, SerializedTrunk,
+    BRANCHES, BRANCH_AFTER, BRANCH_LEAVES, BRANCH_VERTEX, INODE_TRUNK, LEAVES, PATH_TRUNK,
+    TRUNKS, TRUNK_BRANCHES, VERTEX_BRANCH,
 };
 use crate::crdt::{
     BranchId, BranchOp, BranchState, LeafId, LeafOp, LeafState, TrunkId, TrunkOp, TrunkState,
 };
-use crate::pristine::{MutTxnT, PristineError, PristineResult};
+use crate::pristine::{MutTxnT, PristineError, PristineResult, TreeTxnT, WriteTxn};
 use crate::types::{GraphNode, NodeId};
 
 // Statistics
@@ -156,6 +158,146 @@ pub fn apply_file_ops<T: MutTxnT>(
         apply_single_file_ops(txn, change_id, ops, &mut stats)?;
     }
     Ok(stats)
+}
+
+/// Apply FileOps using CRDT table handles opened once for the full pass.
+///
+/// This is a specialized fast path for insert-only workloads such as large
+/// initial file adds. More complex edit patterns fall back to the generic
+/// `apply_file_ops`.
+pub fn apply_file_ops_batched(
+    txn: &mut WriteTxn<'_>,
+    change_id: NodeId,
+    file_ops: &[FileOps],
+) -> PristineResult<ApplyFileOpsStats> {
+    if !can_batch_apply_file_ops(file_ops) {
+        return apply_file_ops(txn, change_id, file_ops);
+    }
+
+    let mut stats = ApplyFileOpsStats::new();
+    let mut trunk_creates = Vec::with_capacity(file_ops.len());
+
+    for ops in file_ops {
+        let trunk_create = match ops.trunk_op() {
+            Some(TrunkOp::Create { encoding, .. }) => {
+                let inode = match txn.get_inode(ops.path())? {
+                    Some(i) => i,
+                    None => txn.alloc_inode()?,
+                };
+                Some(SerializedTrunk {
+                    inode,
+                    state: TrunkState::Alive,
+                    encoding: encoding_to_u8(encoding.as_ref()),
+                    path: ops.path().to_string(),
+                })
+            }
+            _ => None,
+        };
+        trunk_creates.push(trunk_create);
+    }
+
+    let mut trunks_table = txn.txn.open_table(TRUNKS)?;
+    let mut inode_trunk_table = txn.txn.open_table(INODE_TRUNK)?;
+    let mut path_trunk_table = txn.txn.open_table(PATH_TRUNK)?;
+    let mut branches_table = txn.txn.open_table(BRANCHES)?;
+    let mut trunk_branches_table = txn.txn.open_multimap_table(TRUNK_BRANCHES)?;
+    let mut branch_after_table = txn.txn.open_table(BRANCH_AFTER)?;
+    let mut leaves_table = txn.txn.open_table(LEAVES)?;
+    let mut branch_leaves_table = txn.txn.open_multimap_table(BRANCH_LEAVES)?;
+    let mut branch_vertex_table = txn.txn.open_table(BRANCH_VERTEX)?;
+    let mut vertex_branch_table = txn.txn.open_table(VERTEX_BRANCH)?;
+
+    for (ops, trunk_create) in file_ops.iter().zip(trunk_creates.iter()) {
+        let trunk_id = ops.trunk_id();
+        let trunk_key = encode_trunk_id(&trunk_id);
+
+        if let Some(serialized) = trunk_create {
+            let trunk_value = encode_trunk_value(&serialized);
+            trunks_table.insert(&trunk_key, trunk_value.as_slice())?;
+            inode_trunk_table.insert(serialized.inode.get(), &trunk_key)?;
+            path_trunk_table.insert(ops.path(), &trunk_key)?;
+            stats.trunks_created += 1;
+        }
+
+        for line_ops in ops.line_ops() {
+            let raw_branch_id = line_ops.branch_id();
+            let branch_id = if raw_branch_id.change_id().is_root() {
+                BranchId::new(change_id, raw_branch_id.branch_idx())
+            } else {
+                raw_branch_id
+            };
+
+            let BranchOp::Insert { after, content } = line_ops.operation() else {
+                unreachable!("batched apply only runs for insert-only file ops");
+            };
+
+            let branch_key = encode_branch_id(&branch_id);
+            let branch_value = encode_branch_value(&SerializedBranch {
+                trunk_id,
+                state: BranchState::Alive,
+                line_hash: 0,
+            });
+            branches_table.insert(&branch_key, &branch_value)?;
+            trunk_branches_table.insert(&trunk_key, &branch_key)?;
+            stats.branches_created += 1;
+
+            let after_key = match after {
+                Some(a) if a.change_id().is_root() => {
+                    encode_branch_id(&BranchId::new(change_id, a.branch_idx()))
+                }
+                Some(a) => encode_branch_id(a),
+                None => [0u8; 12],
+            };
+            branch_after_table.insert(&branch_key, &after_key)?;
+
+            if let Some((start, end)) = line_ops.content_range() {
+                let graph_node = GraphNode {
+                    change: change_id,
+                    start,
+                    end,
+                };
+                let vertex_bytes = encode_vertex_position(&graph_node);
+                branch_vertex_table.insert(&branch_key, &vertex_bytes)?;
+                vertex_branch_table.insert(&vertex_bytes, &branch_key)?;
+            }
+
+            for (leaf_idx, leaf_op) in content.iter().enumerate() {
+                let LeafOp::Insert { kind, content, .. } = leaf_op else {
+                    unreachable!("batched apply only runs for insert-only leaf ops");
+                };
+
+                let leaf_id = LeafId::new(branch_id.change_id(), leaf_idx as u32);
+                let leaf_key = encode_leaf_id(&leaf_id);
+                let leaf_value = encode_leaf_value(&SerializedLeaf {
+                    branch_id,
+                    kind: *kind,
+                    state: LeafState::Alive,
+                    content_start: 0,
+                    content_end: content.len() as u32,
+                });
+                leaves_table.insert(&leaf_key, &leaf_value)?;
+                branch_leaves_table.insert(&branch_key, &leaf_key)?;
+                stats.leaves_created += 1;
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+fn can_batch_apply_file_ops(file_ops: &[FileOps]) -> bool {
+    file_ops.iter().all(|ops| {
+        matches!(ops.trunk_op(), None | Some(TrunkOp::Create { .. }))
+            && ops.line_ops().iter().all(|line_ops| {
+                matches!(
+                    line_ops.operation(),
+                    BranchOp::Insert { content, .. }
+                        if content
+                            .iter()
+                            .all(|leaf_op| matches!(leaf_op, LeafOp::Insert { .. }))
+                )
+            })
+    })
 }
 
 /// Apply FileOps for a single file.
