@@ -1,14 +1,17 @@
-//! The `org switch` command for changing the default organization.
+//! The `org set` command for changing the default organization.
 //!
-//! This module implements the `atomic org switch` command, which updates
+//! This module implements the `atomic org set` command, which updates
 //! the `server.default_org` field in the global configuration file. All
 //! subsequent commands that interact with the remote server will use the
 //! new default organization.
 //!
+//! Accepts `switch` as a hidden alias for backward compatibility with
+//! the previous command name.
+//!
 //! # Usage
 //!
 //! ```text
-//! atomic org switch <SLUG>
+//! atomic org set <SLUG>
 //!
 //! Arguments:
 //!   <SLUG>  Organization slug to set as the new default
@@ -20,11 +23,11 @@
 //! # Examples
 //!
 //! ```text
-//! # Switch to a different org
-//! $ atomic org switch acme-corp
+//! # Set the default org
+//! $ atomic org set acme-corp
 //! ✓ Default organization set to: acme-corp
 //!
-//! # Verify the switch
+//! # Verify
 //! $ atomic org show
 //!   Name:  Acme Corp
 //!   Slug:  acme-corp
@@ -39,19 +42,18 @@ use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success};
 
-/// Switch the default organization.
+/// Set the default organization.
 ///
 /// Updates the `[server] default_org` field in the global configuration
-/// file (`~/.config/atomic/config.toml`). All subsequent commands that
-/// interact with the remote server will scope their requests to this
-/// organization.
+/// file (`~/.atomic/config.toml`). All subsequent commands that interact
+/// with the remote server will scope their requests to this organization.
 ///
 /// This command does **not** validate that the slug exists on the server.
 /// If the slug is invalid, subsequent commands will fail with a "not found"
 /// error.
 #[derive(Debug, Parser)]
-#[command(name = "switch")]
-pub struct OrgSwitch {
+#[command(name = "set", alias = "switch")]
+pub struct OrgSet {
     /// Organization slug to set as the new default.
     ///
     /// This should be the URL-safe slug of an organization you belong
@@ -60,7 +62,7 @@ pub struct OrgSwitch {
     pub slug: String,
 }
 
-impl Command for OrgSwitch {
+impl Command for OrgSet {
     fn run(&self) -> CliResult<()> {
         // Load the current global config (or defaults if none exists).
         let mut config = GlobalConfig::load().map_err(|e| {
@@ -95,7 +97,7 @@ mod tests {
 
     #[test]
     fn required_slug() {
-        let cmd = OrgSwitch {
+        let cmd = OrgSet {
             slug: "acme-corp".to_string(),
         };
         assert_eq!(cmd.slug, "acme-corp");
@@ -103,7 +105,7 @@ mod tests {
 
     #[test]
     fn slug_with_hyphens() {
-        let cmd = OrgSwitch {
+        let cmd = OrgSet {
             slug: "my-cool-org-123".to_string(),
         };
         assert_eq!(cmd.slug, "my-cool-org-123");
@@ -111,7 +113,7 @@ mod tests {
 
     #[test]
     fn slug_simple() {
-        let cmd = OrgSwitch {
+        let cmd = OrgSet {
             slug: "alice".to_string(),
         };
         assert_eq!(cmd.slug, "alice");

@@ -493,12 +493,12 @@ enum Commands {
     /// Projects live inside workspaces and represent a single Atomic VCS
     /// repository hosted on a remote server. When `--workspace` is omitted,
     /// commands fall back to the default workspace for the current org
-    /// (set with `atomic workspace switch`).
+    /// (set with `atomic workspace set`).
     ///
     /// # Examples
     ///
     /// ```text
-    /// atomic workspace switch my-ws
+    /// atomic workspace set my-ws
     ///
     /// atomic project list
     /// atomic project create my-app
@@ -524,7 +524,7 @@ enum Commands {
     /// atomic org create "Acme Corp"
     ///
     /// # Switch default org
-    /// atomic org switch acme-corp
+    /// atomic org set acme-corp
     ///
     /// # Manage members
     /// atomic org member list

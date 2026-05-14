@@ -29,7 +29,7 @@
 //! ✓ Created project: my-service (slug: my-service)
 //!
 //! # Uses the default workspace for the current org
-//! $ atomic workspace switch backend
+//! $ atomic workspace set backend
 //! $ atomic project create my-service
 //! ✓ Created project: my-service (slug: my-service)
 //!
@@ -58,7 +58,7 @@ use crate::output::{print_next_steps, print_success, KeyValueTable};
 /// and can then be linked to a local repository with `atomic project init`.
 ///
 /// If `--workspace` is not given, falls back to the default workspace for
-/// the current org (set via `atomic workspace switch <slug>`).
+/// the current org (set via `atomic workspace set <slug>`).
 #[derive(Debug, Parser, Default)]
 #[command(name = "create")]
 pub struct ProjectCreate {

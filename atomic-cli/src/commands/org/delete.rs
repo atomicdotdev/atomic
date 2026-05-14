@@ -162,7 +162,7 @@ fn clean_up_local_config(deleted_slug: &str) -> CliResult<()> {
 
     if was_default_org {
         print_hint(&format!(
-            "Default org was '{deleted_slug}' — run 'atomic org switch <slug>' \
+            "Default org was '{deleted_slug}' — run 'atomic org set <slug>' \
              to pick a new one."
         ));
     }

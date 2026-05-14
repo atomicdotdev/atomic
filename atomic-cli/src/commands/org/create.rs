@@ -28,7 +28,7 @@
 //!   Plan:  free
 //!
 //! Next steps:
-//!   atomic org switch acme-corp    Set as your default org
+//!   atomic org set acme-corp    Set as your default org
 //!   atomic org member add <id>     Add members to the org
 //!   atomic team create <name>      Create a team
 //!
@@ -109,7 +109,7 @@ impl OrgCreate {
 
         print_next_steps(&[
             (
-                &format!("atomic org switch {}", info.slug),
+                &format!("atomic org set {}", info.slug),
                 "Set as your default org",
             ),
             ("atomic org member add <id>", "Add members to the org"),

@@ -108,7 +108,7 @@ pub fn remote_err(e: atomic_remote::RemoteError) -> CliError {
 /// Resolution order:
 /// 1. `--org` override (if `Some(non-empty)`)
 /// 2. `server.default_org` from global config
-/// 3. Error with a hint to run `atomic org switch`
+/// 3. Error with a hint to run `atomic org set`
 ///
 /// An explicit empty string (`--org ""`) is an error: the user asked for "no
 /// org" which never makes sense.
@@ -130,7 +130,7 @@ pub fn resolve_org(org_override: Option<&str>) -> CliResult<String> {
         .default_org
         .ok_or_else(|| CliError::InvalidArgument {
             message: "No organization specified.\n  \
-                      Use --org or set a default with: atomic org switch <slug>"
+                      Use --org or set a default with: atomic org set <slug>"
                 .to_string(),
         })
 }
@@ -145,7 +145,7 @@ pub fn resolve_org(org_override: Option<&str>) -> CliResult<String> {
 /// Resolution order:
 /// 1. `--workspace` override (if `Some(non-empty)`)
 /// 2. `server.default_workspaces[org_slug]` from global config
-/// 3. Error with a hint to run `atomic workspace switch`
+/// 3. Error with a hint to run `atomic workspace set`
 ///
 /// An explicit empty string (`--workspace ""`) is an error: the user
 /// explicitly asked for "no workspace", which is meaningless. Distinguishing
@@ -172,7 +172,7 @@ pub fn resolve_workspace(org_slug: &str, workspace_override: Option<&str>) -> Cl
         .ok_or_else(|| CliError::InvalidArgument {
             message: format!(
                 "No workspace specified for org '{org_slug}'.\n  \
-                 Use --workspace or set a default with: atomic workspace switch <slug>"
+                 Use --workspace or set a default with: atomic workspace set <slug>"
             ),
         })
 }

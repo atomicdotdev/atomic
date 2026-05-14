@@ -9,7 +9,7 @@
 //! - Updating organization settings
 //! - Deleting organizations
 //! - Upgrading personal orgs to team orgs
-//! - Switching the default organization
+//! - Setting the default organization
 //! - Managing organization members (nested subcommands)
 //!
 //! # Usage
@@ -24,7 +24,7 @@
 //!   update   Update organization settings
 //!   delete   Delete an organization
 //!   upgrade  Upgrade a personal org to a team org
-//!   switch   Switch the default organization
+//!   set      Set the default organization
 //!   member   Manage organization members
 //! ```
 //!
@@ -37,8 +37,8 @@
 //! # Create a new team org
 //! $ atomic org create "Acme Corp" --email admin@acme.com
 //!
-//! # Switch default org
-//! $ atomic org switch acme-corp
+//! # Set default org (accepts `switch` as a hidden alias for back-compat)
+//! $ atomic org set acme-corp
 //!
 //! # Add a member
 //! $ atomic org member add 550e8400-e29b-41d4-a716-446655440000 --role admin
@@ -53,9 +53,9 @@ pub mod list;
 #[cfg(feature = "teams")]
 pub mod member;
 #[cfg(feature = "teams")]
-pub mod show;
+pub mod set;
 #[cfg(feature = "teams")]
-pub mod switch;
+pub mod show;
 #[cfg(feature = "teams")]
 pub mod update;
 #[cfg(feature = "teams")]
@@ -155,17 +155,18 @@ pub enum OrgCommands {
     /// ```
     Upgrade(upgrade::OrgUpgrade),
 
-    /// Switch the default organization.
+    /// Set the default organization.
     ///
     /// Changes which organization is used by default for all commands
-    /// that interact with the remote server.
+    /// that interact with the remote server. Accepts `switch` as a
+    /// hidden alias for backward compatibility.
     ///
     /// # Examples
     ///
     /// ```text
-    /// atomic org switch acme-corp
+    /// atomic org set acme-corp
     /// ```
-    Switch(switch::OrgSwitch),
+    Set(set::OrgSet),
 
     /// Manage organization members.
     ///
@@ -206,7 +207,7 @@ impl Command for OrgCmd {
             OrgCommands::Update(cmd) => cmd.run(),
             OrgCommands::Delete(cmd) => cmd.run(),
             OrgCommands::Upgrade(cmd) => cmd.run(),
-            OrgCommands::Switch(cmd) => cmd.run(),
+            OrgCommands::Set(cmd) => cmd.run(),
             OrgCommands::Member(cmd) => cmd.run(),
         }
     }
@@ -227,7 +228,7 @@ mod tests {
                 OrgCommands::Update(_) => "update",
                 OrgCommands::Delete(_) => "delete",
                 OrgCommands::Upgrade(_) => "upgrade",
-                OrgCommands::Switch(_) => "switch",
+                OrgCommands::Set(_) => "set",
                 OrgCommands::Member(_) => "member",
             }
         }
@@ -246,9 +247,9 @@ mod tests {
         };
         assert_eq!(check_variant(&OrgCommands::Create(create)), "create");
 
-        let switch = switch::OrgSwitch {
+        let set = set::OrgSet {
             slug: "test".to_string(),
         };
-        assert_eq!(check_variant(&OrgCommands::Switch(switch)), "switch");
+        assert_eq!(check_variant(&OrgCommands::Set(set)), "set");
     }
 }

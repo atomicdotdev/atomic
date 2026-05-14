@@ -1,4 +1,4 @@
-//! The `workspace switch` command for setting a default workspace per org.
+//! The `workspace set` command for setting a default workspace per org.
 //!
 //! Workspaces are org-scoped, so the default is stored per org in
 //! `server.default_workspaces` (a map keyed by org slug). This command
@@ -8,7 +8,7 @@
 //! # Usage
 //!
 //! ```text
-//! atomic workspace switch <SLUG> [--org <ORG>]
+//! atomic workspace set <SLUG> [--org <ORG>]
 //!
 //! Arguments:
 //!   <SLUG>  Workspace slug to set as the default for the target org
@@ -23,13 +23,13 @@
 //!
 //! ```text
 //! # Set default workspace for the current org
-//! $ atomic workspace switch backend
+//! $ atomic workspace set backend
 //! ✓ Default workspace for 'acme' set to: backend
 //!
 //! # Set default workspace for a different org (does not change current org)
-//! $ atomic workspace switch personal --org alice
+//! $ atomic workspace set personal --org alice
 //! ✓ Default workspace for 'alice' set to: personal
-//!   (current default org is 'acme' — run 'atomic org switch alice' to use it)
+//!   (current default org is 'acme' — run 'atomic org set alice' to use it)
 //! ```
 
 use clap::Parser;
@@ -40,7 +40,7 @@ use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success};
 
-/// Switch the default workspace for an org.
+/// Set the default workspace for an org.
 ///
 /// Updates `[server.default_workspaces]` in the global configuration file.
 /// All subsequent commands that take an optional `--workspace` parameter
@@ -48,10 +48,10 @@ use crate::output::{print_hint, print_success};
 ///
 /// This command does **not** validate that the slug exists on the server.
 /// If the slug is invalid, subsequent commands will fail with a "not found"
-/// error. This matches the behavior of `atomic org switch`.
+/// error. This matches the behavior of `atomic org set`.
 #[derive(Debug, Parser, Default)]
-#[command(name = "switch")]
-pub struct WorkspaceSwitch {
+#[command(name = "set")]
+pub struct WorkspaceSet {
     /// Workspace slug to set as the new default.
     ///
     /// This should be the URL-safe slug of a workspace that exists on
@@ -68,7 +68,7 @@ pub struct WorkspaceSwitch {
     pub org: Option<String>,
 }
 
-impl Command for WorkspaceSwitch {
+impl Command for WorkspaceSet {
     fn run(&self) -> CliResult<()> {
         if self.slug.is_empty() {
             return Err(CliError::InvalidArgument {
@@ -96,7 +96,7 @@ impl Command for WorkspaceSwitch {
                 .clone()
                 .ok_or_else(|| CliError::InvalidArgument {
                     message: "No default org set. Use --org or first run: \
-                              atomic org switch <slug>"
+                              atomic org set <slug>"
                         .to_string(),
                 })?,
         };
@@ -127,7 +127,7 @@ impl Command for WorkspaceSwitch {
             if current_org != target_org {
                 print_hint(&format!(
                     "Current default org is '{current_org}' — \
-                     run 'atomic org switch {target_org}' to use this workspace."
+                     run 'atomic org set {target_org}' to use this workspace."
                 ));
             }
         }
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn empty_slug_rejected() {
-        let cmd = WorkspaceSwitch {
+        let cmd = WorkspaceSet {
             slug: "".to_string(),
             org: None,
         };
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn empty_org_override_rejected() {
-        let cmd = WorkspaceSwitch {
+        let cmd = WorkspaceSet {
             slug: "backend".to_string(),
             org: Some("".to_string()),
         };
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn fields_stored() {
-        let cmd = WorkspaceSwitch {
+        let cmd = WorkspaceSet {
             slug: "backend".to_string(),
             org: Some("acme".to_string()),
         };

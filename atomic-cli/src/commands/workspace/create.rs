@@ -109,7 +109,7 @@ impl Command for WorkspaceCreate {
 
             print_next_steps(&[
                 (
-                    &format!("atomic workspace switch {}", ws.slug),
+                    &format!("atomic workspace set {}", ws.slug),
                     "Set as your default workspace",
                 ),
                 (

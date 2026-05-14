@@ -221,7 +221,7 @@ impl Register {
                     "Create your first workspace",
                 ),
                 (
-                    "atomic workspace switch <name>",
+                    "atomic workspace set <name>",
                     "Set as your default workspace",
                 ),
                 (

@@ -26,7 +26,7 @@
 //! my-project    my-project    dev    private     2025-01-15 10:30:00
 //!
 //! # Uses the default workspace for the current org
-//! $ atomic workspace switch my-ws
+//! $ atomic workspace set my-ws
 //! $ atomic project list
 //! ```
 

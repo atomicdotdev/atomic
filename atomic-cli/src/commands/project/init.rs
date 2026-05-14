@@ -56,7 +56,7 @@ use crate::output::{print_info, print_next_steps, print_success};
 /// then stores the remote URL in the local repository configuration.
 ///
 /// If `--workspace` is omitted, falls back to the default workspace for
-/// the current org (set via `atomic workspace switch <slug>`).
+/// the current org (set via `atomic workspace set <slug>`).
 #[derive(Debug, Parser)]
 #[command(name = "init")]
 pub struct ProjectInit {

@@ -68,7 +68,7 @@ pub enum ProjectCommands {
     ///
     /// Shows all projects within a workspace. If `--workspace` is omitted,
     /// uses the default workspace for the current org (set via
-    /// `atomic workspace switch`).
+    /// `atomic workspace set`).
     ///
     /// # Examples
     ///
@@ -83,7 +83,7 @@ pub enum ProjectCommands {
     ///
     /// Creates a project inside a workspace on the server. If `--workspace`
     /// is omitted, uses the default workspace for the current org (set via
-    /// `atomic workspace switch`).
+    /// `atomic workspace set`).
     ///
     /// # Examples
     ///
@@ -136,7 +136,7 @@ pub enum ProjectCommands {
     /// Creates the project on the server and configures the local
     /// repository with the remote URL. If `--workspace` is omitted, uses
     /// the default workspace for the current org (set via
-    /// `atomic workspace switch`).
+    /// `atomic workspace set`).
     ///
     /// # Examples
     ///

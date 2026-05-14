@@ -83,7 +83,7 @@ pub struct ServerConfig {
     /// Default organization slug for management commands.
     ///
     /// Set automatically during registration (personal org = identity name).
-    /// Can be switched with `atomic org switch`.
+    /// Can be switched with `atomic org set`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_org: Option<String>,
 
@@ -93,7 +93,7 @@ pub struct ServerConfig {
     /// a management command needs a workspace and none is given on the
     /// CLI, the resolver looks up the current org in this map.
     ///
-    /// Set with `atomic workspace switch <slug> [--org <slug>]`.
+    /// Set with `atomic workspace set <slug> [--org <slug>]`.
     /// Uses `BTreeMap` so the serialized TOML is alphabetically ordered
     /// and produces stable diffs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

@@ -136,7 +136,7 @@ fn clean_up_local_config(org_slug: &str, deleted_workspace: &str) -> CliResult<(
 
     print_hint(&format!(
         "Default workspace for '{org_slug}' was '{deleted_workspace}' — \
-         run 'atomic workspace switch <slug>' to pick a new one."
+         run 'atomic workspace set <slug>' to pick a new one."
     ));
 
     Ok(())
