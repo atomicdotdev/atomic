@@ -6,7 +6,49 @@ use super::*;
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::ffi::OsString;
     use std::path::PathBuf;
+
+    const AI_ENV_KEYS: &[&str] = &[
+        "ATOMIC_AI_ENABLED",
+        "ATOMIC_AI_PROVIDER",
+        "ATOMIC_AI_MODEL",
+        "ATOMIC_AI_TOOL",
+        "ATOMIC_AI_SUGGESTION_TYPE",
+        "ATOMIC_AI_INPUT_TOKENS",
+        "ATOMIC_AI_OUTPUT_TOKENS",
+        "ATOMIC_AI_COST_USD",
+        "ATOMIC_AI_REQUEST_ID",
+        "ATOMIC_AI_SESSION_ID",
+    ];
+
+    struct AiEnvGuard {
+        original: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl AiEnvGuard {
+        fn clear() -> Self {
+            let original = AI_ENV_KEYS
+                .iter()
+                .map(|&key| (key, std::env::var_os(key)))
+                .collect();
+            for key in AI_ENV_KEYS {
+                std::env::remove_var(key);
+            }
+            Self { original }
+        }
+    }
+
+    impl Drop for AiEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.original {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 
     // Record Command Construction Tests
 
@@ -632,14 +674,18 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_build_provenance_disabled() {
+        let _env = AiEnvGuard::clear();
         let record = Record::new();
         let provenance = record.build_provenance();
         assert!(provenance.is_none());
     }
 
     #[test]
+    #[serial]
     fn test_build_provenance_enabled_without_provider() {
+        let _env = AiEnvGuard::clear();
         let record = Record::new().with_ai_assisted(true);
         // Without provider, provenance should be None
         let provenance = record.build_provenance();
@@ -785,7 +831,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_build_options_without_provenance() {
+        let _env = AiEnvGuard::clear();
         let record = Record::new();
         let options = record.build_options().unwrap();
         assert!(!options.has_provenance());
@@ -795,6 +843,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_build_provenance_from_env_var() {
+        let _env = AiEnvGuard::clear();
         // Set environment variables
         std::env::set_var("ATOMIC_AI_ENABLED", "true");
         std::env::set_var("ATOMIC_AI_PROVIDER", "openai");
@@ -817,6 +866,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_build_provenance_cli_overrides_env() {
+        let _env = AiEnvGuard::clear();
         // Set environment variables
         std::env::set_var("ATOMIC_AI_ENABLED", "true");
         std::env::set_var("ATOMIC_AI_PROVIDER", "openai");
