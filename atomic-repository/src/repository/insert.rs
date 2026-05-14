@@ -828,8 +828,6 @@ impl Repository {
             return Ok(outcome);
         }
 
-        // Insert each change in order.
-        //
         // When the source view is Draft, its changes were recorded against
         // the view filter (GRAPH).  Inserting those changes
         // into a different view verifies edge context against a different

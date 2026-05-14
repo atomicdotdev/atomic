@@ -77,7 +77,7 @@
 
 use crate::change::ChangeStore;
 use crate::merge::{ConflictGroup, MergeOutcome, ResolvedConflicts, SemanticMergeEngine};
-use crate::output::alive::{AliveGraph, OrderResult};
+use crate::output::alive::{AliveGraph, OrderResult, VertexId};
 use crate::output::traits::VertexBuffer;
 use crate::pristine::GraphTxnT;
 use crate::types::{ChangePosition, GraphNode, Hash, NodeId};
@@ -357,6 +357,37 @@ where
             continue;
         }
 
+        // Before treating this as a concurrent CRDT conflict, ask the
+        // change DAG whether one side already supersedes the others.
+        //
+        // The byte-graph can legitimately wire two alive vertices at the
+        // same logical position when one change was recorded *with the
+        // other already applied* (e.g. an edit recorded after a merge,
+        // touching a line that the merged-in change had already
+        // rewritten).  Both vertices look alive and concurrent to the
+        // walker, but the dependency DAG says the later change was
+        // built knowing the earlier one and is meant to replace it.
+        //
+        // Picking the supersedor here keeps the resolution in the
+        // semantic layer rather than guessing at the byte-graph level.
+        if let Some(winner_idx) = supersedor_in_fork(txn, &fork.children, graph) {
+            log::info!(
+                "Fork resolved by change-DAG supersession: child {} wins ({} fork children)",
+                winner_idx,
+                fork.children.len(),
+            );
+            let winner_vid = fork.children[winner_idx];
+            // Mark losers to skip so only the winner's vertex is emitted
+            // through the normal traversal.
+            for (idx, &vid) in fork.children.iter().enumerate() {
+                if idx != winner_idx {
+                    resolved.insert_skip(vid);
+                }
+            }
+            let _ = winner_vid;
+            continue;
+        }
+
         let group = ConflictGroup::new(vertices).with_parent(graph.get_vertex(fork.parent).node);
 
         match engine.try_merge(&group) {
@@ -372,16 +403,89 @@ where
                 }
             }
             Ok(MergeOutcome::Conflict { .. }) => {
-                log::debug!("Semantic merge: true conflict at fork, keeping both sides");
+                log::debug!(
+                    "Semantic merge: true conflict at fork ({} children) \
+                     — emitting conflict markers",
+                    fork.children.len(),
+                );
+                resolved.insert_unresolved_fork(fork.children.clone());
             }
-            Ok(MergeOutcome::NoCrdtData) | Ok(MergeOutcome::Clean(_)) => {}
+            Ok(MergeOutcome::NoCrdtData) | Ok(MergeOutcome::Clean(_)) => {
+                // No CRDT data — still need to wrap the fork in markers
+                // so both sides are visible to the user.
+                resolved.insert_unresolved_fork(fork.children.clone());
+            }
             Err(e) => {
                 log::warn!("Semantic merge failed for fork: {}", e);
+                resolved.insert_unresolved_fork(fork.children.clone());
             }
         }
     }
 
     resolved
+}
+
+/// If one fork child's introducing change transitively depends on every
+/// other fork child's introducing change, return its index — that change
+/// was recorded with full knowledge of the others and supersedes them.
+///
+/// Returns `None` when no single child dominates (the fork is genuinely
+/// concurrent and needs marker / semantic-merge handling).
+fn supersedor_in_fork<T: GraphTxnT>(
+    txn: &T,
+    children: &[crate::output::alive::VertexId],
+    graph: &AliveGraph,
+) -> Option<usize> {
+    use std::collections::HashSet;
+
+    // Collect each child's introducing change.  ROOT vertices have no
+    // change ID; the dependency-DAG check doesn't apply to them.
+    let changes: Vec<NodeId> = children
+        .iter()
+        .map(|&vid| graph.try_get_vertex(vid).map(|v| v.node.change))
+        .collect::<Option<Vec<_>>>()?;
+
+    if changes.iter().any(|c| c.is_root()) {
+        return None;
+    }
+
+    // For each candidate winner, walk its dependency closure and verify
+    // that every OTHER child's change appears in it (directly or
+    // transitively).  The walk follows the indexed normal dependency
+    // edges via `get_change_deps` (hash form) + `get_internal` to
+    // resolve back to NodeIds.
+    let closure_of = |start: NodeId| -> HashSet<NodeId> {
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        let mut stack: Vec<NodeId> = vec![start];
+        seen.insert(start);
+        while let Some(id) = stack.pop() {
+            let deps = match txn.get_change_deps(id) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            for dep_hash in deps {
+                if let Ok(Some(dep_id)) = txn.get_internal(&dep_hash) {
+                    if seen.insert(dep_id) {
+                        stack.push(dep_id);
+                    }
+                }
+            }
+        }
+        seen
+    };
+
+    for (idx, &cand) in changes.iter().enumerate() {
+        let closure = closure_of(cand);
+        let dominates_all_others = changes
+            .iter()
+            .enumerate()
+            .all(|(j, &other)| j == idx || closure.contains(&other));
+        if dominates_all_others {
+            return Some(idx);
+        }
+    }
+
+    None
 }
 
 // OUTPUT GRAPH CONTENT (RESOLVED)
@@ -408,8 +512,8 @@ where
     F: Fn(NodeId) -> Option<Hash>,
     V: VertexBuffer,
 {
-    // Fast path: nothing was resolved — delegate to the original function.
-    if resolved.is_empty() {
+    // Fast path: nothing was resolved and no unresolved forks.
+    if resolved.is_empty() && resolved.unresolved_forks().is_empty() {
         return output_graph_content(changes, hash_fn, graph, order, buffer);
     }
 
@@ -418,6 +522,9 @@ where
 
     // Track zombie state
     let mut in_zombie: Option<usize> = None;
+
+    // Track which fork-conflict vertices have already been emitted.
+    let mut fork_emitted: std::collections::HashSet<VertexId> = std::collections::HashSet::new();
 
     for scc in order.sccs.iter().rev() {
         if scc.is_empty() {
@@ -470,6 +577,56 @@ where
                         })
                         .map_err(OutputError::io)?;
                 }
+                continue;
+            }
+
+            // ── Unresolved fork conflict ────────────────────────────
+            // When this vertex is part of an unresolved fork, emit the
+            // entire group wrapped in conflict markers.  Skip if we have
+            // already emitted it as part of an earlier fork group.
+            if fork_emitted.contains(&vid) {
+                continue;
+            }
+            if let Some(group) = resolved.fork_group_for(vid) {
+                conflict_id += 1;
+                buffer
+                    .begin_conflict(conflict_id, None)
+                    .map_err(OutputError::io)?;
+
+                for (idx, &child_vid) in group.iter().enumerate() {
+                    if idx > 0 {
+                        let change_id = graph.try_get_vertex(child_vid).map(|v| v.node.change);
+                        let hash = change_id.and_then(|cid| hash_fn(cid));
+                        let hashes: Vec<Hash> = hash.into_iter().collect();
+                        let href: Option<&[Hash]> = if hashes.is_empty() {
+                            None
+                        } else {
+                            Some(&hashes)
+                        };
+                        buffer
+                            .conflict_next(conflict_id, href)
+                            .map_err(OutputError::io)?;
+                    }
+
+                    if let Some(vertex_data) = graph.try_get_vertex(child_vid) {
+                        let node = vertex_data.node;
+                        let vertex_len = node.end.get() - node.start.get();
+                        if vertex_len > 0 {
+                            let get_contents = |buf: &mut [u8]| -> Result<(), std::io::Error> {
+                                changes
+                                    .get_contents(&hash_fn, node, buf)
+                                    .map(|_| ())
+                                    .map_err(|e| std::io::Error::other(e.to_string()))
+                            };
+                            buffer
+                                .output_line(node, get_contents)
+                                .map_err(OutputError::io)?;
+                        }
+                    }
+                    fork_emitted.insert(child_vid);
+                }
+
+                buffer.end_conflict(conflict_id).map_err(OutputError::io)?;
                 continue;
             }
         }

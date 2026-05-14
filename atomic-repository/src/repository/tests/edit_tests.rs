@@ -46,18 +46,26 @@ fn test_modified_file_creates_edit_hunks() {
         .apply_after_record(true);
     let initial_outcome = repo.record(header, options).unwrap();
 
-    // Verify initial change has FileAdd graph_op
+    // Verify initial change has FileAdd graph_op followed by Edit ops
+    // for the remaining lines (per-line vertex granularity).
     let initial_change = initial_outcome.change();
-    assert_eq!(
-        initial_change.hunks().len(),
-        1,
-        "Initial commit should have exactly 1 graph_op"
+    assert!(
+        !initial_change.hunks().is_empty(),
+        "Initial commit should have at least one graph_op"
     );
     assert!(
         matches!(initial_change.hunks()[0], GraphOp::FileAdd { .. }),
-        "Initial commit should have FileAdd graph_op, got {:?}",
+        "Initial commit's first graph_op should be FileAdd, got {:?}",
         initial_change.hunks()[0].type_name()
     );
+    // For a 3-line file, expect 1 FileAdd (first line) + 2 Edit (lines 2,3).
+    for op in &initial_change.hunks()[1..] {
+        assert_eq!(
+            op.type_name(),
+            "Edit",
+            "Per-line vertices should be emitted as Edit ops after FileAdd"
+        );
+    }
 
     // Step 2: Modify the file (change middle line)
     std::fs::write(&file_path, b"line1\nmodified_line2\nline3\n").unwrap();

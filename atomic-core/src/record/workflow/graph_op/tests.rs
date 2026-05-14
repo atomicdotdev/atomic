@@ -12,7 +12,10 @@ fn test_options_new_returns_defaults() {
     assert!(opts.get_encoding().is_none());
     assert_eq!(opts.get_context_lines(), 3);
     assert!(!opts.get_include_function_context());
-    assert_eq!(opts.get_combine_threshold(), 6);
+    assert_eq!(
+        opts.get_combine_threshold(),
+        HunkBuildOptions::DEFAULT_COMBINE_THRESHOLD
+    );
 }
 
 #[test]

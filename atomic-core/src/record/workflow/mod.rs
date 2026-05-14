@@ -136,11 +136,11 @@ pub use detect::{
     detect_changes_simple, DetectedFile, DetectionKind, DetectionOptions, DetectionResult,
 };
 pub use globalize::{
-    create_content_vertex, create_deletion_edges, create_inode_vertex, create_name_vertex,
-    extract_filename, extract_parent, globalize_hunk, globalize_recorded_file,
-    resolve_file_position, resolve_inode_to_position, resolve_parent_inode, resolve_path_to_inode,
-    CacheStats, GlobalizeContext, GlobalizeError, GlobalizeOptions, GlobalizeResult,
-    GlobalizedFile,
+    create_content_vertex, create_content_vertices_per_line, create_deletion_edges,
+    create_inode_vertex, create_name_vertex, extract_filename, extract_parent, globalize_hunk,
+    globalize_recorded_file, resolve_file_position, resolve_inode_to_position,
+    resolve_parent_inode, resolve_path_to_inode, CacheStats, GlobalizeContext, GlobalizeError,
+    GlobalizeOptions, GlobalizeResult, GlobalizedFile,
 };
 pub use graph_op::{
     BuiltHunk, BuiltHunkKind, HunkBuildOptions, HunkBuildResult, HunkBuilder, PendingChange,

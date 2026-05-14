@@ -148,13 +148,16 @@ pub fn write_new_vertex<T: MutTxnT>(
         add_edge_with_reverse(txn, resolved_inode, up_flag, up_vertex, node, change_id)?;
     }
 
-    // Create edges from new span to successors
-    // For non-folder edges, remove BLOCK from down edges
-    let down_flag = if insertion.flag.is_folder() {
-        insertion.flag
-    } else {
-        insertion.flag - EdgeFlags::BLOCK
-    };
+    // Create edges from new span to successors.
+    //
+    // We use the SAME flag (BLOCK or FOLDER, possibly with the bit set
+    // from `insertion.flag`) as the predecessor edge.  The legacy Pijul
+    // design stripped BLOCK from down-edges, but with the typed edge
+    // model an edge whose flag is `EMPTY` parses as no [`EdgeKind`]
+    // variant — making the edge invisible to `iter_forward` /
+    // `iter_parents` and breaking forward traversal across a Replace
+    // hunk's wired successor.
+    let down_flag = insertion.flag | EdgeFlags::BLOCK;
 
     for down_pos in workspace.successors().to_vec() {
         // Find the span containing this position to use as edge target.

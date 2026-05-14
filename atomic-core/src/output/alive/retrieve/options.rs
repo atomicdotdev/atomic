@@ -178,22 +178,24 @@ impl RetrieveOptions {
 
     /// Check if a forward edge should be followed during traversal.
     ///
-    /// With no filter, deleted edges are always skipped.
-    /// With a filter, a deleted edge is skipped only if its introducing
-    /// change is IN the filter (meaning the deletion has happened from
-    /// our view's perspective).
+    /// A `BlockDeleted` / `FolderDeleted` edge is **never** an alive
+    /// forward edge.  In the additive model a deletion is recorded by
+    /// adding a new edge with the `DELETED` flag *alongside* the
+    /// original `Block`/`Folder` edge — the original stays in the
+    /// B-tree forever.  Reachability of the destination always comes
+    /// from the original edge, which is filtered separately by
+    /// `passes_filter` on its `introduced_by`.
+    ///
+    /// Treating a `BlockDeleted` edge as alive (because its introducer
+    /// is outside the filter) would push a *second* child entry to the
+    /// same destination into the alive graph, which fork-detection
+    /// misreads as a concurrent CRDT conflict.
+    ///
+    /// Vertex-level aliveness still consults parent-side `BlockDeleted`
+    /// edges via [`is_vertex_alive`] — that path correctly distinguishes
+    /// "deletion happened from our view" from "deletion is invisible".
     pub fn is_edge_alive(&self, edge: &ForwardEdge) -> bool {
-        match &self.change_filter {
-            None => !edge.kind.is_deleted(),
-            Some(_) => {
-                if edge.kind.is_deleted() {
-                    // Deletion from outside our view = "hasn't happened yet" = alive
-                    !self.passes_filter(edge.introduced_by)
-                } else {
-                    true
-                }
-            }
-        }
+        !edge.kind.is_deleted()
     }
 
     /// Check if a vertex is alive by examining all its parent edges.

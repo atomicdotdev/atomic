@@ -63,22 +63,18 @@ impl Repository {
             Err(e) => return Err(RepositoryError::Database(e.to_string())),
         };
 
-        // Build retrieve options.
+        // Always build the change filter.
         //
-        // Fast path: for a Shared view with no parent (the common case
-        // after `atomic init` or `atomic git import`), ALL changes in
-        // GRAPH are visible.  Skip the expensive O(N) change-log scan
-        // and N change-file disk reads — use default options (no filter).
+        // There is no "fast path" for shared root views: draft views
+        // also write their vertices into the global GRAPH (the ambient
+        // graph model), so an unfiltered retrieval on a shared root
+        // would see vertices from drafts that aren't in its VIEW_CHANGES.
         //
-        // Slow path: for Draft views or views with parents, build the
-        // filter set so the alive-graph traversal only sees vertices
-        // from visible changes.
-        let options = if view.kind.is_shared() && view.parent.is_none() {
-            RetrieveOptions::default()
-        } else {
-            let change_filter = collect_visible_change_ids_with_deps(&txn, &view)?;
-            RetrieveOptions::new().with_change_filter(change_filter)
-        };
+        // The filter is the source of truth for what each view sees —
+        // it's computed cheaply at read time from VIEW_CHANGES plus the
+        // parent chain.
+        let change_filter = collect_visible_change_ids_with_deps(&txn, &view)?;
+        let options = RetrieveOptions::new().with_change_filter(change_filter);
 
         // All edges are in GRAPH — raw transaction sees everything.
         // The change_filter handles view isolation.

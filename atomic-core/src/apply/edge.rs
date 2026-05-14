@@ -189,27 +189,16 @@ fn write_new_edge<T: MutTxnT>(
         log::debug!("write_new_edge: collect_pseudo_edges complete");
     }
 
-    // Remove the old edge before adding the new one.
+    // ADDITIVE-ONLY: do NOT delete the old edge.  In a patch-theory
+    // graph database, every change adds new edges — it never removes
+    // them.  The original BLOCK edge stays in the B-tree alongside the
+    // new BLOCK|DELETED edge so other views (whose change filter does
+    // not include this deletion) continue to see the alive edge.
     //
-    // The `previous` field records the flags of the edge being superseded
-    // (e.g., BLOCK for a live edge that is now being marked DELETED).
-    // Without this deletion the old alive edge remains in the B-tree
-    // multimap alongside the new DELETED edge, causing `is_vertex_alive`
-    // to find the stale alive parent and incorrectly report the vertex as
-    // alive — which breaks subsequent Replace operations on the same file.
-    log::debug!("write_new_edge: del_edge_with_reverse");
-    del_edge_with_reverse(
-        txn,
-        resolved_inode,
-        edge.previous,
-        source,
-        target,
-        introduced_by,
-    )?;
-
-    // Add the new edge (e.g., BLOCK|DELETED to mark content as removed,
-    // or BLOCK to wire in new content).
-    log::debug!("write_new_edge: add_edge_with_reverse");
+    // `is_vertex_alive` checks for superseding deletions among ALL
+    // incoming edges (including DELETED ones) when a filter is active,
+    // so the alive edge being present doesn't "leak" through filters.
+    log::debug!("write_new_edge: add_edge_with_reverse (additive-only model)");
     add_edge_with_reverse(txn, resolved_inode, edge.flag, source, target, change_id)?;
 
     // For non-folder deletions, check for zombie context
@@ -301,6 +290,7 @@ pub fn find_target_vertex<T: GraphTxnT>(
 ///
 /// Errors are silently ignored (the edge may not exist if this is the
 /// first time the graph is being written).
+#[allow(dead_code)]
 fn del_edge_with_reverse<T: MutTxnT>(
     txn: &mut T,
     inode: Option<Inode>,

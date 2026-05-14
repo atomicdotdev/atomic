@@ -860,7 +860,7 @@ impl<'a> RepoToolExecutor<'a> {
 
         let nodes = self
             .repo
-            .vault_kg_search(query, limit)
+            .vault_kg_search(query, limit, None)
             .map_err(|e| format!("kg_search failed: {e}"))?;
 
         serde_json::to_string_pretty(&nodes).map_err(|e| format!("serialize error: {e}"))

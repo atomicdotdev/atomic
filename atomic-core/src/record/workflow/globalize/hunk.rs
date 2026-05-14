@@ -20,13 +20,15 @@
 //! |-----------|-----------|-----------------|
 //! | `Insert`  | `old_start == 0` | **Prepend**: insert before first content |
 //! | `Insert`  | `old_start >= old_lines` | **Append**: insert after last content |
-//! | `Replace` | *(always)* | **Replace**: delete all old → insert new |
+//! | `Insert`  | middle, multi-vertex | **Middle**: insert between two vertices |
+//! | `Insert`  | middle, single-vertex | **Fallback**: Replace (re-creates per-line) |
+//! | `Replace` | *(always)* | **Replace**: delete all old → insert new per-line |
 //! | `Delete`  | *(always)* | **Delete**: delete all old content |
 //!
-//! Middle insertions (`0 < old_start < old_lines`) are collapsed into a
-//! single Replace by the upstream consolidation step. If one somehow
-//! reaches here (e.g. a future code path bypasses the consolidation), we
-//! return a clear error rather than silently duplicating content.
+//! Middle insertions into multi-vertex files are resolved to the vertex
+//! boundary at `old_start`.  For single-vertex files (first recording),
+//! the insert falls back to a whole-file Replace which creates per-line
+//! vertices, enabling future middle inserts.
 //!
 //! Both `Replace` and `Delete` need the same "find every content vertex and
 //! build deletion edges" work, so that logic lives in one place:
@@ -40,7 +42,7 @@ use crate::pristine::InodeGraphOps;
 // Public entry point
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Globalize a single built hunk into a graph operation.
+/// Globalize a single built hunk into one or more graph operations.
 ///
 /// # Arguments
 ///
@@ -48,10 +50,13 @@ use crate::pristine::InodeGraphOps;
 /// * `built`          – the built hunk from the recording phase
 /// * `inode`          – the file's stable identifier
 /// * `inode_pos`      – the graph position of the file's inode vertex
-/// * `content`        – the content bytes this hunk should insert (the hunk's
-///   own slice for Insert, the full new file for Replace)
+/// * `content`        – the hunk-specific content slice (the inserted/replaced
+///   bytes for Insert/Replace, empty for Delete)
 /// * `old_line_count` – number of lines in the old file (for insert-position
 ///   classification)
+/// * `full_content`   – the complete new file content, used as a fallback when
+///   a middle Insert cannot be performed granularly (single-vertex file) and
+///   must be escalated to a whole-file Replace
 pub fn globalize_hunk<T>(
     ctx: &mut GlobalizeContext<'_, T>,
     built: &BuiltHunk,
@@ -59,28 +64,49 @@ pub fn globalize_hunk<T>(
     inode_pos: Position<NodeId>,
     content: &[u8],
     old_line_count: Option<usize>,
-) -> GlobalizeResult<GraphOp<Option<Hash>>>
+    full_content: &[u8],
+) -> GlobalizeResult<Vec<GraphOp<Option<Hash>>>>
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
     let local = built.local.clone();
     let encoding = built.encoding;
 
+    log::debug!(
+        "globalize_hunk: kind={:?} old_start={} new_start={} new_len={} content_len={} full_content_len={} old_line_count={:?}",
+        built.kind, built.old_start, built.new_start, built.new_len,
+        content.len(), full_content.len(), old_line_count,
+    );
+
     match built.kind {
-        BuiltHunkKind::Insert => globalize_insert(
-            ctx,
-            built,
-            inode,
-            inode_pos,
-            content,
-            old_line_count,
-            local,
-            encoding,
-        ),
-        BuiltHunkKind::Replace => {
-            globalize_replace(ctx, inode, inode_pos, content, local, encoding)
+        BuiltHunkKind::Insert => {
+            match globalize_insert(
+                ctx,
+                built,
+                inode,
+                inode_pos,
+                content,
+                old_line_count,
+                local.clone(),
+                encoding,
+            ) {
+                Ok(ops) => Ok(ops),
+                Err(e) => {
+                    log::debug!(
+                        "globalize_hunk: insert failed ({:?}), falling back to replace",
+                        e
+                    );
+                    // Middle insert into a single-vertex file — fall back to
+                    // a whole-file Replace using the full file content (not
+                    // just the inserted slice).
+                    globalize_replace(ctx, built, inode, inode_pos, full_content, local, encoding)
+                }
+            }
         }
-        BuiltHunkKind::Delete => globalize_delete(ctx, inode, inode_pos, local, encoding),
+        BuiltHunkKind::Replace => {
+            globalize_replace(ctx, built, inode, inode_pos, content, local, encoding)
+        }
+        BuiltHunkKind::Delete => globalize_delete(ctx, built, inode, inode_pos, local, encoding),
     }
 }
 
@@ -88,17 +114,19 @@ where
 // Insert: prepend / append (the only two safe positions)
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Classify an Insert hunk and emit the corresponding graph operation.
+/// Classify an Insert hunk and emit the corresponding graph operation(s).
 ///
-/// Only two positions are supported:
+/// Three positions are supported:
 ///
 /// * **Prepend** (`old_start == 0`): new content is wired between the inode
 ///   vertex and the first existing content vertex.
 /// * **Append** (`old_start >= old_line_count`): new content is wired after
 ///   the last existing content vertex.
+/// * **Middle** (`0 < old_start < old_line_count`, multi-vertex file): new
+///   content is wired between two adjacent content vertices.
 ///
-/// Any other position means the upstream consolidation was bypassed, and we
-/// return an error instead of silently producing duplicate content.
+/// For single-vertex files, `classify_insert` returns an error and the
+/// caller (`globalize_hunk`) falls back to a whole-file Replace.
 #[allow(clippy::too_many_arguments)]
 fn globalize_insert<T>(
     ctx: &mut GlobalizeContext<'_, T>,
@@ -109,7 +137,7 @@ fn globalize_insert<T>(
     old_line_count: Option<usize>,
     local: Local,
     encoding: Option<Encoding>,
-) -> GlobalizeResult<GraphOp<Option<Hash>>>
+) -> GlobalizeResult<Vec<GraphOp<Option<Hash>>>>
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
@@ -118,94 +146,265 @@ where
     let (predecessors, successors) = match position {
         InsertPosition::Prepend { first_content } => (vec![inode_pos], vec![first_content]),
         InsertPosition::Append { last_content_end } => (vec![last_content_end], vec![]),
+        InsertPosition::Middle {
+            predecessor_end,
+            successor_start,
+        } => (vec![predecessor_end], vec![successor_start]),
     };
 
-    let vertex = create_content_vertex(ctx, inode, inode_pos, predecessors, successors, content)?;
+    let insertions =
+        create_content_vertices_per_line(ctx, inode, inode_pos, predecessors, successors, content)?;
 
-    Ok(GraphOp::Edit {
-        change: Atom::Insertion(vertex),
-        local,
-        encoding,
-    })
+    let ops = insertions
+        .into_iter()
+        .map(|vertex| GraphOp::Edit {
+            change: Atom::Insertion(vertex),
+            local: local.clone(),
+            encoding,
+        })
+        .collect();
+
+    Ok(ops)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
 // Replace: delete all old content, insert full new content
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Delete every existing content vertex and insert `content` (the full new
-/// file) as a single vertex connected to the inode.
+/// Replace the specific line vertices identified by `built.deleted_lines`
+/// with new per-line vertices for the replacement content.
+///
+/// This is **proper patch theory**: only the vertices corresponding to the
+/// changed lines are deleted, and only the new lines are inserted.  Lines
+/// outside the replaced range stay as the original vertices, shared by
+/// every view that includes the parent change.
+///
+/// # Mapping line numbers to vertices
+///
+/// Content is stored as a chain of per-line vertices (see
+/// `create_content_vertices_per_line`).  After sorting by start position,
+/// `vertices[i]` corresponds to line `i` of the old file.
+///
+/// # Behaviour
+///
+/// 1. Find the predecessor: the end of the vertex BEFORE the first deleted
+///    line.  If the deletion starts at line 0, the predecessor is the inode.
+/// 2. Find the successor: the start of the vertex AFTER the last deleted
+///    line.  If the deletion extends to the end of the file, there is no
+///    successor.
+/// 3. Delete only the vertices in the deleted range.
+/// 4. Insert per-line vertices for the new content, wired between the
+///    predecessor and successor.
+///
+/// # Fallback
+///
+/// If the file is stored as a single monolithic vertex (legacy state
+/// before per-line vertex creation), we fall back to whole-file Replace.
+#[allow(clippy::too_many_arguments)]
 fn globalize_replace<T>(
     ctx: &mut GlobalizeContext<'_, T>,
+    built: &BuiltHunk,
     inode: Inode,
     inode_pos: Position<NodeId>,
     content: &[u8],
     local: Local,
     encoding: Option<Encoding>,
-) -> GlobalizeResult<GraphOp<Option<Hash>>>
+) -> GlobalizeResult<Vec<GraphOp<Option<Hash>>>>
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    let step = std::time::Instant::now();
-    let content_vertices = find_content_vertices(ctx.txn(), inode, inode_pos)?;
-    let find_ms = step.elapsed().as_millis();
+    let sorted = collect_sorted_content_vertices(ctx.txn(), inode, inode_pos)?;
 
-    let step = std::time::Instant::now();
-    let deletion_edges = match build_deletion_edges(ctx, &content_vertices) {
-        Ok(edges) => edges,
-        Err(e) => {
-            // The INODE_GRAPH fast path may return vertices whose PARENT
-            // edges are missing/stale in the global GRAPH (e.g. after
-            // many Replaces).  Retry with the global DFS which walks the
-            // full alive graph and produces consistent vertices.
-            log::debug!(
-                "globalize_replace: build_deletion_edges failed for inode={:?} ({} vertices), \
-                 retrying with global DFS: {}",
-                inode,
-                content_vertices.len(),
-                e,
-            );
-            let global_vertices = find_content_vertices_global(ctx.txn(), inode_pos)?;
-            match build_deletion_edges(ctx, &global_vertices) {
-                Ok(edges) => edges,
-                Err(e2) => {
-                    log::debug!(
-                        "globalize_replace: global DFS also failed for inode={:?}: {}",
-                        inode,
-                        e2,
-                    );
-                    return Err(e2);
-                }
-            }
-        }
-    };
-    let del_ms = step.elapsed().as_millis();
-
-    if find_ms + del_ms > 50 {
-        log::warn!(
-            "globalize_replace: inode={:?} find_content={}ms ({} vertices) build_deletion={}ms ({} edges)",
-            inode, find_ms, content_vertices.len(), del_ms, deletion_edges.len(),
-        );
-    } else {
-        log::debug!(
-            "globalize_replace: inode={:?} find_content={}ms ({} vertices) build_deletion={}ms ({} edges)",
-            inode, find_ms, content_vertices.len(), del_ms, deletion_edges.len(),
-        );
+    // Legacy: file has no visible content vertices in this view.  Fall
+    // back to whole-file replace, which walks INODE_GRAPH unfiltered.
+    //
+    // NOTE: we use `== 0`, not `<= 1`.  A single-line file produces
+    // exactly one per-line vertex, and the targeted path below handles
+    // that just fine (predecessor=inode, successor=None, delete that
+    // one vertex, insert the replacement lines).  Falling back to
+    // whole-file replace for single-line files would have us re-read
+    // edges through the unfiltered INODE_GRAPH index, which picks up
+    // vertices from OTHER views and silently adds their changes as
+    // dependencies — producing a phantom supersession relationship
+    // between the just-recorded change and the other view's edits.
+    if sorted.is_empty() {
+        return globalize_replace_whole_file(ctx, inode, inode_pos, content, local, encoding);
     }
+
+    // Pure insertion (no lines deleted) — treat as a middle/append insert.
+    // This happens when the diff produces a Replace with old_len == 0
+    // (an insertion that the algorithm classified as a replacement).
+    if built.deleted_lines.is_empty() {
+        let position = match classify_insert(
+            ctx.txn(),
+            inode,
+            inode_pos,
+            built.old_start,
+            Some(sorted.len()),
+        ) {
+            Ok(p) => p,
+            Err(_) => {
+                return globalize_replace_whole_file(
+                    ctx, inode, inode_pos, content, local, encoding,
+                );
+            }
+        };
+
+        let (predecessors, successors) = match position {
+            InsertPosition::Prepend { first_content } => (vec![inode_pos], vec![first_content]),
+            InsertPosition::Append { last_content_end } => (vec![last_content_end], vec![]),
+            InsertPosition::Middle {
+                predecessor_end,
+                successor_start,
+            } => (vec![predecessor_end], vec![successor_start]),
+        };
+
+        let insertions = create_content_vertices_per_line(
+            ctx,
+            inode,
+            inode_pos,
+            predecessors,
+            successors,
+            content,
+        )?;
+
+        let ops = insertions
+            .into_iter()
+            .map(|vertex| GraphOp::Edit {
+                change: Atom::Insertion(vertex),
+                local: local.clone(),
+                encoding,
+            })
+            .collect();
+
+        return Ok(ops);
+    }
+
+    // The deleted_lines field is contiguous (sorted ascending) by
+    // construction in the hunk builder.
+    let first_deleted = *built.deleted_lines.first().unwrap();
+    let last_deleted = *built.deleted_lines.last().unwrap();
+
+    // Bounds-check.  If the deletion extends beyond what we have stored
+    // as per-line vertices, fall back to whole-file replace.
+    if last_deleted >= sorted.len() {
+        return globalize_replace_whole_file(ctx, inode, inode_pos, content, local, encoding);
+    }
+
+    // Resolve predecessor (end of vertex before the first deleted line).
+    let predecessor = if first_deleted == 0 {
+        inode_pos
+    } else {
+        let v = &sorted[first_deleted - 1];
+        Position::new(v.change, v.end)
+    };
+
+    // Resolve successor (start of vertex after the last deleted line).
+    let successor = if last_deleted + 1 < sorted.len() {
+        let v = &sorted[last_deleted + 1];
+        Some(Position::new(v.change, v.start))
+    } else {
+        None
+    };
+
+    // Build deletion edges only for the targeted vertices.
+    let to_delete: Vec<GraphNode<NodeId>> =
+        (first_deleted..=last_deleted).map(|i| sorted[i]).collect();
+    let deletion_edges = build_deletion_edges(ctx, &to_delete)?;
 
     let deletion = EdgeUpdate {
         edges: deletion_edges,
         inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
     };
 
-    let insertion = create_content_vertex(ctx, inode, inode_pos, vec![inode_pos], vec![], content)?;
+    // Build per-line replacement insertions wired between predecessor and
+    // successor (or to nothing if successor is None — append).
+    let predecessors = vec![predecessor];
+    let successors = successor.into_iter().collect();
 
-    Ok(GraphOp::Replacement {
-        change: deletion,
-        replacement: insertion,
-        local,
-        encoding,
-    })
+    let insertions =
+        create_content_vertices_per_line(ctx, inode, inode_pos, predecessors, successors, content)?;
+
+    let mut ops = Vec::with_capacity(insertions.len());
+    let mut iter = insertions.into_iter();
+
+    if let Some(first) = iter.next() {
+        ops.push(GraphOp::Replacement {
+            change: deletion,
+            replacement: first,
+            local: local.clone(),
+            encoding,
+        });
+        for insertion in iter {
+            ops.push(GraphOp::Edit {
+                change: Atom::Insertion(insertion),
+                local: local.clone(),
+                encoding,
+            });
+        }
+    } else {
+        // Pure deletion (no replacement content) — just emit the EdgeUpdate.
+        ops.push(GraphOp::Edit {
+            change: Atom::EdgeUpdate(deletion),
+            local,
+            encoding,
+        });
+    }
+
+    Ok(ops)
+}
+
+/// Legacy fallback: delete all content vertices and re-insert the entire
+/// file as a chain of per-line vertices.  Used when the file is stored as
+/// a single monolithic vertex (no line-level structure to target).
+fn globalize_replace_whole_file<T>(
+    ctx: &mut GlobalizeContext<'_, T>,
+    inode: Inode,
+    inode_pos: Position<NodeId>,
+    content: &[u8],
+    local: Local,
+    encoding: Option<Encoding>,
+) -> GlobalizeResult<Vec<GraphOp<Option<Hash>>>>
+where
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
+{
+    let content_vertices = find_content_vertices(ctx.txn(), inode, inode_pos)?;
+    let deletion_edges = match build_deletion_edges(ctx, &content_vertices) {
+        Ok(edges) => edges,
+        Err(_) => {
+            let global_vertices = find_content_vertices_global(ctx.txn(), inode_pos)?;
+            build_deletion_edges(ctx, &global_vertices)?
+        }
+    };
+
+    let deletion = EdgeUpdate {
+        edges: deletion_edges,
+        inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
+    };
+
+    let insertions =
+        create_content_vertices_per_line(ctx, inode, inode_pos, vec![inode_pos], vec![], content)?;
+
+    let mut ops = Vec::with_capacity(insertions.len());
+    let mut iter = insertions.into_iter();
+
+    if let Some(first) = iter.next() {
+        ops.push(GraphOp::Replacement {
+            change: deletion,
+            replacement: first,
+            local: local.clone(),
+            encoding,
+        });
+        for insertion in iter {
+            ops.push(GraphOp::Edit {
+                change: Atom::Insertion(insertion),
+                local: local.clone(),
+                encoding,
+            });
+        }
+    }
+
+    Ok(ops)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -213,27 +412,54 @@ where
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Mark every content vertex for this file as deleted.
+/// Delete the specific line vertices identified by `built.deleted_lines`.
+///
+/// Proper patch theory: only the targeted vertices are marked deleted.
+/// Unaffected lines stay alive as the original vertices.
+///
+/// Falls back to whole-file deletion for legacy single-vertex files or
+/// when `deleted_lines` is empty (full-file Delete hunk).
 fn globalize_delete<T>(
     ctx: &mut GlobalizeContext<'_, T>,
+    built: &BuiltHunk,
     inode: Inode,
     inode_pos: Position<NodeId>,
     local: Local,
     encoding: Option<Encoding>,
-) -> GlobalizeResult<GraphOp<Option<Hash>>>
+) -> GlobalizeResult<Vec<GraphOp<Option<Hash>>>>
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    let step = std::time::Instant::now();
+    let sorted = collect_sorted_content_vertices(ctx.txn(), inode, inode_pos)?;
+
+    // Targeted deletion when we have per-line vertices and a specific
+    // deleted range.
+    if sorted.len() > 1 && !built.deleted_lines.is_empty() {
+        let first_deleted = *built.deleted_lines.first().unwrap();
+        let last_deleted = *built.deleted_lines.last().unwrap();
+
+        if last_deleted < sorted.len() {
+            let to_delete: Vec<GraphNode<NodeId>> =
+                (first_deleted..=last_deleted).map(|i| sorted[i]).collect();
+            let deletion_edges = build_deletion_edges(ctx, &to_delete)?;
+
+            let deletion = EdgeUpdate {
+                edges: deletion_edges,
+                inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
+            };
+
+            return Ok(vec![GraphOp::Edit {
+                change: Atom::EdgeUpdate(deletion),
+                local,
+                encoding,
+            }]);
+        }
+    }
+
+    // Fallback: whole-file deletion.
     let deletion = match delete_all_content(ctx, inode, inode_pos) {
         Ok(d) => d,
-        Err(e) => {
-            // Same fallback as globalize_replace: retry via global DFS.
-            log::debug!(
-                "globalize_delete: delete_all_content failed for inode={:?}, \
-                 retrying with global DFS: {}",
-                inode,
-                e,
-            );
+        Err(_) => {
             let global_vertices = find_content_vertices_global(ctx.txn(), inode_pos)?;
             let deletion_edges = build_deletion_edges(ctx, &global_vertices)?;
             EdgeUpdate {
@@ -242,20 +468,12 @@ where
             }
         }
     };
-    let del_ms = step.elapsed().as_millis();
-    if del_ms > 50 {
-        log::warn!(
-            "globalize_delete: inode={:?} delete_all_content took {}ms",
-            inode,
-            del_ms
-        );
-    }
 
-    Ok(GraphOp::Edit {
+    Ok(vec![GraphOp::Edit {
         change: Atom::EdgeUpdate(deletion),
         local,
         encoding,
-    })
+    }])
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -289,7 +507,7 @@ where
 // Insert position classification
 // ───────────────────────────────────────────────────────────────────────────
 
-/// The two valid positions for an Insert hunk.
+/// The valid positions for an Insert hunk.
 #[derive(Debug)]
 enum InsertPosition {
     /// Insert before all existing content.
@@ -303,12 +521,24 @@ enum InsertPosition {
     /// `last_content_end` is the end position of the last content vertex —
     /// used as the predecessor of the new vertex.
     Append { last_content_end: Position<NodeId> },
+
+    /// Insert between two existing content vertices.
+    ///
+    /// `predecessor_end` is the end position of the vertex before the
+    /// insertion point.  `successor_start` is the start position of the
+    /// vertex after the insertion point.
+    Middle {
+        predecessor_end: Position<NodeId>,
+        successor_start: Position<NodeId>,
+    },
 }
 
-/// Determine whether an Insert hunk is a Prepend or Append.
+/// Determine whether an Insert hunk is a Prepend, Append, or Middle insert.
 ///
-/// Returns an error if `old_start` falls in the middle of the file — that
-/// case should have been consolidated into a Replace upstream.
+/// For multi-vertex files (files that have been recorded at least once with
+/// per-line vertex granularity), a middle insert is resolved to the vertex
+/// boundary at `old_start`.  For single-vertex files there are no internal
+/// boundaries, so we return an error and let the caller fall back to Replace.
 fn classify_insert<T>(
     txn: &T,
     inode: Inode,
@@ -320,6 +550,13 @@ where
     T: GraphTxnT + InodeGraphOps,
 {
     let vertices = collect_sorted_content_vertices(txn, inode, inode_pos)?;
+
+    log::debug!(
+        "classify_insert: old_start={} old_line_count={:?} vertices={}",
+        old_start,
+        old_line_count,
+        vertices.len(),
+    );
 
     // Empty file → append (predecessor is the inode itself).
     if vertices.is_empty() {
@@ -346,14 +583,38 @@ where
         });
     }
 
-    // Middle insertion — this should never arrive here after the upstream
-    // consolidation in `record_modified_file`.  Return a clear error so the
-    // caller knows something is wrong rather than silently triplicating
-    // content.
-    Err(GlobalizeError::MissingContext {
-        path: "(middle insertion reached globalize_hunk — upstream consolidation was bypassed)"
-            .to_string(),
-        line: old_start as u64,
+    // ── Middle insertion ──
+    //
+    // For single-vertex files we cannot split at a line boundary, so we
+    // return an error.  The caller (`globalize_insert`) catches this and
+    // falls back to a whole-file Replace.
+    if vertices.len() == 1 {
+        return Err(GlobalizeError::MissingContext {
+            path: "(middle insertion into single-vertex file — needs consolidation)".to_string(),
+            line: old_start as u64,
+        });
+    }
+
+    // Multi-vertex file: walk vertices to find the boundary.
+    // After per-line vertex creation, each vertex corresponds roughly
+    // to one line, so vertex[old_start-1] / vertex[old_start] gives
+    // the correct boundary.
+    if old_start < vertices.len() {
+        let pred = &vertices[old_start - 1];
+        let succ = &vertices[old_start];
+        return Ok(InsertPosition::Middle {
+            predecessor_end: Position::new(pred.change, pred.end),
+            successor_start: Position::new(succ.change, succ.start),
+        });
+    }
+
+    // old_start >= vertices.len() but < total_old_lines.
+    // This can happen when line counting and vertex counting diverge.
+    // Fall back to append after the last vertex.
+    let last = vertices.last().unwrap();
+    let last_end = Position::new(last.change, last.end);
+    Ok(InsertPosition::Append {
+        last_content_end: last_end,
     })
 }
 
@@ -361,9 +622,16 @@ where
 // Graph vertex / edge helpers
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Collect content vertices for a file, sorted by start position.
+/// Collect content vertices for a file in **graph traversal order**.
 ///
-/// Returns non-empty, non-root, non-inode vertices from the alive graph.
+/// Starts at the inode vertex and walks forward BLOCK edges, producing
+/// vertices in the order they appear in the file.  This is the only
+/// correct ordering when vertices come from multiple changes — sorting
+/// by `start` would interleave vertices from different changes whose
+/// position spaces are independent.
+///
+/// Skips DELETED edges and PSEUDO edges.  Stops at empty vertices that
+/// aren't the inode.
 fn collect_sorted_content_vertices<T>(
     txn: &T,
     inode: Inode,
@@ -372,9 +640,75 @@ fn collect_sorted_content_vertices<T>(
 where
     T: GraphTxnT + InodeGraphOps,
 {
-    let mut vertices = find_content_vertices(txn, inode, inode_pos)?;
-    vertices.sort_by_key(|a| a.start);
-    Ok(vertices)
+    use crate::types::EdgeFlags;
+    use std::collections::HashSet;
+
+    let mut ordered: Vec<GraphNode<NodeId>> = Vec::new();
+    let mut visited: HashSet<GraphNode<NodeId>> = HashSet::new();
+    let mut current = inode_pos.inode_node();
+
+    loop {
+        if !visited.insert(current) {
+            break;
+        }
+
+        // Find the next alive BLOCK child of `current`.
+        let min_flag = EdgeFlags::BLOCK;
+        let max_flag = EdgeFlags::BLOCK | EdgeFlags::FOLDER;
+
+        let adj = match txn.iter_adjacent(current, min_flag, max_flag) {
+            Ok(a) => a,
+            Err(_) => break,
+        };
+
+        let mut next_vertex: Option<GraphNode<NodeId>> = None;
+        for edge_result in adj {
+            let edge = match edge_result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let flags = edge.flag();
+            if flags.contains(EdgeFlags::PARENT)
+                || flags.contains(EdgeFlags::DELETED)
+                || flags.contains(EdgeFlags::PSEUDO)
+            {
+                continue;
+            }
+            let dest = match txn.find_block(edge.dest()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if visited.contains(&dest) {
+                continue;
+            }
+            // Verify the destination vertex is alive (not deleted by a
+            // superseding edge).
+            next_vertex = Some(dest);
+            break;
+        }
+
+        let dest = match next_vertex {
+            Some(d) => d,
+            None => break,
+        };
+
+        // Skip the inode marker itself (empty vertex at inode position).
+        let is_inode_marker = dest.start == dest.end && dest.start == inode_pos.pos;
+        if !is_inode_marker && !dest.change.is_root() && dest.start != dest.end {
+            ordered.push(dest);
+        }
+
+        current = dest;
+    }
+
+    log::debug!(
+        "collect_sorted_content_vertices: inode={:?} produced {} ordered vertices",
+        inode,
+        ordered.len(),
+    );
+
+    let _ = inode; // suppress unused warning if logging is off
+    Ok(ordered)
 }
 
 /// Retrieve every alive content vertex for a file.

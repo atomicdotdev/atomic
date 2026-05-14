@@ -289,8 +289,11 @@ where
         for built in recorded.hunks() {
             // Determine the content slice for this hunk.
             //
-            // Replace hunks need the full file content because they delete
-            // all existing vertices and re-insert the complete new file.
+            // Replace hunks need ONLY the replacement lines — passing the
+            // full file would cause `globalize_replace` to create per-line
+            // vertices for unchanged lines, producing a whole-file rewrite
+            // that wipes out the targeted line surgery.  Slice out the lines
+            // [new_start, new_start + new_len) from the new content.
             //
             // Insert hunks only need their own slice — they are guaranteed
             // (by the upstream consolidation in record_modified_file) to be
@@ -298,8 +301,12 @@ where
             // bytes without touching anything else.
             //
             // Delete hunks carry no content.
-            let hunk_content = match built.kind {
-                crate::record::workflow::graph_op::BuiltHunkKind::Replace => content,
+            let replace_slice;
+            let hunk_content: &[u8] = match built.kind {
+                crate::record::workflow::graph_op::BuiltHunkKind::Replace => {
+                    replace_slice = slice_lines(content, built.new_start, built.new_len);
+                    replace_slice
+                }
                 crate::record::workflow::graph_op::BuiltHunkKind::Insert => {
                     if let (Some(start), Some(end)) = (built.content_start, built.content_end) {
                         let start = start as usize;
@@ -319,13 +326,14 @@ where
             // Track content position before globalization
             let content_pos_before = ctx.content_len();
 
-            let graph_op = globalize_hunk(
+            let graph_ops = globalize_hunk(
                 ctx,
                 built,
                 inode,
                 inode_pos,
                 hunk_content,
                 recorded.old_line_count(),
+                content,
             )?;
 
             // Track content position after globalization
@@ -347,7 +355,9 @@ where
                 });
             }
 
-            result.add_hunk(graph_op);
+            for graph_op in graph_ops {
+                result.add_hunk(graph_op);
+            }
         }
 
         // Enrich FileOps with content ranges for Edit hunks
@@ -422,56 +432,90 @@ where
         };
 
         if !content.is_empty() {
-            // Add file content to the context buffer
-            let (content_start, content_end) = ctx.append_content(content);
-
             let encoding = recorded.encoding();
 
-            // Enrich FileOps with the content range if available
-            // This links the CRDT branches to their graph vertex positions
+            // Split content into per-line slices (each line keeps its '\n').
+            // This gives the graph line-level vertex granularity from the
+            // very first record, so subsequent edits to different lines
+            // can target individual vertices rather than the whole file.
+            let line_slices: Vec<&[u8]> = split_into_lines(content);
+
+            // Compute the buffer position where content will start (we use
+            // this to enrich FileOps with per-line ranges).
+            let first_content_start = ChangePosition::new(ctx.content_len());
+
+            // Append each line to the content buffer, recording its range.
+            let mut line_ranges: Vec<(ChangePosition, ChangePosition)> =
+                Vec::with_capacity(line_slices.len());
+            for line in &line_slices {
+                let (s, e) = ctx.append_content(line);
+                line_ranges.push((s, e));
+            }
+
+            // Enrich FileOps with the first content position for CRDT.
             if let Some(mut file_ops) = recorded.crdt_ops().cloned() {
-                // For a FileAdd, all line content is in the single content span
-                // We need to compute per-line ranges within the content
-                enrich_file_ops_for_add(&mut file_ops, content, content_start);
+                enrich_file_ops_for_add(&mut file_ops, content, first_content_start);
                 result.set_file_ops(file_ops);
             }
 
+            // First line goes into FileAdd's `contents` field, wired off
+            // the inode.  Predecessor is the inode vertex.
+            let (first_start, first_end) = line_ranges[0];
+            let first_line = Insertion {
+                predecessors: vec![inode_pos],
+                successors: vec![],
+                flag: EdgeFlags::BLOCK,
+                start: first_start,
+                end: first_end,
+                inode: inode_pos,
+            };
+
             let graph_op = GraphOp::FileAdd {
                 add_name: Insertion {
-                    // Parent context - ROOT for top-level files
                     predecessors: vec![parent_context_pos],
                     successors: vec![],
                     flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
                     start: name_start,
                     end: name_end,
-                    // The inode field for add_name points to the parent's position
                     inode: parent_context_pos,
                 },
                 add_inode: Insertion {
-                    // The inode span's parent is the name span
                     predecessors: vec![name_pos],
                     successors: vec![],
                     flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
                     start: inode_start,
                     end: inode_end,
-                    // The inode field points to itself (this is the file's root)
                     inode: inode_pos,
                 },
-                contents: Some(Insertion {
-                    // Content's parent is the inode span
-                    predecessors: vec![inode_pos],
-                    successors: vec![],
-                    flag: EdgeFlags::BLOCK,
-                    start: content_start,
-                    end: content_end,
-                    // Content belongs to this file (referenced by inode)
-                    inode: inode_pos,
-                }),
+                contents: Some(first_line),
                 path: path.to_string(),
                 encoding,
             };
-
             result.add_hunk(graph_op);
+
+            // Remaining lines: emit as standalone Edit ops chained from
+            // the previous line's end position (self-referencing within
+            // this change).
+            for (i, &(line_start, line_end)) in line_ranges.iter().enumerate().skip(1) {
+                let prev_end = line_ranges[i - 1].1;
+                let chain_pred = Position {
+                    change: None, // self-reference within this change
+                    pos: prev_end,
+                };
+                let line_vertex = Insertion {
+                    predecessors: vec![chain_pred],
+                    successors: vec![],
+                    flag: EdgeFlags::BLOCK,
+                    start: line_start,
+                    end: line_end,
+                    inode: inode_pos,
+                };
+                result.add_hunk(GraphOp::Edit {
+                    change: Atom::Insertion(line_vertex),
+                    local: Local::new(path, (i + 1) as u64),
+                    encoding,
+                });
+            }
         } else if options.include_empty_files() {
             // Empty file - still create the FileAdd but with no content span
             let graph_op = GraphOp::FileAdd {
@@ -508,6 +552,39 @@ where
     result.set_dependency_count(ctx.dependencies().len() - initial_deps);
 
     Ok(result)
+}
+
+/// Return the byte slice of `content` covering `len` lines starting at line
+/// `start` (0-indexed), where lines are delimited by `\n` (the newline is
+/// included with the line it terminates).  Used to extract the replacement
+/// slice for a Replace hunk so that `globalize_replace` only creates
+/// per-line vertices for the lines it actually replaces.
+fn slice_lines(content: &[u8], start: usize, len: usize) -> &[u8] {
+    if len == 0 {
+        return &[];
+    }
+    let mut line = 0usize;
+    let mut byte_start: Option<usize> = None;
+    let mut byte_end = content.len();
+    if start == 0 {
+        byte_start = Some(0);
+    }
+    for (i, &b) in content.iter().enumerate() {
+        if b == b'\n' {
+            line += 1;
+            if byte_start.is_none() && line == start {
+                byte_start = Some(i + 1);
+            }
+            if byte_start.is_some() && line == start + len {
+                byte_end = i + 1;
+                break;
+            }
+        }
+    }
+    match byte_start {
+        Some(s) if s <= byte_end => &content[s..byte_end],
+        _ => &[],
+    }
 }
 
 /// Enrich FileOps with content ranges for a FileAdd operation.

@@ -70,7 +70,7 @@
 //! ```
 
 use crate::change::Encoding;
-use crate::diff::{diff, Algorithm, DiffOp, Line};
+use crate::diff::{diff, diff_raw, Algorithm, DiffOp, Line};
 
 // ============================================================================
 // COMPARE RESULT
@@ -407,8 +407,14 @@ pub fn generate_diff(old_content: &[u8], new_content: &[u8], algorithm: Algorith
     let old_lines: Vec<Line> = Line::from_bytes(old_content);
     let new_lines: Vec<Line> = Line::from_bytes(new_content);
 
-    // Run diff algorithm
-    let result = diff(&old_lines, &new_lines, algorithm);
+    // Use `diff_raw` instead of `diff` to skip the
+    // `rewrite_positional_shifts` heuristic.  That heuristic is helpful
+    // for **displaying** diffs to users but corrupts patch-theory graph
+    // semantics: it rewrites pure insertions into Replace+Insert pairs,
+    // which causes `globalize_replace` to delete unchanged vertices.
+    // Records and graph operations need the algorithmically minimal
+    // diff, not the user-friendly one.
+    let result = diff_raw(&old_lines, &new_lines, algorithm);
 
     // Return operations
     result.ops().to_vec()
