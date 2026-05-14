@@ -164,43 +164,34 @@ pub(crate) fn build_crdt_ops_for_modified_file(
                 new_pos,
                 len,
             } => {
-                // Route through the diff-op rules layer so the choice
-                // between "Equal stayed in place" (advance prev_branch,
-                // no op) and "Equal moved to a different position"
-                // (emit Reparent for each line) is a named, auditable
-                // rule rather than an inline branch.
+                // Equal lines emit no CRDT op (no content change, chain
+                // position unchanged for same-position matches).  We
+                // still need to advance `prev_branch` so any subsequent
+                // op chains its `after` reference off the last equal
+                // line.
                 //
-                // See recipes::diff_op_rules — specifically the rule
-                // "equal/relocated/emit_reparent", which catches the
-                // extract-function pattern where Myers identifies a
-                // line in both old and new at different positions.
-                use crate::record::workflow::recipes::diff_op_rules::{
-                    dispatch as dispatch_diff_op_rule, DiffOpContext, Line,
-                };
-                let old_line_views: Vec<Line<'_>> = old_lines
-                    .iter()
-                    .map(|l| Line::new(l.content()))
-                    .collect();
-                let new_line_views: Vec<Line<'_>> = new_lines
-                    .iter()
-                    .map(|l| Line::new(l.content()))
-                    .collect();
-                let mut rule_ctx = DiffOpContext {
-                    existing_branches,
-                    old_lines: &old_line_views,
-                    new_lines: &new_line_views,
-                    encoding: _encoding,
-                    placeholder_change: placeholder_change_id,
-                    prev_branch,
-                    emitted: Vec::new(),
-                };
-                let matched = dispatch_diff_op_rule(op, &mut rule_ctx);
-                debug_assert!(matched, "Equal DiffOp must match a rule");
-                for emitted in rule_ctx.emitted {
-                    collected_line_ops.push(emitted);
-                    stats.lines_modified += 1;
+                // The diff_op_rules dispatch (for `Equal at different
+                // positions → emit Reparent`) is **temporarily disabled**
+                // because emitting a single Reparent breaks chain
+                // coherence: when a line moves out from between its
+                // existing predecessor and successor, both the moved
+                // branch's `after` AND any branch whose `after` was the
+                // moved branch need updating in a single coordinated
+                // change.  Until paired-Reparent support lands, prefer
+                // the byte-exact Delete+Insert representation (handled
+                // by the surrounding Delete/Insert/Replace arms).
+                //
+                // This advance keeps the existing in-place edit behavior
+                // identical to the pre-Reparent baseline so cross-view
+                // tests don't regress on simple modifications.
+                let _ = old_pos;
+                let _ = new_pos;
+                if let Some(existing) = existing_branches {
+                    let last_equal_idx = old_pos + len - 1;
+                    if last_equal_idx < existing.len() {
+                        prev_branch = Some(existing[last_equal_idx]);
+                    }
                 }
-                prev_branch = rule_ctx.prev_branch;
                 _old_line_idx = old_pos + len;
                 _new_line_idx = new_pos + len;
             }

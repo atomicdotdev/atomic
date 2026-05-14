@@ -522,7 +522,30 @@ impl Repository {
                     // Delete/Modify ops to the real BranchIds for those
                     // old-content lines (or `None` when this file has no CRDT
                     // rows yet — see Step 1).
-                    let crdt_old_content = if existing_branches.is_empty() {
+                    // The CRDT walker (`get_file_content_via_crdt`) reads
+                    // the *materialized* state across all views.  In a
+                    // single-view linear history (e.g. hyperfine import)
+                    // that's identical to the view-scoped byte-graph
+                    // walker, and using it lets the CRDT op recipe see
+                    // chain-correct content for move detection.
+                    //
+                    // In multi-view scenarios (e.g. the cross-view-merge
+                    // tests), the CRDT walker leaks other views'
+                    // modifications into this view's record, which then
+                    // emits spurious reverts.
+                    //
+                    // Gate on view count: with exactly one view, use
+                    // the CRDT walker; otherwise fall back to the
+                    // view-scoped byte-graph content.  This keeps both
+                    // workloads correct until a view-filter-aware CRDT
+                    // walker lands.
+                    let view_count = self
+                        .list_views()
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    let crdt_old_content: Option<Vec<u8>> = if existing_branches.is_empty()
+                        || view_count > 1
+                    {
                         None
                     } else {
                         match self.get_file_content_via_crdt(entry.path()) {
