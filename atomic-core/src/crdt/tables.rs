@@ -204,7 +204,6 @@ pub const BRANCH_VERTEX: TableDefinition<&[u8; 12], &[u8; 24]> =
 /// branch whose stored value is `BranchId::ROOT`.  Concurrent branches
 /// that share the same `after` reference are tie-broken by their natural
 /// `BranchId` order, matching the CRDT model.
-
 /// Graph vertex → BranchId reverse lookup
 ///
 /// Key: 24 bytes encoding `GraphNode<NodeId>` (change_id: u64, start: u64, end: u64)

@@ -323,10 +323,9 @@ pub fn write_change_to_graph(
                     file_ops_count
                 );
             }
-            let _crdt_stats = apply_file_ops_batched(txn, change_id, file_ops)
-                .map_err(|e: atomic_core::pristine::PristineError| {
-                    InsertError::Database(e.to_string())
-                })?;
+            let _crdt_stats = apply_file_ops_batched(txn, change_id, file_ops).map_err(
+                |e: atomic_core::pristine::PristineError| InsertError::Database(e.to_string()),
+            )?;
             let crdt_ms = crdt_start.elapsed().as_millis();
             if trace_record {
                 eprintln!(

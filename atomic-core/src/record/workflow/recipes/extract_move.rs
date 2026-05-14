@@ -59,14 +59,8 @@ pub fn build_ops(ctx: &RecipeContext<'_>) -> (FileOps, CrdtBuildStats) {
     let placeholder_trunk = TrunkId::new(NodeId::new(0), 0);
 
     // Tokenize.
-    let old_lines: Vec<&[u8]> = ctx
-        .old_content
-        .split_inclusive(|&b| b == b'\n')
-        .collect();
-    let new_lines: Vec<&[u8]> = ctx
-        .new_content
-        .split_inclusive(|&b| b == b'\n')
-        .collect();
+    let old_lines: Vec<&[u8]> = ctx.old_content.split_inclusive(|&b| b == b'\n').collect();
+    let new_lines: Vec<&[u8]> = ctx.new_content.split_inclusive(|&b| b == b'\n').collect();
 
     // Index old lines by content hash so we can find moves in O(N).
     let mut old_idx = LineHashIndex::from_lines(&old_lines);
@@ -100,11 +94,7 @@ pub fn build_ops(ctx: &RecipeContext<'_>) -> (FileOps, CrdtBuildStats) {
         id
     };
 
-    let mut file_ops = BuilderFileOps::new(
-        placeholder_trunk,
-        ctx.path.to_string(),
-        None,
-    );
+    let mut file_ops = BuilderFileOps::new(placeholder_trunk, ctx.path.to_string(), None);
     let mut stats = CrdtBuildStats::new();
     let mut prev_emitted: Option<BranchId> = None;
 
@@ -155,11 +145,7 @@ pub fn build_ops(ctx: &RecipeContext<'_>) -> (FileOps, CrdtBuildStats) {
             _ => {
                 // No old-content match: net new line.
                 let new_line = new_lines.get(new_idx).copied().unwrap_or(&[]);
-                let leaf_ops = build_leaf_ops_for_line(
-                    new_line,
-                    ctx.encoding,
-                    &mut alloc_leaf,
-                );
+                let leaf_ops = build_leaf_ops_for_line(new_line, ctx.encoding, &mut alloc_leaf);
                 let branch_id = alloc_branch();
                 let insert_op = BuilderLineOps::insert(branch_id, prev_emitted, leaf_ops)
                     .with_new_line_num(new_idx + 1);
@@ -180,13 +166,9 @@ pub fn build_ops(ctx: &RecipeContext<'_>) -> (FileOps, CrdtBuildStats) {
             .copied()
             .unwrap_or_else(&mut alloc_branch);
         let old_line = old_lines.get(old_idx).copied().unwrap_or(&[]);
-        let content_for_diff = build_leaf_ops_for_line(
-            old_line,
-            ctx.encoding,
-            &mut alloc_leaf,
-        );
-        let delete_op = BuilderLineOps::delete(branch_id, content_for_diff)
-            .with_old_line_num(old_idx + 1);
+        let content_for_diff = build_leaf_ops_for_line(old_line, ctx.encoding, &mut alloc_leaf);
+        let delete_op =
+            BuilderLineOps::delete(branch_id, content_for_diff).with_old_line_num(old_idx + 1);
         file_ops.add_line_op(delete_op);
         stats.lines_deleted += 1;
     }

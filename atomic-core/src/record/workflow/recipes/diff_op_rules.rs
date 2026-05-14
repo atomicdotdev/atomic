@@ -1,6 +1,6 @@
 //! Per-`DiffOp` translation rules.
 //!
-//! The recipe-selection layer ([`super::detector::RULES`]) decides
+//! The recipe-selection layer (`super::detector::RULES`) decides
 //! *which recipe* runs.  Inside a recipe, the rules in this module
 //! decide *how each `DiffOp` becomes one or more CRDT `BranchOp`s*.
 //!
@@ -71,11 +71,7 @@ impl<'a> Line<'a> {
 
     /// Convert the line's tokens into `LeafOp::Insert` ops, allocating
     /// fresh leaf IDs via `alloc_leaf`.
-    pub fn to_leaf_ops(
-        &self,
-        next_leaf_idx: &mut u32,
-        placeholder_change: NodeId,
-    ) -> Vec<LeafOp> {
+    pub fn to_leaf_ops(&self, next_leaf_idx: &mut u32, placeholder_change: NodeId) -> Vec<LeafOp> {
         let tokenizer = ContentTokenizer::new(self.bytes);
         let mut leaf_ops = Vec::new();
         let mut prev_leaf: Option<LeafId> = None;
@@ -94,7 +90,6 @@ impl<'a> Line<'a> {
         leaf_ops
     }
 }
-
 
 /// One translation rule.
 ///
@@ -210,7 +205,12 @@ pub mod appliers {
     /// new at *different* positions, and without a Reparent the existing
     /// branch stays at its old chain position with stale content.
     pub fn emit_reparents_for_equal_block(op: &DiffOp, ctx: &mut DiffOpContext<'_>) {
-        if let DiffOp::Equal { old_pos, new_pos, len } = op {
+        if let DiffOp::Equal {
+            old_pos,
+            new_pos,
+            len,
+        } = op
+        {
             let existing = match ctx.existing_branches {
                 Some(b) => b,
                 None => return,
@@ -236,7 +236,6 @@ pub mod appliers {
             }
         }
     }
-
 }
 
 /// Dispatch a single `DiffOp` through the rule table.
@@ -291,9 +290,7 @@ pub fn dispatch(op: &DiffOp, ctx: &mut DiffOpContext<'_>) -> bool {
 /// # Returns
 ///
 /// Number of pairs promoted, for stats / logging.
-pub fn promote_delete_insert_pairs_to_reparents(
-    line_ops: &mut Vec<BuilderLineOps>,
-) -> usize {
+pub fn promote_delete_insert_pairs_to_reparents(line_ops: &mut Vec<BuilderLineOps>) -> usize {
     use super::content_hash::hash_line;
     use std::collections::HashMap;
 
@@ -312,11 +309,7 @@ pub fn promote_delete_insert_pairs_to_reparents(
     /// lines, and short keyword lines without disqualifying genuine
     /// statement lines.
     fn is_distinctive(bytes: &[u8]) -> bool {
-        bytes
-            .iter()
-            .filter(|b| !b.is_ascii_whitespace())
-            .count()
-            >= MIN_DISTINCTIVE_BYTES
+        bytes.iter().filter(|b| !b.is_ascii_whitespace()).count() >= MIN_DISTINCTIVE_BYTES
     }
 
     // Build a hash → index map of Delete ops with content.
@@ -338,8 +331,7 @@ pub fn promote_delete_insert_pairs_to_reparents(
 
     // Walk Inserts, look for matching Deletes.
     let mut promote: HashMap<usize, usize> = HashMap::new(); // insert_idx → delete_idx
-    let mut consumed_deletes: std::collections::HashSet<usize> =
-        std::collections::HashSet::new();
+    let mut consumed_deletes: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     for (i, op) in line_ops.iter().enumerate() {
         if let BranchOp::Insert { content, .. } = op.operation() {
@@ -357,8 +349,10 @@ pub fn promote_delete_insert_pairs_to_reparents(
                         continue;
                     }
                     // Verify byte-identical (not just hash collision).
-                    if let BranchOp::Delete { content: del_content, .. } =
-                        line_ops[delete_idx_pos].operation()
+                    if let BranchOp::Delete {
+                        content: del_content,
+                        ..
+                    } = line_ops[delete_idx_pos].operation()
                     {
                         if leaf_ops_to_bytes(del_content) == bytes {
                             promote.insert(i, delete_idx_pos);
@@ -463,9 +457,5 @@ fn leaf_ops_to_bytes(leaves: &[LeafOp]) -> Vec<u8> {
 /// Build the placeholder file_ops container the recipe assembles ops
 /// into.  Kept here so callers don't need to import the builder types.
 pub fn new_file_ops(path: &str, placeholder_change: NodeId) -> BuilderFileOps {
-    BuilderFileOps::new(
-        TrunkId::new(placeholder_change, 0),
-        path.to_string(),
-        None,
-    )
+    BuilderFileOps::new(TrunkId::new(placeholder_change, 0), path.to_string(), None)
 }

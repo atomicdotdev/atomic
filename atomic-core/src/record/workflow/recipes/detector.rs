@@ -88,7 +88,7 @@ fn _retain_predicate_for_future_rules() {
 
 /// Pick the best recipe for `ctx`.
 ///
-/// Walks [`RULES`] top-to-bottom; the first rule whose predicate
+/// Walks the `RULES` table top-to-bottom; the first rule whose predicate
 /// matches selects its recipe.  Falls back to [`Recipe::InPlaceEdit`]
 /// when nothing matches.
 ///

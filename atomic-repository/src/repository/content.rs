@@ -95,7 +95,7 @@ impl Repository {
         // The change_filter handles view isolation.
         let content =
             retrieve_content_with_filter_fast(&txn, &self.change_store, inode, position, options)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if content.is_empty() {
             Ok(None)
@@ -152,12 +152,8 @@ impl Repository {
                 drop(txn);
                 self.get_file_content(path)
             }
-            Err(CrdtOutputError::Pristine(e)) => {
-                Err(RepositoryError::Database(e.to_string()))
-            }
-            Err(CrdtOutputError::Store(e)) => {
-                Err(RepositoryError::Database(e.to_string()))
-            }
+            Err(CrdtOutputError::Pristine(e)) => Err(RepositoryError::Database(e.to_string())),
+            Err(CrdtOutputError::Store(e)) => Err(RepositoryError::Database(e.to_string())),
         }
     }
 
@@ -219,7 +215,7 @@ impl Repository {
 
         let content =
             retrieve_content_with_filter_fast(&txn, &self.change_store, inode, position, options)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if content.is_empty() {
             Ok(None)
@@ -771,9 +767,9 @@ impl Repository {
         // Retrieve content from the graph with the filter
         let content =
             retrieve_content_with_filter_fast(txn, &self.change_store, inode, position, options)
-            .map_err(|e: atomic_core::record::RecordError| {
-                RepositoryError::Database(e.to_string())
-            })?;
+                .map_err(|e: atomic_core::record::RecordError| {
+                    RepositoryError::Database(e.to_string())
+                })?;
 
         if content.is_empty() {
             Ok(None)
@@ -828,7 +824,9 @@ where
     C: atomic_core::change::ChangeStore,
 {
     let trace_retrieve = std::env::var_os("ATOMIC_TRACE_RETRIEVE").is_some();
-    if let Some(content) = try_retrieve_linear_content_with_filter(txn, changes, inode, position, &options)? {
+    if let Some(content) =
+        try_retrieve_linear_content_with_filter(txn, changes, inode, position, &options)?
+    {
         if trace_retrieve {
             eprintln!(
                 "[retrieve_content_with_filter_fast] inode fast path hit bytes={}",
@@ -842,7 +840,9 @@ where
         eprintln!("[retrieve_content_with_filter_fast] falling back to retrieve_graph");
     }
 
-    atomic_core::record::workflow::retrieve::retrieve_content_with_filter(txn, changes, position, options)
+    atomic_core::record::workflow::retrieve::retrieve_content_with_filter(
+        txn, changes, position, options,
+    )
 }
 
 fn try_retrieve_linear_content_with_filter<T, C>(

@@ -493,7 +493,8 @@ impl Workspace {
 
     /// Register a vertex inserted during the current change.
     pub fn register_current_vertex(&mut self, node: GraphNode<NodeId>) {
-        self.current_vertices_by_start.insert(node.start_pos(), node);
+        self.current_vertices_by_start
+            .insert(node.start_pos(), node);
         self.current_vertices_by_end.insert(node.end_pos(), node);
     }
 

@@ -494,7 +494,7 @@ impl<E> From<crate::pristine::PristineError> for CrdtOutputError<E> {
 
 /// Reconstruct a file's bytes by walking the CRDT layer.
 ///
-/// This is the alternative to [`crate::output::repo::file::output_file_with_filter`]:
+/// This is the alternative to `output::repo::output_file_with_filter`:
 /// it derives line order from `iter_trunk_branches_in_file_order` (the
 /// CRDT after-chain), filters by `branch.state` for liveness, and pulls
 /// each line's bytes via the branch's recorded graph vertex.
@@ -559,10 +559,7 @@ where
             None => return Err(CrdtOutputError::OrphanBranch(branch_id)),
         };
 
-        let len = graph_node
-            .end
-            .get()
-            .saturating_sub(graph_node.start.get()) as usize;
+        let len = graph_node.end.get().saturating_sub(graph_node.start.get()) as usize;
         if len == 0 {
             continue;
         }

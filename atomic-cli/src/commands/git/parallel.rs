@@ -829,7 +829,14 @@ impl ParallelImporter {
                     let lookup_ms = lookup_start.elapsed().as_millis();
 
                     let diff_start = std::time::Instant::now();
-                    match record_modified_file(&memory_wc, &detected, &old_content, None, &core_options, None) {
+                    match record_modified_file(
+                        &memory_wc,
+                        &detected,
+                        &old_content,
+                        None,
+                        &core_options,
+                        None,
+                    ) {
                         Ok(mut rec) if !rec.is_empty() => {
                             // Override CRDT ops with git's exact diff lines when available.
                             // This guarantees `atomic diff -c` matches `git diff` line-for-line

@@ -124,7 +124,9 @@ pub fn apply_branch_op<T: MutCrdtTxnT>(
             )
         }
         BranchOp::Restore { branch } => apply_restore(txn, context, *branch),
-        BranchOp::Reparent { branch, new_after } => apply_reparent(txn, context, *branch, *new_after),
+        BranchOp::Reparent { branch, new_after } => {
+            apply_reparent(txn, context, *branch, *new_after)
+        }
     }
 }
 
@@ -158,7 +160,9 @@ pub fn apply_branch_op_only<T: MutCrdtTxnT>(
             apply_insert_only(txn, context, trunk_id, branch_id, Some(*branch))
         }
         BranchOp::Restore { branch } => apply_restore(txn, context, *branch),
-        BranchOp::Reparent { branch, new_after } => apply_reparent(txn, context, *branch, *new_after),
+        BranchOp::Reparent { branch, new_after } => {
+            apply_reparent(txn, context, *branch, *new_after)
+        }
     }
 }
 

@@ -58,8 +58,8 @@ use crate::change::{Encoding, FileOps, LineOps};
 use crate::crdt::tables::{
     encode_branch_id, encode_branch_value, encode_leaf_id, encode_leaf_value, encode_trunk_id,
     encode_trunk_value, encode_vertex_position, SerializedBranch, SerializedLeaf, SerializedTrunk,
-    BRANCHES, BRANCH_AFTER, BRANCH_LEAVES, BRANCH_VERTEX, INODE_TRUNK, LEAVES, PATH_TRUNK,
-    TRUNKS, TRUNK_BRANCHES, VERTEX_BRANCH,
+    BRANCHES, BRANCH_AFTER, BRANCH_LEAVES, BRANCH_VERTEX, INODE_TRUNK, LEAVES, PATH_TRUNK, TRUNKS,
+    TRUNK_BRANCHES, VERTEX_BRANCH,
 };
 use crate::crdt::{
     BranchId, BranchOp, BranchState, LeafId, LeafOp, LeafState, TrunkId, TrunkOp, TrunkState,
@@ -212,7 +212,7 @@ pub fn apply_file_ops_batched(
         let trunk_key = encode_trunk_id(&trunk_id);
 
         if let Some(serialized) = trunk_create {
-            let trunk_value = encode_trunk_value(&serialized);
+            let trunk_value = encode_trunk_value(serialized);
             trunks_table.insert(&trunk_key, trunk_value.as_slice())?;
             inode_trunk_table.insert(serialized.inode.get(), &trunk_key)?;
             path_trunk_table.insert(ops.path(), &trunk_key)?;

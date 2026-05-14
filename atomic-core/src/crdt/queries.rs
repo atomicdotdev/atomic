@@ -169,7 +169,8 @@ mod tests {
             state: BranchState::Alive,
             line_hash: 0,
         };
-        txn.put_crdt_branch(&bkey, &encode_branch_value(&serialized)).unwrap();
+        txn.put_crdt_branch(&bkey, &encode_branch_value(&serialized))
+            .unwrap();
         txn.put_crdt_trunk_branch(&trunk_key, &bkey).unwrap();
         let after_key = match after {
             Some(a) => encode_branch_id(&a),
@@ -264,7 +265,8 @@ mod tests {
                 state: BranchState::Alive,
                 line_hash: 0,
             };
-            txn.put_crdt_branch(&bkey, &encode_branch_value(&serialized)).unwrap();
+            txn.put_crdt_branch(&bkey, &encode_branch_value(&serialized))
+                .unwrap();
             txn.put_crdt_trunk_branch(&trunk_key, &bkey).unwrap();
         }
 
@@ -287,11 +289,15 @@ mod tests {
         put_branch(&mut txn, trunk, b, Some(a));
 
         // Reparent b to the file-start sentinel.
-        txn.put_crdt_branch_after(&encode_branch_id(&b), &[0u8; 12]).unwrap();
+        txn.put_crdt_branch_after(&encode_branch_id(&b), &[0u8; 12])
+            .unwrap();
 
         let after = txn.get_crdt_branch_after(&encode_branch_id(&b)).unwrap();
-        assert_eq!(after, Some([0u8; 12]),
-                   "Reparent must rewrite BRANCH_AFTER for the moved branch");
+        assert_eq!(
+            after,
+            Some([0u8; 12]),
+            "Reparent must rewrite BRANCH_AFTER for the moved branch"
+        );
     }
 
     #[test]
@@ -332,12 +338,18 @@ mod tests {
         put_branch(&mut txn, trunk, d, Some(c));
 
         // Paired Reparents to move c from between b and d to between a and b.
-        txn.put_crdt_branch_after(&encode_branch_id(&c), &encode_branch_id(&a)).unwrap();
-        txn.put_crdt_branch_after(&encode_branch_id(&b), &encode_branch_id(&c)).unwrap();
-        txn.put_crdt_branch_after(&encode_branch_id(&d), &encode_branch_id(&b)).unwrap();
+        txn.put_crdt_branch_after(&encode_branch_id(&c), &encode_branch_id(&a))
+            .unwrap();
+        txn.put_crdt_branch_after(&encode_branch_id(&b), &encode_branch_id(&c))
+            .unwrap();
+        txn.put_crdt_branch_after(&encode_branch_id(&d), &encode_branch_id(&b))
+            .unwrap();
 
         let order = iter_trunk_branches_in_file_order(&txn, trunk).unwrap();
-        assert_eq!(order, vec![a, c, b, d],
-                   "paired Reparents must produce a coherent chain");
+        assert_eq!(
+            order,
+            vec![a, c, b, d],
+            "paired Reparents must produce a coherent chain"
+        );
     }
 }

@@ -1170,10 +1170,7 @@ impl crate::pristine::traits::CrdtTxnT for ReadTxn {
         Ok(result)
     }
 
-    fn get_crdt_branch_after(
-        &self,
-        branch_key: &[u8; 12],
-    ) -> PristineResult<Option<[u8; 12]>> {
+    fn get_crdt_branch_after(&self, branch_key: &[u8; 12]) -> PristineResult<Option<[u8; 12]>> {
         use crate::crdt::tables::BRANCH_AFTER;
         let table = crdt_table_opt!(self, BRANCH_AFTER);
         let result = table.get(branch_key)?.map(|v| *v.value());

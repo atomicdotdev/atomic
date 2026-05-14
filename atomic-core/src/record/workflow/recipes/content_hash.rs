@@ -75,10 +75,7 @@ impl LineHashIndex {
     /// has rare collisions).
     pub fn candidates(&self, line: &[u8]) -> &[usize] {
         let h = hash_line(line);
-        self.buckets
-            .get(&h)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.buckets.get(&h).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Consume one candidate position for `line` — pops the first

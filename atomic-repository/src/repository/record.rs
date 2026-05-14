@@ -540,20 +540,16 @@ impl Repository {
                     // view-scoped byte-graph content.  This keeps both
                     // workloads correct until a view-filter-aware CRDT
                     // walker lands.
-                    let view_count = self
-                        .list_views()
-                        .map(|v| v.len())
-                        .unwrap_or(0);
-                    let crdt_old_content: Option<Vec<u8>> = if existing_branches.is_empty()
-                        || view_count > 1
-                    {
-                        None
-                    } else {
-                        match self.get_file_content_via_crdt(entry.path()) {
-                            Ok(Some(content)) => Some(content),
-                            _ => None,
-                        }
-                    };
+                    let view_count = self.list_views().map(|v| v.len()).unwrap_or(0);
+                    let crdt_old_content: Option<Vec<u8>> =
+                        if existing_branches.is_empty() || view_count > 1 {
+                            None
+                        } else {
+                            match self.get_file_content_via_crdt(entry.path()) {
+                                Ok(Some(content)) => Some(content),
+                                _ => None,
+                            }
+                        };
                     let existing_branches_slice: Option<&[_]> = if existing_branches.is_empty() {
                         None
                     } else {

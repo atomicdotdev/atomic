@@ -42,8 +42,10 @@ pub trait CrdtTxnT {
     /// inserted by an apply path that predates `BRANCH_AFTER`, or the CRDT
     /// layer was bypassed).  Returns `Some([0u8; 12])` for branches inserted
     /// at the start of the file.
-    fn get_crdt_branch_after(&self, branch_key: &[u8; 12])
-        -> Result<Option<[u8; 12]>, PristineError>;
+    fn get_crdt_branch_after(
+        &self,
+        branch_key: &[u8; 12],
+    ) -> Result<Option<[u8; 12]>, PristineError>;
 
     /// Get a leaf (token) entry from the CRDT tables.
     fn get_crdt_leaf(
@@ -52,10 +54,7 @@ pub trait CrdtTxnT {
     ) -> Result<Option<crate::crdt::tables::SerializedLeaf>, PristineError>;
 
     /// Look up a trunk by file path.
-    fn get_trunk_by_path(
-        &self,
-        path: &str,
-    ) -> Result<Option<crate::crdt::TrunkId>, PristineError>;
+    fn get_trunk_by_path(&self, path: &str) -> Result<Option<crate::crdt::TrunkId>, PristineError>;
 
     /// Iterate over all branches (lines) belonging to a trunk (file).
     ///

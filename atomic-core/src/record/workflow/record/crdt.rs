@@ -126,12 +126,13 @@ pub(crate) fn build_crdt_ops_for_modified_file(
     // Resolve the existing BranchId for an old-content line, or allocate a
     // fresh placeholder when the CRDT side has no row for that line.
     // Returns the BranchId to use for Delete/Modify on that line.
-    let branch_for_old_line = |old_line_idx: usize, alloc: &mut dyn FnMut() -> BranchId| -> BranchId {
-        match existing_branches {
-            Some(bs) if old_line_idx < bs.len() => bs[old_line_idx],
-            _ => alloc(),
-        }
-    };
+    let branch_for_old_line =
+        |old_line_idx: usize, alloc: &mut dyn FnMut() -> BranchId| -> BranchId {
+            match existing_branches {
+                Some(bs) if old_line_idx < bs.len() => bs[old_line_idx],
+                _ => alloc(),
+            }
+        };
 
     // Helper to allocate leaf IDs
     let mut alloc_leaf = || {
@@ -578,7 +579,11 @@ pub(crate) fn build_crdt_ops_for_modified_file(
         // Helper: rewrite a single `BranchOp::Insert`'s `after` if it points
         // at a promoted placeholder.
         let rewrite_after = |op: &mut BuilderLineOps| {
-            if let BranchOp::Insert { after: Some(ref mut a), .. } = op.operation_mut() {
+            if let BranchOp::Insert {
+                after: Some(ref mut a),
+                ..
+            } = op.operation_mut()
+            {
                 if let Some(replacement) = placeholder_to_existing.get(a) {
                     *a = *replacement;
                 }

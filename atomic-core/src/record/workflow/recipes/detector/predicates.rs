@@ -74,10 +74,8 @@ pub fn has_large_relocated_block(ctx: &RecipeContext<'_>) -> bool {
         return false;
     }
 
-    let old_lines: Vec<&[u8]> =
-        ctx.old_content.split_inclusive(|&b| b == b'\n').collect();
-    let new_lines: Vec<&[u8]> =
-        ctx.new_content.split_inclusive(|&b| b == b'\n').collect();
+    let old_lines: Vec<&[u8]> = ctx.old_content.split_inclusive(|&b| b == b'\n').collect();
+    let new_lines: Vec<&[u8]> = ctx.new_content.split_inclusive(|&b| b == b'\n').collect();
 
     if old_lines.is_empty() || new_lines.is_empty() {
         return false;
@@ -124,11 +122,7 @@ mod tests {
     use crate::diff::Algorithm;
     use crate::types::NodeId;
 
-    fn ctx<'a>(
-        old: &'a [u8],
-        new: &'a [u8],
-        existing: &'a [BranchId],
-    ) -> RecipeContext<'a> {
+    fn ctx<'a>(old: &'a [u8], new: &'a [u8], existing: &'a [BranchId]) -> RecipeContext<'a> {
         RecipeContext {
             path: "test.rs",
             old_content: old,
@@ -140,9 +134,7 @@ mod tests {
     }
 
     fn ten_unique_lines(prefix: &str) -> String {
-        (0..10)
-            .map(|i| format!("{prefix}_line_{i}\n"))
-            .collect()
+        (0..10).map(|i| format!("{prefix}_line_{i}\n")).collect()
     }
 
     #[test]
@@ -193,9 +185,7 @@ mod tests {
     fn returns_true_for_block_extracted_to_different_position() {
         // 30-line file.  Take lines 10-25 and move them to the
         // start of the file.  Clear relocation; should fire.
-        let mut lines: Vec<String> = (0..30)
-            .map(|i| format!("line_{i:02}\n"))
-            .collect();
+        let mut lines: Vec<String> = (0..30).map(|i| format!("line_{i:02}\n")).collect();
         let old: String = lines.iter().cloned().collect();
 
         let moved: Vec<String> = lines.drain(10..25).collect();

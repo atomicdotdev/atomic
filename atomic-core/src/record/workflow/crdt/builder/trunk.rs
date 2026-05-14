@@ -203,12 +203,13 @@ impl super::CrdtChangeBuilder {
             // uses to wire `BRANCH_VERTEX`.  Without this tag, FileAdd
             // branches never get a BRANCH_VERTEX row — and the CRDT-driven
             // output walker raises `OrphanBranch` on every line.
-            let line_op = LineOps::insert(branch_id, prev_branch, leaf_ops)
-                .with_new_line_num(line_idx + 1);
+            let line_op =
+                LineOps::insert(branch_id, prev_branch, leaf_ops).with_new_line_num(line_idx + 1);
 
             if let Some(&file_idx) = self.trunk_index.get(&trunk_id) {
                 let inner_line_idx = self.file_ops[file_idx].line_ops.len();
-                self.branch_index.insert(branch_id, (file_idx, inner_line_idx));
+                self.branch_index
+                    .insert(branch_id, (file_idx, inner_line_idx));
                 self.file_ops[file_idx].add_line_op(line_op);
             }
 
