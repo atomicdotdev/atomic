@@ -77,6 +77,21 @@ pub struct OrgSet {
 
 impl Command for OrgSet {
     fn run(&self) -> CliResult<()> {
+        self.run_with_verifier(verify_org_exists)
+    }
+}
+
+impl OrgSet {
+    /// Inner runner that takes the slug-verification step as a parameter.
+    ///
+    /// Splitting this out lets tests inject a deterministic verifier
+    /// (succeed / fail) without making a real network call, so we can
+    /// assert the load-bearing invariant: **when verification fails, the
+    /// config file is not modified**.
+    fn run_with_verifier<F>(&self, verify: F) -> CliResult<()>
+    where
+        F: FnOnce(&str) -> CliResult<()>,
+    {
         if self.slug.is_empty() {
             return Err(CliError::InvalidArgument {
                 message: "Organization slug cannot be empty.".to_string(),
@@ -84,9 +99,10 @@ impl Command for OrgSet {
         }
 
         // Validate against the server first so a bad slug fails fast
-        // rather than self-locking subsequent commands.
+        // rather than self-locking subsequent commands. The `?` here is
+        // load-bearing: if it returns Err, config is not touched.
         if !self.no_verify {
-            verify_org_exists(&self.slug)?;
+            verify(&self.slug)?;
         }
 
         let mut config = GlobalConfig::load().map_err(|e| {
@@ -192,5 +208,133 @@ mod tests {
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Regression invariant: when the verifier fails, config must NOT be
+    // mutated. This protects against accidentally reordering the verify /
+    // save steps in future refactors.
+    //
+    // Tests touch HOME to redirect `GlobalConfig::{load,save}` at an
+    // isolated config dir, so `#[serial]` is required.
+    // -----------------------------------------------------------------
+
+    use serial_test::serial;
+
+    /// Save the current `HOME` value and point it at a tempdir for the
+    /// lifetime of the guard. Restores on drop. Wraps the tempdir so the
+    /// directory lives as long as `HOME` points at it.
+    struct HomeGuard {
+        _tmp: tempfile::TempDir,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let original = std::env::var_os("HOME");
+            // SAFETY: env mutation is technically UB if accessed
+            // concurrently from another thread. `#[serial]` serializes
+            // these tests against each other but does NOT prevent
+            // unmarked tests elsewhere in the workspace from reading
+            // HOME concurrently. No other test in this crate currently
+            // mutates or reads HOME outside its own `#[serial]` block,
+            // so the race window is empty today. A path-aware
+            // GlobalConfig API would eliminate this — tracked as a
+            // follow-up.
+            unsafe {
+                std::env::set_var("HOME", tmp.path());
+            }
+            Self {
+                _tmp: tmp,
+                original,
+            }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: see HomeGuard::new.
+            unsafe {
+                match &self.original {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    fn seed_config(default_org: &str) {
+        let mut cfg = GlobalConfig::load().unwrap();
+        cfg.server.default_org = Some(default_org.to_string());
+        cfg.save().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn config_unchanged_when_verifier_fails() {
+        let _guard = HomeGuard::new();
+        seed_config("old-org");
+
+        let cmd = OrgSet {
+            slug: "new-org".to_string(),
+            no_verify: false,
+        };
+
+        let result = cmd.run_with_verifier(|slug| {
+            // Simulate "slug not found on server".
+            Err(CliError::InvalidArgument {
+                message: format!("Organization '{slug}' not found on the server."),
+            })
+        });
+
+        assert!(result.is_err(), "verifier failure should propagate");
+
+        // Critical invariant: config on disk still has the old default.
+        let after = GlobalConfig::load().unwrap();
+        assert_eq!(
+            after.server.default_org.as_deref(),
+            Some("old-org"),
+            "default_org must not change when verification fails"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn config_written_when_verifier_succeeds() {
+        let _guard = HomeGuard::new();
+        seed_config("old-org");
+
+        let cmd = OrgSet {
+            slug: "new-org".to_string(),
+            no_verify: false,
+        };
+
+        let result = cmd.run_with_verifier(|_| Ok(()));
+        assert!(result.is_ok(), "verifier success path should succeed");
+
+        let after = GlobalConfig::load().unwrap();
+        assert_eq!(after.server.default_org.as_deref(), Some("new-org"));
+    }
+
+    #[test]
+    #[serial]
+    fn no_verify_skips_verifier_entirely() {
+        let _guard = HomeGuard::new();
+        seed_config("old-org");
+
+        // The verifier panics if called — `--no-verify` must short-circuit
+        // before reaching it.
+        let cmd = OrgSet {
+            slug: "new-org".to_string(),
+            no_verify: true,
+        };
+
+        let result =
+            cmd.run_with_verifier(|_| panic!("verifier must not be called when no_verify is true"));
+        assert!(result.is_ok());
+
+        let after = GlobalConfig::load().unwrap();
+        assert_eq!(after.server.default_org.as_deref(), Some("new-org"));
     }
 }

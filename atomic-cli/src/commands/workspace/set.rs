@@ -45,9 +45,8 @@
 use clap::Parser;
 
 use atomic_config::GlobalConfig;
-use atomic_remote::RemoteError;
 
-use crate::commands::client::build_client_with_org;
+use crate::commands::client::{build_client_with_org, remote_err};
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success};
@@ -88,6 +87,21 @@ pub struct WorkspaceSet {
 
 impl Command for WorkspaceSet {
     fn run(&self) -> CliResult<()> {
+        self.run_with_verifier(verify_workspace_exists)
+    }
+}
+
+impl WorkspaceSet {
+    /// Inner runner that takes the slug-verification step as a parameter.
+    ///
+    /// Splitting this out lets tests inject a deterministic verifier
+    /// (succeed / fail) without making a real network call, so we can
+    /// assert the load-bearing invariant: **when verification fails, the
+    /// config file is not modified**.
+    fn run_with_verifier<F>(&self, verify: F) -> CliResult<()>
+    where
+        F: FnOnce(&str, &str) -> CliResult<()>,
+    {
         if self.slug.is_empty() {
             return Err(CliError::InvalidArgument {
                 message: "Workspace slug cannot be empty.".to_string(),
@@ -122,8 +136,10 @@ impl Command for WorkspaceSet {
 
         // Validate against the server first so a bad slug fails fast
         // rather than producing confusing 404s on subsequent commands.
+        // The `?` here is load-bearing: if it returns Err, the mutation
+        // and save below never execute.
         if !self.no_verify {
-            verify_workspace_exists(&target_org, &self.slug)?;
+            verify(&target_org, &self.slug)?;
         }
 
         let previous = config
@@ -180,16 +196,9 @@ fn verify_workspace_exists(org_slug: &str, workspace_slug: &str) -> CliResult<()
                      Or pass --no-verify to set the value without checking."
                 ),
             }),
-            Err(e) => Err(map_remote(e)),
+            Err(e) => Err(remote_err(e)),
         }
     })
-}
-
-fn map_remote(e: RemoteError) -> CliError {
-    CliError::RemoteError {
-        message: e.to_string(),
-        url: None,
-    }
 }
 
 #[cfg(test)]
@@ -239,5 +248,172 @@ mod tests {
         assert_eq!(cmd.slug, "backend");
         assert_eq!(cmd.org.as_deref(), Some("acme"));
         assert!(!cmd.no_verify);
+    }
+
+    // -----------------------------------------------------------------
+    // Regression invariant: when the verifier fails, config must NOT be
+    // mutated. Protects against accidentally reordering verify / save in
+    // future refactors.
+    //
+    // Tests touch HOME to redirect `GlobalConfig::{load,save}` at an
+    // isolated config dir, so `#[serial]` is required.
+    // -----------------------------------------------------------------
+
+    use serial_test::serial;
+
+    struct HomeGuard {
+        _tmp: tempfile::TempDir,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let original = std::env::var_os("HOME");
+            // SAFETY: env mutation is technically UB if accessed
+            // concurrently from another thread. `#[serial]` serializes
+            // these tests against each other but does NOT prevent
+            // unmarked tests elsewhere in the workspace from reading
+            // HOME concurrently. No other test in this crate currently
+            // mutates or reads HOME outside its own `#[serial]` block,
+            // so the race window is empty today. A path-aware
+            // GlobalConfig API would eliminate this — tracked as a
+            // follow-up.
+            unsafe {
+                std::env::set_var("HOME", tmp.path());
+            }
+            Self {
+                _tmp: tmp,
+                original,
+            }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: see HomeGuard::new.
+            unsafe {
+                match &self.original {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    fn seed_config(default_org: &str, existing_workspace: Option<(&str, &str)>) {
+        let mut cfg = GlobalConfig::load().unwrap();
+        cfg.server.default_org = Some(default_org.to_string());
+        if let Some((org, ws)) = existing_workspace {
+            cfg.server
+                .default_workspaces
+                .insert(org.to_string(), ws.to_string());
+        }
+        cfg.save().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn config_unchanged_when_verifier_fails() {
+        let _guard = HomeGuard::new();
+        seed_config("acme", Some(("acme", "old-ws")));
+
+        let cmd = WorkspaceSet {
+            slug: "new-ws".to_string(),
+            org: None, // use default org "acme"
+            no_verify: false,
+        };
+
+        let result = cmd.run_with_verifier(|org, ws| {
+            Err(CliError::InvalidArgument {
+                message: format!("Workspace '{ws}' not found in org '{org}'."),
+            })
+        });
+
+        assert!(result.is_err(), "verifier failure should propagate");
+
+        // Critical invariant: the old workspace mapping is still there,
+        // unchanged.
+        let after = GlobalConfig::load().unwrap();
+        assert_eq!(
+            after.server.default_workspaces.get("acme"),
+            Some(&"old-ws".to_string()),
+            "default_workspaces[acme] must not change when verification fails"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn config_written_when_verifier_succeeds() {
+        let _guard = HomeGuard::new();
+        seed_config("acme", Some(("acme", "old-ws")));
+
+        let cmd = WorkspaceSet {
+            slug: "new-ws".to_string(),
+            org: None,
+            no_verify: false,
+        };
+
+        let result = cmd.run_with_verifier(|_, _| Ok(()));
+        assert!(result.is_ok(), "verifier success path should succeed");
+
+        let after = GlobalConfig::load().unwrap();
+        assert_eq!(
+            after.server.default_workspaces.get("acme"),
+            Some(&"new-ws".to_string()),
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn no_verify_skips_verifier_entirely() {
+        let _guard = HomeGuard::new();
+        seed_config("acme", None);
+
+        // Verifier panics if called — `--no-verify` must short-circuit.
+        let cmd = WorkspaceSet {
+            slug: "new-ws".to_string(),
+            org: None,
+            no_verify: true,
+        };
+
+        let result = cmd
+            .run_with_verifier(|_, _| panic!("verifier must not be called when no_verify is true"));
+        assert!(result.is_ok());
+
+        let after = GlobalConfig::load().unwrap();
+        assert_eq!(
+            after.server.default_workspaces.get("acme"),
+            Some(&"new-ws".to_string()),
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_org_overrides_default_for_target() {
+        // Side-benefit test: writing to a non-default org leaves the
+        // default org's workspace alone.
+        let _guard = HomeGuard::new();
+        seed_config("acme", Some(("acme", "acme-ws")));
+
+        let cmd = WorkspaceSet {
+            slug: "alice-ws".to_string(),
+            org: Some("alice".to_string()),
+            no_verify: false,
+        };
+
+        let result = cmd.run_with_verifier(|_, _| Ok(()));
+        assert!(result.is_ok());
+
+        let after = GlobalConfig::load().unwrap();
+        assert_eq!(
+            after.server.default_workspaces.get("acme"),
+            Some(&"acme-ws".to_string()),
+            "acme's workspace must not change when writing to alice"
+        );
+        assert_eq!(
+            after.server.default_workspaces.get("alice"),
+            Some(&"alice-ws".to_string()),
+        );
     }
 }

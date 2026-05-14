@@ -24,10 +24,6 @@
 //! # Examples
 //!
 //! ```text
-//! # Explicit workspace
-//! $ atomic project create my-service --workspace backend
-//! ✓ Created project: my-service (slug: my-service)
-//!
 //! # Uses the default workspace for the current org
 //! $ atomic workspace set backend
 //! $ atomic project create my-service
@@ -38,6 +34,14 @@
 //!   Visibility:   private
 //!   VCS URL:      https://alice.atomic.storage/workspaces/backend/projects/my-service/code
 //!
+//! Next steps:
+//!   atomic project init my-service  Link a local repo to this project
+//!   atomic push                     Push changes to the remote
+//!
+//! # Explicit workspace — Next steps repeats the flag
+//! $ atomic project create my-service --workspace backend
+//! ✓ Created project: my-service (slug: my-service)
+//!   ...
 //! Next steps:
 //!   atomic project init my-service --workspace backend  Link a local repo to this project
 //!   atomic push                                         Push changes to the remote
@@ -158,14 +162,19 @@ impl Command for ProjectCreate {
 
             println!("{}", details);
 
+            // Mirror what the user typed when building the follow-up hint.
+            // Omitting flags that fell back to defaults reinforces that the
+            // default-workspace / default-org config is in effect.
+            let mut init_cmd = format!("atomic project init {}", project.slug);
+            if self.workspace.is_some() {
+                init_cmd.push_str(&format!(" --workspace {workspace}"));
+            }
+            if let Some(org) = self.org.as_deref() {
+                init_cmd.push_str(&format!(" --org {org}"));
+            }
+
             print_next_steps(&[
-                (
-                    &format!(
-                        "atomic project init {} --workspace {}",
-                        project.slug, workspace
-                    ),
-                    "Link a local repo to this project",
-                ),
+                (&init_cmd, "Link a local repo to this project"),
                 ("atomic push", "Push changes to the remote"),
             ]);
 

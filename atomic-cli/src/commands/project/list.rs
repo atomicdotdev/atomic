@@ -81,10 +81,19 @@ impl Command for ProjectList {
             }
 
             if projects.is_empty() {
+                // Mirror the flags the user typed so the suggested follow-up
+                // resolves to the same org/workspace they were just looking
+                // at — not whatever the current defaults are.
+                let mut create_hint = String::from("atomic project create <name>");
+                if let Some(ws) = self.workspace.as_deref() {
+                    create_hint.push_str(&format!(" --workspace {ws}"));
+                }
+                if let Some(org) = self.org.as_deref() {
+                    create_hint.push_str(&format!(" --org {org}"));
+                }
                 print_hint(&format!(
-                    "No projects found in workspace '{}'. Create one with \
-                     'atomic project create <name> --workspace {}'.",
-                    workspace, workspace
+                    "No projects found in workspace '{workspace}'. \
+                     Create one with '{create_hint}'."
                 ));
                 return Ok(());
             }
