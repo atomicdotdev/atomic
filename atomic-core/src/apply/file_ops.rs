@@ -62,7 +62,7 @@ use crate::crdt::tables::{
 use crate::crdt::{
     BranchId, BranchOp, BranchState, LeafId, LeafOp, LeafState, TrunkId, TrunkOp, TrunkState,
 };
-use crate::pristine::{MutTxnT, PristineResult};
+use crate::pristine::{MutTxnT, PristineError, PristineResult};
 use crate::types::{GraphNode, NodeId};
 
 // Statistics
@@ -82,6 +82,8 @@ pub struct ApplyFileOpsStats {
     pub branches_deleted: usize,
     /// Number of branches restored.
     pub branches_restored: usize,
+    /// Number of branches re-parented (moved to a new chain position).
+    pub branches_reparented: usize,
     /// Number of leaves (tokens) created.
     pub leaves_created: usize,
     /// Number of leaves deleted.
@@ -105,7 +107,10 @@ impl ApplyFileOpsStats {
 
     /// Returns total branch operations.
     pub fn total_branch_ops(&self) -> usize {
-        self.branches_created + self.branches_deleted + self.branches_restored
+        self.branches_created
+            + self.branches_deleted
+            + self.branches_restored
+            + self.branches_reparented
     }
 
     /// Returns total leaf operations.
@@ -147,11 +152,9 @@ pub fn apply_file_ops<T: MutTxnT>(
     file_ops: &[FileOps],
 ) -> PristineResult<ApplyFileOpsStats> {
     let mut stats = ApplyFileOpsStats::new();
-
     for ops in file_ops {
         apply_single_file_ops(txn, change_id, ops, &mut stats)?;
     }
-
     Ok(stats)
 }
 
@@ -189,8 +192,22 @@ fn apply_trunk_op<T: MutTxnT>(
 ) -> PristineResult<()> {
     match trunk_op {
         TrunkOp::Create { encoding, .. } => {
-            // Allocate a new inode for this file
-            let inode = txn.alloc_inode()?;
+            // Use the inode the tree layer has already allocated for this
+            // path during `write_recorded`'s FileAdd pre-pass.  Allocating
+            // a fresh one here would create a parallel inode for the same
+            // file: the tree layer would index `path → tree_inode → pos`
+            // while the CRDT layer would index `crdt_inode → trunk`, and
+            // a caller asking "what's the CRDT trunk for the inode the
+            // tree returned for this path" would get nothing — even
+            // though both rows exist.
+            //
+            // Falling back to `alloc_inode` only when the tree has no
+            // entry preserves the original behaviour for CRDT-only
+            // callers (no FileAdd hunk).
+            let inode = match txn.get_inode(path)? {
+                Some(i) => i,
+                None => txn.alloc_inode()?,
+            };
 
             // Create the serialized trunk record
             let serialized = SerializedTrunk {
@@ -240,11 +257,29 @@ fn apply_line_ops_with_position<T: MutTxnT>(
     line_ops: &LineOps,
     stats: &mut ApplyFileOpsStats,
 ) -> PristineResult<()> {
-    let branch_id = line_ops.branch_id();
+    // Resolve the BranchId.  The change file stores BranchIds with
+    // `change_id = NodeId::ROOT` as a placeholder meaning "this change
+    // — fill in the real id at apply time" (analogous to how vertex
+    // positions store `change: None` and resolve to the current change
+    // during apply).  Without this resolution, every commit's `Insert`
+    // ops carry `BranchId(ROOT, 0)`, `BranchId(ROOT, 1)`, … which
+    // collide across changes in the BRANCHES table, silently
+    // overwriting each other's rows.
+    //
+    // We treat `BranchId::ROOT` (i.e. change_id == NodeId::ROOT) as
+    // the placeholder marker.  Branches that genuinely reference a
+    // prior change (e.g. an Insert with `after: Some(existing_branch)`)
+    // already carry that change's real id.
+    let raw_branch_id = line_ops.branch_id();
+    let branch_id = if raw_branch_id.change_id().is_root() {
+        BranchId::new(change_id, raw_branch_id.branch_idx())
+    } else {
+        raw_branch_id
+    };
     let branch_op = line_ops.operation();
 
     match branch_op {
-        BranchOp::Insert { content, .. } => {
+        BranchOp::Insert { after, content } => {
             // Create serialized branch record
             let serialized = SerializedBranch {
                 trunk_id,
@@ -254,6 +289,29 @@ fn apply_line_ops_with_position<T: MutTxnT>(
 
             put_branch(txn, trunk_id, branch_id, &serialized)?;
             stats.branches_created += 1;
+
+            // Record the after-reference so file order can be reconstructed.
+            //
+            // Like `branch_id` itself (see the substitution at the top of
+            // this function), an `after` ref with `change_id == ROOT` is a
+            // *placeholder* meaning "another branch from this same change"
+            // — emitted by the recorder before the apply-time change_id is
+            // known.  We must substitute the real change_id here, not
+            // collapse to the file-start sentinel, otherwise every branch
+            // from a single FileAdd would end up listed as a sibling of
+            // the file's first line and the file-order walk would emit
+            // them in BranchId-sort order rather than insertion order.
+            //
+            // `None` means genuine "start of file" and stays as the
+            // all-zeros sentinel.
+            let after_key = match after {
+                Some(a) if a.change_id().is_root() => {
+                    encode_branch_id(&BranchId::new(change_id, a.branch_idx()))
+                }
+                Some(a) => encode_branch_id(a),
+                None => [0u8; 12],
+            };
+            txn.put_crdt_branch_after(&encode_branch_id(&branch_id), &after_key)?;
 
             // If we have enriched position info, link to the graph vertex
             if let Some((start, end)) = line_ops.content_range() {
@@ -303,6 +361,54 @@ fn apply_line_ops_with_position<T: MutTxnT>(
             put_branch(txn, trunk_id, branch_id, &serialized)?;
             stats.branches_created += 1;
 
+            // Re-point the CRDT branch at the *new* graph vertex.  Globalize
+            // sets `content_range` to the modifying change's content blob
+            // range for Modify ops the same way it does for Insert (see
+            // `enrich_file_ops_for_edit` in record/workflow/globalize/
+            // pipeline.rs).  Without this update, BRANCH_VERTEX would still
+            // reference the pre-Modify vertex — and the CRDT-driven output
+            // walker would fetch stale bytes.
+            //
+            // **Required invariant:** every Modify must arrive with
+            // `content_range` set.  If it doesn't, globalize's enrich pass
+            // failed to match this LineOps by `new_line_num` — typically
+            // because the LineOps was emitted without a `new_line_num` or
+            // because the surrounding hunk's range doesn't cover this line.
+            // Either way, the branch's BRANCH_VERTEX would silently keep
+            // pointing at the pre-Modify content, producing a stale-bytes
+            // bug that compounds over commit sequences.
+            //
+            // We hard-fail rather than silently mis-record.  This caught
+            // the hyperfine extended-sequence drift at commit 5 — Modifies
+            // were arriving without content_range and the walker was
+            // emitting stale bytes from earlier changes.
+            match line_ops.content_range() {
+                Some((start, end)) => {
+                    let graph_node = GraphNode {
+                        change: change_id,
+                        start,
+                        end,
+                    };
+                    let branch_key = encode_branch_id(&branch_id);
+                    let vertex_bytes = encode_vertex_position(&graph_node);
+                    txn.put_crdt_branch_vertex(&branch_key, &vertex_bytes)?;
+                    txn.put_crdt_vertex_branch(&vertex_bytes, &branch_key)?;
+                }
+                None => {
+                    return Err(PristineError::Inconsistent {
+                        message: format!(
+                            "apply_line_ops_with_position: Modify of branch {:?} \
+                             arrived without content_range — globalize enrich \
+                             failed for change_id={:?} trunk_id={:?}.  Without \
+                             a new content_range the CRDT branch would silently \
+                             keep pointing at its pre-Modify graph vertex, \
+                             producing stale-bytes drift across commits.",
+                            branch_id, change_id, trunk_id
+                        ),
+                    });
+                }
+            }
+
             // Apply leaf operations for the new content
             for (leaf_idx, leaf_op) in new_content.iter().enumerate() {
                 let leaf_id = LeafId::new(branch_id.change_id(), leaf_idx as u32);
@@ -313,6 +419,26 @@ fn apply_line_ops_with_position<T: MutTxnT>(
         BranchOp::Restore { .. } => {
             update_branch_state(txn, branch_id, BranchState::Alive)?;
             stats.branches_restored += 1;
+        }
+
+        BranchOp::Reparent { new_after, .. } => {
+            // Position-only change: rewrite BRANCH_AFTER, leave state and
+            // content alone.  The walker reads BRANCH_AFTER directly, so
+            // this is the entire effect.
+            //
+            // Same placeholder substitution rule as `BranchOp::Insert.after`
+            // (top of the Insert arm above): a placeholder ref with
+            // `change_id == ROOT` resolves to the current change.  `None`
+            // is the all-zeros sentinel for "start of file".
+            let new_after_key = match new_after {
+                Some(a) if a.change_id().is_root() => {
+                    encode_branch_id(&BranchId::new(change_id, a.branch_idx()))
+                }
+                Some(a) => encode_branch_id(a),
+                None => [0u8; 12],
+            };
+            txn.put_crdt_branch_after(&encode_branch_id(&branch_id), &new_after_key)?;
+            stats.branches_reparented += 1;
         }
     }
 

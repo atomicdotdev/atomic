@@ -70,7 +70,7 @@
 //! ```
 
 use crate::change::Encoding;
-use crate::diff::{diff, diff_raw, Algorithm, DiffOp, Line};
+use crate::diff::{diff_raw, Algorithm, DiffOp, Line};
 
 // ============================================================================
 // COMPARE RESULT

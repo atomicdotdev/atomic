@@ -192,7 +192,7 @@ impl RetrieveOptions {
     /// misreads as a concurrent CRDT conflict.
     ///
     /// Vertex-level aliveness still consults parent-side `BlockDeleted`
-    /// edges via [`is_vertex_alive`] — that path correctly distinguishes
+    /// edges via [`Self::is_vertex_alive`] — that path correctly distinguishes
     /// "deletion happened from our view" from "deletion is invisible".
     pub fn is_edge_alive(&self, edge: &ForwardEdge) -> bool {
         !edge.kind.is_deleted()

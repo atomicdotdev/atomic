@@ -131,7 +131,11 @@ fn process_modified_file(
     detected.inode = input.inode;
     detected.position = input.position;
 
-    match record_modified_file(&memory_wc, &detected, &input.old_content, options) {
+    // The parallel worker has no pristine txn, so existing_branches is None.
+    // CRDT Delete/Modify ops use placeholders here — acceptable for the
+    // git-import path which overrides CRDT ops via build_crdt_ops_from_git_diff
+    // at write_commit time.
+    match record_modified_file(&memory_wc, &detected, &input.old_content, None, options, None) {
         Ok(recorded) => {
             if recorded.is_empty() {
                 return Ok(FileRecordOutput::skipped(

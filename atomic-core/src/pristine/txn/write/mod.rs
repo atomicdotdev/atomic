@@ -10,8 +10,8 @@ use redb::{ReadableMultimapTable, ReadableTable, WriteTransaction};
 use crate::crdt::tables::{
     decode_branch_id, decode_branch_value, decode_leaf_value, decode_trunk_value,
     decode_vertex_position, SerializedBranch, SerializedLeaf, SerializedTrunk, BRANCHES,
-    BRANCH_LEAVES, BRANCH_VERTEX, INODE_TRUNK, LEAVES, PATH_TRUNK, TRUNKS, TRUNK_BRANCHES,
-    VERTEX_BRANCH,
+    BRANCH_AFTER, BRANCH_LEAVES, BRANCH_VERTEX, INODE_TRUNK, LEAVES, PATH_TRUNK, TRUNKS,
+    TRUNK_BRANCHES, VERTEX_BRANCH,
 };
 
 use crate::types::{
@@ -1109,26 +1109,15 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         Ok(result.map(|v| v.value()))
     }
 
-    // CRDT Table Operations
+    // CRDT Table Write Operations
+    //
+    // CRDT *read* methods are implemented on the [`super::CrdtTxnT`] impl
+    // below (which `MutTxnT` requires as a supertrait).
 
     fn put_crdt_trunk(&mut self, key: &[u8; 12], value: &[u8]) -> PristineResult<()> {
         let mut table = self.txn.open_table(TRUNKS)?;
         table.insert(key, value)?;
         Ok(())
-    }
-
-    fn get_crdt_trunk(&mut self, key: &[u8; 12]) -> PristineResult<Option<SerializedTrunk>> {
-        let table = self.txn.open_table(TRUNKS)?;
-        let result = match table.get(key)? {
-            Some(guard) => {
-                let bytes = guard.value();
-                // Copy the bytes before the guard is dropped
-                let bytes_copy: Vec<u8> = bytes.to_vec();
-                decode_trunk_value(&bytes_copy)
-            }
-            None => None,
-        };
-        Ok(result)
     }
 
     fn put_crdt_inode_trunk(&mut self, inode: u64, trunk_key: &[u8; 12]) -> PristineResult<()> {
@@ -1155,18 +1144,6 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         Ok(())
     }
 
-    fn get_crdt_branch(&mut self, key: &[u8; 12]) -> PristineResult<Option<SerializedBranch>> {
-        let table = self.txn.open_table(BRANCHES)?;
-        let result = match table.get(key)? {
-            Some(guard) => {
-                let bytes: [u8; 24] = *guard.value();
-                Some(decode_branch_value(&bytes))
-            }
-            None => None,
-        };
-        Ok(result)
-    }
-
     fn put_crdt_trunk_branch(
         &mut self,
         trunk_key: &[u8; 12],
@@ -1177,22 +1154,20 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         Ok(())
     }
 
+    fn put_crdt_branch_after(
+        &mut self,
+        branch_key: &[u8; 12],
+        after_key: &[u8; 12],
+    ) -> PristineResult<()> {
+        let mut table = self.txn.open_table(BRANCH_AFTER)?;
+        table.insert(branch_key, after_key)?;
+        Ok(())
+    }
+
     fn put_crdt_leaf(&mut self, key: &[u8; 12], value: &[u8; 22]) -> PristineResult<()> {
         let mut table = self.txn.open_table(LEAVES)?;
         table.insert(key, value)?;
         Ok(())
-    }
-
-    fn get_crdt_leaf(&mut self, key: &[u8; 12]) -> PristineResult<Option<SerializedLeaf>> {
-        let table = self.txn.open_table(LEAVES)?;
-        let result = match table.get(key)? {
-            Some(guard) => {
-                let bytes: [u8; 22] = *guard.value();
-                Some(decode_leaf_value(&bytes))
-            }
-            None => None,
-        };
-        Ok(result)
     }
 
     fn put_crdt_branch_leaf(
@@ -1205,73 +1180,6 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         Ok(())
     }
 
-    fn get_trunk_by_path(&mut self, path: &str) -> PristineResult<Option<crate::crdt::TrunkId>> {
-        use crate::crdt::tables::decode_trunk_id;
-
-        let table = self.txn.open_table(PATH_TRUNK)?;
-        let result = table.get(path)?;
-        match result {
-            Some(guard) => {
-                let key: [u8; 12] = *guard.value();
-                drop(guard); // Explicitly drop the guard before returning
-                Ok(Some(decode_trunk_id(&key)))
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn iter_trunk_branches(
-        &mut self,
-        trunk_key: &[u8; 12],
-    ) -> PristineResult<Box<dyn Iterator<Item = Result<[u8; 12], PristineError>> + '_>> {
-        let table = self.txn.open_multimap_table(TRUNK_BRANCHES)?;
-
-        // Collect all branch keys for this trunk
-        let mut results: Vec<Result<[u8; 12], PristineError>> = Vec::new();
-
-        // Get all values for this trunk key
-        let values = table.get(trunk_key)?;
-        for value_result in values {
-            match value_result {
-                Ok(access) => {
-                    let bytes: [u8; 12] = *access.value();
-                    results.push(Ok(bytes));
-                }
-                Err(e) => {
-                    results.push(Err(PristineError::Storage(Box::new(e))));
-                }
-            }
-        }
-
-        Ok(Box::new(results.into_iter()))
-    }
-
-    fn iter_branch_leaves(
-        &mut self,
-        branch_key: &[u8; 12],
-    ) -> PristineResult<Box<dyn Iterator<Item = Result<[u8; 12], PristineError>> + '_>> {
-        let table = self.txn.open_multimap_table(BRANCH_LEAVES)?;
-
-        // Collect all leaf keys for this branch
-        let mut results: Vec<Result<[u8; 12], PristineError>> = Vec::new();
-
-        // Get all values for this branch key
-        let values = table.get(branch_key)?;
-        for value_result in values {
-            match value_result {
-                Ok(access) => {
-                    let bytes: [u8; 12] = *access.value();
-                    results.push(Ok(bytes));
-                }
-                Err(e) => {
-                    results.push(Err(PristineError::Storage(Box::new(e))));
-                }
-            }
-        }
-
-        Ok(Box::new(results.into_iter()))
-    }
-
     fn put_crdt_branch_vertex(
         &mut self,
         branch_key: &[u8; 12],
@@ -1282,23 +1190,6 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         Ok(())
     }
 
-    fn get_crdt_branch_vertex(
-        &mut self,
-        branch_key: &[u8; 12],
-    ) -> PristineResult<Option<GraphNode<NodeId>>> {
-        let table = self.txn.open_table(BRANCH_VERTEX)?;
-        let result = table.get(branch_key)?;
-        match result {
-            Some(value) => {
-                // Copy the bytes out while the guard is still alive
-                let bytes: [u8; 24] = *value.value();
-                drop(value); // Explicitly drop the guard
-                Ok(Some(decode_vertex_position(&bytes)))
-            }
-            None => Ok(None),
-        }
-    }
-
     fn put_crdt_vertex_branch(
         &mut self,
         vertex_key: &[u8; 24],
@@ -1307,22 +1198,6 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         let mut table = self.txn.open_table(VERTEX_BRANCH)?;
         table.insert(vertex_key, branch_key)?;
         Ok(())
-    }
-
-    fn get_crdt_vertex_branch(
-        &mut self,
-        vertex_key: &[u8; 24],
-    ) -> PristineResult<Option<crate::crdt::BranchId>> {
-        let table = self.txn.open_table(VERTEX_BRANCH)?;
-        let result = table.get(vertex_key)?;
-        match result {
-            Some(value) => {
-                let bytes: [u8; 12] = *value.value();
-                drop(value);
-                Ok(Some(decode_branch_id(&bytes)))
-            }
-            None => Ok(None),
-        }
     }
 
     fn put_inodes(&mut self, inode: u64, pos: &Position<NodeId>) -> PristineResult<()> {
@@ -1344,5 +1219,143 @@ impl<'a> MutTxnT for WriteTxn<'a> {
     fn abort(self) -> PristineResult<()> {
         self.txn.abort()?;
         Ok(())
+    }
+}
+
+// CrdtTxnT (read accessors) implementation for WriteTxn.
+//
+// Both `WriteTransaction::open_table` and `ReadTransaction::open_table`
+// take `&self` (per redb 2.6.x), so all CRDT *reads* fit a `&self` trait —
+// which lets us share the same trait between read-only and read-write
+// txns and avoids needing a write_txn just to inspect CRDT state.
+
+impl crate::pristine::traits::CrdtTxnT for WriteTxn<'_> {
+    fn get_crdt_trunk(&self, key: &[u8; 12]) -> PristineResult<Option<SerializedTrunk>> {
+        let table = self.txn.open_table(TRUNKS)?;
+        let result = match table.get(key)? {
+            Some(guard) => {
+                let bytes_copy: Vec<u8> = guard.value().to_vec();
+                decode_trunk_value(&bytes_copy)
+            }
+            None => None,
+        };
+        Ok(result)
+    }
+
+    fn get_crdt_inode_trunk(&self, inode: u64) -> PristineResult<Option<[u8; 12]>> {
+        let table = self.txn.open_table(INODE_TRUNK)?;
+        let result = table.get(inode)?.map(|v| *v.value());
+        Ok(result)
+    }
+
+    fn get_crdt_branch(&self, key: &[u8; 12]) -> PristineResult<Option<SerializedBranch>> {
+        let table = self.txn.open_table(BRANCHES)?;
+        let result = match table.get(key)? {
+            Some(guard) => {
+                let bytes: [u8; 24] = *guard.value();
+                Some(decode_branch_value(&bytes))
+            }
+            None => None,
+        };
+        Ok(result)
+    }
+
+    fn get_crdt_branch_after(
+        &self,
+        branch_key: &[u8; 12],
+    ) -> PristineResult<Option<[u8; 12]>> {
+        let table = self.txn.open_table(BRANCH_AFTER)?;
+        let result = table.get(branch_key)?.map(|v| *v.value());
+        Ok(result)
+    }
+
+    fn get_crdt_leaf(&self, key: &[u8; 12]) -> PristineResult<Option<SerializedLeaf>> {
+        let table = self.txn.open_table(LEAVES)?;
+        let result = match table.get(key)? {
+            Some(guard) => {
+                let bytes: [u8; 22] = *guard.value();
+                Some(decode_leaf_value(&bytes))
+            }
+            None => None,
+        };
+        Ok(result)
+    }
+
+    fn get_trunk_by_path(&self, path: &str) -> PristineResult<Option<crate::crdt::TrunkId>> {
+        use crate::crdt::tables::decode_trunk_id;
+        let table = self.txn.open_table(PATH_TRUNK)?;
+        let result = table.get(path)?;
+        match result {
+            Some(guard) => {
+                let key: [u8; 12] = *guard.value();
+                drop(guard);
+                Ok(Some(decode_trunk_id(&key)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn iter_trunk_branches(
+        &self,
+        trunk_key: &[u8; 12],
+    ) -> PristineResult<Box<dyn Iterator<Item = Result<[u8; 12], PristineError>> + '_>> {
+        let table = self.txn.open_multimap_table(TRUNK_BRANCHES)?;
+        let mut results: Vec<Result<[u8; 12], PristineError>> = Vec::new();
+        let values = table.get(trunk_key)?;
+        for value_result in values {
+            match value_result {
+                Ok(access) => results.push(Ok(*access.value())),
+                Err(e) => results.push(Err(PristineError::Storage(Box::new(e)))),
+            }
+        }
+        Ok(Box::new(results.into_iter()))
+    }
+
+    fn iter_branch_leaves(
+        &self,
+        branch_key: &[u8; 12],
+    ) -> PristineResult<Box<dyn Iterator<Item = Result<[u8; 12], PristineError>> + '_>> {
+        let table = self.txn.open_multimap_table(BRANCH_LEAVES)?;
+        let mut results: Vec<Result<[u8; 12], PristineError>> = Vec::new();
+        let values = table.get(branch_key)?;
+        for value_result in values {
+            match value_result {
+                Ok(access) => results.push(Ok(*access.value())),
+                Err(e) => results.push(Err(PristineError::Storage(Box::new(e)))),
+            }
+        }
+        Ok(Box::new(results.into_iter()))
+    }
+
+    fn get_crdt_branch_vertex(
+        &self,
+        branch_key: &[u8; 12],
+    ) -> PristineResult<Option<GraphNode<NodeId>>> {
+        let table = self.txn.open_table(BRANCH_VERTEX)?;
+        let result = table.get(branch_key)?;
+        match result {
+            Some(value) => {
+                let bytes: [u8; 24] = *value.value();
+                drop(value);
+                Ok(Some(decode_vertex_position(&bytes)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn get_crdt_vertex_branch(
+        &self,
+        vertex_key: &[u8; 24],
+    ) -> PristineResult<Option<crate::crdt::BranchId>> {
+        let table = self.txn.open_table(VERTEX_BRANCH)?;
+        let result = table.get(vertex_key)?;
+        match result {
+            Some(value) => {
+                let bytes: [u8; 12] = *value.value();
+                drop(value);
+                Ok(Some(decode_branch_id(&bytes)))
+            }
+            None => Ok(None),
+        }
     }
 }

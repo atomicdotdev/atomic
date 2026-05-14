@@ -63,6 +63,23 @@ impl Repository {
             Err(e) => return Err(RepositoryError::Database(e.to_string())),
         };
 
+        // NOTE on CRDT-driven output (task #24):
+        // The new `output_file_via_crdt` walker in atomic_core::output::crdt
+        // is faster and avoids the byte-graph linear-walker bugs that
+        // overcount bytes on multi-edge vertices.  Callers that want the
+        // *materialized* (no-filter, single-view) content can call it
+        // directly via `get_file_content_via_crdt`.
+        //
+        // We don't use it here because this entry point honors the
+        // view's `change_filter`, and the CRDT walker reads
+        // `branch.state` directly — the materialized state across all
+        // applied changes.  For multi-view scenarios that would expose
+        // branches from views the caller isn't on.
+        //
+        // Wiring the CRDT walker into the filter-aware path requires
+        // either (a) per-(change, branch) state-change tracking or
+        // (b) replaying BranchOps from filter-in changes — both deferred.
+
         // Always build the change filter.
         //
         // There is no "fast path" for shared root views: draft views
@@ -85,6 +102,63 @@ impl Repository {
             Ok(None)
         } else {
             Ok(Some(content))
+        }
+    }
+
+    /// Get file content using the CRDT-driven walker (task #24).
+    ///
+    /// Walks the `Trunk → Branch` chain in file order and fetches each
+    /// alive branch's bytes from its recorded `BRANCH_VERTEX` span.  This
+    /// bypasses the byte-graph linear walker entirely.
+    ///
+    /// # When to use
+    ///
+    /// Use this when you want the *materialized* file content — the state
+    /// after all applied changes — without filtering by view.  This is
+    /// correct for single-view linear history and for tools that want a
+    /// canonical snapshot.
+    ///
+    /// For view-scoped reads, use [`Self::get_file_content`] instead.
+    /// That entry point honors the view's `change_filter` (at the cost of
+    /// going through the byte-graph walker).
+    ///
+    /// Falls back to byte-graph output when the CRDT layer has no row
+    /// for this file (legacy repos that predate CRDT population) or when
+    /// any alive branch lacks a `BRANCH_VERTEX` mapping.
+    pub fn get_file_content_via_crdt<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        use atomic_core::output::crdt::{output_file_via_crdt, CrdtOutputError};
+
+        let path = path.as_ref();
+        let normalized = normalize_path(path);
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        match output_file_via_crdt(&txn, &self.change_store, &normalized) {
+            Ok(content) if !content.is_empty() => Ok(Some(content)),
+            Ok(_) => {
+                // Empty result — file not in CRDT layer.  Fall back to the
+                // view-scoped byte-graph walker.
+                drop(txn);
+                self.get_file_content(path)
+            }
+            Err(CrdtOutputError::OrphanBranch(_)) => {
+                // Alive branch without BRANCH_VERTEX — pre-walker data.
+                // Fall back to byte-graph walker.
+                drop(txn);
+                self.get_file_content(path)
+            }
+            Err(CrdtOutputError::Pristine(e)) => {
+                Err(RepositoryError::Database(e.to_string()))
+            }
+            Err(CrdtOutputError::Store(e)) => {
+                Err(RepositoryError::Database(e.to_string()))
+            }
         }
     }
 

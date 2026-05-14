@@ -922,31 +922,336 @@ Harness 17 was also extended with four new agent-style scenarios:
 
 ---
 
-## 9 · Follow-up work (deferred, not blocking)
+## 9 · The deeper finding — CRDT scaffolding without CRDT functionality
 
-**Task: CRDT-driven output (`output_file_via_crdt`).**
-The current output walks the byte-range graph and uses the CRDT only
-during fork resolution. The doc's original Task 1 was to walk the CRDT
-layer (Trunk → Branches → Leaves) directly for content emission, with
-the byte graph kept only for storage and merge logic.
+While investigating the residual hyperfine commit-4 regression (the
+multi-hunk Insert case where a vertex has more than one alive forward
+edge), an audit of the CRDT layer surfaced a structural debt that
+predates this PR and explains why the byte-graph walker keeps
+accumulating heuristics:
 
-It is **not required for correctness** — the test scenarios above all
-pass through the byte-graph + change-DAG + token-merge stack. The
-reasons to come back to it later:
+> **The CRDT redb tables are defined and have writers, but nothing
+> in production actually populates them.** A fresh repository will
+> never have a single row in `crdt_trunks`, `crdt_branches`, or
+> `crdt_leaves`. The Trunk → Branch → Leaf hierarchy that §1's
+> preamble describes — and that we advertise externally — is
+> currently a schema, not a database.
 
-1. **Performance on large files** — branch-walking is closer to O(lines)
-   than the current O(V + E) graph DFS.
-2. **Cleaner architecture** — the output path is presently a stack of
-   well-targeted heuristics (antichain reduction, bypass reattachment,
-   change-DAG supersession). A CRDT-driven walker would collapse them
-   into one traversal whose semantics are clear by construction.
-3. **Token-level merge ergonomics** — currently the CRDT layer is
-   consulted only when a fork is already detected. A CRDT-first walker
-   could avoid surfacing some forks at all.
+### What is plumbed vs. what is functional
 
-The CRDT tables are already populated during record (`Trunk`, `Branch`,
-`Leaf` rows go into the B-tree alongside graph edges), so the option
-stays open whenever we choose to take it.
+| Component | Plumbed? | Functional? | Notes |
+|---|---|---|---|
+| `crdt_trunks` / `crdt_branches` / `crdt_leaves` schema | ✅ | ❌ | Tables exist, never written to |
+| `crdt_trunk_branches` / `crdt_branch_leaves` (ordering) | ✅ | ❌ | Same |
+| `crdt_inode_trunk` reverse lookup | ✅ | ❌ | Same |
+| `BRANCH_VERTEX` / `VERTEX_BRANCH` bridge | ✅ | ❌ | Same |
+| `put_crdt_trunk` / `put_crdt_branch` / `put_crdt_leaf` writers | ✅ | ❌ | Methods exist on `MutTxnT`, no production caller |
+| `iter_trunk_branches` / `iter_branch_leaves` readers | ✅ | ❌ | Methods exist, no caller |
+| FileOps generation in record (TrunkOp/BranchOp/LeafOp) | ✅ | ✅ — but as **change-file metadata only** | Embedded inside the change file; never reaches the redb CRDT tables |
+| `atomic diff` token-level highlighting | ✅ | ✅ | Reads FileOps from the change file *in memory*, renders an overlay |
+| `SemanticMergeEngine::try_merge` | ✅ | ✅ | Calls `tokenize()` on raw bytes at merge time, three-way merge in memory |
+| `output_file_via_crdt` (the doc's Task #1) | ❌ | ❌ | Doesn't exist — would query empty tables anyway |
+| `collect_sorted_via_crdt` for record line ordering | ❌ | ❌ | Same |
+
+### Why this matters
+
+The implementation pattern of consuming **change-file FileOps in memory
+to render an overlay** is structurally the same shape as `git` reading
+a `.pack` to render a diff. We advertise a multi-level CRDT graph
+database; what's actually shipping is a byte-range graph (which is
+real and persistent) plus a token-level diff renderer that consumes
+in-memory metadata from change files. The "CRDT graph" doesn't exist
+as a queryable persistent structure today.
+
+This is also why every defect in §5 had to be patched at the byte-graph
+layer: the layer above it — the one that would naturally answer
+"what is the *alive line at position N for inode I in view V*" — has
+the schema but not the data. The byte-graph walker keeps trying to
+re-derive that answer from BLOCK edges + vertex-aliveness rules, and
+that's exactly the question Insert hunks make ambiguous (multiple
+alive forwards from one vertex). The CRDT graph would make it
+unambiguous by construction — but only once the data is there.
+
+### The hyperfine commit-4 residual
+
+After the §5 fixes, hyperfine commits 1, 2, and 3 roundtrip byte-exact
+(this was the original bug class: content duplication). Commit 4 —
+which extracts a `get_progress_bar` helper function (containing a copy
+of the existing `progressbar_style` block) and deletes the original
+copies from `main()` — produces 4630 bytes vs 4539 expected (~2%
+over-count). The duplication comes from the linear `collect_sorted`
+walker reaching the original successor via the still-alive `Block(C1)`
+edge and missing the C4-inserted helper-function vertices via the
+sibling `Block(C4)` edge. Materialize then emits both paths.
+
+This is the structural limit of the byte-graph approach for Insert
+hunks — and the case the CRDT layer is *designed* to handle, by
+storing line identity (Branch IDs) rather than inferring it from
+graph topology.
+
+### What "real" CRDT functionality would mean
+
+| Piece | Effort |
+|---|---|
+| 1. `apply_change` calls into `crdt::apply` so Trunk/Branch/Leaf rows + bridge tables (`BRANCH_VERTEX`/`VERTEX_BRANCH`) land in redb during the apply step | Most of the work — needs full coverage across FileAdd / Insert / Replace / Delete |
+| 2. Read-side accessors moved (or mirrored) onto an immutable trait so output paths can use them without `&mut` | Mechanical |
+| 3. `output_file_via_crdt(inode, change_filter)` walking Trunk → branches (filtered) → leaves | New code, but small once data is present |
+| 4. `collect_sorted_via_crdt` replacing the byte-graph linear walker in record | Small; closes the hyperfine commit-4 regression |
+| 5. CRDT-first git import: tokenize once, hash lines, only deep-compare changed lines, emit BranchOp/LeafOp directly — skipping the diff-then-globalize round trip | The performance and identity-preservation win |
+| 6. Backfill: `atomic doctor --rebuild-crdt-index` (or lazy on first read) so existing repos with FileOps-in-changes but no redb CRDT rows don't break after the upgrade | Necessary for forward-compatibility |
+
+Estimated effort: **3–5 focused days**, depending on how complete
+`atomic_core::crdt::apply` already is. The module exists with
+`branch.rs`, `leaf.rs`, `trunk.rs`, `conflict.rs`, `context.rs`,
+`order.rs`, `traits.rs` — much of the write-side logic may already be
+implemented but never wired into the main `apply_change` path. The
+audit task #20 will clarify which.
+
+### Performance argument
+
+Git import today: per commit, run Myers diff (O(N²) worst case in
+file lines) → build `BuiltHunk`s → globalize each hunk into vertex/edge
+operations → apply.
+
+CRDT-first git import: per commit, tokenize the file content directly
+into Branches/Leaves keyed by stable `BranchId`, compare against the
+previous CRDT state (O(N) by line-hash equality, deep token compare
+only on changed lines), emit `BranchOp::Modify`/`Insert`/`Delete`
+directly → apply writes BOTH the CRDT tables and the byte-graph
+indices that retrieve depends on.
+
+This bypasses the diff-then-globalize round-trip entirely and
+preserves token identity across reformats — both flagship value props
+for the system that the current pipeline cannot deliver.
+
+---
+
+## 10 · What the previous "Task #1 / CRDT-driven output" guidance got wrong
+
+The earlier handoff doc claimed:
+
+> The CRDT tables are already populated during record (`Trunk`,
+> `Branch`, `Leaf` rows go into the B-tree alongside graph edges),
+> so the option stays open whenever we choose to take it.
+
+This was incorrect. The CRDT *FileOps inside the change file* are
+populated (and that's what `atomic diff` consumes). The CRDT
+*redb tables* are not. Until they are, neither
+`output_file_via_crdt` nor a CRDT-aware `collect_sorted` will work.
+This RCA supersedes that earlier note.
+
+---
+
+## 11 · Three layers of CRDT-table-population breakage
+
+Once we started writing the audit test to see *why* the CRDT tables
+were empty, three distinct defects in the write path showed up. The
+first two are fixed in this PR. The third is the load-bearing reason
+the tables can never reach a consistent state and is the next thing
+to land.
+
+### 11.1 · Inode mismatch on `TrunkOp::Create` (fixed in this PR)
+
+`apply_trunk_op` for `Create` called `txn.alloc_inode()` and used the
+result as the CRDT trunk's inode. The tree layer had already allocated
+its *own* inode for the same file during `write_recorded`'s FileAdd
+pre-pass. The two inodes were never reconciled: the tree layer
+indexed `path → tree_inode → graph position`, while the CRDT layer
+indexed `crdt_inode → trunk_id`. A caller asking "what is the CRDT
+trunk for the inode the tree returned for this path" would always
+miss — even though both rows existed.
+
+**Fix.** `apply_trunk_op::Create` now calls `txn.get_inode(path)` and
+reuses the tree's inode (with `alloc_inode` only as a fallback for
+CRDT-only callers that have no tree entry).
+
+**Reference.** `atomic-core/src/apply/file_ops.rs`,
+`apply_trunk_op` — `TrunkOp::Create` arm.
+
+### 11.2 · `BranchId` placeholder collision (fixed in this PR)
+
+The record path allocates BranchIds with a constant
+`placeholder_change_id = NodeId::new(0)` — i.e. `NodeId::ROOT` — so
+every change's record produces `BranchId(ROOT, 0)`,
+`BranchId(ROOT, 1)`, … The convention is "fill in the real change id
+at apply time", analogous to how vertex `Position`s use
+`change: None` as a placeholder and `resolve_position` substitutes the
+current change id during apply.
+
+But apply did not substitute. `apply_line_ops_with_position` used the
+recorded `BranchId(ROOT, N)` verbatim as the BRANCHES table key.
+Every commit's first Insert wrote to the same key as commit 1's first
+Insert and overwrote it. The audit saw commit 1's 82 branches, commit
+2's 82 branches replaced ~half of them, etc.
+
+**Fix.** `apply_line_ops_with_position` now resolves
+`BranchId(NodeId::ROOT, idx)` → `BranchId(current_change_id, idx)`
+before using it as a key. LeafIds inherit the resolved
+`branch_id.change_id()` so the substitution propagates to the leaf
+layer automatically.
+
+**Reference.** `atomic-core/src/apply/file_ops.rs`,
+`apply_line_ops_with_position` — top of the function.
+
+### 11.3 · Record path never looks up existing branches (FIXED in this PR)
+
+This was the load-bearing one. After 11.1 and 11.2 the BRANCHES table
+finally grew with each commit. But the audit showed branches **only
+grew — they never got deleted**:
+
+```
+Before fix:
+CRDT AUDIT commit 1 (a658ab8c): branches=82  alive=82  deleted=0
+CRDT AUDIT commit 2 (d4ebdd7b): branches=134 alive=134 deleted=0
+CRDT AUDIT commit 3 (197f9fb): branches=156 alive=156 deleted=0
+CRDT AUDIT commit 4 (68fdc2c): branches=200 alive=200 deleted=0
+
+After fix:
+CRDT AUDIT commit 1 (a658ab8c): expected=82  branches=82  alive=82  deleted=0
+CRDT AUDIT commit 2 (d4ebdd7b): expected=122 branches=124 alive=122 deleted=2
+CRDT AUDIT commit 3 (197f9fb): expected=127 branches=130 alive=127 deleted=3
+CRDT AUDIT commit 4 (68fdc2c): expected=161 branches=165 alive=162 deleted=3
+```
+
+Alive counts now track expected line counts (within ~1 line),
+deletions actually happen, and branches turn over rather than
+accumulating forever.
+
+Every line the recorder ever observed sits alive forever, even when
+the file has visibly fewer alive lines than the cumulative count
+because lines were deleted or modified across commits.
+
+The cause is upstream in the recorder. Look at
+`atomic-core/src/record/workflow/record/crdt.rs`:
+
+```rust
+let placeholder_change_id = NodeId::new(0);
+…
+let mut alloc_branch = || {
+    let id = BranchId::new(placeholder_change_id, next_branch_idx);
+    next_branch_idx += 1;
+    id
+};
+```
+
+`alloc_branch()` is called for **every** line operation — Insert,
+Delete, and Modify alike — and unconditionally returns a fresh
+placeholder. There is no lookup that says "for this Modify of old
+line N, the existing branch is `BranchId(prior_change_X, idx_Y)`".
+
+Consequences:
+
+- **Insert** ops carry `BranchId(ROOT, k)`. After 11.2's apply
+  substitution this becomes `BranchId(current_change, k)` — a new,
+  unique branch identifier. Correct.
+
+- **Delete** ops carry `BranchId(ROOT, k)`. After substitution it
+  becomes `BranchId(current_change, k)` — a *brand-new* branch
+  id, not the one being deleted. `update_branch_state` calls
+  `get_crdt_branch(this_new_id)` which returns `None`, so the
+  state update is a silent no-op.
+
+- **Modify** ops carry `BranchId(ROOT, k)`. Same outcome: the old
+  branch isn't marked Deleted (the id doesn't refer to it), and the
+  new branch *replaces* the (non-existent) old one with itself —
+  another silent no-op as far as marking the prior content gone.
+
+`atomic diff` keeps working anyway because `diff` reconstructs lines
+from the leaf-ops embedded inside the `BranchOp::Modify` / `Delete`
+variants — it never queries the BRANCHES table. So a user inspecting
+recent commits sees correct token-level highlights and assumes the
+CRDT graph is functional. The graph is *not* functional; only the
+diff overlay is.
+
+### 11.4 · What "fix the record path" looks like (now implemented)
+
+For the recorder to produce CRDT-consistent ops, it needs CRDT state
+to compare against. The implemented shape:
+
+- `iter_trunk_branches_in_file_order(txn, trunk_id)` returns the
+  trunk's branches in **file order** (top-of-file first) by walking the
+  new `BRANCH_AFTER` chain (RCA §11.6).  TRUNK_BRANCHES alone would have
+  given BranchId-sort order, which mis-orders any later commit that
+  prepends a line.
+- `record_modified_file` gained an `existing_branches:
+  Option<&[BranchId]>` parameter.  The repository call site
+  (`repository::record`) reads the file's existing branches via the
+  helper above and threads them through.
+- `build_crdt_ops_for_modified_file` accepts the same parameter and uses
+  `existing_branches[old_line_idx]` for **Delete** and **Modify** ops
+  (anywhere the old line's identity must be referenced), and continues
+  to allocate fresh placeholders for **Insert** (genuinely new lines).
+- Other callers (`git import` parallel path, `parallel_record` worker,
+  tests) pass `None` — acceptable because the git path overrides CRDT
+  ops via `build_crdt_ops_from_git_diff` at write time.
+
+The pre-fix design is preserved below for context:
+
+1. **Load the current CRDT branch list for the file's trunk.** Walk
+   `crdt_trunk_branches[trunk_id]` (filtered by view) in order. Build
+   a mapping `old_line_index → (existing BranchId, line_hash)`.
+
+2. **For each diff op:**
+   - `Equal` → no CRDT op needed. Optional: bump `prev_branch` to the
+     last existing branch so subsequent `Insert::after` references it.
+   - `Delete(old_pos, len)` → emit `BranchOp::Delete { branch:
+     existing_branch_id[old_pos + i] }` for each deleted line, with
+     `old_content` snapshot for diff display.
+   - `Insert(new_pos, len)` → emit `BranchOp::Insert { after: prev,
+     content: leaves }`. `prev` is the existing BranchId at the line
+     just before `new_pos`. The new branch is freshly allocated under
+     this change.
+   - `Replace(old_pos, old_len, new_pos, new_len)` → emit
+     `BranchOp::Modify { branch: existing_branch_id[old_pos + i] }`
+     when sizes match; otherwise a Delete + Insert combination, each
+     with the right existing-branch references.
+
+3. **Allocator becomes hybrid.** `alloc_branch` (for genuinely new
+   branches) keeps producing `BranchId(ROOT, next_idx)` for the
+   placeholder-resolution-at-apply path. Existing-branch references
+   come from the trunk-branch list, with their real change_ids.
+
+This makes the record path **CRDT-aware**. It's the missing piece
+that makes the redb CRDT tables a real database instead of an
+insert-only log.
+
+### 11.5 · Implication for the broader plan
+
+| Step | Status |
+|---|---|
+| Inode mismatch (11.1) | Fixed |
+| BranchId placeholder collision (11.2) | Fixed |
+| TRUNK_BRANCHES preserves file order via `BRANCH_AFTER` (11.6) | Fixed |
+| Record-side existing-branch lookup (11.3) | Fixed |
+| Read accessors on the immutable trait | Pending (currently using write-txn-as-read window) |
+| `output_file_via_crdt` walker | Pending |
+| Replace `collect_sorted_content_vertices` with CRDT-driven version | Pending — closes hyperfine commit-4 byte-graph over-count |
+| CRDT-first git import | Pending; the performance win |
+| Backfill (`atomic doctor --rebuild-crdt-index`) | Pending |
+
+The CRDT layer now correctly tracks branch lifecycle.  The byte-graph
+fix (linear-walker problem) is the remaining piece blocking byte-exact
+hyperfine roundtrip at commit 4.
+
+### 11.6 · `TRUNK_BRANCHES` did not preserve file order (FIXED in this PR)
+
+A prerequisite that surfaced while wiring 11.3: the `TRUNK_BRANCHES`
+multimap stores branch IDs sorted by their natural key
+`(change_id, branch_idx)`.  This means a *later* commit that prepends a
+line at the top of the file would store its new branch *after* all of
+the original commit's branches in iteration order — fine for stable
+identity, wrong for presentation, and fatal for "look up the branch
+for line N" semantics.
+
+Fix:
+
+- New table `BRANCH_AFTER: BranchId → BranchId` records each branch's
+  predecessor at apply time (`[0u8; 12]` sentinel = "start of file").
+- `iter_trunk_branches_in_file_order` walks the chain with
+  deterministic `BranchId` tie-breaks for concurrent inserts —
+  the same rule used by `crdt::apply::order::find_insert_position`.
+- `output/crdt.rs::get_file_lines_by_trunk` switched to the new helper
+  so line numbering is correct in the presence of prepended lines.
 
 ---
 

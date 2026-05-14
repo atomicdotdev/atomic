@@ -503,7 +503,7 @@ fn test_record_modified_file_success() {
     let old_content = b"fn old() {}";
     let options = RecordingOptions::new();
 
-    let result = record_modified_file(&wc, &detected, old_content, &options);
+    let result = record_modified_file(&wc, &detected, old_content, None, &options, None);
 
     assert!(result.is_ok());
     let recorded = result.unwrap();
@@ -520,7 +520,7 @@ fn test_record_modified_file_not_found() {
     let old_content = b"old content";
     let options = RecordingOptions::new();
 
-    let result = record_modified_file(&wc, &detected, old_content, &options);
+    let result = record_modified_file(&wc, &detected, old_content, None, &options, None);
 
     assert!(result.is_err());
 }
@@ -534,7 +534,7 @@ fn test_record_modified_file_with_diff() {
     let old_content = b"line1\nold_line\nline3\n";
     let options = RecordingOptions::new();
 
-    let result = record_modified_file(&wc, &detected, old_content, &options);
+    let result = record_modified_file(&wc, &detected, old_content, None, &options, None);
 
     assert!(result.is_ok());
     let recorded = result.unwrap();
@@ -639,7 +639,7 @@ fn test_record_modified_file_has_crdt_ops() {
     let old_content = b"fn old_function() {\n    // old code\n}\n";
     let options = RecordingOptions::new();
 
-    let result = record_modified_file(&wc, &detected, old_content, &options);
+    let result = record_modified_file(&wc, &detected, old_content, None, &options, None);
     assert!(result.is_ok());
 
     let recorded = result.unwrap();
@@ -659,7 +659,7 @@ fn test_record_modified_file_crdt_stats_tracks_changes() {
     let old_content = b"line1\nold_line\nline3\n";
     let options = RecordingOptions::new();
 
-    let result = record_modified_file(&wc, &detected, old_content, &options);
+    let result = record_modified_file(&wc, &detected, old_content, None, &options, None);
     assert!(result.is_ok());
 
     let recorded = result.unwrap();
@@ -680,7 +680,7 @@ fn test_record_modified_file_crdt_insert_only() {
     let old_content = b"line1\nline2\nline3\n";
     let options = RecordingOptions::new();
 
-    let result = record_modified_file(&wc, &detected, old_content, &options);
+    let result = record_modified_file(&wc, &detected, old_content, None, &options, None);
     assert!(result.is_ok());
 
     let recorded = result.unwrap();
@@ -699,7 +699,7 @@ fn test_record_modified_file_crdt_delete_only() {
     let old_content = b"line1\nline2\nline3\n";
     let options = RecordingOptions::new();
 
-    let result = record_modified_file(&wc, &detected, old_content, &options);
+    let result = record_modified_file(&wc, &detected, old_content, None, &options, None);
     assert!(result.is_ok());
 
     let recorded = result.unwrap();

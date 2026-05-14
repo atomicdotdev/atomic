@@ -188,6 +188,23 @@ pub const PATH_TRUNK: TableDefinition<&str, &[u8; 12]> = TableDefinition::new("c
 pub const BRANCH_VERTEX: TableDefinition<&[u8; 12], &[u8; 24]> =
     TableDefinition::new("crdt_branch_vertex");
 
+/// Branch → "after" reference: BranchId → BranchId
+///
+/// Key: 12 bytes encoding BranchId (the new branch)
+/// Value: 12 bytes encoding BranchId (the branch this one was inserted after).
+///        All zeros (`BranchId::ROOT`) means "inserted at start of file".
+///
+/// This table is the load-bearing piece for reconstructing file order from
+/// the CRDT layer.  Without it, TRUNK_BRANCHES iterates in (change_id,
+/// branch_idx) sort order — fine for stable identity but wrong for
+/// presentation, because a later commit's prepended branch would still
+/// sort *after* all of the original commit's branches.
+///
+/// To produce file order, walk the after-chain starting from the unique
+/// branch whose stored value is `BranchId::ROOT`.  Concurrent branches
+/// that share the same `after` reference are tie-broken by their natural
+/// `BranchId` order, matching the CRDT model.
+
 /// Graph vertex → BranchId reverse lookup
 ///
 /// Key: 24 bytes encoding `GraphNode<NodeId>` (change_id: u64, start: u64, end: u64)
@@ -197,6 +214,9 @@ pub const BRANCH_VERTEX: TableDefinition<&[u8; 12], &[u8; 24]> =
 /// graph vertex to its corresponding CRDT branch during semantic merge.
 pub const VERTEX_BRANCH: TableDefinition<&[u8; 24], &[u8; 12]> =
     TableDefinition::new("crdt_vertex_branch");
+
+pub const BRANCH_AFTER: TableDefinition<&[u8; 12], &[u8; 12]> =
+    TableDefinition::new("crdt_branch_after");
 
 // ID Encoding/Decoding (12 bytes each)
 

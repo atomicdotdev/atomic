@@ -288,6 +288,13 @@ where
     // Bounds-check.  If the deletion extends beyond what we have stored
     // as per-line vertices, fall back to whole-file replace.
     if last_deleted >= sorted.len() {
+        if std::env::var("ATOMIC_TRACE_HYPER").is_ok() {
+            eprintln!(
+                "FALLBACK whole_file_replace: last_deleted={} sorted.len={}",
+                last_deleted,
+                sorted.len()
+            );
+        }
         return globalize_replace_whole_file(ctx, inode, inode_pos, content, local, encoding);
     }
 
@@ -661,7 +668,47 @@ where
             Err(_) => break,
         };
 
-        let mut next_vertex: Option<GraphNode<NodeId>> = None;
+        // Helper: is `node` dead in this view?
+        //
+        // We check parent edges through the same (view-filtered) `txn`.
+        // Any visible `BLOCK|DELETED` parent means a change inside the
+        // view deleted this vertex — it should be skipped during the
+        // line-order walk because it's no longer a live line.
+        //
+        // Without this check, the additive edge model still leaves the
+        // *original* `Block` edge in the B-tree alongside the new
+        // `Block|DELETED` marker, so the raw forward walk reaches dead
+        // vertices and inflates `sorted.len()` past the alive line count.
+        // Downstream globalize_replace would then index `sorted[N]` by
+        // raw chain position instead of by alive line, mis-targeting
+        // hunks.
+        let is_dead_in_view = |node: GraphNode<NodeId>| -> bool {
+            let parents = match txn.iter_adjacent(node, EdgeFlags::PARENT, EdgeFlags::all()) {
+                Ok(it) => it,
+                Err(_) => return false,
+            };
+            for e in parents {
+                let e = match e {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let flags = e.flag();
+                if flags.contains(EdgeFlags::PARENT) && flags.contains(EdgeFlags::DELETED) {
+                    return true;
+                }
+            }
+            false
+        };
+
+        // Prefer alive destinations.  When a dead vertex sits on the
+        // walk path with no alive sibling at the same predecessor, we
+        // still follow it so the walk can reach the next alive line
+        // (the alive-walker `walk_through_dead` does the same at
+        // retrieve time).  Dead vertices never get pushed to the
+        // alive-line index — they don't count as lines and they don't
+        // get a sorted[] slot — but they keep the chain walkable.
+        let mut next_alive: Option<GraphNode<NodeId>> = None;
+        let mut next_dead: Option<GraphNode<NodeId>> = None;
         for edge_result in adj {
             let edge = match edge_result {
                 Ok(e) => e,
@@ -681,20 +728,23 @@ where
             if visited.contains(&dest) {
                 continue;
             }
-            // Verify the destination vertex is alive (not deleted by a
-            // superseding edge).
-            next_vertex = Some(dest);
-            break;
+            if !is_dead_in_view(dest) {
+                next_alive = Some(dest);
+                break;
+            }
+            if next_dead.is_none() {
+                next_dead = Some(dest);
+            }
         }
 
-        let dest = match next_vertex {
+        let dest = match next_alive.or(next_dead) {
             Some(d) => d,
             None => break,
         };
 
-        // Skip the inode marker itself (empty vertex at inode position).
         let is_inode_marker = dest.start == dest.end && dest.start == inode_pos.pos;
-        if !is_inode_marker && !dest.change.is_root() && dest.start != dest.end {
+        let is_alive = !is_dead_in_view(dest);
+        if is_alive && !is_inode_marker && !dest.change.is_root() && dest.start != dest.end {
             ordered.push(dest);
         }
 
@@ -707,7 +757,18 @@ where
         ordered.len(),
     );
 
-    let _ = inode; // suppress unused warning if logging is off
+    if std::env::var("ATOMIC_TRACE_HYPER").is_ok() {
+        eprintln!("SORTED {} entries:", ordered.len());
+        let mut total = 0u64;
+        for (i, v) in ordered.iter().enumerate() {
+            let size = v.end.get() - v.start.get();
+            total += size;
+            eprintln!("  [{:3}] {:?} size={}", i, v, size);
+        }
+        eprintln!("  total content bytes: {}", total);
+    }
+
+    let _ = inode;
     Ok(ordered)
 }
 

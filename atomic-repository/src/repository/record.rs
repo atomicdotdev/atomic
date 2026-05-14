@@ -363,9 +363,18 @@ impl Repository {
                     // This creates efficient incremental changes rather than
                     // replacing the entire file content.
 
-                    // Step 1: Look up the file's inode and position from the pristine
-                    // This is required for globalization to create Edit hunks instead of FileAdd
-                    let (file_inode, file_position) = {
+                    // Step 1: Look up the file's inode and position from the
+                    // pristine, plus its existing CRDT branches in file order.
+                    //
+                    // The existing branches are passed to record_modified_file
+                    // so that Delete and Modify CRDT ops reference the real
+                    // BranchIds for those old-content lines, not fresh
+                    // placeholders — see RCA §11.3 and `iter_trunk_branches_in_file_order`.
+                    let (file_inode, file_position, existing_branches) = {
+                        use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
+                        use atomic_core::crdt::tables::decode_trunk_id;
+                        use atomic_core::pristine::CrdtTxnT;
+
                         let txn = self
                             .pristine
                             .read_txn()
@@ -411,7 +420,50 @@ impl Repository {
                             }
                         };
 
-                        (inode, position)
+                        // Resolve the file's existing CRDT branches in file
+                        // order, filtered to **alive** branches only.
+                        //
+                        // The line diff that consumes this slice indexes by
+                        // 0-based line number in the *old content* — and the
+                        // old content only contains alive lines.  Including
+                        // deleted (tombstoned) branches would shift every
+                        // subsequent index, so a Modify of "line 30" would
+                        // reference a deleted branch from earlier in the
+                        // chain.
+                        //
+                        // Empty when this file has no CRDT rows yet (a repo
+                        // that predates CRDT population, or a file imported
+                        // via a path that bypassed the CRDT builder) — in
+                        // that case record_modified_file falls back to
+                        // placeholders.
+                        use atomic_core::crdt::tables::encode_branch_id;
+                        let inode_u64 = inode.get();
+                        let existing_branches = match txn.get_crdt_inode_trunk(inode_u64) {
+                            Ok(Some(trunk_key)) => {
+                                let trunk_id = decode_trunk_id(&trunk_key);
+                                match iter_trunk_branches_in_file_order(&txn, trunk_id) {
+                                    Ok(all) => {
+                                        let mut alive = Vec::with_capacity(all.len());
+                                        for b in all {
+                                            let bk = encode_branch_id(&b);
+                                            match txn.get_crdt_branch(&bk) {
+                                                Ok(Some(branch_data))
+                                                    if branch_data.state.is_alive() =>
+                                                {
+                                                    alive.push(b);
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        alive
+                                    }
+                                    Err(_) => Vec::new(),
+                                }
+                            }
+                            _ => Vec::new(),
+                        };
+
+                        (inode, position, existing_branches)
                     };
 
                     // Step 2: Retrieve old content from the graph.
@@ -462,10 +514,35 @@ impl Repository {
                     detected.inode = Some(file_inode);
                     detected.position = Some(file_position);
 
-                    // Step 6: Record the modification using the diff-based workflow
+                    // Step 6: Record the modification using the diff-based workflow.
                     // This creates Edit hunks for insertions and Replacement hunks
                     // for deletions, rather than a full FileAdd replacement.
-                    match record_modified_file(&memory_wc, &detected, &old_content, &core_options) {
+                    //
+                    // `existing_branches` lets the CRDT op builder bind
+                    // Delete/Modify ops to the real BranchIds for those
+                    // old-content lines (or `None` when this file has no CRDT
+                    // rows yet — see Step 1).
+                    let crdt_old_content = if existing_branches.is_empty() {
+                        None
+                    } else {
+                        match self.get_file_content_via_crdt(entry.path()) {
+                            Ok(Some(content)) => Some(content),
+                            _ => None,
+                        }
+                    };
+                    let existing_branches_slice: Option<&[_]> = if existing_branches.is_empty() {
+                        None
+                    } else {
+                        Some(existing_branches.as_slice())
+                    };
+                    match record_modified_file(
+                        &memory_wc,
+                        &detected,
+                        &old_content,
+                        crdt_old_content.as_deref(),
+                        &core_options,
+                        existing_branches_slice,
+                    ) {
                         Ok(recorded) => {
                             if !recorded.is_empty() {
                                 stats.files_recorded += 1;

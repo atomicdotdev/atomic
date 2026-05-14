@@ -328,6 +328,36 @@ pub enum BranchOp {
         /// The branch to restore.
         branch: BranchId,
     },
+
+    /// Move an existing line to a new position in the file order without
+    /// changing its content, state, or identity.
+    ///
+    /// `Reparent` is the CRDT-correct expression of a "move" — extract-
+    /// function refactors, line reordering, content shuffling — where
+    /// the line is conceptually the same, just located somewhere else.
+    /// Treating moves as `Delete + Insert` (the alternative) tombstones
+    /// the original branch and creates a fresh one with the same bytes,
+    /// breaking blame continuity and exposing concurrent merges to
+    /// duplicate content.
+    ///
+    /// At apply time, only `BRANCH_AFTER[branch]` is updated:
+    ///
+    /// - `new_after = None` → the branch becomes a file-start sibling
+    /// - `new_after = Some(b)` → the branch is now positioned immediately
+    ///   after `b` in file order
+    ///
+    /// `Reparent` is emitted by the `ExtractMove` record-side recipe and
+    /// any other recipe that needs to express position-only changes
+    /// (e.g., a future cross-block matcher in `WhitespaceCleanup`).  The
+    /// `output_file_via_crdt` walker reads `BRANCH_AFTER` directly, so
+    /// no walker changes are needed.
+    Reparent {
+        /// The branch whose chain position is changing.
+        branch: BranchId,
+        /// The new predecessor in file order, or `None` for "start of
+        /// file".  Mirrors `Insert.after` semantics.
+        new_after: Option<BranchId>,
+    },
 }
 
 impl BranchOp {
@@ -340,6 +370,7 @@ impl BranchOp {
             BranchOp::Delete { branch, .. } => Some(*branch),
             BranchOp::Modify { branch, .. } => Some(*branch),
             BranchOp::Restore { branch } => Some(*branch),
+            BranchOp::Reparent { branch, .. } => Some(*branch),
         }
     }
 
@@ -365,6 +396,7 @@ impl BranchOp {
             BranchOp::Delete { content, .. } => Some(content),
             BranchOp::Modify { new_content, .. } => Some(new_content),
             BranchOp::Restore { .. } => None,
+            BranchOp::Reparent { .. } => None,
         }
     }
 
@@ -413,7 +445,14 @@ impl BranchOp {
             BranchOp::Delete { .. } => "delete",
             BranchOp::Modify { .. } => "modify",
             BranchOp::Restore { .. } => "restore",
+            BranchOp::Reparent { .. } => "reparent",
         }
+    }
+
+    /// Returns `true` if this is a reparent operation.
+    #[inline]
+    pub fn is_reparent(&self) -> bool {
+        matches!(self, BranchOp::Reparent { .. })
     }
 
     /// Returns the insertion point for an Insert operation.
@@ -451,6 +490,13 @@ impl fmt::Display for BranchOp {
                 )
             }
             BranchOp::Restore { branch } => write!(f, "restore {}", branch),
+            BranchOp::Reparent { branch, new_after } => {
+                write!(f, "reparent {} after ", branch)?;
+                match new_after {
+                    Some(id) => write!(f, "{}", id),
+                    None => write!(f, "START"),
+                }
+            }
         }
     }
 }

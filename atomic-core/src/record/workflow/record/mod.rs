@@ -144,7 +144,7 @@
 //!
 //! [`Change`]: crate::change::Change
 
-mod crdt;
+pub(crate) mod crdt;
 mod options;
 mod types;
 
@@ -331,7 +331,8 @@ pub fn record_deleted_file(
 ///
 /// * `working_copy` - Working copy interface
 /// * `detected` - The detected file (should have diff_ops populated)
-/// * `old_content` - The pristine (old) content
+/// * `old_content` - The pristine byte-graph (old) content
+/// * `crdt_old_content` - Optional CRDT-materialized old content for CRDT op generation
 /// * `options` - Recording options
 ///
 /// # Returns
@@ -344,14 +345,27 @@ pub fn record_deleted_file(
 /// use atomic_core::record::workflow::record::{record_modified_file, RecordingOptions};
 ///
 /// let options = RecordingOptions::new();
-/// let recorded = record_modified_file(&working_copy, &detected_file, &old_content, &options)?;
+/// let recorded = record_modified_file(&working_copy, &detected_file, &old_content, &options, None)?;
 /// ```
+///
+/// # `existing_branches`
+///
+/// When supplied, this is the file-ordered list of CRDT `BranchId`s for
+/// `old_content`'s lines (index `i` is the BranchId for the 0-indexed `i`-th
+/// line of the old file).  This lets `Delete` and `Modify` operations
+/// reference the actual existing branches instead of fresh placeholders,
+/// which is required for the CRDT layer to stay coherent across commits
+/// (see RCA §11.3).  Pass `None` only when the caller has no access to the
+/// pristine state (e.g., tests or in-memory pipelines) — that path emits
+/// placeholders and the CRDT layer is effectively insert-only.
 #[allow(clippy::type_complexity)]
 pub fn record_modified_file<W>(
     working_copy: &W,
     detected: &DetectedFile,
     old_content: &[u8],
+    crdt_old_content: Option<&[u8]>,
     options: &RecordingOptions,
+    existing_branches: Option<&[BranchId]>,
 ) -> Result<RecordedFile, String>
 where
     W: WorkingCopyRead,
@@ -475,14 +489,27 @@ where
         recorded.add_hunk(graph_op);
     }
 
-    // Generate CRDT operations for token-level diff tracking
-    let crdt_ops = crdt::build_crdt_ops_for_modified_file(
-        &detected.path,
-        old_content,
-        &new_content,
+    // Generate CRDT operations for token-level diff tracking.
+    //
+    // Load-bearing subtlety: CRDT cleanup must diff against the prior
+    // CRDT materialization when available, not only the byte-graph read.
+    // If the CRDT layer has already drifted from the byte graph, using the
+    // byte-graph content here leaves CRDT-only stale branches alive forever
+    // because the diff never "sees" them to delete them.
+    //
+    // Graph hunks above still use `old_content` (the byte-graph source of
+    // truth for patch theory).  Only the CRDT op builder uses the optional
+    // `crdt_old_content`.
+    use crate::record::workflow::recipes::{Recipe, RecipeContext};
+    let recipe_ctx = RecipeContext {
+        path: &detected.path,
+        old_content: crdt_old_content.unwrap_or(old_content),
+        new_content: &new_content,
+        existing_branches,
         encoding,
-        options.get_algorithm(),
-    );
+        algorithm: options.get_algorithm(),
+    };
+    let crdt_ops = Recipe::detect(&recipe_ctx).build_ops(&recipe_ctx);
     recorded.set_crdt_ops(crdt_ops.0);
     recorded.set_crdt_stats(crdt_ops.1);
 

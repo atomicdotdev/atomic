@@ -147,8 +147,10 @@ fn write_new_edge<T: MutTxnT>(
         edge.to
     );
 
-    // Resolve the introduced_by change
-    let introduced_by = resolve_introduced_by(txn, &edge.introduced_by, change_id)?;
+    // Resolve the introduced_by change for validation / side effects.
+    // The resolved id itself is unused here — the additive-only edge
+    // model writes the new edge directly without consulting it.
+    let _ = resolve_introduced_by(txn, &edge.introduced_by, change_id)?;
 
     // Find source span — predecessor context (ending at position).
     let source_pos = resolve_position(txn, &edge.from, change_id)?;

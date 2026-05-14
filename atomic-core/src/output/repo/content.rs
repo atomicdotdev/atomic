@@ -596,7 +596,7 @@ where
                 for (idx, &child_vid) in group.iter().enumerate() {
                     if idx > 0 {
                         let change_id = graph.try_get_vertex(child_vid).map(|v| v.node.change);
-                        let hash = change_id.and_then(|cid| hash_fn(cid));
+                        let hash = change_id.and_then(&hash_fn);
                         let hashes: Vec<Hash> = hash.into_iter().collect();
                         let href: Option<&[Hash]> = if hashes.is_empty() {
                             None

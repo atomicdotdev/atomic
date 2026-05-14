@@ -241,6 +241,23 @@ pub trait MutCrdtTxnT {
     /// * `state` - The new state
     fn update_branch_state(&mut self, id: BranchId, state: BranchState) -> Result<(), Self::Error>;
 
+    /// Updates a branch's `after` reference (the predecessor in file order).
+    ///
+    /// Used by [`BranchOp::Reparent`](crate::crdt::BranchOp::Reparent) to
+    /// move a branch to a new chain position without altering its content
+    /// or state.  Pass `None` for "start of file".
+    ///
+    /// Default implementation is a no-op so existing test mocks compile;
+    /// production implementations must override it to write the
+    /// `BRANCH_AFTER` row.
+    fn update_branch_after(
+        &mut self,
+        _id: BranchId,
+        _new_after: Option<BranchId>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Lists all branch IDs for a trunk in order.
     ///
     /// Uses the TRUNK_BRANCHES multimap.

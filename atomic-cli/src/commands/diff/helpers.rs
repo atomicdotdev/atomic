@@ -167,6 +167,12 @@ impl Diff {
                             insertions += 1;
                             current_hunk.new_count += 1;
                         }
+                        BranchOp::Reparent { .. } => {
+                            // Position-only change — no visible delta in
+                            // unified diff output.  A future "blame-aware"
+                            // diff might render these explicitly; for now
+                            // they're silent.
+                        }
                     }
                 }
 

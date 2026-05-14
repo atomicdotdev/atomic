@@ -339,12 +339,21 @@ where
             // Track content position after globalization
             let content_pos_after = ctx.content_len();
 
-            // Record the content range for this hunk
+            // Record the content range for this hunk.
+            //
+            // `uses_full_content` originally claimed Replace hunks held the
+            // full file in their content blob — but globalize slices Replace
+            // content to just the replaced lines (`slice_lines(content,
+            // built.new_start, built.new_len)` above), so the blob is the
+            // hunk-only content.  Setting `uses_full = false` routes us to
+            // `enrich_lines_from_hunk_content`, which computes per-line
+            // ranges relative to that smaller blob — matching what apply
+            // can actually read.
+            //
+            // (If a future Replace path materializes the full file into the
+            // content blob, this is the place to flip the flag back.)
             if content_pos_after > content_pos_before {
-                let uses_full = matches!(
-                    built.kind,
-                    crate::record::workflow::graph_op::BuiltHunkKind::Replace
-                );
+                let uses_full = false;
                 hunk_content_ranges.push(HunkContentRange {
                     kind: built.kind,
                     new_start: built.new_start,

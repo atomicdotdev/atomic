@@ -352,10 +352,11 @@ pub fn retrieve_graph<T: GraphTxnT>(
         // alive child, attach them directly so they appear after this
         // vertex.
         if !bypass_children.is_empty() {
-            let direct_child = children_to_add
-                .iter()
-                .rev()
-                .find_map(|(_, v)| if !v.is_dummy() { Some(*v) } else { None });
+            let direct_child =
+                children_to_add
+                    .iter()
+                    .rev()
+                    .find_map(|(_, v)| if !v.is_dummy() { Some(*v) } else { None });
 
             if let Some(direct) = direct_child {
                 pending_bypass
@@ -536,10 +537,7 @@ fn walk_through_dead<T: GraphTxnT>(
                 // diamond/duplicate paths that fork-detection misreads as
                 // CRDT conflicts).
                 let claimed_by_alive_outsider = {
-                    let parents = match txn.iter_parents(next_vertex, true) {
-                        Ok(p) => p,
-                        Err(_) => Vec::new(),
-                    };
+                    let parents = txn.iter_parents(next_vertex, true).unwrap_or_default();
                     parents.iter().any(|p| {
                         if !options.passes_filter(p.introduced_by) {
                             return false;
@@ -561,15 +559,11 @@ fn walk_through_dead<T: GraphTxnT>(
                                 // Source must itself be alive in our view —
                                 // otherwise it's another dead chain that
                                 // doesn't claim this one.
-                                let src_alive = if options.has_filter() {
-                                    options
-                                        .is_vertex_alive(txn, source_vertex)
-                                        .unwrap_or(false)
+                                if options.has_filter() {
+                                    options.is_vertex_alive(txn, source_vertex).unwrap_or(false)
                                 } else {
-                                    classify::is_vertex_alive(txn, &source_vertex)
-                                        .unwrap_or(false)
-                                };
-                                src_alive
+                                    classify::is_vertex_alive(txn, &source_vertex).unwrap_or(false)
+                                }
                             }
                             _ => false,
                         }

@@ -267,7 +267,7 @@ where
             flag: EdgeFlags::BLOCK,
             start: line_start,
             end: line_end,
-            inode: inode_hash.clone(),
+            inode: inode_hash,
         });
     }
 

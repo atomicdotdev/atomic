@@ -177,7 +177,7 @@ impl super::CrdtChangeBuilder {
         let tokenizer = ContentTokenizer::new(content);
         let mut prev_branch: Option<crate::crdt::BranchId> = None;
 
-        for line in tokenizer.lines() {
+        for (line_idx, line) in tokenizer.lines().enumerate() {
             let branch_id = self.alloc_branch_id();
 
             let mut leaf_ops = Vec::new();
@@ -197,11 +197,18 @@ impl super::CrdtChangeBuilder {
                 prev_leaf = Some(leaf_id);
             }
 
-            let line_op = LineOps::insert(branch_id, prev_branch, leaf_ops);
+            // Tag the LineOps with the new-file line number (1-indexed).
+            // Globalize's `enrich_file_ops_for_add` matches LineOps by
+            // `new_line_num` to populate `content_range`, which apply then
+            // uses to wire `BRANCH_VERTEX`.  Without this tag, FileAdd
+            // branches never get a BRANCH_VERTEX row — and the CRDT-driven
+            // output walker raises `OrphanBranch` on every line.
+            let line_op = LineOps::insert(branch_id, prev_branch, leaf_ops)
+                .with_new_line_num(line_idx + 1);
 
             if let Some(&file_idx) = self.trunk_index.get(&trunk_id) {
-                let line_idx = self.file_ops[file_idx].line_ops.len();
-                self.branch_index.insert(branch_id, (file_idx, line_idx));
+                let inner_line_idx = self.file_ops[file_idx].line_ops.len();
+                self.branch_index.insert(branch_id, (file_idx, inner_line_idx));
                 self.file_ops[file_idx].add_line_op(line_op);
             }
 

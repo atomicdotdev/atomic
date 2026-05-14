@@ -355,8 +355,12 @@ fn test_hyperfine_content_duplication_bug() {
     repo.add("src/main.rs", Default::default()).unwrap();
     let _ = record_change(&repo, "Initial commit");
 
+    // Read via the CRDT-driven walker (task #24).  The view-filtered
+    // byte-graph walker (`get_file_content_on_view`) over-counts on
+    // multi-edge vertices — exactly the bug this test was created to
+    // expose.  The CRDT walker is the replacement; that's the goal.
     let content = repo
-        .get_file_content_on_view("src/main.rs", repo.current_view())
+        .get_file_content_via_crdt("src/main.rs")
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -370,9 +374,13 @@ fn test_hyperfine_content_duplication_bug() {
         let _ = record_change(&repo, &format!("Commit {}", i + 2));
 
         let content = repo
-            .get_file_content_on_view("src/main.rs", repo.current_view())
+            .get_file_content_via_crdt("src/main.rs")
             .unwrap()
             .unwrap();
+
+        if content != *version {
+            dump_crdt_line_mismatches(&repo, "src/main.rs", version);
+        }
 
         assert_eq!(
             content.len(),
@@ -393,6 +401,337 @@ fn test_hyperfine_content_duplication_bug() {
             commits[i + 1],
         );
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test: CRDT-population audit for the hyperfine sequence.
+//
+// This test does NOT check materialized byte equality.  Instead it walks
+// the CRDT layer directly (Trunk → Branches → Leaves) after each commit
+// and validates the structural invariants the planned CRDT-driven
+// output relies on:
+//
+//   1. The file's inode has a Trunk entry.
+//   2. Iterating that trunk's branches in TRUNK_BRANCHES order yields
+//      exactly one Branch per alive line in the expected file content.
+//   3. Each branch's leaves reassemble to that line's bytes.
+//
+// If any of these fail, the CRDT walker cannot be relied on to produce
+// correct output for this scenario — we need to fix the record-side
+// CRDT population before wiring output_file_via_crdt.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_hyperfine_crdt_audit() {
+    use atomic_core::crdt::tables::decode_trunk_id;
+    use atomic_core::crdt::{decode_branch_id, decode_branch_value, BranchState};
+    use atomic_core::pristine::{CrdtTxnT, GraphTxnT, MutTxnT};
+    use std::process::Command;
+
+    let git_temp = TempDir::new().expect("Failed to create temp dir for git");
+    let git_path = git_temp.path().to_path_buf();
+    let clone_status = Command::new("git")
+        .args([
+            "clone",
+            "--quiet",
+            "https://github.com/sharkdp/hyperfine.git",
+        ])
+        .arg(&git_path)
+        .status();
+
+    match clone_status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("Skipping test: git clone failed (no network?)");
+            return;
+        }
+    }
+
+    let commits: Vec<&str> = vec![
+        "a658ab8c", "d4ebdd7b", "197f9fb", "68fdc2c",
+        "9ba7ada", "5cdf013", "dab3f94", "219bb1e",
+    ];
+
+    let mut versions: Vec<Vec<u8>> = Vec::new();
+    for sha in &commits {
+        let output = Command::new("git")
+            .args(["show", &format!("{}:src/main.rs", sha)])
+            .current_dir(&git_path)
+            .output()
+            .expect("Failed to run git show");
+        assert!(output.status.success(), "git show failed for {}", sha);
+        versions.push(output.stdout);
+    }
+
+    let (repo, _temp, repo_path) = create_test_repo();
+
+    // Commit 1 — add the file.
+    write_file(
+        &repo_path,
+        "src/main.rs",
+        &String::from_utf8_lossy(&versions[0]),
+    );
+    repo.add("src/main.rs", Default::default()).unwrap();
+    let _ = record_change(&repo, "Initial commit");
+
+    // Walk each commit, audit the CRDT topology after each.
+    for (i, version) in versions.iter().enumerate() {
+        if i > 0 {
+            write_file(&repo_path, "src/main.rs", &String::from_utf8_lossy(version));
+            let _ = record_change(&repo, &format!("Commit {}", i + 1));
+        }
+
+        // Expected: one alive Branch per line in the expected file.
+        let expected_lines: Vec<&[u8]> = version
+            .split_inclusive(|&b| b == b'\n')
+            .collect();
+
+        let (inode, _pos) = repo
+            .get_inode_and_position("src/main.rs")
+            .expect("inode lookup failed")
+            .expect("file is tracked");
+
+        let mut txn = repo
+            .pristine()
+            .write_txn()
+            .expect("write_txn for audit");
+
+        let trunk_key_by_inode = txn
+            .get_crdt_inode_trunk(inode.get())
+            .expect("inode→trunk lookup failed");
+        let trunk_id_by_path = txn
+            .get_trunk_by_path("src/main.rs")
+            .expect("path→trunk lookup failed");
+
+        let trunk_key = match (trunk_key_by_inode, trunk_id_by_path) {
+            (Some(tk), _) => Some(tk),
+            (None, Some(tid)) => {
+                eprintln!(
+                    "CRDT AUDIT commit {} ({}): inode lookup MISSED but path lookup HIT — \
+                     tree_inode={} crdt_trunk_id={:?} (the inode→trunk index is stale or \
+                     keyed under a different inode than the tree layer uses)",
+                    i + 1,
+                    commits[i],
+                    inode.get(),
+                    tid
+                );
+                Some(atomic_core::crdt::tables::encode_trunk_id(&tid))
+            }
+            (None, None) => None,
+        };
+
+        match trunk_key {
+            None => {
+                eprintln!(
+                    "CRDT AUDIT commit {} ({}): NO TRUNK at all — expected_lines={} \
+                     (neither inode→trunk nor path→trunk found a row)",
+                    i + 1,
+                    commits[i],
+                    expected_lines.len(),
+                );
+                drop(txn);
+                continue;
+            }
+            Some(tk) => {
+                let _trunk_id = decode_trunk_id(&tk);
+                let branch_keys: Vec<[u8; 12]> = txn
+                    .iter_trunk_branches(&tk)
+                    .expect("iter_trunk_branches failed")
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("branch iteration error");
+                let mut alive_branch_count = 0usize;
+                let mut deleted_branch_count = 0usize;
+                let mut missing_branch_rows = 0usize;
+                let mut alive_with_vertex = 0usize;
+                let mut alive_phantom_no_vertex = 0usize;
+                let mut alive_phantom_zero_range = 0usize;
+                let mut total_alive_bytes: u64 = 0;
+                let mut alive_multi_line: usize = 0;
+                let mut max_branch_bytes: u64 = 0;
+                let mut vertex_to_branches: std::collections::HashMap<
+                    [u8; 24],
+                    Vec<atomic_core::crdt::BranchId>,
+                > = std::collections::HashMap::new();
+                for bk in &branch_keys {
+                    let branch = txn
+                        .get_crdt_branch(bk)
+                        .expect("get_crdt_branch failed");
+                    let _ = decode_branch_id(bk);
+                    let _ = decode_branch_value;
+                    match branch {
+                        Some(b) => match b.state {
+                            BranchState::Alive => {
+                                alive_branch_count += 1;
+                                match txn.get_crdt_branch_vertex(bk) {
+                                    Ok(Some(gn)) => {
+                                        let len = gn.end.get().saturating_sub(gn.start.get());
+                                        if len > 0 {
+                                            alive_with_vertex += 1;
+                                            total_alive_bytes += len;
+                                            if len > max_branch_bytes {
+                                                max_branch_bytes = len;
+                                            }
+                                            // Encode vertex for dedup detection.
+                                            let vk = atomic_core::crdt::tables::encode_vertex_position(&gn);
+                                            vertex_to_branches
+                                                .entry(vk)
+                                                .or_default()
+                                                .push(decode_branch_id(bk));
+                                            // Count newlines in this branch's content
+                                            // to detect multi-line content_ranges.
+                                            if let Some(hash) = txn
+                                                .get_external(gn.change)
+                                                .ok()
+                                                .flatten()
+                                            {
+                                                let mut buf = vec![0u8; len as usize];
+                                                let hash_fn = |id: atomic_core::types::NodeId| -> Option<atomic_core::types::Hash> {
+                                                    if id.is_root() { None } else {
+                                                        txn.get_external(id).ok().flatten()
+                                                    }
+                                                };
+                                                use atomic_core::change::ChangeStore;
+                                                if repo.change_store()
+                                                    .get_contents(hash_fn, gn, &mut buf)
+                                                    .is_ok()
+                                                {
+                                                    let newline_count = buf.iter().filter(|&&b| b == b'\n').count();
+                                                    // A "well-formed" branch represents one line — exactly one
+                                                    // newline (at the end) OR no newline (only the last line of a
+                                                    // file without trailing newline).
+                                                    let ends_with_newline = buf.last() == Some(&b'\n');
+                                                    let well_formed =
+                                                        (newline_count == 1 && ends_with_newline)
+                                                            || newline_count == 0;
+                                                    if !well_formed {
+                                                        alive_multi_line += 1;
+                                                        eprintln!(
+                                                            "  MALFORMED commit {}: branch={:?} len={} newlines={} ends_nl={} change={} content={:?}",
+                                                            i + 1,
+                                                            decode_branch_id(bk),
+                                                            len,
+                                                            newline_count,
+                                                            ends_with_newline,
+                                                            hash,
+                                                            String::from_utf8_lossy(&buf),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            alive_phantom_zero_range += 1;
+                                            eprintln!(
+                                                "  PHANTOM (zero range) commit {}: branch={:?} vertex={:?}",
+                                                i + 1,
+                                                decode_branch_id(bk),
+                                                gn
+                                            );
+                                        }
+                                    }
+                                    _ => {
+                                        alive_phantom_no_vertex += 1;
+                                        eprintln!(
+                                            "  PHANTOM (no vertex) commit {}: branch={:?}",
+                                            i + 1,
+                                            decode_branch_id(bk)
+                                        );
+                                    }
+                                }
+                            }
+                            BranchState::Deleted => deleted_branch_count += 1,
+                        },
+                        None => missing_branch_rows += 1,
+                    }
+                }
+
+                // Detect branches sharing the same BRANCH_VERTEX entry —
+                // these would cause the walker to emit the same content
+                // multiple times.
+                let mut duplicate_vertices = 0usize;
+                let mut duplicate_extra_bytes: u64 = 0;
+                for (vk, branches) in &vertex_to_branches {
+                    if branches.len() > 1 {
+                        duplicate_vertices += 1;
+                        let gn = atomic_core::crdt::tables::decode_vertex_position(vk);
+                        let len = gn.end.get().saturating_sub(gn.start.get());
+                        duplicate_extra_bytes += len * (branches.len() as u64 - 1);
+                        eprintln!(
+                            "  DUPLICATE VERTEX commit {}: vertex={:?} shared by {} branches: {:?}",
+                            i + 1,
+                            gn,
+                            branches.len(),
+                            branches
+                        );
+                    }
+                }
+
+                // For the first commit that diverges, dump each branch
+                // alongside the expected line so we can see exactly
+                // which branches have wrong content.
+                if total_alive_bytes != version.len() as u64 && i + 1 == 5 {
+                    eprintln!("\n=== DETAILED BRANCH DUMP commit {} ({}) ===", i + 1, commits[i]);
+                    use atomic_core::crdt::tables::decode_trunk_id;
+                    let trunk_id = decode_trunk_id(&tk);
+                    {
+                        let dumped = collect_alive_branch_dump(&repo, &txn, trunk_id);
+                        let expected_split: Vec<&str> = std::str::from_utf8(version)
+                            .unwrap_or("")
+                            .split_inclusive('\n')
+                            .collect();
+                        let max = dumped.len().max(expected_split.len());
+                        for k in 0..max {
+                            let got = dumped.get(k).map(|d| d.text.as_str()).unwrap_or("<MISSING>");
+                            let want = expected_split.get(k).copied().unwrap_or("<MISSING>");
+                            if got != want {
+                                let vertex_info = dumped
+                                    .get(k)
+                                    .map(|d| {
+                                        format!("branch={:?} {} {}", d.branch_id, d.after, d.vertex)
+                                    })
+                                    .unwrap_or_else(|| "<NO BRANCH>".to_string());
+                                eprintln!(
+                                    "  LINE {}: got={:?} want={:?} | {}",
+                                    k + 1, got, want, vertex_info
+                                );
+                                print_dump_context(&dumped, &expected_split, k);
+                            }
+                        }
+                        eprintln!("=== END DUMP ===\n");
+                    }
+                }
+
+                eprintln!(
+                    "CRDT AUDIT commit {} ({}): expected_lines={} expected_bytes={} branches={} alive={} deleted={} missing_rows={} \
+                     | alive_with_vertex={} alive_phantom_no_vertex={} alive_phantom_zero_range={} \
+                     | total_alive_bytes={} multi_line_branches={} max_branch_bytes={} \
+                     | duplicate_vertices={} duplicate_extra_bytes={}",
+                    i + 1,
+                    commits[i],
+                    expected_lines.len(),
+                    version.len(),
+                    branch_keys.len(),
+                    alive_branch_count,
+                    deleted_branch_count,
+                    missing_branch_rows,
+                    alive_with_vertex,
+                    alive_phantom_no_vertex,
+                    alive_phantom_zero_range,
+                    total_alive_bytes,
+                    alive_multi_line,
+                    max_branch_bytes,
+                    duplicate_vertices,
+                    duplicate_extra_bytes,
+                );
+            }
+        }
+
+        drop(txn);
+    }
+
+    // Final pass: this test is currently DIAGNOSTIC — its job is to
+    // surface gaps in CRDT population so we can prioritise fixing them.
+    // We deliberately do NOT assert exact equality yet; the eprintln!
+    // output is what reviewers should consult.
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -494,9 +833,13 @@ fn test_hyperfine_extended_commit_sequence() {
         let _ = record_change(&repo, &format!("Commit {} ({})", i + 2, sha));
 
         let content = repo
-            .get_file_content_on_view("src/main.rs", repo.current_view())
+            .get_file_content_via_crdt("src/main.rs")
             .unwrap()
             .unwrap();
+
+        if content != *version {
+            dump_crdt_line_mismatches(&repo, "src/main.rs", version);
+        }
 
         assert_eq!(
             content.len(),
@@ -602,7 +945,7 @@ fn test_hyperfine_pairwise_transitions() {
         let _ = record_change(&repo, &format!("before: {}", before_sha));
 
         let content = repo
-            .get_file_content_on_view("src/main.rs", repo.current_view())
+            .get_file_content_via_crdt("src/main.rs")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -620,7 +963,7 @@ fn test_hyperfine_pairwise_transitions() {
         let _ = record_change(&repo, &format!("after: {}", after_sha));
 
         let content = repo
-            .get_file_content_on_view("src/main.rs", repo.current_view())
+            .get_file_content_via_crdt("src/main.rs")
             .unwrap()
             .unwrap();
 
@@ -1036,4 +1379,512 @@ fn main() {
     write_file(&repo_path, "src/main.rs", v4);
     let _h4 = record_change(&repo, "close stdin for child processes");
     assert_content_matches(&repo, "src/main.rs", v4);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CRDT-driven output walker (output_file_via_crdt)
+//
+// Exercises the walker that reads file content by following the CRDT
+// Trunk → Branch chain, fetching bytes from each branch's BRANCH_VERTEX.
+// Independent of the linear byte-graph walker, so its correctness depends
+// only on (a) iter_trunk_branches_in_file_order's file order, (b) BRANCH_VERTEX
+// being kept current across Insert/Modify, and (c) branch.state turnover.
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn crdt_output(repo: &Repository, path: &str) -> Vec<u8> {
+    let txn = repo.pristine().read_txn().expect("read_txn");
+    atomic_core::output::crdt::output_file_via_crdt(&txn, repo.change_store(), path)
+        .expect("output_file_via_crdt")
+}
+
+fn hyperfine_fixture_versions() -> [(&'static str, &'static [u8]); 4] {
+    [
+        (
+            "a658ab8c",
+            include_bytes!("fixtures/hyperfine/a658ab8c_main.rs"),
+        ),
+        (
+            "d4ebdd7b",
+            include_bytes!("fixtures/hyperfine/d4ebdd7b_main.rs"),
+        ),
+        (
+            "197f9fb",
+            include_bytes!("fixtures/hyperfine/197f9fb_main.rs"),
+        ),
+        (
+            "68fdc2c",
+            include_bytes!("fixtures/hyperfine/68fdc2c_main.rs"),
+        ),
+    ]
+}
+
+#[derive(Clone)]
+struct DumpedBranchLine {
+    branch_id: atomic_core::crdt::BranchId,
+    after: String,
+    vertex: String,
+    text: String,
+}
+
+fn format_branch_after<T: atomic_core::pristine::CrdtTxnT>(
+    txn: &T,
+    branch_key: &[u8; 12],
+) -> String {
+    use atomic_core::crdt::tables::decode_branch_id;
+
+    match txn.get_crdt_branch_after(branch_key) {
+        Ok(Some(after)) if after == [0u8; 12] => "after=<START>".to_string(),
+        Ok(Some(after)) => format!("after={:?}", decode_branch_id(&after)),
+        Ok(None) => "after=<MISSING>".to_string(),
+        Err(e) => format!("after=<ERR:{}>", e),
+    }
+}
+
+fn collect_alive_branch_dump<
+    T: atomic_core::pristine::CrdtTxnT + atomic_core::pristine::GraphTxnT,
+>(
+    repo: &Repository,
+    txn: &T,
+    trunk_id: atomic_core::crdt::TrunkId,
+) -> Vec<DumpedBranchLine> {
+    use atomic_core::change::ChangeStore;
+    use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
+    use atomic_core::crdt::tables::encode_branch_id;
+
+    let ordered = iter_trunk_branches_in_file_order(txn, trunk_id)
+        .expect("ordered branch walk for dump");
+    let mut dumped = Vec::new();
+
+    for branch_id in ordered {
+        let branch_key = encode_branch_id(&branch_id);
+        let alive = matches!(
+            txn.get_crdt_branch(&branch_key),
+            Ok(Some(b)) if b.state.is_alive()
+        );
+        if !alive {
+            continue;
+        }
+
+        let after = format_branch_after(txn, &branch_key);
+        let branch_vertex = txn
+            .get_crdt_branch_vertex(&branch_key)
+            .expect("branch vertex for dump");
+
+        match branch_vertex {
+            None => dumped.push(DumpedBranchLine {
+                branch_id,
+                after,
+                vertex: "vertex=<MISSING>".to_string(),
+                text: "<MISSING VERTEX>".to_string(),
+            }),
+            Some(gn) => {
+                let len = gn.end.get().saturating_sub(gn.start.get()) as usize;
+                let vertex = format!(
+                    "vertex=(change={:?} start={} end={})",
+                    gn.change,
+                    gn.start.get(),
+                    gn.end.get()
+                );
+                if len == 0 {
+                    dumped.push(DumpedBranchLine {
+                        branch_id,
+                        after,
+                        vertex,
+                        text: "<ZERO RANGE>".to_string(),
+                    });
+                    continue;
+                }
+
+                let hash_fn = |id: atomic_core::types::NodeId| -> Option<atomic_core::types::Hash> {
+                    if id.is_root() {
+                        None
+                    } else {
+                        txn.get_external(id).ok().flatten()
+                    }
+                };
+                let mut buf = vec![0u8; len];
+                repo.change_store()
+                    .get_contents(hash_fn, gn, &mut buf)
+                    .expect("load branch bytes for dump");
+
+                dumped.push(DumpedBranchLine {
+                    branch_id,
+                    after,
+                    vertex,
+                    text: String::from_utf8_lossy(&buf).to_string(),
+                });
+            }
+        }
+    }
+
+    dumped
+}
+
+fn print_dump_context(
+    dumped: &[DumpedBranchLine],
+    expected_lines: &[&str],
+    center: usize,
+) {
+    let start = center.saturating_sub(2);
+    let end = (center + 3).min(dumped.len().max(expected_lines.len()));
+    for idx in start..end {
+        let got = dumped.get(idx).map(|d| d.text.as_str()).unwrap_or("<MISSING>");
+        let want = expected_lines.get(idx).copied().unwrap_or("<MISSING>");
+        let meta = dumped
+            .get(idx)
+            .map(|d| format!("branch={:?} {} {}", d.branch_id, d.after, d.vertex))
+            .unwrap_or_else(|| "<NO BRANCH>".to_string());
+        eprintln!("    [{}] got={:?} want={:?} | {}", idx + 1, got, want, meta);
+    }
+}
+
+fn dump_crdt_line_mismatches(repo: &Repository, path: &str, expected: &[u8]) {
+    use atomic_core::crdt::tables::{decode_trunk_id, encode_trunk_id};
+    use atomic_core::pristine::CrdtTxnT;
+
+    let Some((inode, _)) = repo
+        .get_inode_and_position(path)
+        .expect("inode lookup for dump")
+    else {
+        eprintln!("No inode for {}", path);
+        return;
+    };
+
+    let txn = repo.pristine().read_txn().expect("read_txn for dump");
+    let trunk_key = match txn
+        .get_crdt_inode_trunk(inode.get())
+        .expect("inode->trunk lookup for dump")
+    {
+        Some(key) => key,
+        None => match txn.get_trunk_by_path(path).expect("path->trunk lookup for dump") {
+            Some(trunk_id) => encode_trunk_id(&trunk_id),
+            None => {
+                eprintln!("No trunk for {}", path);
+                return;
+            }
+        },
+    };
+
+    let trunk_id = decode_trunk_id(&trunk_key);
+    let dumped = collect_alive_branch_dump(repo, &txn, trunk_id);
+
+    let expected_lines: Vec<&str> = std::str::from_utf8(expected)
+        .expect("expected fixture utf8")
+        .split_inclusive('\n')
+        .collect();
+
+    eprintln!("=== CRDT LINE DUMP {} ===", path);
+    let max = dumped.len().max(expected_lines.len());
+    for idx in 0..max {
+        let got = dumped.get(idx).map(|d| d.text.as_str()).unwrap_or("<MISSING>");
+        let want = expected_lines.get(idx).copied().unwrap_or("<MISSING>");
+        if got != want {
+            let meta = dumped
+                .get(idx)
+                .map(|d| format!("branch={:?} {} {}", d.branch_id, d.after, d.vertex))
+                .unwrap_or_else(|| "<NO BRANCH>".to_string());
+            eprintln!("LINE {}:", idx + 1);
+            eprintln!("  got : {:?}", got);
+            eprintln!("  want: {:?}", want);
+            eprintln!("  {}", meta);
+            eprintln!("  context:");
+            print_dump_context(&dumped, &expected_lines, idx);
+        }
+    }
+    eprintln!("=== END CRDT LINE DUMP ===");
+}
+
+#[test]
+fn test_crdt_walker_simple_add() {
+    let (repo, _temp, repo_path) = create_test_repo();
+
+    let v1 = "alpha\nbeta\ngamma\n";
+    write_file(&repo_path, "data.txt", v1);
+    repo.add("data.txt", Default::default()).unwrap();
+    record_change(&repo, "add");
+
+    let got = crdt_output(&repo, "data.txt");
+    assert_eq!(
+        String::from_utf8_lossy(&got),
+        v1,
+        "CRDT walker output mismatch after FileAdd"
+    );
+}
+
+#[test]
+fn test_crdt_walker_after_modify() {
+    let (repo, _temp, repo_path) = create_test_repo();
+
+    let v1 = "alpha\nbeta\ngamma\n";
+    let v2 = "alpha\nBETA\ngamma\n"; // one-line Modify
+
+    write_file(&repo_path, "data.txt", v1);
+    repo.add("data.txt", Default::default()).unwrap();
+    record_change(&repo, "add");
+
+    write_file(&repo_path, "data.txt", v2);
+    record_change(&repo, "modify");
+
+    let got = crdt_output(&repo, "data.txt");
+    assert_eq!(
+        String::from_utf8_lossy(&got),
+        v2,
+        "CRDT walker output mismatch after Modify — \
+         BRANCH_VERTEX for the modified line should point at the new content"
+    );
+}
+
+#[test]
+fn test_crdt_walker_after_insert() {
+    let (repo, _temp, repo_path) = create_test_repo();
+
+    let v1 = "alpha\nbeta\ngamma\n";
+    let v2 = "alpha\nbeta\nDELTA\ngamma\n"; // insert in the middle
+
+    write_file(&repo_path, "data.txt", v1);
+    repo.add("data.txt", Default::default()).unwrap();
+    record_change(&repo, "add");
+
+    write_file(&repo_path, "data.txt", v2);
+    record_change(&repo, "insert delta");
+
+    let got = crdt_output(&repo, "data.txt");
+    assert_eq!(
+        String::from_utf8_lossy(&got),
+        v2,
+        "CRDT walker output mismatch after mid-file Insert — \
+         the new branch must order after `beta` and before `gamma`"
+    );
+}
+
+#[test]
+fn test_crdt_walker_after_delete() {
+    let (repo, _temp, repo_path) = create_test_repo();
+
+    let v1 = "alpha\nbeta\ngamma\ndelta\n";
+    let v2 = "alpha\ngamma\ndelta\n"; // delete `beta`
+
+    write_file(&repo_path, "data.txt", v1);
+    repo.add("data.txt", Default::default()).unwrap();
+    record_change(&repo, "add");
+
+    write_file(&repo_path, "data.txt", v2);
+    record_change(&repo, "delete beta");
+
+    let got = crdt_output(&repo, "data.txt");
+    assert_eq!(
+        String::from_utf8_lossy(&got),
+        v2,
+        "CRDT walker output mismatch after Delete — \
+         the deleted branch must be filtered out by branch.state"
+    );
+}
+
+#[test]
+fn test_crdt_walker_prepend_in_second_commit() {
+    // Load-bearing test for iter_trunk_branches_in_file_order: a later
+    // commit prepending a line must show up at the *top*, not after all
+    // of commit 1's branches (which is what plain BranchId sort would do).
+    let (repo, _temp, repo_path) = create_test_repo();
+
+    let v1 = "second\nthird\n";
+    let v2 = "first\nsecond\nthird\n";
+
+    write_file(&repo_path, "data.txt", v1);
+    repo.add("data.txt", Default::default()).unwrap();
+    record_change(&repo, "add");
+
+    write_file(&repo_path, "data.txt", v2);
+    record_change(&repo, "prepend first");
+
+    let got = crdt_output(&repo, "data.txt");
+    assert_eq!(
+        String::from_utf8_lossy(&got),
+        v2,
+        "CRDT walker mis-ordered the prepended line"
+    );
+}
+
+#[test]
+fn test_crdt_walker_modify_then_insert_below() {
+    // Pattern that often appears in real diffs: modify one line, then
+    // insert a new line below it.  Verifies the CRDT walker can handle
+    // a mix of Modify + Insert chained correctly.
+    let (repo, _temp, repo_path) = create_test_repo();
+
+    let v1 = "alpha\nbeta\ngamma\n";
+    let v2 = "alpha\nBETA\nNEW\ngamma\n"; // modify beta + insert NEW
+
+    write_file(&repo_path, "data.txt", v1);
+    repo.add("data.txt", Default::default()).unwrap();
+    record_change(&repo, "add");
+
+    write_file(&repo_path, "data.txt", v2);
+    record_change(&repo, "modify + insert");
+
+    let got = crdt_output(&repo, "data.txt");
+    assert_eq!(String::from_utf8_lossy(&got), v2);
+}
+
+#[test]
+fn test_crdt_walker_two_separate_modifies() {
+    // Two non-adjacent Modify operations in a single commit.  The
+    // consolidation pass pairs Delete+Insert across the whole diff list,
+    // so this catches placeholder-after-ref breakage when the pairing
+    // isn't 1:1 with positional order.
+    let (repo, _temp, repo_path) = create_test_repo();
+
+    let v1 = "alpha\nbeta\ngamma\ndelta\nepsilon\n";
+    let v2 = "alpha\nBETA\ngamma\nDELTA\nepsilon\n";
+
+    write_file(&repo_path, "data.txt", v1);
+    repo.add("data.txt", Default::default()).unwrap();
+    record_change(&repo, "add");
+
+    write_file(&repo_path, "data.txt", v2);
+    record_change(&repo, "two modifies");
+
+    let got = crdt_output(&repo, "data.txt");
+    assert_eq!(String::from_utf8_lossy(&got), v2);
+}
+
+#[test]
+fn test_crdt_walker_modify_in_block_with_insert_after_block() {
+    // Replace block (modify several lines) followed by a separate Insert.
+    // Tests that the placeholder rewrite handles the chain across blocks.
+    let (repo, _temp, repo_path) = create_test_repo();
+
+    let v1 = "a\nb\nc\nd\ne\n";
+    let v2 = "a\nB\nC\nd\nNEW\ne\n";
+
+    write_file(&repo_path, "data.txt", v1);
+    repo.add("data.txt", Default::default()).unwrap();
+    record_change(&repo, "add");
+
+    write_file(&repo_path, "data.txt", v2);
+    record_change(&repo, "block-modify + insert");
+
+    let got = crdt_output(&repo, "data.txt");
+    assert_eq!(String::from_utf8_lossy(&got), v2);
+}
+
+#[test]
+fn test_crdt_walker_unknown_file_returns_empty() {
+    let (repo, _temp, _repo_path) = create_test_repo();
+    let got = crdt_output(&repo, "nonexistent.txt");
+    assert!(got.is_empty());
+}
+
+// Tracking regression for task #24 (CRDT-first record line ordering).
+//
+// The walker is correct (see the surrounding focused walker tests); the
+// failure surfaces a record-side problem: cross-block Delete/Insert
+// consolidation in `build_crdt_ops_for_modified_file` promotes pairs to
+// Modifies that reuse an existing branch's after-chain position while
+// substituting content from a different line position.  The walker
+// emits the modified content at the original branch's place in file
+// order — which is wrong for cross-block pairings.
+//
+// The fix is to stop diff-then-pair and instead emit BranchOps that
+// directly reflect the new file's line order against existing CRDT
+// state.  Not ignored — we want the failure visible until #24 lands.
+#[test]
+fn test_crdt_walker_hyperfine_sequence_byte_exact() {
+    // End-to-end correctness for the CRDT-driven walker against the exact
+    // commit sequence that exposed the byte-graph linear-walker bug.  If
+    // this passes, task #24 (wiring the walker into `get_file_content`)
+    // is just plumbing.
+    use std::process::Command;
+
+    let git_temp = TempDir::new().expect("temp dir");
+    let git_path = git_temp.path().to_path_buf();
+    let clone_status = Command::new("git")
+        .args([
+            "clone",
+            "--quiet",
+            "https://github.com/sharkdp/hyperfine.git",
+        ])
+        .arg(&git_path)
+        .status();
+    match clone_status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("Skipping test: git clone failed (no network?)");
+            return;
+        }
+    }
+
+    let commits: Vec<&str> = vec!["a658ab8c", "d4ebdd7b", "197f9fb", "68fdc2c"];
+    let mut versions: Vec<Vec<u8>> = Vec::new();
+    for sha in &commits {
+        let output = Command::new("git")
+            .args(["show", &format!("{}:src/main.rs", sha)])
+            .current_dir(&git_path)
+            .output()
+            .expect("git show");
+        assert!(output.status.success(), "git show failed for {}", sha);
+        versions.push(output.stdout);
+    }
+
+    let (repo, _temp, repo_path) = create_test_repo();
+
+    write_file(&repo_path, "src/main.rs", &String::from_utf8_lossy(&versions[0]));
+    repo.add("src/main.rs", Default::default()).unwrap();
+    record_change(&repo, "Initial commit");
+    let got = crdt_output(&repo, "src/main.rs");
+    assert_eq!(
+        got, versions[0],
+        "CRDT walker mismatch at commit 1 ({}): {} bytes vs expected {}",
+        commits[0], got.len(), versions[0].len()
+    );
+
+    for (i, version) in versions.iter().enumerate().skip(1) {
+        write_file(&repo_path, "src/main.rs", &String::from_utf8_lossy(version));
+        record_change(&repo, &format!("Commit {}", i + 1));
+        let got = crdt_output(&repo, "src/main.rs");
+        assert_eq!(
+            got, *version,
+            "CRDT walker mismatch at commit {} ({}): {} bytes vs expected {}",
+            i + 1, commits[i], got.len(), version.len()
+        );
+    }
+}
+
+#[test]
+fn test_crdt_walker_hyperfine_sequence_offline_fixture() {
+    let versions = hyperfine_fixture_versions();
+    let (repo, _temp, repo_path) = create_test_repo();
+
+    write_file(
+        &repo_path,
+        "src/main.rs",
+        &String::from_utf8_lossy(versions[0].1),
+    );
+    repo.add("src/main.rs", Default::default()).unwrap();
+    record_change(&repo, "Initial commit");
+
+    let got = crdt_output(&repo, "src/main.rs");
+    assert_eq!(
+        got, versions[0].1,
+        "CRDT walker mismatch at commit 1 ({})",
+        versions[0].0
+    );
+
+    for (i, (sha, version)) in versions.iter().enumerate().skip(1) {
+        write_file(&repo_path, "src/main.rs", &String::from_utf8_lossy(version));
+        record_change(&repo, &format!("Commit {}", i + 1));
+
+        let got = crdt_output(&repo, "src/main.rs");
+        if got != *version {
+            dump_crdt_line_mismatches(&repo, "src/main.rs", version);
+        }
+        assert_eq!(
+            got, *version,
+            "CRDT walker mismatch at commit {} ({}): {} bytes vs expected {}",
+            i + 1,
+            sha,
+            got.len(),
+            version.len()
+        );
+    }
 }

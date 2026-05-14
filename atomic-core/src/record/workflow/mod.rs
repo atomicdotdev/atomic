@@ -115,6 +115,7 @@ pub mod detect;
 pub mod globalize;
 pub mod graph_op;
 pub mod options;
+pub mod recipes;
 pub mod record;
 pub mod retrieve;
 

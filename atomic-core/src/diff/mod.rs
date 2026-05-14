@@ -416,29 +416,14 @@ fn lines_are_similar(old: &[u8], new: &[u8]) -> bool {
     matching * 100 / max_words > 30
 }
 
-/// Find the length of common prefix and suffix between two sequences.
-///
-/// This optimization significantly speeds up diffing when changes are
-/// localized to a small portion of the file.
-///
-/// # Suffix Limiting
-///
-/// The suffix is reduced if stripping it would leave one middle section
-/// empty while the other still has content. In that case, the diff
-/// algorithm would see only insertions or deletions, missing modifications.
-///
-/// Example: old = `[A, B]`, new = `[A, C, B]`
-///   - prefix = 1 (`A`), naive suffix = 1 (`B`)
-///   - old_mid = `[]`, new_mid = `[C]` → empty vs non-empty
-///   - Reduced suffix = 0 → old_mid = `[B]`, new_mid = `[C, B]`
-///   - Now the diff algorithm can detect `B` → `C` as a Replace
-///     followed by an Insert of `B`
 /// Strict common-affix detection: returns the maximal common prefix and
 /// suffix without any reduction.
 ///
 /// Used by the record path so that pure insertions stay as pure
 /// insertions in the produced diff (which the graph layer then maps to
-/// targeted vertex operations).
+/// targeted vertex operations). The relaxed sibling
+/// [`common_affixes`] applies a suffix-limiting heuristic that's useful
+/// for the display path but corrupts patch-theory semantics.
 fn common_affixes_strict<T: PartialEq>(old: &[T], new: &[T]) -> (usize, usize) {
     let prefix_len = old
         .iter()
@@ -461,6 +446,28 @@ fn common_affixes_strict<T: PartialEq>(old: &[T], new: &[T]) -> (usize, usize) {
     (prefix_len, suffix_len)
 }
 
+/// Find the length of common prefix and suffix between two sequences,
+/// applying the **suffix-limiting heuristic** used by the display path.
+///
+/// This optimization significantly speeds up diffing when changes are
+/// localized to a small portion of the file.
+///
+/// # Suffix Limiting
+///
+/// The suffix is reduced if stripping it would leave one middle section
+/// empty while the other still has content. In that case, the diff
+/// algorithm would see only insertions or deletions, missing modifications.
+///
+/// Example: old = `[A, B]`, new = `[A, C, B]`
+/// - prefix = 1 (`A`), naive suffix = 1 (`B`)
+/// - old_mid = `[]`, new_mid = `[C]` → empty vs non-empty
+/// - Reduced suffix = 0 → old_mid = `[B]`, new_mid = `[C, B]`
+/// - Now the diff algorithm can detect `B` → `C` as a Replace followed
+///   by an Insert of `B`
+///
+/// The record path uses [`common_affixes_strict`] instead — that
+/// heuristic is helpful for displaying diffs to users but corrupts
+/// patch-theory graph semantics.
 fn common_affixes<T: PartialEq>(old: &[T], new: &[T]) -> (usize, usize) {
     // Common prefix
     let prefix_len = old

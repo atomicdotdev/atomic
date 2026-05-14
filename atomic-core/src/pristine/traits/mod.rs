@@ -22,6 +22,7 @@
 //!                (Base trait)
 //! ```
 
+mod crdt_read;
 mod embeddings;
 mod graph;
 mod mutate;
@@ -34,6 +35,7 @@ mod view;
 #[cfg(test)]
 mod tests;
 
+pub use crdt_read::CrdtTxnT;
 pub use embeddings::{EmbeddingsMutTxnT, EmbeddingsTxnT};
 pub use graph::GraphTxnT;
 pub use mutate::MutTxnT;
