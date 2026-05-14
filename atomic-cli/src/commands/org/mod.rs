@@ -249,6 +249,7 @@ mod tests {
 
         let set = set::OrgSet {
             slug: "test".to_string(),
+            no_verify: false,
         };
         assert_eq!(check_variant(&OrgCommands::Set(set)), "set");
     }

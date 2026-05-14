@@ -5,10 +5,14 @@
 //! updates that map for the current default org, or for an explicit org
 //! passed via `--org`.
 //!
+//! The slug is validated against the server before being written to
+//! config — typos fail immediately instead of surfacing as confusing
+//! 404s on the next `project create / list / init`.
+//!
 //! # Usage
 //!
 //! ```text
-//! atomic workspace set <SLUG> [--org <ORG>]
+//! atomic workspace set <SLUG> [--org <ORG>] [--no-verify]
 //!
 //! Arguments:
 //!   <SLUG>  Workspace slug to set as the default for the target org
@@ -16,26 +20,34 @@
 //! Options:
 //!       --org <ORG>  Set the default workspace for this org instead
 //!                    of the current default org
+//!       --no-verify  Skip server-side slug validation (advanced)
 //!   -h, --help       Print help information
 //! ```
 //!
 //! # Examples
 //!
 //! ```text
-//! # Set default workspace for the current org
+//! # Set default workspace for the current org (validated against the server)
 //! $ atomic workspace set backend
 //! ✓ Default workspace for 'acme' set to: backend
 //!
-//! # Set default workspace for a different org (does not change current org)
+//! # Typo: fails before any config change
+//! $ atomic workspace set backendz
+//! ✗ Workspace 'backendz' not found in org 'acme'.
+//!
+//! # Set default workspace for a different org
 //! $ atomic workspace set personal --org alice
-//! ✓ Default workspace for 'alice' set to: personal
-//!   (current default org is 'acme' — run 'atomic org set alice' to use it)
+//!
+//! # Skip validation (e.g. pre-configuring before the workspace exists)
+//! $ atomic workspace set new-ws --no-verify
 //! ```
 
 use clap::Parser;
 
 use atomic_config::GlobalConfig;
+use atomic_remote::RemoteError;
 
+use crate::commands::client::build_client_with_org;
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success};
@@ -46,9 +58,8 @@ use crate::output::{print_hint, print_success};
 /// All subsequent commands that take an optional `--workspace` parameter
 /// fall back to this slug for the target org.
 ///
-/// This command does **not** validate that the slug exists on the server.
-/// If the slug is invalid, subsequent commands will fail with a "not found"
-/// error. This matches the behavior of `atomic org set`.
+/// Validates the slug against the server before saving. Pass `--no-verify`
+/// to skip the network round-trip.
 #[derive(Debug, Parser, Default)]
 #[command(name = "set")]
 pub struct WorkspaceSet {
@@ -66,6 +77,13 @@ pub struct WorkspaceSet {
     /// are not currently using as the default.
     #[arg(long, value_name = "ORG")]
     pub org: Option<String>,
+
+    /// Skip server-side slug validation.
+    ///
+    /// Useful for pre-configuring a workspace slug before the workspace
+    /// exists on the server, or for offline workflows.
+    #[arg(long)]
+    pub no_verify: bool,
 }
 
 impl Command for WorkspaceSet {
@@ -80,9 +98,10 @@ impl Command for WorkspaceSet {
             CliError::Internal(anyhow::anyhow!("Failed to load global config: {e}"))
         })?;
 
-        // Determine the target org. Explicit --org wins; otherwise fall back
-        // to the configured default. We don't go through `resolve_org` here
-        // because we want a distinct error message tied to *this* command.
+        // Determine the target org. Explicit --org wins; otherwise fall
+        // back to the configured default. We don't go through `resolve_org`
+        // here because we want a distinct error message tied to *this*
+        // command's flow.
         let target_org = match self.org.as_deref() {
             Some(o) if !o.is_empty() => o.to_string(),
             Some(_) => {
@@ -100,6 +119,12 @@ impl Command for WorkspaceSet {
                         .to_string(),
                 })?,
         };
+
+        // Validate against the server first so a bad slug fails fast
+        // rather than producing confusing 404s on subsequent commands.
+        if !self.no_verify {
+            verify_workspace_exists(&target_org, &self.slug)?;
+        }
 
         let previous = config
             .server
@@ -136,6 +161,37 @@ impl Command for WorkspaceSet {
     }
 }
 
+/// Confirm the workspace slug resolves on the server under the target org.
+///
+/// 404s surface as a clean slug-specific message; other failures (network,
+/// auth, wrong org) bubble through so the user can distinguish problems.
+fn verify_workspace_exists(org_slug: &str, workspace_slug: &str) -> CliResult<()> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {e}")))?;
+
+    rt.block_on(async {
+        let (client, _resolved) = build_client_with_org(Some(org_slug))?;
+        match client.get_workspace(workspace_slug).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.is_not_found() => Err(CliError::InvalidArgument {
+                message: format!(
+                    "Workspace '{workspace_slug}' not found in org '{org_slug}'.\n  \
+                     Check the slug with: atomic workspace list --org {org_slug}\n  \
+                     Or pass --no-verify to set the value without checking."
+                ),
+            }),
+            Err(e) => Err(map_remote(e)),
+        }
+    })
+}
+
+fn map_remote(e: RemoteError) -> CliError {
+    CliError::RemoteError {
+        message: e.to_string(),
+        url: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,13 +201,14 @@ mod tests {
         let cmd = WorkspaceSet {
             slug: "".to_string(),
             org: None,
+            no_verify: true, // skip network so the empty-slug check is the only failure
         };
         let err = cmd.run().unwrap_err();
         match err {
             CliError::InvalidArgument { message } => {
                 assert!(message.contains("cannot be empty"));
             }
-            other => panic!("expected InvalidArgument, got {:?}", other),
+            other => panic!("expected InvalidArgument, got {other:?}"),
         }
     }
 
@@ -160,6 +217,7 @@ mod tests {
         let cmd = WorkspaceSet {
             slug: "backend".to_string(),
             org: Some("".to_string()),
+            no_verify: true,
         };
         let err = cmd.run().unwrap_err();
         match err {
@@ -167,7 +225,7 @@ mod tests {
                 assert!(message.contains("Organization"));
                 assert!(message.contains("empty"));
             }
-            other => panic!("expected InvalidArgument, got {:?}", other),
+            other => panic!("expected InvalidArgument, got {other:?}"),
         }
     }
 
@@ -176,8 +234,10 @@ mod tests {
         let cmd = WorkspaceSet {
             slug: "backend".to_string(),
             org: Some("acme".to_string()),
+            no_verify: false,
         };
         assert_eq!(cmd.slug, "backend");
         assert_eq!(cmd.org.as_deref(), Some("acme"));
+        assert!(!cmd.no_verify);
     }
 }
