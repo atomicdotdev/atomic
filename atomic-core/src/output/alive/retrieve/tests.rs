@@ -148,10 +148,14 @@ fn test_is_edge_alive_with_filter_deleted_by_outside_change() {
     filter.insert(NodeId::new(1));
     let opts = RetrieveOptions::new().with_change_filter(filter);
 
-    // Deletion introduced by change 2 which is NOT in our filter
-    // → deletion "hasn't happened yet" from our perspective → alive
+    // A `BlockDeleted` edge is NEVER alive as a forward edge — its only
+    // role is to flag the original Block edge as deleted (handled via the
+    // parent-side check in `is_vertex_alive`).  Even when the deletion's
+    // introducer is outside our filter, we still don't follow it as a
+    // Block edge: reachability to the destination is provided by the
+    // original (separate) Block edge entry.
     let edge = make_forward_edge(EdgeKind::BlockDeleted, 2);
-    assert!(opts.is_edge_alive(&edge));
+    assert!(!opts.is_edge_alive(&edge));
 }
 
 #[test]
@@ -160,8 +164,9 @@ fn test_is_edge_alive_with_filter_folder_deleted_by_outside_change() {
     filter.insert(NodeId::new(1));
     let opts = RetrieveOptions::new().with_change_filter(filter);
 
+    // Same rationale as the BlockDeleted case above.
     let edge = make_forward_edge(EdgeKind::FolderDeleted, 2);
-    assert!(opts.is_edge_alive(&edge));
+    assert!(!opts.is_edge_alive(&edge));
 }
 
 #[test]

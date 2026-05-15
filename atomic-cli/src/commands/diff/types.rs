@@ -294,7 +294,7 @@ impl Default for DiffOutputConfig {
             color: true,
             format: DiffFormat::Unified,
             stat_width: 80,
-            show_line_numbers: true,
+            show_line_numbers: false,
             show_path_prefix: true,
             word_diff: false,
         }

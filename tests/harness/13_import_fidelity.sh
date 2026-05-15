@@ -18,6 +18,31 @@
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
 
+assert_import_clean_with_bootstrap() {
+    local desc="$1"
+    local out
+    out="$(get_status_short)"
+
+    local unexpected=""
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
+        # Ignore the repository bootstrap artifacts materialized by `atomic init`.
+        case "$line" in
+            \?*\ .atomicignore) continue ;;
+            \?*\ .vault/*) continue ;;
+        esac
+
+        unexpected+="${line}"$'\n'
+    done <<< "$out"
+
+    if [[ -z "$unexpected" ]]; then
+        _pass "$desc"
+    else
+        _fail "$desc" "unexpected status entries: $(printf '%s' "$unexpected" | head -10)"
+    fi
+}
+
 echo ""
 echo "${BOLD}══════════════════════════════════════════════════════════════${RESET}"
 echo "${BOLD}  Suite: 13_import_fidelity${RESET}"
@@ -52,7 +77,7 @@ atomic init >/dev/null 2>&1
 assert_success "import succeeds" atomic git import
 
 # Verify deleted files are gone from atomic
-assert_clean "working tree clean after import"
+assert_import_clean_with_bootstrap "working tree clean after import"
 
 # Double-check: atomic diff should show nothing
 diff_out="$(atomic diff 2>/dev/null || true)"
@@ -85,7 +110,7 @@ git commit --quiet -m "Remove odd files"
 
 atomic init >/dev/null 2>&1
 assert_success "import bulk deletion succeeds" atomic git import
-assert_clean "clean after bulk deletion import"
+assert_import_clean_with_bootstrap "clean after bulk deletion import"
 
 assert_file_not_exists "file1 deleted" "dir/file1.txt"
 assert_file_exists     "file2 survives" "dir/file2.txt"
@@ -110,7 +135,7 @@ git commit --quiet -m "Add binary image"
 
 atomic init >/dev/null 2>&1
 assert_success "import with binary add succeeds" atomic git import
-assert_clean "clean after binary add import"
+assert_import_clean_with_bootstrap "clean after binary add import"
 
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -135,7 +160,7 @@ git commit --quiet -m "Update binary image"
 
 atomic init >/dev/null 2>&1
 assert_success "import with binary modification succeeds" atomic git import
-assert_clean "clean after binary modification import"
+assert_import_clean_with_bootstrap "clean after binary modification import"
 
 # Also verify diff shows nothing
 diff_out="$(atomic diff 2>/dev/null || true)"
@@ -169,7 +194,7 @@ final_size=$(wc -c < icon.png | tr -d ' ')
 
 atomic init >/dev/null 2>&1
 assert_success "import with multiple binary mods succeeds" atomic git import
-assert_clean "clean after multiple binary modifications"
+assert_import_clean_with_bootstrap "clean after multiple binary modifications"
 
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -188,7 +213,7 @@ git commit --quiet -m "Remove logo"
 
 atomic init >/dev/null 2>&1
 assert_success "import with binary deletion succeeds" atomic git import
-assert_clean "clean after binary deletion"
+assert_import_clean_with_bootstrap "clean after binary deletion"
 assert_file_not_exists "logo.png deleted" "logo.png"
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -267,7 +292,7 @@ pub fn extra() {}"
 
 atomic init >/dev/null 2>&1
 assert_success "import rewrite+add succeeds" atomic git import
-assert_clean "clean after rewrite+add import"
+assert_import_clean_with_bootstrap "clean after rewrite+add import"
 
 # Both files must be tracked
 assert_file_exists "tests.rs exists" "tests.rs"
@@ -321,7 +346,7 @@ git commit --quiet -m "Add brand_new.txt"
 
 atomic init >/dev/null 2>&1
 assert_success "import rename-vs-rewrite succeeds" atomic git import
-assert_clean "clean after rename-vs-rewrite import"
+assert_import_clean_with_bootstrap "clean after rename-vs-rewrite import"
 
 assert_file_not_exists "original.txt removed" "original.txt"
 assert_file_exists     "renamed.txt exists" "renamed.txt"
@@ -415,7 +440,7 @@ deleted_files=(
 # Import
 atomic init >/dev/null 2>&1
 assert_success "stress test import succeeds" atomic git import
-assert_clean "clean after stress test import"
+assert_import_clean_with_bootstrap "clean after stress test import"
 
 # Verify expected files exist
 for f in "${expected_files[@]}"; do

@@ -1100,6 +1100,182 @@ impl EmbeddingsTxnT for ReadTxn {
     }
 }
 
+// CrdtTxnT (read accessors) implementation for ReadTxn.
+//
+// `ReadTransaction::open_table` errors with `TableError::TableDoesNotExist`
+// when the table hasn't been created yet — which on a fresh DB is the
+// common case before any CRDT writes have landed.  Each method below
+// treats that as "no data" and returns the empty answer, so callers can
+// poll for CRDT state without first checking whether the apply layer has
+// initialized the tables.
+
+/// Helper: open a redb table, mapping `TableDoesNotExist` to `Ok(None)`.
+macro_rules! crdt_table_opt {
+    ($self:ident, $tbl:expr) => {
+        match $self.txn.open_table($tbl) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+    };
+}
+
+macro_rules! crdt_multimap_opt {
+    ($self:ident, $tbl:expr, $empty:expr) => {
+        match $self.txn.open_multimap_table($tbl) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return $empty,
+            Err(e) => return Err(e.into()),
+        }
+    };
+}
+
+impl crate::pristine::traits::CrdtTxnT for ReadTxn {
+    fn get_crdt_trunk(
+        &self,
+        key: &[u8; 12],
+    ) -> PristineResult<Option<crate::crdt::tables::SerializedTrunk>> {
+        use crate::crdt::tables::{decode_trunk_value, TRUNKS};
+        let table = crdt_table_opt!(self, TRUNKS);
+        let result = match table.get(key)? {
+            Some(guard) => {
+                let bytes_copy: Vec<u8> = guard.value().to_vec();
+                decode_trunk_value(&bytes_copy)
+            }
+            None => None,
+        };
+        Ok(result)
+    }
+
+    fn get_crdt_inode_trunk(&self, inode: u64) -> PristineResult<Option<[u8; 12]>> {
+        use crate::crdt::tables::INODE_TRUNK;
+        let table = crdt_table_opt!(self, INODE_TRUNK);
+        let result = table.get(inode)?.map(|v| *v.value());
+        Ok(result)
+    }
+
+    fn get_crdt_branch(
+        &self,
+        key: &[u8; 12],
+    ) -> PristineResult<Option<crate::crdt::tables::SerializedBranch>> {
+        use crate::crdt::tables::{decode_branch_value, BRANCHES};
+        let table = crdt_table_opt!(self, BRANCHES);
+        let result = match table.get(key)? {
+            Some(guard) => {
+                let bytes: [u8; 24] = *guard.value();
+                Some(decode_branch_value(&bytes))
+            }
+            None => None,
+        };
+        Ok(result)
+    }
+
+    fn get_crdt_branch_after(&self, branch_key: &[u8; 12]) -> PristineResult<Option<[u8; 12]>> {
+        use crate::crdt::tables::BRANCH_AFTER;
+        let table = crdt_table_opt!(self, BRANCH_AFTER);
+        let result = table.get(branch_key)?.map(|v| *v.value());
+        Ok(result)
+    }
+
+    fn get_crdt_leaf(
+        &self,
+        key: &[u8; 12],
+    ) -> PristineResult<Option<crate::crdt::tables::SerializedLeaf>> {
+        use crate::crdt::tables::{decode_leaf_value, LEAVES};
+        let table = crdt_table_opt!(self, LEAVES);
+        let result = match table.get(key)? {
+            Some(guard) => {
+                let bytes: [u8; 22] = *guard.value();
+                Some(decode_leaf_value(&bytes))
+            }
+            None => None,
+        };
+        Ok(result)
+    }
+
+    fn get_trunk_by_path(&self, path: &str) -> PristineResult<Option<crate::crdt::TrunkId>> {
+        use crate::crdt::tables::{decode_trunk_id, PATH_TRUNK};
+        let table = crdt_table_opt!(self, PATH_TRUNK);
+        let result = table.get(path)?;
+        match result {
+            Some(guard) => {
+                let key: [u8; 12] = *guard.value();
+                drop(guard);
+                Ok(Some(decode_trunk_id(&key)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn iter_trunk_branches(
+        &self,
+        trunk_key: &[u8; 12],
+    ) -> PristineResult<Box<dyn Iterator<Item = Result<[u8; 12], PristineError>> + '_>> {
+        use crate::crdt::tables::TRUNK_BRANCHES;
+        let table = crdt_multimap_opt!(self, TRUNK_BRANCHES, Ok(Box::new(std::iter::empty())));
+        let mut results: Vec<Result<[u8; 12], PristineError>> = Vec::new();
+        let values = table.get(trunk_key)?;
+        for value_result in values {
+            match value_result {
+                Ok(access) => results.push(Ok(*access.value())),
+                Err(e) => results.push(Err(PristineError::Storage(Box::new(e)))),
+            }
+        }
+        Ok(Box::new(results.into_iter()))
+    }
+
+    fn iter_branch_leaves(
+        &self,
+        branch_key: &[u8; 12],
+    ) -> PristineResult<Box<dyn Iterator<Item = Result<[u8; 12], PristineError>> + '_>> {
+        use crate::crdt::tables::BRANCH_LEAVES;
+        let table = crdt_multimap_opt!(self, BRANCH_LEAVES, Ok(Box::new(std::iter::empty())));
+        let mut results: Vec<Result<[u8; 12], PristineError>> = Vec::new();
+        let values = table.get(branch_key)?;
+        for value_result in values {
+            match value_result {
+                Ok(access) => results.push(Ok(*access.value())),
+                Err(e) => results.push(Err(PristineError::Storage(Box::new(e)))),
+            }
+        }
+        Ok(Box::new(results.into_iter()))
+    }
+
+    fn get_crdt_branch_vertex(
+        &self,
+        branch_key: &[u8; 12],
+    ) -> PristineResult<Option<GraphNode<NodeId>>> {
+        use crate::crdt::tables::{decode_vertex_position, BRANCH_VERTEX};
+        let table = crdt_table_opt!(self, BRANCH_VERTEX);
+        let result = table.get(branch_key)?;
+        match result {
+            Some(value) => {
+                let bytes: [u8; 24] = *value.value();
+                drop(value);
+                Ok(Some(decode_vertex_position(&bytes)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn get_crdt_vertex_branch(
+        &self,
+        vertex_key: &[u8; 24],
+    ) -> PristineResult<Option<crate::crdt::BranchId>> {
+        use crate::crdt::tables::{decode_branch_id, VERTEX_BRANCH};
+        let table = crdt_table_opt!(self, VERTEX_BRANCH);
+        let result = table.get(vertex_key)?;
+        match result {
+            Some(value) => {
+                let bytes: [u8; 12] = *value.value();
+                drop(value);
+                Ok(Some(decode_branch_id(&bytes)))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

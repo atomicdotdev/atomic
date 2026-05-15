@@ -382,12 +382,6 @@ where
             continue;
         }
 
-        // Collect CRDT file operations (semantic layer) BEFORE globalization
-        // These provide human-readable line/token operations for diff and blame
-        if let Some(crdt_ops) = file.crdt_ops() {
-            ctx.add_file_ops(crdt_ops.clone());
-        }
-
         // Globalize the file
         log::debug!(
             "assemble_change: file {}/{} '{}' globalizing (hunks={} content_bytes={} kind={:?})",
@@ -419,6 +413,22 @@ where
                     );
                     stats.record_skip();
                     continue;
+                }
+
+                // Collect CRDT file operations (semantic layer) AFTER
+                // globalization so the LineOps carry the `content_range`
+                // that globalize's enrich pass populated.  Apply uses
+                // `content_range` to wire BRANCH_VERTEX → graph span;
+                // without it, the CRDT-driven output walker raises
+                // OrphanBranch on every line.  Falling back to
+                // `file.crdt_ops()` (pre-enrichment) preserves the legacy
+                // shape for files globalize couldn't enrich.
+                if !file.opaque_generated() {
+                    if let Some(enriched_ops) = globalized.file_ops() {
+                        ctx.add_file_ops(enriched_ops.clone());
+                    } else if let Some(crdt_ops) = file.crdt_ops() {
+                        ctx.add_file_ops(crdt_ops.clone());
+                    }
                 }
 
                 let hunk_count = globalized.hunks().len();

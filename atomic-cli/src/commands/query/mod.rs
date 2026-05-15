@@ -276,7 +276,7 @@ impl Command for QueryGraph {
 
         // 1. Seed: search the KG, filtered to allowed kinds
         let seed_nodes: Vec<KgNode> = repo
-            .vault_kg_search(&self.query, self.limit * 3) // fetch extra, then filter
+            .vault_kg_search(&self.query, self.limit * 3, None) // fetch extra, then filter
             .map_err(CliError::Repository)?
             .into_iter()
             .filter(|n| kind_allowed(&n.kind))
@@ -1023,6 +1023,15 @@ pub struct QueryNodes {
     #[arg(long, short = 't')]
     pub kind: Option<String>,
 
+    /// Candidate pool size.
+    ///
+    /// How many candidates to score before selecting the top results.
+    /// A larger pool surfaces lower-scored node kinds (e.g. changes)
+    /// that would otherwise be crowded out by files with content matches.
+    /// Default: same as --limit.
+    #[arg(long, short = 'p')]
+    pub pool: Option<usize>,
+
     /// Output as JSON.
     #[arg(long)]
     pub json: bool,
@@ -1033,15 +1042,19 @@ impl Command for QueryNodes {
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
-        // Fetch more results when filtering so we have enough after the filter
-        let fetch_limit = if self.kind.is_some() {
-            self.limit * 10
+        // When filtering by kind, we need enough candidates of that kind
+        // to survive the diversity selection.  Ask for a large pool so the
+        // heap retains many candidates, then post-filter to the target kind.
+        let (fetch_limit, pool) = if self.kind.is_some() {
+            let pool_val = self.pool.unwrap_or(5000);
+            // fetch_limit = pool so all pool candidates become results
+            (pool_val, Some(pool_val))
         } else {
-            self.limit
+            (self.limit, self.pool)
         };
 
         let all_nodes = repo
-            .vault_kg_search(&self.query, fetch_limit)
+            .vault_kg_search(&self.query, fetch_limit, pool)
             .map_err(CliError::Repository)?;
 
         let nodes: Vec<_> = if let Some(ref kind_filter) = self.kind {

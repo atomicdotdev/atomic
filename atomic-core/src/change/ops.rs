@@ -584,6 +584,7 @@ impl LineOps {
             BranchOp::Delete { content, .. } => content,
             BranchOp::Modify { new_content, .. } => new_content,
             BranchOp::Restore { .. } => &[],
+            BranchOp::Reparent { .. } => &[],
         }
     }
 
@@ -646,6 +647,10 @@ impl fmt::Display for LineOps {
                 new_content.len()
             ),
             BranchOp::Restore { .. } => "restore".to_string(),
+            BranchOp::Reparent { new_after, .. } => match new_after {
+                Some(id) => format!("reparent after {}", id),
+                None => "reparent after START".to_string(),
+            },
         };
         write!(f, "LineOps({}, {})", self.branch_id, op_type)
     }
@@ -739,6 +744,10 @@ impl FileOpsStats {
                         }
                     }
                     BranchOp::Restore { .. } => stats.lines_restored += 1,
+                    BranchOp::Reparent { .. } => {
+                        // Position-only — no content delta, doesn't count
+                        // against lines_added/deleted or tokens_*.
+                    }
                 }
             }
         }

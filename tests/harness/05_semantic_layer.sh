@@ -787,6 +787,11 @@ begin_section "Semantic: Change count matches across operations"
 make_temp_repo "sem-change-count"
 init_repo
 
+# Capture the baseline count from init (init creates 2 changes:
+# "Initialize repository" and "Initialize vault").
+baseline_log="$(atomic log 2>/dev/null || true)"
+BASE="$(echo "$baseline_log" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
+
 # Record 3 changes on dev
 for i in 1 2 3; do
     create_file "file${i}.txt" "content ${i}"
@@ -796,10 +801,11 @@ done
 
 dev_log="$(atomic log 2>/dev/null || true)"
 dev_count="$(echo "$dev_log" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
-if [[ $dev_count -eq 3 ]]; then
-    _pass "dev has exactly 3 changes"
+expected_dev=$((BASE + 3))
+if [[ $dev_count -eq $expected_dev ]]; then
+    _pass "dev has exactly $expected_dev changes (base $BASE + 3)"
 else
-    _fail "dev has exactly 3 changes" "got $dev_count"
+    _fail "dev has exactly $expected_dev changes" "got $dev_count"
 fi
 
 # Create feature from dev, add 2 more changes
@@ -815,52 +821,55 @@ done
 
 feature_log="$(atomic log 2>/dev/null || true)"
 feature_count="$(echo "$feature_log" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
-if [[ $feature_count -eq 5 ]]; then
-    _pass "feature has exactly 5 changes (3 inherited + 2 own)"
+expected_feature=$((BASE + 5))
+if [[ $feature_count -eq $expected_feature ]]; then
+    _pass "feature has exactly $expected_feature changes (base $BASE + 3 inherited + 2 own)"
 else
-    _fail "feature has exactly 5 changes" "got $feature_count"
+    _fail "feature has exactly $expected_feature changes" "got $feature_count"
 fi
 
-# Dev should still have exactly 3
+# Dev should still have exactly BASE+3
 switch_view "dev" >/dev/null 2>&1 || true
 dev_log2="$(atomic log 2>/dev/null || true)"
 dev_count2="$(echo "$dev_log2" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
-if [[ $dev_count2 -eq 3 ]]; then
-    _pass "dev still has exactly 3 changes"
+if [[ $dev_count2 -eq $expected_dev ]]; then
+    _pass "dev still has exactly $expected_dev changes"
 else
-    _fail "dev still has exactly 3 changes" "got $dev_count2"
+    _fail "dev still has exactly $expected_dev changes" "got $dev_count2"
 fi
 
-# Insert feature→dev.  Dev should now have 5.
+# Insert feature→dev.  Dev should now have BASE+5.
 insert_from_view "feature" "dev" >/dev/null 2>&1 || true
 switch_view "dev" >/dev/null 2>&1 || true
 
 dev_log3="$(atomic log 2>/dev/null || true)"
 dev_count3="$(echo "$dev_log3" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
-if [[ $dev_count3 -eq 5 ]]; then
-    _pass "dev has 5 changes after insert"
+expected_after_insert=$((BASE + 5))
+if [[ $dev_count3 -eq $expected_after_insert ]]; then
+    _pass "dev has $expected_after_insert changes after insert"
 else
-    _fail "dev has 5 changes after insert" "got $dev_count3"
+    _fail "dev has $expected_after_insert changes after insert" "got $dev_count3"
 fi
 
-# Unrecord last on dev.  Should go back to 4.
+# Unrecord last on dev.  Should go back to BASE+4.
 unrecord_last >/dev/null 2>&1 || true
 dev_log4="$(atomic log 2>/dev/null || true)"
 dev_count4="$(echo "$dev_log4" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
-if [[ $dev_count4 -eq 4 ]]; then
-    _pass "dev has 4 changes after unrecord"
+expected_after_unrecord=$((BASE + 4))
+if [[ $dev_count4 -eq $expected_after_unrecord ]]; then
+    _pass "dev has $expected_after_unrecord changes after unrecord"
 else
-    _fail "dev has 4 changes after unrecord" "got $dev_count4"
+    _fail "dev has $expected_after_unrecord changes after unrecord" "got $dev_count4"
 fi
 
-# Feature should still have 5 (unrecord was on dev)
+# Feature should still have BASE+5 (unrecord was on dev)
 switch_view "feature" >/dev/null 2>&1 || true
 feature_log2="$(atomic log 2>/dev/null || true)"
 feature_count2="$(echo "$feature_log2" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
-if [[ $feature_count2 -eq 5 ]]; then
-    _pass "feature still has 5 changes after dev unrecord"
+if [[ $feature_count2 -eq $expected_feature ]]; then
+    _pass "feature still has $expected_feature changes after dev unrecord"
 else
-    _fail "feature still has 5 changes" "got $feature_count2"
+    _fail "feature still has $expected_feature changes" "got $feature_count2"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -124,6 +124,9 @@ pub fn apply_branch_op<T: MutCrdtTxnT>(
             )
         }
         BranchOp::Restore { branch } => apply_restore(txn, context, *branch),
+        BranchOp::Reparent { branch, new_after } => {
+            apply_reparent(txn, context, *branch, *new_after)
+        }
     }
 }
 
@@ -157,6 +160,9 @@ pub fn apply_branch_op_only<T: MutCrdtTxnT>(
             apply_insert_only(txn, context, trunk_id, branch_id, Some(*branch))
         }
         BranchOp::Restore { branch } => apply_restore(txn, context, *branch),
+        BranchOp::Reparent { branch, new_after } => {
+            apply_reparent(txn, context, *branch, *new_after)
+        }
     }
 }
 
@@ -344,6 +350,44 @@ fn apply_restore<T: MutCrdtTxnT>(
         .map_err(|e| storage_err(e, "updating branch state"))?;
 
     context.record_branch_restored();
+    Ok(())
+}
+
+// Reparent Operation
+
+/// Applies a Reparent operation to change a branch's chain position without
+/// touching its state or content.
+///
+/// # Behavior
+///
+/// 1. Verifies the branch exists.
+/// 2. Calls `update_branch_after` to rewrite the BRANCH_AFTER row.
+///
+/// The walker reads BRANCH_AFTER directly, so this is the entire effect.
+///
+/// # Errors
+///
+/// - `BranchNotFound` - The branch doesn't exist.
+fn apply_reparent<T: MutCrdtTxnT>(
+    txn: &mut T,
+    context: &mut ApplyContext,
+    branch_id: BranchId,
+    new_after: Option<BranchId>,
+) -> ApplyResult<()> {
+    // Verify branch exists
+    if !txn
+        .has_branch(branch_id)
+        .map_err(|e| storage_err(e, "checking branch exists"))?
+    {
+        return Err(ApplyError::branch_not_found(branch_id));
+    }
+
+    txn.update_branch_after(branch_id, new_after)
+        .map_err(|e| storage_err(e, "updating branch after-ref"))?;
+
+    // No dedicated counter on ApplyContext for reparent yet — track as a
+    // skipped op for accounting until we add `record_branch_reparented`.
+    context.record_skipped();
     Ok(())
 }
 

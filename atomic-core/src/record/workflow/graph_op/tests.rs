@@ -12,7 +12,10 @@ fn test_options_new_returns_defaults() {
     assert!(opts.get_encoding().is_none());
     assert_eq!(opts.get_context_lines(), 3);
     assert!(!opts.get_include_function_context());
-    assert_eq!(opts.get_combine_threshold(), 6);
+    assert_eq!(
+        opts.get_combine_threshold(),
+        HunkBuildOptions::DEFAULT_COMBINE_THRESHOLD
+    );
 }
 
 #[test]
@@ -169,8 +172,11 @@ fn test_pending_change_combine_with() {
 
     assert_eq!(combined.old_start, 5);
     assert_eq!(combined.old_len, 4); // lines 5-8 inclusive = 4 lines
-    assert_eq!(combined.new_len, 0); // both deletions have new_len = 0
-    assert!(combined.is_delete());
+                                     // The two deletes are separated by one preserved line in the new file.
+                                     // Combining them must retain that middle line, which makes the merged
+                                     // hunk a one-line replacement rather than a pure delete.
+    assert_eq!(combined.new_len, 1);
+    assert!(combined.is_replace());
 }
 
 #[test]

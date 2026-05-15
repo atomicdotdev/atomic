@@ -443,10 +443,7 @@ begin_section "Parity: Hyperfine first 4 commits (real repo)"
 
 make_temp_repo "parity-hyperfine"
 
-git clone --quiet https://github.com/sharkdp/hyperfine.git "$REPO_DIR/hyperfine" 2>/dev/null
-CLONE_OK="${?}"
-
-if [[ "$CLONE_OK" -ne 0 ]]; then
+if ! git clone --quiet https://github.com/sharkdp/hyperfine.git "$REPO_DIR/hyperfine" 2>/dev/null; then
     _skip "hyperfine clone failed (no network?)"
 else
     GIT_REPO="$REPO_DIR/hyperfine"

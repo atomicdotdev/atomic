@@ -429,6 +429,7 @@ impl Repository {
         outcome: &RecordOutcome,
         options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
+        let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some();
         let change = outcome.change();
         let hash = outcome.hash();
 
@@ -578,8 +579,15 @@ impl Repository {
         .map_err(|e| RepositoryError::Apply(e.to_string()))?;
 
         // Commit the transaction
+        let commit_start = std::time::Instant::now();
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        if trace_record {
+            eprintln!(
+                "[write_recorded] txn.commit complete elapsed={:?}",
+                commit_start.elapsed()
+            );
+        }
 
         Ok(apply_outcome)
     }
@@ -828,8 +836,6 @@ impl Repository {
             return Ok(outcome);
         }
 
-        // Insert each change in order.
-        //
         // When the source view is Draft, its changes were recorded against
         // the view filter (GRAPH).  Inserting those changes
         // into a different view verifies edge context against a different

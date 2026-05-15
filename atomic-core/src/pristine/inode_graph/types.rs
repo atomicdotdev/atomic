@@ -151,6 +151,8 @@ pub struct InodeAdjState {
     pub max_flag: EdgeFlags,
     /// Current position in the iteration.
     pub position: usize,
+    /// Cached matching edges for this inode/node pair.
+    pub edges: Vec<SerializedGraphEdge>,
     /// Whether iteration has completed.
     pub exhausted: bool,
 }
@@ -176,6 +178,7 @@ impl InodeAdjState {
             min_flag,
             max_flag,
             position: 0,
+            edges: Vec::new(),
             exhausted: false,
         }
     }
@@ -196,6 +199,19 @@ impl InodeAdjState {
     #[inline]
     pub fn advance(&mut self) {
         self.position += 1;
+    }
+
+    /// Returns true if the adjacency cache has been populated.
+    #[inline]
+    pub fn is_loaded(&self) -> bool {
+        !self.edges.is_empty() || self.exhausted || self.position > 0
+    }
+
+    /// Store the filtered edge list for this adjacency cursor.
+    #[inline]
+    pub fn set_edges(&mut self, edges: Vec<SerializedGraphEdge>) {
+        self.edges = edges;
+        self.position = 0;
     }
 }
 

@@ -174,6 +174,12 @@ pub struct RecordedFile {
 
     /// CRDT build statistics for this file.
     crdt_stats: Option<CrdtBuildStats>,
+
+    /// Treat this file as opaque generated content during globalization.
+    ///
+    /// Used by import paths for lockfiles/checksums where full line-level
+    /// graph and CRDT detail is not worth the cost.
+    opaque_generated: bool,
 }
 
 impl RecordedFile {
@@ -205,6 +211,7 @@ impl RecordedFile {
             old_line_count: None,
             crdt_ops: None,
             crdt_stats: None,
+            opaque_generated: false,
         }
     }
 
@@ -334,6 +341,17 @@ impl RecordedFile {
         self.crdt_stats = Some(stats);
     }
 
+    /// Clear any CRDT operations/stats.
+    pub fn clear_crdt_ops(&mut self) {
+        self.crdt_ops = None;
+        self.crdt_stats = None;
+    }
+
+    /// Mark this file as opaque generated content.
+    pub fn set_opaque_generated(&mut self, opaque_generated: bool) {
+        self.opaque_generated = opaque_generated;
+    }
+
     /// Get the path.
     #[must_use]
     pub fn path(&self) -> &str {
@@ -392,6 +410,12 @@ impl RecordedFile {
     #[must_use]
     pub fn crdt_stats(&self) -> Option<&CrdtBuildStats> {
         self.crdt_stats.as_ref()
+    }
+
+    /// Whether this file should be globalized as opaque generated content.
+    #[must_use]
+    pub fn opaque_generated(&self) -> bool {
+        self.opaque_generated
     }
 
     /// Check if this file has CRDT operations.

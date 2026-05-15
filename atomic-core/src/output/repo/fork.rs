@@ -19,8 +19,6 @@
 //!    only non-empty content vertices are relevant.
 //! 4. Return the list of [`ForkConflict`]s for the merge engine.
 
-use std::collections::HashMap;
-
 use crate::output::alive::{AliveGraph, OrderResult, VertexId};
 
 /// A detected fork conflict in the alive graph.
@@ -50,15 +48,43 @@ pub(crate) struct ForkConflict {
 ///
 /// A (possibly empty) list of fork conflicts.
 pub(crate) fn detect_fork_conflicts(graph: &AliveGraph, order: &OrderResult) -> Vec<ForkConflict> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
     let mut forks = Vec::new();
 
-    // Build vertex → SCC-index map
+    // Build vertex → SCC-index map so we can identify multi-vertex SCCs.
     let mut vertex_to_scc: HashMap<VertexId, usize> = HashMap::new();
     for (scc_idx, scc) in order.sccs.iter().enumerate() {
         for &vid in scc {
             vertex_to_scc.insert(vid, scc_idx);
         }
     }
+
+    // Reachability helper: does `from` reach `to` by following the alive
+    // graph's child edges (i.e. is `to` topologically downstream of
+    // `from`)?  Used to filter out children that are linearly ordered
+    // through the additive edge model — they form a chain, not a fork.
+    let reachable = |from: VertexId, to: VertexId| -> bool {
+        if from == to {
+            return false;
+        }
+        let mut seen: HashSet<VertexId> = HashSet::new();
+        let mut queue: VecDeque<VertexId> = VecDeque::new();
+        queue.push_back(from);
+        seen.insert(from);
+        while let Some(v) = queue.pop_front() {
+            for (_, child) in graph.children(v) {
+                if child.is_dummy() || !seen.insert(*child) {
+                    continue;
+                }
+                if *child == to {
+                    return true;
+                }
+                queue.push_back(*child);
+            }
+        }
+        false
+    };
 
     let vertex_count = graph.len_vertices();
     for vid_raw in 0..vertex_count {
@@ -71,22 +97,36 @@ pub(crate) fn detect_fork_conflicts(graph: &AliveGraph, order: &OrderResult) -> 
             continue;
         }
 
-        // Collect non-dummy children
-        let children: Vec<VertexId> = graph
-            .children(vid)
-            .map(|(_, child_vid)| *child_vid)
-            .filter(|c: &VertexId| !c.is_dummy())
-            .collect();
+        // Collect non-dummy, deduped children
+        let mut children: Vec<VertexId> = Vec::new();
+        for (_, child_vid) in graph.children(vid) {
+            if child_vid.is_dummy() {
+                continue;
+            }
+            if !children.contains(child_vid) {
+                children.push(*child_vid);
+            }
+        }
 
         if children.len() <= 1 {
             continue;
         }
 
-        // Are the children spread across different SCCs?
-        let first_scc = vertex_to_scc.get(&children[0]);
-        let all_same_scc = children.iter().all(|c| vertex_to_scc.get(c) == first_scc);
+        // Skip when children all live in the SAME multi-vertex SCC.
+        // That's a cyclic conflict (handled by the cyclic-conflict
+        // path), not a fork.  Children in DIFFERENT SCCs — even if some
+        // happen to share an SCC — are concurrent inserts and should
+        // be reported as a fork.
+        let first_scc = vertex_to_scc.get(&children[0]).copied();
+        let all_same_scc = children
+            .iter()
+            .all(|c| vertex_to_scc.get(c).copied() == first_scc);
         if all_same_scc {
-            continue; // Already ordered or in a cyclic SCC — not a fork
+            if let Some(idx) = first_scc {
+                if order.sccs.get(idx).map(|s| s.len() > 1).unwrap_or(false) {
+                    continue; // cyclic SCC — not a fork
+                }
+            }
         }
 
         // Keep only non-empty content vertices (skip inodes / structural markers)
@@ -100,10 +140,28 @@ pub(crate) fn detect_fork_conflicts(graph: &AliveGraph, order: &OrderResult) -> 
             })
             .collect();
 
-        if content_children.len() > 1 {
+        if content_children.len() <= 1 {
+            continue;
+        }
+
+        // Reduce children to a maximal antichain: drop any child that is
+        // reachable from another child via the alive graph DAG.  Those
+        // are linearly ordered downstream of a sibling and belong to the
+        // sibling's chain, not to a concurrent fork.
+        let mut antichain: Vec<VertexId> = Vec::new();
+        for &c in &content_children {
+            let dominated = content_children
+                .iter()
+                .any(|&other| other != c && reachable(other, c));
+            if !dominated {
+                antichain.push(c);
+            }
+        }
+
+        if antichain.len() > 1 {
             forks.push(ForkConflict {
                 parent: vid,
-                children: content_children,
+                children: antichain,
             });
         }
     }

@@ -170,6 +170,16 @@ impl LineOps {
         &self.operation
     }
 
+    /// Returns the branch operation for in-place mutation.
+    ///
+    /// Used by the consolidation pass in `build_crdt_ops_for_modified_file`
+    /// to rewrite an `Insert`'s `after` reference when its target placeholder
+    /// gets promoted to a `Modify` on an existing branch.
+    #[inline]
+    pub fn operation_mut(&mut self) -> &mut BranchOp {
+        &mut self.operation
+    }
+
     /// Returns the token operations.
     #[inline]
     pub fn token_ops(&self) -> &[TokenOps] {

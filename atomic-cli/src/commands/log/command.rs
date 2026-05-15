@@ -91,9 +91,10 @@ pub struct Log {
 
     /// Show full history including inherited changes.
     ///
-    /// By default, draft views only show local changes (those recorded
-    /// after the fork). Use this flag to see the complete history.
-    #[arg(long = "all")]
+    /// Currently a no-op — all views show their complete history.
+    /// Reserved for future use when fork-point filtering is
+    /// re-implemented with a stable fork-point snapshot.
+    #[arg(long = "all", hide = true)]
     pub all: bool,
 }
 
@@ -524,61 +525,15 @@ impl Command for Log {
             );
         }
 
-        // For draft views, filter to only local changes unless --all is set
-        let (display_entries, fork_point): (&[HistoryEntry], Option<(String, u64)>) = if self.all {
-            (&entries, None)
-        } else {
-            match repo.get_view_info(view_name) {
-                Ok(info) if info.scope == ViewScope::Draft => {
-                    match repo.parent_change_count(view_name) {
-                        Ok(Some((parent_name, inherited_count))) => {
-                            let local: Vec<&HistoryEntry> = entries
-                                .iter()
-                                .filter(|e| e.sequence >= inherited_count)
-                                .collect();
-                            if local.is_empty() {
-                                // All changes are inherited — show nothing
-                                // but still print the fork-point footer
-                                (&[], Some((parent_name, inherited_count)))
-                            } else {
-                                // We can't return a slice of a filtered
-                                // Vec, so we fall through and handle it
-                                // below with a separate print path.
-                                let local_entries: Vec<HistoryEntry> = entries
-                                    .iter()
-                                    .filter(|e| e.sequence >= inherited_count)
-                                    .cloned()
-                                    .collect();
-                                // Print the local entries
-                                self.print_entries(&local_entries);
-                                // Print fork-point separator
-                                self.print_fork_point(&parent_name, inherited_count);
-                                return Ok(());
-                            }
-                        }
-                        _ => (&entries, None),
-                    }
-                }
-                _ => (&entries, None),
-            }
-        };
-
-        // Print entries
-        if display_entries.is_empty() {
-            if let Some((ref parent_name, inherited_count)) = fork_point {
-                // Draft view with only inherited changes
-                println!(
-                    "No local changes on draft view '{}'.\n",
-                    style_view(view_name)
-                );
-                self.print_fork_point(parent_name, inherited_count);
-            }
-        } else {
-            self.print_entries(display_entries);
-            if let Some((ref parent_name, inherited_count)) = fork_point {
-                self.print_fork_point(parent_name, inherited_count);
-            }
-        }
+        // Show all entries in VIEW_CHANGES for this view.
+        //
+        // Previous draft-view filtering used `parent_change_count` which
+        // reads the parent's *live* change_count.  That counter moves as
+        // the parent gains more changes, shifting the filter threshold
+        // and hiding entries that should be visible — including the
+        // draft view's own local changes.  Until a stable fork-point
+        // snapshot is stored at view-creation time, show everything.
+        self.print_entries(&entries);
 
         Ok(())
     }
