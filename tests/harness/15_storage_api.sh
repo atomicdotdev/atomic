@@ -208,7 +208,7 @@ run_atomic_ok "Register Charlie with server" \
 # Switch back to Alice for the rest of the tests.
 use_identity "$ALICE_NAME"
 run_atomic_ok "Switch default org back to Alice" \
-    org switch "$ALICE_NAME"
+    org set "$ALICE_NAME"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -232,7 +232,7 @@ assert_last_contains "Create response includes org slug" "$ORG_SLUG"
 
 # Switch to the new org so subsequent commands target it.
 run_atomic_ok "Switch to team org" \
-    org switch "$ORG_SLUG"
+    org set "$ORG_SLUG"
 
 # Verify the switch persisted.
 run_atomic_ok "Show team org after switch" \

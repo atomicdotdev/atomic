@@ -25,7 +25,7 @@
 //!   Slug:  acme-corp
 //!   Plan:  team
 //!
-//!   Hint: Use 'atomic org switch <slug>' to change the default organization.
+//!   Hint: Use 'atomic org set <slug>' to change the default organization.
 //!
 //! $ atomic org list --format json
 //! ```
@@ -41,7 +41,7 @@ use crate::output::{print_hint, print_section, KeyValueTable};
 ///
 /// Currently shows the default organization's info, since the server
 /// does not yet support listing all organizations for a user. Use
-/// `atomic org switch <slug>` to change which organization is active.
+/// `atomic org set <slug>` to change which organization is active.
 #[derive(Debug, Parser)]
 #[command(name = "list")]
 pub struct OrgList {
@@ -112,7 +112,7 @@ impl OrgList {
 
             println!("{table}");
             println!();
-            print_hint("Use 'atomic org switch <slug>' to change the default organization.");
+            print_hint("Use 'atomic org set <slug>' to change the default organization.");
         }
 
         Ok(())

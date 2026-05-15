@@ -34,10 +34,12 @@
 
 use clap::Parser;
 
-use crate::commands::client::{build_client, remote_err};
+use atomic_config::GlobalConfig;
+
+use crate::commands::client::{build_client_with_org, remote_err};
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
-use crate::output::{print_error, print_success, print_warning};
+use crate::output::{print_error, print_hint, print_success, print_warning};
 
 /// Delete a remote workspace.
 ///
@@ -88,7 +90,7 @@ impl Command for WorkspaceDelete {
                 }
             }
 
-            let client = build_client(self.org.as_deref())?;
+            let (client, org_slug) = build_client_with_org(self.org.as_deref())?;
 
             client
                 .delete_workspace(&self.slug)
@@ -97,9 +99,47 @@ impl Command for WorkspaceDelete {
 
             print_success(&format!("Deleted workspace: {}", self.slug));
 
+            // If this workspace was the default for the org we just operated
+            // in, remove the stale entry so subsequent commands don't hit a
+            // confusing 404. Server-side deletion succeeded; config cleanup
+            // is best-effort.
+            if let Err(e) = clean_up_local_config(&org_slug, &self.slug) {
+                log::warn!("Failed to clean up local config after workspace delete: {e}");
+            }
+
             Ok(())
         })
     }
+}
+
+/// Remove a deleted workspace from `[server.default_workspaces]` if it was
+/// the configured default for its org.
+fn clean_up_local_config(org_slug: &str, deleted_workspace: &str) -> CliResult<()> {
+    let mut config = GlobalConfig::load()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {e}")))?;
+
+    let was_default = config
+        .server
+        .default_workspaces
+        .get(org_slug)
+        .map(|v| v == deleted_workspace)
+        .unwrap_or(false);
+
+    if !was_default {
+        return Ok(());
+    }
+
+    config.server.default_workspaces.remove(org_slug);
+    config
+        .save()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to save global config: {e}")))?;
+
+    print_hint(&format!(
+        "Default workspace for '{org_slug}' was '{deleted_workspace}' — \
+         run 'atomic workspace set <slug>' to pick a new one."
+    ));
+
+    Ok(())
 }
 
 #[cfg(test)]

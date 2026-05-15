@@ -11,13 +11,14 @@
 //! # Usage
 //!
 //! ```text
-//! atomic project init <NAME> --workspace <SLUG> [OPTIONS]
+//! atomic project init <NAME> [--workspace <SLUG>] [OPTIONS]
 //!
 //! Arguments:
 //!   <NAME>  Name of the project to create on the server
 //!
 //! Options:
-//!   -w, --workspace <SLUG>    Workspace slug (required)
+//!   -w, --workspace <SLUG>    Workspace slug. Falls back to the default
+//!                             workspace for the current org if omitted.
 //!       --kind <KIND>         Project kind (rust, python, node, go, java, ruby, zig)
 //!       --description <DESC>  Project description
 //!       --visibility <VIS>    Visibility (private or public) [default: private]
@@ -44,15 +45,18 @@ use clap::Parser;
 use atomic_remote::storage_types::{CreateProjectRequest, CreateWorkspaceRequest, Visibility};
 use atomic_repository::Repository;
 
-use crate::commands::client::{build_client, remote_err};
+use crate::commands::client::{build_client_with_org, remote_err, resolve_workspace};
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{print_hint, print_info, print_next_steps, print_success};
+use crate::output::{print_info, print_next_steps, print_success};
 
 /// Initialise a remote project from the current Atomic repository.
 ///
 /// Creates the project (and optionally the workspace) on the server,
 /// then stores the remote URL in the local repository configuration.
+///
+/// If `--workspace` is omitted, falls back to the default workspace for
+/// the current org (set via `atomic workspace set <slug>`).
 #[derive(Debug, Parser)]
 #[command(name = "init")]
 pub struct ProjectInit {
@@ -63,9 +67,10 @@ pub struct ProjectInit {
     /// Workspace slug to create the project in.
     ///
     /// If the workspace does not exist on the server it will be created
-    /// automatically (with default settings).
-    #[arg(short = 'w', long, required = true)]
-    pub workspace: String,
+    /// automatically (with default settings). Falls back to the default
+    /// workspace for the current org if omitted.
+    #[arg(short = 'w', long)]
+    pub workspace: Option<String>,
 
     /// Project kind hint (rust, python, node, go, java, ruby, zig).
     ///
@@ -108,19 +113,20 @@ impl ProjectInit {
             other => CliError::Repository(other),
         })?;
 
-        // 2. Build the storage client.
-        let client = build_client(self.org.as_deref())?;
+        // 2. Build the storage client and resolve the workspace.
+        let (client, org_slug) = build_client_with_org(self.org.as_deref())?;
+        let workspace = resolve_workspace(&org_slug, self.workspace.as_deref())?;
 
         // 3. Ensure the workspace exists — create it if necessary.
         //    A 409 (Conflict) means it already exists, which is fine.
-        match client.get_workspace(&self.workspace).await {
+        match client.get_workspace(&workspace).await {
             Ok(_ws) => {
                 // Already exists — nothing to do.
             }
             Err(_) => {
                 // Try to create it. If the server returns 409 we ignore it.
                 let ws_req = CreateWorkspaceRequest {
-                    name: self.workspace.clone(),
+                    name: workspace.clone(),
                     description: None,
                     visibility: self.visibility,
                 };
@@ -138,7 +144,7 @@ impl ProjectInit {
                         {
                             print_info(&format!(
                                 "Workspace '{}' already exists, using it.",
-                                self.workspace
+                                workspace
                             ));
                         } else {
                             return Err(remote_err(e));
@@ -158,7 +164,7 @@ impl ProjectInit {
         };
 
         let project = client
-            .create_project(&self.workspace, &proj_req)
+            .create_project(&workspace, &proj_req)
             .await
             .map_err(remote_err)?;
 
@@ -166,7 +172,7 @@ impl ProjectInit {
         let vcs_url = format!(
             "{}/workspaces/{}/projects/{}/code",
             client.base_url(),
-            self.workspace,
+            workspace,
             project.slug,
         );
 
@@ -200,7 +206,7 @@ mod tests {
     fn command_fields() {
         let cmd = ProjectInit {
             name: "my-app".to_string(),
-            workspace: "my-ws".to_string(),
+            workspace: Some("my-ws".to_string()),
             kind: Some("rust".to_string()),
             description: Some("My app".to_string()),
             visibility: Visibility::Private,
@@ -208,7 +214,7 @@ mod tests {
         };
 
         assert_eq!(cmd.name, "my-app");
-        assert_eq!(cmd.workspace, "my-ws");
+        assert_eq!(cmd.workspace.as_deref(), Some("my-ws"));
         assert_eq!(cmd.kind.as_deref(), Some("rust"));
         assert_eq!(cmd.description.as_deref(), Some("My app"));
         assert_eq!(cmd.visibility, Visibility::Private);
@@ -219,7 +225,7 @@ mod tests {
     fn default_visibility_is_private() {
         let cmd = ProjectInit {
             name: "proj".to_string(),
-            workspace: "ws".to_string(),
+            workspace: Some("ws".to_string()),
             kind: None,
             description: None,
             visibility: Visibility::Private,
@@ -229,12 +235,25 @@ mod tests {
     }
 
     #[test]
+    fn workspace_can_be_omitted() {
+        let cmd = ProjectInit {
+            name: "proj".to_string(),
+            workspace: None,
+            kind: None,
+            description: None,
+            visibility: Visibility::Private,
+            org: None,
+        };
+        assert!(cmd.workspace.is_none());
+    }
+
+    #[test]
     fn run_outside_repo_fails() {
         // Running outside a repository should produce an error before
         // any network calls happen.
         let cmd = ProjectInit {
             name: "proj".to_string(),
-            workspace: "ws".to_string(),
+            workspace: Some("ws".to_string()),
             kind: None,
             description: None,
             visibility: Visibility::Private,

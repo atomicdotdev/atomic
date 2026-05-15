@@ -66,11 +66,14 @@ pub fn parse_project_path(path: &str) -> CliResult<(&str, &str)> {
 pub enum ProjectCommands {
     /// List projects in a workspace.
     ///
-    /// Shows all projects within the specified workspace.
+    /// Shows all projects within a workspace. If `--workspace` is omitted,
+    /// uses the default workspace for the current org (set via
+    /// `atomic workspace set`).
     ///
     /// # Examples
     ///
     /// ```text
+    /// atomic project list
     /// atomic project list --workspace my-ws
     /// atomic project list --workspace my-ws --format json
     /// ```
@@ -78,11 +81,14 @@ pub enum ProjectCommands {
 
     /// Create a new remote project.
     ///
-    /// Creates a project inside an existing workspace on the server.
+    /// Creates a project inside a workspace on the server. If `--workspace`
+    /// is omitted, uses the default workspace for the current org (set via
+    /// `atomic workspace set`).
     ///
     /// # Examples
     ///
     /// ```text
+    /// atomic project create my-project
     /// atomic project create my-project --workspace my-ws
     /// atomic project create my-project --workspace my-ws --kind rust
     /// ```
@@ -128,11 +134,14 @@ pub enum ProjectCommands {
     /// Initialize a local repo as a remote project.
     ///
     /// Creates the project on the server and configures the local
-    /// repository with the remote URL.
+    /// repository with the remote URL. If `--workspace` is omitted, uses
+    /// the default workspace for the current org (set via
+    /// `atomic workspace set`).
     ///
     /// # Examples
     ///
     /// ```text
+    /// atomic project init my-project
     /// atomic project init my-project --workspace my-ws
     /// atomic project init my-project --workspace my-ws --kind rust
     /// ```
@@ -217,7 +226,7 @@ mod tests {
         }
 
         let list = list::ProjectList {
-            workspace: "ws".to_string(),
+            workspace: Some("ws".to_string()),
             org: None,
             format: "table".to_string(),
         };
@@ -225,7 +234,7 @@ mod tests {
 
         let create = create::ProjectCreate {
             name: "proj".to_string(),
-            workspace: "ws".to_string(),
+            workspace: Some("ws".to_string()),
             description: None,
             kind: None,
             default_view: "dev".to_string(),

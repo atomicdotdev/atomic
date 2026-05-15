@@ -491,19 +491,20 @@ enum Commands {
     /// Manage remote projects.
     ///
     /// Projects live inside workspaces and represent a single Atomic VCS
-    /// repository hosted on a remote server.
+    /// repository hosted on a remote server. When `--workspace` is omitted,
+    /// commands fall back to the default workspace for the current org
+    /// (set with `atomic workspace set`).
     ///
     /// # Examples
     ///
     /// ```text
-    /// # List projects
-    /// atomic project list --workspace my-ws
+    /// atomic workspace set my-ws
     ///
-    /// # Create a project
-    /// atomic project create my-app --workspace my-ws
+    /// atomic project list
+    /// atomic project create my-app
+    /// atomic project init my-app
     ///
-    /// # Initialize local repo as remote project
-    /// atomic project init my-app --workspace my-ws
+    /// atomic project create my-app --workspace other-ws
     /// ```
     Project(ProjectCmd),
 
@@ -523,7 +524,7 @@ enum Commands {
     /// atomic org create "Acme Corp"
     ///
     /// # Switch default org
-    /// atomic org switch acme-corp
+    /// atomic org set acme-corp
     ///
     /// # Manage members
     /// atomic org member list

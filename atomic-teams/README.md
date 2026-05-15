@@ -155,7 +155,7 @@ atomic org update acme-corp --name "Acme Corporation" --email new@acme.com
 atomic org upgrade
 
 # Switch your default org context
-atomic org switch acme-corp
+atomic org set acme-corp
 
 # Delete an org (owner only, interactive confirmation)
 atomic org delete acme-corp
@@ -674,7 +674,7 @@ atomic org create "Dev Team" --email team@dev.local
 #   Plan:  free
 
 # Switch to the new org
-atomic org switch dev-team
+atomic org set dev-team
 ```
 
 #### 4. Add Bob to the organization
