@@ -10,6 +10,7 @@
 //! Configuration is merged with later levels overriding earlier ones.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -65,6 +66,10 @@ pub struct Author {
 /// [server]
 /// url = "https://atomic.storage"
 /// default_org = "alice"
+///
+/// [server.default_workspaces]
+/// alice = "personal"
+/// acme = "backend"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerConfig {
@@ -78,9 +83,21 @@ pub struct ServerConfig {
     /// Default organization slug for management commands.
     ///
     /// Set automatically during registration (personal org = identity name).
-    /// Can be switched with `atomic org switch`.
+    /// Can be switched with `atomic org set`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_org: Option<String>,
+
+    /// Default workspace slug per organization.
+    ///
+    /// Workspaces are org-scoped, so the default is stored per org. When
+    /// a management command needs a workspace and none is given on the
+    /// CLI, the resolver looks up the current org in this map.
+    ///
+    /// Set with `atomic workspace set <slug> [--org <slug>]`.
+    /// Uses `BTreeMap` so the serialized TOML is alphabetically ordered
+    /// and produces stable diffs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub default_workspaces: BTreeMap<String, String>,
 }
 
 impl ServerConfig {
@@ -352,6 +369,7 @@ mod tests {
         let config = ServerConfig {
             url: Some("https://atomic.storage".to_string()),
             default_org: Some("alice".to_string()),
+            default_workspaces: BTreeMap::new(),
         };
         assert!(config.is_configured());
 
@@ -359,6 +377,7 @@ mod tests {
         let partial = ServerConfig {
             url: Some("https://atomic.storage".to_string()),
             default_org: None,
+            default_workspaces: BTreeMap::new(),
         };
         assert!(!partial.is_configured());
 
@@ -366,6 +385,7 @@ mod tests {
         let partial = ServerConfig {
             url: None,
             default_org: Some("alice".to_string()),
+            default_workspaces: BTreeMap::new(),
         };
         assert!(!partial.is_configured());
     }
@@ -375,6 +395,7 @@ mod tests {
         let config = ServerConfig {
             url: Some("https://atomic.storage".to_string()),
             default_org: Some("alice".to_string()),
+            default_workspaces: BTreeMap::new(),
         };
         assert_eq!(
             config.org_base_url("alice"),
@@ -391,6 +412,7 @@ mod tests {
         let config = ServerConfig {
             url: Some("http://localhost:8080".to_string()),
             default_org: None,
+            default_workspaces: BTreeMap::new(),
         };
         assert_eq!(
             config.org_base_url("alice"),
@@ -403,6 +425,7 @@ mod tests {
         let config = ServerConfig {
             url: Some("https://atomic.storage".to_string()),
             default_org: Some("alice".to_string()),
+            default_workspaces: BTreeMap::new(),
         };
         assert_eq!(
             config.default_org_base_url(),
@@ -413,6 +436,7 @@ mod tests {
         let config = ServerConfig {
             url: Some("https://atomic.storage".to_string()),
             default_org: None,
+            default_workspaces: BTreeMap::new(),
         };
         assert!(config.default_org_base_url().is_none());
     }
@@ -422,6 +446,7 @@ mod tests {
         let config = ServerConfig {
             url: Some("https://atomic.storage".to_string()),
             default_org: Some("alice".to_string()),
+            default_workspaces: BTreeMap::new(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -444,6 +469,7 @@ mod tests {
             server: ServerConfig {
                 url: Some("https://atomic.storage".to_string()),
                 default_org: Some("alice".to_string()),
+                default_workspaces: BTreeMap::new(),
             },
             ..GlobalConfig::default()
         };
@@ -459,6 +485,60 @@ mod tests {
         );
         assert_eq!(parsed.server.default_org, Some("alice".to_string()));
         assert!(parsed.server.is_configured());
+    }
+
+    #[test]
+    fn test_default_workspaces_skipped_when_empty() {
+        let config = ServerConfig {
+            url: Some("https://atomic.storage".to_string()),
+            default_org: Some("alice".to_string()),
+            default_workspaces: BTreeMap::new(),
+        };
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        assert!(!toml_str.contains("default_workspaces"));
+    }
+
+    #[test]
+    fn test_default_workspaces_roundtrip() {
+        let mut workspaces = BTreeMap::new();
+        workspaces.insert("alice".to_string(), "personal".to_string());
+        workspaces.insert("acme".to_string(), "backend".to_string());
+
+        let config = ServerConfig {
+            url: Some("https://atomic.storage".to_string()),
+            default_org: Some("alice".to_string()),
+            default_workspaces: workspaces,
+        };
+
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        assert!(toml_str.contains("[default_workspaces]"));
+
+        // BTreeMap → alphabetical, so "acme" appears before "alice"
+        let acme_pos = toml_str.find("acme = \"backend\"").unwrap();
+        let alice_pos = toml_str.find("alice = \"personal\"").unwrap();
+        assert!(acme_pos < alice_pos);
+
+        let parsed: ServerConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            parsed.default_workspaces.get("alice"),
+            Some(&"personal".to_string())
+        );
+        assert_eq!(
+            parsed.default_workspaces.get("acme"),
+            Some(&"backend".to_string())
+        );
+    }
+
+    #[test]
+    fn test_default_workspaces_backward_compatibility() {
+        // Old configs without default_workspaces should still parse.
+        let toml_str = r#"
+url = "https://atomic.storage"
+default_org = "alice"
+"#;
+        let parsed: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.default_org.as_deref(), Some("alice"));
+        assert!(parsed.default_workspaces.is_empty());
     }
 
     #[test]

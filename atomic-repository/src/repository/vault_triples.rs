@@ -133,13 +133,21 @@ impl Repository {
     }
 
     /// Full-text search over knowledge graph nodes.
+    ///
+    /// `pool` controls the candidate heap size — how many nodes are scored
+    /// before the top `limit` are selected. A larger pool lets lower-scored
+    /// node kinds (e.g. changes) survive alongside higher-scored ones
+    /// (e.g. files with content matches). When `None`, defaults to `limit`.
     pub fn vault_kg_search(
         &self,
         query: &str,
         limit: usize,
+        pool: Option<usize>,
     ) -> Result<Vec<KgNode>, RepositoryError> {
         use std::cmp::Reverse;
         use std::collections::{BinaryHeap, HashMap, HashSet};
+
+        let pool_size = pool.unwrap_or(limit).max(limit);
 
         let txn = self
             .pristine
@@ -172,14 +180,14 @@ impl Repository {
         // ── Phase 2: Stream candidates through a bounded min-heap ──────────
         //
         // As each candidate arrives, score it and bubble it into the heap.
-        // The heap holds at most `limit` items — weakest score at the top.
+        // The heap holds at most `pool_size` items — weakest score at the top.
         // If a new candidate beats the weakest, it replaces it.
-        // We never allocate more than `limit` entries.
+        // We trim to `limit` in Phase 3.
 
         // Min-heap: Reverse so BinaryHeap (max-heap) gives us min-score at top.
         // Tuple: (score, node_id, content_match_count)
         let mut heap: BinaryHeap<Reverse<(u64, String, usize)>> =
-            BinaryHeap::with_capacity(limit + 1);
+            BinaryHeap::with_capacity(pool_size + 1);
         let mut seen: HashSet<String> = HashSet::new();
 
         // Helper: push a candidate into the bounded heap
@@ -189,7 +197,7 @@ impl Repository {
              content_matches: usize,
              heap: &mut BinaryHeap<Reverse<(u64, String, usize)>>| {
                 let score = id_rank_score(&id, kg_hits, content_matches);
-                if heap.len() < limit {
+                if heap.len() < pool_size {
                     heap.push(Reverse((score, id, content_matches)));
                 } else if let Some(&Reverse((min_score, _, _))) = heap.peek() {
                     if score > min_score {
@@ -219,11 +227,55 @@ impl Repository {
             push_candidate(file_id, 0, count, &mut heap);
         }
 
-        // ── Phase 3: Extract top N in descending score order ───────────────
+        // ── Phase 3: Diversity-aware selection ─────────────────────────────
+        //
+        // When pool_size > limit the heap holds more candidates than we
+        // need.  Pure top-N by score would return only the dominant kind
+        // (usually files with content matches).  Instead, reserve a
+        // minimum number of slots per node kind, then fill the rest by
+        // overall score.  This guarantees that changes, entities, and
+        // other kinds appear in results when they match the query.
 
-        let mut ranked: Vec<(u64, String, usize)> =
+        let mut all_candidates: Vec<(u64, String, usize)> =
             heap.into_iter().map(|Reverse(entry)| entry).collect();
-        ranked.sort_by_key(|entry| std::cmp::Reverse(entry.0)); // highest score first
+        all_candidates.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+
+        let ranked = if pool_size > limit {
+            // Diversity mode: reserve slots per kind.
+            let min_per_kind: usize = 2;
+
+            // Group by kind (inferred from ID prefix)
+            let mut by_kind: HashMap<String, Vec<(u64, String, usize)>> = HashMap::new();
+            for entry in all_candidates {
+                let kind = entry.1.split(':').next().unwrap_or("other").to_string();
+                by_kind.entry(kind).or_default().push(entry);
+            }
+
+            // First pass: take up to min_per_kind from each kind (already
+            // sorted by score within each group since all_candidates was sorted).
+            let mut selected: Vec<(u64, String, usize)> = Vec::with_capacity(limit);
+            let mut remaining: Vec<(u64, String, usize)> = Vec::new();
+            for (_kind, mut entries) in by_kind {
+                let reserved: Vec<_> = entries.drain(..entries.len().min(min_per_kind)).collect();
+                selected.extend(reserved);
+                remaining.extend(entries);
+            }
+
+            // Second pass: fill remaining slots from leftover candidates by score
+            if selected.len() < limit {
+                remaining.sort_by_key(|e| std::cmp::Reverse(e.0));
+                selected.extend(remaining.into_iter().take(limit - selected.len()));
+            }
+
+            // Final sort by score for consistent output order
+            selected.sort_by_key(|e| std::cmp::Reverse(e.0));
+            selected.truncate(limit);
+            selected
+        } else {
+            // No diversity — simple top-N by score (original behavior)
+            all_candidates.truncate(limit);
+            all_candidates
+        };
 
         // ── Phase 4: Fetch full nodes only for the top N ───────────────────
 
@@ -269,7 +321,12 @@ impl Repository {
 /// Higher score = more relevant.  Works on IDs only (no node fetching needed).
 /// Combines: node kind weight, path tier, KG hit count, content match count.
 fn id_rank_score(id: &str, kg_hits: usize, content_matches: usize) -> u64 {
-    // Base score by node kind (inferred from ID prefix)
+    // Base score by node kind (inferred from ID prefix).
+    //
+    // Changes score the same as files: a change whose commit message
+    // matches the query is equally relevant as a file whose name does.
+    // Content matches (syntext hits) still boost files above changes
+    // when the query appears heavily inside file bodies.
     let kind_score: u64 = if id.starts_with("module:") {
         500
     } else if id.starts_with("file:") {
@@ -277,7 +334,7 @@ fn id_rank_score(id: &str, kg_hits: usize, content_matches: usize) -> u64 {
     } else if id.starts_with("entity:") {
         300
     } else if id.starts_with("change:") {
-        100
+        400
     } else {
         200
     };
@@ -802,7 +859,7 @@ mod tests {
         repo.vault_index_kg("memory/architecture.md").unwrap();
 
         // FTS search
-        let results = repo.vault_kg_search("architecture", 10).unwrap();
+        let results = repo.vault_kg_search("architecture", 10, None).unwrap();
         assert!(!results.is_empty(), "FTS search should return results");
         assert_eq!(results[0].kind, "memory");
     }

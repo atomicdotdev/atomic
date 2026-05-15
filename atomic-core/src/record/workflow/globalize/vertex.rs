@@ -173,6 +173,107 @@ where
     })
 }
 
+/// Create a chain of per-line content vertices.
+///
+/// Splits `content` on newline boundaries and creates one [`Insertion`] per
+/// line, chained via predecessor/successor edges.  This gives the graph
+/// line-level granularity so that concurrent edits to different lines
+/// don't conflict.
+///
+/// Returns a `Vec` of `Insertion`s.  The first has the given `predecessors`,
+/// the last has the given `successors`, and intermediate ones chain to
+/// each other via self-referencing positions within the new change.
+///
+/// If the content is empty or contains only a single line, a single vertex
+/// is created (equivalent to [`create_content_vertex`]).
+pub fn create_content_vertices_per_line<T>(
+    ctx: &mut GlobalizeContext<'_, T>,
+    _inode: Inode,
+    inode_pos: Position<NodeId>,
+    predecessors: Vec<Position<NodeId>>,
+    successors: Vec<Position<NodeId>>,
+    content: &[u8],
+) -> GlobalizeResult<Vec<Insertion<Option<Hash>>>>
+where
+    T: GraphTxnT + TreeTxnT,
+{
+    // Track dependencies on context vertices
+    for pos in &predecessors {
+        ctx.add_dependency_by_id(pos.change)?;
+    }
+    for pos in &successors {
+        ctx.add_dependency_by_id(pos.change)?;
+    }
+
+    // Split content into lines (keeping the \n in each line)
+    let mut lines: Vec<&[u8]> = Vec::new();
+    let mut start = 0;
+    for (i, &byte) in content.iter().enumerate() {
+        if byte == b'\n' {
+            lines.push(&content[start..=i]);
+            start = i + 1;
+        }
+    }
+    // Remainder after last \n (if content doesn't end with \n)
+    if start < content.len() {
+        lines.push(&content[start..]);
+    }
+
+    // If empty or single line, just create one vertex
+    if lines.len() <= 1 {
+        let insertion =
+            create_content_vertex(ctx, _inode, inode_pos, predecessors, successors, content)?;
+        return Ok(vec![insertion]);
+    }
+
+    let inode_hash = position_to_option_hash_resolved(ctx.txn(), inode_pos, None);
+
+    let mut insertions = Vec::with_capacity(lines.len());
+
+    for (i, line) in lines.iter().enumerate() {
+        let (line_start, line_end) = ctx.append_content(line);
+
+        let up_ctx = if i == 0 {
+            // First line: predecessors are the given predecessors
+            predecessors
+                .iter()
+                .map(|pos| position_to_option_hash_resolved(ctx.txn(), *pos, None))
+                .collect()
+        } else {
+            // Subsequent lines: predecessor is the previous line in this change.
+            // Use None for change (self-reference) and the end position of
+            // the previous line's vertex.
+            let prev: &Insertion<Option<Hash>> = &insertions[i - 1];
+            vec![Position {
+                change: None,
+                pos: prev.end,
+            }]
+        };
+
+        let down_ctx = if i == lines.len() - 1 {
+            // Last line: successors are the given successors
+            successors
+                .iter()
+                .map(|pos| position_to_option_hash_resolved(ctx.txn(), *pos, None))
+                .collect()
+        } else {
+            // Not last: no successor (the next line will reference us as predecessor)
+            vec![]
+        };
+
+        insertions.push(Insertion {
+            predecessors: up_ctx,
+            successors: down_ctx,
+            flag: EdgeFlags::BLOCK,
+            start: line_start,
+            end: line_end,
+            inode: inode_hash,
+        });
+    }
+
+    Ok(insertions)
+}
+
 // EDGE CREATION (DELETIONS)
 
 /// Create an EdgeUpdate for deleting content.

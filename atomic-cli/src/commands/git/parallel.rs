@@ -54,6 +54,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -65,7 +66,10 @@ use git2::{
 use rayon::prelude::*;
 
 use atomic_core::change::{Author, Change, ChangeHeader};
+use atomic_core::change::{Encoding, Local};
+use atomic_core::record::workflow::graph_op::BuiltHunk;
 use atomic_core::record::workflow::GitDiffLine;
+use atomic_core::record::workflow::RecordedFile;
 use atomic_core::types::Hash as ContentHash;
 use atomic_repository::Repository;
 
@@ -199,6 +203,66 @@ impl Default for ParallelImportOptions {
 pub struct ParallelImporter {
     git_repo_path: PathBuf,
     options: ParallelImportOptions,
+}
+
+fn is_generated_diff_skip_path(path: &str) -> bool {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path);
+
+    name.ends_with(".lock")
+        || name.ends_with(".sum")
+        || matches!(name, "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml")
+}
+
+fn count_line_units(content: &[u8]) -> usize {
+    if content.is_empty() {
+        0
+    } else {
+        content.split_inclusive(|&b| b == b'\n').count()
+    }
+}
+
+fn record_generated_full_replace(
+    path: &str,
+    new_content: &[u8],
+    old_content: &[u8],
+    inode_pos: Option<(
+        atomic_core::types::Inode,
+        atomic_core::types::Position<atomic_core::types::NodeId>,
+    )>,
+) -> RecordedFile {
+    let mut recorded = RecordedFile::new(path);
+    recorded.set_kind(atomic_core::record::workflow::DetectionKind::Modified);
+    if let Some((inode, pos)) = inode_pos {
+        recorded.set_inode(inode);
+        recorded.set_position(pos);
+    }
+
+    let old_line_count = count_line_units(old_content);
+    recorded.set_old_line_count(old_line_count);
+    recorded.set_encoding(Encoding::Utf8);
+
+    // Force globalization onto the whole-file replacement path. For generated
+    // lockfiles and checksums we do not need expensive line-granular CRDT ops
+    // during git import; final content fidelity matters more than preserving
+    // every tiny semantic edit inside machine-generated text.
+    let deleted_lines: Vec<usize> = (0..=old_line_count).collect();
+    let mut hunk = BuiltHunk::new_replace_with_lines(
+        Local::new(path, 1),
+        Some(Encoding::Utf8),
+        deleted_lines,
+        0,
+        0,
+        count_line_units(new_content),
+    );
+    hunk.content_start = Some(0);
+    hunk.content_end = Some(new_content.len() as u64);
+    recorded.add_hunk(hunk);
+    recorded.set_content(new_content.to_vec());
+    recorded.set_opaque_generated(true);
+    recorded
 }
 
 impl ParallelImporter {
@@ -695,12 +759,10 @@ impl ParallelImporter {
         // record_modified_file via in-memory working copies.  This
         // eliminates all filesystem I/O for Phase 2.
 
-        // Use patience diff for both the CRDT line-op generation and the
-        // git2 capture (see parse_commit).  Both implementations produce the
-        // same output for patience, so `atomic diff -c` matches `git diff
-        // --patience` exactly.
-        let core_options =
-            RecordingOptions::new().algorithm(atomic_core::diff::Algorithm::Patience);
+        // Keep the record path on the default diff algorithm so the git2
+        // line capture below and `git diff` CLI parity harness both describe
+        // the same edit sequence.
+        let core_options = RecordingOptions::new();
         let mut recorded_files: Vec<RecordedFile> = Vec::new();
 
         let record_start = std::time::Instant::now();
@@ -736,12 +798,22 @@ impl ParallelImporter {
                     // We do NOT call repo.move_file() here — the TREE update
                     // happens later when insert_change processes the FileMove op.
                     let old_path = file.old_path.as_deref().unwrap_or(&file.path);
+                    let parent_path = Path::new(&file.path)
+                        .parent()
+                        .and_then(|p| p.to_str())
+                        .unwrap_or("");
+                    let can_emit_move = parent_path.is_empty()
+                        || repo
+                            .get_inode_and_position(parent_path)
+                            .ok()
+                            .flatten()
+                            .is_some();
 
                     // Look up the inode and position for the old path.
                     // If the old file isn't tracked at all, fall back to
                     // treating the rename as a plain addition.
-                    match repo.get_inode_and_position(old_path) {
-                        Ok(Some((inode, pos))) => {
+                    match (can_emit_move, repo.get_inode_and_position(old_path)) {
+                        (true, Ok(Some((inode, pos)))) => {
                             // Build the move RecordedFile. Globalization will
                             // produce a GraphOp::FileMove from this.
                             let mut move_rec = RecordedFile::new(&file.path);
@@ -763,39 +835,63 @@ impl ParallelImporter {
                             let old_content = file.old_content.as_deref().unwrap_or(&[]).to_vec();
 
                             if !new_content.is_empty() && old_content != new_content {
-                                let memory_wc2 = Memory::new();
-                                memory_wc2.add_file(&file.path, new_content);
+                                if is_generated_diff_skip_path(&file.path) {
+                                    let rec = record_generated_full_replace(
+                                        &file.path,
+                                        new_content,
+                                        &old_content,
+                                        Some((inode, pos)),
+                                    );
+                                    recorded_files.push(rec);
+                                } else {
+                                    let memory_wc2 = Memory::new();
+                                    memory_wc2.add_file(&file.path, new_content);
 
-                                let mut detected = DetectedFile::modified(&file.path);
-                                detected.inode = Some(inode);
-                                detected.position = Some(pos);
+                                    let mut detected = DetectedFile::modified(&file.path);
+                                    detected.inode = Some(inode);
+                                    detected.position = Some(pos);
 
-                                match record_modified_file(
-                                    &memory_wc2,
-                                    &detected,
-                                    &old_content,
-                                    &core_options,
-                                ) {
-                                    Ok(mut rec) if !rec.is_empty() => {
-                                        if let Some(ref diff_lines) = file.diff_lines {
-                                            use atomic_core::record::workflow::build_crdt_ops_from_git_diff;
-                                            let (git_file_ops, _) = build_crdt_ops_from_git_diff(
-                                                &file.path, diff_lines,
-                                            );
-                                            rec.set_crdt_ops(git_file_ops);
+                                    match record_modified_file(
+                                        &memory_wc2,
+                                        &detected,
+                                        &old_content,
+                                        None, // no separate CRDT old content
+                                        &core_options,
+                                        None, // git-import path has no existing trunk binding here
+                                        None, // git-import path overrides CRDT ops below
+                                    ) {
+                                        Ok(mut rec) if !rec.is_empty() => {
+                                            if let Some(ref diff_lines) = file.diff_lines {
+                                                use atomic_core::record::workflow::build_crdt_ops_from_git_diff;
+                                                let (git_file_ops, _) =
+                                                    build_crdt_ops_from_git_diff(
+                                                        &file.path, diff_lines,
+                                                    );
+                                                rec.set_crdt_ops(git_file_ops);
+                                            }
+                                            recorded_files.push(rec);
                                         }
-                                        recorded_files.push(rec);
+                                        _ => {}
                                     }
-                                    _ => {}
                                 }
                             }
                         }
                         _ => {
-                            // Old path not tracked — treat rename as a plain addition.
-                            let content = match &file.new_content {
-                                Some(c) => c.as_slice(),
-                                None => continue,
-                            };
+                            // Fallback: if we cannot anchor the rename to an
+                            // existing inode or the new parent is not tracked
+                            // as a first-class directory inode, degrade it to
+                            // "delete old path + add new path" so the imported
+                            // history stays faithful and the final tree
+                            // remains clean.
+                            if old_path != file.path {
+                                deleted_paths.push(old_path.to_string());
+                            }
+
+                            let content =
+                                match file.new_content.as_deref().or(file.old_content.as_deref()) {
+                                    Some(c) => c,
+                                    None => continue,
+                                };
                             memory_wc.add_file(&file.path, content);
                             let detected = DetectedFile::added(&file.path);
                             match record_added_file(&memory_wc, &detected, &core_options) {
@@ -826,8 +922,41 @@ impl ParallelImporter {
                     }
                     let lookup_ms = lookup_start.elapsed().as_millis();
 
+                    if is_generated_diff_skip_path(&file.path) {
+                        let inode_pos = detected.inode.zip(detected.position);
+                        let rec = record_generated_full_replace(
+                            &file.path,
+                            new_content,
+                            &old_content,
+                            inode_pos,
+                        );
+                        recorded_files.push(rec);
+                        let file_ms = file_start.elapsed().as_millis();
+                        if file_ms > 100 {
+                            slow_files.push((file.path.clone(), file_ms));
+                        }
+                        if lookup_ms > 10 {
+                            log::debug!(
+                                "write_commit {}: generated fast path {} lookup={}ms file={}ms",
+                                parsed.short_sha,
+                                file.path,
+                                lookup_ms,
+                                file_ms
+                            );
+                        }
+                        continue;
+                    }
+
                     let diff_start = std::time::Instant::now();
-                    match record_modified_file(&memory_wc, &detected, &old_content, &core_options) {
+                    match record_modified_file(
+                        &memory_wc,
+                        &detected,
+                        &old_content,
+                        None,
+                        &core_options,
+                        None,
+                        None,
+                    ) {
                         Ok(mut rec) if !rec.is_empty() => {
                             // Override CRDT ops with git's exact diff lines when available.
                             // This guarantees `atomic diff -c` matches `git diff` line-for-line
@@ -882,7 +1011,10 @@ impl ParallelImporter {
                                 &del_wc,
                                 &detected,
                                 &old_content,
+                                None, // no separate CRDT old content
                                 &core_options,
+                                None, // git-import path has no existing trunk binding here
+                                None, // git-import path overrides CRDT ops below
                             ) {
                                 Ok(mut rec) if !rec.is_empty() => {
                                     // Override CRDT ops with git's exact diff lines
@@ -1074,6 +1206,23 @@ impl ParallelImporter {
             "short_sha": parsed.short_sha,
         });
 
+        let diff_files: Vec<serde_json::Value> = parsed
+            .files
+            .iter()
+            .filter_map(|file| {
+                file.diff_lines.as_ref().map(|lines| {
+                    serde_json::json!({
+                        "path": file.path,
+                        "lines": lines,
+                    })
+                })
+            })
+            .collect();
+
+        if !diff_files.is_empty() {
+            git["diff_lines"] = serde_json::Value::Array(diff_files);
+        }
+
         if is_empty {
             git["empty_commit"] = serde_json::json!(true);
         }
@@ -1175,12 +1324,11 @@ fn parse_commit(
         None
     };
 
-    // Use patience diff for the git2 line capture.  We use patience for
-    // the atomic RecordingOptions too (see write_commit), so both produce
-    // the same line classification for the same file content.
+    // Use git's default diff algorithm here. Harness parity compares against
+    // plain `git diff`, so the captured +/- lines need to reflect the same
+    // default edit classification rather than `--patience`.
     let mut diff_opts = DiffOptions::new();
     diff_opts.include_untracked(false);
-    diff_opts.patience(true);
 
     let mut diff = git_repo
         .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut diff_opts))
@@ -1210,10 +1358,19 @@ fn parse_commit(
         message: format!("Failed to get diff stats: {}", e),
     })?;
 
-    let is_empty = stats.files_changed() == 0;
-
-    // Parse files
-    let files = parse_diff_files(git_repo, &diff, &tree, parent_tree.as_ref())?;
+    // Parse files. Pure rename commits can show up as zero-stat directory
+    // modifications in libgit2; when that happens, fall back to recursive
+    // `git diff-tree -r -M` name-status output for per-file entries.
+    let mut files = parse_diff_files(git_repo, &diff, &tree, parent_tree.as_ref())?;
+    if stats.files_changed() == 0 {
+        if let Some(ref pt) = parent_tree {
+            let fallback = parse_diff_files_via_git_cli(git_repo, oid, pt.id(), &tree, pt)?;
+            if !fallback.is_empty() {
+                files = fallback;
+            }
+        }
+    }
+    let is_empty = files.is_empty();
 
     Ok(ParsedCommit {
         git_sha: sha,
@@ -1371,6 +1528,118 @@ fn parse_diff_files(
             diff_lines,
             old_path,
         });
+    }
+
+    Ok(files)
+}
+
+fn parse_diff_files_via_git_cli(
+    git_repo: &GitRepository,
+    commit_oid: Oid,
+    parent_oid: Oid,
+    tree: &Tree<'_>,
+    parent_tree: &Tree<'_>,
+) -> CliResult<Vec<ParsedFile>> {
+    let repo_root = git_repo.path().parent().ok_or_else(|| CliError::GitError {
+        message: "Failed to locate git repository root".to_string(),
+    })?;
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("diff-tree")
+        .arg("-r")
+        .arg("--name-status")
+        .arg("-M")
+        .arg(parent_oid.to_string())
+        .arg(commit_oid.to_string())
+        .output()
+        .map_err(|e| CliError::GitError {
+            message: format!("Failed to run git diff-tree fallback: {}", e),
+        })?;
+
+    if !output.status.success() {
+        return Err(CliError::GitError {
+            message: format!(
+                "git diff-tree fallback failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+
+    let mut files = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let status = parts.next().unwrap_or_default();
+        let Some(kind) = status.chars().next() else {
+            continue;
+        };
+
+        match kind {
+            'A' => {
+                let Some(path) = parts.next() else { continue };
+                files.push(ParsedFile {
+                    path: path.to_string(),
+                    operation: FileOperation::Added,
+                    new_content: get_file_content(git_repo, tree, path).ok(),
+                    old_content: None,
+                    diff_lines: None,
+                    old_path: None,
+                });
+            }
+            'M' => {
+                let Some(path) = parts.next() else { continue };
+                files.push(ParsedFile {
+                    path: path.to_string(),
+                    operation: FileOperation::Modified,
+                    new_content: get_file_content(git_repo, tree, path).ok(),
+                    old_content: get_file_content(git_repo, parent_tree, path).ok(),
+                    diff_lines: None,
+                    old_path: None,
+                });
+            }
+            'D' => {
+                let Some(path) = parts.next() else { continue };
+                files.push(ParsedFile {
+                    path: path.to_string(),
+                    operation: FileOperation::Deleted,
+                    new_content: None,
+                    old_content: get_file_content(git_repo, parent_tree, path).ok(),
+                    diff_lines: None,
+                    old_path: None,
+                });
+            }
+            'R' => {
+                let Some(old_path) = parts.next() else {
+                    continue;
+                };
+                let Some(path) = parts.next() else { continue };
+                files.push(ParsedFile {
+                    path: path.to_string(),
+                    operation: FileOperation::Renamed,
+                    new_content: get_file_content(git_repo, tree, path).ok(),
+                    old_content: get_file_content(git_repo, parent_tree, old_path).ok(),
+                    diff_lines: None,
+                    old_path: Some(old_path.to_string()),
+                });
+            }
+            'C' => {
+                let _old_path = parts.next();
+                let Some(path) = parts.next() else { continue };
+                files.push(ParsedFile {
+                    path: path.to_string(),
+                    operation: FileOperation::Copied,
+                    new_content: get_file_content(git_repo, tree, path).ok(),
+                    old_content: None,
+                    diff_lines: None,
+                    old_path: None,
+                });
+            }
+            _ => {}
+        }
     }
 
     Ok(files)

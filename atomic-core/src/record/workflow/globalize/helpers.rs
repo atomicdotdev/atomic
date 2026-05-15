@@ -153,6 +153,29 @@ pub fn extract_filename(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+/// Split a byte slice into lines, preserving the trailing `\n` on each.
+///
+/// The final slice may not end with `\n` if the input doesn't.  An empty
+/// input produces an empty `Vec`.
+///
+/// This is used by the FileAdd path to create one graph vertex per line,
+/// giving the graph line-level granularity from the very first record.
+#[must_use]
+pub fn split_into_lines(content: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for (i, &b) in content.iter().enumerate() {
+        if b == b'\n' {
+            lines.push(&content[start..=i]);
+            start = i + 1;
+        }
+    }
+    if start < content.len() {
+        lines.push(&content[start..]);
+    }
+    lines
+}
+
 /// Extract the parent directory from a path.
 ///
 /// # Arguments

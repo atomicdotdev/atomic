@@ -53,6 +53,12 @@ pub struct GlobalizeContext<'txn, T> {
     ///
     /// Maps inodes to their graph positions.
     pub(super) position_cache: std::collections::HashMap<Inode, Position<NodeId>>,
+
+    /// Cache of ordered content vertices per inode.
+    ///
+    /// Globalization frequently asks for the same file's line vertices across
+    /// many hunks in a single recorded file. Cache that traversal once.
+    pub(super) content_vertices_cache: std::collections::HashMap<Inode, Vec<GraphNode<NodeId>>>,
 }
 
 impl<'txn, T> GlobalizeContext<'txn, T>
@@ -79,6 +85,7 @@ where
             dependencies: HashSet::new(),
             inode_cache: std::collections::HashMap::new(),
             position_cache: std::collections::HashMap::new(),
+            content_vertices_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -102,6 +109,7 @@ where
             dependencies: HashSet::new(),
             inode_cache: std::collections::HashMap::new(),
             position_cache: std::collections::HashMap::new(),
+            content_vertices_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -238,6 +246,7 @@ where
     pub fn clear_caches(&mut self) {
         self.inode_cache.clear();
         self.position_cache.clear();
+        self.content_vertices_cache.clear();
     }
 
     /// Get cache statistics for debugging.

@@ -47,6 +47,7 @@ impl Repository {
         header: ChangeHeader,
         options: RecordOptions,
     ) -> Result<RecordOutcome, RecordError> {
+        let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some();
         use atomic_core::output::Memory;
         use atomic_core::record::workflow::{
             assemble_change, record_added_file, record_deleted_file, record_modified_file,
@@ -363,9 +364,24 @@ impl Repository {
                     // This creates efficient incremental changes rather than
                     // replacing the entire file content.
 
-                    // Step 1: Look up the file's inode and position from the pristine
-                    // This is required for globalization to create Edit hunks instead of FileAdd
-                    let (file_inode, file_position) = {
+                    // Step 1: Look up the file's inode and position from the
+                    // pristine, plus its existing CRDT branches in file order.
+                    //
+                    // The existing branches are passed to record_modified_file
+                    // so that Delete and Modify CRDT ops reference the real
+                    // BranchIds for those old-content lines, not fresh
+                    // placeholders — see RCA §11.3 and `iter_trunk_branches_in_file_order`.
+                    let (
+                        file_inode,
+                        file_position,
+                        existing_trunk_id,
+                        existing_branches,
+                        can_use_crdt_old_content,
+                    ) = {
+                        use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
+                        use atomic_core::crdt::tables::decode_trunk_id;
+                        use atomic_core::pristine::CrdtTxnT;
+
                         let txn = self
                             .pristine
                             .read_txn()
@@ -411,7 +427,74 @@ impl Repository {
                             }
                         };
 
-                        (inode, position)
+                        // Resolve the file's existing CRDT branches in file
+                        // order, filtered to **alive** branches only.
+                        //
+                        // The line diff that consumes this slice indexes by
+                        // 0-based line number in the *old content* — and the
+                        // old content only contains alive lines.  Including
+                        // deleted (tombstoned) branches would shift every
+                        // subsequent index, so a Modify of "line 30" would
+                        // reference a deleted branch from earlier in the
+                        // chain.
+                        //
+                        // Empty when this file has no CRDT rows yet (a repo
+                        // that predates CRDT population, or a file imported
+                        // via a path that bypassed the CRDT builder) — in
+                        // that case record_modified_file falls back to
+                        // placeholders.
+                        use atomic_core::crdt::tables::encode_branch_id;
+                        let inode_u64 = inode.get();
+                        let existing_trunk_id = match txn.get_crdt_inode_trunk(inode_u64) {
+                            Ok(Some(trunk_key)) => Some(decode_trunk_id(&trunk_key)),
+                            _ => None,
+                        };
+                        let existing_branches = match existing_trunk_id {
+                            Some(trunk_id) => {
+                                match iter_trunk_branches_in_file_order(&txn, trunk_id) {
+                                    Ok(all) => {
+                                        let mut alive = Vec::with_capacity(all.len());
+                                        for b in all {
+                                            let bk = encode_branch_id(&b);
+                                            match txn.get_crdt_branch(&bk) {
+                                                Ok(Some(branch_data))
+                                                    if branch_data.state.is_alive() =>
+                                                {
+                                                    alive.push(b);
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        alive
+                                    }
+                                    Err(_) => Vec::new(),
+                                }
+                            }
+                            None => Vec::new(),
+                        };
+
+                        let view_name = options.get_view().unwrap_or(&self.current_view);
+                        let can_use_crdt_old_content = if existing_branches.is_empty() {
+                            false
+                        } else if let Some(view) = txn
+                            .get_view(view_name)
+                            .map_err(|e| RecordError::Database(e.to_string()))?
+                        {
+                            let visible_changes = collect_visible_change_ids(&txn, &view)?;
+                            existing_branches
+                                .iter()
+                                .all(|branch_id| visible_changes.contains(&branch_id.change_id()))
+                        } else {
+                            false
+                        };
+
+                        (
+                            inode,
+                            position,
+                            existing_trunk_id,
+                            existing_branches,
+                            can_use_crdt_old_content,
+                        )
                     };
 
                     // Step 2: Retrieve old content from the graph.
@@ -462,10 +545,53 @@ impl Repository {
                     detected.inode = Some(file_inode);
                     detected.position = Some(file_position);
 
-                    // Step 6: Record the modification using the diff-based workflow
+                    // Step 6: Record the modification using the diff-based workflow.
                     // This creates Edit hunks for insertions and Replacement hunks
                     // for deletions, rather than a full FileAdd replacement.
-                    match record_modified_file(&memory_wc, &detected, &old_content, &core_options) {
+                    //
+                    // `existing_branches` lets the CRDT op builder bind
+                    // Delete/Modify ops to the real BranchIds for those
+                    // old-content lines (or `None` when this file has no CRDT
+                    // rows yet — see Step 1).
+                    // The CRDT walker (`get_file_content_via_crdt`) reads
+                    // the *materialized* state across all views.  In a
+                    // single-view linear history (e.g. hyperfine import)
+                    // that's identical to the view-scoped byte-graph
+                    // walker, and using it lets the CRDT op recipe see
+                    // chain-correct content for move detection.
+                    //
+                    // In multi-view scenarios (e.g. the cross-view-merge
+                    // tests), the CRDT walker leaks other views'
+                    // modifications into this view's record, which then
+                    // emits spurious reverts.
+                    //
+                    // Reuse the CRDT-materialized baseline only when every
+                    // existing branch belongs to a change visible on this
+                    // view. That keeps draft-only linear histories on the
+                    // CRDT cleanup path without leaking sibling-view branches
+                    // into cross-view recording.
+                    let crdt_old_content: Option<Vec<u8>> = if can_use_crdt_old_content {
+                        match self.get_file_content_via_crdt(entry.path()) {
+                            Ok(Some(content)) if content == old_content => Some(content),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let existing_branches_slice: Option<&[_]> = if existing_branches.is_empty() {
+                        None
+                    } else {
+                        Some(existing_branches.as_slice())
+                    };
+                    match record_modified_file(
+                        &memory_wc,
+                        &detected,
+                        &old_content,
+                        crdt_old_content.as_deref(),
+                        &core_options,
+                        existing_trunk_id,
+                        existing_branches_slice,
+                    ) {
                         Ok(recorded) => {
                             if !recorded.is_empty() {
                                 stats.files_recorded += 1;
@@ -598,6 +724,7 @@ impl Repository {
         // Use the original V3 bytes (not re-serialized) to ensure the hash
         // on disk matches the hash registered in the pristine graph.
         if options.get_save_to_store() {
+            let save_start = std::time::Instant::now();
             if let Some(v3_bytes) = outcome.v3_bytes() {
                 // Fast path: write the exact V3 bytes that produced computed_hash
                 self.save_change_bytes(&computed_hash, v3_bytes, outcome.change())
@@ -608,6 +735,12 @@ impl Repository {
                     .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
             }
             outcome.set_saved(true);
+            if trace_record {
+                eprintln!(
+                    "[record] save_change complete elapsed={:?}",
+                    save_start.elapsed()
+                );
+            }
         }
 
         // Apply if requested
@@ -629,6 +762,7 @@ impl Repository {
                     // files (mtime+size match) or avoid graph reconstruction
                     // (compare stored content hash instead).
                     if let Ok(mut idx_txn) = self.pristine.write_txn() {
+                        let file_index_start = std::time::Instant::now();
                         for path_str in outcome.recorded_files() {
                             // Strip directory markers like "dir/ (directory)"
                             let clean_path =
@@ -653,6 +787,12 @@ impl Repository {
                             }
                         }
                         let _ = idx_txn.commit();
+                        if trace_record {
+                            eprintln!(
+                                "[record] file_index_update complete elapsed={:?}",
+                                file_index_start.elapsed()
+                            );
+                        }
                     }
                 }
                 Err(e) => {

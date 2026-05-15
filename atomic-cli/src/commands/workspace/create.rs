@@ -109,10 +109,14 @@ impl Command for WorkspaceCreate {
 
             print_next_steps(&[
                 (
-                    &format!("atomic project create <name> --workspace {}", ws.slug),
+                    &format!("atomic workspace set {}", ws.slug),
+                    "Set as your default workspace",
+                ),
+                (
+                    "atomic project create <project-name>",
                     "Create a project in this workspace",
                 ),
-                ("atomic workspace list", "List all workspaces"),
+                ("atomic workspace list", "View all workspaces"),
             ]);
 
             Ok(())

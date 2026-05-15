@@ -225,6 +225,7 @@ pub mod conflict;
 pub mod edge;
 mod error;
 pub mod file_ops;
+mod graph_batch;
 pub mod insertion;
 pub mod position;
 mod workspace;
@@ -247,8 +248,8 @@ pub use position::{
 };
 
 // Re-export atom application functions
-pub use edge::{find_source_vertex, find_target_vertex, write_edge_map};
-pub use insertion::{add_edge_with_reverse, write_new_vertex};
+pub use edge::{find_source_vertex, find_target_vertex, write_edge_map, write_edge_map_batched};
+pub use insertion::{add_edge_with_reverse, write_new_vertex, write_new_vertex_batched};
 
 // Re-export conflict tracking types
 pub use conflict::{
@@ -256,4 +257,5 @@ pub use conflict::{
 };
 
 // Re-export FileOps application
-pub use file_ops::{apply_file_ops, ApplyFileOpsStats};
+pub use file_ops::{apply_file_ops, apply_file_ops_batched, ApplyFileOpsStats};
+pub use graph_batch::GraphWriteBatch;

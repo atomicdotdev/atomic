@@ -6,6 +6,7 @@ use atomic_core::types::Base32;
 use tempfile::TempDir;
 
 mod change_tests;
+mod cross_view_merge_tests;
 mod edit_tests;
 mod history_tests;
 mod init_tests;

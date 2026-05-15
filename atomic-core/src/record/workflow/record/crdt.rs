@@ -14,6 +14,9 @@ use crate::record::workflow::crdt::{
     ContentTokenizer, CrdtBuildStats, CrdtChangeBuilder, FileOps as BuilderFileOps,
     LineOps as BuilderLineOps,
 };
+use crate::record::workflow::recipes::diff_op_rules::{
+    dispatch as dispatch_diff_op_rule, DiffOpContext as RuleDiffOpContext, Line as RuleLine,
+};
 
 /// Build CRDT operations for a newly added file.
 ///
@@ -83,30 +86,57 @@ pub(super) fn build_crdt_ops_for_deleted_file(path: &str) -> (FileOps, CrdtBuild
 ///
 /// This performs token-level diff analysis to generate fine-grained
 /// Branch and Leaf operations for conflict-free merging.
-pub(super) fn build_crdt_ops_for_modified_file(
+///
+/// `existing_branches`, when supplied, is the file-ordered list of
+/// `BranchId`s for `old_content`'s lines.  `existing_branches[i]` is the
+/// `BranchId` representing line `i` of the old file (0-indexed).  When this
+/// is `Some(..)`, `Delete` and `Modify` operations reference the actual
+/// existing branch instead of a fresh placeholder — the load-bearing piece
+/// for keeping the CRDT layer in sync across commits (RCA §11.3).
+///
+/// When `existing_branches` is `None` (e.g., a CRDT-naïve caller, or the
+/// trunk has no recorded branches yet), the function falls back to allocating
+/// fresh placeholders for every line op.  That preserves the legacy behavior
+/// but is *not* sufficient for correct cross-commit branch tracking.
+pub(crate) fn build_crdt_ops_for_modified_file(
     path: &str,
     old_content: &[u8],
     new_content: &[u8],
     _encoding: Encoding,
     algorithm: Algorithm,
+    existing_trunk_id: Option<TrunkId>,
+    existing_branches: Option<&[BranchId]>,
 ) -> (FileOps, CrdtBuildStats) {
     // Use placeholder change ID
     let placeholder_change_id = NodeId::new(0);
 
     // Create file ops container (no TrunkOp for modification - file already exists)
-    let trunk_id = TrunkId::new(placeholder_change_id, 0);
+    let trunk_id = existing_trunk_id.unwrap_or_else(|| TrunkId::new(placeholder_change_id, 0));
     let mut file_ops = BuilderFileOps::new(trunk_id, path.to_string(), None);
 
     let mut stats = CrdtBuildStats::new();
     let mut next_branch_idx: u32 = 0;
     let mut next_leaf_idx: u32 = 0;
 
-    // Helper to allocate branch IDs
+    // Helper to allocate fresh placeholder branch IDs.  Used for Inserts
+    // (genuinely new lines) and as a fallback when existing_branches has no
+    // entry for the requested old-line index.
     let mut alloc_branch = || {
         let id = BranchId::new(placeholder_change_id, next_branch_idx);
         next_branch_idx += 1;
         id
     };
+
+    // Resolve the existing BranchId for an old-content line, or allocate a
+    // fresh placeholder when the CRDT side has no row for that line.
+    // Returns the BranchId to use for Delete/Modify on that line.
+    let branch_for_old_line =
+        |old_line_idx: usize, alloc: &mut dyn FnMut() -> BranchId| -> BranchId {
+            match existing_branches {
+                Some(bs) if old_line_idx < bs.len() => bs[old_line_idx],
+                _ => alloc(),
+            }
+        };
 
     // Helper to allocate leaf IDs
     let mut alloc_leaf = || {
@@ -121,6 +151,14 @@ pub(super) fn build_crdt_ops_for_modified_file(
 
     let old_lines: Vec<_> = old_tokenizer.lines().collect();
     let new_lines: Vec<_> = new_tokenizer.lines().collect();
+    let old_rule_lines: Vec<_> = old_content
+        .split_inclusive(|&b| b == b'\n')
+        .map(RuleLine::new)
+        .collect();
+    let new_rule_lines: Vec<_> = new_content
+        .split_inclusive(|&b| b == b'\n')
+        .map(RuleLine::new)
+        .collect();
 
     // Perform line-level diff
     let line_diff = compare_content(old_content, new_content, algorithm);
@@ -139,11 +177,28 @@ pub(super) fn build_crdt_ops_for_modified_file(
                 new_pos,
                 len,
             } => {
-                // Equal lines - no CRDT operations needed, but track position
+                let mut ctx = RuleDiffOpContext {
+                    existing_branches,
+                    old_lines: &old_rule_lines,
+                    new_lines: &new_rule_lines,
+                    encoding: _encoding,
+                    placeholder_change: placeholder_change_id,
+                    prev_branch,
+                    emitted: Vec::new(),
+                };
+
+                if dispatch_diff_op_rule(op, &mut ctx) {
+                    collected_line_ops.extend(ctx.emitted);
+                    prev_branch = ctx.prev_branch;
+                } else if let Some(existing) = existing_branches {
+                    let _ = new_pos;
+                    let last_equal_idx = old_pos + len - 1;
+                    if last_equal_idx < existing.len() {
+                        prev_branch = Some(existing[last_equal_idx]);
+                    }
+                }
                 _old_line_idx = old_pos + len;
                 _new_line_idx = new_pos + len;
-                // Update prev_branch to reference the last equal line
-                // (In a full implementation, we'd look up the existing branch ID)
             }
             crate::diff::DiffOp::Delete {
                 old_pos,
@@ -153,7 +208,7 @@ pub(super) fn build_crdt_ops_for_modified_file(
                 // Deleted lines - create BranchOp::Delete for each with original content
                 for i in 0..*len {
                     let line_idx = old_pos + i;
-                    let branch_id = alloc_branch();
+                    let branch_id = branch_for_old_line(line_idx, &mut alloc_branch);
 
                     // Capture the original line content for diff display
                     let content = if line_idx < old_lines.len() {
@@ -259,7 +314,7 @@ pub(super) fn build_crdt_ops_for_modified_file(
                     for i in 0..*old_len {
                         let old_line_idx = old_pos + i;
                         let new_line_idx = new_pos + i;
-                        let branch_id = alloc_branch();
+                        let branch_id = branch_for_old_line(old_line_idx, &mut alloc_branch);
                         let old_leaf_ops = build_old_leaf_ops(old_line_idx);
 
                         let mut prev_leaf: Option<crate::crdt::LeafId> = None;
@@ -294,76 +349,15 @@ pub(super) fn build_crdt_ops_for_modified_file(
                     _old_line_idx = old_pos + old_len;
                     _new_line_idx = new_pos + new_len;
                 } else {
-                    // Unequal counts: use bigram similarity to find the
-                    // best match for each old line among the new lines.
-                    let bigrams = |s: &str| -> std::collections::HashSet<(u8, u8)> {
-                        let bytes = s.trim().as_bytes();
-                        let mut set = std::collections::HashSet::new();
-                        if bytes.len() >= 2 {
-                            for w in bytes.windows(2) {
-                                set.insert((w[0], w[1]));
-                            }
-                        }
-                        set
-                    };
-
-                    // paired_old[oi] = Some(ni) means old line oi pairs with new line ni
-                    let mut paired_old: Vec<Option<usize>> = vec![None; *old_len];
-                    let mut matched_new: Vec<bool> = vec![false; *new_len];
-
-                    let mut scores: Vec<(usize, usize, f64)> = Vec::new();
+                    // Unequal counts are structurally ambiguous.  Do not try
+                    // to infer line identity by trimming or fuzzy similarity:
+                    // that collapses indentation-only edits, blank lines, and
+                    // moved-and-edited lines onto the wrong branch.  Emit the
+                    // byte-exact Delete+Insert shape and let the later exact-
+                    // content move pass promote only genuine unchanged moves.
                     for oi in 0..*old_len {
-                        let old_idx = old_pos + oi;
-                        let old_text = if old_idx < old_lines.len() {
-                            String::from_utf8_lossy(old_lines[old_idx].content())
-                        } else {
-                            continue;
-                        };
-                        let old_bg = bigrams(old_text.trim());
-                        if old_bg.is_empty() {
-                            continue;
-                        }
-
-                        for ni in 0..*new_len {
-                            let new_idx = new_pos + ni;
-                            let new_text = if new_idx < new_lines.len() {
-                                String::from_utf8_lossy(new_lines[new_idx].content())
-                            } else {
-                                continue;
-                            };
-                            let new_bg = bigrams(new_text.trim());
-                            if new_bg.is_empty() {
-                                continue;
-                            }
-                            let inter = old_bg.intersection(&new_bg).count();
-                            let union = old_bg.union(&new_bg).count();
-                            if union > 0 {
-                                let score = inter as f64 / union as f64;
-                                if score >= 0.3 {
-                                    scores.push((oi, ni, score));
-                                }
-                            }
-                        }
-                    }
-
-                    scores
-                        .sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-
-                    for (oi, ni, _score) in &scores {
-                        if paired_old[*oi].is_some() || matched_new[*ni] {
-                            continue;
-                        }
-                        paired_old[*oi] = Some(*ni);
-                        matched_new[*ni] = true;
-                    }
-
-                    // Walk old lines: unpaired → Delete
-                    for (oi, paired_old_item) in paired_old.iter().enumerate().take(*old_len) {
-                        if paired_old_item.is_some() {
-                            continue;
-                        }
                         let old_line_idx = old_pos + oi;
-                        let branch_id = alloc_branch();
+                        let branch_id = branch_for_old_line(old_line_idx, &mut alloc_branch);
                         let content = if old_line_idx < old_lines.len() {
                             old_lines[old_line_idx]
                                 .tokens()
@@ -383,82 +377,31 @@ pub(super) fn build_crdt_ops_for_modified_file(
                         stats.lines_deleted += 1;
                     }
 
-                    // Walk new lines: paired → Modify, unpaired → Insert
                     for ni in 0..*new_len {
                         let new_line_idx = new_pos + ni;
-                        // Find if any old line pairs with this new line
-                        let paired_oi = paired_old.iter().position(|m| m == &Some(ni));
-
-                        if let Some(oi) = paired_oi {
-                            let old_line_idx = old_pos + oi;
+                        if new_line_idx < new_lines.len() {
                             let branch_id = alloc_branch();
-                            let old_leaf_ops = if old_line_idx < old_lines.len() {
-                                old_lines[old_line_idx]
-                                    .tokens()
-                                    .iter()
-                                    .map(|t| LeafOp::Insert {
-                                        after: None,
+                            let mut prev_leaf: Option<crate::crdt::LeafId> = None;
+                            let leaf_ops: Vec<LeafOp> = new_lines[new_line_idx]
+                                .tokens()
+                                .iter()
+                                .map(|t| {
+                                    let leaf_id = alloc_leaf();
+                                    let op = LeafOp::Insert {
+                                        after: prev_leaf,
                                         kind: t.kind(),
                                         content: t.content().to_vec(),
-                                    })
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                            let mut prev_leaf: Option<crate::crdt::LeafId> = None;
-                            let new_leaf_ops: Vec<LeafOp> = if new_line_idx < new_lines.len() {
-                                new_lines[new_line_idx]
-                                    .tokens()
-                                    .iter()
-                                    .map(|t| {
-                                        let leaf_id = alloc_leaf();
-                                        let op = LeafOp::Insert {
-                                            after: prev_leaf,
-                                            kind: t.kind(),
-                                            content: t.content().to_vec(),
-                                        };
-                                        stats.tokens_added += 1;
-                                        prev_leaf = Some(leaf_id);
-                                        op
-                                    })
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                            let line_op =
-                                BuilderLineOps::modify(branch_id, old_leaf_ops, new_leaf_ops)
-                                    .with_old_line_num(old_line_idx + 1)
-                                    .with_new_line_num(new_line_idx + 1);
+                                    };
+                                    stats.tokens_added += 1;
+                                    prev_leaf = Some(leaf_id);
+                                    op
+                                })
+                                .collect();
+                            let line_op = BuilderLineOps::insert(branch_id, prev_branch, leaf_ops)
+                                .with_new_line_num(new_line_idx + 1);
                             collected_line_ops.push(line_op);
-                            stats.lines_modified += 1;
+                            stats.lines_added += 1;
                             prev_branch = Some(branch_id);
-                        } else {
-                            // Unpaired new line → Insert
-                            if new_line_idx < new_lines.len() {
-                                let branch_id = alloc_branch();
-                                let mut prev_leaf: Option<crate::crdt::LeafId> = None;
-                                let leaf_ops: Vec<LeafOp> = new_lines[new_line_idx]
-                                    .tokens()
-                                    .iter()
-                                    .map(|t| {
-                                        let leaf_id = alloc_leaf();
-                                        let op = LeafOp::Insert {
-                                            after: prev_leaf,
-                                            kind: t.kind(),
-                                            content: t.content().to_vec(),
-                                        };
-                                        stats.tokens_added += 1;
-                                        prev_leaf = Some(leaf_id);
-                                        op
-                                    })
-                                    .collect();
-                                let line_op =
-                                    BuilderLineOps::insert(branch_id, prev_branch, leaf_ops)
-                                        .with_new_line_num(new_line_idx + 1);
-                                collected_line_ops.push(line_op);
-                                stats.lines_added += 1;
-                                prev_branch = Some(branch_id);
-                            }
                         }
                     }
 
@@ -469,16 +412,59 @@ pub(super) fn build_crdt_ops_for_modified_file(
         }
     }
 
-    // ── Cross-block Delete+Insert→Modify consolidation ───────────────────
+    // ── Move detection: promote Delete+Insert pairs to Reparent ─────────
     //
-    // After the Replace blocks have handled within-block pairing, this pass
-    // promotes any remaining standalone Delete+Insert pairs (from separate
-    // DiffOp::Delete and DiffOp::Insert operations) into BranchOp::Modify
-    // when the lines are similar (bigram Jaccard ≥ 0.3).
+    // Myers emits separate Delete (at the old location) and Insert (at
+    // the new location) for moved lines — extract-function refactors are
+    // the canonical example.  Without intervention, the existing branch
+    // stays alive at its old chain position with stale content, AND a
+    // new branch is created at the new chain position with the same
+    // content.  Walker emits the line twice.
     //
-    // NOTE: For git-imported changes, build_crdt_ops_from_git_diff() overrides
-    // the entire CRDT output, so this pairing only affects `atomic record`.
-    {
+    // The diff_op_rules post-pass scans the emitted op stream for
+    // Delete + Insert pairs whose leaf content is byte-identical, and
+    // promotes each pair into a single Reparent of the existing branch
+    // to the Insert's chain position.  Exact-content matching (not
+    // similarity) prevents the false positives that scoring-based
+    // consolidation suffered from.
+    // Disabled for now: a single Reparent is not sufficient to preserve a
+    // coherent BRANCH_AFTER chain when a line moves.  The current post-pass
+    // promotes Delete+Insert into one Reparent without also repointing the
+    // moved line's former successor, which can leave stale ordering behind.
+    //
+    // Until the move representation grows paired-reparent support, keep the
+    // byte-exact Delete+Insert form.  That preserves materialized content and
+    // whitespace accurately, which is more important than line identity here.
+    let _promoted_count = 0usize;
+
+    // ── Legacy bigram-similarity consolidation (DISABLED) ────────────────
+    //
+    // This pass used to pair standalone DiffOp::Delete and DiffOp::Insert
+    // operations by bigram similarity across the full diff, promoting
+    // matches to BranchOp::Modify so the diff display could show them as
+    // a single -/+ pair with word-level highlighting.
+    //
+    // The problem: a Modify reuses an EXISTING branch's after-chain
+    // position while taking content from a different line's new-content
+    // position.  Pairing across blocks (where the Delete and Insert are
+    // far apart in the diff) means the Modify ends up emitting content
+    // from line N at branch position M — the walker, iterating in chain
+    // order, then emits the content at the wrong place in file order.
+    //
+    // For CRDT correctness the chain MUST reflect the new file's line
+    // order.  Cross-block pairing breaks that invariant.  Within-block
+    // pairing (handled inside the Replace match arm above) is safe
+    // because all paired old/new positions stay within the same diff
+    // block, and Inserts inside the block correctly interleave between
+    // the surviving Modifies.
+    //
+    // Diff display can re-pair Delete+Insert at render time if it wants
+    // a Modify-style presentation — that's a display concern, not a
+    // graph concern.
+    //
+    // Task #24 (RCA §11.7): keeping standalone Delete/Insert ops as-is
+    // closes the hyperfine commit-2 walker mismatch.
+    if false {
         let extract_text = |op: &BuilderLineOps| -> String {
             let leaves = match op.operation() {
                 BranchOp::Delete { content, .. } | BranchOp::Insert { content, .. } => content,
@@ -579,6 +565,35 @@ pub(super) fn build_crdt_ops_for_modified_file(
             .map(|op| std::mem::replace(op, make_placeholder()))
             .collect();
 
+        // Build a map of placeholder BranchId → the existing BranchId it
+        // got promoted to.  When a later Insert's `after` ref points at one
+        // of these (because `prev_branch` was set to the placeholder before
+        // we knew the Insert would be consolidated), we need to rewrite the
+        // ref to the existing branch — otherwise BRANCH_AFTER ends up with
+        // a dangling pointer and the file-order walk falls back to
+        // BranchId-sort leftover cleanup, producing scrambled output.
+        let mut placeholder_to_existing: std::collections::HashMap<BranchId, BranchId> =
+            std::collections::HashMap::new();
+        for (&ins_idx, &del_idx) in &promote {
+            let original_insert_branch = slots[ins_idx].branch_id();
+            let existing_branch = slots[del_idx].branch_id();
+            placeholder_to_existing.insert(original_insert_branch, existing_branch);
+        }
+
+        // Helper: rewrite a single `BranchOp::Insert`'s `after` if it points
+        // at a promoted placeholder.
+        let rewrite_after = |op: &mut BuilderLineOps| {
+            if let BranchOp::Insert {
+                after: Some(ref mut a),
+                ..
+            } = op.operation_mut()
+            {
+                if let Some(replacement) = placeholder_to_existing.get(a) {
+                    *a = *replacement;
+                }
+            }
+        };
+
         let mut consolidated: Vec<BuilderLineOps> = Vec::with_capacity(slots.len());
 
         for idx in 0..slots.len() {
@@ -608,7 +623,8 @@ pub(super) fn build_crdt_ops_for_modified_file(
                 }
                 consolidated.push(modify);
             } else {
-                let op = std::mem::replace(&mut slots[idx], make_placeholder());
+                let mut op = std::mem::replace(&mut slots[idx], make_placeholder());
+                rewrite_after(&mut op);
                 consolidated.push(op);
             }
         }

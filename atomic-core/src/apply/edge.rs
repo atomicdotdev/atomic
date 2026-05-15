@@ -43,14 +43,17 @@
 //! These are tracked in the workspace for later resolution.
 
 use crate::change::{Change, EdgeUpdate, NewEdge};
-use crate::pristine::{GraphTxnT, MutTxnT};
+use crate::pristine::{GraphTxnT, MutTxnT, TreeTxnT};
 use crate::types::{
     ChangePosition, EdgeFlags, EdgeKind, GraphNode, Hash, Inode, NodeId, Position,
     SerializedGraphEdge,
 };
 
 use super::error::LocalApplyError;
-use super::position::{resolve_inode, resolve_introduced_by, resolve_position};
+use super::graph_batch::GraphWriteBatch;
+use super::position::{
+    resolve_inode, resolve_introduced_by, resolve_position, resolve_vertex as resolve_exact_vertex,
+};
 use super::workspace::Workspace;
 
 // EdgeUpdate Writing
@@ -92,6 +95,31 @@ pub fn write_edge_map<T: MutTxnT>(
     Ok(())
 }
 
+/// Batched variant of [`write_edge_map`] that keeps graph tables open across
+/// the full hunk pass.
+pub fn write_edge_map_batched<T: GraphTxnT + TreeTxnT>(
+    txn: &T,
+    graph_batch: &mut GraphWriteBatch<'_>,
+    workspace: &mut Workspace,
+    change_id: NodeId,
+    edge_update: &EdgeUpdate<Option<Hash>>,
+    change: &Change,
+) -> Result<(), LocalApplyError> {
+    for edge in &edge_update.edges {
+        write_new_edge_batched(
+            txn,
+            graph_batch,
+            workspace,
+            change_id,
+            &edge_update.inode,
+            edge,
+            change,
+        )?;
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Vertex resolution helpers for the apply pipeline
 // ---------------------------------------------------------------------------
@@ -100,7 +128,7 @@ pub fn write_edge_map<T: MutTxnT>(
 ///
 /// Uses `find_block` for forward context (containing position) and
 /// `find_block_end` for predecessor context (ending at position).
-pub(super) fn resolve_vertex<T: MutTxnT>(
+pub(super) fn resolve_vertex<T: GraphTxnT>(
     txn: &T,
     pos: Position<NodeId>,
     is_predecessor: bool,
@@ -147,16 +175,29 @@ fn write_new_edge<T: MutTxnT>(
         edge.to
     );
 
-    // Resolve the introduced_by change
-    let introduced_by = resolve_introduced_by(txn, &edge.introduced_by, change_id)?;
+    // Resolve the introduced_by change for validation / side effects.
+    // The resolved id itself is unused here — the additive-only edge
+    // model writes the new edge directly without consulting it.
+    let _ = resolve_introduced_by(txn, &edge.introduced_by, change_id)?;
 
     // Find source span — predecessor context (ending at position).
     let source_pos = resolve_position(txn, &edge.from, change_id)?;
     let source = resolve_vertex(txn, source_pos, true)?;
 
-    // Find target span — forward context (containing position).
-    let target_pos = resolve_position(txn, &edge.to.start_pos(), change_id)?;
-    let mut target = resolve_vertex(txn, target_pos, false)?;
+    // Prefer the exact serialized target span when it already exists.
+    // Structural updates like FileMove name deletions refer to a concrete
+    // vertex span, and reducing them to start_pos loses that precision.
+    let exact_target = resolve_exact_vertex(txn, &edge.to, change_id)?;
+    let mut target = if txn
+        .has_vertex(exact_target)
+        .map_err(|e| LocalApplyError::Internal {
+            message: format!("Failed to check target vertex: {}", e),
+        })? {
+        exact_target
+    } else {
+        let target_pos = resolve_position(txn, &edge.to.start_pos(), change_id)?;
+        resolve_vertex(txn, target_pos, false)?
+    };
 
     // Resolve inode for indexing
     let resolved_inode = resolve_inode(txn, inode, change_id)?;
@@ -189,27 +230,16 @@ fn write_new_edge<T: MutTxnT>(
         log::debug!("write_new_edge: collect_pseudo_edges complete");
     }
 
-    // Remove the old edge before adding the new one.
+    // ADDITIVE-ONLY: do NOT delete the old edge.  In a patch-theory
+    // graph database, every change adds new edges — it never removes
+    // them.  The original BLOCK edge stays in the B-tree alongside the
+    // new BLOCK|DELETED edge so other views (whose change filter does
+    // not include this deletion) continue to see the alive edge.
     //
-    // The `previous` field records the flags of the edge being superseded
-    // (e.g., BLOCK for a live edge that is now being marked DELETED).
-    // Without this deletion the old alive edge remains in the B-tree
-    // multimap alongside the new DELETED edge, causing `is_vertex_alive`
-    // to find the stale alive parent and incorrectly report the vertex as
-    // alive — which breaks subsequent Replace operations on the same file.
-    log::debug!("write_new_edge: del_edge_with_reverse");
-    del_edge_with_reverse(
-        txn,
-        resolved_inode,
-        edge.previous,
-        source,
-        target,
-        introduced_by,
-    )?;
-
-    // Add the new edge (e.g., BLOCK|DELETED to mark content as removed,
-    // or BLOCK to wire in new content).
-    log::debug!("write_new_edge: add_edge_with_reverse");
+    // `is_vertex_alive` checks for superseding deletions among ALL
+    // incoming edges (including DELETED ones) when a filter is active,
+    // so the alive edge being present doesn't "leak" through filters.
+    log::debug!("write_new_edge: add_edge_with_reverse (additive-only model)");
     add_edge_with_reverse(txn, resolved_inode, edge.flag, source, target, change_id)?;
 
     // For non-folder deletions, check for zombie context
@@ -217,6 +247,77 @@ fn write_new_edge<T: MutTxnT>(
         log::debug!("write_new_edge: collect_zombie_context starting");
         collect_zombie_context(txn, workspace, change, edge, change_id)?;
         log::debug!("write_new_edge: collect_zombie_context complete");
+    }
+
+    Ok(())
+}
+
+fn write_new_edge_batched<T: GraphTxnT + TreeTxnT>(
+    txn: &T,
+    graph_batch: &mut GraphWriteBatch<'_>,
+    workspace: &mut Workspace,
+    change_id: NodeId,
+    inode: &Position<Option<Hash>>,
+    edge: &NewEdge<Option<Hash>>,
+    change: &Change,
+) -> Result<(), LocalApplyError> {
+    log::debug!(
+        "write_new_edge_batched: flag={:?} from={:?} to={:?}",
+        edge.flag,
+        edge.from,
+        edge.to
+    );
+
+    let _ = resolve_introduced_by(txn, &edge.introduced_by, change_id)?;
+
+    let source_pos = resolve_position(txn, &edge.from, change_id)?;
+    let source = resolve_vertex(txn, source_pos, true)?;
+
+    let exact_target = resolve_exact_vertex(txn, &edge.to, change_id)?;
+    let mut target =
+        if graph_batch
+            .has_graph_vertex(exact_target)
+            .map_err(|e| LocalApplyError::Internal {
+                message: format!("Failed to check target vertex: {}", e),
+            })?
+        {
+            exact_target
+        } else {
+            let target_pos = resolve_position(txn, &edge.to.start_pos(), change_id)?;
+            resolve_vertex(txn, target_pos, false)?
+        };
+
+    let resolved_inode = resolve_inode(txn, inode, change_id)?;
+    let kind = EdgeKind::from_flags(edge.flag);
+
+    if kind.is_some_and(|k| k.is_folder()) {
+        workspace.mark_rooted(target.start_pos());
+    }
+
+    let target_end_pos = resolve_position(txn, &edge.to.end_pos(), change_id)?;
+    if target.end > target_end_pos.pos {
+        target = GraphNode {
+            change: target.change,
+            start: target.start,
+            end: target_end_pos.pos,
+        };
+    }
+
+    if kind.is_some_and(|k| k.is_deleted()) {
+        collect_pseudo_edges_for_reconnection(txn, workspace, target)?;
+    }
+
+    add_edge_with_reverse_batched(
+        graph_batch,
+        resolved_inode,
+        edge.flag,
+        source,
+        target,
+        change_id,
+    )?;
+
+    if kind.is_some_and(|k| k.is_deleted() && !k.is_folder()) {
+        collect_zombie_context(txn, workspace, change, edge, change_id)?;
     }
 
     Ok(())
@@ -301,6 +402,7 @@ pub fn find_target_vertex<T: GraphTxnT>(
 ///
 /// Errors are silently ignored (the edge may not exist if this is the
 /// first time the graph is being written).
+#[allow(dead_code)]
 fn del_edge_with_reverse<T: MutTxnT>(
     txn: &mut T,
     inode: Option<Inode>,
@@ -379,6 +481,28 @@ fn add_edge_with_reverse<T: MutTxnT>(
     }
 
     Ok(())
+}
+
+fn add_edge_with_reverse_batched(
+    graph_batch: &mut GraphWriteBatch<'_>,
+    inode: Option<Inode>,
+    flag: EdgeFlags,
+    source: GraphNode<NodeId>,
+    dest: GraphNode<NodeId>,
+    introduced_by: NodeId,
+) -> Result<(), LocalApplyError> {
+    log::debug!(
+        "add_edge_with_reverse_batched: flag={:?} source=[{:?} {:?}:{:?}] dest=[{:?} {:?}:{:?}] introduced_by={:?}",
+        flag, source.change, source.start, source.end,
+        dest.change, dest.start, dest.end,
+        introduced_by
+    );
+
+    graph_batch
+        .add_edge_with_reverse(inode, flag, source, dest, introduced_by)
+        .map_err(|e| LocalApplyError::Internal {
+            message: format!("Failed to add edge pair: {}", e),
+        })
 }
 
 // Deletion Handling

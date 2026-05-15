@@ -349,22 +349,6 @@ for curr_sha in "${SAMPLED_COMMITS[@]}"; do
         continue
     fi
 
-    # Determine which files in this commit are renames (new path → old path).
-    # We handle renames inline rather than skipping the whole commit:
-    #   - Pure rename  : git --follow produces 0 +/- lines; atomic also produces 0.
-    #   - Rename+modify: git --follow produces the content delta; atomic shows the
-    #                    same lines under the new path.
-    # git diff --diff-filter=R --name-status gives lines like:
-    #   R100<TAB>old/path<TAB>new/path
-    # We build a set of new-paths that are renames so we can switch to --follow.
-    declare -A _rename_new_paths
-    _rename_new_paths=()
-    while IFS=$'\t' read -r _status _old _new; do
-        [[ -z "$_new" ]] && continue
-        _rename_new_paths["$_new"]="$_old"
-    done < <(git -C "$CLONE_DIR" diff --diff-filter=R --name-status \
-                 "$parent" "$curr_sha" 2>/dev/null || true)
-
     # Get the full atomic diff output once per commit (amortised cost).
     atomic_raw=$( (cd "$CLONE_DIR" && atomic diff -c "$atomic_hash" --no-color 2>/dev/null) || true )
 
@@ -372,7 +356,7 @@ for curr_sha in "${SAMPLED_COMMITS[@]}"; do
     for fpath in "${changed_files[@]}"; do
         # Detect whether this file is the new path of a rename.
         _is_rename=0
-        if [[ -n "${_rename_new_paths[$fpath]+x}" ]]; then
+        if [[ -n "$(get_rename_old_path "$CLONE_DIR" "$curr_sha" "$fpath")" ]]; then
             _is_rename=1
         fi
 
@@ -401,8 +385,6 @@ for curr_sha in "${SAMPLED_COMMITS[@]}"; do
             commit_ok=0
         fi
     done
-    unset _rename_new_paths
-
     if [[ $commit_ok -eq 1 ]]; then
         COMMITS_PASS=$((COMMITS_PASS + 1))
     else

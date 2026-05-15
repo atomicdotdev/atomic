@@ -119,6 +119,7 @@ pub mod apply;
 pub mod branch;
 pub mod ids;
 pub mod leaf;
+pub mod queries;
 pub mod tables;
 pub mod trunk;
 
@@ -172,6 +173,7 @@ pub use tables::{
     SerializedTrunk,
     // Table definitions
     BRANCHES,
+    BRANCH_AFTER,
     BRANCH_LEAVES,
     INODE_TRUNK,
     LEAVES,

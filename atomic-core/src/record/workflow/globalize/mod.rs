@@ -102,7 +102,7 @@ use crate::output::alive::{retrieve_graph, RetrieveOptions};
 
 use thiserror::Error;
 
-use crate::change::{Atom, EdgeUpdate, Encoding, GraphOp, Insertion, NewEdge};
+use crate::change::{Atom, EdgeUpdate, Encoding, GraphOp, Insertion, Local, NewEdge};
 use crate::pristine::{GraphTxnT, PristineError, TreeTxnT};
 use crate::types::{ChangePosition, EdgeFlags, GraphNode, Hash, Inode, NodeId, Position};
 
@@ -122,7 +122,7 @@ mod vertex;
 pub use context::*;
 pub use error::*;
 pub use file::*;
-pub use helpers::{extract_filename, extract_parent};
+pub use helpers::{extract_filename, extract_parent, split_into_lines};
 pub(crate) use helpers::{
     node_id_to_option_hash, position_to_option_hash, position_to_option_hash_resolved,
     vertex_to_option_hash,

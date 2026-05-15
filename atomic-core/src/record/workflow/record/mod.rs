@@ -144,7 +144,7 @@
 //!
 //! [`Change`]: crate::change::Change
 
-mod crdt;
+pub(crate) mod crdt;
 mod options;
 mod types;
 
@@ -156,6 +156,7 @@ pub use types::{RecordedFile, RecordingResult, RecordingStats};
 
 use crate::change::{Encoding, FileOps, Local};
 use crate::crdt::{BranchId, TrunkId};
+use crate::diff::DiffOp;
 use crate::output::WorkingCopyRead;
 use crate::types::NodeId;
 
@@ -174,7 +175,7 @@ use super::graph_op::{BuiltHunk, BuiltHunkKind, HunkBuilder};
 ///
 /// Used by [`build_crdt_ops_from_git_diff`] to build BranchOps that
 /// exactly match `git diff` output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GitDiffLine {
     /// `+`, `-`, or ` `
     pub origin: char,
@@ -331,7 +332,8 @@ pub fn record_deleted_file(
 ///
 /// * `working_copy` - Working copy interface
 /// * `detected` - The detected file (should have diff_ops populated)
-/// * `old_content` - The pristine (old) content
+/// * `old_content` - The pristine byte-graph (old) content
+/// * `crdt_old_content` - Optional CRDT-materialized old content for CRDT op generation
 /// * `options` - Recording options
 ///
 /// # Returns
@@ -344,14 +346,28 @@ pub fn record_deleted_file(
 /// use atomic_core::record::workflow::record::{record_modified_file, RecordingOptions};
 ///
 /// let options = RecordingOptions::new();
-/// let recorded = record_modified_file(&working_copy, &detected_file, &old_content, &options)?;
+/// let recorded = record_modified_file(&working_copy, &detected_file, &old_content, &options, None)?;
 /// ```
+///
+/// # `existing_branches`
+///
+/// When supplied, this is the file-ordered list of CRDT `BranchId`s for
+/// `old_content`'s lines (index `i` is the BranchId for the 0-indexed `i`-th
+/// line of the old file).  This lets `Delete` and `Modify` operations
+/// reference the actual existing branches instead of fresh placeholders,
+/// which is required for the CRDT layer to stay coherent across commits
+/// (see RCA §11.3).  Pass `None` only when the caller has no access to the
+/// pristine state (e.g., tests or in-memory pipelines) — that path emits
+/// placeholders and the CRDT layer is effectively insert-only.
 #[allow(clippy::type_complexity)]
 pub fn record_modified_file<W>(
     working_copy: &W,
     detected: &DetectedFile,
     old_content: &[u8],
+    crdt_old_content: Option<&[u8]>,
     options: &RecordingOptions,
+    existing_trunk_id: Option<TrunkId>,
+    existing_branches: Option<&[BranchId]>,
 ) -> Result<RecordedFile, String>
 where
     W: WorkingCopyRead,
@@ -426,7 +442,9 @@ where
     let hunk_options = options.to_hunk_options().encoding(encoding);
     let mut builder = HunkBuilder::with_options(&detected.path, hunk_options);
 
-    for op in &comparison.diff_ops {
+    let graph_diff_ops = rewrite_shifted_equals_for_graph(&comparison.diff_ops);
+
+    for op in &graph_diff_ops {
         builder.process_diff_op(op);
     }
 
@@ -435,97 +453,12 @@ where
     // Calculate line offsets in the new content for mapping line numbers to byte positions
     let new_line_offsets = calculate_line_offsets(&new_content);
 
-    // Add all built hunks to the recorded file, updating content positions
-    // ── Consolidate hunks into a single whole-file Replace ──
-    //
-    // In the globalize pipeline, every hunk kind that isn't a clean
-    // Prepend or Append ends up doing the same thing: delete ALL content
-    // vertices for the file, then insert full_content (the entire new
-    // file). Specifically:
-    //
-    //   Replace  → always does delete-all + insert-full_content
-    //   Delete   → always does delete-all (every content vertex)
-    //   Insert with 0 < old_start < old_line_count
-    //            → escalates to NeedsReplace → delete-all + insert-full_content
-    //
-    // When multiple hunks hit these paths, each one independently
-    // inserts a full copy of the file, causing N× content duplication.
-    //
-    // Fix: detect when ANY combination of hunks would trigger whole-file
-    // behavior, and collapse them all into a single Replace that covers
-    // the entire file. This guarantees exactly one delete-all +
-    // insert-full_content in the globalizer, regardless of diff shape.
-    //
-    // Insert hunks that are clean Prepend (old_start == 0) or Append
-    // (old_start >= old_line_count) are safe — they only insert their
-    // own content slice, not full_content. Those are kept as-is.
-    //
-    // The semantic layer (CRDT line_ops) is unaffected — it's built
-    // separately from the raw diff and retains per-line granularity.
-    let mut hunks: Vec<BuiltHunk> = hunk_result.into_hunks();
-
-    // Count hunks that will trigger whole-file operations in globalize.
-    //
-    // The globalize layer has NO concept of partial deletion — both
-    // `globalize_delete` and `globalize_replace` call `delete_all_content`
-    // which marks EVERY content vertex as deleted.  So:
-    //
-    //   Replace  → delete-all + insert-full_content  (correct on its own)
-    //   Delete   → delete-all, insert nothing         (DESTROYS the file)
-    //   Insert with 0 < old_start < old_line_count
-    //            → escalates to delete-all + insert-full_content
-    //
-    // A Delete hunk in a *modified* file means "some lines were removed"
-    // — the file still has content.  But globalize_delete would nuke the
-    // whole file.  Since `record_modified_file` is never called for truly
-    // deleted files (those go through `record_deleted_file`), every
-    // Delete hunk here MUST be promoted to a Replace so the surviving
-    // content is re-inserted.
-    //
-    // We also consolidate when multiple nuclear hunks coexist, or when a
-    // nuclear hunk coexists with other hunks, to prevent N× duplication.
-    let has_nuclear_hunk = hunks.iter().any(|h| match h.kind {
-        // Replace already does delete-all + insert-full; correct on its own
-        // but must be consolidated if it coexists with other hunks.
-        BuiltHunkKind::Replace => true,
-        // Delete does delete-all with NO re-insert — would nuke the whole
-        // file.  Since record_modified_file is never called for truly
-        // deleted files, every Delete here is a partial line removal that
-        // must become a Replace so the surviving content is re-inserted.
-        BuiltHunkKind::Delete => true,
-        // Middle inserts (0 < old_start < old_line_count) cannot be
-        // handled by the globalizer — it only supports Prepend and Append.
-        // These must be consolidated into a Replace.
-        BuiltHunkKind::Insert => h.old_start != 0 && h.old_start < old_line_count,
-    });
-
-    if has_nuclear_hunk {
-        // Multiple hunks where at least one is nuclear, OR a single nuclear
-        // hunk coexisting with other hunks. Collapse everything into one
-        // Replace to prevent duplication.
-        //
-        // Collect deleted lines from all hunks that delete old content.
-        let mut all_deleted: Vec<usize> = Vec::new();
-        for h in &hunks {
-            all_deleted.extend_from_slice(&h.deleted_lines);
-        }
-        all_deleted.sort_unstable();
-        all_deleted.dedup();
-
-        let new_line_count = new_content.split(|&b| b == b'\n').count();
-        let merged_replace = BuiltHunk::new_replace_with_lines(
-            Local::new(&detected.path, 1),
-            Some(encoding),
-            all_deleted,
-            0,              // old_start: beginning of old content
-            0,              // new_start: beginning of new content
-            new_line_count, // new_len: all lines in the new file
-        );
-
-        // Replace all hunks with the single merged Replace
-        hunks.clear();
-        hunks.push(merged_replace);
-    }
+    // Each hunk is now processed independently by the globalize layer
+    // using proper patch theory: targeted per-line deletions and
+    // insertions on the specific vertices involved.  No whole-file
+    // consolidation is needed — see `globalize_replace` and
+    // `globalize_delete` for the line-level vertex operations.
+    let hunks: Vec<BuiltHunk> = hunk_result.into_hunks();
 
     for mut graph_op in hunks {
         // For Insert and Replace hunks, calculate actual content byte positions
@@ -560,14 +493,28 @@ where
         recorded.add_hunk(graph_op);
     }
 
-    // Generate CRDT operations for token-level diff tracking
-    let crdt_ops = crdt::build_crdt_ops_for_modified_file(
-        &detected.path,
-        old_content,
-        &new_content,
+    // Generate CRDT operations for token-level diff tracking.
+    //
+    // Load-bearing subtlety: CRDT cleanup must diff against the prior
+    // CRDT materialization when available, not only the byte-graph read.
+    // If the CRDT layer has already drifted from the byte graph, using the
+    // byte-graph content here leaves CRDT-only stale branches alive forever
+    // because the diff never "sees" them to delete them.
+    //
+    // Graph hunks above still use `old_content` (the byte-graph source of
+    // truth for patch theory).  Only the CRDT op builder uses the optional
+    // `crdt_old_content`.
+    use crate::record::workflow::recipes::{Recipe, RecipeContext};
+    let recipe_ctx = RecipeContext {
+        path: &detected.path,
+        old_content: crdt_old_content.unwrap_or(old_content),
+        new_content: &new_content,
+        existing_branches,
+        existing_trunk_id,
         encoding,
-        options.get_algorithm(),
-    );
+        algorithm: options.get_algorithm(),
+    };
+    let crdt_ops = Recipe::detect(&recipe_ctx).build_ops(&recipe_ctx);
     recorded.set_crdt_ops(crdt_ops.0);
     recorded.set_crdt_stats(crdt_ops.1);
 
@@ -575,6 +522,30 @@ where
     recorded.set_content(new_content);
 
     Ok(recorded)
+}
+
+fn rewrite_shifted_equals_for_graph(diff_ops: &[DiffOp]) -> Vec<DiffOp> {
+    diff_ops
+        .iter()
+        .map(|op| match *op {
+            DiffOp::Equal {
+                old_pos,
+                new_pos,
+                len,
+                // Only rewrite unchanged lines that were pushed *down* by
+                // inserted content above them. When lines shift *up* due to
+                // deletions above, the delete path should reconnect the old
+                // suffix in place; forcing a Replace there duplicates the
+                // suffix as fresh content.
+            } if new_pos > old_pos && len > 0 => DiffOp::Replace {
+                old_pos,
+                old_len: len,
+                new_pos,
+                new_len: len,
+            },
+            _ => op.clone(),
+        })
+        .collect()
 }
 
 /// Build CRDT FileOps directly from git diff lines.

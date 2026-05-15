@@ -195,7 +195,7 @@ impl Diff {
             color: !self.no_color,
             format: self.get_format(),
             stat_width: 80,
-            show_line_numbers: true,
+            show_line_numbers: false,
             show_path_prefix: true,
             word_diff: self.word_diff,
         }

@@ -154,7 +154,7 @@ pub fn execute_plan(repo: &Repository, plan: &QueryPlan) -> Result<PlanResult, R
 
         match step {
             QueryStep::KgSearch { query, limit, bind } => {
-                let nodes = repo.vault_kg_search(query, *limit)?;
+                let nodes = repo.vault_kg_search(query, *limit, None)?;
                 let count = nodes.len();
 
                 if let Some(var) = bind {

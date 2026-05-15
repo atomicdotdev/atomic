@@ -226,8 +226,21 @@ impl PendingChange {
         let other_old_end = other.old_start + other.old_len;
         let new_old_len = other_old_end.saturating_sub(self.old_start);
 
-        // For new range, we sum the lengths since both insertions should be combined
-        let combined_new_len = self.new_len + other.new_len;
+        // Calculate combined new range.
+        //
+        // This must span from the first change's new_start through the
+        // later change's new end, not merely sum the two changed ranges.
+        // When two changes are adjacent in the old file but separated in
+        // the new file by preserved or inserted lines, summing the lengths
+        // drops that middle section from the replacement hunk.  The graph
+        // then records a patch that deletes a broad old range but only
+        // inserts the changed fragments, causing materialization to skip or
+        // rotate content after sequential inserts.
+        let self_new_end = self.new_start + self.new_len;
+        let other_new_end = other.new_start + other.new_len;
+        let combined_new_len = self_new_end
+            .max(other_new_end)
+            .saturating_sub(self.new_start);
 
         // Determine the combined kind
         let kind = if new_old_len == 0 && combined_new_len > 0 {

@@ -15,6 +15,7 @@
 //!   show    Show workspace details
 //!   update  Update a workspace
 //!   delete  Delete a workspace
+//!   set     Set the default workspace for an org
 //!
 //! Options:
 //!   -h, --help  Print help information
@@ -44,11 +45,16 @@
 //! # Delete a workspace
 //! $ atomic workspace delete my-team --force
 //! ✓ Deleted workspace: my-team
+//!
+//! # Set the default workspace for the current org
+//! $ atomic workspace set my-team
+//! ✓ Default workspace for 'acme' set to: my-team
 //! ```
 
 pub mod create;
 pub mod delete;
 pub mod list;
+pub mod set;
 pub mod show;
 pub mod update;
 
@@ -57,6 +63,7 @@ use clap::Subcommand;
 pub use create::WorkspaceCreate;
 pub use delete::WorkspaceDelete;
 pub use list::WorkspaceList;
+pub use set::WorkspaceSet;
 pub use show::WorkspaceShow;
 pub use update::WorkspaceUpdate;
 
@@ -131,6 +138,20 @@ pub enum WorkspaceCommands {
     /// atomic workspace delete my-team --force
     /// ```
     Delete(WorkspaceDelete),
+
+    /// Set the default workspace for an org.
+    ///
+    /// Stores the chosen workspace slug in `[server.default_workspaces]`
+    /// keyed by the target org. Subsequent commands that take an optional
+    /// `--workspace` parameter fall back to this default.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic workspace set my-team
+    /// atomic workspace set personal --org alice
+    /// ```
+    Set(WorkspaceSet),
 }
 
 /// Workspace management command.
@@ -152,6 +173,7 @@ impl Command for WorkspaceCmd {
             WorkspaceCommands::Show(cmd) => cmd.run(),
             WorkspaceCommands::Update(cmd) => cmd.run(),
             WorkspaceCommands::Delete(cmd) => cmd.run(),
+            WorkspaceCommands::Set(cmd) => cmd.run(),
         }
     }
 }
@@ -169,6 +191,7 @@ mod tests {
                 WorkspaceCommands::Show(_) => "show",
                 WorkspaceCommands::Update(_) => "update",
                 WorkspaceCommands::Delete(_) => "delete",
+                WorkspaceCommands::Set(_) => "set",
             }
         }
 
@@ -177,11 +200,13 @@ mod tests {
         let show = WorkspaceShow::default();
         let update = WorkspaceUpdate::default();
         let delete = WorkspaceDelete::default();
+        let set = WorkspaceSet::default();
 
         assert_eq!(check_variant(&WorkspaceCommands::List(list)), "list");
         assert_eq!(check_variant(&WorkspaceCommands::Create(create)), "create");
         assert_eq!(check_variant(&WorkspaceCommands::Show(show)), "show");
         assert_eq!(check_variant(&WorkspaceCommands::Update(update)), "update");
         assert_eq!(check_variant(&WorkspaceCommands::Delete(delete)), "delete");
+        assert_eq!(check_variant(&WorkspaceCommands::Set(set)), "set");
     }
 }

@@ -57,7 +57,15 @@ impl HunkBuildOptions {
     pub const DEFAULT_CONTEXT_LINES: usize = 3;
 
     /// Default threshold for combining adjacent hunks.
-    pub const DEFAULT_COMBINE_THRESHOLD: usize = 6;
+    ///
+    /// In the patch-theory graph model, combining two edits separated by
+    /// unchanged lines is destructive: the combined Replace would delete
+    /// the unchanged vertices in between and not re-emit them (only the
+    /// changed slices land in the replacement), losing content that
+    /// should have stayed as the existing per-line vertices.  Set to 0
+    /// so only directly touching changes (e.g. an Insert immediately
+    /// followed by a Delete) merge into a single hunk.
+    pub const DEFAULT_COMBINE_THRESHOLD: usize = 0;
 
     /// Create new options with default values.
     ///

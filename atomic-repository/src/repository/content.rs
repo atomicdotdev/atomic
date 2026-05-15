@@ -28,8 +28,6 @@ impl Repository {
         path: P,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
         use atomic_core::output::alive::RetrieveOptions;
-        use atomic_core::record::workflow::retrieve::retrieve_content_with_filter;
-
         let path = path.as_ref();
         let normalized = normalize_path(path);
 
@@ -63,32 +61,99 @@ impl Repository {
             Err(e) => return Err(RepositoryError::Database(e.to_string())),
         };
 
-        // Build retrieve options.
+        // NOTE on CRDT-driven output (task #24):
+        // The new `output_file_via_crdt` walker in atomic_core::output::crdt
+        // is faster and avoids the byte-graph linear-walker bugs that
+        // overcount bytes on multi-edge vertices.  Callers that want the
+        // *materialized* (no-filter, single-view) content can call it
+        // directly via `get_file_content_via_crdt`.
         //
-        // Fast path: for a Shared view with no parent (the common case
-        // after `atomic init` or `atomic git import`), ALL changes in
-        // GRAPH are visible.  Skip the expensive O(N) change-log scan
-        // and N change-file disk reads — use default options (no filter).
+        // We don't use it here because this entry point honors the
+        // view's `change_filter`, and the CRDT walker reads
+        // `branch.state` directly — the materialized state across all
+        // applied changes.  For multi-view scenarios that would expose
+        // branches from views the caller isn't on.
         //
-        // Slow path: for Draft views or views with parents, build the
-        // filter set so the alive-graph traversal only sees vertices
-        // from visible changes.
-        let options = if view.kind.is_shared() && view.parent.is_none() {
-            RetrieveOptions::default()
-        } else {
-            let change_filter = collect_visible_change_ids_with_deps(&txn, &view)?;
-            RetrieveOptions::new().with_change_filter(change_filter)
-        };
+        // Wiring the CRDT walker into the filter-aware path requires
+        // either (a) per-(change, branch) state-change tracking or
+        // (b) replaying BranchOps from filter-in changes — both deferred.
+
+        // Always build the change filter.
+        //
+        // There is no "fast path" for shared root views: draft views
+        // also write their vertices into the global GRAPH (the ambient
+        // graph model), so an unfiltered retrieval on a shared root
+        // would see vertices from drafts that aren't in its VIEW_CHANGES.
+        //
+        // The filter is the source of truth for what each view sees —
+        // it's computed cheaply at read time from VIEW_CHANGES plus the
+        // parent chain.
+        let change_filter = collect_visible_change_ids_with_deps(&txn, &view)?;
+        let options = RetrieveOptions::new().with_change_filter(change_filter);
 
         // All edges are in GRAPH — raw transaction sees everything.
         // The change_filter handles view isolation.
-        let content = retrieve_content_with_filter(&txn, &self.change_store, position, options)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let content =
+            retrieve_content_with_filter_fast(&txn, &self.change_store, inode, position, options)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if content.is_empty() {
             Ok(None)
         } else {
             Ok(Some(content))
+        }
+    }
+
+    /// Get file content using the CRDT-driven walker (task #24).
+    ///
+    /// Walks the `Trunk → Branch` chain in file order and fetches each
+    /// alive branch's bytes from its recorded `BRANCH_VERTEX` span.  This
+    /// bypasses the byte-graph linear walker entirely.
+    ///
+    /// # When to use
+    ///
+    /// Use this when you want the *materialized* file content — the state
+    /// after all applied changes — without filtering by view.  This is
+    /// correct for single-view linear history and for tools that want a
+    /// canonical snapshot.
+    ///
+    /// For view-scoped reads, use [`Self::get_file_content`] instead.
+    /// That entry point honors the view's `change_filter` (at the cost of
+    /// going through the byte-graph walker).
+    ///
+    /// Falls back to byte-graph output when the CRDT layer has no row
+    /// for this file (legacy repos that predate CRDT population) or when
+    /// any alive branch lacks a `BRANCH_VERTEX` mapping.
+    pub fn get_file_content_via_crdt<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        use atomic_core::output::crdt::{output_file_via_crdt, CrdtOutputError};
+
+        let path = path.as_ref();
+        let normalized = normalize_path(path);
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        match output_file_via_crdt(&txn, &self.change_store, &normalized) {
+            Ok(content) if !content.is_empty() => Ok(Some(content)),
+            Ok(_) => {
+                // Empty result — file not in CRDT layer.  Fall back to the
+                // view-scoped byte-graph walker.
+                drop(txn);
+                self.get_file_content(path)
+            }
+            Err(CrdtOutputError::OrphanBranch(_)) => {
+                // Alive branch without BRANCH_VERTEX — pre-walker data.
+                // Fall back to byte-graph walker.
+                drop(txn);
+                self.get_file_content(path)
+            }
+            Err(CrdtOutputError::Pristine(e)) => Err(RepositoryError::Database(e.to_string())),
+            Err(CrdtOutputError::Store(e)) => Err(RepositoryError::Database(e.to_string())),
         }
     }
 
@@ -104,8 +169,6 @@ impl Repository {
         exclude_hash: &Hash,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
         use atomic_core::output::alive::RetrieveOptions;
-        use atomic_core::record::workflow::retrieve::retrieve_content_with_filter;
-
         let path = path.as_ref();
         let normalized = normalize_path(path);
 
@@ -150,8 +213,9 @@ impl Repository {
 
         let options = RetrieveOptions::new().with_change_filter(change_filter);
 
-        let content = retrieve_content_with_filter(&txn, &self.change_store, position, options)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let content =
+            retrieve_content_with_filter_fast(&txn, &self.change_store, inode, position, options)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if content.is_empty() {
             Ok(None)
@@ -669,11 +733,11 @@ impl Repository {
         require_tracked: bool,
     ) -> Result<Option<Vec<u8>>, RepositoryError>
     where
-        T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::TreeTxnT,
+        T: atomic_core::pristine::GraphTxnT
+            + atomic_core::pristine::TreeTxnT
+            + atomic_core::pristine::InodeGraphOps,
     {
         use atomic_core::output::alive::RetrieveOptions;
-        use atomic_core::record::workflow::retrieve::retrieve_content_with_filter;
-
         // Check if file is tracked (skip for deleted files — they are no
         // longer in the TREE but their inode/content is still in the graph).
         if require_tracked
@@ -701,8 +765,11 @@ impl Repository {
         let options = RetrieveOptions::new().with_change_filter(change_set.clone());
 
         // Retrieve content from the graph with the filter
-        let content = retrieve_content_with_filter(txn, &self.change_store, position, options)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let content =
+            retrieve_content_with_filter_fast(txn, &self.change_store, inode, position, options)
+                .map_err(|e: atomic_core::record::RecordError| {
+                    RepositoryError::Database(e.to_string())
+                })?;
 
         if content.is_empty() {
             Ok(None)
@@ -743,4 +810,228 @@ impl Repository {
         // Archive with the tag's state
         self.archive(destination, options)
     }
+}
+
+fn retrieve_content_with_filter_fast<T, C>(
+    txn: &T,
+    changes: &C,
+    inode: Inode,
+    position: Position<NodeId>,
+    options: atomic_core::output::alive::RetrieveOptions,
+) -> atomic_core::record::RecordResult<Vec<u8>>
+where
+    T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::InodeGraphOps,
+    C: atomic_core::change::ChangeStore,
+{
+    let trace_retrieve = std::env::var_os("ATOMIC_TRACE_RETRIEVE").is_some();
+
+    // The inode-linear fast path is only safe for unfiltered materialization.
+    // When a change filter is active, divergent view-local edits can produce
+    // dead-chain bypasses that the linear walk cannot represent correctly,
+    // causing one side's visible content to disappear. Fall back to the full
+    // alive-graph retrieval for correctness in filtered reads.
+    if options.has_filter() {
+        if trace_retrieve {
+            eprintln!(
+                "[retrieve_content_with_filter_fast] filtered read; falling back to retrieve_graph"
+            );
+        }
+        return atomic_core::record::workflow::retrieve::retrieve_content_with_filter(
+            txn, changes, position, options,
+        );
+    }
+
+    if let Some(content) =
+        try_retrieve_linear_content_with_filter(txn, changes, inode, position, &options)?
+    {
+        if trace_retrieve {
+            eprintln!(
+                "[retrieve_content_with_filter_fast] inode fast path hit bytes={}",
+                content.len()
+            );
+        }
+        return Ok(content);
+    }
+
+    if trace_retrieve {
+        eprintln!("[retrieve_content_with_filter_fast] falling back to retrieve_graph");
+    }
+
+    atomic_core::record::workflow::retrieve::retrieve_content_with_filter(
+        txn, changes, position, options,
+    )
+}
+
+fn try_retrieve_linear_content_with_filter<T, C>(
+    txn: &T,
+    changes: &C,
+    inode: Inode,
+    position: Position<NodeId>,
+    options: &atomic_core::output::alive::RetrieveOptions,
+) -> atomic_core::record::RecordResult<Option<Vec<u8>>>
+where
+    T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::InodeGraphOps,
+    C: atomic_core::change::ChangeStore,
+{
+    use atomic_core::types::EdgeFlags;
+    let trace_retrieve = std::env::var_os("ATOMIC_TRACE_RETRIEVE").is_some();
+
+    if position == Position::ROOT {
+        return Ok(Some(Vec::new()));
+    }
+
+    let inode_marker = position.inode_node();
+    let mut current = inode_marker;
+    let mut visited = std::collections::HashSet::new();
+    let mut vertices = Vec::new();
+
+    loop {
+        if !visited.insert(current) {
+            if trace_retrieve {
+                eprintln!(
+                    "[try_retrieve_linear_content_with_filter] cycle at {}",
+                    current
+                );
+            }
+            return Ok(None);
+        }
+
+        let mut adj = txn
+            .init_inode_adj(inode, current, EdgeFlags::BLOCK, EdgeFlags::all())
+            .map_err(|e| {
+                atomic_core::record::RecordError::Io(std::io::Error::other(format!(
+                    "Failed to init inode traversal: {}",
+                    e
+                )))
+            })?;
+
+        let mut next_vertex = None;
+
+        while let Some(edge_result) = txn.next_inode_adj(&mut adj) {
+            let edge = match edge_result {
+                Ok(edge) => edge,
+                Err(_) => {
+                    if trace_retrieve {
+                        eprintln!(
+                            "[try_retrieve_linear_content_with_filter] inode adj read error at {}",
+                            current
+                        );
+                    }
+                    return Ok(None);
+                }
+            };
+
+            let flags = edge.flag();
+            if flags.contains(EdgeFlags::PARENT)
+                || flags.contains(EdgeFlags::PSEUDO)
+                || flags.contains(EdgeFlags::FOLDER)
+            {
+                continue;
+            }
+
+            if !options.passes_filter(edge.introduced_by()) {
+                continue;
+            }
+
+            if flags.contains(EdgeFlags::DELETED) {
+                if trace_retrieve {
+                    eprintln!(
+                        "[try_retrieve_linear_content_with_filter] deleted edge from {} to {}",
+                        current,
+                        edge.dest()
+                    );
+                }
+                return Ok(None);
+            }
+
+            let Some(dest) = (match txn.find_block_in_inode(inode, edge.dest()) {
+                Ok(dest) => dest,
+                Err(_) => {
+                    if trace_retrieve {
+                        eprintln!(
+                            "[try_retrieve_linear_content_with_filter] find_block_in_inode error for {}",
+                            edge.dest()
+                        );
+                    }
+                    return Ok(None);
+                }
+            }) else {
+                if trace_retrieve {
+                    eprintln!(
+                        "[try_retrieve_linear_content_with_filter] no inode block for {}",
+                        edge.dest()
+                    );
+                }
+                return Ok(None);
+            };
+
+            if !options.passes_filter(dest.change) {
+                continue;
+            }
+
+            if next_vertex.replace(dest).is_some() {
+                if trace_retrieve {
+                    eprintln!(
+                        "[try_retrieve_linear_content_with_filter] multiple successors from {}",
+                        current
+                    );
+                }
+                return Ok(None);
+            }
+        }
+
+        let Some(dest) = next_vertex else {
+            break;
+        };
+
+        let is_inode_marker = dest.start == dest.end && dest.start == position.pos;
+        if !is_inode_marker && !dest.change.is_root() && dest.start != dest.end {
+            vertices.push(dest);
+        }
+
+        current = dest;
+    }
+
+    let mut content = Vec::new();
+    let mut change_contents = std::collections::HashMap::<Hash, Vec<u8>>::new();
+    for node in vertices {
+        let Some(hash) = txn.get_external(node.change).ok().flatten() else {
+            if trace_retrieve {
+                eprintln!(
+                    "[try_retrieve_linear_content_with_filter] missing hash for {}",
+                    node
+                );
+            }
+            return Ok(None);
+        };
+
+        if let std::collections::hash_map::Entry::Vacant(entry) = change_contents.entry(hash) {
+            let Ok(change) = changes.get_change(&hash) else {
+                if trace_retrieve {
+                    eprintln!(
+                        "[try_retrieve_linear_content_with_filter] load_change failed for {}",
+                        node
+                    );
+                }
+                return Ok(None);
+            };
+            entry.insert(change.contents);
+        }
+
+        let start = node.start.get() as usize;
+        let end = node.end.get() as usize;
+        let bytes = change_contents.get(&hash).expect("change contents cached");
+        if end > bytes.len() {
+            if trace_retrieve {
+                eprintln!(
+                    "[try_retrieve_linear_content_with_filter] span out of bounds for {}",
+                    node
+                );
+            }
+            return Ok(None);
+        }
+        content.extend_from_slice(&bytes[start..end]);
+    }
+
+    Ok(Some(content))
 }

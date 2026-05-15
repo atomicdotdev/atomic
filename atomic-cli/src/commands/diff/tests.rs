@@ -249,7 +249,7 @@ mod tests {
         assert!(config.color);
         assert_eq!(config.format, DiffFormat::Unified);
         assert_eq!(config.stat_width, 80);
-        assert!(config.show_line_numbers);
+        assert!(!config.show_line_numbers);
         assert!(config.show_path_prefix);
         assert!(!config.word_diff);
     }

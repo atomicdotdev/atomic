@@ -44,6 +44,14 @@ pub struct ResolvedConflicts {
 
     /// VertexIds to skip (non-first vertices in resolved SCCs).
     skip: HashSet<VertexId>,
+
+    /// Unresolved fork conflict groups.
+    ///
+    /// Each entry is a list of child `VertexId`s that form a fork the
+    /// semantic merge engine could not auto-resolve.  The output stage
+    /// wraps these in conflict markers so the user can see and resolve
+    /// them.
+    unresolved_forks: Vec<Vec<VertexId>>,
 }
 
 impl ResolvedConflicts {
@@ -52,12 +60,22 @@ impl ResolvedConflicts {
         Self {
             merged: HashMap::new(),
             skip: HashSet::new(),
+            unresolved_forks: Vec::new(),
         }
     }
 
-    /// Returns `true` if no conflicts were resolved.
+    /// Returns `true` if no resolution state is present at all.
+    ///
+    /// We must consult **every** field — `merged`, `skip` and
+    /// `unresolved_forks` — because the resolved-output writer takes a
+    /// fast path through `output_graph_content` when this returns
+    /// `true`, and that fast path honours none of them.  A resolution
+    /// that's only a skip set (e.g. a fork settled by change-DAG
+    /// supersession where the winner is emitted as-is and the losers
+    /// are dropped) must NOT trip the fast path or the loser bytes
+    /// would still be written.
     pub fn is_empty(&self) -> bool {
-        self.merged.is_empty()
+        self.merged.is_empty() && self.skip.is_empty() && self.unresolved_forks.is_empty()
     }
 
     /// Record merged content for the lead vertex of a resolved SCC.
@@ -86,6 +104,24 @@ impl ResolvedConflicts {
     /// How many conflict groups were resolved.
     pub fn resolved_count(&self) -> usize {
         self.merged.len()
+    }
+
+    /// Record an unresolved fork conflict group.
+    pub fn insert_unresolved_fork(&mut self, children: Vec<VertexId>) {
+        self.unresolved_forks.push(children);
+    }
+
+    /// Get all unresolved fork conflict groups.
+    pub fn unresolved_forks(&self) -> &[Vec<VertexId>] {
+        &self.unresolved_forks
+    }
+
+    /// Find the fork group a vertex belongs to, if any.
+    pub fn fork_group_for(&self, vid: VertexId) -> Option<&[VertexId]> {
+        self.unresolved_forks
+            .iter()
+            .find(|group| group.contains(&vid))
+            .map(|g| g.as_slice())
     }
 }
 

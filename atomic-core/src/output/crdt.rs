@@ -57,7 +57,8 @@
 //! }
 //! ```
 
-use crate::crdt::tables::{decode_branch_id, decode_leaf_id, encode_trunk_id, SerializedTrunk};
+use crate::crdt::queries::iter_trunk_branches_in_file_order;
+use crate::crdt::tables::{decode_leaf_id, encode_branch_id, encode_trunk_id, SerializedTrunk};
 use crate::crdt::{BranchId, BranchState, LeafId, LeafState, TrunkId, TrunkState};
 use crate::diff::token::TokenKind;
 use crate::pristine::{MutTxnT, PristineResult};
@@ -332,26 +333,24 @@ pub fn get_file_lines_by_trunk<T: MutTxnT>(
     trunk_id: TrunkId,
     options: &RetrievalOptions,
 ) -> PristineResult<Vec<Line>> {
-    let trunk_key = encode_trunk_id(&trunk_id);
-
-    // Get all branches for this trunk
-    let branch_keys: Vec<[u8; 12]> = txn
-        .iter_trunk_branches(&trunk_key)?
-        .collect::<Result<Vec<_>, _>>()?;
+    // Get all branches for this trunk **in file order**.  The BRANCH_AFTER
+    // chain produces top-of-file → bottom-of-file ordering — TRUNK_BRANCHES
+    // alone gives BranchId sort order, which is wrong for prepended lines
+    // from later commits.
+    let branch_ids: Vec<BranchId> = iter_trunk_branches_in_file_order(txn, trunk_id)?;
 
     let mut lines = Vec::new();
     let mut line_number = 1usize;
 
-    for branch_key in branch_keys {
+    for branch_id in branch_ids {
+        let branch_key = encode_branch_id(&branch_id);
+
         // Check line limit
         if let Some(max) = options.max_lines {
             if lines.len() >= max {
                 break;
             }
         }
-
-        // Get branch metadata
-        let branch_id = decode_branch_id(&branch_key);
         let branch_data = match txn.get_crdt_branch(&branch_key)? {
             Some(data) => data,
             None => continue, // Branch not found, skip
@@ -453,6 +452,136 @@ pub fn file_exists<T: MutTxnT>(txn: &mut T, path: &str) -> PristineResult<bool> 
 /// Get the trunk ID for a file path.
 pub fn get_trunk_id<T: MutTxnT>(txn: &mut T, path: &str) -> PristineResult<Option<TrunkId>> {
     txn.get_trunk_by_path(path)
+}
+
+// CRDT-driven file output
+
+/// Error type for the CRDT-driven output walker.
+#[derive(Debug)]
+pub enum CrdtOutputError<E> {
+    /// Pristine read failed.
+    Pristine(crate::pristine::PristineError),
+    /// Change store read failed.
+    Store(E),
+    /// A branch was alive but had no BRANCH_VERTEX mapping — the CRDT layer
+    /// has no way to know which bytes the branch corresponds to.
+    ///
+    /// Carries the orphan `BranchId` so callers can diagnose which line is
+    /// missing its content reference.  This is recoverable: callers can fall
+    /// back to the byte-graph walker for the affected file.
+    OrphanBranch(crate::crdt::BranchId),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for CrdtOutputError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CrdtOutputError::Pristine(e) => write!(f, "pristine error: {}", e),
+            CrdtOutputError::Store(e) => write!(f, "change store error: {}", e),
+            CrdtOutputError::OrphanBranch(b) => {
+                write!(f, "branch {} has no BRANCH_VERTEX mapping", b)
+            }
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for CrdtOutputError<E> {}
+
+impl<E> From<crate::pristine::PristineError> for CrdtOutputError<E> {
+    fn from(e: crate::pristine::PristineError) -> Self {
+        CrdtOutputError::Pristine(e)
+    }
+}
+
+/// Reconstruct a file's bytes by walking the CRDT layer.
+///
+/// This is the alternative to `output::repo::output_file_with_filter`:
+/// it derives line order from `iter_trunk_branches_in_file_order` (the
+/// CRDT after-chain), filters by `branch.state` for liveness, and pulls
+/// each line's bytes via the branch's recorded graph vertex.
+///
+/// The byte-graph is consulted *only* to fetch content blob ranges — the
+/// linear-edge walk (`collect_sorted_content_vertices`, the
+/// pick-one-outgoing-edge problem) is bypassed entirely.  That's the
+/// whole point: the CRDT decides "what" and "in what order"; the change
+/// store provides "the bytes."
+///
+/// # Behavior
+///
+/// 1. Look up the trunk for `path`.  No trunk → return `Ok(Vec::new())`
+///    (file isn't tracked by the CRDT layer at all).
+/// 2. Iterate branches in file order.
+/// 3. Skip branches whose state is not alive.
+/// 4. For each alive branch, fetch `BRANCH_VERTEX` → `GraphNode` → byte
+///    range from the change's content blob.
+/// 5. Concatenate.
+///
+/// # Caveats
+///
+/// - Reads `branch.state` directly — correct for single-view linear
+///   history, *not* multi-view scenarios where the same branch may be
+///   alive on one view and deleted on another.  Add a `change_filter`
+///   parameter (task #24+) for multi-view support.
+/// - An "orphan branch" (alive but no `BRANCH_VERTEX` row) raises
+///   [`CrdtOutputError::OrphanBranch`].  Callers can catch and fall
+///   back to the byte-graph walker for that file.
+pub fn output_file_via_crdt<T, C>(
+    txn: &T,
+    changes: &C,
+    path: &str,
+) -> Result<Vec<u8>, CrdtOutputError<C::Error>>
+where
+    T: crate::pristine::CrdtTxnT + crate::pristine::GraphTxnT,
+    C: crate::change::ChangeStore,
+{
+    use crate::types::Hash;
+
+    let trunk_id = match txn.get_trunk_by_path(path)? {
+        Some(t) => t,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut out: Vec<u8> = Vec::new();
+
+    for branch_id in iter_trunk_branches_in_file_order(txn, trunk_id)? {
+        let branch_key = encode_branch_id(&branch_id);
+
+        let branch_data = match txn.get_crdt_branch(&branch_key)? {
+            Some(b) => b,
+            None => continue, // No row — branch listed in TRUNK_BRANCHES but
+                              // missing from BRANCHES.  Treat as deleted.
+        };
+        if !branch_data.state.is_alive() {
+            continue;
+        }
+
+        let graph_node = match txn.get_crdt_branch_vertex(&branch_key)? {
+            Some(n) => n,
+            None => return Err(CrdtOutputError::OrphanBranch(branch_id)),
+        };
+
+        let len = graph_node.end.get().saturating_sub(graph_node.start.get()) as usize;
+        if len == 0 {
+            continue;
+        }
+
+        let start = out.len();
+        out.resize(start + len, 0);
+
+        // hash_fn re-created per call to keep the &txn borrow re-entrant.
+        let hash_fn = |id: crate::types::NodeId| -> Option<Hash> {
+            if id.is_root() {
+                None
+            } else {
+                txn.get_external(id).ok().flatten()
+            }
+        };
+
+        changes
+            .get_contents(hash_fn, graph_node, &mut out[start..])
+            .map_err(CrdtOutputError::Store)?;
+    }
+
+    Ok(out)
 }
 
 // Tests

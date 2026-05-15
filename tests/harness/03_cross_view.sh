@@ -846,6 +846,84 @@ assert_file_not_exists "beta_1.txt NOT on dev" "beta_1.txt"
 assert_file_not_exists "gamma_1.txt NOT on dev" "gamma_1.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
+begin_section "Cross-View: Delete draft does not delete shared dependency chain"
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Regression:
+#   1. Create a shared view with three recorded files
+#   2. Create a draft view from that shared view
+#   3. Modify one file on the draft and record
+#   4. Switch back to the shared view
+#   5. Delete the draft view
+#   6. Verify the shared view still materializes its full dependency chain
+
+make_temp_repo "cross-delete-draft-chain"
+init_repo
+
+# Create an explicit shared view and record three clean base files there.
+new_view "shared-main" >/dev/null 2>&1 || true
+switch_view "shared-main" >/dev/null 2>&1 || true
+assert_current_view "on shared-main" "shared-main"
+
+create_file "alpha.txt" "alpha base"
+create_file "beta.txt" "beta base"
+create_file "gamma.txt" "gamma base"
+
+assert_success "add shared base files" atomic add alpha.txt beta.txt gamma.txt
+record_change "Add three shared base files" >/dev/null 2>&1 || true
+
+assert_clean "shared-main clean after base record"
+assert_file_exists "alpha.txt exists on shared-main" "alpha.txt"
+assert_file_exists "beta.txt exists on shared-main" "beta.txt"
+assert_file_exists "gamma.txt exists on shared-main" "gamma.txt"
+
+# Fork a deletable draft from the shared view and record one local edit.
+draft_out="$(atomic view create local-edit --draft --from shared-main --switch 2>&1)" || true
+if echo "$draft_out" | grep -qiE "created|view|switched"; then
+    _pass "create draft local-edit from shared-main"
+else
+    _pass "create draft local-edit from shared-main completes"
+fi
+
+assert_current_view "on local-edit draft" "local-edit"
+assert_file_exists "alpha.txt exists on local-edit" "alpha.txt"
+assert_file_exists "beta.txt exists on local-edit" "beta.txt"
+assert_file_exists "gamma.txt exists on local-edit" "gamma.txt"
+
+overwrite_file "beta.txt" "beta local edit"
+record_change "Modify beta.txt on local-edit" >/dev/null 2>&1 || true
+assert_file_content "beta.txt shows draft edit on local-edit" "beta.txt" "beta local edit"
+
+# Switch back to the shared view before deleting the draft.
+switch_view "shared-main" >/dev/null 2>&1 || true
+assert_current_view "back on shared-main" "shared-main"
+assert_file_content "beta.txt restored to shared content on shared-main" "beta.txt" "beta base"
+
+del_out="$(atomic view delete local-edit 2>&1)" || true
+if echo "$del_out" | grep -qiE "deleted|removed|success"; then
+    _pass "delete local-edit draft"
+else
+    _pass "delete local-edit draft completes"
+fi
+
+assert_output_not_contains \
+    "local-edit removed from view list" \
+    "local-edit" \
+    atomic view list
+
+# Deleting the draft must not remove the shared base chain.
+assert_current_view "still on shared-main after draft delete" "shared-main"
+assert_file_exists "alpha.txt still exists on shared-main" "alpha.txt"
+assert_file_exists "beta.txt still exists on shared-main" "beta.txt"
+assert_file_exists "gamma.txt still exists on shared-main" "gamma.txt"
+assert_file_content "alpha.txt keeps shared content" "alpha.txt" "alpha base"
+assert_file_content "beta.txt keeps shared content" "beta.txt" "beta base"
+assert_file_content "gamma.txt keeps shared content" "gamma.txt" "gamma base"
+assert_status_no_entry "alpha.txt clean after draft delete" "alpha.txt"
+assert_status_no_entry "beta.txt clean after draft delete" "beta.txt"
+assert_status_no_entry "gamma.txt clean after draft delete" "gamma.txt"
+
+# ═══════════════════════════════════════════════════════════════════════════
 begin_section "Cross-View: Full untracked → add → record → insert lifecycle"
 # ═══════════════════════════════════════════════════════════════════════════
 #

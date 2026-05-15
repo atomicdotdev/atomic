@@ -170,8 +170,39 @@ pub use word::{
 /// assert!(!result.is_empty());
 /// ```
 pub fn diff<'a>(old: &[Line<'a>], new: &[Line<'a>], algorithm: Algorithm) -> DiffResult {
-    // Optimization: strip common prefix and suffix
-    let (prefix_len, suffix_len) = common_affixes(old, new);
+    diff_with_options(old, new, algorithm, true)
+}
+
+/// Like [`diff`] but skips the heuristic that converts positional shifts
+/// into `Replace` operations.
+///
+/// The record/patch-theory path uses this so that pure insertions stay as
+/// `Insert` operations — the `rewrite_positional_shifts` heuristic is
+/// designed to produce user-friendly diff display, but it mangles graph
+/// semantics by converting concurrent inserts into replacements that
+/// delete unchanged lines.
+pub fn diff_raw<'a>(old: &[Line<'a>], new: &[Line<'a>], algorithm: Algorithm) -> DiffResult {
+    diff_with_options(old, new, algorithm, false)
+}
+
+fn diff_with_options<'a>(
+    old: &[Line<'a>],
+    new: &[Line<'a>],
+    algorithm: Algorithm,
+    rewrite_shifts: bool,
+) -> DiffResult {
+    // Optimization: strip common prefix and suffix.
+    //
+    // When `rewrite_shifts == false` (i.e. `diff_raw`, used by the
+    // record/patch-theory path) we use the **strict** form that never
+    // reduces the suffix to artificially force Replace detection.  This
+    // preserves pure insertions/deletions, which is what graph
+    // operations need.
+    let (prefix_len, suffix_len) = if rewrite_shifts {
+        common_affixes(old, new)
+    } else {
+        common_affixes_strict(old, new)
+    };
 
     let old_mid = &old[prefix_len..old.len().saturating_sub(suffix_len)];
     let new_mid = &new[prefix_len..new.len().saturating_sub(suffix_len)];
@@ -213,7 +244,9 @@ pub fn diff<'a>(old: &[Line<'a>], new: &[Line<'a>], algorithm: Algorithm) -> Dif
     // We detect this pattern: when an Equal op maps old_pos N to new_pos M
     // where M > N (line shifted down), AND there's an Insert immediately
     // before it that occupies the original position, convert to Replace+Insert.
-    ops = rewrite_positional_shifts(ops, old, new);
+    if rewrite_shifts {
+        ops = rewrite_positional_shifts(ops, old, new);
+    }
 
     ops
 }
@@ -383,7 +416,38 @@ fn lines_are_similar(old: &[u8], new: &[u8]) -> bool {
     matching * 100 / max_words > 30
 }
 
-/// Find the length of common prefix and suffix between two sequences.
+/// Strict common-affix detection: returns the maximal common prefix and
+/// suffix without any reduction.
+///
+/// Used by the record path so that pure insertions stay as pure
+/// insertions in the produced diff (which the graph layer then maps to
+/// targeted vertex operations). The relaxed sibling
+/// [`common_affixes`] applies a suffix-limiting heuristic that's useful
+/// for the display path but corrupts patch-theory semantics.
+fn common_affixes_strict<T: PartialEq>(old: &[T], new: &[T]) -> (usize, usize) {
+    let prefix_len = old
+        .iter()
+        .zip(new.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let remaining_old = old.len() - prefix_len;
+    let remaining_new = new.len() - prefix_len;
+    let max_suffix = remaining_old.min(remaining_new);
+
+    let suffix_len = old[prefix_len..]
+        .iter()
+        .rev()
+        .zip(new[prefix_len..].iter().rev())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    (prefix_len, suffix_len)
+}
+
+/// Find the length of common prefix and suffix between two sequences,
+/// applying the **suffix-limiting heuristic** used by the display path.
 ///
 /// This optimization significantly speeds up diffing when changes are
 /// localized to a small portion of the file.
@@ -395,11 +459,15 @@ fn lines_are_similar(old: &[u8], new: &[u8]) -> bool {
 /// algorithm would see only insertions or deletions, missing modifications.
 ///
 /// Example: old = `[A, B]`, new = `[A, C, B]`
-///   - prefix = 1 (`A`), naive suffix = 1 (`B`)
-///   - old_mid = `[]`, new_mid = `[C]` → empty vs non-empty
-///   - Reduced suffix = 0 → old_mid = `[B]`, new_mid = `[C, B]`
-///   - Now the diff algorithm can detect `B` → `C` as a Replace
-///     followed by an Insert of `B`
+/// - prefix = 1 (`A`), naive suffix = 1 (`B`)
+/// - old_mid = `[]`, new_mid = `[C]` → empty vs non-empty
+/// - Reduced suffix = 0 → old_mid = `[B]`, new_mid = `[C, B]`
+/// - Now the diff algorithm can detect `B` → `C` as a Replace followed
+///   by an Insert of `B`
+///
+/// The record path uses [`common_affixes_strict`] instead — that
+/// heuristic is helpful for displaying diffs to users but corrupts
+/// patch-theory graph semantics.
 fn common_affixes<T: PartialEq>(old: &[T], new: &[T]) -> (usize, usize) {
     // Common prefix
     let prefix_len = old

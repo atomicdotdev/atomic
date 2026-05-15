@@ -56,52 +56,52 @@ impl InodeGraphOps for ReadTxn {
             return None;
         }
 
-        let table = match self.txn.open_multimap_table(INODE_GRAPH) {
-            Ok(t) => t,
-            Err(e) => {
-                adj.mark_exhausted();
-                return Some(Err(PristineError::Table(Box::new(e))));
-            }
-        };
-
-        let inode_id = adj.inode.get();
-        let key = encode_inode_vertex(
-            inode_id,
-            adj.node.change.get(),
-            adj.node.start.get(),
-            adj.node.end.get(),
-        );
-
-        // Get all edges for this exact span
-        let values = match table.get(&key) {
-            Ok(v) => v,
-            Err(e) => {
-                adj.mark_exhausted();
-                return Some(Err(PristineError::Storage(Box::new(e))));
-            }
-        };
-
-        // Collect matching edges into a vector
-        let mut matching_edges: Vec<SerializedGraphEdge> = Vec::new();
-        for result in values {
-            match result {
-                Ok(v) => {
-                    let edge = deserialize_edge(v.value());
-                    let flag = edge.flag();
-                    if flag >= adj.min_flag && flag <= adj.max_flag {
-                        matching_edges.push(edge);
-                    }
+        if !adj.is_loaded() {
+            let table = match self.txn.open_multimap_table(INODE_GRAPH) {
+                Ok(t) => t,
+                Err(e) => {
+                    adj.mark_exhausted();
+                    return Some(Err(PristineError::Table(Box::new(e))));
                 }
+            };
+
+            let inode_id = adj.inode.get();
+            let key = encode_inode_vertex(
+                inode_id,
+                adj.node.change.get(),
+                adj.node.start.get(),
+                adj.node.end.get(),
+            );
+
+            let values = match table.get(&key) {
+                Ok(v) => v,
                 Err(e) => {
                     adj.mark_exhausted();
                     return Some(Err(PristineError::Storage(Box::new(e))));
                 }
+            };
+
+            let mut matching_edges: Vec<SerializedGraphEdge> = Vec::new();
+            for result in values {
+                match result {
+                    Ok(v) => {
+                        let edge = deserialize_edge(v.value());
+                        let flag = edge.flag();
+                        if flag >= adj.min_flag && flag <= adj.max_flag {
+                            matching_edges.push(edge);
+                        }
+                    }
+                    Err(e) => {
+                        adj.mark_exhausted();
+                        return Some(Err(PristineError::Storage(Box::new(e))));
+                    }
+                }
             }
+            adj.set_edges(matching_edges);
         }
 
-        // Return the edge at the current position
-        if adj.position < matching_edges.len() {
-            let edge = matching_edges[adj.position];
+        if adj.position < adj.edges.len() {
+            let edge = adj.edges[adj.position];
             adj.advance();
             Some(Ok(edge))
         } else {
@@ -120,6 +120,42 @@ impl InodeGraphOps for ReadTxn {
         let inode_id = inode.get();
         let change_id = pos.change.get();
         let target_pos = pos.pos.get();
+
+        // Fast path: most inode-local edge destinations point at the exact
+        // start of the next span. Probe that narrow key range first so large
+        // single-change files do not rescan the whole inode slice per hop.
+        let exact_start_key = encode_inode_vertex(inode_id, change_id, target_pos, 0);
+        let exact_end_key = encode_inode_vertex(inode_id, change_id, target_pos, u64::MAX);
+        let mut empty_match = None;
+
+        for result in table.range::<&[u8; 32]>(&exact_start_key..=&exact_end_key)? {
+            let (key, _values) = result?;
+            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
+
+            if v_change != change_id || v_start != target_pos {
+                continue;
+            }
+
+            if v_start != v_end {
+                return Ok(Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                }));
+            }
+
+            if empty_match.is_none() {
+                empty_match = Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                });
+            }
+        }
+
+        if empty_match.is_some() {
+            return Ok(empty_match);
+        }
 
         let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
         let end_key = encode_inode_vertex(inode_id, change_id, u64::MAX, u64::MAX);
@@ -190,52 +226,52 @@ impl<'a> InodeGraphOps for WriteTxn<'a> {
             return None;
         }
 
-        let table = match self.txn.open_multimap_table(INODE_GRAPH) {
-            Ok(t) => t,
-            Err(e) => {
-                adj.mark_exhausted();
-                return Some(Err(PristineError::Table(Box::new(e))));
-            }
-        };
-
-        let inode_id = adj.inode.get();
-        let key = encode_inode_vertex(
-            inode_id,
-            adj.node.change.get(),
-            adj.node.start.get(),
-            adj.node.end.get(),
-        );
-
-        // Get all edges for this exact span
-        let values = match table.get(&key) {
-            Ok(v) => v,
-            Err(e) => {
-                adj.mark_exhausted();
-                return Some(Err(PristineError::Storage(Box::new(e))));
-            }
-        };
-
-        // Collect matching edges into a vector
-        let mut matching_edges: Vec<SerializedGraphEdge> = Vec::new();
-        for result in values {
-            match result {
-                Ok(v) => {
-                    let edge = deserialize_edge(v.value());
-                    let flag = edge.flag();
-                    if flag >= adj.min_flag && flag <= adj.max_flag {
-                        matching_edges.push(edge);
-                    }
+        if !adj.is_loaded() {
+            let table = match self.txn.open_multimap_table(INODE_GRAPH) {
+                Ok(t) => t,
+                Err(e) => {
+                    adj.mark_exhausted();
+                    return Some(Err(PristineError::Table(Box::new(e))));
                 }
+            };
+
+            let inode_id = adj.inode.get();
+            let key = encode_inode_vertex(
+                inode_id,
+                adj.node.change.get(),
+                adj.node.start.get(),
+                adj.node.end.get(),
+            );
+
+            let values = match table.get(&key) {
+                Ok(v) => v,
                 Err(e) => {
                     adj.mark_exhausted();
                     return Some(Err(PristineError::Storage(Box::new(e))));
                 }
+            };
+
+            let mut matching_edges: Vec<SerializedGraphEdge> = Vec::new();
+            for result in values {
+                match result {
+                    Ok(v) => {
+                        let edge = deserialize_edge(v.value());
+                        let flag = edge.flag();
+                        if flag >= adj.min_flag && flag <= adj.max_flag {
+                            matching_edges.push(edge);
+                        }
+                    }
+                    Err(e) => {
+                        adj.mark_exhausted();
+                        return Some(Err(PristineError::Storage(Box::new(e))));
+                    }
+                }
             }
+            adj.set_edges(matching_edges);
         }
 
-        // Return the edge at the current position
-        if adj.position < matching_edges.len() {
-            let edge = matching_edges[adj.position];
+        if adj.position < adj.edges.len() {
+            let edge = adj.edges[adj.position];
             adj.advance();
             Some(Ok(edge))
         } else {
@@ -254,6 +290,42 @@ impl<'a> InodeGraphOps for WriteTxn<'a> {
         let inode_id = inode.get();
         let change_id = pos.change.get();
         let target_pos = pos.pos.get();
+
+        // Fast path: most inode-local edge destinations point at the exact
+        // start of the next span. Probe that narrow key range first so large
+        // single-change files do not rescan the whole inode slice per hop.
+        let exact_start_key = encode_inode_vertex(inode_id, change_id, target_pos, 0);
+        let exact_end_key = encode_inode_vertex(inode_id, change_id, target_pos, u64::MAX);
+        let mut empty_match = None;
+
+        for result in table.range::<&[u8; 32]>(&exact_start_key..=&exact_end_key)? {
+            let (key, _values) = result?;
+            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
+
+            if v_change != change_id || v_start != target_pos {
+                continue;
+            }
+
+            if v_start != v_end {
+                return Ok(Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                }));
+            }
+
+            if empty_match.is_none() {
+                empty_match = Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                });
+            }
+        }
+
+        if empty_match.is_some() {
+            return Ok(empty_match);
+        }
 
         let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
         let end_key = encode_inode_vertex(inode_id, change_id, u64::MAX, u64::MAX);

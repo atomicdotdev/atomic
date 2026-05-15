@@ -32,7 +32,7 @@ use super::view::{ViewScope, ViewState, ViewTxnT};
 ///
 /// All operations within a transaction are atomic—either all succeed and
 /// are committed, or none take effect.
-pub trait MutTxnT: ViewTxnT + TreeTxnT {
+pub trait MutTxnT: ViewTxnT + TreeTxnT + super::CrdtTxnT {
     // ── Change Registration ─────────────────────────────────────
 
     /// Register a new internal ID for an external hash.
@@ -245,14 +245,12 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT {
 
     // ── CRDT Table Operations ───────────────────────────────────
 
+    // CRDT *read* methods (`get_crdt_*`, `iter_*`, `get_trunk_by_path`) live
+    // on [`super::CrdtTxnT`].  MutTxnT extends that trait via the supertrait
+    // bound above, so they are still callable through `&impl MutTxnT`.
+
     /// Store a trunk (file) entry in the CRDT tables.
     fn put_crdt_trunk(&mut self, key: &[u8; 12], value: &[u8]) -> Result<(), PristineError>;
-
-    /// Get a trunk entry from the CRDT tables.
-    fn get_crdt_trunk(
-        &mut self,
-        key: &[u8; 12],
-    ) -> Result<Option<crate::crdt::tables::SerializedTrunk>, PristineError>;
 
     /// Store an inode→trunk mapping.
     fn put_crdt_inode_trunk(
@@ -274,12 +272,6 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT {
     /// Store a branch (line) entry in the CRDT tables.
     fn put_crdt_branch(&mut self, key: &[u8; 12], value: &[u8; 24]) -> Result<(), PristineError>;
 
-    /// Get a branch entry from the CRDT tables.
-    fn get_crdt_branch(
-        &mut self,
-        key: &[u8; 12],
-    ) -> Result<Option<crate::crdt::tables::SerializedBranch>, PristineError>;
-
     /// Add a branch to a trunk's branch list (multimap).
     fn put_crdt_trunk_branch(
         &mut self,
@@ -287,14 +279,20 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT {
         branch_key: &[u8; 12],
     ) -> Result<(), PristineError>;
 
+    /// Store the "after" reference for a branch (the branch it was inserted after).
+    ///
+    /// `after_key` is `[0u8; 12]` (encoded `BranchId::ROOT`) when the branch
+    /// was inserted at the start of the file.  This is the load-bearing
+    /// metadata for reconstructing file order from the CRDT layer — see the
+    /// `BRANCH_AFTER` table doc.
+    fn put_crdt_branch_after(
+        &mut self,
+        branch_key: &[u8; 12],
+        after_key: &[u8; 12],
+    ) -> Result<(), PristineError>;
+
     /// Store a leaf (token) entry in the CRDT tables.
     fn put_crdt_leaf(&mut self, key: &[u8; 12], value: &[u8; 22]) -> Result<(), PristineError>;
-
-    /// Get a leaf entry from the CRDT tables.
-    fn get_crdt_leaf(
-        &mut self,
-        key: &[u8; 12],
-    ) -> Result<Option<crate::crdt::tables::SerializedLeaf>, PristineError>;
 
     /// Add a leaf to a branch's leaf list (multimap).
     fn put_crdt_branch_leaf(
@@ -302,30 +300,6 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT {
         branch_key: &[u8; 12],
         leaf_key: &[u8; 12],
     ) -> Result<(), PristineError>;
-
-    /// Look up a trunk by file path.
-    fn get_trunk_by_path(
-        &mut self,
-        path: &str,
-    ) -> Result<Option<crate::crdt::TrunkId>, PristineError>;
-
-    /// Iterate over all branches (lines) belonging to a trunk (file).
-    ///
-    /// Returns branch IDs in CRDT ordering (by BranchId).
-    #[allow(clippy::type_complexity)]
-    fn iter_trunk_branches(
-        &mut self,
-        trunk_key: &[u8; 12],
-    ) -> Result<Box<dyn Iterator<Item = Result<[u8; 12], PristineError>> + '_>, PristineError>;
-
-    /// Iterate over all leaves (tokens) belonging to a branch (line).
-    ///
-    /// Returns leaf IDs in CRDT ordering (by LeafId).
-    #[allow(clippy::type_complexity)]
-    fn iter_branch_leaves(
-        &mut self,
-        branch_key: &[u8; 12],
-    ) -> Result<Box<dyn Iterator<Item = Result<[u8; 12], PristineError>> + '_>, PristineError>;
 
     /// Store a branch→vertex mapping for CRDT graph integration.
     ///
@@ -337,15 +311,6 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT {
         node_bytes: &[u8; 24],
     ) -> Result<(), PristineError>;
 
-    /// Get the graph vertex for a branch.
-    ///
-    /// Returns the vertex position stored when the branch was first inserted,
-    /// enabling delete operations to find and mark the corresponding graph edges.
-    fn get_crdt_branch_vertex(
-        &mut self,
-        branch_key: &[u8; 12],
-    ) -> Result<Option<crate::types::GraphNode<NodeId>>, PristineError>;
-
     /// Store the reverse mapping from a graph vertex to a CRDT BranchId.
     ///
     /// This is the reverse of `put_crdt_branch_vertex`, enabling efficient
@@ -356,15 +321,6 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT {
         vertex_key: &[u8; 24],
         branch_key: &[u8; 12],
     ) -> Result<(), PristineError>;
-
-    /// Look up the CRDT BranchId for a graph vertex.
-    ///
-    /// Returns the BranchId stored by `put_crdt_vertex_branch`, enabling
-    /// the semantic merge engine to find CRDT data for a graph vertex.
-    fn get_crdt_vertex_branch(
-        &mut self,
-        vertex_key: &[u8; 24],
-    ) -> Result<Option<crate::crdt::BranchId>, PristineError>;
 
     /// Store inode→position mapping for CRDT compatibility.
     fn put_inodes(&mut self, inode: u64, pos: &Position<NodeId>) -> Result<(), PristineError>;
