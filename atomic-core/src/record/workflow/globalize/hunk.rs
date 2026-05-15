@@ -654,6 +654,74 @@ where
     let mut visited: HashSet<GraphNode<NodeId>> = HashSet::new();
     let mut current = inode_pos.inode_node();
 
+    // Helper: is `node` dead in this view?
+    //
+    // We check parent edges through the same (view-filtered) `txn`.
+    // Any visible `BLOCK|DELETED` parent means a change inside the
+    // view deleted this vertex — it should be skipped during the
+    // line-order walk because it's no longer a live line.
+    let is_dead_in_view = |node: GraphNode<NodeId>| -> bool {
+        let parents = match txn.iter_adjacent(node, EdgeFlags::PARENT, EdgeFlags::all()) {
+            Ok(it) => it,
+            Err(_) => return false,
+        };
+        for e in parents {
+            let e = match e {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let flags = e.flag();
+            if flags.contains(EdgeFlags::PARENT) && flags.contains(EdgeFlags::DELETED) {
+                return true;
+            }
+        }
+        false
+    };
+
+    fn alive_reaches<T: GraphTxnT>(
+        txn: &T,
+        start: GraphNode<NodeId>,
+        target: GraphNode<NodeId>,
+        is_dead_in_view: &dyn Fn(GraphNode<NodeId>) -> bool,
+    ) -> bool {
+        if start == target {
+            return true;
+        }
+
+        let mut stack = vec![start];
+        let mut seen = std::collections::HashSet::new();
+
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+
+            let edges = match txn.iter_forward(current, false) {
+                Ok(edges) => edges,
+                Err(_) => continue,
+            };
+
+            for edge in edges {
+                if edge.kind.is_pseudo() {
+                    continue;
+                }
+                let dest = match txn.find_block(edge.dest) {
+                    Ok(dest) => dest,
+                    Err(_) => continue,
+                };
+                if is_dead_in_view(dest) {
+                    continue;
+                }
+                if dest == target {
+                    return true;
+                }
+                stack.push(dest);
+            }
+        }
+
+        false
+    }
+
     loop {
         if !visited.insert(current) {
             break;
@@ -668,46 +736,14 @@ where
             Err(_) => break,
         };
 
-        // Helper: is `node` dead in this view?
-        //
-        // We check parent edges through the same (view-filtered) `txn`.
-        // Any visible `BLOCK|DELETED` parent means a change inside the
-        // view deleted this vertex — it should be skipped during the
-        // line-order walk because it's no longer a live line.
-        //
-        // Without this check, the additive edge model still leaves the
-        // *original* `Block` edge in the B-tree alongside the new
-        // `Block|DELETED` marker, so the raw forward walk reaches dead
-        // vertices and inflates `sorted.len()` past the alive line count.
-        // Downstream globalize_replace would then index `sorted[N]` by
-        // raw chain position instead of by alive line, mis-targeting
-        // hunks.
-        let is_dead_in_view = |node: GraphNode<NodeId>| -> bool {
-            let parents = match txn.iter_adjacent(node, EdgeFlags::PARENT, EdgeFlags::all()) {
-                Ok(it) => it,
-                Err(_) => return false,
-            };
-            for e in parents {
-                let e = match e {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-                let flags = e.flag();
-                if flags.contains(EdgeFlags::PARENT) && flags.contains(EdgeFlags::DELETED) {
-                    return true;
-                }
-            }
-            false
-        };
-
-        // Prefer alive destinations.  When a dead vertex sits on the
-        // walk path with no alive sibling at the same predecessor, we
-        // still follow it so the walk can reach the next alive line
-        // (the alive-walker `walk_through_dead` does the same at
-        // retrieve time).  Dead vertices never get pushed to the
-        // alive-line index — they don't count as lines and they don't
-        // get a sorted[] slot — but they keep the chain walkable.
-        let mut next_alive: Option<GraphNode<NodeId>> = None;
+        // Prefer alive destinations. When there are multiple alive children,
+        // choose the one that reaches another alive child downstream. This
+        // preserves linear order for cases like:
+        //   console.log(...) -> metrics -> }    and
+        //   console.log(...) -> }
+        // where the first encountered child may be the downstream `}` rather
+        // than the upstream `metrics` line we need to index next.
+        let mut alive_candidates: Vec<GraphNode<NodeId>> = Vec::new();
         let mut next_dead: Option<GraphNode<NodeId>> = None;
         for edge_result in adj {
             let edge = match edge_result {
@@ -729,13 +765,34 @@ where
                 continue;
             }
             if !is_dead_in_view(dest) {
-                next_alive = Some(dest);
-                break;
-            }
-            if next_dead.is_none() {
+                alive_candidates.push(dest);
+            } else if next_dead.is_none() {
                 next_dead = Some(dest);
             }
         }
+
+        let next_alive = if alive_candidates.len() <= 1 {
+            alive_candidates.into_iter().next()
+        } else {
+            alive_candidates.iter().copied().find(|candidate| {
+                let reaches_other = alive_candidates.iter().copied().any(|other| {
+                    other != *candidate && alive_reaches(txn, *candidate, other, &is_dead_in_view)
+                });
+                let reached_by_other = alive_candidates.iter().copied().any(|other| {
+                    other != *candidate && alive_reaches(txn, other, *candidate, &is_dead_in_view)
+                });
+                reaches_other && !reached_by_other
+            })
+            .or_else(|| {
+                alive_candidates.iter().copied().find(|candidate| {
+                    alive_candidates.iter().copied().any(|other| {
+                        other != *candidate
+                            && alive_reaches(txn, *candidate, other, &is_dead_in_view)
+                    })
+                })
+            })
+            .or_else(|| alive_candidates.into_iter().next())
+        };
 
         let dest = match next_alive.or(next_dead) {
             Some(d) => d,

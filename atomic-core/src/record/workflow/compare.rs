@@ -468,6 +468,7 @@ mod tests {
         assert_eq!(result.new_encoding, Encoding::Binary);
     }
 
+
     #[test]
     fn test_compare_result_with_diff() {
         let ops = vec![DiffOp::Insert {

@@ -108,7 +108,7 @@ use clap::{Parser, ValueEnum};
 use serde::Serialize;
 
 use atomic_core::change::Author;
-use atomic_core::pristine::ViewScope;
+
 use atomic_core::types::Base32;
 use atomic_repository::history::{HistoryEntry, HistoryOptions};
 use atomic_repository::Repository;

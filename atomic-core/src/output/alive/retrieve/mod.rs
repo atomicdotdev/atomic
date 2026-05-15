@@ -247,6 +247,7 @@ pub fn retrieve_graph<T: GraphTxnT>(
                     let successors = walk_through_dead(
                         txn,
                         &options,
+                        node,
                         resolved_vertex,
                         &mut stack,
                         &mut cache,
@@ -283,6 +284,7 @@ pub fn retrieve_graph<T: GraphTxnT>(
                         let successors = walk_through_dead(
                             txn,
                             &options,
+                            node,
                             resolved_vertex,
                             &mut stack,
                             &mut cache,
@@ -304,6 +306,7 @@ pub fn retrieve_graph<T: GraphTxnT>(
                     let successors = walk_through_dead(
                         txn,
                         &options,
+                        node,
                         resolved_vertex,
                         &mut stack,
                         &mut cache,
@@ -348,10 +351,16 @@ pub fn retrieve_graph<T: GraphTxnT>(
         // If this vertex has at least one direct alive child, defer the
         // bypass children so they attach to the LAST direct child when
         // it's processed — they sit downstream of it in the linearised
-        // output, not as concurrent siblings.  If there is no direct
+        // output, not as concurrent siblings. If there is no direct
         // alive child, attach them directly so they appear after this
         // vertex.
         if !bypass_children.is_empty() {
+            // In the insert-path graph, bypass successors reached through
+            // dead chains belong after the downstream surviving child, not
+            // alongside the first direct child. Attaching them to the
+            // last direct child preserves linear file order when a change
+            // both replaces an earlier line and carries through to later
+            // descendants in the same chain.
             let direct_child =
                 children_to_add
                     .iter()
@@ -418,6 +427,7 @@ pub fn retrieve_graph<T: GraphTxnT>(
 fn walk_through_dead<T: GraphTxnT>(
     txn: &T,
     options: &RetrieveOptions,
+    owner_parent: GraphNode<NodeId>,
     dead_vertex: GraphNode<NodeId>,
     stack: &mut Vec<VertexId>,
     cache: &mut std::collections::HashMap<GraphNode<NodeId>, VertexId>,
@@ -474,34 +484,48 @@ fn walk_through_dead<T: GraphTxnT>(
             };
 
             if alive {
-                // Live successor.  Only treat it as a bypass-child of
-                // the upstream alive parent if it has NO OTHER alive
-                // incoming path in the filter.  If it does, the normal
-                // traversal will reach it through that path — we'd be
-                // creating a duplicate edge.
+                // Live successor. Only surface it as a bypass child when
+                // there is no OTHER alive parent outside the dead chain.
+                // Ancestors of `owner_parent` in the already-built alive
+                // graph do not count as alternates; they are the same
+                // linear chain we are currently bypassing for.
                 let has_alive_alt_parent = {
                     let parents = txn.iter_parents(next_vertex, true)?;
                     parents.iter().any(|p| {
-                        // Skip parents whose introducing change isn't in
-                        // the filter — those edges are invisible to us.
                         if !options.passes_filter(p.introduced_by) {
                             return false;
                         }
-                        // We're looking for an alive BLOCK/FOLDER edge
-                        // (not deleted, not pseudo) coming from a vertex
-                        // OTHER than the dead chain we walked through.
                         match p.kind {
                             crate::types::ParentEdgeKind::Block
                             | crate::types::ParentEdgeKind::Folder => {
-                                // Source must not be in the dead chain we
-                                // walked through.  We compare against
-                                // `dead_visited` (not `seen`) so that
-                                // alive vertices found earlier in this
-                                // walk still count as alternate parents.
                                 let source_vertex = match txn.find_block_end(p.dest) {
                                     Ok(v) => v,
                                     Err(_) => return false,
                                 };
+                                let source_alive = if options.has_filter() {
+                                    match options.is_vertex_alive(txn, source_vertex) {
+                                        Ok(alive) => alive,
+                                        Err(_) => return false,
+                                    }
+                                } else {
+                                    match classify::is_vertex_alive(txn, &source_vertex) {
+                                        Ok(alive) => alive,
+                                        Err(_) => return false,
+                                    }
+                                };
+                                if !source_alive {
+                                    return false;
+                                }
+                                if source_vertex == owner_parent {
+                                    return false;
+                                }
+                                if let (Some(&source_vid), Some(&owner_vid)) =
+                                    (cache.get(&source_vertex), cache.get(&owner_parent))
+                                {
+                                    if alive_graph_reaches(&result.graph, source_vid, owner_vid) {
+                                        return false;
+                                    }
+                                }
                                 !dead_visited.contains(&source_vertex)
                             }
                             _ => false,
@@ -523,9 +547,18 @@ fn walk_through_dead<T: GraphTxnT>(
                 };
 
                 if !has_alive_alt_parent && !live_successors.contains(&vid) {
-                    // No alternate route — we need to wire this as a
-                    // bypass-child of the upstream alive parent.
-                    live_successors.push(vid);
+                    let shadowed_by_existing = live_successors.iter().copied().any(|existing_vid| {
+                        let existing_node = result.graph.get_vertex(existing_vid).node;
+                        visible_chain_reaches(txn, options, existing_node, next_vertex)
+                    });
+
+                    if !shadowed_by_existing {
+                        live_successors.retain(|existing_vid| {
+                            let existing_node = result.graph.get_vertex(*existing_vid).node;
+                            !visible_chain_reaches(txn, options, next_vertex, existing_node)
+                        });
+                        live_successors.push(vid);
+                    }
                 }
             } else {
                 // The vertex is dead.  Before continuing to walk through
@@ -536,46 +569,6 @@ fn walk_through_dead<T: GraphTxnT>(
                 // bypass-children of the upstream caller (would create
                 // diamond/duplicate paths that fork-detection misreads as
                 // CRDT conflicts).
-                let claimed_by_alive_outsider = {
-                    let parents = txn.iter_parents(next_vertex, true).unwrap_or_default();
-                    parents.iter().any(|p| {
-                        if !options.passes_filter(p.introduced_by) {
-                            return false;
-                        }
-                        match p.kind {
-                            crate::types::ParentEdgeKind::Block
-                            | crate::types::ParentEdgeKind::Folder => {
-                                let source_vertex = match txn.find_block_end(p.dest) {
-                                    Ok(v) => v,
-                                    Err(_) => return false,
-                                };
-                                // Outsider = not part of the dead chain.
-                                // An alive vertex we already discovered
-                                // during this walk is a legitimate
-                                // outsider claimant.
-                                if dead_visited.contains(&source_vertex) {
-                                    return false;
-                                }
-                                // Source must itself be alive in our view —
-                                // otherwise it's another dead chain that
-                                // doesn't claim this one.
-                                if options.has_filter() {
-                                    options.is_vertex_alive(txn, source_vertex).unwrap_or(false)
-                                } else {
-                                    classify::is_vertex_alive(txn, &source_vertex).unwrap_or(false)
-                                }
-                            }
-                            _ => false,
-                        }
-                    })
-                };
-
-                if claimed_by_alive_outsider {
-                    // Another alive vertex already owns this dead chain's
-                    // downstream — stop walking.
-                    continue;
-                }
-
                 // Still dead — keep walking through it.
                 dead_visited.insert(next_vertex);
                 queue.push(next_vertex);
@@ -584,4 +577,79 @@ fn walk_through_dead<T: GraphTxnT>(
     }
 
     Ok(live_successors)
+}
+
+fn visible_chain_reaches<T: GraphTxnT>(
+    txn: &T,
+    options: &RetrieveOptions,
+    start: GraphNode<NodeId>,
+    target: GraphNode<NodeId>,
+) -> bool {
+    if start == target {
+        return true;
+    }
+
+    let mut stack = vec![start];
+    let mut seen = std::collections::HashSet::new();
+
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+
+        let edges = match txn.iter_forward(current, true) {
+            Ok(edges) => edges,
+            Err(_) => continue,
+        };
+
+        for edge in edges {
+            if edge.kind.is_pseudo() {
+                continue;
+            }
+
+            let next = match txn.find_block(edge.dest) {
+                Ok(next) => next,
+                Err(_) => continue,
+            };
+
+            if !options.passes_filter(next.change) {
+                continue;
+            }
+
+            if next == target {
+                return true;
+            }
+
+            stack.push(next);
+        }
+    }
+
+    false
+}
+
+fn alive_graph_reaches(graph: &AliveGraph, from: VertexId, target: VertexId) -> bool {
+    if from == target {
+        return true;
+    }
+
+    let mut stack = vec![from];
+    let mut seen = std::collections::HashSet::new();
+
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+
+        for (_, child) in graph.children(current) {
+            if child.is_dummy() {
+                continue;
+            }
+            if *child == target {
+                return true;
+            }
+            stack.push(*child);
+        }
+    }
+
+    false
 }

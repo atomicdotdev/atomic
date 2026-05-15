@@ -371,7 +371,7 @@ impl Repository {
                     // so that Delete and Modify CRDT ops reference the real
                     // BranchIds for those old-content lines, not fresh
                     // placeholders — see RCA §11.3 and `iter_trunk_branches_in_file_order`.
-                    let (file_inode, file_position, existing_branches) = {
+                    let (file_inode, file_position, existing_branches, can_use_crdt_old_content) = {
                         use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
                         use atomic_core::crdt::tables::decode_trunk_id;
                         use atomic_core::pristine::CrdtTxnT;
@@ -464,7 +464,22 @@ impl Repository {
                             _ => Vec::new(),
                         };
 
-                        (inode, position, existing_branches)
+                        let view_name = options.get_view().unwrap_or(&self.current_view);
+                        let can_use_crdt_old_content = if existing_branches.is_empty() {
+                            false
+                        } else if let Some(view) = txn
+                            .get_view(view_name)
+                            .map_err(|e| RecordError::Database(e.to_string()))?
+                        {
+                            let visible_changes = collect_visible_change_ids(&txn, &view)?;
+                            existing_branches
+                                .iter()
+                                .all(|branch_id| visible_changes.contains(&branch_id.change_id()))
+                        } else {
+                            false
+                        };
+
+                        (inode, position, existing_branches, can_use_crdt_old_content)
                     };
 
                     // Step 2: Retrieve old content from the graph.
@@ -535,21 +550,19 @@ impl Repository {
                     // modifications into this view's record, which then
                     // emits spurious reverts.
                     //
-                    // Gate on view count: with exactly one view, use
-                    // the CRDT walker; otherwise fall back to the
-                    // view-scoped byte-graph content.  This keeps both
-                    // workloads correct until a view-filter-aware CRDT
-                    // walker lands.
-                    let view_count = self.list_views().map(|v| v.len()).unwrap_or(0);
-                    let crdt_old_content: Option<Vec<u8>> =
-                        if existing_branches.is_empty() || view_count > 1 {
-                            None
-                        } else {
-                            match self.get_file_content_via_crdt(entry.path()) {
-                                Ok(Some(content)) => Some(content),
-                                _ => None,
-                            }
-                        };
+                    // Reuse the CRDT-materialized baseline only when every
+                    // existing branch belongs to a change visible on this
+                    // view. That keeps draft-only linear histories on the
+                    // CRDT cleanup path without leaking sibling-view branches
+                    // into cross-view recording.
+                    let crdt_old_content: Option<Vec<u8>> = if can_use_crdt_old_content {
+                        match self.get_file_content_via_crdt(entry.path()) {
+                            Ok(Some(content)) => Some(content),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     let existing_branches_slice: Option<&[_]> = if existing_branches.is_empty() {
                         None
                     } else {

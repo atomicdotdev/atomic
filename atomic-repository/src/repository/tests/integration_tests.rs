@@ -394,6 +394,517 @@ fn test_switch_view_shows_view_content() {
     );
 }
 
+#[test]
+fn test_switch_view_preserves_harness_08_sequence_through_v8() {
+    let (temp_dir, mut repo) = create_temp_repo();
+    let file_path = temp_dir.path().join("src/app.ts");
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+    let versions = harness_08_versions();
+
+    repo.create_view("agent-h08").unwrap();
+    repo.switch_view("agent-h08").unwrap();
+
+    for (idx, content) in versions.iter().take(8).enumerate() {
+        std::fs::write(&file_path, content.as_bytes()).unwrap();
+
+        if idx == 0 {
+            repo.add("src/app.ts", TrackingOptions::default()).unwrap();
+        }
+
+        repo.record(
+            ChangeHeader::new(&format!("v{}", idx + 1)),
+            RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
+    }
+
+    let expected_v8 = versions[7].as_bytes();
+    assert_eq!(std::fs::read(&file_path).unwrap(), expected_v8);
+
+    repo.switch_view("dev").unwrap();
+    repo.switch_view("agent-h08").unwrap();
+
+    let after_switch = std::fs::read(&file_path).unwrap();
+    assert_eq!(
+        after_switch, expected_v8,
+        "agent view content should survive a dev round-trip without truncation"
+    );
+}
+
+#[test]
+fn test_switch_view_preserves_harness_08_sequence_through_v9() {
+    let (temp_dir, mut repo) = create_temp_repo();
+    let file_path = temp_dir.path().join("src/app.ts");
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+    let versions = harness_08_versions();
+
+    repo.create_view("agent-h08-v9").unwrap();
+    repo.switch_view("agent-h08-v9").unwrap();
+
+    for (idx, content) in versions.iter().take(9).enumerate() {
+        std::fs::write(&file_path, content.as_bytes()).unwrap();
+
+        if idx == 0 {
+            repo.add("src/app.ts", TrackingOptions::default()).unwrap();
+        }
+
+        repo.record(
+            ChangeHeader::new(&format!("v{}", idx + 1)),
+            RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
+
+    }
+
+    let expected_v9 = versions[8].as_bytes();
+    assert_eq!(std::fs::read(&file_path).unwrap(), expected_v9);
+
+    repo.switch_view("dev").unwrap();
+    repo.switch_view("agent-h08-v9").unwrap();
+
+    let after_switch = std::fs::read(&file_path).unwrap();
+    assert_eq!(
+        after_switch, expected_v9,
+        "agent view content should survive a dev round-trip through v9"
+    );
+}
+
+#[test]
+fn test_switch_view_preserves_harness_08_sequence_through_v10() {
+    let (temp_dir, mut repo) = create_temp_repo();
+    let file_path = temp_dir.path().join("src/app.ts");
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+    let versions = harness_08_versions();
+
+    repo.create_view("agent-h08-v10").unwrap();
+    repo.switch_view("agent-h08-v10").unwrap();
+
+    for (idx, content) in versions.iter().enumerate() {
+        std::fs::write(&file_path, content.as_bytes()).unwrap();
+
+        if idx == 0 {
+            repo.add("src/app.ts", TrackingOptions::default()).unwrap();
+        }
+
+        repo
+            .record(
+                ChangeHeader::new(&format!("v{}", idx + 1)),
+                RecordOptions::new()
+                    .with_all(true)
+                    .save_to_store(true)
+                    .apply_after_record(true),
+            )
+            .unwrap();
+
+    }
+
+    let expected_v10 = versions[9].as_bytes();
+    assert_eq!(std::fs::read(&file_path).unwrap(), expected_v10);
+
+    repo.switch_view("dev").unwrap();
+    repo.switch_view("agent-h08-v10").unwrap();
+
+    let after_switch = std::fs::read(&file_path).unwrap();
+    if after_switch != expected_v10 {
+        dump_filtered_alive_graph_for_test(&repo, "src/app.ts");
+        eprintln!(
+            "actual v10:\n{}",
+            String::from_utf8_lossy(&after_switch)
+        );
+        eprintln!(
+            "expected v10:\n{}",
+            String::from_utf8_lossy(expected_v10)
+        );
+    }
+    assert_eq!(
+        after_switch, expected_v10,
+        "agent view content should survive a dev round-trip through v10"
+    );
+}
+
+#[test]
+fn test_insert_change_preserves_harness_08_sequence_through_v9() {
+    let versions = harness_08_versions();
+
+    let (client_dir, mut client) = create_temp_repo();
+    let client_src = client_dir.path().join("src");
+    std::fs::create_dir_all(&client_src).unwrap();
+    let client_file = client_src.join("app.ts");
+
+    client.create_view("agent-h08-insert").unwrap();
+    client.switch_view("agent-h08-insert").unwrap();
+
+    let mut server_hashes = Vec::new();
+    let (server_dir, mut server) = create_temp_repo();
+    server.create_view("agent-h08-insert").unwrap();
+    let server_file = server_dir.path().join("src/app.ts");
+
+    for (idx, content) in versions.iter().enumerate() {
+        std::fs::write(&client_file, content.as_bytes()).unwrap();
+        if idx == 0 {
+            client.add("src/app.ts", TrackingOptions::default()).unwrap();
+        }
+
+        let outcome = client
+            .record(
+                ChangeHeader::new(&format!("v{}", idx + 1)),
+                RecordOptions::new()
+                    .with_all(true)
+                    .save_to_store(true)
+                    .apply_after_record(true),
+            )
+            .unwrap();
+
+        let change = client.load_change(outcome.hash()).unwrap();
+        let server_hash = server.save_change(&change).unwrap();
+        server_hashes.push(server_hash);
+    }
+
+    for (idx, expected) in versions.iter().take(9).enumerate() {
+        server
+            .insert_change(
+                &server_hashes[idx],
+                InsertOptions::default().view("agent-h08-insert"),
+            )
+            .unwrap();
+        server.switch_view("agent-h08-insert").unwrap();
+
+        let actual = std::fs::read(&server_file).unwrap_or_default();
+        if actual != expected.as_bytes() {
+            dump_filtered_alive_graph_for_test(&server, "src/app.ts");
+        }
+        assert_eq!(
+            actual,
+            expected.as_bytes(),
+            "server insert path diverged at v{}",
+            idx + 1
+        );
+    }
+}
+
+#[test]
+fn test_insert_change_preserves_harness_08_sequence_through_v10() {
+    let versions = harness_08_versions();
+
+    let (client_dir, mut client) = create_temp_repo();
+    let client_src = client_dir.path().join("src");
+    std::fs::create_dir_all(&client_src).unwrap();
+    let client_file = client_src.join("app.ts");
+
+    client.create_view("agent-h08-insert-v10").unwrap();
+    client.switch_view("agent-h08-insert-v10").unwrap();
+
+    let mut server_hashes = Vec::new();
+    let (server_dir, mut server) = create_temp_repo();
+    server.create_view("agent-h08-insert-v10").unwrap();
+    let server_file = server_dir.path().join("src/app.ts");
+
+    for (idx, content) in versions.iter().enumerate() {
+        std::fs::write(&client_file, content.as_bytes()).unwrap();
+        if idx == 0 {
+            client.add("src/app.ts", TrackingOptions::default()).unwrap();
+        }
+
+        let outcome = client
+            .record(
+                ChangeHeader::new(&format!("v{}", idx + 1)),
+                RecordOptions::new()
+                    .with_all(true)
+                    .save_to_store(true)
+                    .apply_after_record(true),
+            )
+            .unwrap();
+
+        let change = client.load_change(outcome.hash()).unwrap();
+        let server_hash = server.save_change(&change).unwrap();
+        server_hashes.push(server_hash);
+    }
+
+    for (idx, expected) in versions.iter().enumerate() {
+        server
+            .insert_change(
+                &server_hashes[idx],
+                InsertOptions::default().view("agent-h08-insert-v10"),
+            )
+            .unwrap();
+        server.switch_view("agent-h08-insert-v10").unwrap();
+
+        let actual = std::fs::read(&server_file).unwrap_or_default();
+        if actual != expected.as_bytes() {
+            dump_filtered_alive_graph_for_test(&server, "src/app.ts");
+        }
+        assert_eq!(
+            actual,
+            expected.as_bytes(),
+            "inserted server content should match client snapshot at v{}",
+            idx + 1
+        );
+    }
+}
+
+fn harness_08_versions() -> Vec<&'static str> {
+    vec![
+        r#"// App v1 — initial
+const VERSION = "1";
+
+function greet(name: string): string {
+  return `Hello, ${name}!`;
+}
+
+function main(): void {
+  console.log(greet("World"));
+}
+
+main();
+"#,
+        r#"// App v2 — add color + helper
+const VERSION = "2";
+
+function formatName(name: string): string {
+  return name.toUpperCase();
+}
+
+function greet(name: string): string {
+  return `Hello, ${formatName(name)}!`;
+}
+
+function main(): void {
+  console.log(greet("World"));
+}
+
+main();
+"#,
+        r#"// App v3 — inline formatting
+const VERSION = "3";
+
+function greet(name: string): string {
+  return `Hello, ${name.toUpperCase()}!`;
+}
+
+function main(): void {
+  const result = greet("World");
+  console.log(result);
+}
+
+main();
+"#,
+        r#"// App v4 — add config
+const VERSION = "4";
+
+const config = {
+  greeting: "Hello",
+  loud: true,
+};
+
+function greet(name: string): string {
+  const g = config.loud ? config.greeting.toUpperCase() : config.greeting;
+  return `${g}, ${name}!`;
+}
+
+function main(): void {
+  console.log(greet("World"));
+}
+
+main();
+"#,
+        r#"const VERSION = "5";
+
+const config = {
+  greeting: "Hey",
+  loud: false,
+  emoji: true,
+};
+
+function greet(name: string): string {
+  const suffix = config.emoji ? " 👋" : "";
+  return `${config.greeting}, ${name}!${suffix}`;
+}
+
+function main(): void {
+  console.log(greet("World"));
+}
+
+main();
+"#,
+        r#"const VERSION = "6";
+
+const config = {
+  greeting: "Hey",
+  loud: false,
+  emoji: true,
+};
+
+function greet(name: string): string {
+  const suffix = config.emoji ? " 👋" : "";
+  return `${config.greeting}, ${name}!${suffix}`;
+}
+
+function main(args: string[]): void {
+  try {
+    const name = args[0] || "World";
+    console.log(greet(name));
+  } catch (e) {
+    console.error("Failed:", e);
+  }
+}
+
+main(process.argv.slice(2));
+"#,
+        r#"const VERSION = "7";
+
+const logger = {
+  info: (msg: string) => console.log(`[INFO] ${msg}`),
+  error: (msg: string) => console.error(`[ERROR] ${msg}`),
+};
+
+const config = {
+  greeting: "Hey",
+  emoji: true,
+};
+
+function greet(name: string): string {
+  const suffix = config.emoji ? " 👋" : "";
+  return `${config.greeting}, ${name}!${suffix}`;
+}
+
+function main(): void {
+  logger.info(greet("World"));
+}
+
+main();
+"#,
+        r#"const VERSION = "8";
+
+let callCount = 0;
+
+const logger = {
+  info: (msg: string) => console.log(`[${new Date().toISOString()}] ${msg}`),
+};
+
+const config = {
+  greeting: "Hey",
+};
+
+function greet(name: string): string {
+  callCount++;
+  return `${config.greeting}, ${name}!`;
+}
+
+function main(): void {
+  logger.info(greet("World"));
+  logger.info(`Calls: ${callCount}`);
+}
+
+main();
+"#,
+        r#"const VERSION = "9";
+
+const config = {
+  greeting: "Hello",
+};
+
+function greet(name: string): string {
+  return `${config.greeting}, ${name}!`;
+}
+
+function main(): void {
+  console.log(greet("World"));
+}
+
+main();
+// End of app
+"#,
+        r#"const VERSION = "10";
+
+type Config = { greeting: string; formal: boolean };
+
+const config: Config = {
+  greeting: "Greetings",
+  formal: true,
+};
+
+function greet(name: string): string {
+  const title = config.formal ? "esteemed " : "";
+  return `${config.greeting}, ${title}${name}!`;
+}
+
+function main(): void {
+  console.log(greet("World"));
+}
+
+main();
+"#,
+    ]
+}
+
+fn dump_filtered_alive_graph_for_test(repo: &Repository, path: &str) {
+    use crate::repository::filter::collect_visible_change_ids;
+    use atomic_core::change::ChangeStore as _;
+    use atomic_core::output::alive::{compute_order, retrieve_graph, RetrieveOptions, VertexId};
+    use atomic_core::pristine::{GraphTxnT, ViewTxnT};
+
+    let txn = repo.pristine.read_txn().unwrap();
+    let view = txn.get_view(&repo.current_view).unwrap().unwrap();
+    let filter = collect_visible_change_ids(&txn, &view).unwrap();
+    let (_, position) = repo.get_inode_and_position(path).unwrap().unwrap();
+    let retrieve = retrieve_graph(&txn, position, RetrieveOptions::new().with_change_filter(filter))
+        .unwrap();
+    let mut graph = retrieve.graph;
+
+    eprintln!("--- alive graph dump for view={} path={} ---", repo.current_view, path);
+    for idx in 1..graph.len_vertices() {
+        let vid = VertexId::new(idx);
+        let node = graph.get_vertex(vid).node;
+        let len = (node.end.get() - node.start.get()) as usize;
+        let mut buf = vec![0; len];
+        repo.change_store()
+            .get_contents(|id| txn.get_external(id).unwrap(), node, &mut buf)
+            .unwrap();
+        let text = String::from_utf8_lossy(&buf).replace('\n', "\\n");
+        let children: Vec<String> = graph
+            .children(vid)
+            .filter(|(_, child)| !child.is_dummy())
+            .map(|(edge, child)| {
+                let flags = edge
+                    .map(|e| format!("{:?}", e.flag()))
+                    .unwrap_or_else(|| "Bypass".to_string());
+                format!("{flags}->{:?}", graph.get_vertex(*child).node)
+            })
+            .collect();
+        let raw_forward: Vec<String> = txn
+            .iter_forward(node, true)
+            .unwrap()
+            .into_iter()
+            .map(|edge| format!("{:?}->{:?}", edge.kind, txn.find_block(edge.dest).ok()))
+            .collect();
+        let raw_parents: Vec<String> = txn
+            .iter_parents(node, true)
+            .unwrap()
+            .into_iter()
+            .map(|edge| format!("{:?}->{:?}", edge.kind, txn.find_block_end(edge.dest).ok()))
+            .collect();
+        eprintln!(
+            "V{idx} {:?} text={:?} children={children:?} raw_forward={raw_forward:?} raw_parents={raw_parents:?}",
+            node, text
+        );
+    }
+
+    let order = compute_order(&mut graph);
+    for (idx, scc) in order.sccs.iter().enumerate() {
+        eprintln!("SCC{idx}: {:?}", scc);
+    }
+    eprintln!("--- end alive graph dump ---");
+}
+
 /// Repro for the post-switch phantom-Deleted / false-Modified bug.
 ///
 /// Scenario:

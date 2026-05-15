@@ -14,6 +14,9 @@ use crate::record::workflow::crdt::{
     ContentTokenizer, CrdtBuildStats, CrdtChangeBuilder, FileOps as BuilderFileOps,
     LineOps as BuilderLineOps,
 };
+use crate::record::workflow::recipes::diff_op_rules::{
+    dispatch as dispatch_diff_op_rule, DiffOpContext as RuleDiffOpContext, Line as RuleLine,
+};
 
 /// Build CRDT operations for a newly added file.
 ///
@@ -147,6 +150,14 @@ pub(crate) fn build_crdt_ops_for_modified_file(
 
     let old_lines: Vec<_> = old_tokenizer.lines().collect();
     let new_lines: Vec<_> = new_tokenizer.lines().collect();
+    let old_rule_lines: Vec<_> = old_content
+        .split_inclusive(|&b| b == b'\n')
+        .map(RuleLine::new)
+        .collect();
+    let new_rule_lines: Vec<_> = new_content
+        .split_inclusive(|&b| b == b'\n')
+        .map(RuleLine::new)
+        .collect();
 
     // Perform line-level diff
     let line_diff = compare_content(old_content, new_content, algorithm);
@@ -165,29 +176,21 @@ pub(crate) fn build_crdt_ops_for_modified_file(
                 new_pos,
                 len,
             } => {
-                // Equal lines emit no CRDT op (no content change, chain
-                // position unchanged for same-position matches).  We
-                // still need to advance `prev_branch` so any subsequent
-                // op chains its `after` reference off the last equal
-                // line.
-                //
-                // The diff_op_rules dispatch (for `Equal at different
-                // positions → emit Reparent`) is **temporarily disabled**
-                // because emitting a single Reparent breaks chain
-                // coherence: when a line moves out from between its
-                // existing predecessor and successor, both the moved
-                // branch's `after` AND any branch whose `after` was the
-                // moved branch need updating in a single coordinated
-                // change.  Until paired-Reparent support lands, prefer
-                // the byte-exact Delete+Insert representation (handled
-                // by the surrounding Delete/Insert/Replace arms).
-                //
-                // This advance keeps the existing in-place edit behavior
-                // identical to the pre-Reparent baseline so cross-view
-                // tests don't regress on simple modifications.
-                let _ = old_pos;
-                let _ = new_pos;
-                if let Some(existing) = existing_branches {
+                let mut ctx = RuleDiffOpContext {
+                    existing_branches,
+                    old_lines: &old_rule_lines,
+                    new_lines: &new_rule_lines,
+                    encoding: _encoding,
+                    placeholder_change: placeholder_change_id,
+                    prev_branch,
+                    emitted: Vec::new(),
+                };
+
+                if dispatch_diff_op_rule(op, &mut ctx) {
+                    collected_line_ops.extend(ctx.emitted);
+                    prev_branch = ctx.prev_branch;
+                } else if let Some(existing) = existing_branches {
+                    let _ = new_pos;
                     let last_equal_idx = old_pos + len - 1;
                     if last_equal_idx < existing.len() {
                         prev_branch = Some(existing[last_equal_idx]);

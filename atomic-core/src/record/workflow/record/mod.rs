@@ -155,6 +155,7 @@ pub use options::RecordingOptions;
 pub use types::{RecordedFile, RecordingResult, RecordingStats};
 
 use crate::change::{Encoding, FileOps, Local};
+use crate::diff::DiffOp;
 use crate::crdt::{BranchId, TrunkId};
 use crate::output::WorkingCopyRead;
 use crate::types::NodeId;
@@ -440,7 +441,9 @@ where
     let hunk_options = options.to_hunk_options().encoding(encoding);
     let mut builder = HunkBuilder::with_options(&detected.path, hunk_options);
 
-    for op in &comparison.diff_ops {
+    let graph_diff_ops = rewrite_shifted_equals_for_graph(&comparison.diff_ops);
+
+    for op in &graph_diff_ops {
         builder.process_diff_op(op);
     }
 
@@ -517,6 +520,25 @@ where
     recorded.set_content(new_content);
 
     Ok(recorded)
+}
+
+fn rewrite_shifted_equals_for_graph(diff_ops: &[DiffOp]) -> Vec<DiffOp> {
+    diff_ops
+        .iter()
+        .map(|op| match *op {
+            DiffOp::Equal {
+                old_pos,
+                new_pos,
+                len,
+            } if old_pos != new_pos && len > 0 => DiffOp::Replace {
+                old_pos,
+                old_len: len,
+                new_pos,
+                new_len: len,
+            },
+            _ => op.clone(),
+        })
+        .collect()
 }
 
 /// Build CRDT FileOps directly from git diff lines.

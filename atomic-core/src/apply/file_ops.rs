@@ -208,7 +208,13 @@ pub fn apply_file_ops_batched(
     let mut vertex_branch_table = txn.txn.open_table(VERTEX_BRANCH)?;
 
     for (ops, trunk_create) in file_ops.iter().zip(trunk_creates.iter()) {
-        let trunk_id = ops.trunk_id();
+        // Resolve TrunkId placeholder — same logic as apply_single_file_ops.
+        let raw_trunk_id = ops.trunk_id();
+        let trunk_id = if raw_trunk_id.change_id().is_root() {
+            TrunkId::new(change_id, raw_trunk_id.file_idx())
+        } else {
+            raw_trunk_id
+        };
         let trunk_key = encode_trunk_id(&trunk_id);
 
         if let Some(serialized) = trunk_create {
@@ -307,7 +313,20 @@ fn apply_single_file_ops<T: MutTxnT>(
     ops: &FileOps,
     stats: &mut ApplyFileOpsStats,
 ) -> PristineResult<()> {
-    let trunk_id = ops.trunk_id();
+    // Resolve the TrunkId placeholder.  The recorder stores TrunkIds
+    // with `change_id = NodeId::ROOT` as a placeholder meaning "this
+    // change — fill in the real id at apply time" (same convention as
+    // BranchId, see `apply_line_ops_with_position`).  Without this
+    // resolution every file recorded in a single change shares
+    // `TrunkId(ROOT, 0)` in the CRDT tables, so queries like
+    // `get_file_content_via_crdt` return branches from every file
+    // concatenated.
+    let raw_trunk_id = ops.trunk_id();
+    let trunk_id = if raw_trunk_id.change_id().is_root() {
+        TrunkId::new(change_id, raw_trunk_id.file_idx())
+    } else {
+        raw_trunk_id
+    };
     let path = ops.path();
 
     // Apply trunk operation if present
