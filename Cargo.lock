@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-agent"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "atomic-core",
@@ -143,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-cli"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "atomic-agent",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-config"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-core"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bitflags",
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-identity"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "atomic-config",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-remote"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-repository"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "atomic-config",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-semantic"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-teams"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "atomic-remote",
  "chrono",
