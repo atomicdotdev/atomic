@@ -423,10 +423,12 @@ where
                 // OrphanBranch on every line.  Falling back to
                 // `file.crdt_ops()` (pre-enrichment) preserves the legacy
                 // shape for files globalize couldn't enrich.
-                if let Some(enriched_ops) = globalized.file_ops() {
-                    ctx.add_file_ops(enriched_ops.clone());
-                } else if let Some(crdt_ops) = file.crdt_ops() {
-                    ctx.add_file_ops(crdt_ops.clone());
+                if !file.opaque_generated() {
+                    if let Some(enriched_ops) = globalized.file_ops() {
+                        ctx.add_file_ops(enriched_ops.clone());
+                    } else if let Some(crdt_ops) = file.crdt_ops() {
+                        ctx.add_file_ops(crdt_ops.clone());
+                    }
                 }
 
                 let hunk_count = globalized.hunks().len();

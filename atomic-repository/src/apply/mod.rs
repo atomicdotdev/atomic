@@ -112,11 +112,11 @@ pub(crate) use types::format_hashes;
 
 use atomic_core::apply::{
     apply_file_ops_batched, compute_new_state, validate_can_apply, verify_dependencies,
-    write_edge_map, write_new_vertex, ConflictTracker, MissingContextConflict, Workspace,
-    ZombieConflict,
+    write_edge_map, write_edge_map_batched, write_new_vertex, write_new_vertex_batched,
+    ConflictTracker, GraphWriteBatch, MissingContextConflict, Workspace, ZombieConflict,
 };
 use atomic_core::change::{Atom, AtomRef, Change, GraphOp};
-use atomic_core::pristine::{GraphTxnT, MutTxnT, WriteTxn};
+use atomic_core::pristine::{GraphTxnT, MutTxnT, TreeTxnT, WriteTxn};
 use atomic_core::types::{Base32, Hash, NodeId};
 use std::collections::{HashSet, VecDeque};
 
@@ -267,37 +267,75 @@ pub fn write_change_to_graph(
         let hunks = change.hunks();
         let total_hunks = hunks.len();
         let hunk_phase_start = std::time::Instant::now();
-        // Process each graph_op (graph layer)
-        for (hunk_idx, graph_op) in hunks.iter().enumerate() {
-            if trace_record && (hunk_idx == 0 || (hunk_idx + 1) % 1_000 == 0) {
-                eprintln!(
-                    "[write_change_to_graph] applying hunk {}/{} elapsed={:?}",
+        let use_batched_graph_writes = !hunks.iter().any(GraphOp::is_content_edit);
+        if use_batched_graph_writes {
+            let mut graph_batch =
+                GraphWriteBatch::new(&*txn).map_err(|e| InsertError::Database(e.to_string()))?;
+
+            for (hunk_idx, graph_op) in hunks.iter().enumerate() {
+                if trace_record && (hunk_idx == 0 || (hunk_idx + 1) % 1_000 == 0) {
+                    eprintln!(
+                        "[write_change_to_graph] applying hunk {}/{} elapsed={:?}",
+                        hunk_idx + 1,
+                        total_hunks,
+                        hunk_phase_start.elapsed()
+                    );
+                }
+                log::debug!(
+                    "write_change_to_graph: hunk {}/{} starting: {:?}",
                     hunk_idx + 1,
                     total_hunks,
-                    hunk_phase_start.elapsed()
+                    std::mem::discriminant(graph_op)
+                );
+                write_hunk_batched(
+                    &*txn,
+                    &mut graph_batch,
+                    &mut workspace,
+                    &mut conflict_tracker,
+                    change_id,
+                    graph_op,
+                    change,
+                    options,
+                    &mut stats,
+                )?;
+                log::debug!(
+                    "write_change_to_graph: hunk {}/{} complete",
+                    hunk_idx + 1,
+                    total_hunks
                 );
             }
-            log::debug!(
-                "write_change_to_graph: hunk {}/{} starting: {:?}",
-                hunk_idx + 1,
-                total_hunks,
-                std::mem::discriminant(graph_op)
-            );
-            write_hunk(
-                txn,
-                &mut workspace,
-                &mut conflict_tracker,
-                change_id,
-                graph_op,
-                change,
-                options,
-                &mut stats,
-            )?;
-            log::debug!(
-                "write_change_to_graph: hunk {}/{} complete",
-                hunk_idx + 1,
-                total_hunks
-            );
+        } else {
+            for (hunk_idx, graph_op) in hunks.iter().enumerate() {
+                if trace_record && (hunk_idx == 0 || (hunk_idx + 1) % 1_000 == 0) {
+                    eprintln!(
+                        "[write_change_to_graph] applying hunk {}/{} elapsed={:?}",
+                        hunk_idx + 1,
+                        total_hunks,
+                        hunk_phase_start.elapsed()
+                    );
+                }
+                log::debug!(
+                    "write_change_to_graph: unbatched hunk {}/{} starting: {:?}",
+                    hunk_idx + 1,
+                    total_hunks,
+                    std::mem::discriminant(graph_op)
+                );
+                write_hunk_unbatched(
+                    txn,
+                    &mut workspace,
+                    &mut conflict_tracker,
+                    change_id,
+                    graph_op,
+                    change,
+                    options,
+                    &mut stats,
+                )?;
+                log::debug!(
+                    "write_change_to_graph: unbatched hunk {}/{} complete",
+                    hunk_idx + 1,
+                    total_hunks
+                );
+            }
         }
         if trace_record {
             eprintln!(
@@ -387,9 +425,74 @@ pub fn write_change_to_graph(
     ))
 }
 
-/// Write a single graph_op to the graph.
 #[allow(clippy::too_many_arguments)]
-fn write_hunk<T: MutTxnT>(
+fn write_hunk_batched<T: GraphTxnT + TreeTxnT>(
+    txn: &T,
+    graph_batch: &mut GraphWriteBatch<'_>,
+    workspace: &mut Workspace,
+    conflict_tracker: &mut ConflictTracker,
+    change_id: NodeId,
+    graph_op: &GraphOp<Option<Hash>>,
+    change: &Change,
+    _options: &InsertOptions,
+    stats: &mut InsertStats,
+) -> InsertResult<()> {
+    for atom_ref in graph_op.atoms() {
+        match atom_ref {
+            AtomRef::Insertion(insertion) => {
+                write_new_vertex_batched(
+                    txn,
+                    graph_batch,
+                    workspace,
+                    change_id,
+                    insertion,
+                    change,
+                )?;
+                stats.atoms_processed += 1;
+            }
+            AtomRef::EdgeUpdate(edge_update) => {
+                write_edge_map_batched(
+                    txn,
+                    graph_batch,
+                    workspace,
+                    change_id,
+                    edge_update,
+                    change,
+                )?;
+                stats.atoms_processed += 1;
+            }
+            AtomRef::Atom(atom) => match atom {
+                Atom::Insertion(nv) => {
+                    write_new_vertex_batched(txn, graph_batch, workspace, change_id, nv, change)?;
+                    stats.atoms_processed += 1;
+                }
+                Atom::EdgeUpdate(em) => {
+                    write_edge_map_batched(txn, graph_batch, workspace, change_id, em, change)?;
+                    stats.atoms_processed += 1;
+                }
+            },
+        }
+
+        if workspace.has_conflicts() {
+            for missing_ctx in workspace.missing_contexts() {
+                let conflict = if missing_ctx.is_predecessor {
+                    MissingContextConflict::predecessors(missing_ctx.position, change_id)
+                } else {
+                    MissingContextConflict::successors(missing_ctx.position, change_id)
+                };
+                conflict_tracker.add_missing_context(conflict);
+            }
+            for zombie in workspace.zombies() {
+                conflict_tracker.add_zombie(ZombieConflict::new(zombie.node));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_hunk_unbatched<T: MutTxnT>(
     txn: &mut T,
     workspace: &mut Workspace,
     conflict_tracker: &mut ConflictTracker,
@@ -399,7 +502,6 @@ fn write_hunk<T: MutTxnT>(
     _options: &InsertOptions,
     stats: &mut InsertStats,
 ) -> InsertResult<()> {
-    // Process atoms in the graph_op
     for atom_ref in graph_op.atoms() {
         match atom_ref {
             AtomRef::Insertion(insertion) => {
@@ -410,25 +512,18 @@ fn write_hunk<T: MutTxnT>(
                 write_edge_map(txn, workspace, change_id, edge_update, change)?;
                 stats.atoms_processed += 1;
             }
-            AtomRef::Atom(atom) => {
-                // Full atom - dispatch to appropriate handler
-                match atom {
-                    Atom::Insertion(nv) => {
-                        write_new_vertex(txn, workspace, change_id, nv, change)?;
-                        stats.atoms_processed += 1;
-                    }
-                    Atom::EdgeUpdate(em) => {
-                        write_edge_map(txn, workspace, change_id, em, change)?;
-                        stats.atoms_processed += 1;
-                    }
+            AtomRef::Atom(atom) => match atom {
+                Atom::Insertion(nv) => {
+                    write_new_vertex(txn, workspace, change_id, nv, change)?;
+                    stats.atoms_processed += 1;
                 }
-            }
+                Atom::EdgeUpdate(em) => {
+                    write_edge_map(txn, workspace, change_id, em, change)?;
+                    stats.atoms_processed += 1;
+                }
+            },
         }
 
-        // Track conflicts but never abort.  In the ambient graph model all
-        // edges live in a single GRAPH and changes are validated at record
-        // time, so "conflicts" here are structural context notes — not
-        // errors that should block graph writes.
         if workspace.has_conflicts() {
             for missing_ctx in workspace.missing_contexts() {
                 let conflict = if missing_ctx.is_predecessor {

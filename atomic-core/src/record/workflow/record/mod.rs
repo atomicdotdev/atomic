@@ -155,8 +155,8 @@ pub use options::RecordingOptions;
 pub use types::{RecordedFile, RecordingResult, RecordingStats};
 
 use crate::change::{Encoding, FileOps, Local};
-use crate::diff::DiffOp;
 use crate::crdt::{BranchId, TrunkId};
+use crate::diff::DiffOp;
 use crate::output::WorkingCopyRead;
 use crate::types::NodeId;
 
@@ -175,7 +175,7 @@ use super::graph_op::{BuiltHunk, BuiltHunkKind, HunkBuilder};
 ///
 /// Used by [`build_crdt_ops_from_git_diff`] to build BranchOps that
 /// exactly match `git diff` output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GitDiffLine {
     /// `+`, `-`, or ` `
     pub origin: char,
@@ -366,6 +366,7 @@ pub fn record_modified_file<W>(
     old_content: &[u8],
     crdt_old_content: Option<&[u8]>,
     options: &RecordingOptions,
+    existing_trunk_id: Option<TrunkId>,
     existing_branches: Option<&[BranchId]>,
 ) -> Result<RecordedFile, String>
 where
@@ -509,6 +510,7 @@ where
         old_content: crdt_old_content.unwrap_or(old_content),
         new_content: &new_content,
         existing_branches,
+        existing_trunk_id,
         encoding,
         algorithm: options.get_algorithm(),
     };
@@ -530,7 +532,12 @@ fn rewrite_shifted_equals_for_graph(diff_ops: &[DiffOp]) -> Vec<DiffOp> {
                 old_pos,
                 new_pos,
                 len,
-            } if old_pos != new_pos && len > 0 => DiffOp::Replace {
+                // Only rewrite unchanged lines that were pushed *down* by
+                // inserted content above them. When lines shift *up* due to
+                // deletions above, the delete path should reconnect the old
+                // suffix in place; forcing a Replace there duplicates the
+                // suffix as fresh content.
+            } if new_pos > old_pos && len > 0 => DiffOp::Replace {
                 old_pos,
                 old_len: len,
                 new_pos,

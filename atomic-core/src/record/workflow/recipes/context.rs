@@ -7,7 +7,7 @@
 //! we add fields.
 
 use crate::change::Encoding;
-use crate::crdt::BranchId;
+use crate::crdt::{BranchId, TrunkId};
 use crate::diff::Algorithm;
 
 /// Everything a recipe needs to produce CRDT operations for a modified
@@ -35,6 +35,14 @@ pub struct RecipeContext<'a> {
     /// in-memory pipelines).  Recipes that need to look up an existing
     /// branch fall back to fresh placeholders.
     pub existing_branches: Option<&'a [BranchId]>,
+
+    /// Existing trunk identity for the file being edited.
+    ///
+    /// Required when a modification inserts new branches: those new lines
+    /// must join the file's existing trunk rather than a synthetic
+    /// per-change trunk, otherwise the CRDT walker cannot see them when it
+    /// traverses the file by path.
+    pub existing_trunk_id: Option<TrunkId>,
 
     /// Detected encoding of the new content.
     pub encoding: Encoding,

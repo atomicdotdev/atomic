@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::change::{Encoding, Local};
+use crate::crdt::BranchOp;
 use crate::diff::Algorithm;
 use crate::output::Memory;
 use crate::record::workflow::detect::{DetectedFile, DetectionKind};
@@ -503,7 +504,7 @@ fn test_record_modified_file_success() {
     let old_content = b"fn old() {}";
     let options = RecordingOptions::new();
 
-    let result = record_modified_file(&wc, &detected, old_content, None, &options, None);
+    let result = record_modified_file(&wc, &detected, old_content, None, &options, None, None);
 
     assert!(result.is_ok());
     let recorded = result.unwrap();
@@ -520,7 +521,7 @@ fn test_record_modified_file_not_found() {
     let old_content = b"old content";
     let options = RecordingOptions::new();
 
-    let result = record_modified_file(&wc, &detected, old_content, None, &options, None);
+    let result = record_modified_file(&wc, &detected, old_content, None, &options, None, None);
 
     assert!(result.is_err());
 }
@@ -534,7 +535,7 @@ fn test_record_modified_file_with_diff() {
     let old_content = b"line1\nold_line\nline3\n";
     let options = RecordingOptions::new();
 
-    let result = record_modified_file(&wc, &detected, old_content, None, &options, None);
+    let result = record_modified_file(&wc, &detected, old_content, None, &options, None, None);
 
     assert!(result.is_ok());
     let recorded = result.unwrap();
@@ -639,7 +640,7 @@ fn test_record_modified_file_has_crdt_ops() {
     let old_content = b"fn old_function() {\n    // old code\n}\n";
     let options = RecordingOptions::new();
 
-    let result = record_modified_file(&wc, &detected, old_content, None, &options, None);
+    let result = record_modified_file(&wc, &detected, old_content, None, &options, None, None);
     assert!(result.is_ok());
 
     let recorded = result.unwrap();
@@ -659,7 +660,7 @@ fn test_record_modified_file_crdt_stats_tracks_changes() {
     let old_content = b"line1\nold_line\nline3\n";
     let options = RecordingOptions::new();
 
-    let result = record_modified_file(&wc, &detected, old_content, None, &options, None);
+    let result = record_modified_file(&wc, &detected, old_content, None, &options, None, None);
     assert!(result.is_ok());
 
     let recorded = result.unwrap();
@@ -680,7 +681,7 @@ fn test_record_modified_file_crdt_insert_only() {
     let old_content = b"line1\nline2\nline3\n";
     let options = RecordingOptions::new();
 
-    let result = record_modified_file(&wc, &detected, old_content, None, &options, None);
+    let result = record_modified_file(&wc, &detected, old_content, None, &options, None, None);
     assert!(result.is_ok());
 
     let recorded = result.unwrap();
@@ -688,6 +689,31 @@ fn test_record_modified_file_crdt_insert_only() {
 
     // Should have inserted one line
     assert!(stats.lines_added >= 1);
+}
+
+#[test]
+fn test_record_modified_file_crdt_insert_only_emits_insert_op() {
+    let wc = Memory::new();
+    wc.add_file("test.rs", b"alpha\nbeta\nDELTA\ngamma\n");
+
+    let detected = DetectedFile::modified("test.rs");
+    let old_content = b"alpha\nbeta\ngamma\n";
+    let options = RecordingOptions::new();
+
+    let result = record_modified_file(&wc, &detected, old_content, None, &options, None, None);
+    assert!(result.is_ok());
+
+    let recorded = result.unwrap();
+    let crdt_ops = recorded.crdt_ops().unwrap();
+
+    assert!(
+        crdt_ops
+            .line_ops()
+            .iter()
+            .any(|op| matches!(op.operation(), BranchOp::Insert { .. })),
+        "mid-file insert should emit at least one BranchOp::Insert; got {:?}",
+        crdt_ops.line_ops()
+    );
 }
 
 #[test]
@@ -699,7 +725,7 @@ fn test_record_modified_file_crdt_delete_only() {
     let old_content = b"line1\nline2\nline3\n";
     let options = RecordingOptions::new();
 
-    let result = record_modified_file(&wc, &detected, old_content, None, &options, None);
+    let result = record_modified_file(&wc, &detected, old_content, None, &options, None, None);
     assert!(result.is_ok());
 
     let recorded = result.unwrap();

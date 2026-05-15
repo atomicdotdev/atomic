@@ -547,10 +547,11 @@ fn walk_through_dead<T: GraphTxnT>(
                 };
 
                 if !has_alive_alt_parent && !live_successors.contains(&vid) {
-                    let shadowed_by_existing = live_successors.iter().copied().any(|existing_vid| {
-                        let existing_node = result.graph.get_vertex(existing_vid).node;
-                        visible_chain_reaches(txn, options, existing_node, next_vertex)
-                    });
+                    let shadowed_by_existing =
+                        live_successors.iter().copied().any(|existing_vid| {
+                            let existing_node = result.graph.get_vertex(existing_vid).node;
+                            visible_chain_reaches(txn, options, existing_node, next_vertex)
+                        });
 
                     if !shadowed_by_existing {
                         live_successors.retain(|existing_vid| {

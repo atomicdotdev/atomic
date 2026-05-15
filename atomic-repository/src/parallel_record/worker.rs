@@ -142,6 +142,7 @@ fn process_modified_file(
         None,
         options,
         None,
+        None,
     ) {
         Ok(recorded) => {
             if recorded.is_empty() {

@@ -371,7 +371,13 @@ impl Repository {
                     // so that Delete and Modify CRDT ops reference the real
                     // BranchIds for those old-content lines, not fresh
                     // placeholders — see RCA §11.3 and `iter_trunk_branches_in_file_order`.
-                    let (file_inode, file_position, existing_branches, can_use_crdt_old_content) = {
+                    let (
+                        file_inode,
+                        file_position,
+                        existing_trunk_id,
+                        existing_branches,
+                        can_use_crdt_old_content,
+                    ) = {
                         use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
                         use atomic_core::crdt::tables::decode_trunk_id;
                         use atomic_core::pristine::CrdtTxnT;
@@ -439,9 +445,12 @@ impl Repository {
                         // placeholders.
                         use atomic_core::crdt::tables::encode_branch_id;
                         let inode_u64 = inode.get();
-                        let existing_branches = match txn.get_crdt_inode_trunk(inode_u64) {
-                            Ok(Some(trunk_key)) => {
-                                let trunk_id = decode_trunk_id(&trunk_key);
+                        let existing_trunk_id = match txn.get_crdt_inode_trunk(inode_u64) {
+                            Ok(Some(trunk_key)) => Some(decode_trunk_id(&trunk_key)),
+                            _ => None,
+                        };
+                        let existing_branches = match existing_trunk_id {
+                            Some(trunk_id) => {
                                 match iter_trunk_branches_in_file_order(&txn, trunk_id) {
                                     Ok(all) => {
                                         let mut alive = Vec::with_capacity(all.len());
@@ -461,7 +470,7 @@ impl Repository {
                                     Err(_) => Vec::new(),
                                 }
                             }
-                            _ => Vec::new(),
+                            None => Vec::new(),
                         };
 
                         let view_name = options.get_view().unwrap_or(&self.current_view);
@@ -479,7 +488,13 @@ impl Repository {
                             false
                         };
 
-                        (inode, position, existing_branches, can_use_crdt_old_content)
+                        (
+                            inode,
+                            position,
+                            existing_trunk_id,
+                            existing_branches,
+                            can_use_crdt_old_content,
+                        )
                     };
 
                     // Step 2: Retrieve old content from the graph.
@@ -557,7 +572,7 @@ impl Repository {
                     // into cross-view recording.
                     let crdt_old_content: Option<Vec<u8>> = if can_use_crdt_old_content {
                         match self.get_file_content_via_crdt(entry.path()) {
-                            Ok(Some(content)) => Some(content),
+                            Ok(Some(content)) if content == old_content => Some(content),
                             _ => None,
                         }
                     } else {
@@ -574,6 +589,7 @@ impl Repository {
                         &old_content,
                         crdt_old_content.as_deref(),
                         &core_options,
+                        existing_trunk_id,
                         existing_branches_slice,
                     ) {
                         Ok(recorded) => {

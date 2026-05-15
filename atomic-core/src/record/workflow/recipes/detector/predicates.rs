@@ -128,6 +128,7 @@ mod tests {
             old_content: old,
             new_content: new,
             existing_branches: Some(existing),
+            existing_trunk_id: None,
             encoding: Encoding::Utf8,
             algorithm: Algorithm::Myers,
         }
@@ -144,6 +145,7 @@ mod tests {
             old_content: b"foo\n",
             new_content: b"bar\n",
             existing_branches: None,
+            existing_trunk_id: None,
             encoding: Encoding::Utf8,
             algorithm: Algorithm::Myers,
         };

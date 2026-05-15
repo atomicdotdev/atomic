@@ -104,13 +104,14 @@ pub(crate) fn build_crdt_ops_for_modified_file(
     new_content: &[u8],
     _encoding: Encoding,
     algorithm: Algorithm,
+    existing_trunk_id: Option<TrunkId>,
     existing_branches: Option<&[BranchId]>,
 ) -> (FileOps, CrdtBuildStats) {
     // Use placeholder change ID
     let placeholder_change_id = NodeId::new(0);
 
     // Create file ops container (no TrunkOp for modification - file already exists)
-    let trunk_id = TrunkId::new(placeholder_change_id, 0);
+    let trunk_id = existing_trunk_id.unwrap_or_else(|| TrunkId::new(placeholder_change_id, 0));
     let mut file_ops = BuilderFileOps::new(trunk_id, path.to_string(), None);
 
     let mut stats = CrdtBuildStats::new();

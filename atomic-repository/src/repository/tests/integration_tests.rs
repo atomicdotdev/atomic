@@ -461,7 +461,6 @@ fn test_switch_view_preserves_harness_08_sequence_through_v9() {
                 .apply_after_record(true),
         )
         .unwrap();
-
     }
 
     let expected_v9 = versions[8].as_bytes();
@@ -495,16 +494,14 @@ fn test_switch_view_preserves_harness_08_sequence_through_v10() {
             repo.add("src/app.ts", TrackingOptions::default()).unwrap();
         }
 
-        repo
-            .record(
-                ChangeHeader::new(&format!("v{}", idx + 1)),
-                RecordOptions::new()
-                    .with_all(true)
-                    .save_to_store(true)
-                    .apply_after_record(true),
-            )
-            .unwrap();
-
+        repo.record(
+            ChangeHeader::new(&format!("v{}", idx + 1)),
+            RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
     }
 
     let expected_v10 = versions[9].as_bytes();
@@ -516,14 +513,8 @@ fn test_switch_view_preserves_harness_08_sequence_through_v10() {
     let after_switch = std::fs::read(&file_path).unwrap();
     if after_switch != expected_v10 {
         dump_filtered_alive_graph_for_test(&repo, "src/app.ts");
-        eprintln!(
-            "actual v10:\n{}",
-            String::from_utf8_lossy(&after_switch)
-        );
-        eprintln!(
-            "expected v10:\n{}",
-            String::from_utf8_lossy(expected_v10)
-        );
+        eprintln!("actual v10:\n{}", String::from_utf8_lossy(&after_switch));
+        eprintln!("expected v10:\n{}", String::from_utf8_lossy(expected_v10));
     }
     assert_eq!(
         after_switch, expected_v10,
@@ -551,7 +542,9 @@ fn test_insert_change_preserves_harness_08_sequence_through_v9() {
     for (idx, content) in versions.iter().enumerate() {
         std::fs::write(&client_file, content.as_bytes()).unwrap();
         if idx == 0 {
-            client.add("src/app.ts", TrackingOptions::default()).unwrap();
+            client
+                .add("src/app.ts", TrackingOptions::default())
+                .unwrap();
         }
 
         let outcome = client
@@ -611,7 +604,9 @@ fn test_insert_change_preserves_harness_08_sequence_through_v10() {
     for (idx, content) in versions.iter().enumerate() {
         std::fs::write(&client_file, content.as_bytes()).unwrap();
         if idx == 0 {
-            client.add("src/app.ts", TrackingOptions::default()).unwrap();
+            client
+                .add("src/app.ts", TrackingOptions::default())
+                .unwrap();
         }
 
         let outcome = client
@@ -856,11 +851,18 @@ fn dump_filtered_alive_graph_for_test(repo: &Repository, path: &str) {
     let view = txn.get_view(&repo.current_view).unwrap().unwrap();
     let filter = collect_visible_change_ids(&txn, &view).unwrap();
     let (_, position) = repo.get_inode_and_position(path).unwrap().unwrap();
-    let retrieve = retrieve_graph(&txn, position, RetrieveOptions::new().with_change_filter(filter))
-        .unwrap();
+    let retrieve = retrieve_graph(
+        &txn,
+        position,
+        RetrieveOptions::new().with_change_filter(filter),
+    )
+    .unwrap();
     let mut graph = retrieve.graph;
 
-    eprintln!("--- alive graph dump for view={} path={} ---", repo.current_view, path);
+    eprintln!(
+        "--- alive graph dump for view={} path={} ---",
+        repo.current_view, path
+    );
     for idx in 1..graph.len_vertices() {
         let vid = VertexId::new(idx);
         let node = graph.get_vertex(vid).node;

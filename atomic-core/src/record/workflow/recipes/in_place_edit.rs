@@ -24,6 +24,7 @@ pub fn build_ops(ctx: &RecipeContext<'_>) -> (FileOps, CrdtBuildStats) {
         ctx.new_content,
         ctx.encoding,
         ctx.algorithm,
+        ctx.existing_trunk_id,
         ctx.existing_branches,
     )
 }

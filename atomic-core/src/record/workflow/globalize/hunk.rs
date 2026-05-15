@@ -38,6 +38,19 @@ use super::*;
 use crate::change::Local;
 use crate::pristine::InodeGraphOps;
 
+fn should_use_opaque_generated_vertices(path: &str) -> bool {
+    let Some(name) = std::path::Path::new(path).file_name() else {
+        return false;
+    };
+    let name = name.to_string_lossy();
+    name.ends_with(".lock")
+        || name.ends_with(".sum")
+        || matches!(
+            name.as_ref(),
+            "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml"
+        )
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Public entry point
 // ───────────────────────────────────────────────────────────────────────────
@@ -141,7 +154,8 @@ fn globalize_insert<T>(
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    let position = classify_insert(ctx.txn(), inode, inode_pos, built.old_start, old_line_count)?;
+    let vertices = collect_sorted_content_vertices_cached(ctx, inode, inode_pos)?;
+    let position = classify_insert(&vertices, inode_pos, built.old_start, old_line_count)?;
 
     let (predecessors, successors) = match position {
         InsertPosition::Prepend { first_content } => (vec![inode_pos], vec![first_content]),
@@ -151,6 +165,16 @@ where
             successor_start,
         } => (vec![predecessor_end], vec![successor_start]),
     };
+
+    if should_use_opaque_generated_vertices(&local.path) {
+        let insertion =
+            create_content_vertex(ctx, inode, inode_pos, predecessors, successors, content)?;
+        return Ok(vec![GraphOp::Edit {
+            change: Atom::Insertion(insertion),
+            local,
+            encoding,
+        }]);
+    }
 
     let insertions =
         create_content_vertices_per_line(ctx, inode, inode_pos, predecessors, successors, content)?;
@@ -213,7 +237,11 @@ fn globalize_replace<T>(
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    let sorted = collect_sorted_content_vertices(ctx.txn(), inode, inode_pos)?;
+    if should_use_opaque_generated_vertices(&local.path) {
+        return globalize_replace_whole_file(ctx, inode, inode_pos, content, local, encoding);
+    }
+
+    let sorted = collect_sorted_content_vertices_cached(ctx, inode, inode_pos)?;
 
     // Legacy: file has no visible content vertices in this view.  Fall
     // back to whole-file replace, which walks INODE_GRAPH unfiltered.
@@ -235,20 +263,15 @@ where
     // This happens when the diff produces a Replace with old_len == 0
     // (an insertion that the algorithm classified as a replacement).
     if built.deleted_lines.is_empty() {
-        let position = match classify_insert(
-            ctx.txn(),
-            inode,
-            inode_pos,
-            built.old_start,
-            Some(sorted.len()),
-        ) {
-            Ok(p) => p,
-            Err(_) => {
-                return globalize_replace_whole_file(
-                    ctx, inode, inode_pos, content, local, encoding,
-                );
-            }
-        };
+        let position =
+            match classify_insert(&sorted, inode_pos, built.old_start, Some(sorted.len())) {
+                Ok(p) => p,
+                Err(_) => {
+                    return globalize_replace_whole_file(
+                        ctx, inode, inode_pos, content, local, encoding,
+                    );
+                }
+            };
 
         let (predecessors, successors) = match position {
             InsertPosition::Prepend { first_content } => (vec![inode_pos], vec![first_content]),
@@ -375,7 +398,7 @@ fn globalize_replace_whole_file<T>(
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    let content_vertices = find_content_vertices(ctx.txn(), inode, inode_pos)?;
+    let content_vertices = find_content_vertices_cached(ctx, inode, inode_pos)?;
     let deletion_edges = match build_deletion_edges(ctx, &content_vertices) {
         Ok(edges) => edges,
         Err(_) => {
@@ -389,8 +412,18 @@ where
         inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
     };
 
-    let insertions =
-        create_content_vertices_per_line(ctx, inode, inode_pos, vec![inode_pos], vec![], content)?;
+    let insertions = if should_use_opaque_generated_vertices(&local.path) {
+        vec![create_content_vertex(
+            ctx,
+            inode,
+            inode_pos,
+            vec![inode_pos],
+            vec![],
+            content,
+        )?]
+    } else {
+        create_content_vertices_per_line(ctx, inode, inode_pos, vec![inode_pos], vec![], content)?
+    };
 
     let mut ops = Vec::with_capacity(insertions.len());
     let mut iter = insertions.into_iter();
@@ -437,7 +470,21 @@ fn globalize_delete<T>(
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    let sorted = collect_sorted_content_vertices(ctx.txn(), inode, inode_pos)?;
+    if should_use_opaque_generated_vertices(&local.path) {
+        let content_vertices = find_content_vertices(ctx.txn(), inode, inode_pos)?;
+        let deletion_edges = build_deletion_edges(ctx, &content_vertices)?;
+        let deletion = EdgeUpdate {
+            edges: deletion_edges,
+            inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
+        };
+        return Ok(vec![GraphOp::Edit {
+            change: Atom::EdgeUpdate(deletion),
+            local,
+            encoding,
+        }]);
+    }
+
+    let sorted = collect_sorted_content_vertices_cached(ctx, inode, inode_pos)?;
 
     // Targeted deletion when we have per-line vertices and a specific
     // deleted range.
@@ -501,7 +548,7 @@ fn delete_all_content<T>(
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    let content_vertices = find_content_vertices(ctx.txn(), inode, inode_pos)?;
+    let content_vertices = find_content_vertices_cached(ctx, inode, inode_pos)?;
     let deletion_edges = build_deletion_edges(ctx, &content_vertices)?;
 
     Ok(EdgeUpdate {
@@ -546,18 +593,12 @@ enum InsertPosition {
 /// per-line vertex granularity), a middle insert is resolved to the vertex
 /// boundary at `old_start`.  For single-vertex files there are no internal
 /// boundaries, so we return an error and let the caller fall back to Replace.
-fn classify_insert<T>(
-    txn: &T,
-    inode: Inode,
+fn classify_insert(
+    vertices: &[GraphNode<NodeId>],
     inode_pos: Position<NodeId>,
     old_start: usize,
     old_line_count: Option<usize>,
-) -> GlobalizeResult<InsertPosition>
-where
-    T: GraphTxnT + InodeGraphOps,
-{
-    let vertices = collect_sorted_content_vertices(txn, inode, inode_pos)?;
-
+) -> GlobalizeResult<InsertPosition> {
     log::debug!(
         "classify_insert: old_start={} old_line_count={:?} vertices={}",
         old_start,
@@ -625,6 +666,40 @@ where
     })
 }
 
+fn collect_sorted_content_vertices_cached<T>(
+    ctx: &mut GlobalizeContext<'_, T>,
+    inode: Inode,
+    inode_pos: Position<NodeId>,
+) -> GlobalizeResult<Vec<GraphNode<NodeId>>>
+where
+    T: GraphTxnT + InodeGraphOps,
+{
+    if let Some(vertices) = ctx.content_vertices_cache.get(&inode) {
+        return Ok(vertices.clone());
+    }
+
+    let vertices = collect_sorted_content_vertices(ctx.txn, inode, inode_pos)?;
+    ctx.content_vertices_cache.insert(inode, vertices.clone());
+    Ok(vertices)
+}
+
+fn find_content_vertices_cached<T>(
+    ctx: &mut GlobalizeContext<'_, T>,
+    inode: Inode,
+    inode_pos: Position<NodeId>,
+) -> GlobalizeResult<Vec<GraphNode<NodeId>>>
+where
+    T: GraphTxnT + InodeGraphOps,
+{
+    if let Some(vertices) = ctx.content_vertices_cache.get(&inode) {
+        return Ok(vertices.clone());
+    }
+
+    let vertices = collect_sorted_content_vertices(ctx.txn, inode, inode_pos)?;
+    ctx.content_vertices_cache.insert(inode, vertices.clone());
+    Ok(vertices)
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Graph vertex / edge helpers
 // ───────────────────────────────────────────────────────────────────────────
@@ -678,8 +753,9 @@ where
         false
     };
 
-    fn alive_reaches<T: GraphTxnT>(
+    fn alive_reaches<T: GraphTxnT + InodeGraphOps>(
         txn: &T,
+        inode: Inode,
         start: GraphNode<NodeId>,
         target: GraphNode<NodeId>,
         is_dead_in_view: &dyn Fn(GraphNode<NodeId>) -> bool,
@@ -705,9 +781,13 @@ where
                 if edge.kind.is_pseudo() {
                     continue;
                 }
-                let dest = match txn.find_block(edge.dest) {
-                    Ok(dest) => dest,
-                    Err(_) => continue,
+                let dest = txn
+                    .find_block_in_inode(inode, edge.dest)
+                    .ok()
+                    .flatten()
+                    .or_else(|| txn.find_block(edge.dest).ok());
+                let Some(dest) = dest else {
+                    continue;
                 };
                 if is_dead_in_view(dest) {
                     continue;
@@ -757,9 +837,13 @@ where
             {
                 continue;
             }
-            let dest = match txn.find_block(edge.dest()) {
-                Ok(v) => v,
-                Err(_) => continue,
+            let dest = txn
+                .find_block_in_inode(inode, edge.dest())
+                .ok()
+                .flatten()
+                .or_else(|| txn.find_block(edge.dest()).ok());
+            let Some(dest) = dest else {
+                continue;
             };
             if visited.contains(&dest) {
                 continue;
@@ -774,24 +858,29 @@ where
         let next_alive = if alive_candidates.len() <= 1 {
             alive_candidates.into_iter().next()
         } else {
-            alive_candidates.iter().copied().find(|candidate| {
-                let reaches_other = alive_candidates.iter().copied().any(|other| {
-                    other != *candidate && alive_reaches(txn, *candidate, other, &is_dead_in_view)
-                });
-                let reached_by_other = alive_candidates.iter().copied().any(|other| {
-                    other != *candidate && alive_reaches(txn, other, *candidate, &is_dead_in_view)
-                });
-                reaches_other && !reached_by_other
-            })
-            .or_else(|| {
-                alive_candidates.iter().copied().find(|candidate| {
-                    alive_candidates.iter().copied().any(|other| {
+            alive_candidates
+                .iter()
+                .copied()
+                .find(|candidate| {
+                    let reaches_other = alive_candidates.iter().copied().any(|other| {
                         other != *candidate
-                            && alive_reaches(txn, *candidate, other, &is_dead_in_view)
+                            && alive_reaches(txn, inode, *candidate, other, &is_dead_in_view)
+                    });
+                    let reached_by_other = alive_candidates.iter().copied().any(|other| {
+                        other != *candidate
+                            && alive_reaches(txn, inode, other, *candidate, &is_dead_in_view)
+                    });
+                    reaches_other && !reached_by_other
+                })
+                .or_else(|| {
+                    alive_candidates.iter().copied().find(|candidate| {
+                        alive_candidates.iter().copied().any(|other| {
+                            other != *candidate
+                                && alive_reaches(txn, inode, *candidate, other, &is_dead_in_view)
+                        })
                     })
                 })
-            })
-            .or_else(|| alive_candidates.into_iter().next())
+                .or_else(|| alive_candidates.into_iter().next())
         };
 
         let dest = match next_alive.or(next_dead) {
@@ -855,6 +944,7 @@ where
 /// returned vertices lack PARENT edges in the global GRAPH, the caller
 /// will see a `GlobalizeError`.  To handle this transparently we expose
 /// a `_with_fallback` wrapper that retries via the global DFS.
+#[allow(dead_code)]
 fn find_content_vertices<T>(
     txn: &T,
     inode: Inode,
@@ -889,6 +979,7 @@ where
 /// This is the fast path: iterates only edges belonging to this specific
 /// file, giving O(m) performance where m is the number of edges for the
 /// file, regardless of total graph size.
+#[allow(dead_code)]
 fn find_content_vertices_inode<T>(
     txn: &T,
     inode: Inode,
@@ -939,9 +1030,13 @@ where
 
             // Resolve destination vertex
             let dest_pos = edge.dest();
-            let dest_node = match txn.find_block(dest_pos) {
-                Ok(v) => v,
-                Err(_) => continue,
+            let dest_node = txn
+                .find_block_in_inode(inode, dest_pos)
+                .ok()
+                .flatten()
+                .or_else(|| txn.find_block(dest_pos).ok());
+            let Some(dest_node) = dest_node else {
+                continue;
             };
 
             if !visited.contains(&dest_node) {

@@ -58,23 +58,30 @@ console.log(message);
 EOF
 
 add_files src/index.ts
-REC1_OUT="$(record_change "Initial TypeScript file" 2>&1)"
 
-# Extract the full hash from the change files on disk.
-# `atomic log` truncates hashes with "...", but the filenames in
-# .atomic/changes/XX/<FULL_HASH>.change have the complete hash.
-# We take the most recently created .change file.
-get_latest_change_hash() {
-    find "$REPO_DIR/.atomic/changes" -name "*.change" -type f -newer "${1:-.atomic}" \
-        2>/dev/null | sort | tail -1 | xargs -I{} basename {} .change
+# Extract the exact hash of the change file created by the most recent
+# record operation. Sorting by filename is unsafe because repo init writes
+# bootstrap changes whose hashes may sort after later user changes.
+capture_change_hashes() {
+    find "$REPO_DIR/.atomic/changes" -name "*.change" -type f 2>/dev/null \
+        | xargs -I{} basename {} .change | sort
 }
 
-# Snapshot marker for finding new files
-touch "$REPO_DIR/.atomic/_marker_before_1"
-# The file was just created above, so use the marker trick differently:
-# Just find ALL change files and pick the one that matches.
-HASH1="$(find "$REPO_DIR/.atomic/changes" -name "*.change" -type f 2>/dev/null \
-    | sort | tail -1 | xargs -I{} basename {} .change)"
+find_new_change_hash() {
+    local before_file="$1"
+    local after_file="$2"
+
+    comm -13 "$before_file" "$after_file" | tail -1
+}
+
+BEFORE_1="$(mktemp)"
+AFTER_1="$(mktemp)"
+capture_change_hashes > "$BEFORE_1"
+
+REC1_OUT="$(record_change "Initial TypeScript file" 2>&1)"
+
+capture_change_hashes > "$AFTER_1"
+HASH1="$(find_new_change_hash "$BEFORE_1" "$AFTER_1")"
 
 if [[ -n "$HASH1" ]]; then
     _pass "Recorded change 1 on client: ${HASH1:0:12}"
@@ -99,28 +106,21 @@ console.log(message);
 EOF
 
 # Mark before recording so we can find the NEW change file
-CHANGE_COUNT_BEFORE="$(find "$REPO_DIR/.atomic/changes" -name "*.change" -type f 2>/dev/null | wc -l | tr -d ' ')"
+BEFORE_2="$(mktemp)"
+AFTER_2="$(mktemp)"
+capture_change_hashes > "$BEFORE_2"
 
 REC2_OUT="$(record_change "Add ANSI color codes" 2>&1)"
 
-# Find the change file that wasn't there before
-HASH2="$(find "$REPO_DIR/.atomic/changes" -name "*.change" -type f 2>/dev/null \
-    | sort | tail -1 | xargs -I{} basename {} .change)"
+capture_change_hashes > "$AFTER_2"
+HASH2="$(find_new_change_hash "$BEFORE_2" "$AFTER_2")"
 
-# Verify it's different from HASH1
 if [[ -n "$HASH2" && "$HASH2" != "$HASH1" ]]; then
     _pass "Recorded change 2 on client: ${HASH2:0:12}"
 else
-    # Fallback: list all and pick the one that isn't HASH1
-    HASH2="$(find "$REPO_DIR/.atomic/changes" -name "*.change" -type f 2>/dev/null \
-        | xargs -I{} basename {} .change | grep -v "$HASH1" | head -1)"
-    if [[ -n "$HASH2" ]]; then
-        _pass "Recorded change 2 on client: ${HASH2:0:12}"
-    else
-        _fail "Record change 2" "Could not find second change file. Record output: $REC2_OUT"
-        print_summary
-        exit 1
-    fi
+    _fail "Record change 2" "Could not find second change file. Record output: $REC2_OUT"
+    print_summary
+    exit 1
 fi
 
 # Save the client's final file content for comparison
@@ -430,11 +430,14 @@ console.log(message);
 console.log(farewell("World"));
 EOF
 
+BEFORE_3="$(mktemp)"
+AFTER_3="$(mktemp)"
+capture_change_hashes > "$BEFORE_3"
+
 REC3_OUT="$(record_change "Add farewell function" 2>&1)"
 
-# Find the newest change file that isn't HASH1 or HASH2
-HASH3="$(find "$CLIENT_DIR/.atomic/changes" -name "*.change" -type f 2>/dev/null \
-    | xargs -I{} basename {} .change | grep -v "$HASH1" | grep -v "$HASH2" | head -1)"
+capture_change_hashes > "$AFTER_3"
+HASH3="$(find_new_change_hash "$BEFORE_3" "$AFTER_3")"
 
 CLIENT_CONTENT_V3="$(cat src/index.ts)"
 

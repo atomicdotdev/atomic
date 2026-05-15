@@ -6,6 +6,14 @@
 
 use super::output::*;
 use super::*;
+use atomic_core::record::workflow::GitDiffLine;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct GitMetadataDiffFile {
+    path: String,
+    lines: Vec<GitDiffLine>,
+}
 
 impl Diff {
     /// Print a message when there are no changes.
@@ -59,6 +67,24 @@ impl Diff {
         change_hash: &Hash,
         config: &DiffOutputConfig,
     ) -> CliResult<()> {
+        if let Some((file_diffs, stats)) = Self::build_git_import_file_diffs(change) {
+            if file_diffs.is_empty() {
+                self.print_no_changes();
+                return Ok(());
+            }
+
+            if config.format == DiffFormat::Unified {
+                self.print_change_header(change, change_hash, config);
+            }
+
+            return match config.format {
+                DiffFormat::Unified => self.print_unified(&file_diffs, config),
+                DiffFormat::Stat => self.print_stat(&stats, config),
+                DiffFormat::NameOnly => self.print_name_only(&file_diffs),
+                DiffFormat::NameStatus => self.print_name_status(&file_diffs, config),
+            };
+        }
+
         let file_ops = change.file_ops();
 
         if file_ops.is_empty() {
@@ -192,7 +218,14 @@ impl Diff {
                     // matching Added line (by bigram Jaccard similarity)
                     // and emitted adjacently (-/+).  Unpaired lines keep
                     // their original position.
-                    current_hunk.lines = Self::repair_diff_lines(current_hunk.lines);
+                    //
+                    // Git-imported changes already carry Git's authoritative
+                    // line ordering in their stored FileOps. Running the
+                    // heuristic re-pairing pass on top of that can scramble
+                    // the exact +/- sequence and break diff parity.
+                    if !Self::is_git_import_change(change) {
+                        current_hunk.lines = Self::repair_diff_lines(current_hunk.lines);
+                    }
                     file_diff.add_hunk(current_hunk);
                 }
             }
@@ -248,6 +281,95 @@ impl Diff {
             }
         }
         line
+    }
+
+    fn is_git_import_change(change: &Change) -> bool {
+        change
+            .unhashed
+            .as_ref()
+            .and_then(|value| value.get("git"))
+            .is_some()
+    }
+
+    fn build_git_import_file_diffs(change: &Change) -> Option<(Vec<FileDiff>, DiffStats)> {
+        let diff_files_value = change
+            .unhashed
+            .as_ref()?
+            .get("git")?
+            .get("diff_lines")?
+            .clone();
+
+        let diff_files: Vec<GitMetadataDiffFile> = serde_json::from_value(diff_files_value).ok()?;
+        let mut file_diffs = Vec::new();
+        let mut stats = DiffStats::new();
+
+        for entry in diff_files {
+            let mut insertions = 0usize;
+            let mut deletions = 0usize;
+            let mut hunk_lines = Vec::new();
+            let mut old_start = None;
+            let mut new_start = None;
+
+            for line in entry.lines {
+                let content = String::from_utf8_lossy(&line.content)
+                    .trim_end_matches('\n')
+                    .to_string();
+                match line.origin {
+                    '+' => {
+                        let new_num = line.new_lineno.unwrap_or((insertions + 1) as u32) as usize;
+                        if new_start.is_none() {
+                            new_start = Some(new_num);
+                        }
+                        hunk_lines.push(HunkLine::added(content, new_num));
+                        insertions += 1;
+                    }
+                    '-' => {
+                        let old_num = line.old_lineno.unwrap_or((deletions + 1) as u32) as usize;
+                        if old_start.is_none() {
+                            old_start = Some(old_num);
+                        }
+                        hunk_lines.push(HunkLine::removed(content, old_num));
+                        deletions += 1;
+                    }
+                    _ => {}
+                }
+            }
+
+            if hunk_lines.is_empty() {
+                continue;
+            }
+
+            let status = match (insertions > 0, deletions > 0) {
+                (true, false) => FileChangeStatus::Added,
+                (false, true) => FileChangeStatus::Deleted,
+                _ => FileChangeStatus::Modified,
+            };
+
+            let mut file_diff = match status {
+                FileChangeStatus::Added => FileDiff::added(&entry.path),
+                FileChangeStatus::Deleted => FileDiff::deleted(&entry.path),
+                _ => FileDiff::modified(&entry.path),
+            };
+
+            let mut hunk = DiffHunk::new(
+                old_start.unwrap_or(1),
+                deletions,
+                new_start.unwrap_or(1),
+                insertions,
+            );
+            hunk.lines = hunk_lines;
+            file_diff.add_hunk(hunk);
+            file_diff.stats = match status {
+                FileChangeStatus::Added => FileDiffStats::added(&entry.path, insertions),
+                FileChangeStatus::Deleted => FileDiffStats::deleted(&entry.path, deletions),
+                _ => FileDiffStats::modified(&entry.path, insertions, deletions),
+            };
+
+            stats.add_file(file_diff.stats.clone());
+            file_diffs.push(file_diff);
+        }
+
+        Some((file_diffs, stats))
     }
 
     /// Re-pair Delete+Insert lines by content similarity for display.

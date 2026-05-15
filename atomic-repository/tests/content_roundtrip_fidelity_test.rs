@@ -1660,6 +1660,9 @@ fn test_crdt_walker_after_insert() {
     record_change(&repo, "insert delta");
 
     let got = crdt_output(&repo, "data.txt");
+    if got != v2.as_bytes() {
+        dump_crdt_line_mismatches(&repo, "data.txt", v2.as_bytes());
+    }
     assert_eq!(
         String::from_utf8_lossy(&got),
         v2,

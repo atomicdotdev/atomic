@@ -824,6 +824,23 @@ where
     C: atomic_core::change::ChangeStore,
 {
     let trace_retrieve = std::env::var_os("ATOMIC_TRACE_RETRIEVE").is_some();
+
+    // The inode-linear fast path is only safe for unfiltered materialization.
+    // When a change filter is active, divergent view-local edits can produce
+    // dead-chain bypasses that the linear walk cannot represent correctly,
+    // causing one side's visible content to disappear. Fall back to the full
+    // alive-graph retrieval for correctness in filtered reads.
+    if options.has_filter() {
+        if trace_retrieve {
+            eprintln!(
+                "[retrieve_content_with_filter_fast] filtered read; falling back to retrieve_graph"
+            );
+        }
+        return atomic_core::record::workflow::retrieve::retrieve_content_with_filter(
+            txn, changes, position, options,
+        );
+    }
+
     if let Some(content) =
         try_retrieve_linear_content_with_filter(txn, changes, inode, position, &options)?
     {

@@ -195,20 +195,48 @@ where
         // Add a dependency on the change that introduced this file
         ctx.add_dependency_by_id(old_inode_pos_node.change)?;
 
-        // Build the del EdgeUpdate: marks the FOLDER edge at the inode vertex as DELETED.
-        // This follows the same pattern as DirDel.
+        let old_parent_context_pos: Position<Option<Hash>> = {
+            let old_parent_path = extract_parent(old_path);
+            if old_parent_path.is_empty() {
+                Position {
+                    change: Some(Hash::NONE),
+                    pos: ChangePosition::ROOT,
+                }
+            } else {
+                match resolve_parent_inode(ctx, old_path)
+                    .and_then(|parent_inode| resolve_inode_to_position(ctx, parent_inode))
+                {
+                    Ok(parent_pos) => {
+                        ctx.add_dependency_by_id(parent_pos.change)?;
+                        position_to_option_hash_resolved(ctx.txn(), parent_pos, None)
+                    }
+                    Err(_) => Position {
+                        change: Some(Hash::NONE),
+                        pos: ChangePosition::ROOT,
+                    },
+                }
+            }
+        };
+
+        let old_filename = extract_filename(old_path);
+        let old_name_end = old_inode_pos_node.pos;
+        let old_name_start =
+            ChangePosition::new(old_name_end.get().saturating_sub(old_filename.len() as u64));
+
+        // Build the del EdgeUpdate: delete the old parent -> old-name edge.
+        //
+        // For file adds, the path name is inserted as a normal BLOCK|FOLDER
+        // vertex with predecessor = parent context. Renames must delete that
+        // edge, not an edge at the inode marker position.
         let del = EdgeUpdate {
             edges: vec![NewEdge {
-                previous: EdgeFlags::FOLDER,
-                flag: EdgeFlags::FOLDER | EdgeFlags::DELETED,
-                from: Position {
-                    change: change_hash,
-                    pos: old_inode_pos_node.pos,
-                },
+                previous: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+                flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK | EdgeFlags::DELETED,
+                from: old_parent_context_pos,
                 to: GraphNode {
                     change: change_hash,
-                    start: old_inode_pos_node.pos,
-                    end: old_inode_pos_node.pos,
+                    start: old_name_start,
+                    end: old_name_end,
                 },
                 introduced_by: change_hash,
             }],
@@ -218,11 +246,29 @@ where
             },
         };
 
-        // Build the add Insertion: a new name vertex pointing to the same inode position.
-        // The parent context is ROOT (top-level file — nested-dir support is a future concern).
-        let parent_context_pos: Position<Option<Hash>> = Position {
-            change: Some(Hash::NONE),
-            pos: ChangePosition::ROOT,
+        // Build the add Insertion: a new name vertex in the correct parent
+        // directory, wired to the existing inode position.
+        let parent_context_pos: Position<Option<Hash>> = {
+            let parent_path = extract_parent(path);
+            if parent_path.is_empty() {
+                Position {
+                    change: Some(Hash::NONE),
+                    pos: ChangePosition::ROOT,
+                }
+            } else {
+                match resolve_parent_inode(ctx, path)
+                    .and_then(|parent_inode| resolve_inode_to_position(ctx, parent_inode))
+                {
+                    Ok(parent_pos) => {
+                        ctx.add_dependency_by_id(parent_pos.change)?;
+                        position_to_option_hash_resolved(ctx.txn(), parent_pos, None)
+                    }
+                    Err(_) => Position {
+                        change: Some(Hash::NONE),
+                        pos: ChangePosition::ROOT,
+                    },
+                }
+            }
         };
 
         // The inode position for the add — references the EXISTING inode (old change).
@@ -239,7 +285,7 @@ where
 
         let add = Insertion {
             predecessors: vec![parent_context_pos],
-            successors: vec![],
+            successors: vec![inode_opt_hash_pos],
             flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
             start: name_start,
             end: name_end,
@@ -442,24 +488,7 @@ where
 
         if !content.is_empty() {
             let encoding = recorded.encoding();
-
-            // Split content into per-line slices (each line keeps its '\n').
-            // This gives the graph line-level vertex granularity from the
-            // very first record, so subsequent edits to different lines
-            // can target individual vertices rather than the whole file.
-            let line_slices: Vec<&[u8]> = split_into_lines(content);
-
-            // Compute the buffer position where content will start (we use
-            // this to enrich FileOps with per-line ranges).
             let first_content_start = ChangePosition::new(ctx.content_len());
-
-            // Append each line to the content buffer, recording its range.
-            let mut line_ranges: Vec<(ChangePosition, ChangePosition)> =
-                Vec::with_capacity(line_slices.len());
-            for line in &line_slices {
-                let (s, e) = ctx.append_content(line);
-                line_ranges.push((s, e));
-            }
 
             // Enrich FileOps with the first content position for CRDT.
             if let Some(mut file_ops) = recorded.crdt_ops().cloned() {
@@ -467,16 +496,33 @@ where
                 result.set_file_ops(file_ops);
             }
 
-            // First line goes into FileAdd's `contents` field, wired off
-            // the inode.  Predecessor is the inode vertex.
-            let (first_start, first_end) = line_ranges[0];
-            let first_line = Insertion {
-                predecessors: vec![inode_pos],
-                successors: vec![],
-                flag: EdgeFlags::BLOCK,
-                start: first_start,
-                end: first_end,
-                inode: inode_pos,
+            let (first_line, line_ranges) = {
+                // Split content into per-line slices (each line keeps its '\n').
+                // This gives the graph line-level vertex granularity from the
+                // very first record, so subsequent edits to different lines
+                // can target individual vertices rather than the whole file.
+                let line_slices: Vec<&[u8]> = split_into_lines(content);
+
+                // Append each line to the content buffer, recording its range.
+                let mut line_ranges: Vec<(ChangePosition, ChangePosition)> =
+                    Vec::with_capacity(line_slices.len());
+                for line in &line_slices {
+                    let (s, e) = ctx.append_content(line);
+                    line_ranges.push((s, e));
+                }
+
+                let (first_start, first_end) = line_ranges[0];
+                (
+                    Insertion {
+                        predecessors: vec![inode_pos],
+                        successors: vec![],
+                        flag: EdgeFlags::BLOCK,
+                        start: first_start,
+                        end: first_end,
+                        inode: inode_pos,
+                    },
+                    line_ranges,
+                )
             };
 
             let graph_op = GraphOp::FileAdd {

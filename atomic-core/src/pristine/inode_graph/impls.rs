@@ -56,52 +56,52 @@ impl InodeGraphOps for ReadTxn {
             return None;
         }
 
-        let table = match self.txn.open_multimap_table(INODE_GRAPH) {
-            Ok(t) => t,
-            Err(e) => {
-                adj.mark_exhausted();
-                return Some(Err(PristineError::Table(Box::new(e))));
-            }
-        };
-
-        let inode_id = adj.inode.get();
-        let key = encode_inode_vertex(
-            inode_id,
-            adj.node.change.get(),
-            adj.node.start.get(),
-            adj.node.end.get(),
-        );
-
-        // Get all edges for this exact span
-        let values = match table.get(&key) {
-            Ok(v) => v,
-            Err(e) => {
-                adj.mark_exhausted();
-                return Some(Err(PristineError::Storage(Box::new(e))));
-            }
-        };
-
-        // Collect matching edges into a vector
-        let mut matching_edges: Vec<SerializedGraphEdge> = Vec::new();
-        for result in values {
-            match result {
-                Ok(v) => {
-                    let edge = deserialize_edge(v.value());
-                    let flag = edge.flag();
-                    if flag >= adj.min_flag && flag <= adj.max_flag {
-                        matching_edges.push(edge);
-                    }
+        if !adj.is_loaded() {
+            let table = match self.txn.open_multimap_table(INODE_GRAPH) {
+                Ok(t) => t,
+                Err(e) => {
+                    adj.mark_exhausted();
+                    return Some(Err(PristineError::Table(Box::new(e))));
                 }
+            };
+
+            let inode_id = adj.inode.get();
+            let key = encode_inode_vertex(
+                inode_id,
+                adj.node.change.get(),
+                adj.node.start.get(),
+                adj.node.end.get(),
+            );
+
+            let values = match table.get(&key) {
+                Ok(v) => v,
                 Err(e) => {
                     adj.mark_exhausted();
                     return Some(Err(PristineError::Storage(Box::new(e))));
                 }
+            };
+
+            let mut matching_edges: Vec<SerializedGraphEdge> = Vec::new();
+            for result in values {
+                match result {
+                    Ok(v) => {
+                        let edge = deserialize_edge(v.value());
+                        let flag = edge.flag();
+                        if flag >= adj.min_flag && flag <= adj.max_flag {
+                            matching_edges.push(edge);
+                        }
+                    }
+                    Err(e) => {
+                        adj.mark_exhausted();
+                        return Some(Err(PristineError::Storage(Box::new(e))));
+                    }
+                }
             }
+            adj.set_edges(matching_edges);
         }
 
-        // Return the edge at the current position
-        if adj.position < matching_edges.len() {
-            let edge = matching_edges[adj.position];
+        if adj.position < adj.edges.len() {
+            let edge = adj.edges[adj.position];
             adj.advance();
             Some(Ok(edge))
         } else {
@@ -226,52 +226,52 @@ impl<'a> InodeGraphOps for WriteTxn<'a> {
             return None;
         }
 
-        let table = match self.txn.open_multimap_table(INODE_GRAPH) {
-            Ok(t) => t,
-            Err(e) => {
-                adj.mark_exhausted();
-                return Some(Err(PristineError::Table(Box::new(e))));
-            }
-        };
-
-        let inode_id = adj.inode.get();
-        let key = encode_inode_vertex(
-            inode_id,
-            adj.node.change.get(),
-            adj.node.start.get(),
-            adj.node.end.get(),
-        );
-
-        // Get all edges for this exact span
-        let values = match table.get(&key) {
-            Ok(v) => v,
-            Err(e) => {
-                adj.mark_exhausted();
-                return Some(Err(PristineError::Storage(Box::new(e))));
-            }
-        };
-
-        // Collect matching edges into a vector
-        let mut matching_edges: Vec<SerializedGraphEdge> = Vec::new();
-        for result in values {
-            match result {
-                Ok(v) => {
-                    let edge = deserialize_edge(v.value());
-                    let flag = edge.flag();
-                    if flag >= adj.min_flag && flag <= adj.max_flag {
-                        matching_edges.push(edge);
-                    }
+        if !adj.is_loaded() {
+            let table = match self.txn.open_multimap_table(INODE_GRAPH) {
+                Ok(t) => t,
+                Err(e) => {
+                    adj.mark_exhausted();
+                    return Some(Err(PristineError::Table(Box::new(e))));
                 }
+            };
+
+            let inode_id = adj.inode.get();
+            let key = encode_inode_vertex(
+                inode_id,
+                adj.node.change.get(),
+                adj.node.start.get(),
+                adj.node.end.get(),
+            );
+
+            let values = match table.get(&key) {
+                Ok(v) => v,
                 Err(e) => {
                     adj.mark_exhausted();
                     return Some(Err(PristineError::Storage(Box::new(e))));
                 }
+            };
+
+            let mut matching_edges: Vec<SerializedGraphEdge> = Vec::new();
+            for result in values {
+                match result {
+                    Ok(v) => {
+                        let edge = deserialize_edge(v.value());
+                        let flag = edge.flag();
+                        if flag >= adj.min_flag && flag <= adj.max_flag {
+                            matching_edges.push(edge);
+                        }
+                    }
+                    Err(e) => {
+                        adj.mark_exhausted();
+                        return Some(Err(PristineError::Storage(Box::new(e))));
+                    }
+                }
             }
+            adj.set_edges(matching_edges);
         }
 
-        // Return the edge at the current position
-        if adj.position < matching_edges.len() {
-            let edge = matching_edges[adj.position];
+        if adj.position < adj.edges.len() {
+            let edge = adj.edges[adj.position];
             adj.advance();
             Some(Ok(edge))
         } else {
