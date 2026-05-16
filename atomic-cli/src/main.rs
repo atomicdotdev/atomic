@@ -82,6 +82,7 @@ use commands::{
     Status,
     Tag,
     Unrecord,
+    Update,
     Vault,
     View,
     // Storage management (always available)
@@ -667,6 +668,23 @@ enum Commands {
     /// atomic unrecord --dry-run
     /// ```
     Unrecord(Unrecord),
+
+    /// Check for available updates and route to the correct upgrade path.
+    ///
+    /// Detects how this binary was installed (Homebrew, Cargo, official
+    /// installer, or manual) and prints the upgrade command for that
+    /// source. With `--check`, only reports status; exits 1 if outdated.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Check status and show how to upgrade
+    /// atomic update
+    ///
+    /// # Status-only, scriptable: exit 1 if outdated
+    /// atomic update --check
+    /// ```
+    Update(Update),
 }
 
 // Main Entry Point
@@ -746,6 +764,8 @@ fn main() {
         Commands::Tag(tag) => tag.run(),
 
         Commands::Unrecord(unrecord) => unrecord.run(),
+
+        Commands::Update(update) => update.run(),
 
         Commands::Query(query) => query.run(),
 
