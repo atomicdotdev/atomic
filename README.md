@@ -212,6 +212,57 @@ The `ask` command gives the LLM six tools (`kg_search`, `kg_neighbors`, `read_fi
 
 No API key required for `search`, `code`, `entities`, `neighbors`, `graph`, or `enrich`.
 
+## Installation
+
+Pick the path that matches your environment.
+
+### macOS — Homebrew (recommended)
+
+```bash
+brew install atomicdotdev/tap/atomic
+```
+
+Upgrade later with:
+
+```bash
+brew upgrade atomicdotdev/tap/atomic
+```
+
+After installation, `brew upgrade atomic` also works in normal Homebrew setups.
+
+### Linux, CI, or no Homebrew — hosted installer
+
+```bash
+curl -sSf https://atomic.storage/install.sh | sh
+```
+
+Pin a specific version or install to a user-writable directory:
+
+```bash
+curl -sSf https://atomic.storage/install.sh | ATOMIC_VERSION=0.6.0 sh
+curl -sSf https://atomic.storage/install.sh | ATOMIC_INSTALL="$HOME/.local/bin" sh
+```
+
+The installer detects your platform, downloads the matching GitHub release,
+verifies checksums, and installs the `atomic` binary.
+
+### Manual — release tarball
+
+For air-gapped, audited, or one-off installs, download the archive for your
+platform directly from the [latest release](https://github.com/atomicdotdev/atomic/releases/latest)
+and place `atomic` somewhere on your `PATH`.
+
+### From source — development builds
+
+See the [installation docs](https://docs.atomic.dev/getting-started/installation#source-install-development)
+for the source build path (rustup, system dependencies, `cargo install`).
+
+### Verify
+
+```bash
+atomic --version
+```
+
 ## Quick Start
 
 ```bash
