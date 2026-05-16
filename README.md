@@ -244,7 +244,7 @@ curl -sSf https://atomic.storage/install.sh | ATOMIC_INSTALL="$HOME/.local/bin" 
 ```
 
 The installer detects your platform, downloads the matching GitHub release,
-verifies checksums, and installs the `atomic` binary.
+verifies checksums when available, and installs the `atomic` binary.
 
 ### Manual — release tarball
 
