@@ -28,7 +28,7 @@ use serde::Deserialize;
 
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
-use crate::output::{print_hint, print_success, print_warning};
+use crate::output::{print_hint, print_info, print_success, print_warning};
 
 // CLI argument struct
 
@@ -102,6 +102,16 @@ pub enum UpdateOutcome {
         /// disagrees with `current` (out-of-band replacement). None
         /// otherwise. Diagnostic only.
         drift_manifest_version: Option<String>,
+    },
+    /// Current binary version is strictly greater than the latest
+    /// published release. Common during local dev builds and internal
+    /// pre-release dogfooding; rare for real users. Exits 0 — there is
+    /// nothing to upgrade — but the wording must not lie about being
+    /// "on the latest release".
+    AheadOfRelease {
+        current: String,
+        latest: String,
+        source: InstallSource,
     },
     /// Neither current nor latest parsed cleanly as MAJOR.MINOR.PATCH.
     /// Treated as a soft failure: warn the user, exit 0 in normal mode,
@@ -307,10 +317,27 @@ const RELEASES_PAGE: &str = "https://github.com/atomicdotdev/atomic/releases/lat
 const DEFAULT_INSTALL_PATH: &str = "/usr/local/bin/atomic";
 const TAP_FORMULA: &str = "atomicdotdev/tap/atomic";
 
+/// POSIX single-quote escape for arbitrary strings.
+///
+/// Wraps the value in single quotes and escapes any embedded single
+/// quote as `'\''` (end quote, escaped quote, start quote). The result
+/// is safe to paste into any POSIX shell without parameter expansion,
+/// command substitution, or backslash interpretation.
+///
+/// We use this for paths that come from the install manifest, which is
+/// user-writable — a path containing `$`, backticks, or quotes must not
+/// be able to break the copy-pasteable upgrade hint or smuggle
+/// expansion into the user's shell.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Render an `ATOMIC_INSTALL=...` value suitable for embedding in a shell
 /// snippet. When the directory equals `$HOME/.local/bin` literally we
-/// prefer the variable form for legibility; otherwise we quote the
-/// absolute path verbatim.
+/// keep the pretty `"$HOME/.local/bin"` form so users can copy it
+/// verbatim and have their shell expand `$HOME`. Otherwise we POSIX
+/// single-quote the absolute path so it survives copy-paste regardless
+/// of what's in it.
 fn render_atomic_install_value(dir: &Path, home: Option<&str>) -> String {
     if let Some(h) = home {
         let home_local_bin = PathBuf::from(h).join(".local").join("bin");
@@ -318,7 +345,7 @@ fn render_atomic_install_value(dir: &Path, home: Option<&str>) -> String {
             return r#""$HOME/.local/bin""#.to_string();
         }
     }
-    format!("\"{}\"", dir.display())
+    shell_quote(&dir.display().to_string())
 }
 
 /// Produce the multi-line outdated message for a given source. Pure so
@@ -456,6 +483,26 @@ impl Command for Update {
                 print!("{msg}");
                 Ok(())
             }
+            UpdateOutcome::AheadOfRelease {
+                current,
+                latest,
+                source,
+            } => {
+                if self.check {
+                    println!(
+                        "Ahead of release: {current} > {latest} (source: {})",
+                        source.short_label()
+                    );
+                    // Exit 0 — nothing to upgrade — but distinct status text
+                    // so dev / pre-release users aren't told they're "on the
+                    // latest release" when they're actually ahead of it.
+                    return Ok(());
+                }
+                print_info(&format!(
+                    "This binary is newer than the latest GitHub release.\n  Current:        {current}\n  Latest release: {latest}"
+                ));
+                Ok(())
+            }
             UpdateOutcome::UnknownVersion {
                 current,
                 latest,
@@ -498,7 +545,12 @@ impl Update {
             .to_string();
 
         Ok(match (parse_version(&current), parse_version(&latest)) {
-            (Some(c), Some(l)) if c >= l => UpdateOutcome::UpToDate { current, source },
+            (Some(c), Some(l)) if c == l => UpdateOutcome::UpToDate { current, source },
+            (Some(c), Some(l)) if c > l => UpdateOutcome::AheadOfRelease {
+                current,
+                latest,
+                source,
+            },
             (Some(_), Some(_)) => {
                 let drift = match &source {
                     InstallSource::OfficialInstaller {
@@ -778,10 +830,111 @@ mod tests {
         };
         let env = MockEnv::new();
         let msg = format_upgrade_message(&source, "0.6.0", "0.7.0", None, &env);
+        // Custom paths are POSIX single-quoted so any character survives copy-paste.
+        assert!(msg.contains("ATOMIC_INSTALL='/opt/atomic'"), "got: {msg}");
+    }
+
+    // shell_quote — defends against malicious or just-weird install_path
+    // values smuggling shell expansion into the copy-pasted upgrade hint.
+
+    #[test]
+    fn shell_quote_plain() {
+        assert_eq!(shell_quote("/usr/local/bin"), "'/usr/local/bin'");
+    }
+
+    #[test]
+    fn shell_quote_with_space() {
+        assert_eq!(shell_quote("/opt/atomic dir"), "'/opt/atomic dir'");
+    }
+
+    #[test]
+    fn shell_quote_with_dollar() {
+        // $ inside single quotes is literal — no parameter expansion.
+        assert_eq!(shell_quote("/opt/$HOME/bin"), "'/opt/$HOME/bin'");
+    }
+
+    #[test]
+    fn shell_quote_with_backtick() {
+        // Backticks inside single quotes are literal — no command substitution.
+        assert_eq!(shell_quote("/opt/`whoami`/bin"), "'/opt/`whoami`/bin'");
+    }
+
+    #[test]
+    fn shell_quote_with_command_substitution() {
+        // $(...) inside single quotes is literal — no command substitution.
+        assert_eq!(
+            shell_quote("/opt/$(touch /tmp/evil)/bin"),
+            "'/opt/$(touch /tmp/evil)/bin'"
+        );
+    }
+
+    #[test]
+    fn shell_quote_with_double_quote() {
+        // Double quotes inside single quotes are literal.
+        assert_eq!(
+            shell_quote(r#"/opt/atomic"test""#),
+            r#"'/opt/atomic"test"'"#
+        );
+    }
+
+    #[test]
+    fn shell_quote_with_backslash() {
+        // Backslash inside single quotes is literal (unlike double quotes).
+        assert_eq!(shell_quote(r"/opt/atomic\bin"), r"'/opt/atomic\bin'");
+    }
+
+    #[test]
+    fn shell_quote_with_single_quote() {
+        // The tricky case: end the single-quoted run, escape the quote, restart.
+        // Per POSIX:  'a'\''b'  parses as the single string  a'b
+        assert_eq!(
+            shell_quote("/opt/atomic user's/bin"),
+            "'/opt/atomic user'\\''s/bin'"
+        );
+    }
+
+    #[test]
+    fn upgrade_message_path_with_single_quote_renders_safely() {
+        // End-to-end through render_atomic_install_value + format_upgrade_message.
+        let source = InstallSource::OfficialInstaller {
+            manifest_path: PathBuf::from("/x/install.json"),
+            recorded_install_path: PathBuf::from("/opt/atomic user's/bin/atomic"),
+            recorded_version: "0.6.0".to_string(),
+        };
+        let env = MockEnv::new();
+        let msg = format_upgrade_message(&source, "0.6.0", "0.7.0", None, &env);
         assert!(
-            msg.contains(r#"ATOMIC_INSTALL="/opt/atomic""#),
+            msg.contains("ATOMIC_INSTALL='/opt/atomic user'\\''s/bin'"),
             "got: {msg}"
         );
+    }
+
+    #[test]
+    fn upgrade_message_path_with_dollar_does_not_expand() {
+        let source = InstallSource::OfficialInstaller {
+            manifest_path: PathBuf::from("/x/install.json"),
+            recorded_install_path: PathBuf::from("/opt/$HOME/bin/atomic"),
+            recorded_version: "0.6.0".to_string(),
+        };
+        // HOME set but path is not exactly $HOME/.local/bin — must NOT use
+        // the pretty $HOME form, and must single-quote so $HOME doesn't
+        // expand when the user pastes the command.
+        let env = MockEnv::new().set("HOME", "/home/me");
+        let msg = format_upgrade_message(&source, "0.6.0", "0.7.0", None, &env);
+        assert!(
+            msg.contains("ATOMIC_INSTALL='/opt/$HOME/bin'"),
+            "got: {msg}"
+        );
+        assert!(!msg.contains(r#""$HOME/bin""#), "got: {msg}");
+    }
+
+    #[test]
+    fn render_atomic_install_value_keeps_home_pretty_form() {
+        // Regression: the pretty $HOME/.local/bin output is the ONE case we
+        // intentionally let `$HOME` reach the shell — for legibility.
+        let value =
+            render_atomic_install_value(&PathBuf::from("/home/me/.local/bin"), Some("/home/me"));
+        assert_eq!(value, r#""$HOME/.local/bin""#);
     }
 
     #[test]
