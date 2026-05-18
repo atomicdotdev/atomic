@@ -55,9 +55,10 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use git2::{
@@ -234,6 +235,88 @@ fn trace_git_import(message: impl AsRef<str>) {
     }
 }
 
+struct SlowImportProgress {
+    done: mpsc::Sender<()>,
+    reported: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl SlowImportProgress {
+    fn start(commit: String, summary: String) -> Self {
+        let (done, rx) = mpsc::channel();
+        let reported = Arc::new(AtomicBool::new(false));
+        let reported_for_thread = Arc::clone(&reported);
+        let handle = thread::spawn(move || {
+            let started = Instant::now();
+            if rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+                return;
+            }
+
+            reported_for_thread.store(true, Ordering::Relaxed);
+            print_info(&format!(
+                "Still importing {} after {}s; please be patient. {}",
+                commit,
+                started.elapsed().as_secs(),
+                summary
+            ));
+
+            loop {
+                if rx.recv_timeout(Duration::from_secs(15)).is_ok() {
+                    break;
+                }
+                print_info(&format!(
+                    "Still importing {} after {}s; graph/CRDT writes are still running.",
+                    commit,
+                    started.elapsed().as_secs()
+                ));
+            }
+        });
+
+        Self {
+            done,
+            reported,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self) -> bool {
+        let _ = self.done.send(());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        self.reported.load(Ordering::Relaxed)
+    }
+}
+
+fn truncate_for_progress(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in input.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn format_byte_count(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.1}GiB", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.1}MiB", bytes_f / MIB)
+    } else if bytes_f >= KIB {
+        format!("{:.1}KiB", bytes_f / KIB)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
 fn should_detect_renames(diff: &Diff) -> bool {
     let mut adds = 0usize;
     let mut deletes = 0usize;
@@ -390,6 +473,62 @@ fn record_git_import_add_linewise(path: &str, new_content: &[u8]) -> Option<Reco
     recorded.set_crdt_ops(file_ops);
     recorded.set_crdt_stats(stats);
     Some(recorded)
+}
+
+fn slow_import_commit_label(parsed: &ParsedCommit) -> String {
+    let message = truncate_for_progress(&parsed.metadata.message.replace('\n', " "), 72);
+    format!("{} \"{}\"", parsed.short_sha, message)
+}
+
+fn slow_import_record_summary(parsed: &ParsedCommit, recorded_files: &[RecordedFile]) -> String {
+    let mut added = 0usize;
+    let mut modified = 0usize;
+    let mut deleted = 0usize;
+    let mut renamed = 0usize;
+    let mut copied = 0usize;
+    let mut bytes = 0usize;
+
+    for file in &parsed.files {
+        match file.operation {
+            FileOperation::Added => added += 1,
+            FileOperation::Modified => modified += 1,
+            FileOperation::Deleted => deleted += 1,
+            FileOperation::Renamed => renamed += 1,
+            FileOperation::Copied => copied += 1,
+        }
+        bytes += file.new_content.as_ref().map(|c| c.len()).unwrap_or(0);
+        bytes += file.old_content.as_ref().map(|c| c.len()).unwrap_or(0);
+    }
+
+    let mut largest: Vec<(&str, usize)> = recorded_files
+        .iter()
+        .map(|rec| (rec.path(), rec.content().len()))
+        .collect();
+    largest.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let top_paths = largest
+        .into_iter()
+        .take(3)
+        .map(|(path, size)| format!("{} ({})", path, format_byte_count(size)))
+        .collect::<Vec<_>>();
+
+    let top = if top_paths.is_empty() {
+        "top records: none".to_string()
+    } else {
+        format!("top records: {}", top_paths.join(", "))
+    };
+
+    format!(
+        "records={}, files={}, bytes={}, ops=+{}/~{}/-{} renames={} copies={}; {}",
+        recorded_files.len(),
+        parsed.files.len(),
+        format_byte_count(bytes),
+        added,
+        modified,
+        deleted,
+        renamed,
+        copied,
+        top
+    )
 }
 
 impl ParallelImporter {
@@ -1228,6 +1367,10 @@ impl ParallelImporter {
         }
 
         let metadata = self.build_git_metadata(parsed, false, recorded_files.is_empty());
+        let progress = SlowImportProgress::start(
+            slow_import_commit_label(parsed),
+            slow_import_record_summary(parsed, &recorded_files),
+        );
         let write_start = Instant::now();
         let write_outcome = repo
             .write_import_recorded(
@@ -1239,6 +1382,19 @@ impl ParallelImporter {
             )
             .map_err(|e| CliError::Internal(e.into()))?;
         let write_ms = write_start.elapsed().as_millis();
+        let progress_reported = progress.finish();
+        if progress_reported || write_ms >= 5_000 {
+            print_info(&format!(
+                "Imported {} in {:.1}s (assemble={}ms apply={}ms direct_graph={}ms direct_crdt={}ms commit={}ms)",
+                slow_import_commit_label(parsed),
+                write_ms as f64 / 1000.0,
+                write_outcome.timings.assemble_ms,
+                write_outcome.timings.apply_ms,
+                write_outcome.timings.direct_graph_ms,
+                write_outcome.timings.direct_crdt_ms,
+                write_outcome.timings.commit_ms
+            ));
+        }
 
         // Files deleted via record_modified_file (the "show diff lines" path)
         // produce GraphOp::Replacement, not GraphOp::FileDel, so insert_change
