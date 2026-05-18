@@ -267,15 +267,14 @@ else
     _fail "import completed in reasonable time" "took ${duration}s"
 fi
 
-# Verify counts match (with some tolerance for merge handling)
-actual="$(atomic log 2>/dev/null | grep -cE '^\s*#[0-9]+|^[0-9a-f]{8,}' 2>/dev/null || true)"
-actual="${actual:-0}"
-actual="$(echo "$actual" | tr -d '[:space:]')"
-[[ -z "$actual" ]] && actual=0
-if [[ $actual -ge $((expected_commits - 50)) ]] && [[ $actual -le $((expected_commits + 50)) ]]; then
-    _pass "change count roughly matches ($actual vs $expected_commits)"
+# Verify imported Git commit count exactly. Do not use raw `atomic log`
+# length here: git import records follow-up Atomic-only changes such as
+# repository/vault initialization, and those are not Git commits.
+actual="$(count_imported_git_changes)"
+if [[ "$actual" -eq "$expected_commits" ]]; then
+    _pass "imported git change count matches ($actual vs $expected_commits)"
 else
-    _fail "change count matches" "expected ~$expected_commits, got $actual"
+    _fail "imported git change count matches" "expected $expected_commits imported git changes, got $actual"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════

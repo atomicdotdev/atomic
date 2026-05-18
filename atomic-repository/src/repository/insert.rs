@@ -5,6 +5,9 @@ use crate::apply::{
     write_change_to_graph, CrossViewInsertOptions, CrossViewInsertOutcome, InsertOptions,
     InsertOutcome, InsertStats,
 };
+use atomic_core::change::Insertion;
+use atomic_core::types::{ChangePosition, EdgeFlags, GraphNode, SerializedGraphEdge};
+use std::collections::{HashMap, HashSet};
 
 /// Check whether a file's creating change exists ONLY on the given view
 /// (and no other view).  Returns `true` when it is safe to remove the
@@ -63,8 +66,459 @@ fn is_file_only_on_view<T: GraphTxnT + ViewTxnT + TreeTxnT>(
     true
 }
 
+/// Timing details for the git-import fresh-write path.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ImportWriteTimings {
+    pub assemble_ms: u128,
+    pub save_ms: u128,
+    pub apply_ms: u128,
+    pub commit_ms: u128,
+    pub direct_graph_ms: u128,
+    pub direct_crdt_ms: u128,
+}
+
+/// Outcome from writing an already-recorded git-import commit.
+#[derive(Debug, Clone)]
+pub struct ImportWriteOutcome {
+    pub hash: Hash,
+    pub timings: ImportWriteTimings,
+    pub insert: InsertOutcome,
+}
+
+fn import_direct_source(
+    pos: &Position<Option<Hash>>,
+    by_end: &HashMap<ChangePosition, GraphNode<NodeId>>,
+) -> Option<GraphNode<NodeId>> {
+    match pos.change {
+        Some(hash) if hash == Hash::NONE => Some(GraphNode::root()),
+        None => by_end.get(&pos.pos).copied(),
+        _ => None,
+    }
+}
+
+fn import_direct_inode(
+    pos: &Position<Option<Hash>>,
+    inode_by_pos: &HashMap<ChangePosition, Inode>,
+) -> Option<Inode> {
+    match pos.change {
+        None => inode_by_pos.get(&pos.pos).copied(),
+        _ => None,
+    }
+}
+
+fn import_direct_can_apply(change: &Change) -> bool {
+    if change.hunks().is_empty() {
+        return true;
+    }
+
+    change.hunks().iter().all(|op| match op {
+        GraphOp::FileAdd {
+            add_name,
+            add_inode,
+            contents,
+            ..
+        } => {
+            add_name.successors.is_empty()
+                && add_inode.successors.is_empty()
+                && contents
+                    .as_ref()
+                    .map(|c| c.successors.is_empty())
+                    .unwrap_or(true)
+        }
+        GraphOp::Edit {
+            change: atomic_core::change::Atom::Insertion(insertion),
+            ..
+        } => {
+            insertion.successors.is_empty()
+                && insertion.predecessors.len() == 1
+                && insertion.predecessors[0].change.is_none()
+                && insertion.inode.change.is_none()
+        }
+        _ => false,
+    })
+}
+
+fn import_direct_write_insertion(
+    batch: &mut atomic_core::apply::GraphWriteBatch<'_>,
+    change_id: NodeId,
+    insertion: &Insertion<Option<Hash>>,
+    by_end: &mut HashMap<ChangePosition, GraphNode<NodeId>>,
+    inode_by_pos: &HashMap<ChangePosition, Inode>,
+    inode_sources: &mut HashSet<(u64, GraphNode<NodeId>)>,
+    inode_terminal_candidates: &mut Vec<(Inode, GraphNode<NodeId>, SerializedGraphEdge)>,
+) -> Result<(), RepositoryError> {
+    if !insertion.successors.is_empty() || insertion.predecessors.len() != 1 {
+        return Err(RepositoryError::Apply(
+            "direct import insertion requires one predecessor and no successors".to_string(),
+        ));
+    }
+
+    let source = import_direct_source(&insertion.predecessors[0], by_end).ok_or_else(|| {
+        RepositoryError::Apply(format!(
+            "direct import missing predecessor at {:?}",
+            insertion.predecessors[0]
+        ))
+    })?;
+    let dest = GraphNode {
+        change: change_id,
+        start: insertion.start,
+        end: insertion.end,
+    };
+    let inode = import_direct_inode(&insertion.inode, inode_by_pos);
+    let flag = insertion.flag | EdgeFlags::BLOCK;
+
+    batch
+        .add_edge_with_reverse_inode_forward_only(inode, flag, source, dest, change_id)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    if let Some(inode_val) = inode {
+        inode_sources.insert((inode_val.get(), source));
+        let reverse_edge =
+            SerializedGraphEdge::new(flag | EdgeFlags::PARENT, source.end_pos(), change_id);
+        inode_terminal_candidates.push((inode_val, dest, reverse_edge));
+    }
+    by_end.insert(dest.end, dest);
+    Ok(())
+}
+
 impl Repository {
     // Change Insertion Methods
+
+    /// Assemble, save, and apply a freshly imported Git commit without going
+    /// through the normal `insert_change()` load/check path.
+    ///
+    /// This preserves the normal graph writer and CRDT table application, but
+    /// avoids reloading the just-saved change and avoids the `has_change_in_graph`
+    /// probe. The write transaction is opened before assembly, so globalization
+    /// and application share one consistent transaction view.
+    pub fn write_import_recorded(
+        &self,
+        header: ChangeHeader,
+        recorded_files: &[atomic_core::record::workflow::RecordedFile],
+        unhashed: serde_json::Value,
+        deleted_paths: &[String],
+        options: InsertOptions,
+    ) -> Result<ImportWriteOutcome, RepositoryError> {
+        use atomic_core::record::workflow::assemble_change;
+        use atomic_core::record::workflow::assembly::AssemblyOptions;
+
+        let mut timings = ImportWriteTimings::default();
+        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let assemble_start = std::time::Instant::now();
+        let mut change = if recorded_files.is_empty() {
+            Change::empty(header)
+        } else {
+            match assemble_change(&txn, recorded_files, header.clone(), &AssemblyOptions::default())
+            {
+                Ok(result) => result.into_change(),
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    if err_msg.contains("empty") || err_msg.contains("AllEmpty") {
+                        Change::empty(header)
+                    } else {
+                        return Err(RepositoryError::Apply(e.to_string()));
+                    }
+                }
+            }
+        };
+        timings.assemble_ms = assemble_start.elapsed().as_millis();
+
+        change.unhashed = Some(unhashed);
+
+        let mut v3_bytes = Vec::new();
+        let hash = change
+            .serialize(&mut v3_bytes)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let (final_change, verified_hash) = Change::deserialize(&mut v3_bytes.as_slice())
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        debug_assert_eq!(hash, verified_hash);
+
+        let save_start = std::time::Instant::now();
+        self.save_change_bytes(&hash, &v3_bytes, &final_change)?;
+        timings.save_ms = save_start.elapsed().as_millis();
+
+        let change_id = txn
+            .register_change(&hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.put_change_deps(change_id, final_change.dependencies())
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        for graph_op in final_change.hunks() {
+            match graph_op {
+                GraphOp::FileAdd {
+                    add_inode, path, ..
+                } => {
+                    let new_inode = txn
+                        .alloc_inode()
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    let inode_position = Position::new(change_id, add_inode.start);
+                    txn.put_tree(path, new_inode)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    txn.put_inode(new_inode, inode_position)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                }
+                GraphOp::DirAdd {
+                    add_inode, path, ..
+                } => {
+                    use atomic_core::pristine::directory_flags;
+
+                    let new_inode = txn
+                        .alloc_inode()
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    let inode_position = Position::new(change_id, add_inode.start);
+                    txn.put_tree(path, new_inode)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    txn.put_inode(new_inode, inode_position)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    txn.put_directory(new_inode, directory_flags::explicit_empty())
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                }
+                GraphOp::FileDel { path, .. } => {
+                    if let Ok(Some(inode)) = txn.get_inode(path) {
+                        let dominated = is_file_only_on_view(&txn, inode, view_name);
+                        if dominated {
+                            let _ = txn.del_tree(path);
+                            let _ = txn.del_inode(inode);
+                        }
+                    }
+                }
+                GraphOp::DirDel { path, .. } => {
+                    if let Ok(Some(inode)) = txn.get_inode(path) {
+                        let dominated = is_file_only_on_view(&txn, inode, view_name);
+                        if dominated {
+                            let _ = txn.del_tree(path);
+                            let _ = txn.del_inode(inode);
+                            let _ = txn.del_directory(inode);
+                        }
+                    }
+                }
+                GraphOp::FileMove { add, path, .. } => {
+                    let inode_change_id = match &add.inode.change {
+                        None => change_id,
+                        Some(h) if *h == Hash::NONE => NodeId::ROOT,
+                        Some(h) => txn.get_internal(h).unwrap_or(None).unwrap_or(NodeId::ROOT),
+                    };
+                    let inode_pos = Position::new(inode_change_id, add.inode.pos);
+
+                    if let Ok(Some(inode)) = txn.position_inode(inode_pos) {
+                        if let Ok(Some(old_path)) = txn.get_path(inode) {
+                            if old_path != *path {
+                                let _ = txn.del_tree(&old_path);
+                            }
+                        }
+                        let _ = txn.put_tree(path, inode);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for deleted_path in deleted_paths {
+            if let Ok(Some(inode)) = txn.get_inode(deleted_path) {
+                let dominated = is_file_only_on_view(&txn, inode, view_name);
+                if dominated {
+                    let _ = txn.del_tree(deleted_path);
+                    let _ = txn.del_inode(inode);
+                }
+            }
+        }
+
+        let apply_start = std::time::Instant::now();
+        let (insert, direct_graph_ms, direct_crdt_ms) = if import_direct_can_apply(&final_change) {
+            let (insert, graph_ms, crdt_ms) = self.write_import_direct_add_chain(
+                &mut txn,
+                view_name,
+                change_id,
+                &hash,
+                &final_change,
+                &options,
+            )?;
+            (insert, graph_ms, crdt_ms)
+        } else {
+            let insert = write_change_to_graph(
+                &mut txn,
+                view_name,
+                change_id,
+                &hash,
+                &final_change,
+                &options,
+                false,
+            )
+            .map_err(|e| RepositoryError::Apply(e.to_string()))?;
+            (insert, 0, 0)
+        };
+        timings.apply_ms = apply_start.elapsed().as_millis();
+        timings.direct_graph_ms = direct_graph_ms;
+        timings.direct_crdt_ms = direct_crdt_ms;
+
+        let commit_start = std::time::Instant::now();
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        timings.commit_ms = commit_start.elapsed().as_millis();
+
+        Ok(ImportWriteOutcome {
+            hash,
+            timings,
+            insert,
+        })
+    }
+
+    fn write_import_direct_add_chain(
+        &self,
+        txn: &mut atomic_core::pristine::WriteTxn<'_>,
+        view_name: &str,
+        change_id: NodeId,
+        hash: &Hash,
+        change: &Change,
+        _options: &InsertOptions,
+    ) -> Result<(InsertOutcome, u128, u128), RepositoryError> {
+        use atomic_core::apply::{apply_file_ops_batched, compute_new_state};
+
+        let mut by_end: HashMap<ChangePosition, GraphNode<NodeId>> = HashMap::new();
+        let mut inode_by_pos: HashMap<ChangePosition, Inode> = HashMap::new();
+
+        for graph_op in change.hunks() {
+            if let GraphOp::FileAdd {
+                add_inode, path, ..
+            } = graph_op
+            {
+                let inode_position = Position::new(change_id, add_inode.start);
+                let inode = match txn
+                    .position_inode(inode_position)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                {
+                    Some(existing) => existing,
+                    None => {
+                        let inode = txn
+                            .alloc_inode()
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        txn.put_tree(path, inode)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        txn.put_inode(inode, inode_position)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        inode
+                    }
+                };
+                inode_by_pos.insert(add_inode.start, inode);
+            }
+        }
+
+        let graph_start = std::time::Instant::now();
+        {
+            let mut batch = atomic_core::apply::GraphWriteBatch::new(&*txn)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let mut inode_sources: HashSet<(u64, GraphNode<NodeId>)> = HashSet::new();
+            let mut inode_terminal_candidates: Vec<(
+                Inode,
+                GraphNode<NodeId>,
+                SerializedGraphEdge,
+            )> = Vec::new();
+
+            for graph_op in change.hunks() {
+                match graph_op {
+                    GraphOp::FileAdd {
+                        add_name,
+                        add_inode,
+                        contents,
+                        ..
+                    } => {
+                        import_direct_write_insertion(
+                            &mut batch,
+                            change_id,
+                            add_name,
+                            &mut by_end,
+                            &inode_by_pos,
+                            &mut inode_sources,
+                            &mut inode_terminal_candidates,
+                        )?;
+                        import_direct_write_insertion(
+                            &mut batch,
+                            change_id,
+                            add_inode,
+                            &mut by_end,
+                            &inode_by_pos,
+                            &mut inode_sources,
+                            &mut inode_terminal_candidates,
+                        )?;
+                        if let Some(contents) = contents {
+                            import_direct_write_insertion(
+                                &mut batch,
+                                change_id,
+                                contents,
+                                &mut by_end,
+                                &inode_by_pos,
+                                &mut inode_sources,
+                                &mut inode_terminal_candidates,
+                            )?;
+                        }
+                    }
+                    GraphOp::Edit {
+                        change: atomic_core::change::Atom::Insertion(insertion),
+                        ..
+                    } => {
+                        import_direct_write_insertion(
+                            &mut batch,
+                            change_id,
+                            insertion,
+                            &mut by_end,
+                            &inode_by_pos,
+                            &mut inode_sources,
+                            &mut inode_terminal_candidates,
+                        )?;
+                    }
+                    _ => {
+                        return Err(RepositoryError::Apply(
+                            "direct import received unsupported graph op".to_string(),
+                        ));
+                    }
+                }
+            }
+
+            for (inode, node, edge) in inode_terminal_candidates {
+                if !inode_sources.contains(&(inode.get(), node)) {
+                    batch
+                        .put_inode_graph(inode, node, edge)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                }
+            }
+        }
+        let graph_ms = graph_start.elapsed().as_millis();
+
+        let crdt_start = std::time::Instant::now();
+        if change.has_file_ops() {
+            apply_file_ops_batched(txn, change_id, change.file_ops())
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
+        let crdt_ms = crdt_start.elapsed().as_millis();
+
+        let mut view = txn
+            .open_or_create_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let new_state = compute_new_state(&view.state, hash);
+        let sequence = view.change_count + 1;
+        txn.put_change(&mut view, change_id, hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        view.state = new_state;
+        view.change_count = sequence;
+        txn.update_view(&view)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut stats = InsertStats::new();
+        stats.changes_applied = 1;
+        stats.applied_hashes.push(*hash);
+        stats.atoms_processed = change.hunks().len();
+
+        Ok((
+            InsertOutcome::new(new_state, sequence, false, stats),
+            graph_ms,
+            crdt_ms,
+        ))
+    }
 
     /// Insert a change into the current view.
     ///

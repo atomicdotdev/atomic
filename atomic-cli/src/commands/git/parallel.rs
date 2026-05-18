@@ -65,7 +65,7 @@ use git2::{
 };
 use rayon::prelude::*;
 
-use atomic_core::change::{Author, Change, ChangeHeader};
+use atomic_core::change::{Author, ChangeHeader};
 use atomic_core::change::{Encoding, Local};
 use atomic_core::record::workflow::graph_op::BuiltHunk;
 use atomic_core::record::workflow::GitDiffLine;
@@ -224,6 +224,38 @@ fn count_line_units(content: &[u8]) -> usize {
     }
 }
 
+fn trace_git_import_enabled() -> bool {
+    std::env::var_os("ATOMIC_TRACE_GIT_IMPORT").is_some()
+}
+
+fn trace_git_import(message: impl AsRef<str>) {
+    if trace_git_import_enabled() {
+        eprintln!("[git-import] {}", message.as_ref());
+    }
+}
+
+fn should_detect_renames(diff: &Diff) -> bool {
+    let mut adds = 0usize;
+    let mut deletes = 0usize;
+
+    for delta in diff.deltas() {
+        match delta.status() {
+            Delta::Added => adds += 1,
+            Delta::Deleted => deletes += 1,
+            _ => {}
+        }
+    }
+
+    if adds == 0 || deletes == 0 {
+        return false;
+    }
+
+    // libgit2 rename detection is similarity matching over candidate
+    // add/delete pairs. On root imports or vendored-tree rewrites this can
+    // dominate the whole import before Atomic sees a single ParsedCommit.
+    adds.saturating_mul(deletes) <= 250_000
+}
+
 fn record_generated_full_replace(
     path: &str,
     new_content: &[u8],
@@ -263,6 +295,101 @@ fn record_generated_full_replace(
     recorded.set_content(new_content.to_vec());
     recorded.set_opaque_generated(true);
     recorded
+}
+
+fn record_git_diff_add_fast(
+    path: &str,
+    new_content: &[u8],
+    diff_lines: &[GitDiffLine],
+    kind: atomic_core::record::workflow::DetectionKind,
+) -> Option<RecordedFile> {
+    let encoding = Encoding::detect(new_content);
+    if encoding == Encoding::Binary {
+        return None;
+    }
+
+    let mut recorded = RecordedFile::new(path);
+    recorded.set_kind(kind);
+    recorded.set_encoding(encoding);
+    recorded.add_hunk(BuiltHunk::new_edit(
+        Local::new(path, 1),
+        Some(encoding),
+        0,
+        new_content.len() as u64,
+    ));
+    recorded.set_content(new_content.to_vec());
+
+    let (git_file_ops, git_stats) =
+        atomic_core::record::workflow::build_crdt_ops_from_git_diff(path, diff_lines);
+    recorded.set_crdt_ops(git_file_ops);
+    recorded.set_crdt_stats(git_stats);
+    Some(recorded)
+}
+
+fn build_linewise_crdt_ops_for_added_file(
+    path: &str,
+    content: &[u8],
+    encoding: Encoding,
+) -> (
+    atomic_core::change::FileOps,
+    atomic_core::record::workflow::CrdtBuildStats,
+) {
+    use atomic_core::change::LineOps;
+    use atomic_core::crdt::{BranchId, BranchOp, TrunkId};
+    use atomic_core::types::NodeId;
+
+    let placeholder_change_id = NodeId::new(0);
+    let trunk_id = TrunkId::new(placeholder_change_id, 0);
+    let enc = if encoding == Encoding::Binary {
+        None
+    } else {
+        Some(encoding)
+    };
+    let mut file_ops = atomic_core::change::FileOps::create(trunk_id, path.to_string(), enc);
+    let mut stats = atomic_core::record::workflow::CrdtBuildStats::new();
+    stats.files_added = 1;
+
+    let mut prev_branch: Option<BranchId> = None;
+    for (line_idx, _line) in content.split_inclusive(|&b| b == b'\n').enumerate() {
+        let branch_id = BranchId::new(placeholder_change_id, line_idx as u32);
+        let line_ops = LineOps::new_with_line_nums(
+            branch_id,
+            BranchOp::Insert {
+                after: prev_branch,
+                content: Vec::new(),
+            },
+            None,
+            Some(line_idx + 1),
+        );
+        file_ops.add_line_op(line_ops);
+        stats.lines_added += 1;
+        prev_branch = Some(branch_id);
+    }
+
+    (file_ops, stats)
+}
+
+fn record_git_import_add_linewise(path: &str, new_content: &[u8]) -> Option<RecordedFile> {
+    let encoding = Encoding::detect(new_content);
+    if encoding == Encoding::Binary {
+        return None;
+    }
+
+    let mut recorded = RecordedFile::new(path);
+    recorded.set_kind(atomic_core::record::workflow::DetectionKind::Added);
+    recorded.set_encoding(encoding);
+    recorded.add_hunk(BuiltHunk::new_edit(
+        Local::new(path, 1),
+        Some(encoding),
+        0,
+        new_content.len() as u64,
+    ));
+    recorded.set_content(new_content.to_vec());
+
+    let (file_ops, stats) = build_linewise_crdt_ops_for_added_file(path, new_content, encoding);
+    recorded.set_crdt_ops(file_ops);
+    recorded.set_crdt_stats(stats);
+    Some(recorded)
 }
 
 impl ParallelImporter {
@@ -778,6 +905,21 @@ impl ParallelImporter {
                         Some(c) => c.as_slice(),
                         None => continue,
                     };
+                    if let Some(ref diff_lines) = file.diff_lines {
+                        if let Some(rec) = record_git_diff_add_fast(
+                            &file.path,
+                            content,
+                            diff_lines,
+                            atomic_core::record::workflow::DetectionKind::Added,
+                        ) {
+                            recorded_files.push(rec);
+                            continue;
+                        }
+                    }
+                    if let Some(rec) = record_git_import_add_linewise(&file.path, content) {
+                        recorded_files.push(rec);
+                        continue;
+                    }
                     memory_wc.add_file(&file.path, content);
                     let detected = DetectedFile::added(&file.path);
                     match record_added_file(&memory_wc, &detected, &core_options) {
@@ -1085,77 +1227,18 @@ impl ParallelImporter {
             );
         }
 
-        // Assemble the change from recorded files
-        if recorded_files.is_empty() {
-            let mut change = Change::empty(header);
-            change.unhashed = Some(self.build_git_metadata(parsed, false, true));
-            let hash = change.hash().map_err(|e| CliError::Internal(e.into()))?;
-            repo.save_change(&change)
-                .map_err(|e| CliError::Internal(e.into()))?;
-            repo.insert_change(&hash, Default::default())
-                .map_err(|e| CliError::Internal(e.into()))?;
-            return Ok(true);
-        }
-
-        let step_start = Instant::now();
-        let (mut change, hash) = match repo.assemble_and_hash(header.clone(), &recorded_files) {
-            Ok(result) => result,
-            Err(e) => {
-                // Globalization may strip all hunks (e.g., pure deletion commits
-                // where find_content_vertices returns empty for already-deleted
-                // files).  Fall back to an empty change — the explicit
-                // repo.remove() cleanup below still handles the TREE entries.
-                let err_msg = e.to_string();
-                if err_msg.contains("empty") || err_msg.contains("AllEmpty") {
-                    let mut empty = Change::empty(header);
-                    empty.unhashed = Some(self.build_git_metadata(parsed, false, true));
-                    let h = empty.hash().map_err(|e| CliError::Internal(e.into()))?;
-                    repo.save_change(&empty)
-                        .map_err(|e| CliError::Internal(e.into()))?;
-                    repo.insert_change(&h, Default::default())
-                        .map_err(|e| CliError::Internal(e.into()))?;
-
-                    // Still clean up deleted files from TREE and FILE_INDEX
-                    if !deleted_paths.is_empty() {
-                        let del_refs: Vec<&str> =
-                            deleted_paths.iter().map(|s| s.as_str()).collect();
-                        let _ = repo.remove_batch(&del_refs);
-                        let _ = repo.del_file_index_batch(&del_refs);
-                    }
-
-                    return Ok(true);
-                }
-                return Err(CliError::Internal(e.into()));
-            }
-        };
-        let assemble_ms = step_start.elapsed().as_millis();
-
-        change.unhashed = Some(self.build_git_metadata(parsed, false, false));
-
-        // Save and insert
-        let step_start = Instant::now();
-        repo.save_change(&change)
+        let metadata = self.build_git_metadata(parsed, false, recorded_files.is_empty());
+        let write_start = Instant::now();
+        let write_outcome = repo
+            .write_import_recorded(
+                header,
+                &recorded_files,
+                metadata,
+                &deleted_paths,
+                Default::default(),
+            )
             .map_err(|e| CliError::Internal(e.into()))?;
-        let save_ms = step_start.elapsed().as_millis();
-
-        let step_start = Instant::now();
-        repo.insert_change(&hash, Default::default())
-            .map_err(|e| CliError::Internal(e.into()))?;
-        let insert_ms = step_start.elapsed().as_millis();
-
-        // Log slow commits (>50ms total) so we can identify the bottleneck
-        let total_ms = assemble_ms + save_ms + insert_ms;
-        if total_ms > 50 {
-            log::info!(
-                "  SLOW commit {} ({} files): assemble={}ms save={}ms insert={}ms total={}ms",
-                parsed.short_sha,
-                parsed.files.len(),
-                assemble_ms,
-                save_ms,
-                insert_ms,
-                total_ms,
-            );
-        }
+        let write_ms = write_start.elapsed().as_millis();
 
         // Files deleted via record_modified_file (the "show diff lines" path)
         // produce GraphOp::Replacement, not GraphOp::FileDel, so insert_change
@@ -1164,9 +1247,44 @@ impl ParallelImporter {
         // Also remove from FILE_INDEX so status doesn't show them as deleted.
         // Batch-remove deleted files from TREE and FILE_INDEX in single write txns.
         if !deleted_paths.is_empty() {
+            let cleanup_start = Instant::now();
             let del_refs: Vec<&str> = deleted_paths.iter().map(|s| s.as_str()).collect();
-            let _ = repo.remove_batch(&del_refs);
             let _ = repo.del_file_index_batch(&del_refs);
+            let cleanup_ms = cleanup_start.elapsed().as_millis();
+            trace_git_import(format!(
+                "write {} files={} recorded={} add_batch={}ms record={}ms assemble={}ms save={}ms apply={}ms direct_graph={}ms direct_crdt={}ms commit={}ms cleanup={}ms writer_total={}ms total={}ms",
+                parsed.short_sha,
+                parsed.files.len(),
+                recorded_files.len(),
+                add_batch_ms,
+                record_ms,
+                write_outcome.timings.assemble_ms,
+                write_outcome.timings.save_ms,
+                write_outcome.timings.apply_ms,
+                write_outcome.timings.direct_graph_ms,
+                write_outcome.timings.direct_crdt_ms,
+                write_outcome.timings.commit_ms,
+                cleanup_ms,
+                write_ms,
+                commit_start.elapsed().as_millis()
+            ));
+        } else {
+            trace_git_import(format!(
+                "write {} files={} recorded={} add_batch={}ms record={}ms assemble={}ms save={}ms apply={}ms direct_graph={}ms direct_crdt={}ms commit={}ms cleanup=0ms writer_total={}ms total={}ms",
+                parsed.short_sha,
+                parsed.files.len(),
+                recorded_files.len(),
+                add_batch_ms,
+                record_ms,
+                write_outcome.timings.assemble_ms,
+                write_outcome.timings.save_ms,
+                write_outcome.timings.apply_ms,
+                write_outcome.timings.direct_graph_ms,
+                write_outcome.timings.direct_crdt_ms,
+                write_outcome.timings.commit_ms,
+                write_ms,
+                commit_start.elapsed().as_millis()
+            ));
         }
 
         Ok(true)
@@ -1179,16 +1297,23 @@ impl ParallelImporter {
         parsed: &ParsedCommit,
         header: ChangeHeader,
     ) -> CliResult<bool> {
-        let mut change = Change::empty(header);
-        change.unhashed = Some(self.build_git_metadata(parsed, true, false));
-
-        let hash = change.hash().map_err(|e| CliError::Internal(e.into()))?;
-
-        repo.save_change(&change)
+        let commit_start = Instant::now();
+        let metadata = self.build_git_metadata(parsed, true, false);
+        let write_outcome = repo
+            .write_import_recorded(header, &[], metadata, &[], Default::default())
             .map_err(|e| CliError::Internal(e.into()))?;
 
-        repo.insert_change(&hash, Default::default())
-            .map_err(|e| CliError::Internal(e.into()))?;
+        trace_git_import(format!(
+            "write {} files=0 recorded=0 add_batch=0ms record=0ms assemble={}ms save={}ms apply={}ms direct_graph={}ms direct_crdt={}ms commit={}ms cleanup=0ms total={}ms empty_commit=true",
+            parsed.short_sha,
+            write_outcome.timings.assemble_ms,
+            write_outcome.timings.save_ms,
+            write_outcome.timings.apply_ms,
+            write_outcome.timings.direct_graph_ms,
+            write_outcome.timings.direct_crdt_ms,
+            write_outcome.timings.commit_ms,
+            commit_start.elapsed().as_millis()
+        ));
 
         Ok(true)
     }
@@ -1281,6 +1406,7 @@ fn parse_commit(
     _index: usize,
     oid_to_index: &std::collections::HashMap<Oid, usize>,
 ) -> CliResult<ParsedCommit> {
+    let parse_start = Instant::now();
     let commit = git_repo.find_commit(oid).map_err(|e| CliError::GitError {
         message: format!("Failed to find commit {}: {}", oid, e),
     })?;
@@ -1330,11 +1456,13 @@ fn parse_commit(
     let mut diff_opts = DiffOptions::new();
     diff_opts.include_untracked(false);
 
+    let diff_start = Instant::now();
     let mut diff = git_repo
         .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut diff_opts))
         .map_err(|e| CliError::GitError {
             message: format!("Failed to compute diff: {}", e),
         })?;
+    let diff_ms = diff_start.elapsed().as_millis();
 
     // Apply rename detection — mirrors what git CLI does after computing
     // the initial diff.  This correctly classifies renamed files as R deltas
@@ -1350,27 +1478,57 @@ fn parse_commit(
     // src/export/markdown.rs while adding src/export/tests.rs (52%
     // similar) would be misclassified as a rename of markdown→tests,
     // orphaning markdown.rs from the TREE.
-    let mut find_opts = DiffFindOptions::new();
-    find_opts.renames(true);
-    let _ = diff.find_similar(Some(&mut find_opts));
-
-    let stats = diff.stats().map_err(|e| CliError::GitError {
-        message: format!("Failed to get diff stats: {}", e),
-    })?;
+    let rename_start = Instant::now();
+    let detected_renames = should_detect_renames(&diff);
+    if detected_renames {
+        let mut find_opts = DiffFindOptions::new();
+        find_opts.renames(true);
+        let _ = diff.find_similar(Some(&mut find_opts));
+    } else {
+        log::debug!(
+            "parse_commit {}: skipping rename detection for large/add-only diff",
+            short_sha
+        );
+    }
+    let rename_ms = rename_start.elapsed().as_millis();
 
     // Parse files. Pure rename commits can show up as zero-stat directory
     // modifications in libgit2; when that happens, fall back to recursive
     // `git diff-tree -r -M` name-status output for per-file entries.
-    let mut files = parse_diff_files(git_repo, &diff, &tree, parent_tree.as_ref())?;
-    if stats.files_changed() == 0 {
+    let capture_diff_lines = parent_tree.is_some();
+    let files_start = Instant::now();
+    let mut files = parse_diff_files(
+        git_repo,
+        &diff,
+        &tree,
+        parent_tree.as_ref(),
+        capture_diff_lines,
+    )?;
+    let mut parse_files_ms = files_start.elapsed().as_millis();
+    if files.is_empty() {
         if let Some(ref pt) = parent_tree {
+            let fallback_start = Instant::now();
             let fallback = parse_diff_files_via_git_cli(git_repo, oid, pt.id(), &tree, pt)?;
+            parse_files_ms += fallback_start.elapsed().as_millis();
             if !fallback.is_empty() {
                 files = fallback;
             }
         }
     }
     let is_empty = files.is_empty();
+
+    trace_git_import(format!(
+        "parse {} files={} merge={} empty={} diff={}ms rename={}ms(rename_detect={}) files={}ms total={}ms",
+        short_sha,
+        files.len(),
+        is_merge,
+        is_empty,
+        diff_ms,
+        rename_ms,
+        detected_renames,
+        parse_files_ms,
+        parse_start.elapsed().as_millis()
+    ));
 
     Ok(ParsedCommit {
         git_sha: sha,
@@ -1420,6 +1578,7 @@ fn parse_diff_files(
     diff: &Diff,
     tree: &Tree,
     parent_tree: Option<&Tree>,
+    capture_diff_lines: bool,
 ) -> CliResult<Vec<ParsedFile>> {
     use std::collections::HashMap;
 
@@ -1432,32 +1591,34 @@ fn parse_diff_files(
     // Map from file path → accumulated diff lines for that file.
     let mut lines_by_path: HashMap<String, Vec<GitDiffLine>> = HashMap::new();
 
-    let _ = diff.foreach(
-        &mut |_delta, _progress| true, // file_cb  (no-op)
-        None,                          // binary_cb
-        None,                          // hunk_cb
-        Some(&mut |delta, _hunk, line| {
-            let origin = line.origin();
-            // We only keep `+`, `-`, and context (` `) lines.
-            if origin != '+' && origin != '-' && origin != ' ' {
-                return true;
-            }
-            let path = delta
-                .new_file()
-                .path()
-                .or_else(|| delta.old_file().path())
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
+    if capture_diff_lines {
+        let _ = diff.foreach(
+            &mut |_delta, _progress| true, // file_cb  (no-op)
+            None,                          // binary_cb
+            None,                          // hunk_cb
+            Some(&mut |delta, _hunk, line| {
+                let origin = line.origin();
+                // We only keep `+`, `-`, and context (` `) lines.
+                if origin != '+' && origin != '-' && origin != ' ' {
+                    return true;
+                }
+                let path = delta
+                    .new_file()
+                    .path()
+                    .or_else(|| delta.old_file().path())
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
 
-            lines_by_path.entry(path).or_default().push(GitDiffLine {
-                origin,
-                content: line.content().to_vec(),
-                old_lineno: line.old_lineno(),
-                new_lineno: line.new_lineno(),
-            });
-            true
-        }),
-    );
+                lines_by_path.entry(path).or_default().push(GitDiffLine {
+                    origin,
+                    content: line.content().to_vec(),
+                    old_lineno: line.old_lineno(),
+                    new_lineno: line.new_lineno(),
+                });
+                true
+            }),
+        );
+    }
 
     // ── Step 2: build ParsedFile entries from the delta list ─────────────
 
