@@ -140,11 +140,15 @@ impl EnvLookup for StdEnv {
 /// Shape of `~/.local/state/atomic/install.json` as written by install.sh.
 /// Optional fields we don't consume in v1 are omitted; serde tolerates
 /// extra fields by default.
+///
+/// `install_path` is platform-native (POSIX path on Unix, Windows path on
+/// Windows); we never compare it across platforms, only `canonicalize` it
+/// and compare against the local `current_exe()`.
 #[derive(Debug, Deserialize)]
 struct Manifest {
     schema_version: u32,
     source: String,
-    install_path: String,
+    install_path: PathBuf,
     version: String,
 }
 
@@ -189,8 +193,7 @@ pub fn detect_source(current_exe: &Path, env: &dyn EnvLookup) -> InstallSource {
     if let Ok(raw) = std::fs::read_to_string(&manifest_p) {
         if let Ok(m) = serde_json::from_str::<Manifest>(&raw) {
             if m.schema_version == 1 && m.source == "official-installer" {
-                let recorded = std::fs::canonicalize(&m.install_path)
-                    .unwrap_or_else(|_| PathBuf::from(&m.install_path));
+                let recorded = std::fs::canonicalize(&m.install_path).unwrap_or(m.install_path);
                 if recorded == canonical_exe {
                     return InstallSource::OfficialInstaller {
                         manifest_path: manifest_p,
@@ -632,22 +635,22 @@ mod tests {
     fn write_manifest(dir: &Path, install_path: &Path, version: &str, schema_version: u32) {
         let atomic_dir = dir.join("atomic");
         fs::create_dir_all(&atomic_dir).unwrap();
-        let manifest = format!(
-            r#"{{
-  "schema_version": {schema_version},
-  "source": "official-installer",
-  "install_path": "{}",
-  "version": "{version}",
-  "platform": "x86_64-unknown-linux-gnu",
-  "installed_at": "2026-05-16T00:00:00Z",
-  "installer_url": "https://atomic.storage/install.sh",
-  "artifact_url": "",
-  "artifact_sha256": "",
-  "binary_sha256": ""
-}}"#,
-            install_path.display()
-        );
-        fs::write(atomic_dir.join("install.json"), manifest).unwrap();
+        // Use serde_json::json! rather than format!-templating: on Windows,
+        // `install_path` contains backslashes that are illegal in raw JSON
+        // string literals. Let the encoder do the escaping.
+        let manifest = serde_json::json!({
+            "schema_version": schema_version,
+            "source": "official-installer",
+            "install_path": install_path,
+            "version": version,
+            "platform": "x86_64-unknown-linux-gnu",
+            "installed_at": "2026-05-16T00:00:00Z",
+            "installer_url": "https://atomic.storage/install.sh",
+            "artifact_url": "",
+            "artifact_sha256": "",
+            "binary_sha256": "",
+        });
+        fs::write(atomic_dir.join("install.json"), manifest.to_string()).unwrap();
     }
 
     #[test]
@@ -695,6 +698,22 @@ mod tests {
 
         let env = MockEnv::new().set("XDG_STATE_HOME", state.path().to_str().unwrap());
         assert_eq!(detect_source(&bin, &env), InstallSource::Manual);
+    }
+
+    #[test]
+    fn write_manifest_emits_valid_json_for_windows_paths() {
+        // Regression: previously `write_manifest` used `format!` to embed the
+        // path, which on Windows produced `"install_path": "C:\Users\..."` —
+        // illegal JSON because `\U` etc. aren't valid escapes. Verify the
+        // emitted manifest parses, even for Windows-shaped paths, on any host.
+        let state = TempDir::new().unwrap();
+        let win_path = Path::new(r"C:\Users\test\AppData\Local\atomic\atomic.exe");
+        write_manifest(state.path(), win_path, "0.6.0", 1);
+
+        let raw = fs::read_to_string(state.path().join("atomic").join("install.json")).unwrap();
+        let parsed: Manifest = serde_json::from_str(&raw)
+            .expect("manifest with Windows-shaped path must be valid JSON");
+        assert_eq!(parsed.install_path, win_path);
     }
 
     #[test]
