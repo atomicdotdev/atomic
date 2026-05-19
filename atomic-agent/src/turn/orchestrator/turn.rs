@@ -2,6 +2,7 @@
 //!
 //! Contains handlers for TurnStart, TurnEnd, and ToolUse events.
 
+use std::fs::File;
 use std::path::Path;
 
 use crate::error::{AgentError, AgentResult};
@@ -10,6 +11,24 @@ use crate::record::{record_turn, TurnRecordOptions};
 use crate::turn::phase::{self, Action, Event, TransitionContext};
 
 use super::{DispatchResult, TurnOrchestrator};
+
+const TURN_END_LOCK_FILENAME: &str = "turn-end.lock";
+
+struct TurnEndLockGuard {
+    file: File,
+}
+
+impl Drop for TurnEndLockGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+enum TurnEndLock {
+    Acquired(TurnEndLockGuard),
+    Busy,
+    Unavailable,
+}
 
 impl TurnOrchestrator {
     /// Handle a TurnStart event (UserPromptSubmit).
@@ -117,6 +136,18 @@ impl TurnOrchestrator {
         event: TurnEvent,
     ) -> AgentResult<DispatchResult> {
         let session_id = &event.session_id;
+        let _turn_end_lock = match self.try_turn_end_lock(session_id) {
+            TurnEndLock::Acquired(guard) => Some(guard),
+            TurnEndLock::Busy => {
+                log::warn!(
+                    "Turn end for session {} is already being recorded; skipping duplicate Stop hook",
+                    session_id
+                );
+                return Ok(DispatchResult::new(session_id, phase::Phase::Idle)
+                    .with_warning("duplicate Stop hook skipped: turn already recording"));
+            }
+            TurnEndLock::Unavailable => None,
+        };
 
         // Fast gate: check if anything changed since the last record.
         // This bypasses the entire status machinery (TREE scan, filesystem
@@ -384,5 +415,50 @@ impl TurnOrchestrator {
         }
 
         Ok(DispatchResult::new(session_id, session.phase))
+    }
+
+    fn try_turn_end_lock(&self, session_id: &str) -> TurnEndLock {
+        use fs2::FileExt;
+
+        let dir = self.session_graph_dir(session_id);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log::warn!(
+                "Failed to create turn-end lock dir for session {}: {}",
+                session_id,
+                e
+            );
+            return TurnEndLock::Unavailable;
+        }
+
+        let lock_path = dir.join(TURN_END_LOCK_FILENAME);
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(e) => {
+                log::warn!(
+                    "Failed to open turn-end lock for session {}: {}",
+                    session_id,
+                    e
+                );
+                return TurnEndLock::Unavailable;
+            }
+        };
+
+        match file.try_lock_exclusive() {
+            Ok(()) => TurnEndLock::Acquired(TurnEndLockGuard { file }),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => TurnEndLock::Busy,
+            Err(e) => {
+                log::warn!(
+                    "Failed to acquire turn-end lock for session {}: {}",
+                    session_id,
+                    e
+                );
+                TurnEndLock::Unavailable
+            }
+        }
     }
 }

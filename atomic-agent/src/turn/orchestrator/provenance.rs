@@ -75,8 +75,15 @@ impl TurnOrchestrator {
             }
         };
 
-        if let Err(e) = lock_file.lock_exclusive() {
-            log::warn!("Failed to acquire lock for session {}: {}", session_id, e,);
+        if let Err(e) = lock_file.try_lock_exclusive() {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                log::warn!(
+                    "Provenance accumulator for session {} is already locked; skipping best-effort provenance update",
+                    session_id,
+                );
+            } else {
+                log::warn!("Failed to acquire lock for session {}: {}", session_id, e,);
+            }
             return None;
         }
 
@@ -146,8 +153,15 @@ impl TurnOrchestrator {
             }
         };
 
-        if let Err(e) = lock_file.lock_exclusive() {
-            log::warn!("Failed to acquire lock for session {}: {}", session_id, e);
+        if let Err(e) = lock_file.try_lock_exclusive() {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                log::warn!(
+                    "Provenance accumulator for session {} is already locked; skipping save",
+                    session_id,
+                );
+            } else {
+                log::warn!("Failed to acquire lock for session {}: {}", session_id, e);
+            }
             return;
         }
 
