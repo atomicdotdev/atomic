@@ -447,15 +447,15 @@ impl ChangeCmd {
                 count_unique_paths(&change.hashed.hunks)
             ));
 
-            // Always show hunks with atom details
-            for graph_op in &change.hashed.hunks {
-                let (symbol, path) = hunk_symbol_and_path(graph_op);
-                let atom_info = hunk_atom_info(graph_op);
+            // Show one summary row per path. Git imports and large records can
+            // legitimately contain thousands of graph ops for a small number
+            // of files; printing each op makes the change view unusable.
+            for summary in hunk_display_summaries(&change.hashed.hunks) {
                 output.push_str(&format!(
                     "  {} {} {}\n",
-                    symbol,
-                    style_path(&path),
-                    hint(&atom_info)
+                    summary.symbol,
+                    style_path(&summary.path),
+                    hint(&summary.info)
                 ));
             }
         }
@@ -831,4 +831,85 @@ fn hunk_symbol_and_path<H>(graph_op: &GraphOp<H>) -> (&'static str, String) {
         GraphOp::AddRoot { .. } => ("◉", "(root)".to_string()),
         GraphOp::DelRoot { .. } => ("⊘", "(root)".to_string()),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HunkDisplaySummary {
+    pub symbol: &'static str,
+    pub path: String,
+    pub info: String,
+}
+
+#[derive(Debug, Clone)]
+struct HunkDisplayAggregate {
+    symbol: &'static str,
+    total: usize,
+    infos: std::collections::BTreeMap<String, usize>,
+}
+
+pub(crate) fn hunk_display_summaries<H>(hunks: &[GraphOp<H>]) -> Vec<HunkDisplaySummary> {
+    let mut by_path: std::collections::BTreeMap<String, HunkDisplayAggregate> =
+        std::collections::BTreeMap::new();
+
+    for graph_op in hunks {
+        let (symbol, path) = hunk_symbol_and_path(graph_op);
+        let info = hunk_atom_info(graph_op);
+        let aggregate = by_path.entry(path).or_insert_with(|| HunkDisplayAggregate {
+            symbol,
+            total: 0,
+            infos: std::collections::BTreeMap::new(),
+        });
+        aggregate.symbol = merge_hunk_symbols(aggregate.symbol, symbol);
+        aggregate.total += 1;
+        *aggregate.infos.entry(info).or_insert(0) += 1;
+    }
+
+    by_path
+        .into_iter()
+        .map(|(path, aggregate)| HunkDisplaySummary {
+            symbol: aggregate.symbol,
+            path,
+            info: format_hunk_aggregate_info(aggregate.total, &aggregate.infos),
+        })
+        .collect()
+}
+
+fn merge_hunk_symbols(current: &'static str, next: &'static str) -> &'static str {
+    if current == next {
+        return current;
+    }
+    if current == "±" || next == "±" {
+        return "±";
+    }
+    match (current, next) {
+        ("+", "~") | ("~", "+") | ("+", "-") | ("-", "+") | ("~", "-") | ("-", "~") => "±",
+        ("📁+", "📁-") | ("📁-", "📁+") => "±",
+        _ => current,
+    }
+}
+
+fn format_hunk_aggregate_info(
+    total: usize,
+    infos: &std::collections::BTreeMap<String, usize>,
+) -> String {
+    if total == 1 {
+        return infos
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "(1 hunk)".to_string());
+    }
+
+    let details = infos
+        .iter()
+        .map(|(info, count)| format!("{}x {}", count, trim_hunk_info(info)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("({} hunks: {})", total, details)
+}
+
+fn trim_hunk_info(info: &str) -> &str {
+    info.strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(info)
 }

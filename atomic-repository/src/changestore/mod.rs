@@ -130,6 +130,36 @@ impl std::fmt::Debug for ChangeStore {
     }
 }
 
+fn copy_content_from_change(
+    hash: &Hash,
+    change: &Change,
+    start: usize,
+    end: usize,
+    buf: &mut [u8],
+) -> ChangeStoreResult<usize> {
+    if end > change.contents.len() {
+        return Err(ChangeStoreError::ContentOutOfBounds {
+            hash: hash.to_base32(),
+            requested_start: start,
+            requested_end: end,
+            content_len: change.contents.len(),
+        });
+    }
+
+    let len = end - start;
+    if buf.len() < len {
+        return Err(ChangeStoreError::ContentOutOfBounds {
+            hash: hash.to_base32(),
+            requested_start: start,
+            requested_end: end,
+            content_len: buf.len(),
+        });
+    }
+
+    buf[..len].copy_from_slice(&change.contents[start..end]);
+    Ok(len)
+}
+
 impl ChangeStore {
     /// Create a new change store with the given directory and cache capacity.
     ///
@@ -368,6 +398,60 @@ impl ChangeStore {
         }
 
         Ok(change)
+    }
+
+    /// Copy a content span from a change without cloning the full `Change`.
+    ///
+    /// Graph output calls this for every vertex it materializes. Using
+    /// `load_change()` here is expensive for imported changes because cache
+    /// hits clone the entire change, including potentially large unhashed Git
+    /// metadata. This path copies only the requested bytes.
+    pub(crate) fn copy_content_span(
+        &self,
+        hash: &Hash,
+        start: usize,
+        end: usize,
+        buf: &mut [u8],
+    ) -> ChangeStoreResult<usize> {
+        {
+            if let Ok(mut cache) = self.cache.write() {
+                if let Some(change) = cache.get(hash) {
+                    return copy_content_from_change(hash, change, start, end, buf);
+                }
+            }
+        }
+
+        let path = self.change_path(hash);
+        log::debug!(
+            "Loading change content {} from {}",
+            hash.to_base32(),
+            path.display()
+        );
+
+        if !path.exists() {
+            return Err(ChangeStoreError::NotFound {
+                hash: hash.to_base32(),
+            });
+        }
+
+        let file = File::open(&path)?;
+        let mut reader = BufReader::new(file);
+        let (change, computed_hash) = Change::deserialize(&mut reader)?;
+
+        if computed_hash != *hash {
+            return Err(ChangeStoreError::HashMismatch {
+                expected: hash.to_base32(),
+                computed: computed_hash.to_base32(),
+            });
+        }
+
+        let copied = copy_content_from_change(hash, &change, start, end, buf)?;
+
+        if let Ok(mut cache) = self.cache.write() {
+            cache.insert(*hash, change);
+        }
+
+        Ok(copied)
     }
 
     /// Delete a change from disk and the cache.

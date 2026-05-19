@@ -85,6 +85,56 @@ pub struct ImportWriteOutcome {
     pub insert: InsertOutcome,
 }
 
+#[derive(Default)]
+struct ImportGraphFirstVertexCache {
+    by_inode: HashMap<Inode, ImportGraphFirstInodeCache>,
+}
+
+#[derive(Default)]
+struct ImportGraphFirstInodeCache {
+    by_end: HashMap<Position<NodeId>, GraphNode<NodeId>>,
+    by_start: HashMap<Position<NodeId>, GraphNode<NodeId>>,
+}
+
+impl ImportGraphFirstVertexCache {
+    fn load<T>(
+        &mut self,
+        txn: &T,
+        inode: Inode,
+    ) -> Result<&ImportGraphFirstInodeCache, RepositoryError>
+    where
+        T: TreeTxnT,
+    {
+        if !self.by_inode.contains_key(&inode) {
+            let mut cache = ImportGraphFirstInodeCache::default();
+            let vertices = txn
+                .iter_inode_vertices(inode)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            for result in vertices {
+                let (node, _edge) = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
+                cache.by_end.entry(node.end_pos()).or_insert(node);
+                cache
+                    .by_start
+                    .entry(node.start_pos())
+                    .and_modify(|existing| {
+                        if existing.start == existing.end && node.start != node.end {
+                            *existing = node;
+                        }
+                    })
+                    .or_insert(node);
+            }
+            self.by_inode.insert(inode, cache);
+        }
+
+        self.by_inode.get(&inode).ok_or_else(|| {
+            RepositoryError::Apply(format!(
+                "missing import vertex cache for inode {}",
+                inode.get()
+            ))
+        })
+    }
+}
+
 fn import_direct_source(
     pos: &Position<Option<Hash>>,
     by_end: &HashMap<ChangePosition, GraphNode<NodeId>>,
@@ -136,6 +186,144 @@ fn import_direct_can_apply(change: &Change) -> bool {
         }
         _ => false,
     })
+}
+
+fn import_graph_first_can_apply(change: &Change) -> bool {
+    !change.hunks().is_empty()
+        && change.hunks().iter().all(|op| match op {
+            GraphOp::FileAdd { .. } => true,
+            GraphOp::FileMove { add, .. } => {
+                !add.predecessors.is_empty() && add.predecessors.len() == 1
+            }
+            GraphOp::Replacement { replacement, .. } => {
+                !replacement.predecessors.is_empty() && replacement.predecessors.len() == 1
+            }
+            GraphOp::Edit {
+                change: atomic_core::change::Atom::Insertion(insertion),
+                ..
+            } => !insertion.predecessors.is_empty() && insertion.predecessors.len() == 1,
+            GraphOp::Edit {
+                change: atomic_core::change::Atom::EdgeUpdate(_),
+                ..
+            } => true,
+            _ => false,
+        })
+}
+
+fn import_graph_first_position<T: GraphTxnT>(
+    txn: &T,
+    pos: &Position<Option<Hash>>,
+    change_id: NodeId,
+) -> Result<Position<NodeId>, RepositoryError> {
+    let resolved_change = match pos.change {
+        Some(hash) if hash == Hash::NONE => NodeId::ROOT,
+        Some(hash) => txn
+            .get_internal(&hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::Apply(format!("missing dependency {}", hash)))?,
+        None => change_id,
+    };
+
+    Ok(Position::new(resolved_change, pos.pos))
+}
+
+fn import_graph_first_node<T: GraphTxnT>(
+    txn: &T,
+    node: GraphNode<Option<Hash>>,
+    change_id: NodeId,
+) -> Result<GraphNode<NodeId>, RepositoryError> {
+    let pos = Position::new(node.change, node.start);
+    let resolved = import_graph_first_position(txn, &pos, change_id)?;
+    Ok(GraphNode {
+        change: resolved.change,
+        start: node.start,
+        end: node.end,
+    })
+}
+
+fn import_graph_first_resolved_inode<T: GraphTxnT + TreeTxnT>(
+    txn: &T,
+    inode_pos: &Position<Option<Hash>>,
+    change_id: NodeId,
+) -> Result<Option<Inode>, RepositoryError> {
+    let resolved = import_graph_first_position(txn, inode_pos, change_id)?;
+    if resolved.change.is_root() {
+        return Ok(None);
+    }
+    txn.position_inode(resolved)
+        .map_err(|e| RepositoryError::Database(e.to_string()))
+}
+
+fn import_graph_first_source<T>(
+    txn: &T,
+    pos: &Position<Option<Hash>>,
+    inode_pos: &Position<Option<Hash>>,
+    resolved_inode: Option<Inode>,
+    old_by_end: &HashMap<Position<NodeId>, GraphNode<NodeId>>,
+    current_by_end: &HashMap<Position<NodeId>, GraphNode<NodeId>>,
+    vertex_cache: &mut ImportGraphFirstVertexCache,
+    change_id: NodeId,
+) -> Result<GraphNode<NodeId>, RepositoryError>
+where
+    T: GraphTxnT + TreeTxnT,
+{
+    let resolved = import_graph_first_position(txn, pos, change_id)?;
+
+    if resolved.change == change_id {
+        if let Some(node) = current_by_end.get(&resolved) {
+            return Ok(*node);
+        }
+    }
+
+    if let Some(node) = old_by_end.get(&resolved) {
+        return Ok(*node);
+    }
+
+    let resolved_inode_pos = import_graph_first_position(txn, inode_pos, change_id)?;
+    if resolved == resolved_inode_pos {
+        return Ok(GraphNode {
+            change: resolved.change,
+            start: resolved.pos,
+            end: resolved.pos,
+        });
+    }
+
+    if let Some(inode) = resolved_inode {
+        if let Some(node) = vertex_cache.load(txn, inode)?.by_end.get(&resolved) {
+            return Ok(*node);
+        }
+    }
+
+    txn.find_block_end(resolved)
+        .map_err(|e| RepositoryError::Apply(e.to_string()))
+}
+
+fn import_graph_first_successor<T>(
+    txn: &T,
+    pos: &Position<Option<Hash>>,
+    resolved_inode: Option<Inode>,
+    current_by_start: &HashMap<Position<NodeId>, GraphNode<NodeId>>,
+    vertex_cache: &mut ImportGraphFirstVertexCache,
+    change_id: NodeId,
+) -> Result<GraphNode<NodeId>, RepositoryError>
+where
+    T: GraphTxnT + TreeTxnT,
+{
+    let resolved = import_graph_first_position(txn, pos, change_id)?;
+    if resolved.change == change_id {
+        if let Some(node) = current_by_start.get(&resolved) {
+            return Ok(*node);
+        }
+    }
+
+    if let Some(inode) = resolved_inode {
+        if let Some(node) = vertex_cache.load(txn, inode)?.by_start.get(&resolved) {
+            return Ok(*node);
+        }
+    }
+
+    txn.find_block(resolved)
+        .map_err(|e| RepositoryError::Apply(e.to_string()))
 }
 
 fn import_direct_write_insertion(
@@ -213,8 +401,12 @@ impl Repository {
         let mut change = if recorded_files.is_empty() {
             Change::empty(header)
         } else {
-            match assemble_change(&txn, recorded_files, header.clone(), &AssemblyOptions::default())
-            {
+            match assemble_change(
+                &txn,
+                recorded_files,
+                header.clone(),
+                &AssemblyOptions::default(),
+            ) {
                 Ok(result) => result.into_change(),
                 Err(e) => {
                     let err_msg = e.to_string();
@@ -366,6 +558,484 @@ impl Repository {
             timings,
             insert,
         })
+    }
+
+    /// Save and apply an already-built git-import graph change.
+    ///
+    /// This bypasses record/globalize and eager CRDT table writes. The caller
+    /// has already compiled Git's snapshot delta into line-level graph ops.
+    pub fn write_import_graph_change(
+        &self,
+        change: Change,
+        deleted_paths: &[String],
+        options: InsertOptions,
+    ) -> Result<ImportWriteOutcome, RepositoryError> {
+        let mut timings = ImportWriteTimings::default();
+        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let assemble_start = std::time::Instant::now();
+        let mut v3_bytes = Vec::new();
+        let hash = change
+            .serialize(&mut v3_bytes)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let (final_change, verified_hash) = Change::deserialize(&mut v3_bytes.as_slice())
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        debug_assert_eq!(hash, verified_hash);
+        timings.assemble_ms = assemble_start.elapsed().as_millis();
+
+        let save_start = std::time::Instant::now();
+        self.save_change_bytes(&hash, &v3_bytes, &final_change)?;
+        timings.save_ms = save_start.elapsed().as_millis();
+
+        let change_id = txn
+            .register_change(&hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.put_change_deps(change_id, final_change.dependencies())
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let apply_start = std::time::Instant::now();
+        let insert = if import_graph_first_can_apply(&final_change) {
+            let (insert, graph_ms, crdt_ms) = self.write_import_graph_first_direct(
+                &mut txn,
+                view_name,
+                change_id,
+                &hash,
+                &final_change,
+                &options,
+            )?;
+            timings.direct_graph_ms = graph_ms;
+            timings.direct_crdt_ms = crdt_ms;
+            insert
+        } else {
+            write_change_to_graph(
+                &mut txn,
+                view_name,
+                change_id,
+                &hash,
+                &final_change,
+                &options,
+                false,
+            )
+            .map_err(|e| RepositoryError::Apply(e.to_string()))?
+        };
+        timings.apply_ms = apply_start.elapsed().as_millis();
+
+        for deleted_path in deleted_paths {
+            if let Ok(Some(inode)) = txn.get_inode(deleted_path) {
+                let _ = txn.del_tree(deleted_path);
+                let _ = txn.del_inode(inode);
+            }
+        }
+
+        let commit_start = std::time::Instant::now();
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        timings.commit_ms = commit_start.elapsed().as_millis();
+
+        Ok(ImportWriteOutcome {
+            hash,
+            timings,
+            insert,
+        })
+    }
+
+    fn write_import_graph_first_direct(
+        &self,
+        txn: &mut atomic_core::pristine::WriteTxn<'_>,
+        view_name: &str,
+        change_id: NodeId,
+        hash: &Hash,
+        change: &Change,
+        _options: &InsertOptions,
+    ) -> Result<(InsertOutcome, u128, u128), RepositoryError> {
+        use atomic_core::apply::compute_new_state;
+
+        let graph_start = std::time::Instant::now();
+        let mut pending_edges: Vec<(
+            Option<Inode>,
+            EdgeFlags,
+            GraphNode<NodeId>,
+            GraphNode<NodeId>,
+        )> = Vec::new();
+
+        {
+            let mut old_by_end: HashMap<Position<NodeId>, GraphNode<NodeId>> = HashMap::new();
+            let mut current_by_end: HashMap<Position<NodeId>, GraphNode<NodeId>> = HashMap::new();
+            let mut current_by_start: HashMap<Position<NodeId>, GraphNode<NodeId>> = HashMap::new();
+            let mut vertex_cache = ImportGraphFirstVertexCache::default();
+
+            for graph_op in change.hunks() {
+                match graph_op {
+                    GraphOp::FileAdd {
+                        add_name,
+                        add_inode,
+                        contents,
+                        path,
+                        ..
+                    } => {
+                        let inode_position = Position::new(change_id, add_inode.start);
+                        let inode = txn
+                            .alloc_inode()
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        txn.put_tree(path, inode)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        txn.put_inode(inode, inode_position)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+                        let name_node = GraphNode {
+                            change: change_id,
+                            start: add_name.start,
+                            end: add_name.end,
+                        };
+                        let name_inode =
+                            import_graph_first_resolved_inode(&*txn, &add_name.inode, change_id)?;
+                        let name_source = import_graph_first_source(
+                            &*txn,
+                            &add_name.predecessors[0],
+                            &add_name.inode,
+                            name_inode,
+                            &old_by_end,
+                            &current_by_end,
+                            &mut vertex_cache,
+                            change_id,
+                        )?;
+                        pending_edges.push((
+                            name_inode,
+                            add_name.flag | EdgeFlags::BLOCK,
+                            name_source,
+                            name_node,
+                        ));
+                        current_by_end.insert(name_node.end_pos(), name_node);
+                        current_by_start.insert(name_node.start_pos(), name_node);
+
+                        let inode_node = GraphNode {
+                            change: change_id,
+                            start: add_inode.start,
+                            end: add_inode.end,
+                        };
+                        let inode_source = import_graph_first_source(
+                            &*txn,
+                            &add_inode.predecessors[0],
+                            &add_inode.inode,
+                            Some(inode),
+                            &old_by_end,
+                            &current_by_end,
+                            &mut vertex_cache,
+                            change_id,
+                        )?;
+                        pending_edges.push((
+                            Some(inode),
+                            add_inode.flag | EdgeFlags::BLOCK,
+                            inode_source,
+                            inode_node,
+                        ));
+                        current_by_end.insert(inode_node.end_pos(), inode_node);
+                        current_by_start.insert(inode_node.start_pos(), inode_node);
+
+                        if let Some(contents) = contents {
+                            let content_node = GraphNode {
+                                change: change_id,
+                                start: contents.start,
+                                end: contents.end,
+                            };
+                            let content_source = import_graph_first_source(
+                                &*txn,
+                                &contents.predecessors[0],
+                                &contents.inode,
+                                Some(inode),
+                                &old_by_end,
+                                &current_by_end,
+                                &mut vertex_cache,
+                                change_id,
+                            )?;
+                            pending_edges.push((
+                                Some(inode),
+                                contents.flag | EdgeFlags::BLOCK,
+                                content_source,
+                                content_node,
+                            ));
+                            current_by_end.insert(content_node.end_pos(), content_node);
+                            current_by_start.insert(content_node.start_pos(), content_node);
+                        }
+                    }
+                    GraphOp::Replacement {
+                        change: edge_update,
+                        replacement,
+                        ..
+                    } => {
+                        let resolved_inode = import_graph_first_resolved_inode(
+                            &*txn,
+                            &edge_update.inode,
+                            change_id,
+                        )?;
+
+                        for edge in &edge_update.edges {
+                            let target = import_graph_first_node(&*txn, edge.to, change_id)?;
+                            let source = import_graph_first_source(
+                                &*txn,
+                                &edge.from,
+                                &edge_update.inode,
+                                resolved_inode,
+                                &old_by_end,
+                                &current_by_end,
+                                &mut vertex_cache,
+                                change_id,
+                            )?;
+                            pending_edges.push((resolved_inode, edge.flag, source, target));
+                            old_by_end.insert(target.end_pos(), target);
+                        }
+
+                        let node = GraphNode {
+                            change: change_id,
+                            start: replacement.start,
+                            end: replacement.end,
+                        };
+                        let source = import_graph_first_source(
+                            &*txn,
+                            &replacement.predecessors[0],
+                            &replacement.inode,
+                            resolved_inode,
+                            &old_by_end,
+                            &current_by_end,
+                            &mut vertex_cache,
+                            change_id,
+                        )?;
+                        pending_edges.push((
+                            resolved_inode,
+                            replacement.flag | EdgeFlags::BLOCK,
+                            source,
+                            node,
+                        ));
+
+                        for successor in &replacement.successors {
+                            let target = import_graph_first_successor(
+                                &*txn,
+                                successor,
+                                resolved_inode,
+                                &current_by_start,
+                                &mut vertex_cache,
+                                change_id,
+                            )?;
+                            pending_edges.push((
+                                resolved_inode,
+                                replacement.flag | EdgeFlags::BLOCK,
+                                node,
+                                target,
+                            ));
+                        }
+
+                        current_by_end.insert(node.end_pos(), node);
+                        current_by_start.insert(node.start_pos(), node);
+                    }
+                    GraphOp::FileMove { del, add, path } => {
+                        let resolved_inode =
+                            import_graph_first_resolved_inode(&*txn, &add.inode, change_id)?;
+
+                        for edge in &del.edges {
+                            let target = import_graph_first_node(&*txn, edge.to, change_id)?;
+                            let source = import_graph_first_source(
+                                &*txn,
+                                &edge.from,
+                                &del.inode,
+                                resolved_inode,
+                                &old_by_end,
+                                &current_by_end,
+                                &mut vertex_cache,
+                                change_id,
+                            )?;
+                            pending_edges.push((resolved_inode, edge.flag, source, target));
+                            old_by_end.insert(target.end_pos(), target);
+                        }
+
+                        let node = GraphNode {
+                            change: change_id,
+                            start: add.start,
+                            end: add.end,
+                        };
+                        let source = import_graph_first_source(
+                            &*txn,
+                            &add.predecessors[0],
+                            &add.inode,
+                            resolved_inode,
+                            &old_by_end,
+                            &current_by_end,
+                            &mut vertex_cache,
+                            change_id,
+                        )?;
+                        pending_edges.push((
+                            resolved_inode,
+                            add.flag | EdgeFlags::BLOCK,
+                            source,
+                            node,
+                        ));
+
+                        let inode_pos = import_graph_first_position(&*txn, &add.inode, change_id)?;
+                        for successor in &add.successors {
+                            let resolved_successor =
+                                import_graph_first_position(&*txn, successor, change_id)?;
+                            let target = if resolved_successor == inode_pos {
+                                GraphNode {
+                                    change: inode_pos.change,
+                                    start: inode_pos.pos,
+                                    end: inode_pos.pos,
+                                }
+                            } else {
+                                import_graph_first_successor(
+                                    &*txn,
+                                    successor,
+                                    resolved_inode,
+                                    &current_by_start,
+                                    &mut vertex_cache,
+                                    change_id,
+                                )?
+                            };
+                            pending_edges.push((
+                                resolved_inode,
+                                add.flag | EdgeFlags::BLOCK,
+                                node,
+                                target,
+                            ));
+                        }
+
+                        if let Some(inode) = resolved_inode {
+                            if let Ok(Some(old_path)) = txn.get_path(inode) {
+                                if old_path != *path {
+                                    let _ = txn.del_tree(&old_path);
+                                }
+                            }
+                            txn.put_tree(path, inode)
+                                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        }
+
+                        current_by_end.insert(node.end_pos(), node);
+                        current_by_start.insert(node.start_pos(), node);
+                    }
+                    GraphOp::Edit {
+                        change: atomic_core::change::Atom::Insertion(insertion),
+                        ..
+                    } => {
+                        let resolved_inode =
+                            import_graph_first_resolved_inode(&*txn, &insertion.inode, change_id)?;
+                        let node = GraphNode {
+                            change: change_id,
+                            start: insertion.start,
+                            end: insertion.end,
+                        };
+                        let source = import_graph_first_source(
+                            &*txn,
+                            &insertion.predecessors[0],
+                            &insertion.inode,
+                            resolved_inode,
+                            &old_by_end,
+                            &current_by_end,
+                            &mut vertex_cache,
+                            change_id,
+                        )?;
+                        pending_edges.push((
+                            resolved_inode,
+                            insertion.flag | EdgeFlags::BLOCK,
+                            source,
+                            node,
+                        ));
+
+                        for successor in &insertion.successors {
+                            let target = import_graph_first_successor(
+                                &*txn,
+                                successor,
+                                resolved_inode,
+                                &current_by_start,
+                                &mut vertex_cache,
+                                change_id,
+                            )?;
+                            pending_edges.push((
+                                resolved_inode,
+                                insertion.flag | EdgeFlags::BLOCK,
+                                node,
+                                target,
+                            ));
+                        }
+
+                        current_by_end.insert(node.end_pos(), node);
+                        current_by_start.insert(node.start_pos(), node);
+                    }
+                    GraphOp::Edit {
+                        change: atomic_core::change::Atom::EdgeUpdate(edge_update),
+                        ..
+                    } => {
+                        let resolved_inode = import_graph_first_resolved_inode(
+                            &*txn,
+                            &edge_update.inode,
+                            change_id,
+                        )?;
+
+                        for edge in &edge_update.edges {
+                            let target = import_graph_first_node(&*txn, edge.to, change_id)?;
+                            let source = import_graph_first_source(
+                                &*txn,
+                                &edge.from,
+                                &edge_update.inode,
+                                resolved_inode,
+                                &old_by_end,
+                                &current_by_end,
+                                &mut vertex_cache,
+                                change_id,
+                            )?;
+                            pending_edges.push((resolved_inode, edge.flag, source, target));
+                            old_by_end.insert(target.end_pos(), target);
+                        }
+                    }
+                    _ => {
+                        return Err(RepositoryError::Apply(
+                            "graph-first direct import received unsupported graph op".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        {
+            let mut graph_batch = atomic_core::apply::GraphWriteBatch::new(&*txn)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            for (inode, flag, source, target) in pending_edges {
+                graph_batch
+                    .add_edge_with_reverse(inode, flag, source, target, change_id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            }
+        }
+        let graph_ms = graph_start.elapsed().as_millis();
+
+        // Phase 1 of git import writes the graph truth and stores semantic
+        // FileOps in the change file, but intentionally does not fan those
+        // FileOps out into CRDT tables. That table materialization is phase 2.
+        let crdt_ms = 0;
+
+        let mut view = txn
+            .open_or_create_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let new_state = compute_new_state(&view.state, hash);
+        let sequence = view.change_count + 1;
+        txn.put_change(&mut view, change_id, hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        view.state = new_state;
+        view.change_count = sequence;
+        txn.update_view(&view)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut stats = InsertStats::new();
+        stats.changes_applied = 1;
+        stats.applied_hashes.push(*hash);
+        stats.atoms_processed = change.hunks().len();
+
+        Ok((
+            InsertOutcome::new(new_state, sequence, false, stats),
+            graph_ms,
+            crdt_ms,
+        ))
     }
 
     fn write_import_direct_add_chain(

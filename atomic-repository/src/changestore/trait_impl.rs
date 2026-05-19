@@ -5,7 +5,7 @@
 
 use atomic_core::change::ChangeHeader;
 use atomic_core::change::ChangeStore as ChangeStoreTrait;
-use atomic_core::types::{Base32, GraphNode, Hash, NodeId};
+use atomic_core::types::{GraphNode, Hash, NodeId};
 
 use super::{ChangeStore, ChangeStoreError};
 
@@ -44,34 +44,10 @@ impl ChangeStoreTrait for ChangeStore {
             }
         };
 
-        // Load the change
-        let change = self.load_change(&hash)?;
-
-        // Extract content bytes
         let start = span.start.get() as usize;
         let end = span.end.get() as usize;
 
-        if end > change.contents.len() {
-            return Err(ChangeStoreError::ContentOutOfBounds {
-                hash: hash.to_base32(),
-                requested_start: start,
-                requested_end: end,
-                content_len: change.contents.len(),
-            });
-        }
-
-        let len = end - start;
-        if buf.len() < len {
-            return Err(ChangeStoreError::ContentOutOfBounds {
-                hash: hash.to_base32(),
-                requested_start: start,
-                requested_end: end,
-                content_len: buf.len(),
-            });
-        }
-
-        buf[..len].copy_from_slice(&change.contents[start..end]);
-        Ok(len)
+        self.copy_content_span(&hash, start, end, buf)
     }
 
     fn get_contents_ext(
@@ -85,34 +61,10 @@ impl ChangeStoreTrait for ChangeStore {
             None => return Ok(0),
         };
 
-        // Load the change
-        let change = self.load_change(&hash)?;
-
-        // Extract content bytes
         let start = span.start.get() as usize;
         let end = span.end.get() as usize;
 
-        if end > change.contents.len() {
-            return Err(ChangeStoreError::ContentOutOfBounds {
-                hash: hash.to_base32(),
-                requested_start: start,
-                requested_end: end,
-                content_len: change.contents.len(),
-            });
-        }
-
-        let len = end - start;
-        if buf.len() < len {
-            return Err(ChangeStoreError::ContentOutOfBounds {
-                hash: hash.to_base32(),
-                requested_start: start,
-                requested_end: end,
-                content_len: buf.len(),
-            });
-        }
-
-        buf[..len].copy_from_slice(&change.contents[start..end]);
-        Ok(len)
+        self.copy_content_span(&hash, start, end, buf)
     }
 
     fn get_header(&self, hash: &Hash) -> Result<ChangeHeader, Self::Error> {

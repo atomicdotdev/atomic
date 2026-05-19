@@ -625,6 +625,41 @@ mod tests {
     }
 
     #[test]
+    fn test_git_import_diff_metadata_without_file_ops_builds_file_diff() {
+        use atomic_core::change::ChangeHeader;
+        use atomic_core::record::workflow::GitDiffLine;
+
+        let mut change = Change::empty(ChangeHeader::new("Imported graph-first change"));
+        change.unhashed = Some(serde_json::json!({
+            "git": {
+                "sha": "1234567890abcdef",
+                "diff_lines": [{
+                    "path": "src/lib.rs",
+                    "lines": [
+                        GitDiffLine {
+                            origin: '+',
+                            content: b"fn imported() {}\n".to_vec(),
+                            old_lineno: None,
+                            new_lineno: Some(1),
+                        }
+                    ]
+                }]
+            }
+        }));
+
+        assert!(!change.has_file_ops());
+
+        let (file_diffs, stats) = Diff::build_git_import_file_diffs(&change).unwrap();
+
+        assert_eq!(file_diffs.len(), 1);
+        assert_eq!(file_diffs[0].new_path, "src/lib.rs");
+        assert_eq!(file_diffs[0].hunks.len(), 1);
+        assert_eq!(file_diffs[0].hunks[0].lines.len(), 1);
+        assert_eq!(file_diffs[0].stats.insertions, 1);
+        assert_eq!(stats.total_insertions(), 1);
+    }
+
+    #[test]
     fn test_diff_with_algorithm() {
         let diff = Diff::new().with_algorithm("patience");
         assert_eq!(diff.algorithm, "patience");

@@ -24,6 +24,7 @@
 //! - Merge commits are linearized (first parent only)
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use clap::Parser;
 use git2::{Repository as GitRepository, Sort};
@@ -84,6 +85,38 @@ pub struct Import {
     pub no_vault: bool,
 }
 
+fn import_ignore_patterns(workdir: &Path, kind: Option<&str>) -> Vec<String> {
+    let template = if let Some(kind) = kind {
+        super::super::init::get_ignore_template(kind)
+    } else if workdir.join("Cargo.toml").exists() {
+        super::super::init::get_ignore_template("rust")
+    } else if workdir.join("package.json").exists() {
+        super::super::init::get_ignore_template("node")
+    } else if workdir.join("go.mod").exists() {
+        super::super::init::get_ignore_template("go")
+    } else if workdir.join("setup.py").exists() || workdir.join("pyproject.toml").exists() {
+        super::super::init::get_ignore_template("python")
+    } else {
+        None
+    };
+
+    template
+        .unwrap_or(".atomic\n.git\n")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn current_git_branch(git_repo: &GitRepository) -> Option<String> {
+    let head = git_repo.head().ok()?;
+    if !head.is_branch() {
+        return None;
+    }
+    head.shorthand().map(ToOwned::to_owned)
+}
+
 impl Import {
     /// Import a single branch into an Atomic view using parallel processing.
     fn import_branch(
@@ -101,6 +134,10 @@ impl Import {
             incremental: self.incremental,
             imported_shas: imported_shas.clone(),
             repo_name,
+            ignored_path_patterns: import_ignore_patterns(
+                git_repo.workdir().unwrap_or_else(|| repo.root()),
+                self.kind.as_deref(),
+            ),
         };
 
         let importer = ParallelImporter::new(git_repo, options);
@@ -187,12 +224,8 @@ impl Import {
     /// Get the default branch name.
     fn get_default_branch(&self, git_repo: &GitRepository) -> CliResult<String> {
         // Try HEAD first (current branch)
-        if let Ok(head) = git_repo.head() {
-            if head.is_branch() {
-                if let Some(name) = head.shorthand() {
-                    return Ok(name.to_string());
-                }
-            }
+        if let Some(name) = current_git_branch(git_repo) {
+            return Ok(name);
         }
 
         // Fall back to common default names
@@ -334,13 +367,7 @@ impl Command for Import {
                 Ok(result) => print_info(&format!("Materialized {} files", result.files_written)),
                 Err(e) => print_warning(&format!("Working copy materialization failed: {}", e)),
             }
-
-            // Restore files from git to fix import fidelity issues.
-            // The graph reconstruction may produce slightly wrong content
-            // for some files (hunk misalignment across thousands of commits).
-            // Git has the authoritative content — restore from it and update
-            // the FILE_INDEX so atomic status sees them as clean.
-            restore_from_git_and_reindex(&repo, &git_repo);
+            reindex_working_copy(&repo);
 
             // Initialize .atomicignore + vault AFTER import + materialize.
             // Must be before KG enrichment so has_vault() returns true.
@@ -394,15 +421,20 @@ impl Command for Import {
             // Import
             let count = self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas)?;
 
-            // Materialize the working copy from the graph
-            print_info("Materializing working copy...");
-            match repo.materialize() {
-                Ok(result) => print_info(&format!("Materialized {} files", result.files_written)),
-                Err(e) => print_warning(&format!("Working copy materialization failed: {}", e)),
+            if current_git_branch(&git_repo).as_deref() == Some(branch_name.as_str()) {
+                print_info("Using Git working copy as imported materialization.");
+                reindex_working_copy(&repo);
+            } else {
+                // Importing a non-checked-out branch must update disk from Atomic.
+                print_info("Materializing working copy...");
+                match repo.materialize() {
+                    Ok(result) => {
+                        print_info(&format!("Materialized {} files", result.files_written))
+                    }
+                    Err(e) => print_warning(&format!("Working copy materialization failed: {}", e)),
+                }
+                reindex_working_copy(&repo);
             }
-
-            // Restore files from git to fix import fidelity issues.
-            restore_from_git_and_reindex(&repo, &git_repo);
 
             // Initialize .atomicignore + vault AFTER import + materialize
             if !repo_exists {
@@ -441,59 +473,41 @@ impl Command for Import {
     }
 }
 
-/// Restore working copy files from git and rebuild FILE_INDEX.
+/// Rebuild FILE_INDEX from the current working copy.
 ///
-/// After materialize, some files may have slightly wrong content due to
-/// graph reconstruction fidelity issues. Git is the source of truth for
-/// file content — restore from it, then update the FILE_INDEX so that
-/// `atomic status` reports the working copy as clean.
-fn restore_from_git_and_reindex(repo: &Repository, git_repo: &GitRepository) {
+/// During normal single-branch Git import the files on disk are already the
+/// authoritative Git checkout for the imported branch, so there is no reason
+/// to materialize the same content back out of Atomic. Indexing the tracked
+/// files makes the post-import `atomic status` baseline clean.
+fn reindex_working_copy(repo: &Repository) {
     use atomic_core::types::Hash;
     use std::time::SystemTime;
 
     let repo_root = repo.root().to_path_buf();
+    let tracked = repo.list_tracked_files().unwrap_or_default();
+    let mut entries: Vec<(String, i64, u32, u64, Hash)> = Vec::new();
 
-    // `git checkout -- .` restores all tracked files to HEAD state
-    let result = std::process::Command::new("git")
-        .args(["checkout", "--", "."])
-        .current_dir(&repo_root)
-        .output();
-
-    match result {
-        Ok(output) if output.status.success() => {
-            // Rebuild FILE_INDEX for all tracked files so status is clean.
-            // Only index files that exist on disk and have graph content.
-            // Files without graph content (tracked but not recorded) are
-            // left alone — status will correctly show them as Added.
-            let tracked = repo.list_tracked_files().unwrap_or_default();
-            let mut entries: Vec<(String, i64, u32, u64, Hash)> = Vec::new();
-
-            for file in &tracked {
-                let abs = repo_root.join(&file.path);
-                if let Ok(metadata) = std::fs::metadata(&abs) {
-                    let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                    let duration = mtime
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default();
-                    if let Ok(bytes) = std::fs::read(&abs) {
-                        entries.push((
-                            file.path.to_string_lossy().replace('\\', "/"),
-                            duration.as_secs() as i64,
-                            duration.subsec_nanos(),
-                            metadata.len(),
-                            Hash::of(&bytes),
-                        ));
-                    }
-                }
-            }
-
-            if !entries.is_empty() {
-                let _ = repo.update_file_index(&entries);
+    for file in &tracked {
+        let abs = repo_root.join(&file.path);
+        if let Ok(metadata) = std::fs::metadata(&abs) {
+            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let duration = mtime
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            if let Ok(bytes) = std::fs::read(&abs) {
+                entries.push((
+                    file.path.to_string_lossy().replace('\\', "/"),
+                    duration.as_secs() as i64,
+                    duration.subsec_nanos(),
+                    metadata.len(),
+                    Hash::of(&bytes),
+                ));
             }
         }
-        _ => {
-            log::warn!("git checkout failed — some files may show as modified in atomic status");
-        }
+    }
+
+    if !entries.is_empty() {
+        let _ = repo.update_file_index(&entries);
     }
 }
 

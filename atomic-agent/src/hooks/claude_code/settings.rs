@@ -9,11 +9,6 @@ use crate::error::{AgentError, AgentResult};
 pub(super) const ATOMIC_HOOK_PREFIX: &str = "atomic agent hooks claude-code";
 pub(super) const METADATA_DENY_RULE: &str = "Read(./.atomic/metadata/**)";
 
-// ============================================================================
-// SETTINGS FILE TYPES
-// ============================================================================
-
-/// A single hook entry within a matcher group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ClaudeHookEntry {
     #[serde(rename = "type")]
@@ -21,11 +16,6 @@ pub(crate) struct ClaudeHookEntry {
     pub command: String,
 }
 
-/// A matcher group containing one or more hook entries.
-///
-/// For simple hooks (stop, session-start, etc.) the `matcher` is empty.
-/// For tool-specific hooks (PreToolUse, PostToolUse) the `matcher` is the
-/// tool name (e.g., "Task", "TodoWrite").
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ClaudeHookMatcher {
     #[serde(default)]
@@ -33,7 +23,6 @@ pub(crate) struct ClaudeHookMatcher {
     pub hooks: Vec<ClaudeHookEntry>,
 }
 
-/// The hooks section of `.claude/settings.json`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct ClaudeHooks {
@@ -60,14 +49,6 @@ pub(crate) struct ClaudeHooks {
     pub post_tool_use: Vec<ClaudeHookMatcher>,
 }
 
-// ============================================================================
-// READ / WRITE SETTINGS
-// ============================================================================
-
-/// Read and parse the existing `.claude/settings.json`, if it exists.
-///
-/// Returns `(raw_settings, hooks)` where `raw_settings` preserves unknown
-/// fields and `hooks` is the parsed hooks section.
 pub(crate) fn read_settings(
     settings_path: &Path,
 ) -> AgentResult<(serde_json::Map<String, serde_json::Value>, ClaudeHooks)> {
@@ -105,7 +86,6 @@ pub(crate) fn read_settings(
     Ok((raw, hooks))
 }
 
-/// Write settings back to `.claude/settings.json`, preserving formatting.
 pub(crate) fn write_settings(
     settings_path: &Path,
     raw: &serde_json::Map<String, serde_json::Value>,
@@ -123,8 +103,6 @@ pub(crate) fn write_settings(
         path: settings_path.to_path_buf(),
         reason: e.to_string(),
     })?;
-
-    // Ensure trailing newline for POSIX compatibility
     if !output.ends_with('\n') {
         output.push('\n');
     }
@@ -133,33 +111,19 @@ pub(crate) fn write_settings(
         operation: "write".to_string(),
         path: settings_path.to_path_buf(),
         reason: e.to_string(),
-    })?;
-
-    Ok(())
+    })
 }
 
-/// Check if a specific command exists in a matcher list.
 pub(crate) fn hook_command_exists(
     matchers: &[ClaudeHookMatcher],
     matcher_name: &str,
     command: &str,
 ) -> bool {
-    for matcher in matchers {
-        if matcher.matcher == matcher_name {
-            for hook in &matcher.hooks {
-                if hook.command == command {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+    matchers.iter().any(|matcher| {
+        matcher.matcher == matcher_name && matcher.hooks.iter().any(|h| h.command == command)
+    })
 }
 
-/// Add a hook command to the appropriate matcher in the list.
-///
-/// If a matcher with the given name already exists, the hook is appended to it.
-/// Otherwise, a new matcher group is created.
 pub(crate) fn add_hook_to_matcher(
     matchers: &mut Vec<ClaudeHookMatcher>,
     matcher_name: &str,
@@ -170,73 +134,51 @@ pub(crate) fn add_hook_to_matcher(
         command: command.to_string(),
     };
 
-    // Find existing matcher with the same name
-    for matcher in matchers.iter_mut() {
-        if matcher.matcher == matcher_name {
-            matcher.hooks.push(entry);
-            return;
-        }
+    if let Some(matcher) = matchers.iter_mut().find(|m| m.matcher == matcher_name) {
+        matcher.hooks.push(entry);
+        return;
     }
 
-    // No existing matcher — create a new one
     matchers.push(ClaudeHookMatcher {
         matcher: matcher_name.to_string(),
         hooks: vec![entry],
     });
 }
 
-/// Check if any matcher in a hook list contains an Atomic hook.
 pub(crate) fn has_any_atomic_hook(matchers: &[ClaudeHookMatcher]) -> bool {
-    matchers.iter().any(|m| {
-        m.hooks
-            .iter()
-            .any(|h| h.command.contains(ATOMIC_HOOK_PREFIX))
-    })
+    matchers
+        .iter()
+        .any(|m| m.hooks.iter().any(|h| is_atomic_hook(&h.command)))
 }
 
-/// Returns `true` if a hook command string is an Atomic hook.
-///
-/// Uses `contains` rather than `starts_with` so that guarded commands
-/// like `test -d .atomic && atomic agent hooks claude-code … || true`
-/// are still recognized.
 pub(crate) fn is_atomic_hook(command: &str) -> bool {
     command.contains(ATOMIC_HOOK_PREFIX)
 }
 
-/// Remove all Atomic hooks from a matcher list.
-///
-/// Preserves non-Atomic hooks. Removes empty matchers after filtering.
 pub(crate) fn remove_atomic_hooks(matchers: &mut Vec<ClaudeHookMatcher>) {
     for matcher in matchers.iter_mut() {
         matcher.hooks.retain(|h| !is_atomic_hook(&h.command));
     }
-    // Remove empty matchers
     matchers.retain(|m| !m.hooks.is_empty());
 }
 
-/// Ensure the metadata deny rule exists in permissions.deny.
-///
-/// Returns `true` if the rule was added (i.e., it wasn't already present).
 pub(crate) fn ensure_deny_rule(raw: &mut serde_json::Map<String, serde_json::Value>) -> bool {
     let permissions = raw
         .entry("permissions".to_string())
         .or_insert_with(|| serde_json::json!({}));
 
-    let permissions_obj = match permissions.as_object_mut() {
-        Some(obj) => obj,
-        None => return false,
+    let Some(permissions_obj) = permissions.as_object_mut() else {
+        return false;
     };
 
     let deny = permissions_obj
         .entry("deny".to_string())
         .or_insert_with(|| serde_json::json!([]));
 
-    let deny_arr = match deny.as_array_mut() {
-        Some(arr) => arr,
-        None => return false,
+    let Some(deny_arr) = deny.as_array_mut() else {
+        return false;
     };
 
-    // Check if already present
     let rule_value = serde_json::Value::String(METADATA_DENY_RULE.to_string());
     if deny_arr.contains(&rule_value) {
         return false;
@@ -246,7 +188,6 @@ pub(crate) fn ensure_deny_rule(raw: &mut serde_json::Map<String, serde_json::Val
     true
 }
 
-/// Remove the metadata deny rule from permissions.deny.
 pub(crate) fn remove_deny_rule(raw: &mut serde_json::Map<String, serde_json::Value>) {
     let Some(permissions) = raw.get_mut("permissions") else {
         return;
@@ -264,12 +205,9 @@ pub(crate) fn remove_deny_rule(raw: &mut serde_json::Map<String, serde_json::Val
     let rule_value = serde_json::Value::String(METADATA_DENY_RULE.to_string());
     deny_arr.retain(|v| v != &rule_value);
 
-    // Clean up empty deny array
     if deny_arr.is_empty() {
         permissions_obj.remove("deny");
     }
-
-    // Clean up empty permissions object
     if permissions_obj.is_empty() {
         raw.remove("permissions");
     }

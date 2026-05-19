@@ -246,8 +246,10 @@ impl Enable {
     /// Supports:
     /// - `claude-code` → `~/.claude/settings.json`
     /// - `gemini-cli` → `~/.gemini/settings.json`
+    /// - `codex` → `~/.codex/hooks.json`
     fn run_global(&self) -> CliResult<()> {
         use atomic_agent::hooks::claude_code::ClaudeCodeHook;
+        use atomic_agent::hooks::codex::CodexHook;
         use atomic_agent::hooks::gemini_cli::GeminiCliHook;
 
         let agent_name = self.agent.as_deref().unwrap_or("claude-code");
@@ -319,9 +321,42 @@ impl Enable {
                 }
             }
 
+            "codex" => {
+                let hook = CodexHook::new();
+
+                if !self.force && hook.is_installed_global() {
+                    print_success("Global hooks already installed in ~/.codex/hooks.json.");
+                    println!("  Use --force to reinstall.");
+                    return Ok(());
+                }
+
+                match hook.install_global(self.force) {
+                    Ok(count) if count > 0 => {
+                        print_success(&format!(
+                            "Installed {} global hook{} for Codex",
+                            count,
+                            if count == 1 { "" } else { "s" },
+                        ));
+                        println!();
+                        println!("Hooks written to: ~/.codex/hooks.json");
+                        println!();
+                        println!("Every Codex session in a project with .atomic/ will now:");
+                        println!("  • Record each turn as an Atomic change with full provenance");
+                        println!("  • Track session metadata (turn number, timing, files)");
+                        println!("  • Capture tool calls through pre/post tool hooks");
+                    }
+                    Ok(_) => {
+                        print_success("Global hooks already up to date.");
+                    }
+                    Err(e) => {
+                        print_error(&format!("Failed to install global hooks: {}", e));
+                    }
+                }
+            }
+
             other => {
                 print_warning(&format!(
-                    "Global install is not supported for '{}'. Supported agents: claude-code, gemini-cli",
+                    "Global install is not supported for '{}'. Supported agents: claude-code, gemini-cli, codex",
                     other
                 ));
             }
