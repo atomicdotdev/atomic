@@ -12,21 +12,12 @@ use crate::apply::get_view_changes;
 use crate::{Repository, RepositoryError};
 
 /// Options for materializing stored FileOps into CRDT tables.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CrdtMaterializeOptions {
     /// View whose ordered changes should be replayed.
     pub view: Option<String>,
     /// Re-apply rows that appear to already have CRDT trunks.
     pub force: bool,
-}
-
-impl Default for CrdtMaterializeOptions {
-    fn default() -> Self {
-        Self {
-            view: None,
-            force: false,
-        }
-    }
 }
 
 /// Summary from a CRDT materialization pass.

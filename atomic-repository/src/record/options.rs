@@ -65,6 +65,15 @@ pub struct RecordOptions {
     /// Whether to save the change to the store.
     save_to_store: bool,
 
+    /// Whether to refresh the file index after applying the recorded change.
+    update_file_index: bool,
+
+    /// Whether to deflate vault working-copy files after recording.
+    sync_vault: bool,
+
+    /// Whether to enrich the knowledge graph for the newly recorded change.
+    enrich_kg: bool,
+
     /// AI provenance information for this change.
     ///
     /// When recording AI-assisted changes, this captures metadata about
@@ -191,6 +200,37 @@ impl RecordOptions {
         self
     }
 
+    /// Set whether to refresh the file index after applying the recorded change.
+    ///
+    /// Defaults to true for normal user records. Agent hooks may disable this
+    /// to keep turn-end latency low.
+    #[must_use]
+    pub fn update_file_index(mut self, update: bool) -> Self {
+        self.update_file_index = update;
+        self
+    }
+
+    /// Set whether to deflate vault working-copy files after recording.
+    ///
+    /// Defaults to true for normal user records. Agent hooks may disable this
+    /// because vault sync is best-effort maintenance, not required for the
+    /// recorded change itself.
+    #[must_use]
+    pub fn sync_vault(mut self, sync: bool) -> Self {
+        self.sync_vault = sync;
+        self
+    }
+
+    /// Set whether to enrich the knowledge graph after recording.
+    ///
+    /// Defaults to true for normal user records. Agent hooks may disable this
+    /// so enrichment can happen explicitly instead of blocking Stop hooks.
+    #[must_use]
+    pub fn enrich_kg(mut self, enrich: bool) -> Self {
+        self.enrich_kg = enrich;
+        self
+    }
+
     /// Set opaque metadata bytes for `HashedChange.metadata`.
     ///
     /// These bytes are included in the change's cryptographic hash,
@@ -300,6 +340,24 @@ impl RecordOptions {
         self.save_to_store
     }
 
+    /// Get whether to refresh the file index after applying.
+    #[must_use]
+    pub fn get_update_file_index(&self) -> bool {
+        self.update_file_index
+    }
+
+    /// Get whether to deflate vault working-copy files after recording.
+    #[must_use]
+    pub fn get_sync_vault(&self) -> bool {
+        self.sync_vault
+    }
+
+    /// Get whether to enrich the knowledge graph after recording.
+    #[must_use]
+    pub fn get_enrich_kg(&self) -> bool {
+        self.enrich_kg
+    }
+
     /// Get the AI provenance information.
     #[must_use]
     pub fn get_provenance(&self) -> &[Provenance] {
@@ -366,6 +424,9 @@ impl Default for RecordOptions {
             message: None,
             apply_after_record: true,
             save_to_store: true,
+            update_file_index: true,
+            sync_vault: true,
+            enrich_kg: true,
             provenance: Vec::new(),
         }
     }

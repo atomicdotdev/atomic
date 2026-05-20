@@ -188,6 +188,13 @@ pub struct ParallelImportOptions {
     /// template. These are applied before graph construction so generated
     /// build outputs never enter the imported history.
     pub ignored_path_patterns: Vec<String>,
+    /// Import only the selected branch's first-parent history.
+    ///
+    /// This is the default single-branch Git import mode. It treats merge
+    /// commits on the trunk branch as the landing event and avoids importing
+    /// long-running branch internals or repeated upstream merges into feature
+    /// branches.
+    pub mainline_only: bool,
 }
 
 impl Default for ParallelImportOptions {
@@ -197,6 +204,7 @@ impl Default for ParallelImportOptions {
             imported_shas: HashSet::new(),
             repo_name: "unknown".to_string(),
             ignored_path_patterns: Vec::new(),
+            mainline_only: true,
         }
     }
 }
@@ -263,14 +271,49 @@ pub struct ParallelImporter {
 }
 
 fn is_generated_diff_skip_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
     let name = Path::new(path)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(path);
+    let lower_name = name.to_ascii_lowercase();
+    let lower_path = normalized.to_ascii_lowercase();
 
-    name.ends_with(".lock")
-        || name.ends_with(".sum")
-        || matches!(name, "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml")
+    lower_name.ends_with(".lock")
+        || lower_name.ends_with(".sum")
+        || lower_name.ends_with(".min.css")
+        || lower_name.ends_with(".min.js")
+        || lower_name.ends_with(".map")
+        || matches!(
+            lower_name.as_str(),
+            "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml" | "npm-shrinkwrap.json"
+        )
+        || matches!(
+            Path::new(&lower_name)
+                .extension()
+                .and_then(|ext| ext.to_str()),
+            Some(
+                "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "webp"
+                    | "ico"
+                    | "bmp"
+                    | "tiff"
+                    | "woff"
+                    | "woff2"
+                    | "ttf"
+                    | "eot"
+                    | "otf"
+                    | "pdf"
+                    | "zip"
+                    | "gz"
+                    | "tgz"
+            )
+        )
+        || lower_path.ends_with("/website/source/stylesheets/main.css")
+        || lower_path == "website/source/stylesheets/main.css"
 }
 
 fn count_line_units(content: &[u8]) -> usize {
@@ -676,6 +719,9 @@ fn build_graph_first_file_ops_for_added_file(
         Some(encoding)
     };
     let mut file_ops = atomic_core::change::FileOps::create(trunk_id, path.to_string(), enc);
+    if encoding == Encoding::Binary {
+        return file_ops;
+    }
 
     let mut prev_branch: Option<BranchId> = None;
     for (line_idx, line) in content_lines.iter().enumerate() {
@@ -758,9 +804,6 @@ fn build_graph_first_change(
             FileOperation::Added | FileOperation::Copied => {
                 let new_content = file.new_content.as_deref().unwrap_or(&[]);
                 let encoding = Encoding::detect(new_content);
-                if encoding == Encoding::Binary {
-                    return None;
-                }
 
                 let filename = extract_filename(&file.path);
                 let name_start = ChangePosition::new(contents.len() as u64);
@@ -779,18 +822,19 @@ fn build_graph_first_change(
                     pos: ChangePosition::ROOT,
                 };
 
-                let new_line_contents: Vec<Vec<u8>> = if is_generated_diff_skip_path(&file.path) {
-                    if new_content.is_empty() {
-                        Vec::new()
+                let new_line_contents: Vec<Vec<u8>> =
+                    if encoding == Encoding::Binary || is_generated_diff_skip_path(&file.path) {
+                        if new_content.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![new_content.to_vec()]
+                        }
                     } else {
-                        vec![new_content.to_vec()]
-                    }
-                } else {
-                    split_graph_first_lines(new_content)
-                        .into_iter()
-                        .map(|line| line.to_vec())
-                        .collect()
-                };
+                        split_graph_first_lines(new_content)
+                            .into_iter()
+                            .map(|line| line.to_vec())
+                            .collect()
+                    };
                 let mut new_ranges = Vec::new();
                 for line in &new_line_contents {
                     let start = ChangePosition::new(contents.len() as u64);
@@ -870,9 +914,6 @@ fn build_graph_first_change(
                 let indexed = line_index.files.get(old_path)?;
                 let new_content = file.new_content.as_deref().unwrap_or(&[]);
                 let encoding = Encoding::detect(new_content);
-                if encoding == Encoding::Binary {
-                    return None;
-                }
 
                 let new_filename = extract_filename(&file.path);
                 let name_start = ChangePosition::new(contents.len() as u64);
@@ -923,27 +964,30 @@ fn build_graph_first_change(
                     new_path: file.path.clone(),
                 });
 
-                if let Some(diff_lines) = file.diff_lines.as_ref() {
-                    let (ops, _) = atomic_core::record::workflow::build_crdt_ops_from_git_diff(
-                        &file.path, diff_lines,
-                    );
-                    file_ops.push(ops);
+                if encoding != Encoding::Binary && !is_generated_diff_skip_path(&file.path) {
+                    if let Some(diff_lines) = file.diff_lines.as_ref() {
+                        let (ops, _) = atomic_core::record::workflow::build_crdt_ops_from_git_diff(
+                            &file.path, diff_lines,
+                        );
+                        file_ops.push(ops);
+                    }
                 }
 
-                let replacements = if is_generated_diff_skip_path(&file.path) {
-                    vec![GitReplacementBlock {
-                        old_start: if indexed.lines.is_empty() { 0 } else { 1 },
-                        old_len: indexed.lines.len(),
-                        new_start: 1,
-                        new_lines: if new_content.is_empty() {
-                            Vec::new()
-                        } else {
-                            vec![new_content.to_vec()]
-                        },
-                    }]
-                } else {
-                    current_state_replacements(indexed, new_content)
-                };
+                let replacements =
+                    if encoding == Encoding::Binary || is_generated_diff_skip_path(&file.path) {
+                        vec![GitReplacementBlock {
+                            old_start: if indexed.lines.is_empty() { 0 } else { 1 },
+                            old_len: indexed.lines.len(),
+                            new_start: 1,
+                            new_lines: if new_content.is_empty() {
+                                Vec::new()
+                            } else {
+                                vec![new_content.to_vec()]
+                            },
+                        }]
+                    } else {
+                        current_state_replacements(indexed, new_content)
+                    };
                 if !replacements.is_empty() {
                     let mut pending_replacements = Vec::new();
                     for replacement in replacements {
@@ -1138,8 +1182,11 @@ fn build_graph_first_change(
         }
 
         let indexed = line_index.files.get(&file.path)?;
-        let replacements = if is_generated_diff_skip_path(&file.path) {
-            let new_content = file.new_content.as_deref()?;
+        let new_content = file.new_content.as_deref()?;
+        let encoding = Encoding::detect(new_content);
+        let replacements = if encoding == Encoding::Binary
+            || is_generated_diff_skip_path(&file.path)
+        {
             vec![GitReplacementBlock {
                 old_start: if indexed.lines.is_empty() { 0 } else { 1 },
                 old_len: indexed.lines.len(),
@@ -1883,6 +1930,14 @@ impl ParallelImporter {
         revwalk.push(target_oid).map_err(|e| CliError::GitError {
             message: format!("Failed to push target to revwalk: {}", e),
         })?;
+
+        if self.options.mainline_only {
+            revwalk
+                .simplify_first_parent()
+                .map_err(|e| CliError::GitError {
+                    message: format!("Failed to simplify revwalk to first-parent history: {}", e),
+                })?;
+        }
 
         // Topological order, oldest first
         revwalk
@@ -3233,6 +3288,26 @@ mod tests {
     }
 
     #[test]
+    fn test_generated_diff_skip_paths_include_terraform_website_assets() {
+        assert!(is_generated_diff_skip_path(
+            "website/source/stylesheets/main.css"
+        ));
+        assert!(is_generated_diff_skip_path(
+            "website/source/images/logo-static.png"
+        ));
+        assert!(is_generated_diff_skip_path("package-lock.json"));
+        assert!(is_generated_diff_skip_path("dist/app.min.js"));
+
+        assert!(!is_generated_diff_skip_path(
+            "website/source/stylesheets/_footer.less"
+        ));
+        assert!(!is_generated_diff_skip_path(
+            "website/source/layouts/docs.erb"
+        ));
+        assert!(!is_generated_diff_skip_path("internal/style.css"));
+    }
+
+    #[test]
     fn test_graph_first_added_file_ops_use_unique_branch_ids_and_ranges() {
         let mut next_branch_idx = 0;
         let first = build_graph_first_file_ops_for_added_file(
@@ -3264,5 +3339,22 @@ mod tests {
             first.line_ops()[1].content_range(),
             Some((ChangePosition::new(4), ChangePosition::new(8)))
         );
+    }
+
+    #[test]
+    fn test_graph_first_binary_file_ops_create_trunk_only() {
+        let mut next_branch_idx = 0;
+        let ops = build_graph_first_file_ops_for_added_file(
+            "website/source/images/logo-static.png",
+            &[b"\x89PNG\r\n\x1a\n".to_vec()],
+            &[(ChangePosition::new(0), ChangePosition::new(8))],
+            Encoding::Binary,
+            0,
+            &mut next_branch_idx,
+        );
+
+        assert_eq!(ops.trunk_id().file_idx(), 0);
+        assert!(ops.line_ops().is_empty());
+        assert_eq!(next_branch_idx, 0);
     }
 }

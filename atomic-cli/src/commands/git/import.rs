@@ -8,7 +8,7 @@
 //! The import process:
 //! 1. Opens the Git repository in the current directory
 //! 2. Resolves the target branch (default or specified)
-//! 3. Walks commit history in topological order (oldest first)
+//! 3. Walks first-parent commit history in topological order (oldest first)
 //! 4. For each commit, creates an Atomic change with:
 //!    - Author from Git commit
 //!    - Message from commit subject/body
@@ -21,7 +21,8 @@
 //!
 //! - Submodules are skipped with a warning
 //! - Binary files are imported as-is
-//! - Merge commits are linearized (first parent only)
+//! - Default imports are mainline-only (first parent)
+//! - Use `--all` to import all local branches as views
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -56,10 +57,13 @@ pub struct Import {
     #[arg(long, short = 'b', value_name = "BRANCH")]
     pub branch: Option<String>,
 
-    /// Import all branches as separate views.
+    /// Import all local branches as separate views.
     ///
-    /// Creates one Atomic view for each Git branch found in the repository.
-    #[arg(long)]
+    /// Creates one Atomic view for each Git branch found in the repository and
+    /// imports the full reachable history for those branches. By default,
+    /// `atomic git import` imports only the selected branch's mainline
+    /// first-parent history.
+    #[arg(long = "all", visible_alias = "all-branches")]
     pub all_branches: bool,
 
     /// Only import commits not already in Atomic.
@@ -86,6 +90,13 @@ pub struct Import {
 }
 
 fn import_ignore_patterns(workdir: &Path, kind: Option<&str>) -> Vec<String> {
+    const COMMON_IMPORT_IGNORES: &[&str] = &[
+        "node_modules/",
+        "bower_components/",
+        ".yarn/cache/",
+        ".pnpm-store/",
+    ];
+
     let template = if let Some(kind) = kind {
         super::super::init::get_ignore_template(kind)
     } else if workdir.join("Cargo.toml").exists() {
@@ -100,13 +111,22 @@ fn import_ignore_patterns(workdir: &Path, kind: Option<&str>) -> Vec<String> {
         None
     };
 
-    template
-        .unwrap_or(".atomic\n.git\n")
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(ToOwned::to_owned)
-        .collect()
+    let mut patterns: Vec<String> = COMMON_IMPORT_IGNORES
+        .iter()
+        .map(|pattern| (*pattern).to_string())
+        .collect();
+
+    patterns.extend(
+        template
+            .unwrap_or(".atomic\n.git\n")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(ToOwned::to_owned),
+    );
+    patterns.sort();
+    patterns.dedup();
+    patterns
 }
 
 fn current_git_branch(git_repo: &GitRepository) -> Option<String> {
@@ -125,6 +145,7 @@ impl Import {
         branch_name: &str,
         repo: &mut Repository,
         imported_shas: &HashSet<String>,
+        mainline_only: bool,
     ) -> CliResult<usize> {
         // Get repository name from remote URL or working directory
         let repo_name = self.get_repo_name(git_repo);
@@ -138,6 +159,7 @@ impl Import {
                 git_repo.workdir().unwrap_or_else(|| repo.root()),
                 self.kind.as_deref(),
             ),
+            mainline_only,
         };
 
         let importer = ParallelImporter::new(git_repo, options);
@@ -246,6 +268,7 @@ impl Import {
         git_repo: &GitRepository,
         head_oid: git2::Oid,
         imported_shas: &HashSet<String>,
+        mainline_only: bool,
     ) -> CliResult<usize> {
         let mut revwalk = git_repo.revwalk().map_err(|e| CliError::GitError {
             message: format!("Failed to create revwalk: {}", e),
@@ -254,6 +277,14 @@ impl Import {
         revwalk.push(head_oid).map_err(|e| CliError::GitError {
             message: format!("Failed to push HEAD to revwalk: {}", e),
         })?;
+
+        if mainline_only {
+            revwalk
+                .simplify_first_parent()
+                .map_err(|e| CliError::GitError {
+                    message: format!("Failed to simplify revwalk to first-parent history: {}", e),
+                })?;
+        }
 
         revwalk
             .set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)
@@ -303,7 +334,12 @@ impl Command for Import {
             for branch_name in &branches {
                 if let Ok(reference) = git_repo.find_branch(branch_name, git2::BranchType::Local) {
                     if let Some(target) = reference.get().target() {
-                        let count = self.count_commits(&git_repo, target, &HashSet::new())?;
+                        let count = self.count_commits(
+                            &git_repo,
+                            target,
+                            &HashSet::new(),
+                            !self.all_branches,
+                        )?;
                         print_info(&format!(
                             "Would import {} commits from branch '{}'",
                             count, branch_name
@@ -357,7 +393,7 @@ impl Command for Import {
 
                 // Import the branch
                 let count =
-                    self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas)?;
+                    self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas, false)?;
                 total_imported += count;
             }
 
@@ -419,7 +455,8 @@ impl Command for Import {
                 .map_err(|e| CliError::Internal(e.into()))?;
 
             // Import
-            let count = self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas)?;
+            let count =
+                self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas, true)?;
 
             if current_git_branch(&git_repo).as_deref() == Some(branch_name.as_str()) {
                 print_info("Using Git working copy as imported materialization.");
@@ -612,5 +649,23 @@ mod tests {
         assert!(!import.all_branches);
         assert!(!import.incremental);
         assert!(import.branch.is_none());
+    }
+
+    #[test]
+    fn test_all_flag_and_legacy_alias() {
+        let import = Import::try_parse_from(["import", "--all"]).unwrap();
+        assert!(import.all_branches);
+
+        let import = Import::try_parse_from(["import", "--all-branches"]).unwrap();
+        assert!(import.all_branches);
+    }
+
+    #[test]
+    fn test_import_ignore_patterns_always_exclude_dependency_dirs() {
+        let patterns = import_ignore_patterns(Path::new("."), Some("go"));
+
+        assert!(patterns.iter().any(|p| p == "node_modules/"));
+        assert!(patterns.iter().any(|p| p == ".yarn/cache/"));
+        assert!(patterns.iter().any(|p| p == "vendor/"));
     }
 }

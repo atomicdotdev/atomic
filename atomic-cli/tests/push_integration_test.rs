@@ -422,8 +422,8 @@ fn test_remote_error_is_not_found() {
     let repo_err = RemoteError::repo_not_found("url");
     assert!(repo_err.is_not_found());
 
-    let stack_err = RemoteError::stack_not_found("main");
-    assert!(stack_err.is_not_found());
+    let view_err = RemoteError::view_not_found("main");
+    assert!(view_err.is_not_found());
 
     let change_err = RemoteError::change_not_found("ABC123");
     assert!(change_err.is_not_found());

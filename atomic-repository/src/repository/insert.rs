@@ -105,15 +105,15 @@ impl ImportGraphFirstVertexCache {
     where
         T: TreeTxnT,
     {
-        if !self.by_inode.contains_key(&inode) {
-            let mut cache = ImportGraphFirstInodeCache::default();
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.by_inode.entry(inode) {
+            let mut inode_cache = ImportGraphFirstInodeCache::default();
             let vertices = txn
                 .iter_inode_vertices(inode)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             for result in vertices {
                 let (node, _edge) = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
-                cache.by_end.entry(node.end_pos()).or_insert(node);
-                cache
+                inode_cache.by_end.entry(node.end_pos()).or_insert(node);
+                inode_cache
                     .by_start
                     .entry(node.start_pos())
                     .and_modify(|existing| {
@@ -123,7 +123,7 @@ impl ImportGraphFirstVertexCache {
                     })
                     .or_insert(node);
             }
-            self.by_inode.insert(inode, cache);
+            entry.insert(inode_cache);
         }
 
         self.by_inode.get(&inode).ok_or_else(|| {
@@ -134,6 +134,13 @@ impl ImportGraphFirstVertexCache {
         })
     }
 }
+
+type PendingImportEdge = (
+    Option<Inode>,
+    EdgeFlags,
+    GraphNode<NodeId>,
+    GraphNode<NodeId>,
+);
 
 fn import_direct_source(
     pos: &Position<Option<Hash>>,
@@ -254,6 +261,7 @@ fn import_graph_first_resolved_inode<T: GraphTxnT + TreeTxnT>(
         .map_err(|e| RepositoryError::Database(e.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn import_graph_first_source<T>(
     txn: &T,
     pos: &Position<Option<Hash>>,
@@ -656,12 +664,7 @@ impl Repository {
         use atomic_core::apply::compute_new_state;
 
         let graph_start = std::time::Instant::now();
-        let mut pending_edges: Vec<(
-            Option<Inode>,
-            EdgeFlags,
-            GraphNode<NodeId>,
-            GraphNode<NodeId>,
-        )> = Vec::new();
+        let mut pending_edges: Vec<PendingImportEdge> = Vec::new();
 
         {
             let mut old_by_end: HashMap<Position<NodeId>, GraphNode<NodeId>> = HashMap::new();
