@@ -361,6 +361,7 @@ impl ImportLine {
 struct ImportIndexedFile {
     inode_pos: Position<Option<ContentHash>>,
     lines: Vec<ImportLine>,
+    imported_commits: usize,
 }
 
 #[derive(Default)]
@@ -394,8 +395,14 @@ impl ImportLineIndex {
                                 .to_vec(),
                         });
                     }
-                    self.files
-                        .insert(path.clone(), ImportIndexedFile { inode_pos, lines });
+                    self.files.insert(
+                        path.clone(),
+                        ImportIndexedFile {
+                            inode_pos,
+                            lines,
+                            imported_commits: 1,
+                        },
+                    );
                 }
                 GraphOp::Edit {
                     change: Atom::Insertion(insertion),
@@ -415,6 +422,191 @@ impl ImportLineIndex {
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    fn seed_missing_modified_files(&mut self, repo: &Repository, parsed: &ParsedCommit) {
+        for file in &parsed.files {
+            if file.operation != FileOperation::Modified || self.files.contains_key(&file.path) {
+                continue;
+            }
+            let Some(old_content) = file.old_content.as_deref() else {
+                continue;
+            };
+
+            let old_lines: Vec<Vec<u8>> = if Encoding::detect(old_content) == Encoding::Binary
+                || is_generated_diff_skip_path(&file.path)
+            {
+                if old_content.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![old_content.to_vec()]
+                }
+            } else {
+                split_graph_first_lines(old_content)
+                    .into_iter()
+                    .map(|line| line.to_vec())
+                    .collect()
+            };
+
+            let seed = match repo.import_line_index_seed(&file.path) {
+                Ok(Some(seed)) => seed,
+                Ok(None) => continue,
+                Err(err) => {
+                    trace_git_import(format!(
+                        "{}: could not seed line index for {}: {}",
+                        parsed.short_sha, file.path, err
+                    ));
+                    continue;
+                }
+            };
+
+            if seed.lines.len() != old_lines.len() {
+                trace_git_import(format!(
+                    "{}: not seeding line index for {}: graph lines={} git old lines={}",
+                    parsed.short_sha,
+                    file.path,
+                    seed.lines.len(),
+                    old_lines.len()
+                ));
+                continue;
+            }
+
+            let mut imported_changes = HashSet::new();
+            let lines = seed
+                .lines
+                .iter()
+                .zip(old_lines)
+                .map(|(line, content)| {
+                    imported_changes.insert(line.incoming_by);
+                    ImportLine {
+                        change: line.change,
+                        start: line.start,
+                        end: line.end,
+                        incoming_by: line.incoming_by,
+                        content,
+                    }
+                })
+                .collect();
+
+            self.files.insert(
+                file.path.clone(),
+                ImportIndexedFile {
+                    inode_pos: Position {
+                        change: Some(seed.inode_pos.change),
+                        pos: seed.inode_pos.pos,
+                    },
+                    lines,
+                    imported_commits: imported_changes.len().max(1),
+                },
+            );
+        }
+    }
+
+    fn seed_file_from_graph_content(
+        &mut self,
+        repo: &Repository,
+        path: &str,
+        content: &[u8],
+        imported_commits_hint: usize,
+    ) -> bool {
+        let line_contents: Vec<Vec<u8>> =
+            if Encoding::detect(content) == Encoding::Binary || is_generated_diff_skip_path(path) {
+                if content.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![content.to_vec()]
+                }
+            } else {
+                split_graph_first_lines(content)
+                    .into_iter()
+                    .map(|line| line.to_vec())
+                    .collect()
+            };
+
+        let seed = match repo.import_line_index_seed(path) {
+            Ok(Some(seed)) => seed,
+            Ok(None) => return false,
+            Err(err) => {
+                trace_git_import(format!(
+                    "could not reseed line index for {} after fallback: {}",
+                    path, err
+                ));
+                return false;
+            }
+        };
+
+        if seed.lines.len() != line_contents.len() {
+            trace_git_import(format!(
+                "not reseeding line index for {} after fallback: graph lines={} content lines={}",
+                path,
+                seed.lines.len(),
+                line_contents.len()
+            ));
+            return false;
+        }
+
+        let mut imported_changes = HashSet::new();
+        let lines = seed
+            .lines
+            .iter()
+            .zip(line_contents)
+            .map(|(line, content)| {
+                imported_changes.insert(line.incoming_by);
+                ImportLine {
+                    change: line.change,
+                    start: line.start,
+                    end: line.end,
+                    incoming_by: line.incoming_by,
+                    content,
+                }
+            })
+            .collect();
+
+        self.files.insert(
+            path.to_string(),
+            ImportIndexedFile {
+                inode_pos: Position {
+                    change: Some(seed.inode_pos.change),
+                    pos: seed.inode_pos.pos,
+                },
+                lines,
+                imported_commits: imported_changes.len().max(imported_commits_hint).max(1),
+            },
+        );
+        true
+    }
+
+    fn reseed_from_fallback_write(&mut self, repo: &Repository, parsed: &ParsedCommit) {
+        for file in &parsed.files {
+            match file.operation {
+                FileOperation::Deleted => {
+                    self.files.remove(&file.path);
+                }
+                FileOperation::Renamed => {
+                    if let Some(old_path) = file.old_path.as_deref() {
+                        self.files.remove(old_path);
+                    }
+                    if let Some(new_content) = file.new_content.as_deref() {
+                        let hint = self
+                            .files
+                            .get(&file.path)
+                            .map(|indexed| indexed.imported_commits.saturating_add(1))
+                            .unwrap_or(1);
+                        self.seed_file_from_graph_content(repo, &file.path, new_content, hint);
+                    }
+                }
+                FileOperation::Added | FileOperation::Copied | FileOperation::Modified => {
+                    if let Some(new_content) = file.new_content.as_deref() {
+                        let hint = self
+                            .files
+                            .get(&file.path)
+                            .map(|indexed| indexed.imported_commits.saturating_add(1))
+                            .unwrap_or(1);
+                        self.seed_file_from_graph_content(repo, &file.path, new_content, hint);
+                    }
+                }
             }
         }
     }
@@ -458,6 +650,23 @@ struct GitReplacementBlock {
     new_lines: Vec<Vec<u8>>,
 }
 
+#[derive(Debug, Clone)]
+struct GraphFirstSkip {
+    path: String,
+    operation: FileOperation,
+    reason: &'static str,
+}
+
+impl GraphFirstSkip {
+    fn new(file: &ParsedFile, reason: &'static str) -> Self {
+        Self {
+            path: file.path.clone(),
+            operation: file.operation,
+            reason,
+        }
+    }
+}
+
 fn position_hashes(pos: &Position<Option<ContentHash>>) -> impl Iterator<Item = ContentHash> + '_ {
     pos.change
         .into_iter()
@@ -470,6 +679,92 @@ fn split_graph_first_lines(content: &[u8]) -> Vec<&[u8]> {
     } else {
         content.split_inclusive(|&b| b == b'\n').collect()
     }
+}
+
+fn import_shape_for_file(file: &ParsedFile, line_index: &ImportLineIndex) -> (usize, usize, usize) {
+    let indexed = line_index.files.get(&file.path).or_else(|| {
+        file.old_path
+            .as_deref()
+            .and_then(|old| line_index.files.get(old))
+    });
+    let current_lines = file
+        .new_content
+        .as_deref()
+        .or(file.old_content.as_deref())
+        .map(count_line_units)
+        .or_else(|| indexed.map(|idx| idx.lines.len()))
+        .unwrap_or(0);
+    let indexed_lines = indexed.map(|idx| idx.lines.len()).unwrap_or(0);
+    let imported_commits = indexed.map(|idx| idx.imported_commits).unwrap_or(0);
+    (current_lines, indexed_lines, imported_commits)
+}
+
+fn import_shape_summary(parsed: &ParsedCommit, line_index: &ImportLineIndex) -> String {
+    let mut entries: Vec<(usize, String)> = parsed
+        .files
+        .iter()
+        .map(|file| {
+            let (current_lines, indexed_lines, imported_commits) =
+                import_shape_for_file(file, line_index);
+            let bytes = file
+                .new_content
+                .as_ref()
+                .or(file.old_content.as_ref())
+                .map(|content| content.len())
+                .unwrap_or(0);
+            let weight = current_lines
+                .saturating_mul(imported_commits.max(1))
+                .saturating_add(indexed_lines);
+            (
+                weight,
+                format!(
+                    "{} op={:?} lines={} indexed_lines={} file_commits={} bytes={}",
+                    file.path,
+                    file.operation,
+                    current_lines,
+                    indexed_lines,
+                    imported_commits,
+                    bytes
+                ),
+            )
+        })
+        .collect();
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries
+        .into_iter()
+        .take(3)
+        .map(|(_, entry)| entry)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn graph_first_skip_summary(skips: &[GraphFirstSkip], parsed: &ParsedCommit) -> String {
+    if skips.is_empty() {
+        return String::new();
+    }
+
+    skips
+        .iter()
+        .take(5)
+        .map(|skip| {
+            let lines = parsed
+                .files
+                .iter()
+                .find(|file| file.path == skip.path)
+                .and_then(|file| {
+                    file.new_content
+                        .as_deref()
+                        .or(file.old_content.as_deref())
+                        .map(count_line_units)
+                })
+                .unwrap_or(0);
+            format!(
+                "{} op={:?} reason={} lines={}",
+                skip.path, skip.operation, skip.reason, lines
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn trace_git_import_enabled() -> bool {
@@ -785,9 +1080,13 @@ fn build_graph_first_change(
     header: ChangeHeader,
     parsed: &ParsedCommit,
     line_index: &ImportLineIndex,
-) -> Option<(Change, Vec<PendingLineIndexUpdate>, Vec<String>)> {
+) -> Result<(Change, Vec<PendingLineIndexUpdate>, Vec<String>), Vec<GraphFirstSkip>> {
     if parsed.files.is_empty() {
-        return None;
+        return Err(vec![GraphFirstSkip {
+            path: String::new(),
+            operation: FileOperation::Modified,
+            reason: "empty_commit",
+        }]);
     }
 
     let mut contents = Vec::new();
@@ -798,6 +1097,7 @@ fn build_graph_first_change(
     let mut dependencies = HashSet::new();
     let mut pending = Vec::new();
     let mut deleted_paths = Vec::new();
+    let mut skips = Vec::new();
 
     for file in &parsed.files {
         match file.operation {
@@ -910,8 +1210,14 @@ fn build_graph_first_change(
                 continue;
             }
             FileOperation::Renamed => {
-                let old_path = file.old_path.as_deref()?;
-                let indexed = line_index.files.get(old_path)?;
+                let Some(old_path) = file.old_path.as_deref() else {
+                    skips.push(GraphFirstSkip::new(file, "rename_missing_old_path"));
+                    continue;
+                };
+                let Some(indexed) = line_index.files.get(old_path) else {
+                    skips.push(GraphFirstSkip::new(file, "rename_missing_line_index"));
+                    continue;
+                };
                 let new_content = file.new_content.as_deref().unwrap_or(&[]);
                 let encoding = Encoding::detect(new_content);
 
@@ -994,11 +1300,27 @@ fn build_graph_first_change(
                         let start_idx = if replacement.old_len == 0 {
                             replacement.old_start
                         } else {
-                            replacement.old_start.checked_sub(1)?
+                            match replacement.old_start.checked_sub(1) {
+                                Some(idx) => idx,
+                                None => {
+                                    skips.push(GraphFirstSkip::new(
+                                        file,
+                                        "rename_replacement_underflow",
+                                    ));
+                                    continue;
+                                }
+                            }
                         };
-                        let end_idx = start_idx.checked_add(replacement.old_len)?;
+                        let Some(end_idx) = start_idx.checked_add(replacement.old_len) else {
+                            skips.push(GraphFirstSkip::new(file, "rename_replacement_overflow"));
+                            continue;
+                        };
                         if end_idx > indexed.lines.len() {
-                            return None;
+                            skips.push(GraphFirstSkip::new(
+                                file,
+                                "rename_replacement_out_of_bounds",
+                            ));
+                            continue;
                         }
 
                         let predecessor = if start_idx == 0 {
@@ -1134,7 +1456,17 @@ fn build_graph_first_change(
                 continue;
             }
             FileOperation::Deleted => {
-                let indexed = line_index.files.get(&file.path)?;
+                let Some(indexed) = line_index.files.get(&file.path) else {
+                    skips.push(GraphFirstSkip::new(
+                        file,
+                        "delete_missing_line_index_cleanup_only",
+                    ));
+                    deleted_paths.push(file.path.clone());
+                    pending.push(PendingLineIndexUpdate::Delete {
+                        path: file.path.clone(),
+                    });
+                    continue;
+                };
                 let mut edge_update = EdgeUpdate {
                     edges: Vec::with_capacity(indexed.lines.len()),
                     inode: indexed.inode_pos,
@@ -1181,8 +1513,14 @@ fn build_graph_first_change(
             FileOperation::Modified => {}
         }
 
-        let indexed = line_index.files.get(&file.path)?;
-        let new_content = file.new_content.as_deref()?;
+        let Some(indexed) = line_index.files.get(&file.path) else {
+            skips.push(GraphFirstSkip::new(file, "modified_missing_line_index"));
+            continue;
+        };
+        let Some(new_content) = file.new_content.as_deref() else {
+            skips.push(GraphFirstSkip::new(file, "modified_missing_new_content"));
+            continue;
+        };
         let encoding = Encoding::detect(new_content);
         let replacements = if encoding == Encoding::Binary
             || is_generated_diff_skip_path(&file.path)
@@ -1198,14 +1536,20 @@ fn build_graph_first_change(
                 },
             }]
         } else if parsed.is_merge {
-            let new_content = file.new_content.as_deref()?;
             current_state_replacements(indexed, new_content)
         } else {
-            let diff_lines = file.diff_lines.as_ref()?;
+            let Some(diff_lines) = file.diff_lines.as_ref() else {
+                skips.push(GraphFirstSkip::new(file, "modified_missing_diff_lines"));
+                continue;
+            };
             let (ops, _) =
                 atomic_core::record::workflow::build_crdt_ops_from_git_diff(&file.path, diff_lines);
             file_ops.push(ops);
-            parse_git_diff_replacements(diff_lines)?
+            let Some(replacements) = parse_git_diff_replacements(diff_lines) else {
+                skips.push(GraphFirstSkip::new(file, "modified_unparseable_diff_lines"));
+                continue;
+            };
+            replacements
         };
         if replacements.is_empty() {
             continue;
@@ -1224,11 +1568,22 @@ fn build_graph_first_change(
             let start_idx = if replacement.old_len == 0 {
                 replacement.old_start
             } else {
-                replacement.old_start.checked_sub(1)?
+                let Some(idx) = replacement.old_start.checked_sub(1) else {
+                    skips.push(GraphFirstSkip::new(file, "modified_replacement_underflow"));
+                    continue;
+                };
+                idx
             };
-            let end_idx = start_idx.checked_add(replacement.old_len)?;
+            let Some(end_idx) = start_idx.checked_add(replacement.old_len) else {
+                skips.push(GraphFirstSkip::new(file, "modified_replacement_overflow"));
+                continue;
+            };
             if end_idx > indexed.lines.len() {
-                return None;
+                skips.push(GraphFirstSkip::new(
+                    file,
+                    "modified_replacement_out_of_bounds",
+                ));
+                continue;
             }
 
             let predecessor = if start_idx == 0 {
@@ -1361,17 +1716,82 @@ fn build_graph_first_change(
     }
 
     if hunks.is_empty() {
-        return None;
+        if skips.is_empty() {
+            skips.push(GraphFirstSkip {
+                path: String::new(),
+                operation: FileOperation::Modified,
+                reason: "no_graph_hunks",
+            });
+        }
+        return Err(skips);
+    }
+
+    let fatal_skips: Vec<GraphFirstSkip> = skips
+        .iter()
+        .filter(|skip| skip.reason != "delete_missing_line_index_cleanup_only")
+        .cloned()
+        .collect();
+    if !fatal_skips.is_empty() {
+        return Err(skips);
     }
 
     let mut dependencies: Vec<ContentHash> = dependencies.into_iter().collect();
     dependencies.sort();
     dependencies.dedup();
-    Some((
+    Ok((
         Change::with_file_ops(header, hunks, file_ops, contents, dependencies),
         pending,
         deleted_paths,
     ))
+}
+
+fn build_graph_first_skip_reasons(
+    parsed: &ParsedCommit,
+    line_index: &ImportLineIndex,
+) -> Vec<GraphFirstSkip> {
+    let mut skips = Vec::new();
+    for file in &parsed.files {
+        match file.operation {
+            FileOperation::Modified => {
+                if !line_index.files.contains_key(&file.path) {
+                    skips.push(GraphFirstSkip::new(file, "modified_missing_line_index"));
+                } else if file.new_content.is_none() {
+                    skips.push(GraphFirstSkip::new(file, "modified_missing_new_content"));
+                } else if !parsed.is_merge
+                    && !is_generated_diff_skip_path(&file.path)
+                    && file
+                        .new_content
+                        .as_deref()
+                        .map(Encoding::detect)
+                        .is_some_and(|encoding| encoding != Encoding::Binary)
+                    && file.diff_lines.is_none()
+                {
+                    skips.push(GraphFirstSkip::new(file, "modified_missing_diff_lines"));
+                }
+            }
+            FileOperation::Deleted => {
+                if !line_index.files.contains_key(&file.path) {
+                    skips.push(GraphFirstSkip::new(
+                        file,
+                        "delete_missing_line_index_cleanup_only",
+                    ));
+                }
+            }
+            FileOperation::Renamed => {
+                if file.old_path.is_none() {
+                    skips.push(GraphFirstSkip::new(file, "rename_missing_old_path"));
+                } else if file
+                    .old_path
+                    .as_deref()
+                    .is_some_and(|old| !line_index.files.contains_key(old))
+                {
+                    skips.push(GraphFirstSkip::new(file, "rename_missing_line_index"));
+                }
+            }
+            FileOperation::Added | FileOperation::Copied => {}
+        }
+    }
+    skips
 }
 
 fn current_state_replacements(
@@ -1529,14 +1949,22 @@ fn apply_line_index_updates(
                         content,
                     })
                     .collect();
-                line_index
-                    .files
-                    .insert(path, ImportIndexedFile { inode_pos, lines });
+                line_index.files.insert(
+                    path,
+                    ImportIndexedFile {
+                        inode_pos,
+                        lines,
+                        imported_commits: 1,
+                    },
+                );
             }
             PendingLineIndexUpdate::Modify { path, replacements } => {
                 let Some(indexed) = line_index.files.get_mut(&path) else {
                     continue;
                 };
+                if !replacements.is_empty() {
+                    indexed.imported_commits += 1;
+                }
 
                 let mut offset: isize = 0;
                 for replacement in replacements {
@@ -1697,14 +2125,8 @@ impl ParallelImporter {
     /// Commits are processed in **batches** to keep memory bounded and show
     /// progress sooner. Each batch: parse in parallel → write sequentially.
     ///
-    /// Batch sizes are tiered by total commit count:
-    ///
-    /// | Total commits | Batch size |
-    /// |---------------|------------|
-    /// | < 5,000       | 250        |
-    /// | 5,000–9,999   | 500        |
-    /// | 10,000–19,999 | 1,000      |
-    /// | ≥ 20,000      | 2,500      |
+    /// Imports use a fixed 1,000-commit batch size. This keeps progress and
+    /// memory behavior predictable across small and large repositories.
     pub fn import_branch(
         &self,
         branch_name: &str,
@@ -1897,14 +2319,9 @@ impl ParallelImporter {
         Ok(stats)
     }
 
-    /// Determine batch size based on total commit count.
-    fn batch_size_for(total: usize) -> usize {
-        match total {
-            0..5_000 => 250,
-            5_000..10_000 => 500,
-            10_000..20_000 => 1_000,
-            _ => 2_500,
-        }
+    /// Determine the default import batch size.
+    fn batch_size_for(_total: usize) -> usize {
+        1_000
     }
 
     /// Collect commit OIDs in topological order (oldest first).
@@ -2160,17 +2577,40 @@ impl ParallelImporter {
             return self.write_empty_commit(repo, parsed, header);
         }
 
-        if let Some((mut graph_change, pending_updates, graph_deleted_paths)) =
-            build_graph_first_change(header.clone(), parsed, line_index)
-        {
+        line_index.seed_missing_modified_files(repo, parsed);
+        let graph_first_skips = build_graph_first_skip_reasons(parsed, line_index);
+        let graph_first_result = build_graph_first_change(header.clone(), parsed, line_index);
+
+        if let Ok((mut graph_change, pending_updates, graph_deleted_paths)) = graph_first_result {
             graph_change.unhashed = Some(self.build_git_metadata(parsed, false, false));
+            let pre_write_shape = import_shape_summary(parsed, line_index);
+            let pre_write_skip_summary = graph_first_skip_summary(&graph_first_skips, parsed);
             let progress = SlowImportProgress::start(
                 slow_import_commit_label(parsed),
-                format!(
-                    "graph-first files={}, ops={}; CRDT metadata deferred",
-                    parsed.files.len(),
-                    graph_change.hunks().len()
-                ),
+                if pre_write_shape.is_empty() && pre_write_skip_summary.is_empty() {
+                    format!(
+                        "graph-first files={}, ops={}; CRDT metadata deferred",
+                        parsed.files.len(),
+                        graph_change.hunks().len()
+                    )
+                } else {
+                    format!(
+                        "graph-first files={}, ops={}; {}{}{}CRDT metadata deferred",
+                        parsed.files.len(),
+                        graph_change.hunks().len(),
+                        pre_write_shape,
+                        if pre_write_shape.is_empty() || pre_write_skip_summary.is_empty() {
+                            ""
+                        } else {
+                            "; "
+                        },
+                        if pre_write_skip_summary.is_empty() {
+                            String::new()
+                        } else {
+                            format!("cleanup-only skips: {}; ", pre_write_skip_summary)
+                        }
+                    )
+                },
             );
             let write_start = Instant::now();
             let write_result = repo.write_import_graph_change(
@@ -2181,6 +2621,16 @@ impl ParallelImporter {
             let write_ms = write_start.elapsed().as_millis();
             let progress_reported = progress.finish();
             let write_outcome = write_result.map_err(|e| CliError::Internal(e.into()))?;
+            let shape_summary = if progress_reported
+                || write_ms >= 5_000
+                || write_outcome.timings.assemble_ms >= 5_000
+                || write_outcome.timings.apply_ms >= 5_000
+                || write_outcome.timings.direct_graph_ms >= 5_000
+            {
+                Some(pre_write_shape.clone())
+            } else {
+                None
+            };
             apply_line_index_updates(line_index, write_outcome.hash, pending_updates);
             if progress_reported || write_ms >= 5_000 {
                 print_info(&format!(
@@ -2193,6 +2643,15 @@ impl ParallelImporter {
                     write_outcome.timings.direct_crdt_ms,
                     write_outcome.timings.commit_ms
                 ));
+                if let Some(shape) = shape_summary.as_ref().filter(|shape| !shape.is_empty()) {
+                    print_info(&format!("  Slow import shape: {}", shape));
+                }
+                if !pre_write_skip_summary.is_empty() {
+                    print_info(&format!(
+                        "  Graph-first cleanup-only skips: {}",
+                        pre_write_skip_summary
+                    ));
+                }
             }
             trace_git_import(format!(
                 "write {} files={} graph_first=1 ops={} apply={}ms direct_graph={}ms direct_crdt={}ms commit={}ms total={}ms",
@@ -2205,6 +2664,10 @@ impl ParallelImporter {
                 write_outcome.timings.commit_ms,
                 commit_start.elapsed().as_millis()
             ));
+            if !graph_deleted_paths.is_empty() {
+                let del_refs: Vec<&str> = graph_deleted_paths.iter().map(|s| s.as_str()).collect();
+                let _ = repo.del_file_index_batch(&del_refs);
+            }
             return Ok(true);
         }
 
@@ -2577,10 +3040,19 @@ impl ParallelImporter {
         }
 
         let metadata = self.build_git_metadata(parsed, false, recorded_files.is_empty());
-        let progress = SlowImportProgress::start(
-            slow_import_commit_label(parsed),
-            slow_import_record_summary(parsed, &recorded_files),
-        );
+        let pre_write_shape = import_shape_summary(parsed, line_index);
+        let graph_first_skip_summary = graph_first_skip_summary(&graph_first_skips, parsed);
+        let progress_summary = if pre_write_shape.is_empty() {
+            slow_import_record_summary(parsed, &recorded_files)
+        } else {
+            format!(
+                "{}; {}",
+                slow_import_record_summary(parsed, &recorded_files),
+                pre_write_shape
+            )
+        };
+        let progress =
+            SlowImportProgress::start(slow_import_commit_label(parsed), progress_summary);
         let write_start = Instant::now();
         let write_outcome = repo
             .write_import_recorded(
@@ -2593,22 +3065,7 @@ impl ParallelImporter {
             .map_err(|e| CliError::Internal(e.into()))?;
         let write_ms = write_start.elapsed().as_millis();
         let progress_reported = progress.finish();
-        if !recorded_files.is_empty()
-            && recorded_files.iter().all(|recorded| {
-                matches!(
-                    recorded.kind(),
-                    Some(atomic_core::record::workflow::DetectionKind::Added)
-                )
-            })
-        {
-            match repo.load_change(&write_outcome.hash) {
-                Ok(change) => line_index.update_from_added_change(write_outcome.hash, &change),
-                Err(err) => trace_git_import(format!(
-                    "graph-first {}: could not seed line index from {}: {}",
-                    parsed.short_sha, write_outcome.hash, err
-                )),
-            }
-        }
+        line_index.reseed_from_fallback_write(repo, parsed);
         if progress_reported || write_ms >= 5_000 {
             print_info(&format!(
                 "Imported {} in {:.1}s (assemble={}ms apply={}ms direct_graph={}ms direct_crdt={}ms commit={}ms)",
@@ -2620,6 +3077,15 @@ impl ParallelImporter {
                 write_outcome.timings.direct_crdt_ms,
                 write_outcome.timings.commit_ms
             ));
+            if !pre_write_shape.is_empty() {
+                print_info(&format!("  Slow import shape: {}", pre_write_shape));
+            }
+            if !graph_first_skip_summary.is_empty() {
+                print_info(&format!(
+                    "  Graph-first skipped: {}",
+                    graph_first_skip_summary
+                ));
+            }
         }
 
         // Files deleted via record_modified_file (the "show diff lines" path)
@@ -3285,6 +3751,14 @@ mod tests {
         let stats = ImportStats::default();
         assert_eq!(stats.commits_found, 0);
         assert_eq!(stats.changes_written, 0);
+    }
+
+    #[test]
+    fn test_import_batch_size_is_fixed_at_1000() {
+        assert_eq!(ParallelImporter::batch_size_for(0), 1_000);
+        assert_eq!(ParallelImporter::batch_size_for(82), 1_000);
+        assert_eq!(ParallelImporter::batch_size_for(18_000), 1_000);
+        assert_eq!(ParallelImporter::batch_size_for(100_000), 1_000);
     }
 
     #[test]

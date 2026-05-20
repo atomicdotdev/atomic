@@ -358,6 +358,20 @@ pub trait InodeGraphOps {
         pos: Position<NodeId>,
     ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError>;
 
+    /// Find a block ending at the given position within an inode scope.
+    ///
+    /// This is the inode-scoped equivalent of `GraphTxnT::find_block_end`.
+    /// Implementations that cannot support it efficiently may return `Ok(None)`
+    /// and callers can fall back to the global graph lookup.
+    fn find_block_end_in_inode(
+        &self,
+        inode: Inode,
+        pos: Position<NodeId>,
+    ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
+        let _ = (inode, pos);
+        Ok(None)
+    }
+
     /// Count vertices in an inode scope.
     ///
     /// More efficient than iterating and counting when only the count is needed.
@@ -383,6 +397,16 @@ pub trait InodeGraphOps {
     /// with a more efficient check.
     fn inode_graph_is_populated(&self, inode: Inode) -> Result<bool, Self::InodeError> {
         Ok(self.count_inode_vertices(inode)? > 0)
+    }
+
+    /// Whether inode-scoped edge iteration needs an external view filter.
+    ///
+    /// Plain repository transactions return `false`: `INODE_GRAPH` can be used
+    /// as file-local truth. View wrappers that delegate to an unfiltered
+    /// `INODE_GRAPH` return `true` so callers do not accidentally see edges
+    /// from changes outside the current view.
+    fn inode_graph_needs_view_filter(&self) -> bool {
+        false
     }
 
     /// Iterate all edges for vertices within an inode scope.

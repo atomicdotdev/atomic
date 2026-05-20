@@ -6,6 +6,7 @@ use crate::apply::{
     InsertOutcome, InsertStats,
 };
 use atomic_core::change::Insertion;
+use atomic_core::pristine::InodeGraphOps;
 use atomic_core::types::{ChangePosition, EdgeFlags, GraphNode, SerializedGraphEdge};
 use std::collections::{HashMap, HashSet};
 
@@ -85,9 +86,27 @@ pub struct ImportWriteOutcome {
     pub insert: InsertOutcome,
 }
 
+/// Existing graph line metadata used by git import to lazily rebuild its
+/// in-memory line index after a prior fallback or interrupted fast path.
+#[derive(Debug, Clone)]
+pub struct ImportLineIndexSeed {
+    pub inode_pos: Position<Hash>,
+    pub lines: Vec<ImportLineIndexSeedLine>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportLineIndexSeedLine {
+    pub change: Hash,
+    pub start: ChangePosition,
+    pub end: ChangePosition,
+    pub incoming_by: Hash,
+}
+
 #[derive(Default)]
 struct ImportGraphFirstVertexCache {
     by_inode: HashMap<Inode, ImportGraphFirstInodeCache>,
+    by_end_pos: HashMap<(Inode, Position<NodeId>), GraphNode<NodeId>>,
+    by_start_pos: HashMap<(Inode, Position<NodeId>), GraphNode<NodeId>>,
 }
 
 #[derive(Default)]
@@ -97,6 +116,50 @@ struct ImportGraphFirstInodeCache {
 }
 
 impl ImportGraphFirstVertexCache {
+    fn find_end<T>(
+        &mut self,
+        txn: &T,
+        inode: Inode,
+        pos: Position<NodeId>,
+    ) -> Result<Option<GraphNode<NodeId>>, RepositoryError>
+    where
+        T: GraphTxnT + InodeGraphOps,
+    {
+        if let Some(node) = self.by_end_pos.get(&(inode, pos)) {
+            return Ok(Some(*node));
+        }
+        let Some(node) = txn
+            .find_block_end_in_inode(inode, pos)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        self.by_end_pos.insert((inode, pos), node);
+        Ok(Some(node))
+    }
+
+    fn find_start<T>(
+        &mut self,
+        txn: &T,
+        inode: Inode,
+        pos: Position<NodeId>,
+    ) -> Result<Option<GraphNode<NodeId>>, RepositoryError>
+    where
+        T: GraphTxnT + InodeGraphOps,
+    {
+        if let Some(node) = self.by_start_pos.get(&(inode, pos)) {
+            return Ok(Some(*node));
+        }
+        let Some(node) = txn
+            .find_block_in_inode(inode, pos)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        self.by_start_pos.insert((inode, pos), node);
+        Ok(Some(node))
+    }
+
     fn load<T>(
         &mut self,
         txn: &T,
@@ -195,6 +258,106 @@ fn import_direct_can_apply(change: &Change) -> bool {
     })
 }
 
+fn import_seed_edge_visible(edge: &SerializedGraphEdge, visible: &HashSet<NodeId>) -> bool {
+    let change = edge.introduced_by();
+    change.is_root() || visible.contains(&change)
+}
+
+fn import_seed_node_visible(node: GraphNode<NodeId>, visible: &HashSet<NodeId>) -> bool {
+    node.change.is_root() || visible.contains(&node.change)
+}
+
+fn import_seed_is_dead<T>(
+    txn: &T,
+    inode: Inode,
+    node: GraphNode<NodeId>,
+    visible: &HashSet<NodeId>,
+) -> bool
+where
+    T: GraphTxnT + InodeGraphOps,
+{
+    let mut parents = match txn.init_inode_adj(inode, node, EdgeFlags::PARENT, EdgeFlags::all()) {
+        Ok(adj) => adj,
+        Err(_) => return false,
+    };
+    while let Some(edge) = txn.next_inode_adj(&mut parents) {
+        let Ok(edge) = edge else {
+            continue;
+        };
+        let flags = edge.flag();
+        if flags.contains(EdgeFlags::PARENT)
+            && flags.contains(EdgeFlags::DELETED)
+            && import_seed_edge_visible(&edge, visible)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn import_seed_alive_reaches<T>(
+    txn: &T,
+    inode: Inode,
+    start: GraphNode<NodeId>,
+    target: GraphNode<NodeId>,
+    visible: &HashSet<NodeId>,
+) -> bool
+where
+    T: GraphTxnT + InodeGraphOps,
+{
+    if start == target {
+        return true;
+    }
+
+    let mut stack = vec![start];
+    let mut seen = HashSet::new();
+
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+
+        let mut adj = match txn.init_inode_adj(inode, current, EdgeFlags::BLOCK, EdgeFlags::all()) {
+            Ok(adj) => adj,
+            Err(_) => continue,
+        };
+
+        while let Some(edge) = txn.next_inode_adj(&mut adj) {
+            let Ok(edge) = edge else {
+                continue;
+            };
+            let flags = edge.flag();
+            if flags.contains(EdgeFlags::PARENT)
+                || flags.contains(EdgeFlags::DELETED)
+                || flags.contains(EdgeFlags::PSEUDO)
+                || !import_seed_edge_visible(&edge, visible)
+            {
+                continue;
+            }
+
+            let Some(dest) = txn
+                .find_block_in_inode(inode, edge.dest())
+                .ok()
+                .flatten()
+                .or_else(|| txn.find_block(edge.dest()).ok())
+            else {
+                continue;
+            };
+            if !import_seed_node_visible(dest, visible)
+                || import_seed_is_dead(txn, inode, dest, visible)
+            {
+                continue;
+            }
+            if dest == target {
+                return true;
+            }
+            stack.push(dest);
+        }
+    }
+
+    false
+}
+
 fn import_graph_first_can_apply(change: &Change) -> bool {
     !change.hunks().is_empty()
         && change.hunks().iter().all(|op| match op {
@@ -273,7 +436,7 @@ fn import_graph_first_source<T>(
     change_id: NodeId,
 ) -> Result<GraphNode<NodeId>, RepositoryError>
 where
-    T: GraphTxnT + TreeTxnT,
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
     let resolved = import_graph_first_position(txn, pos, change_id)?;
 
@@ -297,6 +460,9 @@ where
     }
 
     if let Some(inode) = resolved_inode {
+        if let Some(node) = vertex_cache.find_end(txn, inode, resolved)? {
+            return Ok(node);
+        }
         if let Some(node) = vertex_cache.load(txn, inode)?.by_end.get(&resolved) {
             return Ok(*node);
         }
@@ -315,7 +481,7 @@ fn import_graph_first_successor<T>(
     change_id: NodeId,
 ) -> Result<GraphNode<NodeId>, RepositoryError>
 where
-    T: GraphTxnT + TreeTxnT,
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
     let resolved = import_graph_first_position(txn, pos, change_id)?;
     if resolved.change == change_id {
@@ -325,6 +491,9 @@ where
     }
 
     if let Some(inode) = resolved_inode {
+        if let Some(node) = vertex_cache.find_start(txn, inode, resolved)? {
+            return Ok(node);
+        }
         if let Some(node) = vertex_cache.load(txn, inode)?.by_start.get(&resolved) {
             return Ok(*node);
         }
@@ -378,6 +547,170 @@ fn import_direct_write_insertion(
 
 impl Repository {
     // Change Insertion Methods
+
+    /// Rebuild ordered line vertex metadata for a tracked file from the
+    /// current view's graph. Git import uses this as a conservative repair
+    /// path when its in-memory line index is missing for a modified file.
+    pub fn import_line_index_seed(
+        &self,
+        path: &str,
+    ) -> Result<Option<ImportLineIndexSeed>, RepositoryError> {
+        let normalized = path.replace('\\', "/");
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let view = txn
+            .get_view(&self.current_view)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: self.current_view.clone(),
+            })?;
+        let visible = collect_visible_change_ids_with_deps(&txn, &view)?;
+
+        let Some(inode) = txn
+            .get_inode(&normalized)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let Some(position) = txn
+            .inode_position(inode)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if !import_seed_node_visible(position.inode_node(), &visible) {
+            return Ok(None);
+        }
+        let Some(inode_change) = txn
+            .get_external(position.change)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+
+        let mut current = position.inode_node();
+        let mut visited = HashSet::new();
+        let mut lines = Vec::new();
+
+        loop {
+            if !visited.insert(current) {
+                return Ok(None);
+            }
+
+            let mut adj = txn
+                .init_inode_adj(
+                    inode,
+                    current,
+                    EdgeFlags::BLOCK,
+                    EdgeFlags::BLOCK | EdgeFlags::FOLDER,
+                )
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+            let mut alive_candidates: Vec<(GraphNode<NodeId>, NodeId)> = Vec::new();
+            let mut next_dead: Option<(GraphNode<NodeId>, NodeId)> = None;
+
+            while let Some(edge) = txn.next_inode_adj(&mut adj) {
+                let edge = edge.map_err(|e| RepositoryError::Database(e.to_string()))?;
+                let flags = edge.flag();
+                if flags.contains(EdgeFlags::PARENT)
+                    || flags.contains(EdgeFlags::DELETED)
+                    || flags.contains(EdgeFlags::PSEUDO)
+                    || !import_seed_edge_visible(&edge, &visible)
+                {
+                    continue;
+                }
+
+                let Some(dest) = txn
+                    .find_block_in_inode(inode, edge.dest())
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .or_else(|| txn.find_block(edge.dest()).ok())
+                else {
+                    continue;
+                };
+                if visited.contains(&dest) || !import_seed_node_visible(dest, &visible) {
+                    continue;
+                }
+                let introduced_by = edge.introduced_by();
+                if !import_seed_is_dead(&txn, inode, dest, &visible) {
+                    alive_candidates.push((dest, introduced_by));
+                } else if next_dead.is_none() {
+                    next_dead = Some((dest, introduced_by));
+                }
+            }
+
+            let next_alive = if alive_candidates.len() <= 1 {
+                alive_candidates.into_iter().next()
+            } else {
+                alive_candidates
+                    .iter()
+                    .copied()
+                    .find(|(candidate, _)| {
+                        let reaches_other = alive_candidates.iter().copied().any(|(other, _)| {
+                            other != *candidate
+                                && import_seed_alive_reaches(
+                                    &txn, inode, *candidate, other, &visible,
+                                )
+                        });
+                        let reached_by_other =
+                            alive_candidates.iter().copied().any(|(other, _)| {
+                                other != *candidate
+                                    && import_seed_alive_reaches(
+                                        &txn, inode, other, *candidate, &visible,
+                                    )
+                            });
+                        reaches_other && !reached_by_other
+                    })
+                    .or_else(|| {
+                        alive_candidates.iter().copied().find(|(candidate, _)| {
+                            alive_candidates.iter().copied().any(|(other, _)| {
+                                other != *candidate
+                                    && import_seed_alive_reaches(
+                                        &txn, inode, *candidate, other, &visible,
+                                    )
+                            })
+                        })
+                    })
+                    .or_else(|| alive_candidates.into_iter().next())
+            };
+
+            let Some((dest, introduced_by)) = next_alive.or(next_dead) else {
+                break;
+            };
+
+            let is_inode_marker = dest.start == dest.end && dest.start == position.pos;
+            let is_alive = !import_seed_is_dead(&txn, inode, dest, &visible);
+            if is_alive && !is_inode_marker && !dest.change.is_root() && dest.start != dest.end {
+                let Some(change) = txn
+                    .get_external(dest.change)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                else {
+                    return Ok(None);
+                };
+                let Some(incoming_by) = txn
+                    .get_external(introduced_by)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                else {
+                    return Ok(None);
+                };
+                lines.push(ImportLineIndexSeedLine {
+                    change,
+                    start: dest.start,
+                    end: dest.end,
+                    incoming_by,
+                });
+            }
+
+            current = dest;
+        }
+
+        Ok(Some(ImportLineIndexSeed {
+            inode_pos: Position::new(inode_change, position.pos),
+            lines,
+        }))
+    }
 
     /// Assemble, save, and apply a freshly imported Git commit without going
     /// through the normal `insert_change()` load/check path.

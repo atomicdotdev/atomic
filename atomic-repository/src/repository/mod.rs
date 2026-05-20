@@ -114,7 +114,9 @@ mod vault_intent;
 mod vault_kg_enrich;
 mod vault_names;
 mod vault_triples;
-pub use insert::{ImportWriteOutcome, ImportWriteTimings};
+pub use insert::{
+    ImportLineIndexSeed, ImportLineIndexSeedLine, ImportWriteOutcome, ImportWriteTimings,
+};
 pub use semantic_materialize::{CrdtMaterializeOptions, CrdtMaterializeOutcome};
 pub use vault_embeddings::{hash_embed, EmbedConfig, TextChunk};
 pub use vault_goal::{
