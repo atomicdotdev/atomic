@@ -84,6 +84,7 @@ pub mod stash;
 pub mod status;
 pub mod tag;
 pub mod unrecord;
+pub mod update;
 pub mod vault;
 pub mod view;
 
@@ -144,6 +145,7 @@ pub use stash::Stash;
 pub use status::Status;
 pub use tag::Tag;
 pub use unrecord::Unrecord;
+pub use update::Update;
 pub use vault::Vault;
 pub use view::View;
 pub use workspace::WorkspaceCmd;
