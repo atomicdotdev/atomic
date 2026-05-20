@@ -729,7 +729,7 @@ fn import_shape_summary(parsed: &ParsedCommit, line_index: &ImportLineIndex) -> 
             )
         })
         .collect();
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     entries
         .into_iter()
         .take(3)
