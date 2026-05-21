@@ -49,7 +49,8 @@
 //! {"systemMessage": "Atomic is tracking this session..."}
 //! ```
 
-use std::io::Read;
+use std::io::{Read, Write};
+use std::process::{Command as ProcessCommand, Stdio};
 
 use anyhow::anyhow;
 use clap::Args;
@@ -82,6 +83,10 @@ pub struct Hooks {
 
     /// The hook verb (e.g., "stop", "user-prompt-submit", "session-start").
     verb: String,
+
+    /// Run the hook body in this process.
+    #[arg(long, hide = true)]
+    foreground: bool,
 }
 
 impl Command for Hooks {
@@ -94,6 +99,10 @@ impl Command for Hooks {
                 format!("Failed to read hook input from stdin: {}", e),
             ))
         })?;
+
+        if self.should_handoff_codex_stop() {
+            return self.handoff_codex_stop(&input);
+        }
 
         // Look up the agent adapter
         let registry = AgentRegistry::with_defaults();
@@ -200,6 +209,49 @@ impl Command for Hooks {
     }
 }
 
+impl Hooks {
+    fn should_handoff_codex_stop(&self) -> bool {
+        !self.foreground && self.agent_name == "codex" && self.verb == "stop"
+    }
+
+    fn handoff_codex_stop(&self, input: &[u8]) -> CliResult<()> {
+        let exe = std::env::current_exe().map_err(|e| {
+            CliError::Internal(anyhow!("Failed to resolve atomic executable: {}", e))
+        })?;
+
+        let mut child = ProcessCommand::new(exe)
+            .arg("agent")
+            .arg("hooks")
+            .arg(&self.agent_name)
+            .arg(&self.verb)
+            .arg("--foreground")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                CliError::Internal(anyhow!(
+                    "Failed to start background Codex Stop recorder: {}",
+                    e
+                ))
+            })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(input).map_err(|e| {
+                CliError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to pass Codex Stop input to background recorder: {}",
+                        e
+                    ),
+                ))
+            })?;
+        }
+
+        Ok(())
+    }
+}
+
 // Tests
 
 #[cfg(test)]
@@ -211,6 +263,7 @@ mod tests {
         let hooks = Hooks {
             agent_name: "claude-code".to_string(),
             verb: "stop".to_string(),
+            foreground: false,
         };
         assert_eq!(hooks.agent_name, "claude-code");
         assert_eq!(hooks.verb, "stop");
@@ -318,9 +371,43 @@ mod tests {
         let hooks = Hooks {
             agent_name: "claude-code".to_string(),
             verb: "session-start".to_string(),
+            foreground: false,
         };
         let debug = format!("{:?}", hooks);
         assert!(debug.contains("claude-code"));
         assert!(debug.contains("session-start"));
+    }
+
+    #[test]
+    fn test_codex_stop_handoffs_by_default() {
+        let hooks = Hooks {
+            agent_name: "codex".to_string(),
+            verb: "stop".to_string(),
+            foreground: false,
+        };
+
+        assert!(hooks.should_handoff_codex_stop());
+    }
+
+    #[test]
+    fn test_codex_stop_foreground_disables_handoff() {
+        let hooks = Hooks {
+            agent_name: "codex".to_string(),
+            verb: "stop".to_string(),
+            foreground: true,
+        };
+
+        assert!(!hooks.should_handoff_codex_stop());
+    }
+
+    #[test]
+    fn test_non_codex_stop_does_not_handoff() {
+        let hooks = Hooks {
+            agent_name: "claude-code".to_string(),
+            verb: "stop".to_string(),
+            foreground: false,
+        };
+
+        assert!(!hooks.should_handoff_codex_stop());
     }
 }

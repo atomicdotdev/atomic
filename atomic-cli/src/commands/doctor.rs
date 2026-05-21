@@ -1,5 +1,6 @@
 //! Repository diagnostic and repair commands.
 
+use atomic_repository::CrdtMaterializeOptions;
 use clap::{Args, Subcommand};
 
 use crate::commands::{require_repository, Command};
@@ -23,6 +24,14 @@ pub enum DoctorCommands {
     /// without repeatedly loading change files.
     #[command(name = "repair-dependency-index")]
     RepairDependencyIndex(RepairDependencyIndex),
+
+    /// Materialize stored FileOps into CRDT semantic tables.
+    ///
+    /// This is the second phase of graph-first Git import: the graph is already
+    /// written, and this command builds CRDT tables from graph-linked FileOps
+    /// stored in the imported changes.
+    #[command(name = "materialize-crdt")]
+    MaterializeCrdt(MaterializeCrdt),
 }
 
 /// Rebuild the normal change dependency index from stored changes.
@@ -33,10 +42,23 @@ pub struct RepairDependencyIndex {
     pub force: bool,
 }
 
+/// Build CRDT tables from stored change FileOps.
+#[derive(Debug, Args, Default)]
+pub struct MaterializeCrdt {
+    /// View to materialize. Defaults to the current view.
+    #[arg(long)]
+    pub view: Option<String>,
+
+    /// Re-apply even when a trunk row already exists.
+    #[arg(long)]
+    pub force: bool,
+}
+
 impl Command for Doctor {
     fn run(&self) -> CliResult<()> {
         match &self.command {
             DoctorCommands::RepairDependencyIndex(cmd) => cmd.run(),
+            DoctorCommands::MaterializeCrdt(cmd) => cmd.run(),
         }
     }
 }
@@ -69,6 +91,61 @@ impl Command for RepairDependencyIndex {
     }
 }
 
+impl Command for MaterializeCrdt {
+    fn run(&self) -> CliResult<()> {
+        let repo = require_repository(None)?;
+        let view = self
+            .view
+            .clone()
+            .unwrap_or_else(|| repo.current_view().to_string());
+
+        print_info(&format!("Materializing CRDT tables for view '{}'...", view));
+        if self.force {
+            print_warning("--force enabled: existing CRDT trunk rows may be overwritten");
+        }
+
+        let outcome = repo.materialize_crdt_from_changes(CrdtMaterializeOptions {
+            view: Some(view),
+            force: self.force,
+        })?;
+
+        print_success(&format!(
+            "CRDT materialization complete in {:.1}s: {} changes scanned, {} changes applied, {} FileOps applied, {} already materialized, {} skipped",
+            outcome.elapsed_ms as f64 / 1000.0,
+            outcome.changes_scanned,
+            outcome.changes_applied,
+            outcome.file_ops_applied,
+            outcome.file_ops_already_materialized,
+            outcome.file_ops_skipped
+        ));
+        print_hint(&format!(
+            "CRDT rows: trunks +{}, branches +{}, leaves +{}",
+            outcome.stats.trunks_created,
+            outcome.stats.branches_created,
+            outcome.stats.leaves_created
+        ));
+        if outcome.file_ops_skipped > 0 {
+            print_hint(&format!(
+                "Skipped FileOps: non_create={}, unresolved_path={}, unresolved_line={}, missing_range={}, non_insert_branch={}, non_insert_leaf={}",
+                outcome.skip_stats.non_create_trunk,
+                outcome.skip_stats.unresolved_path,
+                outcome.skip_stats.unresolved_line,
+                outcome.skip_stats.missing_content_range,
+                outcome.skip_stats.non_insert_branch,
+                outcome.skip_stats.non_insert_leaf
+            ));
+            if !outcome.skip_samples.is_empty() {
+                print_hint(&format!(
+                    "Skip samples: {}",
+                    outcome.skip_samples.join(", ")
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,6 +153,13 @@ mod tests {
     #[test]
     fn repair_dependency_index_defaults_to_non_force() {
         let cmd = RepairDependencyIndex::default();
+        assert!(!cmd.force);
+    }
+
+    #[test]
+    fn materialize_crdt_defaults_to_current_view_non_force() {
+        let cmd = MaterializeCrdt::default();
+        assert!(cmd.view.is_none());
         assert!(!cmd.force);
     }
 }

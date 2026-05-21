@@ -24,6 +24,10 @@ count_imported_git_changes() {
     echo "$count"
 }
 
+git_first_parent_commit_count() {
+    git rev-list --first-parent --count HEAD 2>/dev/null || echo "0"
+}
+
 assert_imported_git_change_count() {
     local desc="$1"
     local expected="$2"
@@ -78,9 +82,9 @@ echo "  Cloning hashicorp/go-uuid..."
 clone_git_repo "https://github.com/hashicorp/go-uuid.git"
 cd "$GIT_REPO_DIR"
 
-expected_commits="$(git_commit_count)"
+expected_commits="$(git_first_parent_commit_count)"
 default_branch="$(git_default_branch)"
-echo "  Found $expected_commits commits on branch '$default_branch'"
+echo "  Found $expected_commits first-parent commits on branch '$default_branch'"
 
 # Initialize atomic and import
 assert_success "atomic git import succeeds" atomic git import
@@ -94,10 +98,10 @@ assert_view_exists "view '$default_branch' created" "$default_branch"
 actual_imported_commits="$(count_imported_git_changes)"
 if [[ "$actual_imported_commits" -eq "$expected_commits" ]] || \
    [[ "$actual_imported_commits" -eq $((expected_commits - 1)) ]]; then
-    _pass "change count matches git commits ($expected_commits)"
+    _pass "change count matches git first-parent commits ($expected_commits)"
 else
-    _fail "change count matches git commits ($expected_commits)" \
-        "expected $expected_commits imported git changes (or $((expected_commits - 1)) with one skipped empty/merge commit), got $actual_imported_commits"
+    _fail "change count matches git first-parent commits ($expected_commits)" \
+        "expected $expected_commits imported git mainline changes (or $((expected_commits - 1)) with one skipped empty/merge commit), got $actual_imported_commits"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -172,8 +176,8 @@ echo "  Cloning holman/spark..."
 clone_git_repo "https://github.com/holman/spark.git"
 cd "$GIT_REPO_DIR"
 
-expected_commits="$(git_commit_count)"
-echo "  Found $expected_commits commits"
+expected_commits="$(git_first_parent_commit_count)"
+echo "  Found $expected_commits first-parent commits"
 
 assert_success "atomic git import succeeds" atomic git import
 
@@ -249,8 +253,8 @@ echo "  Cloning sharkdp/hyperfine (this may take a minute)..."
 clone_git_repo "https://github.com/sharkdp/hyperfine.git"
 cd "$GIT_REPO_DIR"
 
-expected_commits="$(git_commit_count)"
-echo "  Found $expected_commits commits"
+expected_commits="$(git_first_parent_commit_count)"
+echo "  Found $expected_commits first-parent commits"
 
 start_time=$(date +%s)
 atomic git import >/dev/null 2>&1
@@ -267,15 +271,14 @@ else
     _fail "import completed in reasonable time" "took ${duration}s"
 fi
 
-# Verify counts match (with some tolerance for merge handling)
-actual="$(atomic log 2>/dev/null | grep -cE '^\s*#[0-9]+|^[0-9a-f]{8,}' 2>/dev/null || true)"
-actual="${actual:-0}"
-actual="$(echo "$actual" | tr -d '[:space:]')"
-[[ -z "$actual" ]] && actual=0
-if [[ $actual -ge $((expected_commits - 50)) ]] && [[ $actual -le $((expected_commits + 50)) ]]; then
-    _pass "change count roughly matches ($actual vs $expected_commits)"
+# Verify imported Git mainline commit count exactly. Do not use raw `atomic log`
+# length here: git import records follow-up Atomic-only changes such as
+# repository/vault initialization, and those are not Git commits.
+actual="$(count_imported_git_changes)"
+if [[ "$actual" -eq "$expected_commits" ]]; then
+    _pass "imported git change count matches ($actual vs $expected_commits)"
 else
-    _fail "change count matches" "expected ~$expected_commits, got $actual"
+    _fail "imported git change count matches" "expected $expected_commits imported git changes, got $actual"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -368,7 +371,7 @@ git_commit "Feature B" "b.txt" "b"
 git checkout "$initial_branch" --quiet
 
 atomic init >/dev/null 2>&1
-atomic git import --all-branches >/dev/null 2>&1
+atomic git import --all >/dev/null 2>&1
 
 # Verify all branches became views
 assert_view_exists "${initial_branch} view exists" "$initial_branch"

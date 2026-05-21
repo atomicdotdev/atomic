@@ -761,37 +761,40 @@ impl Repository {
                     // the record, so subsequent status() calls can skip unchanged
                     // files (mtime+size match) or avoid graph reconstruction
                     // (compare stored content hash instead).
-                    if let Ok(mut idx_txn) = self.pristine.write_txn() {
-                        let file_index_start = std::time::Instant::now();
-                        for path_str in outcome.recorded_files() {
-                            // Strip directory markers like "dir/ (directory)"
-                            let clean_path =
-                                path_str.strip_suffix("/ (directory)").unwrap_or(path_str);
-                            let abs_path = self.root.join(clean_path);
-                            if let Ok(metadata) = std::fs::metadata(&abs_path) {
-                                use std::time::SystemTime;
-                                let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                                let duration = mtime
-                                    .duration_since(SystemTime::UNIX_EPOCH)
-                                    .unwrap_or_default();
-                                let content_hash = std::fs::read(&abs_path)
-                                    .map(|bytes| Hash::of(&bytes))
-                                    .unwrap_or(Hash::ZERO);
-                                let _ = idx_txn.put_file_index(
-                                    clean_path,
-                                    duration.as_secs() as i64,
-                                    duration.subsec_nanos(),
-                                    metadata.len(),
-                                    &content_hash,
+                    if options.get_update_file_index() {
+                        if let Ok(mut idx_txn) = self.pristine.write_txn() {
+                            let file_index_start = std::time::Instant::now();
+                            for path_str in outcome.recorded_files() {
+                                // Strip directory markers like "dir/ (directory)"
+                                let clean_path =
+                                    path_str.strip_suffix("/ (directory)").unwrap_or(path_str);
+                                let abs_path = self.root.join(clean_path);
+                                if let Ok(metadata) = std::fs::metadata(&abs_path) {
+                                    use std::time::SystemTime;
+                                    let mtime =
+                                        metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                                    let duration = mtime
+                                        .duration_since(SystemTime::UNIX_EPOCH)
+                                        .unwrap_or_default();
+                                    let content_hash = std::fs::read(&abs_path)
+                                        .map(|bytes| Hash::of(&bytes))
+                                        .unwrap_or(Hash::ZERO);
+                                    let _ = idx_txn.put_file_index(
+                                        clean_path,
+                                        duration.as_secs() as i64,
+                                        duration.subsec_nanos(),
+                                        metadata.len(),
+                                        &content_hash,
+                                    );
+                                }
+                            }
+                            let _ = idx_txn.commit();
+                            if trace_record {
+                                eprintln!(
+                                    "[record] file_index_update complete elapsed={:?}",
+                                    file_index_start.elapsed()
                                 );
                             }
-                        }
-                        let _ = idx_txn.commit();
-                        if trace_record {
-                            eprintln!(
-                                "[record] file_index_update complete elapsed={:?}",
-                                file_index_start.elapsed()
-                            );
                         }
                     }
                 }
@@ -802,7 +805,7 @@ impl Repository {
         }
 
         // Deflate vault working copy changes (if vault is initialized)
-        if self.has_vault().unwrap_or(false) {
+        if options.get_sync_vault() && self.has_vault().unwrap_or(false) {
             match self.vault_record_working_copy() {
                 Ok(vault_paths) if !vault_paths.is_empty() => {
                     outcome.set_vault_paths(vault_paths);
@@ -817,7 +820,7 @@ impl Repository {
         }
 
         // Auto-enrich KG with the new change (best-effort)
-        if outcome.was_saved() {
+        if options.get_enrich_kg() && outcome.was_saved() {
             let hash = *outcome.hash();
             if let Err(e) = self.kg_enrich_change(&hash) {
                 log::debug!("KG enrich for change: {}", e);

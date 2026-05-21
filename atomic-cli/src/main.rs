@@ -380,8 +380,8 @@ enum Commands {
     /// # Import specific branch
     /// atomic git import --branch main
     ///
-    /// # Import all branches as views
-    /// atomic git import --all-branches
+    /// # Import all local branches as views
+    /// atomic git import --all
     ///
     /// # Preview without creating repository
     /// atomic git import --dry-run

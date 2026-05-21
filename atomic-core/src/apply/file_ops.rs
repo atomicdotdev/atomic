@@ -124,6 +124,21 @@ impl ApplyFileOpsStats {
     pub fn has_operations(&self) -> bool {
         self.total_trunk_ops() > 0 || self.total_branch_ops() > 0 || self.total_leaf_ops() > 0
     }
+
+    /// Add another stats value into this one.
+    pub fn merge(&mut self, other: ApplyFileOpsStats) {
+        self.trunks_created += other.trunks_created;
+        self.trunks_deleted += other.trunks_deleted;
+        self.trunks_moved += other.trunks_moved;
+        self.branches_created += other.branches_created;
+        self.branches_deleted += other.branches_deleted;
+        self.branches_restored += other.branches_restored;
+        self.branches_reparented += other.branches_reparented;
+        self.leaves_created += other.leaves_created;
+        self.leaves_deleted += other.leaves_deleted;
+        self.leaves_replaced += other.leaves_replaced;
+        self.leaves_restored += other.leaves_restored;
+    }
 }
 
 // Apply Functions
@@ -154,8 +169,9 @@ pub fn apply_file_ops<T: MutTxnT>(
     file_ops: &[FileOps],
 ) -> PristineResult<ApplyFileOpsStats> {
     let mut stats = ApplyFileOpsStats::new();
+    let mut next_leaf_idx = 0u32;
     for ops in file_ops {
-        apply_single_file_ops(txn, change_id, ops, &mut stats)?;
+        apply_single_file_ops(txn, change_id, ops, &mut stats, &mut next_leaf_idx)?;
     }
     Ok(stats)
 }
@@ -207,6 +223,7 @@ pub fn apply_file_ops_batched(
     let mut branch_vertex_table = txn.txn.open_table(BRANCH_VERTEX)?;
     let mut vertex_branch_table = txn.txn.open_table(VERTEX_BRANCH)?;
 
+    let mut next_leaf_idx = 0u32;
     for (ops, trunk_create) in file_ops.iter().zip(trunk_creates.iter()) {
         // Resolve TrunkId placeholder — same logic as apply_single_file_ops.
         let raw_trunk_id = ops.trunk_id();
@@ -267,12 +284,13 @@ pub fn apply_file_ops_batched(
                 vertex_branch_table.insert(&vertex_bytes, &branch_key)?;
             }
 
-            for (leaf_idx, leaf_op) in content.iter().enumerate() {
+            for leaf_op in content {
                 let LeafOp::Insert { kind, content, .. } = leaf_op else {
                     unreachable!("batched apply only runs for insert-only leaf ops");
                 };
 
-                let leaf_id = LeafId::new(branch_id.change_id(), leaf_idx as u32);
+                let leaf_id = LeafId::new(branch_id.change_id(), next_leaf_idx);
+                next_leaf_idx += 1;
                 let leaf_key = encode_leaf_id(&leaf_id);
                 let leaf_value = encode_leaf_value(&SerializedLeaf {
                     branch_id,
@@ -284,6 +302,161 @@ pub fn apply_file_ops_batched(
                 leaves_table.insert(&leaf_key, &leaf_value)?;
                 branch_leaves_table.insert(&branch_key, &leaf_key)?;
                 stats.leaves_created += 1;
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Apply insert-only FileOps for multiple changes with CRDT tables opened once.
+///
+/// Graph-first Git import stores semantic FileOps in every change during phase
+/// 1, then materializes the CRDT tables in phase 2. Applying each change
+/// independently opens the same redb tables repeatedly. This grouped variant
+/// keeps those table handles open across the whole fanout while still resolving
+/// `ROOT` IDs against each change's real `NodeId`.
+pub fn apply_file_ops_batched_groups(
+    txn: &mut WriteTxn<'_>,
+    groups: &[(NodeId, Vec<FileOps>)],
+) -> PristineResult<ApplyFileOpsStats> {
+    if groups
+        .iter()
+        .any(|(_, file_ops)| !can_batch_apply_file_ops(file_ops))
+    {
+        let mut stats = ApplyFileOpsStats::new();
+        for (change_id, file_ops) in groups {
+            stats.merge(apply_file_ops_batched(txn, *change_id, file_ops)?);
+        }
+        return Ok(stats);
+    }
+
+    let mut stats = ApplyFileOpsStats::new();
+    let mut trunk_creates = Vec::new();
+
+    for (change_id, file_ops) in groups {
+        for ops in file_ops {
+            let trunk_create = match ops.trunk_op() {
+                Some(TrunkOp::Create { encoding, .. }) => {
+                    let inode = match txn.get_inode(ops.path())? {
+                        Some(i) => i,
+                        None => txn.alloc_inode()?,
+                    };
+                    let raw_trunk_id = ops.trunk_id();
+                    let trunk_id = if raw_trunk_id.change_id().is_root() {
+                        TrunkId::new(*change_id, raw_trunk_id.file_idx())
+                    } else {
+                        raw_trunk_id
+                    };
+                    Some((
+                        trunk_id,
+                        SerializedTrunk {
+                            inode,
+                            state: TrunkState::Alive,
+                            encoding: encoding_to_u8(encoding.as_ref()),
+                            path: ops.path().to_string(),
+                        },
+                    ))
+                }
+                _ => None,
+            };
+            trunk_creates.push(trunk_create);
+        }
+    }
+
+    let mut trunks_table = txn.txn.open_table(TRUNKS)?;
+    let mut inode_trunk_table = txn.txn.open_table(INODE_TRUNK)?;
+    let mut path_trunk_table = txn.txn.open_table(PATH_TRUNK)?;
+    let mut branches_table = txn.txn.open_table(BRANCHES)?;
+    let mut trunk_branches_table = txn.txn.open_multimap_table(TRUNK_BRANCHES)?;
+    let mut branch_after_table = txn.txn.open_table(BRANCH_AFTER)?;
+    let mut leaves_table = txn.txn.open_table(LEAVES)?;
+    let mut branch_leaves_table = txn.txn.open_multimap_table(BRANCH_LEAVES)?;
+    let mut branch_vertex_table = txn.txn.open_table(BRANCH_VERTEX)?;
+    let mut vertex_branch_table = txn.txn.open_table(VERTEX_BRANCH)?;
+
+    let mut trunk_create_idx = 0usize;
+    for (change_id, file_ops) in groups {
+        let mut next_leaf_idx = 0u32;
+        for ops in file_ops {
+            let raw_trunk_id = ops.trunk_id();
+            let trunk_id = if raw_trunk_id.change_id().is_root() {
+                TrunkId::new(*change_id, raw_trunk_id.file_idx())
+            } else {
+                raw_trunk_id
+            };
+            let trunk_key = encode_trunk_id(&trunk_id);
+
+            if let Some((_, serialized)) = &trunk_creates[trunk_create_idx] {
+                let trunk_value = encode_trunk_value(serialized);
+                trunks_table.insert(&trunk_key, trunk_value.as_slice())?;
+                inode_trunk_table.insert(serialized.inode.get(), &trunk_key)?;
+                path_trunk_table.insert(ops.path(), &trunk_key)?;
+                stats.trunks_created += 1;
+            }
+            trunk_create_idx += 1;
+
+            for line_ops in ops.line_ops() {
+                let raw_branch_id = line_ops.branch_id();
+                let branch_id = if raw_branch_id.change_id().is_root() {
+                    BranchId::new(*change_id, raw_branch_id.branch_idx())
+                } else {
+                    raw_branch_id
+                };
+
+                let BranchOp::Insert { after, content } = line_ops.operation() else {
+                    unreachable!("batched apply only runs for insert-only file ops");
+                };
+
+                let branch_key = encode_branch_id(&branch_id);
+                let branch_value = encode_branch_value(&SerializedBranch {
+                    trunk_id,
+                    state: BranchState::Alive,
+                    line_hash: 0,
+                });
+                branches_table.insert(&branch_key, &branch_value)?;
+                trunk_branches_table.insert(&trunk_key, &branch_key)?;
+                stats.branches_created += 1;
+
+                let after_key = match after {
+                    Some(a) if a.change_id().is_root() => {
+                        encode_branch_id(&BranchId::new(*change_id, a.branch_idx()))
+                    }
+                    Some(a) => encode_branch_id(a),
+                    None => [0u8; 12],
+                };
+                branch_after_table.insert(&branch_key, &after_key)?;
+
+                if let Some((start, end)) = line_ops.content_range() {
+                    let graph_node = GraphNode {
+                        change: *change_id,
+                        start,
+                        end,
+                    };
+                    let vertex_bytes = encode_vertex_position(&graph_node);
+                    branch_vertex_table.insert(&branch_key, &vertex_bytes)?;
+                    vertex_branch_table.insert(&vertex_bytes, &branch_key)?;
+                }
+
+                for leaf_op in content {
+                    let LeafOp::Insert { kind, content, .. } = leaf_op else {
+                        unreachable!("batched apply only runs for insert-only leaf ops");
+                    };
+
+                    let leaf_id = LeafId::new(branch_id.change_id(), next_leaf_idx);
+                    next_leaf_idx += 1;
+                    let leaf_key = encode_leaf_id(&leaf_id);
+                    let leaf_value = encode_leaf_value(&SerializedLeaf {
+                        branch_id,
+                        kind: *kind,
+                        state: LeafState::Alive,
+                        content_start: 0,
+                        content_end: content.len() as u32,
+                    });
+                    leaves_table.insert(&leaf_key, &leaf_value)?;
+                    branch_leaves_table.insert(&branch_key, &leaf_key)?;
+                    stats.leaves_created += 1;
+                }
             }
         }
     }
@@ -312,6 +485,7 @@ fn apply_single_file_ops<T: MutTxnT>(
     change_id: NodeId,
     ops: &FileOps,
     stats: &mut ApplyFileOpsStats,
+    next_leaf_idx: &mut u32,
 ) -> PristineResult<()> {
     // Resolve the TrunkId placeholder.  The recorder stores TrunkIds
     // with `change_id = NodeId::ROOT` as a placeholder meaning "this
@@ -336,7 +510,7 @@ fn apply_single_file_ops<T: MutTxnT>(
 
     // Apply line operations
     for line_ops in ops.line_ops() {
-        apply_line_ops_with_position(txn, change_id, trunk_id, line_ops, stats)?;
+        apply_line_ops_with_position(txn, change_id, trunk_id, line_ops, stats, next_leaf_idx)?;
     }
 
     Ok(())
@@ -417,6 +591,7 @@ fn apply_line_ops_with_position<T: MutTxnT>(
     trunk_id: TrunkId,
     line_ops: &LineOps,
     stats: &mut ApplyFileOpsStats,
+    next_leaf_idx: &mut u32,
 ) -> PristineResult<()> {
     // Resolve the BranchId.  The change file stores BranchIds with
     // `change_id = NodeId::ROOT` as a placeholder meaning "this change
@@ -493,8 +668,9 @@ fn apply_line_ops_with_position<T: MutTxnT>(
             }
 
             // Apply leaf operations for this line's tokens
-            for (leaf_idx, leaf_op) in content.iter().enumerate() {
-                let leaf_id = LeafId::new(branch_id.change_id(), leaf_idx as u32);
+            for leaf_op in content {
+                let leaf_id = LeafId::new(branch_id.change_id(), *next_leaf_idx);
+                *next_leaf_idx += 1;
                 apply_leaf_op(txn, branch_id, leaf_id, leaf_op, stats)?;
             }
         }
@@ -571,8 +747,9 @@ fn apply_line_ops_with_position<T: MutTxnT>(
             }
 
             // Apply leaf operations for the new content
-            for (leaf_idx, leaf_op) in new_content.iter().enumerate() {
-                let leaf_id = LeafId::new(branch_id.change_id(), leaf_idx as u32);
+            for leaf_op in new_content {
+                let leaf_id = LeafId::new(branch_id.change_id(), *next_leaf_idx);
+                *next_leaf_idx += 1;
                 apply_leaf_op(txn, branch_id, leaf_id, leaf_op, stats)?;
             }
         }

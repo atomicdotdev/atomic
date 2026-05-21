@@ -257,5 +257,7 @@ pub use conflict::{
 };
 
 // Re-export FileOps application
-pub use file_ops::{apply_file_ops, apply_file_ops_batched, ApplyFileOpsStats};
+pub use file_ops::{
+    apply_file_ops, apply_file_ops_batched, apply_file_ops_batched_groups, ApplyFileOpsStats,
+};
 pub use graph_batch::GraphWriteBatch;

@@ -3,7 +3,9 @@ use super::*;
 mod tests {
     use super::*;
     use atomic_core::change::ChangeHeader;
-    use atomic_core::types::Merkle;
+    use atomic_core::change::{Atom, Encoding, Insertion, Local};
+    use atomic_core::types::{ChangePosition, Merkle, Position};
+    use atomic_core::EdgeFlags;
 
     // ChangeFormat Tests
 
@@ -359,6 +361,23 @@ mod tests {
         )
     }
 
+    fn test_edit_hunk(path: &str, start: u64, end: u64) -> GraphOp<Hash> {
+        let change = Hash::of(format!("{}:{}:{}", path, start, end).as_bytes());
+        let inode = Position::new(change, ChangePosition::new(0));
+        GraphOp::Edit {
+            change: Atom::Insertion(Insertion {
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                flag: EdgeFlags::BLOCK,
+                start: ChangePosition::new(start),
+                end: ChangePosition::new(end),
+                inode,
+            }),
+            local: Local::new(path, 1),
+            encoding: Some(Encoding::Utf8),
+        }
+    }
+
     #[test]
     fn test_json_change_from_change() {
         let change = create_test_change();
@@ -474,6 +493,23 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert!(parsed.get("sequence").is_none() || parsed["sequence"].is_null());
+    }
+
+    #[test]
+    fn test_hunk_display_summaries_coalesce_same_path() {
+        let hunks = vec![
+            test_edit_hunk("src/main.rs", 0, 5),
+            test_edit_hunk("src/main.rs", 5, 10),
+            test_edit_hunk("src/lib.rs", 10, 15),
+        ];
+
+        let summaries = hunk_display_summaries(&hunks);
+
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].path, "src/lib.rs");
+        assert_eq!(summaries[0].info, "(+1 span: new content)");
+        assert_eq!(summaries[1].path, "src/main.rs");
+        assert_eq!(summaries[1].info, "(2 hunks: 2x +1 span: new content)");
     }
 
     // Integration Tests

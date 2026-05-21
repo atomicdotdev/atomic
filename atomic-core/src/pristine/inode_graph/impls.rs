@@ -176,6 +176,57 @@ impl InodeGraphOps for ReadTxn {
         Ok(None)
     }
 
+    fn find_block_end_in_inode(
+        &self,
+        inode: Inode,
+        pos: Position<NodeId>,
+    ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
+        let table = self.txn.open_multimap_table(INODE_GRAPH)?;
+
+        let inode_id = inode.get();
+        let change_id = pos.change.get();
+        let target_pos = pos.pos.get();
+
+        let empty_key = encode_inode_vertex(inode_id, change_id, target_pos, target_pos);
+        if table.get(&empty_key)?.next().is_some() {
+            return Ok(Some(GraphNode {
+                change: NodeId::new(change_id),
+                start: ChangePosition::new(target_pos),
+                end: ChangePosition::new(target_pos),
+            }));
+        }
+
+        let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
+        let end_key = encode_inode_vertex(inode_id, change_id, target_pos, u64::MAX);
+
+        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
+            let (key, _values) = result?;
+            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
+
+            if v_change != change_id {
+                continue;
+            }
+
+            if v_end == target_pos && v_start < v_end {
+                return Ok(Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                }));
+            }
+
+            if v_start <= target_pos && target_pos < v_end {
+                return Ok(Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
     fn count_inode_vertices(&self, inode: Inode) -> Result<usize, Self::InodeError> {
         let table = self.txn.open_multimap_table(INODE_GRAPH)?;
 
@@ -335,6 +386,57 @@ impl<'a> InodeGraphOps for WriteTxn<'a> {
             let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
 
             if v_change == change_id && v_start <= target_pos && target_pos < v_end {
+                return Ok(Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn find_block_end_in_inode(
+        &self,
+        inode: Inode,
+        pos: Position<NodeId>,
+    ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
+        let table = self.txn.open_multimap_table(INODE_GRAPH)?;
+
+        let inode_id = inode.get();
+        let change_id = pos.change.get();
+        let target_pos = pos.pos.get();
+
+        let empty_key = encode_inode_vertex(inode_id, change_id, target_pos, target_pos);
+        if table.get(&empty_key)?.next().is_some() {
+            return Ok(Some(GraphNode {
+                change: NodeId::new(change_id),
+                start: ChangePosition::new(target_pos),
+                end: ChangePosition::new(target_pos),
+            }));
+        }
+
+        let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
+        let end_key = encode_inode_vertex(inode_id, change_id, target_pos, u64::MAX);
+
+        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
+            let (key, _values) = result?;
+            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
+
+            if v_change != change_id {
+                continue;
+            }
+
+            if v_end == target_pos && v_start < v_end {
+                return Ok(Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                }));
+            }
+
+            if v_start <= target_pos && target_pos < v_end {
                 return Ok(Some(GraphNode {
                     change: NodeId::new(v_change),
                     start: ChangePosition::new(v_start),
