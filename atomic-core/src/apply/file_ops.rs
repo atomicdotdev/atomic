@@ -305,7 +305,6 @@ pub fn apply_file_ops_batched(
             }
         }
     }
-
     Ok(stats)
 }
 

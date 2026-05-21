@@ -742,7 +742,6 @@ where
             return Ok(ordered);
         }
     }
-
     let mut ordered: Vec<GraphNode<NodeId>> = Vec::new();
     let mut visited: HashSet<GraphNode<NodeId>> = HashSet::new();
     let mut current = inode_pos.inode_node();

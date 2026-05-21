@@ -27,7 +27,6 @@ count_imported_git_changes() {
 git_first_parent_commit_count() {
     git rev-list --first-parent --count HEAD 2>/dev/null || echo "0"
 }
-
 assert_imported_git_change_count() {
     local desc="$1"
     local expected="$2"

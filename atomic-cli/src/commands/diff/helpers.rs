@@ -75,6 +75,24 @@ impl Diff {
         change_hash: &Hash,
         config: &DiffOutputConfig,
     ) -> CliResult<()> {
+        if let Some((file_diffs, stats)) = Self::build_git_import_file_diffs(change) {
+            if file_diffs.is_empty() {
+                self.print_no_changes();
+                return Ok(());
+            }
+
+            if config.format == DiffFormat::Unified {
+                self.print_change_header(change, change_hash, config);
+            }
+
+            return match config.format {
+                DiffFormat::Unified => self.print_unified(&file_diffs, config),
+                DiffFormat::Stat => self.print_stat(&stats, config),
+                DiffFormat::NameOnly => self.print_name_only(&file_diffs),
+                DiffFormat::NameStatus => self.print_name_status(&file_diffs, config),
+            };
+        }
+
         let file_ops = change.file_ops();
 
         if file_ops.is_empty() {
