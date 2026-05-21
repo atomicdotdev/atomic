@@ -137,29 +137,29 @@ atomic move config.toml src/config.toml
 
 **Alias:** `atomic mv`
 
-#### `atomic reset`
+#### `atomic restore`
 
-Reset the working copy to the last recorded state, discarding uncommitted changes.
+Restore the working copy to the last recorded state, discarding uncommitted
+changes (the working-copy counterpart of `git restore`). The legacy name
+`atomic reset` is kept as an alias.
 
 ```bash
-# Preview what would be reset
-atomic reset --dry-run
+# Restore specific files (no --force needed)
+atomic restore src/main.rs
 
-# Reset everything (requires --force)
-atomic reset --force
+# Restore everything (requires --force)
+atomic restore --force
 
-# Reset specific files
-atomic reset src/main.rs
-
-# Reset to a different stack's state
-atomic reset --stack main
+# Preview a single file's pristine content
+atomic restore --dry-run src/main.rs
 ```
 
 | Option | Description |
 |--------|-------------|
-| `--force` | Required to confirm destructive reset |
+| `--force` | Required only for a whole-tree restore |
 | `--dry-run` | Preview without making changes |
-| `--stack <NAME>` | Reset to a specific stack's state |
+
+To switch views, use `atomic view switch <view>`.
 
 ---
 

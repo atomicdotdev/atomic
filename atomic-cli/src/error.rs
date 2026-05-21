@@ -294,6 +294,17 @@ pub enum CliError {
         message: String,
     },
 
+    /// A destructive operation was blocked because it would discard
+    /// uncommitted changes and `--force` was not supplied.
+    ///
+    /// This is an expected, user-fixable condition (not a bug): the user
+    /// asked for a whole-working-copy operation that would throw away work.
+    #[error("Cannot {operation}: this would discard all uncommitted changes")]
+    RequiresForce {
+        /// The operation that was blocked, e.g. "reset".
+        operation: String,
+    },
+
     // Internal Errors
     /// An unexpected internal error occurred.
     ///
@@ -440,6 +451,7 @@ impl CliError {
                 | Self::RemoteNotFound { .. }
                 | Self::AuthenticationFailed { .. }
                 | Self::InvalidArgument { .. }
+                | Self::RequiresForce { .. }
                 | Self::InvalidRepository { .. }
                 | Self::InvalidPath { .. }
         )
@@ -530,6 +542,9 @@ impl CliError {
             Self::InvalidArgument { .. } => {
                 Some("Run 'atomic <command> --help' for usage information.")
             }
+            Self::RequiresForce { .. } => Some(
+                "Restore specific files with 'atomic restore <file>...', or use 'atomic restore --force' to discard everything.",
+            ),
             Self::Internal(_) => {
                 Some("This appears to be a bug. Please report it at: https://github.com/atomicdotdev/atomic/issues")
             }
@@ -557,6 +572,7 @@ impl CliError {
             Self::NothingToRecord
             | Self::Cancelled
             | Self::FileAlreadyTracked { .. }
+            | Self::RequiresForce { .. }
             | Self::ViewAlreadyExists { .. } => 1,
 
             // Command-line usage errors
@@ -749,6 +765,17 @@ mod tests {
         assert!(
             !CliError::Io(std::io::Error::new(std::io::ErrorKind::Other, "test")).is_user_fixable()
         );
+    }
+
+    #[test]
+    fn test_requires_force_is_user_fixable_not_internal() {
+        let err = CliError::RequiresForce {
+            operation: "restore".to_string(),
+        };
+        assert!(err.is_user_fixable());
+        assert!(!err.is_internal());
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.suggestion().is_some());
     }
 
     #[test]
