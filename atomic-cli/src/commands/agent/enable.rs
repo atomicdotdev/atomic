@@ -341,9 +341,11 @@ impl Enable {
                         println!("Hooks written to: ~/.codex/hooks.json");
                         println!();
                         println!("Every Codex session in a project with .atomic/ will now:");
-                        println!("  • Record each turn as an Atomic change with full provenance");
-                        println!("  • Track session metadata (turn number, timing, files)");
-                        println!("  • Capture tool calls through pre/post tool hooks");
+                        println!(
+                            "  \u{2022} Record each turn as an Atomic change with full provenance"
+                        );
+                        println!("  \u{2022} Track session metadata (turn number, timing, files)");
+                        println!("  \u{2022} Capture tool calls through pre/post tool hooks");
                     }
                     Ok(_) => {
                         print_success("Global hooks already up to date.");
@@ -354,9 +356,21 @@ impl Enable {
                 }
             }
 
+            "kiro" => {
+                print_success("Kiro hooks are configured through the IDE panel.");
+                println!();
+                println!("Install the atomic-kiro package for skills, steering, and hook scripts:");
+                println!("  npx atomic-kiro");
+                println!();
+                println!(
+                    "Then configure hooks in Kiro IDE \u{2192} Agent Steering & Skills panel."
+                );
+                println!("See: https://github.com/atomicdotdev/atomic-kiro");
+            }
+
             other => {
                 print_warning(&format!(
-                    "Global install is not supported for '{}'. Supported agents: claude-code, gemini-cli, codex",
+                    "Global install is not supported for '{}'. Supported agents: claude-code, gemini-cli, codex, kiro",
                     other
                 ));
             }

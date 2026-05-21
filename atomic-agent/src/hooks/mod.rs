@@ -62,6 +62,7 @@ pub mod codex;
 pub mod copilot;
 pub mod cursor;
 pub mod gemini_cli;
+pub mod kiro;
 pub mod opencode;
 pub mod pi;
 pub mod sherpa;
@@ -247,6 +248,7 @@ impl AgentRegistry {
     /// - Copilot (`copilot`)
     /// - Cursor (`cursor`)
     /// - Gemini CLI (`gemini-cli`)
+    /// - Kiro (`kiro`)
     /// - OpenCode (`opencode`)
     /// - Pi (`pi`)
     /// - Sherpa (`sherpa`)
@@ -258,6 +260,7 @@ impl AgentRegistry {
         registry.register(Box::new(copilot::CopilotHook::new()));
         registry.register(Box::new(cursor::CursorHook::new()));
         registry.register(Box::new(gemini_cli::GeminiCliHook::new()));
+        registry.register(Box::new(kiro::KiroHook::new()));
         registry.register(Box::new(opencode::OpenCodeHook::new()));
         registry.register(Box::new(pi::PiHook::new()));
         registry.register(Box::new(sherpa::SherpaHook::new()));

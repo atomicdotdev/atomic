@@ -175,6 +175,14 @@ mod tests {
     }
 
     #[test]
+    fn test_default_registry_has_kiro() {
+        let registry = AgentRegistry::with_defaults();
+        let agent = registry.get("kiro");
+        assert!(agent.is_some(), "Default registry should include kiro");
+        assert_eq!(agent.unwrap().display_name(), "Kiro");
+    }
+
+    #[test]
     fn test_default_registry_has_pi() {
         let registry = AgentRegistry::with_defaults();
         let agent = registry.get("pi");

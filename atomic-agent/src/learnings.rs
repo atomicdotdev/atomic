@@ -115,6 +115,7 @@ const SECTION_NOTE: &str =
 /// assert_eq!(context_file_for_agent("gemini-cli"), "GEMINI.md");
 /// assert_eq!(context_file_for_agent("codex"), "codex.md");
 /// assert_eq!(context_file_for_agent("opencode"), "opencode.md");
+/// assert_eq!(context_file_for_agent("kiro"), "AGENTS.md");
 /// assert_eq!(context_file_for_agent("unknown"), ".atomic/learnings.md");
 /// ```
 pub fn context_file_for_agent(agent_name: &str) -> &'static str {
@@ -123,6 +124,7 @@ pub fn context_file_for_agent(agent_name: &str) -> &'static str {
         "gemini-cli" => "GEMINI.md",
         "codex" => "codex.md",
         "opencode" => "opencode.md",
+        "kiro" => "AGENTS.md",
         _ => ".atomic/learnings.md",
     }
 }
@@ -627,6 +629,11 @@ mod tests {
     #[test]
     fn test_context_file_opencode() {
         assert_eq!(context_file_for_agent("opencode"), "opencode.md");
+    }
+
+    #[test]
+    fn test_context_file_kiro() {
+        assert_eq!(context_file_for_agent("kiro"), "AGENTS.md");
     }
 
     #[test]
