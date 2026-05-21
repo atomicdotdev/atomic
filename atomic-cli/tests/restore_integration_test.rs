@@ -1,9 +1,9 @@
-//! Integration tests for `atomic reset`, driving the real CLI binary
-//! end-to-end (`Reset::run()`), against a temporary repository.
+//! Integration tests for `atomic restore`, driving the real CLI binary
+//! end-to-end (`Restore::run()`), against a temporary repository.
 //!
-//! These complement the unit tests in `commands/reset.rs` by exercising the
-//! full command path: argument parsing, the safety guard, `--view` rejection,
-//! and the actual filesystem effects.
+//! These complement the unit tests in `commands/restore.rs` by exercising the
+//! full command path: argument parsing, the safety guard, the `reset` alias,
+//! `--view` removal, and the actual filesystem effects.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -34,30 +34,43 @@ fn repo_with_recorded_file() -> TempDir {
 }
 
 #[test]
-fn reset_named_modified_file_restores_without_force() {
+fn restore_named_modified_file_without_force() {
+    let dir = repo_with_recorded_file();
+    let root = dir.path();
+
+    std::fs::write(root.join("file.txt"), b"local edit\n").unwrap();
+
+    let out = atomic(root, &["restore", "file.txt"]);
+    assert!(out.status.success(), "restore <file> should succeed");
+    assert_eq!(std::fs::read(root.join("file.txt")).unwrap(), b"v1\n");
+}
+
+#[test]
+fn reset_alias_still_works() {
+    // The legacy `reset` name is kept as an alias for `restore`.
     let dir = repo_with_recorded_file();
     let root = dir.path();
 
     std::fs::write(root.join("file.txt"), b"local edit\n").unwrap();
 
     let out = atomic(root, &["reset", "file.txt"]);
-    assert!(out.status.success(), "reset <file> should succeed");
+    assert!(out.status.success(), "reset alias should still work");
     assert_eq!(std::fs::read(root.join("file.txt")).unwrap(), b"v1\n");
 }
 
 #[test]
-fn reset_named_file_not_blocked_by_unrelated_dirty_file() {
+fn restore_named_file_not_blocked_by_unrelated_dirty_file() {
     let dir = repo_with_recorded_file();
     let root = dir.path();
     std::fs::write(root.join("other.txt"), b"o1\n").unwrap();
     assert!(atomic(root, &["add", "other.txt"]).status.success());
     assert!(atomic(root, &["record", "-m", "two"]).status.success());
 
-    // Both files dirty; reset only file.txt.
+    // Both files dirty; restore only file.txt.
     std::fs::write(root.join("file.txt"), b"edit-a\n").unwrap();
     std::fs::write(root.join("other.txt"), b"edit-b\n").unwrap();
 
-    let out = atomic(root, &["reset", "file.txt"]);
+    let out = atomic(root, &["restore", "file.txt"]);
     assert!(out.status.success());
     assert_eq!(std::fs::read(root.join("file.txt")).unwrap(), b"v1\n");
     // The unrelated dirty file is untouched.
@@ -65,19 +78,22 @@ fn reset_named_file_not_blocked_by_unrelated_dirty_file() {
 }
 
 #[test]
-fn whole_tree_reset_without_force_is_user_error_not_internal() {
+fn whole_tree_restore_without_force_is_user_error_not_internal() {
     let dir = repo_with_recorded_file();
     let root = dir.path();
     std::fs::write(root.join("file.txt"), b"dirty\n").unwrap();
 
-    let out = atomic(root, &["reset"]);
-    assert!(!out.status.success(), "whole-tree reset needs --force");
+    let out = atomic(root, &["restore"]);
+    assert!(!out.status.success(), "whole-tree restore needs --force");
     assert_eq!(out.status.code(), Some(1), "user-level exit code");
 
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
-        combined.contains("Cannot reset"),
+        combined.contains("Cannot restore"),
         "should explain the guard, got: {combined}"
     );
     assert!(
@@ -89,14 +105,14 @@ fn whole_tree_reset_without_force_is_user_error_not_internal() {
 }
 
 #[test]
-fn reset_added_file_untracks_and_keeps_it_on_disk() {
+fn restore_added_file_untracks_and_keeps_it_on_disk() {
     let dir = repo_with_recorded_file();
     let root = dir.path();
 
     std::fs::write(root.join("new.txt"), b"brand new\n").unwrap();
     assert!(atomic(root, &["add", "new.txt"]).status.success());
 
-    let out = atomic(root, &["reset", "new.txt"]);
+    let out = atomic(root, &["restore", "new.txt"]);
     assert!(out.status.success());
     // Kept on disk...
     assert!(root.join("new.txt").exists());
@@ -118,7 +134,7 @@ fn dry_run_added_file_reports_untrack_without_erroring() {
     std::fs::write(root.join("new.txt"), b"brand new\n").unwrap();
     assert!(atomic(root, &["add", "new.txt"]).status.success());
 
-    let out = atomic(root, &["reset", "--dry-run", "new.txt"]);
+    let out = atomic(root, &["restore", "--dry-run", "new.txt"]);
     assert!(
         out.status.success(),
         "dry-run on an added file must not error"
@@ -141,39 +157,17 @@ fn dry_run_added_file_reports_untrack_without_erroring() {
 }
 
 #[test]
-fn reset_view_fails_fast_and_points_to_view_switch() {
-    // `reset --view` must not silently half-switch views (it used to leave
-    // stale working-copy content while printing "working copy already clean").
-    // It now fails fast and directs the user to `atomic view switch`.
+fn view_flag_is_removed() {
+    // `--view` was removed; switching views is `atomic view switch`. clap
+    // should reject the unknown flag before any work happens.
     let dir = repo_with_recorded_file();
     let root = dir.path();
-    assert!(atomic(root, &["view", "create", "feature"])
-        .status
-        .success());
 
-    std::fs::write(root.join("file.txt"), b"DIRTY-EDIT\n").unwrap();
-
-    let out = atomic(root, &["reset", "--force", "--view", "feature"]);
-    assert!(!out.status.success(), "reset --view should be rejected");
-
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let out = atomic(root, &["restore", "--view", "feature", "--force"]);
+    assert!(!out.status.success(), "--view should no longer be accepted");
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        combined.contains("view switch"),
-        "should point users to 'atomic view switch', got: {combined}"
-    );
-    // It must not have touched the working copy or switched the view.
-    assert_eq!(
-        std::fs::read(root.join("file.txt")).unwrap(),
-        b"DIRTY-EDIT\n"
-    );
-    let views = atomic(root, &["view", "list"]);
-    let views_text = String::from_utf8_lossy(&views.stdout);
-    assert!(
-        views_text.contains("* dev"),
-        "current view must be unchanged (still dev), got: {views_text}"
+        stderr.contains("unexpected argument") || stderr.contains("--view"),
+        "clap should reject --view, got: {stderr}"
     );
 }

@@ -543,7 +543,7 @@ impl CliError {
                 Some("Run 'atomic <command> --help' for usage information.")
             }
             Self::RequiresForce { .. } => Some(
-                "Reset specific files with 'atomic reset <file>...', or use 'atomic reset --force' to discard everything.",
+                "Restore specific files with 'atomic restore <file>...', or use 'atomic restore --force' to discard everything.",
             ),
             Self::Internal(_) => {
                 Some("This appears to be a bug. Please report it at: https://github.com/atomicdotdev/atomic/issues")
@@ -770,7 +770,7 @@ mod tests {
     #[test]
     fn test_requires_force_is_user_fixable_not_internal() {
         let err = CliError::RequiresForce {
-            operation: "reset".to_string(),
+            operation: "restore".to_string(),
         };
         assert!(err.is_user_fixable());
         assert!(!err.is_internal());
