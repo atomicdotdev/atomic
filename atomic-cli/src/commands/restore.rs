@@ -355,16 +355,20 @@ impl Command for Restore {
         let files_to_restore = self.files_to_restore(&status);
 
         // Handle dry-run for a single file by printing its pristine content to
-        // stdout (useful for piping). This only makes sense for files that
-        // have pristine content; an Added file would be untracked, not
-        // restored, so fall through to the listing branch below.
+        // stdout (useful for piping). This only makes sense when the argument
+        // is exactly one concrete file:
+        // - a directory or prefix filter (e.g. `src/`) has no pristine content
+        //   of its own and must fall through to the listing branch;
+        // - an Added file would be untracked, not restored, so it lists too.
         let single_added = files_to_restore
             .first()
             .map(|(_, s)| *s == FileStatus::Added)
             .unwrap_or(false);
-        if self.dry_run && self.files.len() == 1 && files_to_restore.len() <= 1 && !single_added {
-            let path = &self.files[0];
-            return self.dry_run_single_file(&repo, path);
+        let single_file_arg = self.files.len() == 1
+            && !self.files[0].ends_with('/')
+            && !repo_root.join(&self.files[0]).is_dir();
+        if self.dry_run && single_file_arg && !single_added {
+            return self.dry_run_single_file(&repo, &self.files[0]);
         }
 
         // Dry run mode - just show what would happen

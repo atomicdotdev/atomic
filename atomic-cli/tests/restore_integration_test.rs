@@ -157,6 +157,40 @@ fn dry_run_added_file_reports_untrack_without_erroring() {
 }
 
 #[test]
+fn dry_run_directory_lists_instead_of_reading_pristine() {
+    // `restore --dry-run src/` must list what would be restored, not try to
+    // read pristine content for the directory itself (which 404s).
+    let dir = repo_with_recorded_file();
+    let root = dir.path();
+    std::fs::create_dir(root.join("src")).unwrap();
+    std::fs::write(root.join("src/main.rs"), b"v1\n").unwrap();
+    assert!(atomic(root, &["add", "src/main.rs"]).status.success());
+    assert!(atomic(root, &["record", "-m", "src"]).status.success());
+
+    // One modified file under src/.
+    std::fs::write(root.join("src/main.rs"), b"edited\n").unwrap();
+
+    let out = atomic(root, &["restore", "--dry-run", "src/"]);
+    assert!(
+        out.status.success(),
+        "dry-run on a directory must not error"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Would restore: src/main.rs"),
+        "should list the matched file, got: {combined}"
+    );
+    assert!(
+        !combined.contains("File not found"),
+        "must not read pristine for the directory itself: {combined}"
+    );
+}
+
+#[test]
 fn view_flag_is_removed() {
     // `--view` was removed; switching views is `atomic view switch`. clap
     // should reject the unknown flag before any work happens.
@@ -169,5 +203,23 @@ fn view_flag_is_removed() {
     assert!(
         stderr.contains("unexpected argument") || stderr.contains("--view"),
         "clap should reject --view, got: {stderr}"
+    );
+}
+
+#[test]
+fn view_flag_is_removed_for_reset_alias_too() {
+    // The `reset` alias must also reject `--view`, not silently accept it.
+    let dir = repo_with_recorded_file();
+    let root = dir.path();
+
+    let out = atomic(root, &["reset", "--view", "feature", "--force"]);
+    assert!(
+        !out.status.success(),
+        "--view should be rejected via the reset alias too"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unexpected argument") || stderr.contains("--view"),
+        "clap should reject --view on the reset alias, got: {stderr}"
     );
 }
