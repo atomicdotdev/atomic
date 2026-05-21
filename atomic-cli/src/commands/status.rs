@@ -30,7 +30,7 @@
 //! State: ABCDEF123456
 //!
 //! Changes to be recorded:
-//!   (use "atomic reset <file>..." to discard changes)
+//!   (use "atomic restore <file>..." to discard changes)
 //!
 //!     new file:   src/new_feature.rs
 //!     modified:   src/main.rs
@@ -281,7 +281,7 @@ impl Status {
             print_section("Changes to be recorded:");
             println!(
                 "  {}",
-                hint("(use \"atomic reset <file>...\" to discard changes)")
+                hint("(use \"atomic restore <file>...\" to discard changes)")
             );
             print_blank();
 

@@ -1,209 +1,192 @@
 //! Codex hook adapter for Atomic Agent.
 //!
-//! Handles hook JSON parsing, installation into `.codex/hooks.json`,
-//! and presence detection via the `.codex/` directory.
+//! Codex reads hooks from `~/.codex/hooks.json`. The installed Atomic hooks
+//! call `atomic agent hooks codex <verb>` with JSON on stdin.
 //!
-//! # Codex Hooks Architecture
+//! Supported verbs:
 //!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────────────────┐
-//! │  Codex Hooks (.codex/hooks.json)                                        │
-//! │                                                                         │
-//! │  SessionStart      ──▶  atomic agent hooks codex session-start         │
-//! │  UserPromptSubmit  ──▶  atomic agent hooks codex user-prompt-submit    │
-//! │  Stop              ──▶  atomic agent hooks codex stop                  │
-//! │  PostToolUse       ──▶  atomic agent hooks codex post-tool             │
-//! │  PreToolUse        ──▶  atomic agent hooks codex pre-tool              │
-//! └─────────────────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! # Config Format
-//!
-//! Codex uses `.codex/hooks.json` (project-level) or `~/.codex/hooks.json`
-//! (user-level). The format uses PascalCase event names:
-//!
-//! ```json
-//! {
-//!   "hooks": {
-//!     "SessionStart": [{ "hooks": [{ "type": "command", "command": "..." }] }],
-//!     "PostToolUse": [{ "hooks": [{ "type": "command", "command": "..." }] }]
-//!   }
-//! }
-//! ```
-//!
-//! # Exit Code Behavior
-//!
-//! Same as Claude Code: exit 0 = success, exit 2 = block.
-//!
-//! # Limitations
-//!
-//! - No `SessionEnd` event (Codex does not fire one)
-//! - `PostToolUse` currently only fires for Bash tool (WIP)
-//! - Feature flag `[features] codex_hooks = true` required in config.toml
+//! | Codex hook       | CLI verb              | HookType       |
+//! |------------------|-----------------------|----------------|
+//! | `SessionStart`   | `session-start`       | SessionStart   |
+//! | `UserPromptSubmit` | `user-prompt-submit` | TurnStart      |
+//! | `Stop`           | `stop`                | TurnEnd        |
+//! | `PreToolUse`     | `pre-tool`            | PreToolUse     |
+//! | `PostToolUse`    | `post-tool`           | PostToolUse    |
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
 
 use super::AgentHook;
 
-// =============================================================================
-// Constants
-// =============================================================================
-
-/// The directory where Codex stores per-project configuration.
 const CODEX_DIR: &str = ".codex";
+const HOOKS_FILE: &str = "hooks.json";
+const ATOMIC_HOOK_PREFIX: &str = "atomic agent hooks codex";
 
-// =============================================================================
-// Codex JSON Input Types
-// =============================================================================
-
-/// JSON input for the `SessionStart` hook.
-///
-/// Fires when Codex begins a new session.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct SessionStartInput {
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
-    transcript_path: Option<String>,
+    thread_id: Option<String>,
     #[serde(default)]
-    cwd: Option<String>,
+    transcript_path: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     source: Option<String>,
     #[serde(default)]
-    hook_event_name: Option<String>,
+    cwd: Option<String>,
 }
 
-/// JSON input for the `UserPromptSubmit` hook (maps to TurnStart).
-///
-/// Fires after the user submits a prompt, before the model begins responding.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct UserPromptSubmitInput {
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
     transcript_path: Option<String>,
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
-    turn_id: Option<String>,
+    model: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
-/// JSON input for the `Stop` hook (maps to TurnEnd).
-///
-/// Fires when the model finishes responding for the turn.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct StopInput {
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
-    transcript_path: Option<String>,
+    thread_id: Option<String>,
     #[serde(default)]
-    cwd: Option<String>,
+    transcript_path: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
-    turn_id: Option<String>,
+    last_assistant_message: Option<String>,
     #[serde(default)]
     stop_hook_active: Option<bool>,
     #[serde(default)]
-    last_assistant_message: Option<String>,
+    cwd: Option<String>,
 }
 
-/// JSON input for the `PostToolUse` hook.
-///
-/// Currently only fires for the Bash tool (WIP for other tools).
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct PostToolUseInput {
+struct ToolUseInput {
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
     transcript_path: Option<String>,
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    turn_id: Option<String>,
     #[serde(default)]
     tool_name: Option<String>,
     #[serde(default)]
     tool_use_id: Option<String>,
     #[serde(default)]
-    tool_input: Option<serde_json::Value>,
+    tool_call_id: Option<String>,
     #[serde(default)]
-    tool_response: Option<serde_json::Value>,
+    call_id: Option<String>,
+    #[serde(default)]
+    tool_input: Option<Value>,
+    #[serde(default)]
+    tool_response: Option<Value>,
 }
 
-/// JSON input for the `PreToolUse` hook.
-///
-/// Fires before a tool is invoked.
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct PreToolUseInput {
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct CodexHooksFile {
     #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    transcript_path: Option<String>,
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    turn_id: Option<String>,
-    #[serde(default)]
-    tool_name: Option<String>,
-    #[serde(default)]
-    tool_use_id: Option<String>,
-    #[serde(default)]
-    tool_input: Option<serde_json::Value>,
+    hooks: Map<String, Value>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
-// =============================================================================
-// =============================================================================
-// CodexHook
-// =============================================================================
-
-/// Codex agent hook adapter.
-///
-/// Handles hook JSON parsing, installation into `.codex/hooks.json`,
-/// and presence detection via the `.codex/` directory.
-///
-/// Codex is OpenAI's coding agent. It uses a hooks system with PascalCase
-/// event names and a simpler config format than Claude Code.
 #[derive(Debug)]
 pub struct CodexHook {
-    _private: (), // prevent construction outside of new()
+    _private: (),
 }
 
 impl CodexHook {
-    /// Create a new Codex hook adapter.
     pub fn new() -> Self {
         Self { _private: () }
     }
 
-    /// Extract a session ID from an optional field, generating a fallback if missing.
-    ///
-    /// Codex provides stable session IDs, so we use them directly. If missing
-    /// (shouldn't happen in practice), fall back to a generated ID.
-    fn extract_session_id(session_id: Option<String>) -> String {
+    pub fn global_hooks_path() -> Option<PathBuf> {
+        dirs::home_dir().map(|home| home.join(CODEX_DIR).join(HOOKS_FILE))
+    }
+
+    pub fn install_global(&self, force: bool) -> AgentResult<usize> {
+        let path = Self::global_hooks_path().ok_or_else(|| AgentError::ConfigError {
+            operation: "resolve".to_string(),
+            path: PathBuf::from("~/.codex/hooks.json"),
+            reason: "Could not determine home directory for Codex hooks".to_string(),
+        })?;
+        install_hooks_at(&path, force)
+    }
+
+    pub fn uninstall_global(&self) -> AgentResult<()> {
+        if let Some(path) = Self::global_hooks_path() {
+            uninstall_hooks_at(&path)?;
+        }
+        Ok(())
+    }
+
+    pub fn is_installed_global(&self) -> bool {
+        Self::global_hooks_path().is_some_and(|path| hooks_file_has_atomic_hooks(&path))
+    }
+
+    fn local_hooks_path(repo_root: &Path) -> PathBuf {
+        repo_root.join(CODEX_DIR).join(HOOKS_FILE)
+    }
+
+    fn extract_session_id(
+        session_id: Option<String>,
+        thread_id: Option<String>,
+        raw: &Value,
+    ) -> String {
         session_id
+            .or(thread_id)
+            .or_else(|| value_string(raw, "conversation_id"))
+            .or_else(|| value_string(raw, "thread_id"))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("codex-{}", uuid_short()))
+    }
+
+    fn parse_json(&self, hook_type: HookType, input: &[u8]) -> AgentResult<Value> {
+        if input.is_empty() {
+            return Err(AgentError::HookInputEmpty {
+                agent: self.name().to_string(),
+                hook_type: hook_type.as_str().to_string(),
+            });
+        }
+
+        serde_json::from_slice(input).map_err(|e| AgentError::HookParseFailed {
+            agent: self.name().to_string(),
+            hook_type: hook_type.as_str().to_string(),
+            reason: e.to_string(),
+        })
+    }
+
+    fn parse_value<T: for<'de> Deserialize<'de>>(
+        &self,
+        hook_type: HookType,
+        raw_json: Value,
+    ) -> AgentResult<T> {
+        serde_json::from_value(raw_json).map_err(|e| AgentError::HookParseFailed {
+            agent: self.name().to_string(),
+            hook_type: hook_type.as_str().to_string(),
+            reason: e.to_string(),
+        })
     }
 }
 
@@ -212,10 +195,6 @@ impl Default for CodexHook {
         Self::new()
     }
 }
-
-// =============================================================================
-// AgentHook Trait Implementation
-// =============================================================================
 
 impl AgentHook for CodexHook {
     fn name(&self) -> &str {
@@ -227,154 +206,97 @@ impl AgentHook for CodexHook {
     }
 
     fn parse_event(&self, hook_type: HookType, input: &[u8]) -> AgentResult<TurnEvent> {
-        if input.is_empty() {
-            return Err(AgentError::HookInputEmpty {
-                agent: self.name().to_string(),
-                hook_type: hook_type.as_str().to_string(),
-            });
-        }
-
-        let raw_json: serde_json::Value =
-            serde_json::from_slice(input).map_err(|e| AgentError::HookParseFailed {
-                agent: self.name().to_string(),
-                hook_type: hook_type.as_str().to_string(),
-                reason: e.to_string(),
-            })?;
+        let raw_json = self.parse_json(hook_type, input)?;
 
         match hook_type {
             HookType::SessionStart => {
-                let parsed: SessionStartInput =
-                    serde_json::from_value(raw_json.clone()).map_err(|e| {
-                        AgentError::HookParseFailed {
-                            agent: self.name().to_string(),
-                            hook_type: hook_type.as_str().to_string(),
-                            reason: e.to_string(),
-                        }
-                    })?;
-
-                let session_id = Self::extract_session_id(parsed.session_id);
-                let mut event = TurnEvent::new(session_id, hook_type).with_raw_json(raw_json);
-
+                let parsed: SessionStartInput = self.parse_value(hook_type, raw_json.clone())?;
+                let mut event = TurnEvent::new(
+                    Self::extract_session_id(parsed.session_id, parsed.thread_id, &raw_json),
+                    hook_type,
+                )
+                .with_raw_json(with_openai_provider(raw_json));
                 if let Some(path) = parsed.transcript_path {
                     event = event.with_transcript_path(path);
                 }
-
                 Ok(event)
             }
-
             HookType::TurnStart => {
-                // Codex: UserPromptSubmit → TurnStart
-                let parsed: UserPromptSubmitInput = serde_json::from_value(raw_json.clone())
-                    .map_err(|e| AgentError::HookParseFailed {
-                        agent: self.name().to_string(),
-                        hook_type: hook_type.as_str().to_string(),
-                        reason: e.to_string(),
-                    })?;
-
-                let session_id = Self::extract_session_id(parsed.session_id);
-                let mut event = TurnEvent::new(session_id, hook_type).with_raw_json(raw_json);
-
+                let parsed: UserPromptSubmitInput =
+                    self.parse_value(hook_type, raw_json.clone())?;
+                let mut event = TurnEvent::new(
+                    Self::extract_session_id(parsed.session_id, parsed.thread_id, &raw_json),
+                    hook_type,
+                )
+                .with_raw_json(with_openai_provider(raw_json));
                 if let Some(path) = parsed.transcript_path {
                     event = event.with_transcript_path(path);
                 }
-                if let Some(prompt) = parsed.prompt {
+                if let Some(prompt) = parsed.prompt.filter(|p| !p.is_empty()) {
                     event = event.with_prompt(prompt);
                 }
-
                 Ok(event)
             }
-
             HookType::TurnEnd => {
-                // Codex: Stop → TurnEnd
-                let parsed: StopInput = serde_json::from_value(raw_json.clone()).map_err(|e| {
-                    AgentError::HookParseFailed {
-                        agent: self.name().to_string(),
-                        hook_type: hook_type.as_str().to_string(),
-                        reason: e.to_string(),
-                    }
-                })?;
-
-                let session_id = Self::extract_session_id(parsed.session_id);
-                let mut event = TurnEvent::new(session_id, hook_type).with_raw_json(raw_json);
-
+                let parsed: StopInput = self.parse_value(hook_type, raw_json.clone())?;
+                let raw_json = normalize_stop_raw(raw_json);
+                let mut event = TurnEvent::new(
+                    Self::extract_session_id(parsed.session_id, parsed.thread_id, &raw_json),
+                    hook_type,
+                )
+                .with_raw_json(with_openai_provider(raw_json));
                 if let Some(path) = parsed.transcript_path {
                     event = event.with_transcript_path(path);
                 }
-
                 Ok(event)
             }
-
-            HookType::PreToolUse => {
-                let parsed: PreToolUseInput =
-                    serde_json::from_value(raw_json.clone()).map_err(|e| {
-                        AgentError::HookParseFailed {
-                            agent: self.name().to_string(),
-                            hook_type: hook_type.as_str().to_string(),
-                            reason: e.to_string(),
-                        }
-                    })?;
-
-                let session_id = Self::extract_session_id(parsed.session_id);
-                let mut event = TurnEvent::new(session_id, hook_type).with_raw_json(raw_json);
-
+            HookType::PreToolUse | HookType::PostToolUse => {
+                let parsed: ToolUseInput = self.parse_value(hook_type, raw_json.clone())?;
+                let raw_json = if hook_type == HookType::PostToolUse {
+                    normalize_tool_raw(raw_json)
+                } else {
+                    raw_json
+                };
+                let mut event = TurnEvent::new(
+                    Self::extract_session_id(parsed.session_id, parsed.thread_id, &raw_json),
+                    hook_type,
+                )
+                .with_raw_json(with_openai_provider(raw_json));
                 if let Some(path) = parsed.transcript_path {
                     event = event.with_transcript_path(path);
                 }
-                if let Some(name) = parsed.tool_name {
+                if let Some(name) = parsed.tool_name.filter(|n| !n.is_empty()) {
                     event = event.with_tool_name(name);
                 }
-                if let Some(id) = parsed.tool_use_id {
+                let tool_use_id = parsed
+                    .tool_use_id
+                    .or(parsed.tool_call_id)
+                    .or(parsed.call_id)
+                    .filter(|id| !id.is_empty());
+                if let Some(id) = tool_use_id {
                     event = event.with_tool_use_id(id);
                 }
-
                 Ok(event)
             }
-
-            HookType::PostToolUse => {
-                let parsed: PostToolUseInput =
-                    serde_json::from_value(raw_json.clone()).map_err(|e| {
-                        AgentError::HookParseFailed {
-                            agent: self.name().to_string(),
-                            hook_type: hook_type.as_str().to_string(),
-                            reason: e.to_string(),
-                        }
-                    })?;
-
-                let session_id = Self::extract_session_id(parsed.session_id);
-                let mut event = TurnEvent::new(session_id, hook_type).with_raw_json(raw_json);
-
-                if let Some(path) = parsed.transcript_path {
-                    event = event.with_transcript_path(path);
-                }
-                if let Some(name) = parsed.tool_name {
-                    event = event.with_tool_name(name);
-                }
-                if let Some(id) = parsed.tool_use_id {
-                    event = event.with_tool_use_id(id);
-                }
-
-                Ok(event)
-            }
-
-            // Codex does NOT have a SessionEnd event
             HookType::SessionEnd => Err(AgentError::HookParseFailed {
                 agent: self.name().to_string(),
                 hook_type: hook_type.as_str().to_string(),
-                reason: "Codex does not support SessionEnd hooks".to_string(),
+                reason: "Codex does not currently emit SessionEnd hooks".to_string(),
             }),
         }
     }
 
-    fn install(&self, _repo_root: &Path) -> AgentResult<usize> {
-        Ok(0) // Installation handled by atomic-codex package
+    fn install(&self, repo_root: &Path) -> AgentResult<usize> {
+        install_hooks_at(&Self::local_hooks_path(repo_root), false)
     }
 
-    fn uninstall(&self, _repo_root: &Path) -> AgentResult<()> {
-        Ok(()) // Uninstallation handled by atomic-codex package
+    fn uninstall(&self, repo_root: &Path) -> AgentResult<()> {
+        uninstall_hooks_at(&Self::local_hooks_path(repo_root))
     }
 
-    fn is_installed(&self, _repo_root: &Path) -> bool {
-        false // Managed by atomic-codex package
+    fn is_installed(&self, repo_root: &Path) -> bool {
+        hooks_file_has_atomic_hooks(&Self::local_hooks_path(repo_root))
+            || self.is_installed_global()
     }
 
     fn supported_hooks(&self) -> Vec<HookType> {
@@ -389,6 +311,7 @@ impl AgentHook for CodexHook {
 
     fn detect_presence(&self, repo_root: &Path) -> bool {
         repo_root.join(CODEX_DIR).is_dir()
+            || Self::global_hooks_path().is_some_and(|path| path.exists())
     }
 
     fn hook_verbs(&self) -> Vec<&str> {
@@ -396,38 +319,286 @@ impl AgentHook for CodexHook {
             "session-start",
             "user-prompt-submit",
             "stop",
-            "post-tool",
             "pre-tool",
+            "post-tool",
         ]
     }
 }
 
-// =============================================================================
-// Verb Mapping
-// =============================================================================
-
-/// Map Codex hook verbs to Atomic HookTypes.
-///
-/// These are registered in addition to the standard verbs in
-/// [`HookType::from_verb`]. The CLI dispatch layer checks both.
 pub fn verb_to_hook_type(verb: &str) -> Option<HookType> {
     match verb {
         "session-start" => Some(HookType::SessionStart),
         "user-prompt-submit" => Some(HookType::TurnStart),
         "stop" => Some(HookType::TurnEnd),
-        "post-tool" => Some(HookType::PostToolUse),
         "pre-tool" => Some(HookType::PreToolUse),
+        "post-tool" => Some(HookType::PostToolUse),
         _ => None,
     }
 }
 
-// =============================================================================
-// Helpers
-// =============================================================================
+fn install_hooks_at(path: &Path, force: bool) -> AgentResult<usize> {
+    let mut config = read_hooks_file(path)?;
+    if force {
+        remove_atomic_hooks(&mut config.hooks);
+    }
 
-/// Generate a short hex ID from the current timestamp.
-///
-/// Used as a fallback session ID when Codex doesn't provide one.
+    let mut installed = 0;
+    for spec in CODEX_HOOK_DEFS {
+        if add_hook(
+            &mut config.hooks,
+            spec.event,
+            spec.command,
+            spec.status_message,
+        ) {
+            installed += 1;
+        }
+    }
+
+    write_hooks_file(path, &config)?;
+    Ok(installed)
+}
+
+fn uninstall_hooks_at(path: &Path) -> AgentResult<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut config = read_hooks_file(path)?;
+    remove_atomic_hooks(&mut config.hooks);
+    write_hooks_file(path, &config)
+}
+
+fn read_hooks_file(path: &Path) -> AgentResult<CodexHooksFile> {
+    if !path.exists() {
+        return Ok(CodexHooksFile::default());
+    }
+    let content = std::fs::read_to_string(path).map_err(|e| AgentError::ConfigError {
+        operation: "read".to_string(),
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    })?;
+    serde_json::from_str(&content).map_err(|e| AgentError::ConfigError {
+        operation: "parse".to_string(),
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    })
+}
+
+fn write_hooks_file(path: &Path, config: &CodexHooksFile) -> AgentResult<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| AgentError::ConfigError {
+            operation: "create directory".to_string(),
+            path: parent.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+    }
+    let content = serde_json::to_string_pretty(config).map_err(|e| AgentError::ConfigError {
+        operation: "serialize".to_string(),
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    })?;
+    std::fs::write(path, content).map_err(|e| AgentError::ConfigError {
+        operation: "write".to_string(),
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    })
+}
+
+fn hooks_file_has_atomic_hooks(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|content| content.contains(ATOMIC_HOOK_PREFIX))
+        .unwrap_or(false)
+}
+
+fn add_hook(
+    hooks: &mut Map<String, Value>,
+    event: &str,
+    command: &str,
+    status_message: Option<&str>,
+) -> bool {
+    let groups = hooks
+        .entry(event.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(groups) = groups.as_array_mut() else {
+        *groups = Value::Array(Vec::new());
+        let Some(groups) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
+            return false;
+        };
+        return add_hook_to_groups(groups, command, status_message);
+    };
+    add_hook_to_groups(groups, command, status_message)
+}
+
+fn add_hook_to_groups(
+    groups: &mut Vec<Value>,
+    command: &str,
+    status_message: Option<&str>,
+) -> bool {
+    if groups.iter().any(|group| group_has_command(group, command)) {
+        return false;
+    }
+
+    let mut entry = Map::new();
+    entry.insert("type".to_string(), Value::String("command".to_string()));
+    entry.insert("command".to_string(), Value::String(command.to_string()));
+    if let Some(message) = status_message {
+        entry.insert(
+            "statusMessage".to_string(),
+            Value::String(message.to_string()),
+        );
+    }
+
+    let mut group = Map::new();
+    group.insert(
+        "hooks".to_string(),
+        Value::Array(vec![Value::Object(entry)]),
+    );
+    groups.push(Value::Object(group));
+    true
+}
+
+fn group_has_command(group: &Value, command: &str) -> bool {
+    group
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|cmd| cmd == command)
+            })
+        })
+}
+
+fn remove_atomic_hooks(hooks: &mut Map<String, Value>) {
+    for value in hooks.values_mut() {
+        let Some(groups) = value.as_array_mut() else {
+            continue;
+        };
+        groups.retain_mut(|group| {
+            let Some(group_obj) = group.as_object_mut() else {
+                return true;
+            };
+            let Some(group_hooks) = group_obj.get_mut("hooks").and_then(Value::as_array_mut) else {
+                return true;
+            };
+            group_hooks.retain(|hook| {
+                !hook
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_atomic_hook)
+            });
+            !group_hooks.is_empty()
+        });
+    }
+}
+
+fn is_atomic_hook(command: &str) -> bool {
+    command.contains(ATOMIC_HOOK_PREFIX)
+}
+
+fn with_openai_provider(mut raw: Value) -> Value {
+    if let Some(obj) = raw.as_object_mut() {
+        obj.entry("provider".to_string())
+            .or_insert_with(|| Value::String("openai".to_string()));
+    }
+    raw
+}
+
+fn normalize_stop_raw(mut raw: Value) -> Value {
+    let stop_hook_active = raw.get("stop_hook_active").and_then(Value::as_bool);
+    if let Some(active) = stop_hook_active {
+        if let Some(obj) = raw.as_object_mut() {
+            obj.entry("finish_reason".to_string()).or_insert_with(|| {
+                Value::String(if active { "tool-calls" } else { "stop" }.to_string())
+            });
+        }
+    }
+    raw
+}
+
+fn normalize_tool_raw(mut raw: Value) -> Value {
+    let Some(response) = raw.get("tool_response").cloned() else {
+        return raw;
+    };
+
+    if let Some(output) = extract_tool_output(&response) {
+        insert_if_missing(&mut raw, "tool_output", Value::String(output));
+    }
+    if let Some(status) = extract_tool_status(&response) {
+        insert_if_missing(&mut raw, "status", Value::String(status));
+    }
+    if let Some(duration) = extract_duration_ms(&response) {
+        insert_if_missing(&mut raw, "duration", Value::Number(duration.into()));
+    }
+    if let Some(file_path) = extract_file_path(raw.get("tool_input"), &response) {
+        insert_if_missing(&mut raw, "file_path", Value::String(file_path));
+    }
+
+    raw
+}
+
+fn extract_tool_output(response: &Value) -> Option<String> {
+    if let Some(text) = response.as_str() {
+        return Some(text.to_string());
+    }
+    for key in ["output", "content", "result", "stdout", "message"] {
+        if let Some(text) = response.get(key).and_then(Value::as_str) {
+            return Some(text.to_string());
+        }
+    }
+    None
+}
+
+fn extract_tool_status(response: &Value) -> Option<String> {
+    if response
+        .get("success")
+        .and_then(Value::as_bool)
+        .is_some_and(|success| success)
+    {
+        return Some("completed".to_string());
+    }
+    if response
+        .get("success")
+        .and_then(Value::as_bool)
+        .is_some_and(|success| !success)
+        || response.get("error").is_some()
+    {
+        return Some("error".to_string());
+    }
+    None
+}
+
+fn extract_duration_ms(response: &Value) -> Option<u64> {
+    response
+        .get("duration_ms")
+        .or_else(|| response.get("duration"))
+        .and_then(Value::as_u64)
+}
+
+fn extract_file_path(tool_input: Option<&Value>, response: &Value) -> Option<String> {
+    for value in [tool_input, Some(response)].into_iter().flatten() {
+        for key in ["file_path", "filePath", "path"] {
+            if let Some(path) = value.get(key).and_then(Value::as_str) {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn insert_if_missing(raw: &mut Value, key: &str, value: Value) {
+    if let Some(obj) = raw.as_object_mut() {
+        obj.entry(key.to_string()).or_insert(value);
+    }
+}
+
+fn value_string(raw: &Value, key: &str) -> Option<String> {
+    raw.get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
 fn uuid_short() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -435,79 +606,95 @@ fn uuid_short() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-
-    // Use lower 32 bits of timestamp for a short hex ID
     format!("{:08x}", (now & 0xFFFF_FFFF) as u32)
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
+struct HookDef {
+    event: &'static str,
+    command: &'static str,
+    status_message: Option<&'static str>,
+}
+
+const CODEX_HOOK_DEFS: &[HookDef] = &[
+    HookDef {
+        event: "SessionStart",
+        command: "test -d .atomic && atomic agent hooks codex session-start || true",
+        status_message: Some("Atomic: tracking session"),
+    },
+    HookDef {
+        event: "UserPromptSubmit",
+        command: "test -d .atomic && atomic agent hooks codex user-prompt-submit || true",
+        status_message: None,
+    },
+    HookDef {
+        event: "Stop",
+        command: "test -d .atomic && atomic agent hooks codex stop || true",
+        status_message: None,
+    },
+    HookDef {
+        event: "PreToolUse",
+        command: "test -d .atomic && atomic agent hooks codex pre-tool || true",
+        status_message: None,
+    },
+    HookDef {
+        event: "PostToolUse",
+        command: "test -d .atomic && atomic agent hooks codex post-tool || true",
+        status_message: None,
+    },
+];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::HookType;
+    use tempfile::TempDir;
 
     fn make_hook() -> CodexHook {
         CodexHook::new()
     }
 
-    // =========================================================================
-    // Identity tests
-    // =========================================================================
-
     #[test]
     fn test_name() {
-        let hook = make_hook();
-        assert_eq!(hook.name(), "codex");
+        assert_eq!(make_hook().name(), "codex");
     }
 
     #[test]
     fn test_display_name() {
-        let hook = make_hook();
-        assert_eq!(hook.display_name(), "Codex");
+        assert_eq!(make_hook().display_name(), "Codex");
     }
 
     #[test]
     fn test_default() {
-        let hook = CodexHook::default();
-        assert_eq!(hook.name(), "codex");
+        assert_eq!(CodexHook::default().name(), "codex");
     }
 
     #[test]
     fn test_supported_hooks() {
-        let hook = make_hook();
-        let supported = hook.supported_hooks();
-        assert!(supported.contains(&HookType::SessionStart));
-        assert!(supported.contains(&HookType::TurnStart));
-        assert!(supported.contains(&HookType::TurnEnd));
-        assert!(supported.contains(&HookType::PreToolUse));
-        assert!(supported.contains(&HookType::PostToolUse));
-        // Codex does NOT support SessionEnd
-        assert!(!supported.contains(&HookType::SessionEnd));
-    }
-
-    #[test]
-    fn test_supported_hooks_count() {
-        let hook = make_hook();
-        assert_eq!(hook.supported_hooks().len(), 5);
+        let hooks = make_hook().supported_hooks();
+        assert_eq!(hooks.len(), 5);
+        assert!(hooks.contains(&HookType::SessionStart));
+        assert!(hooks.contains(&HookType::TurnStart));
+        assert!(hooks.contains(&HookType::TurnEnd));
+        assert!(hooks.contains(&HookType::PreToolUse));
+        assert!(hooks.contains(&HookType::PostToolUse));
+        assert!(!hooks.contains(&HookType::SessionEnd));
     }
 
     #[test]
     fn test_hook_verbs() {
         let hook = make_hook();
         let verbs = hook.hook_verbs();
-        assert_eq!(verbs.len(), 5);
-        assert!(verbs.contains(&"session-start"));
-        assert!(verbs.contains(&"user-prompt-submit"));
-        assert!(verbs.contains(&"stop"));
-        assert!(verbs.contains(&"post-tool"));
-        assert!(verbs.contains(&"pre-tool"));
+        assert_eq!(
+            verbs,
+            vec![
+                "session-start",
+                "user-prompt-submit",
+                "stop",
+                "pre-tool",
+                "post-tool"
+            ]
+        );
     }
-
-    // =========================================================================
-    // Verb mapping tests
-    // =========================================================================
 
     #[test]
     fn test_verb_to_hook_type() {
@@ -520,319 +707,253 @@ mod tests {
             Some(HookType::TurnStart)
         );
         assert_eq!(verb_to_hook_type("stop"), Some(HookType::TurnEnd));
-        assert_eq!(verb_to_hook_type("post-tool"), Some(HookType::PostToolUse));
         assert_eq!(verb_to_hook_type("pre-tool"), Some(HookType::PreToolUse));
+        assert_eq!(verb_to_hook_type("post-tool"), Some(HookType::PostToolUse));
+        assert_eq!(verb_to_hook_type("session-end"), None);
         assert_eq!(verb_to_hook_type("unknown"), None);
-        assert_eq!(verb_to_hook_type(""), None);
     }
-
-    // =========================================================================
-    // Parse event tests
-    // =========================================================================
 
     #[test]
     fn test_parse_session_start() {
-        let hook = make_hook();
         let input = br#"{
-            "session_id": "sess-abc-123",
-            "transcript_path": "/tmp/codex-transcript.json",
-            "cwd": "/home/user/project",
-            "model": "o3-mini",
+            "session_id": "sess-123",
+            "transcript_path": "/tmp/codex.jsonl",
+            "model": "gpt-5.5",
             "source": "startup",
-            "hook_event_name": "SessionStart"
+            "cwd": "/repo"
         }"#;
-        let event = hook.parse_event(HookType::SessionStart, input).unwrap();
-        assert_eq!(event.session_id, "sess-abc-123");
+        let event = make_hook()
+            .parse_event(HookType::SessionStart, input)
+            .unwrap();
+        assert_eq!(event.session_id, "sess-123");
         assert_eq!(event.event_type, HookType::SessionStart);
-        assert!(event.transcript_path.is_some());
-        assert!(event.raw_json.is_some());
+        assert_eq!(
+            event.transcript_path.as_deref(),
+            Some(Path::new("/tmp/codex.jsonl"))
+        );
+        let raw = event.raw_json.unwrap();
+        assert_eq!(raw["model"], "gpt-5.5");
+        assert_eq!(raw["provider"], "openai");
     }
 
     #[test]
-    fn test_parse_session_start_extracts_model_in_raw_json() {
-        let hook = make_hook();
-        let input = br#"{"session_id": "s1", "model": "o3-mini"}"#;
-        let event = hook.parse_event(HookType::SessionStart, input).unwrap();
-        let raw = event.raw_json.unwrap();
-        assert_eq!(raw.get("model").and_then(|v| v.as_str()), Some("o3-mini"));
+    fn test_parse_session_start_uses_thread_id_fallback() {
+        let input = br#"{"thread_id": "thread-123"}"#;
+        let event = make_hook()
+            .parse_event(HookType::SessionStart, input)
+            .unwrap();
+        assert_eq!(event.session_id, "thread-123");
+    }
+
+    #[test]
+    fn test_parse_session_start_generates_fallback_session_id() {
+        let input = br#"{"cwd": "/repo"}"#;
+        let event = make_hook()
+            .parse_event(HookType::SessionStart, input)
+            .unwrap();
+        assert!(event.session_id.starts_with("codex-"));
     }
 
     #[test]
     fn test_parse_user_prompt_submit() {
-        let hook = make_hook();
         let input = br#"{
-            "session_id": "sess-abc-123",
-            "transcript_path": "/tmp/t.json",
-            "cwd": "/home/user/project",
-            "model": "o3-mini",
-            "prompt": "Fix the login bug in auth.rs",
-            "turn_id": "turn-001"
+            "session_id": "sess-123",
+            "prompt": "fix the hook",
+            "model": "gpt-5.5"
         }"#;
-        let event = hook.parse_event(HookType::TurnStart, input).unwrap();
-        assert_eq!(event.session_id, "sess-abc-123");
+        let event = make_hook().parse_event(HookType::TurnStart, input).unwrap();
+        assert_eq!(event.session_id, "sess-123");
         assert_eq!(event.event_type, HookType::TurnStart);
-        assert_eq!(
-            event.prompt.as_deref(),
-            Some("Fix the login bug in auth.rs")
-        );
+        assert_eq!(event.prompt.as_deref(), Some("fix the hook"));
+        assert_eq!(event.raw_json.unwrap()["provider"], "openai");
     }
 
     #[test]
-    fn test_parse_stop() {
-        let hook = make_hook();
-        let input = br#"{
-            "session_id": "sess-abc-123",
-            "transcript_path": "/tmp/t.json",
-            "cwd": "/home/user/project",
-            "model": "o3-mini",
-            "turn_id": "turn-001",
-            "stop_hook_active": true,
-            "last_assistant_message": "Done! I fixed the bug."
-        }"#;
-        let event = hook.parse_event(HookType::TurnEnd, input).unwrap();
-        assert_eq!(event.session_id, "sess-abc-123");
-        assert_eq!(event.event_type, HookType::TurnEnd);
-    }
-
-    #[test]
-    fn test_parse_pre_tool_use() {
-        let hook = make_hook();
-        let input = br#"{
-            "session_id": "sess-abc-123",
-            "tool_name": "Bash",
-            "tool_use_id": "tool-42",
-            "tool_input": {"command": "ls -la"}
-        }"#;
-        let event = hook.parse_event(HookType::PreToolUse, input).unwrap();
-        assert_eq!(event.session_id, "sess-abc-123");
-        assert_eq!(event.event_type, HookType::PreToolUse);
-        assert_eq!(event.tool_name.as_deref(), Some("Bash"));
-        assert_eq!(event.tool_use_id.as_deref(), Some("tool-42"));
-    }
-
-    #[test]
-    fn test_parse_post_tool_use() {
-        let hook = make_hook();
-        let input = br#"{
-            "session_id": "sess-abc-123",
-            "tool_name": "Bash",
-            "tool_use_id": "tool-42",
-            "tool_input": {"command": "ls -la"},
-            "tool_response": {"output": "total 0\ndrwxr-xr-x 2 user user 64 Jan 1 00:00 ."}
-        }"#;
-        let event = hook.parse_event(HookType::PostToolUse, input).unwrap();
-        assert_eq!(event.session_id, "sess-abc-123");
-        assert_eq!(event.event_type, HookType::PostToolUse);
-        assert_eq!(event.tool_name.as_deref(), Some("Bash"));
-        assert_eq!(event.tool_use_id.as_deref(), Some("tool-42"));
-    }
-
-    #[test]
-    fn test_parse_session_end_unsupported() {
-        let hook = make_hook();
-        let input = br#"{"session_id": "s1"}"#;
-        let result = hook.parse_event(HookType::SessionEnd, input);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("SessionEnd"));
-    }
-
-    #[test]
-    fn test_parse_empty_input() {
-        let hook = make_hook();
-        let result = hook.parse_event(HookType::SessionStart, b"");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_invalid_json() {
-        let hook = make_hook();
-        let result = hook.parse_event(HookType::SessionStart, b"not json at all");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_missing_session_id_generates_fallback() {
-        let hook = make_hook();
-        let input = br#"{"transcript_path": "/tmp/t.json"}"#;
-        let event = hook.parse_event(HookType::SessionStart, input).unwrap();
-        assert!(event.session_id.starts_with("codex-"));
-    }
-
-    #[test]
-    fn test_parse_empty_session_id_generates_fallback() {
-        let hook = make_hook();
-        let input = br#"{"session_id": ""}"#;
-        let event = hook.parse_event(HookType::SessionStart, input).unwrap();
-        assert!(event.session_id.starts_with("codex-"));
-    }
-
-    #[test]
-    fn test_parse_minimal_input() {
-        let hook = make_hook();
-        // Codex sends at least {} — all fields are optional with serde(default)
-        let input = br#"{}"#;
-        let event = hook.parse_event(HookType::SessionStart, input).unwrap();
-        assert!(event.session_id.starts_with("codex-"));
-        assert_eq!(event.event_type, HookType::SessionStart);
-    }
-
-    #[test]
-    fn test_parse_turn_start_no_prompt() {
-        let hook = make_hook();
-        let input = br#"{"session_id": "s1"}"#;
-        let event = hook.parse_event(HookType::TurnStart, input).unwrap();
-        assert_eq!(event.session_id, "s1");
+    fn test_parse_user_prompt_submit_empty_prompt_is_none() {
+        let input = br#"{"session_id": "sess-123", "prompt": ""}"#;
+        let event = make_hook().parse_event(HookType::TurnStart, input).unwrap();
         assert!(event.prompt.is_none());
     }
 
     #[test]
-    fn test_parse_post_tool_no_tool_name() {
+    fn test_parse_stop_preserves_assistant_summary_and_finish_reason() {
+        let input = br#"{
+            "session_id": "sess-123",
+            "last_assistant_message": "Updated the parser and tests.",
+            "stop_hook_active": false,
+            "model": "gpt-5.5"
+        }"#;
+        let event = make_hook().parse_event(HookType::TurnEnd, input).unwrap();
+        assert_eq!(event.session_id, "sess-123");
+        assert_eq!(event.event_type, HookType::TurnEnd);
+        let raw = event.raw_json.unwrap();
+        assert_eq!(
+            raw["last_assistant_message"],
+            "Updated the parser and tests."
+        );
+        assert_eq!(raw["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn test_parse_stop_active_infers_tool_calls_finish_reason() {
+        let input = br#"{"session_id": "sess-123", "stop_hook_active": true}"#;
+        let event = make_hook().parse_event(HookType::TurnEnd, input).unwrap();
+        assert_eq!(event.raw_json.unwrap()["finish_reason"], "tool-calls");
+    }
+
+    #[test]
+    fn test_parse_pre_tool() {
+        let input = br#"{
+            "session_id": "sess-123",
+            "tool_name": "exec_command",
+            "tool_use_id": "call-1",
+            "tool_input": {"cmd": "cargo test"}
+        }"#;
+        let event = make_hook()
+            .parse_event(HookType::PreToolUse, input)
+            .unwrap();
+        assert_eq!(event.session_id, "sess-123");
+        assert_eq!(event.event_type, HookType::PreToolUse);
+        assert_eq!(event.tool_name.as_deref(), Some("exec_command"));
+        assert_eq!(event.tool_use_id.as_deref(), Some("call-1"));
+        assert_eq!(event.raw_json.unwrap()["tool_input"]["cmd"], "cargo test");
+    }
+
+    #[test]
+    fn test_parse_pre_tool_accepts_tool_call_id_alias() {
+        let input = br#"{
+            "session_id": "sess-123",
+            "tool_name": "exec_command",
+            "tool_call_id": "call-2"
+        }"#;
+        let event = make_hook()
+            .parse_event(HookType::PreToolUse, input)
+            .unwrap();
+        assert_eq!(event.tool_use_id.as_deref(), Some("call-2"));
+    }
+
+    #[test]
+    fn test_parse_post_tool_normalizes_tool_response_for_provenance() {
+        let input = br#"{
+            "session_id": "sess-123",
+            "tool_name": "exec_command",
+            "tool_use_id": "call-3",
+            "tool_input": {"cmd": "cargo test", "file_path": "src/lib.rs"},
+            "tool_response": {"output": "ok", "success": true, "duration_ms": 42}
+        }"#;
+        let event = make_hook()
+            .parse_event(HookType::PostToolUse, input)
+            .unwrap();
+        assert_eq!(event.session_id, "sess-123");
+        assert_eq!(event.event_type, HookType::PostToolUse);
+        assert_eq!(event.tool_name.as_deref(), Some("exec_command"));
+        assert_eq!(event.tool_use_id.as_deref(), Some("call-3"));
+        let raw = event.raw_json.unwrap();
+        assert_eq!(raw["tool_output"], "ok");
+        assert_eq!(raw["status"], "completed");
+        assert_eq!(raw["duration"], 42);
+        assert_eq!(raw["file_path"], "src/lib.rs");
+    }
+
+    #[test]
+    fn test_parse_post_tool_normalizes_error_response() {
+        let input = br#"{
+            "session_id": "sess-123",
+            "tool_name": "exec_command",
+            "tool_response": {"error": "failed"}
+        }"#;
+        let event = make_hook()
+            .parse_event(HookType::PostToolUse, input)
+            .unwrap();
+        assert_eq!(event.raw_json.unwrap()["status"], "error");
+    }
+
+    #[test]
+    fn test_parse_session_end_is_unsupported() {
+        let result = make_hook().parse_event(HookType::SessionEnd, br#"{"session_id":"s"}"#);
+        assert!(matches!(result, Err(AgentError::HookParseFailed { .. })));
+    }
+
+    #[test]
+    fn test_parse_event_empty_input() {
+        let result = make_hook().parse_event(HookType::TurnEnd, b"");
+        assert!(matches!(result, Err(AgentError::HookInputEmpty { .. })));
+    }
+
+    #[test]
+    fn test_parse_event_invalid_json() {
+        let result = make_hook().parse_event(HookType::TurnEnd, b"not-json");
+        assert!(matches!(result, Err(AgentError::HookParseFailed { .. })));
+    }
+
+    #[test]
+    fn test_detect_presence_with_local_codex_dir() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(CODEX_DIR)).unwrap();
+        assert!(make_hook().detect_presence(dir.path()));
+    }
+
+    #[test]
+    fn test_local_install_is_idempotent_and_preserves_other_hooks() {
+        let dir = TempDir::new().unwrap();
+        let hooks_path = dir.path().join(CODEX_DIR).join(HOOKS_FILE);
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hooks_path,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"custom stop"}]}]},"other":true}"#,
+        )
+        .unwrap();
+
         let hook = make_hook();
-        let input = br#"{"session_id": "s1"}"#;
-        let event = hook.parse_event(HookType::PostToolUse, input).unwrap();
-        assert_eq!(event.session_id, "s1");
-        assert!(event.tool_name.is_none());
+        assert_eq!(hook.install(dir.path()).unwrap(), 5);
+        assert!(hook.is_installed(dir.path()));
+        assert_eq!(hook.install(dir.path()).unwrap(), 0);
+
+        let content = std::fs::read_to_string(&hooks_path).unwrap();
+        assert!(content.contains("custom stop"));
+        assert!(content.contains("atomic agent hooks codex session-start"));
+        assert!(content.contains("atomic agent hooks codex user-prompt-submit"));
+        assert!(content.contains("atomic agent hooks codex stop"));
+        assert!(content.contains("atomic agent hooks codex pre-tool"));
+        assert!(content.contains("atomic agent hooks codex post-tool"));
+        assert!(content.contains("\"other\": true"));
     }
 
     #[test]
-    fn test_parse_pre_tool_no_tool_use_id() {
+    fn test_uninstall_removes_only_atomic_hooks() {
+        let dir = TempDir::new().unwrap();
         let hook = make_hook();
-        let input = br#"{"session_id": "s1", "tool_name": "Bash"}"#;
-        let event = hook.parse_event(HookType::PreToolUse, input).unwrap();
-        assert_eq!(event.session_id, "s1");
-        assert_eq!(event.tool_name.as_deref(), Some("Bash"));
-        assert!(event.tool_use_id.is_none());
-    }
+        hook.install(dir.path()).unwrap();
+        let hooks_path = dir.path().join(CODEX_DIR).join(HOOKS_FILE);
+        let mut config = read_hooks_file(&hooks_path).unwrap();
+        add_hook_to_groups(
+            config
+                .hooks
+                .get_mut("Stop")
+                .and_then(Value::as_array_mut)
+                .unwrap(),
+            "custom stop",
+            None,
+        );
+        write_hooks_file(&hooks_path, &config).unwrap();
 
-    // =========================================================================
-    // Detection tests
-    // =========================================================================
-
-    #[test]
-    fn test_detect_presence_with_codex_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".codex")).unwrap();
-
-        let hook = make_hook();
-        assert!(hook.detect_presence(dir.path()));
-    }
-
-    #[test]
-    fn test_detect_presence_without_codex_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let hook = make_hook();
-        assert!(!hook.detect_presence(dir.path()));
-    }
-
-    // =========================================================================
-    // Install / uninstall are no-ops (managed by atomic-codex package)
-    // =========================================================================
-
-    #[test]
-    fn test_install_is_noop() {
-        let dir = tempfile::tempdir().unwrap();
-        let hook = make_hook();
-        let count = hook.install(dir.path()).unwrap();
-        assert_eq!(count, 0);
+        hook.uninstall(dir.path()).unwrap();
+        let content = std::fs::read_to_string(&hooks_path).unwrap();
+        assert!(!content.contains("atomic agent hooks codex"));
+        assert!(content.contains("custom stop"));
     }
 
     #[test]
-    fn test_uninstall_is_noop() {
-        let dir = tempfile::tempdir().unwrap();
-        let hook = make_hook();
-        assert!(hook.uninstall(dir.path()).is_ok());
+    fn test_uninstall_missing_file_is_ok() {
+        let dir = TempDir::new().unwrap();
+        make_hook().uninstall(dir.path()).unwrap();
     }
 
     #[test]
-    fn test_is_installed_always_false() {
-        let dir = tempfile::tempdir().unwrap();
-        let hook = make_hook();
-        assert!(!hook.is_installed(dir.path()));
-    }
-
-    // =========================================================================
-    // extract_session_id tests
-    // =========================================================================
-
-    #[test]
-    fn test_extract_session_id_with_value() {
-        let id = CodexHook::extract_session_id(Some("sess-123".to_string()));
-        assert_eq!(id, "sess-123");
-    }
-
-    #[test]
-    fn test_extract_session_id_empty_generates_fallback() {
-        let id = CodexHook::extract_session_id(Some("".to_string()));
-        assert!(id.starts_with("codex-"));
-    }
-
-    #[test]
-    fn test_extract_session_id_none_generates_fallback() {
-        let id = CodexHook::extract_session_id(None);
-        assert!(id.starts_with("codex-"));
-    }
-
-    // =========================================================================
-    // hook_command_exists tests
-    // =========================================================================
-
-    // =========================================================================
-    // uuid_short helper tests
-    // =========================================================================
-
-    #[test]
-    fn test_uuid_short_format() {
-        let id = uuid_short();
-        assert_eq!(id.len(), 8);
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn test_uuid_short_not_all_zeros() {
-        let id = uuid_short();
-        assert_ne!(id, "00000000");
-    }
-
-    // =========================================================================
-    // Roundtrip / integration tests
-    // =========================================================================
-
-    #[test]
-    fn test_parse_all_events_roundtrip() {
-        let hook = make_hook();
-
-        // SessionStart
-        let input = br#"{"session_id": "s1", "model": "o3-mini"}"#;
-        let event = hook.parse_event(HookType::SessionStart, input).unwrap();
-        assert_eq!(event.session_id, "s1");
-
-        // TurnStart (UserPromptSubmit)
-        let input = br#"{"session_id": "s1", "prompt": "do something"}"#;
-        let event = hook.parse_event(HookType::TurnStart, input).unwrap();
-        assert_eq!(event.prompt.as_deref(), Some("do something"));
-
-        // TurnEnd (Stop)
-        let input = br#"{"session_id": "s1", "stop_hook_active": true}"#;
-        let event = hook.parse_event(HookType::TurnEnd, input).unwrap();
-        assert_eq!(event.session_id, "s1");
-
-        // PreToolUse
-        let input = br#"{"session_id": "s1", "tool_name": "Bash"}"#;
-        let event = hook.parse_event(HookType::PreToolUse, input).unwrap();
-        assert_eq!(event.tool_name.as_deref(), Some("Bash"));
-
-        // PostToolUse
-        let input =
-            br#"{"session_id": "s1", "tool_name": "Bash", "tool_response": {"output": "ok"}}"#;
-        let event = hook.parse_event(HookType::PostToolUse, input).unwrap();
-        assert_eq!(event.tool_name.as_deref(), Some("Bash"));
-    }
-
-    #[test]
-    fn test_debug_impl() {
-        let hook = make_hook();
-        let debug = format!("{:?}", hook);
-        assert!(debug.contains("CodexHook"));
+    fn test_force_install_rewrites_atomic_hooks() {
+        let dir = TempDir::new().unwrap();
+        let hooks_path = dir.path().join(CODEX_DIR).join(HOOKS_FILE);
+        install_hooks_at(&hooks_path, false).unwrap();
+        assert_eq!(install_hooks_at(&hooks_path, true).unwrap(), 5);
     }
 }

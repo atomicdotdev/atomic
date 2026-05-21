@@ -221,6 +221,39 @@ fn test_save_load_roundtrip() {
 }
 
 #[test]
+fn test_copy_content_span_avoids_full_change_load_on_cache_hit() {
+    let (store, _temp) = create_test_store();
+
+    let mut original = create_test_change_with_content("Test content span", b"0123456789abcdef");
+    original.unhashed = Some(serde_json::json!({
+        "git": {
+            "diff_lines": [
+                {
+                    "path": "large.rs",
+                    "lines": (0..1000).map(|idx| serde_json::json!({
+                        "origin": "+",
+                        "content": format!("line {idx}\n"),
+                        "old_lineno": null,
+                        "new_lineno": idx + 1,
+                    })).collect::<Vec<_>>()
+                }
+            ]
+        }
+    }));
+
+    let hash = store.save_change(&original).expect("Failed to save change");
+
+    let mut buf = [0u8; 4];
+    let copied = store
+        .copy_content_span(&hash, 4, 8, &mut buf)
+        .expect("Failed to copy content span");
+
+    assert_eq!(copied, 4);
+    assert_eq!(&buf, b"4567");
+    assert_eq!(store.cache_size(), 1);
+}
+
+#[test]
 fn test_load_nonexistent_change() {
     let (store, _temp) = create_test_store();
 

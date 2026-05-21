@@ -106,12 +106,24 @@ impl<'a, T: InodeGraphOps> InodeGraphOps for ViewGraph<'a, T> {
         self.inner.find_block_in_inode(inode, pos)
     }
 
+    fn find_block_end_in_inode(
+        &self,
+        inode: Inode,
+        pos: Position<NodeId>,
+    ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
+        self.inner.find_block_end_in_inode(inode, pos)
+    }
+
     fn count_inode_vertices(&self, inode: Inode) -> Result<usize, Self::InodeError> {
         self.inner.count_inode_vertices(inode)
     }
 
     fn inode_graph_is_populated(&self, inode: Inode) -> Result<bool, Self::InodeError> {
         self.inner.inode_graph_is_populated(inode)
+    }
+
+    fn inode_graph_needs_view_filter(&self) -> bool {
+        true
     }
 }
 

@@ -8,7 +8,7 @@
 //! The import process:
 //! 1. Opens the Git repository in the current directory
 //! 2. Resolves the target branch (default or specified)
-//! 3. Walks commit history in topological order (oldest first)
+//! 3. Walks first-parent commit history in topological order (oldest first)
 //! 4. For each commit, creates an Atomic change with:
 //!    - Author from Git commit
 //!    - Message from commit subject/body
@@ -21,9 +21,11 @@
 //!
 //! - Submodules are skipped with a warning
 //! - Binary files are imported as-is
-//! - Merge commits are linearized (first parent only)
+//! - Default imports are mainline-only (first parent)
+//! - Use `--all` to import all local branches as views
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use clap::Parser;
 use git2::{Repository as GitRepository, Sort};
@@ -55,10 +57,13 @@ pub struct Import {
     #[arg(long, short = 'b', value_name = "BRANCH")]
     pub branch: Option<String>,
 
-    /// Import all branches as separate views.
+    /// Import all local branches as separate views.
     ///
-    /// Creates one Atomic view for each Git branch found in the repository.
-    #[arg(long)]
+    /// Creates one Atomic view for each Git branch found in the repository and
+    /// imports the full reachable history for those branches. By default,
+    /// `atomic git import` imports only the selected branch's mainline
+    /// first-parent history.
+    #[arg(long = "all", visible_alias = "all-branches")]
     pub all_branches: bool,
 
     /// Only import commits not already in Atomic.
@@ -84,6 +89,54 @@ pub struct Import {
     pub no_vault: bool,
 }
 
+fn import_ignore_patterns(workdir: &Path, kind: Option<&str>) -> Vec<String> {
+    const COMMON_IMPORT_IGNORES: &[&str] = &[
+        "node_modules/",
+        "bower_components/",
+        ".yarn/cache/",
+        ".pnpm-store/",
+    ];
+
+    let template = if let Some(kind) = kind {
+        super::super::init::get_ignore_template(kind)
+    } else if workdir.join("Cargo.toml").exists() {
+        super::super::init::get_ignore_template("rust")
+    } else if workdir.join("package.json").exists() {
+        super::super::init::get_ignore_template("node")
+    } else if workdir.join("go.mod").exists() {
+        super::super::init::get_ignore_template("go")
+    } else if workdir.join("setup.py").exists() || workdir.join("pyproject.toml").exists() {
+        super::super::init::get_ignore_template("python")
+    } else {
+        None
+    };
+
+    let mut patterns: Vec<String> = COMMON_IMPORT_IGNORES
+        .iter()
+        .map(|pattern| (*pattern).to_string())
+        .collect();
+
+    patterns.extend(
+        template
+            .unwrap_or(".atomic\n.git\n")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(ToOwned::to_owned),
+    );
+    patterns.sort();
+    patterns.dedup();
+    patterns
+}
+
+fn current_git_branch(git_repo: &GitRepository) -> Option<String> {
+    let head = git_repo.head().ok()?;
+    if !head.is_branch() {
+        return None;
+    }
+    head.shorthand().map(ToOwned::to_owned)
+}
+
 impl Import {
     /// Import a single branch into an Atomic view using parallel processing.
     fn import_branch(
@@ -92,6 +145,7 @@ impl Import {
         branch_name: &str,
         repo: &mut Repository,
         imported_shas: &HashSet<String>,
+        mainline_only: bool,
     ) -> CliResult<usize> {
         // Get repository name from remote URL or working directory
         let repo_name = self.get_repo_name(git_repo);
@@ -101,6 +155,11 @@ impl Import {
             incremental: self.incremental,
             imported_shas: imported_shas.clone(),
             repo_name,
+            ignored_path_patterns: import_ignore_patterns(
+                git_repo.workdir().unwrap_or_else(|| repo.root()),
+                self.kind.as_deref(),
+            ),
+            mainline_only,
         };
 
         let importer = ParallelImporter::new(git_repo, options);
@@ -187,12 +246,8 @@ impl Import {
     /// Get the default branch name.
     fn get_default_branch(&self, git_repo: &GitRepository) -> CliResult<String> {
         // Try HEAD first (current branch)
-        if let Ok(head) = git_repo.head() {
-            if head.is_branch() {
-                if let Some(name) = head.shorthand() {
-                    return Ok(name.to_string());
-                }
-            }
+        if let Some(name) = current_git_branch(git_repo) {
+            return Ok(name);
         }
 
         // Fall back to common default names
@@ -213,6 +268,7 @@ impl Import {
         git_repo: &GitRepository,
         head_oid: git2::Oid,
         imported_shas: &HashSet<String>,
+        mainline_only: bool,
     ) -> CliResult<usize> {
         let mut revwalk = git_repo.revwalk().map_err(|e| CliError::GitError {
             message: format!("Failed to create revwalk: {}", e),
@@ -221,6 +277,14 @@ impl Import {
         revwalk.push(head_oid).map_err(|e| CliError::GitError {
             message: format!("Failed to push HEAD to revwalk: {}", e),
         })?;
+
+        if mainline_only {
+            revwalk
+                .simplify_first_parent()
+                .map_err(|e| CliError::GitError {
+                    message: format!("Failed to simplify revwalk to first-parent history: {}", e),
+                })?;
+        }
 
         revwalk
             .set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)
@@ -270,7 +334,12 @@ impl Command for Import {
             for branch_name in &branches {
                 if let Ok(reference) = git_repo.find_branch(branch_name, git2::BranchType::Local) {
                     if let Some(target) = reference.get().target() {
-                        let count = self.count_commits(&git_repo, target, &HashSet::new())?;
+                        let count = self.count_commits(
+                            &git_repo,
+                            target,
+                            &HashSet::new(),
+                            !self.all_branches,
+                        )?;
                         print_info(&format!(
                             "Would import {} commits from branch '{}'",
                             count, branch_name
@@ -324,7 +393,7 @@ impl Command for Import {
 
                 // Import the branch
                 let count =
-                    self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas)?;
+                    self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas, false)?;
                 total_imported += count;
             }
 
@@ -334,13 +403,7 @@ impl Command for Import {
                 Ok(result) => print_info(&format!("Materialized {} files", result.files_written)),
                 Err(e) => print_warning(&format!("Working copy materialization failed: {}", e)),
             }
-
-            // Restore files from git to fix import fidelity issues.
-            // The graph reconstruction may produce slightly wrong content
-            // for some files (hunk misalignment across thousands of commits).
-            // Git has the authoritative content — restore from it and update
-            // the FILE_INDEX so atomic status sees them as clean.
-            restore_from_git_and_reindex(&repo, &git_repo);
+            reindex_working_copy(&repo);
 
             // Initialize .atomicignore + vault AFTER import + materialize.
             // Must be before KG enrichment so has_vault() returns true.
@@ -392,17 +455,23 @@ impl Command for Import {
                 .map_err(|e| CliError::Internal(e.into()))?;
 
             // Import
-            let count = self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas)?;
+            let count =
+                self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas, true)?;
 
-            // Materialize the working copy from the graph
-            print_info("Materializing working copy...");
-            match repo.materialize() {
-                Ok(result) => print_info(&format!("Materialized {} files", result.files_written)),
-                Err(e) => print_warning(&format!("Working copy materialization failed: {}", e)),
+            if current_git_branch(&git_repo).as_deref() == Some(branch_name.as_str()) {
+                print_info("Using Git working copy as imported materialization.");
+                reindex_working_copy(&repo);
+            } else {
+                // Importing a non-checked-out branch must update disk from Atomic.
+                print_info("Materializing working copy...");
+                match repo.materialize() {
+                    Ok(result) => {
+                        print_info(&format!("Materialized {} files", result.files_written))
+                    }
+                    Err(e) => print_warning(&format!("Working copy materialization failed: {}", e)),
+                }
+                reindex_working_copy(&repo);
             }
-
-            // Restore files from git to fix import fidelity issues.
-            restore_from_git_and_reindex(&repo, &git_repo);
 
             // Initialize .atomicignore + vault AFTER import + materialize
             if !repo_exists {
@@ -441,59 +510,41 @@ impl Command for Import {
     }
 }
 
-/// Restore working copy files from git and rebuild FILE_INDEX.
+/// Rebuild FILE_INDEX from the current working copy.
 ///
-/// After materialize, some files may have slightly wrong content due to
-/// graph reconstruction fidelity issues. Git is the source of truth for
-/// file content — restore from it, then update the FILE_INDEX so that
-/// `atomic status` reports the working copy as clean.
-fn restore_from_git_and_reindex(repo: &Repository, git_repo: &GitRepository) {
+/// During normal single-branch Git import the files on disk are already the
+/// authoritative Git checkout for the imported branch, so there is no reason
+/// to materialize the same content back out of Atomic. Indexing the tracked
+/// files makes the post-import `atomic status` baseline clean.
+fn reindex_working_copy(repo: &Repository) {
     use atomic_core::types::Hash;
     use std::time::SystemTime;
 
     let repo_root = repo.root().to_path_buf();
+    let tracked = repo.list_tracked_files().unwrap_or_default();
+    let mut entries: Vec<(String, i64, u32, u64, Hash)> = Vec::new();
 
-    // `git checkout -- .` restores all tracked files to HEAD state
-    let result = std::process::Command::new("git")
-        .args(["checkout", "--", "."])
-        .current_dir(&repo_root)
-        .output();
-
-    match result {
-        Ok(output) if output.status.success() => {
-            // Rebuild FILE_INDEX for all tracked files so status is clean.
-            // Only index files that exist on disk and have graph content.
-            // Files without graph content (tracked but not recorded) are
-            // left alone — status will correctly show them as Added.
-            let tracked = repo.list_tracked_files().unwrap_or_default();
-            let mut entries: Vec<(String, i64, u32, u64, Hash)> = Vec::new();
-
-            for file in &tracked {
-                let abs = repo_root.join(&file.path);
-                if let Ok(metadata) = std::fs::metadata(&abs) {
-                    let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                    let duration = mtime
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default();
-                    if let Ok(bytes) = std::fs::read(&abs) {
-                        entries.push((
-                            file.path.to_string_lossy().replace('\\', "/"),
-                            duration.as_secs() as i64,
-                            duration.subsec_nanos(),
-                            metadata.len(),
-                            Hash::of(&bytes),
-                        ));
-                    }
-                }
-            }
-
-            if !entries.is_empty() {
-                let _ = repo.update_file_index(&entries);
+    for file in &tracked {
+        let abs = repo_root.join(&file.path);
+        if let Ok(metadata) = std::fs::metadata(&abs) {
+            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let duration = mtime
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            if let Ok(bytes) = std::fs::read(&abs) {
+                entries.push((
+                    file.path.to_string_lossy().replace('\\', "/"),
+                    duration.as_secs() as i64,
+                    duration.subsec_nanos(),
+                    metadata.len(),
+                    Hash::of(&bytes),
+                ));
             }
         }
-        _ => {
-            log::warn!("git checkout failed — some files may show as modified in atomic status");
-        }
+    }
+
+    if !entries.is_empty() {
+        let _ = repo.update_file_index(&entries);
     }
 }
 
@@ -598,5 +649,23 @@ mod tests {
         assert!(!import.all_branches);
         assert!(!import.incremental);
         assert!(import.branch.is_none());
+    }
+
+    #[test]
+    fn test_all_flag_and_legacy_alias() {
+        let import = Import::try_parse_from(["import", "--all"]).unwrap();
+        assert!(import.all_branches);
+
+        let import = Import::try_parse_from(["import", "--all-branches"]).unwrap();
+        assert!(import.all_branches);
+    }
+
+    #[test]
+    fn test_import_ignore_patterns_always_exclude_dependency_dirs() {
+        let patterns = import_ignore_patterns(Path::new("."), Some("go"));
+
+        assert!(patterns.iter().any(|p| p == "node_modules/"));
+        assert!(patterns.iter().any(|p| p == ".yarn/cache/"));
+        assert!(patterns.iter().any(|p| p == "vendor/"));
     }
 }

@@ -802,7 +802,7 @@ impl Repository {
         }
 
         // Deflate vault working copy changes (if vault is initialized)
-        if self.has_vault().unwrap_or(false) {
+        if options.get_sync_vault() && self.has_vault().unwrap_or(false) {
             match self.vault_record_working_copy() {
                 Ok(vault_paths) if !vault_paths.is_empty() => {
                     outcome.set_vault_paths(vault_paths);
@@ -817,7 +817,7 @@ impl Repository {
         }
 
         // Auto-enrich KG with the new change (best-effort)
-        if outcome.was_saved() {
+        if options.get_enrich_kg() && outcome.was_saved() {
             let hash = *outcome.hash();
             if let Err(e) = self.kg_enrich_change(&hash) {
                 log::debug!("KG enrich for change: {}", e);

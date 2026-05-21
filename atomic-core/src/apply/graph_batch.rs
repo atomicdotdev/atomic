@@ -72,6 +72,34 @@ impl<'txn> GraphWriteBatch<'txn> {
 
         Ok(())
     }
+
+    /// Add a canonical bidirectional GRAPH edge pair, but only the forward
+    /// adjacency row to INODE_GRAPH.
+    ///
+    /// This is useful for bulk import paths that can add terminal inode rows
+    /// after building a linear chain. The global GRAPH remains fully
+    /// bidirectional; only the file-local secondary index is compacted.
+    pub fn add_edge_with_reverse_inode_forward_only(
+        &mut self,
+        inode: Option<Inode>,
+        flag: EdgeFlags,
+        source: GraphNode<NodeId>,
+        dest: GraphNode<NodeId>,
+        introduced_by: NodeId,
+    ) -> PristineResult<()> {
+        let forward_edge = SerializedGraphEdge::new(flag, dest.start_pos(), introduced_by);
+        let reverse_flag = flag | EdgeFlags::PARENT;
+        let reverse_edge = SerializedGraphEdge::new(reverse_flag, source.end_pos(), introduced_by);
+
+        self.put_graph(source, forward_edge)?;
+        self.put_graph(dest, reverse_edge)?;
+
+        if let Some(inode_val) = inode {
+            self.put_inode_graph(inode_val, source, forward_edge)?;
+        }
+
+        Ok(())
+    }
 }
 
 #[inline]

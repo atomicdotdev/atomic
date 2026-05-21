@@ -47,6 +47,14 @@ impl Diff {
                     hash: change_ref.to_string(),
                 })?;
 
+        // Git-imported changes carry Git's captured +/- lines in unhashed
+        // metadata. Use that directly for review output before considering
+        // FileOps or the expensive graph reconstruction fallback. Graph-first
+        // imported changes may intentionally have no FileOps yet.
+        if let Some((file_diffs, stats)) = Self::build_git_import_file_diffs(&change) {
+            return self.print_change_file_diffs(&change, &hash, config, file_diffs, stats);
+        }
+
         // Check if change has semantic layer (file_ops)
         if change.has_file_ops() {
             // Use the semantic layer for human-readable diff
@@ -246,12 +254,26 @@ impl Diff {
             return Ok(());
         }
 
-        // Print change header information
+        self.print_change_file_diffs(change, change_hash, config, file_diffs, stats)
+    }
+
+    fn print_change_file_diffs(
+        &self,
+        change: &Change,
+        change_hash: &Hash,
+        config: &DiffOutputConfig,
+        file_diffs: Vec<FileDiff>,
+        stats: DiffStats,
+    ) -> CliResult<()> {
+        if file_diffs.is_empty() {
+            self.print_no_changes();
+            return Ok(());
+        }
+
         if config.format == DiffFormat::Unified {
             self.print_change_header(change, change_hash, config);
         }
 
-        // Print in the appropriate format
         match config.format {
             DiffFormat::Unified => self.print_unified(&file_diffs, config),
             DiffFormat::Stat => self.print_stat(&stats, config),
@@ -291,7 +313,9 @@ impl Diff {
             .is_some()
     }
 
-    fn build_git_import_file_diffs(change: &Change) -> Option<(Vec<FileDiff>, DiffStats)> {
+    pub(super) fn build_git_import_file_diffs(
+        change: &Change,
+    ) -> Option<(Vec<FileDiff>, DiffStats)> {
         let diff_files_value = change
             .unhashed
             .as_ref()?

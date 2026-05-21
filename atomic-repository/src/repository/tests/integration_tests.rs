@@ -246,6 +246,48 @@ fn test_status_clean_after_modify_and_record() {
     );
 }
 
+#[test]
+fn test_import_line_index_seed_reads_current_graph_lines() {
+    let (temp_dir, repo) = create_temp_repo();
+
+    let file_path = temp_dir.path().join("seed_test.txt");
+    std::fs::write(&file_path, b"one\ntwo\nthree\n").unwrap();
+    repo.add("seed_test.txt", TrackingOptions::default())
+        .unwrap();
+
+    repo.record(
+        ChangeHeader::new("seed base"),
+        RecordOptions::new()
+            .with_all(true)
+            .save_to_store(true)
+            .apply_after_record(true),
+    )
+    .unwrap();
+
+    let seed = repo
+        .import_line_index_seed("seed_test.txt")
+        .unwrap()
+        .expect("tracked file should seed from graph");
+    assert_eq!(seed.lines.len(), 3);
+    assert!(seed.lines.iter().all(|line| line.start < line.end));
+
+    std::fs::write(&file_path, b"one\nTWO\nthree\nfour\n").unwrap();
+    repo.record(
+        ChangeHeader::new("seed edit"),
+        RecordOptions::new()
+            .with_all(true)
+            .save_to_store(true)
+            .apply_after_record(true),
+    )
+    .unwrap();
+
+    let seed = repo
+        .import_line_index_seed("seed_test.txt")
+        .unwrap()
+        .expect("edited file should seed from graph");
+    assert_eq!(seed.lines.len(), 4);
+}
+
 /// Test that switching views correctly outputs file content.
 ///
 /// This test verifies that when switching between views that share

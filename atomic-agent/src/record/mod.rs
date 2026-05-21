@@ -258,6 +258,8 @@ pub fn record_turn(
         .view(options.session.view_name.clone())
         .apply_after_record(true)
         .save_to_store(true)
+        .sync_vault(false)
+        .enrich_kg(false)
         .provenance(vec![provenance_entry])
         .metadata_bytes(envelope_bytes);
 

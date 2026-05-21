@@ -40,7 +40,7 @@
 //! ## Import All Branches
 //!
 //! ```text
-//! $ atomic git import --all-branches
+//! $ atomic git import --all
 //! ```
 //!
 //! ## Incremental Import
@@ -81,8 +81,8 @@ pub enum GitCommands {
     /// # Import specific branch
     /// atomic git import --branch main
     ///
-    /// # Import all branches as stacks
-    /// atomic git import --all-branches
+    /// # Import all local branches as views
+    /// atomic git import --all
     ///
     /// # Preview without creating repository
     /// atomic git import --dry-run

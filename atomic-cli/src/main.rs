@@ -75,13 +75,14 @@ use commands::{
     Record,
     Remote,
     Remove,
-    Reset,
+    Restore,
     Revise,
     Split,
     Stash,
     Status,
     Tag,
     Unrecord,
+    Update,
     Vault,
     View,
     // Storage management (always available)
@@ -216,27 +217,26 @@ enum Commands {
     #[command(visible_alias = "mv")]
     Move(Move),
 
-    /// Reset the working copy to the last recorded state.
+    /// Restore the working copy to the last recorded state.
     ///
     /// Restores the working copy to match the pristine state (last recorded
-    /// state in the view). This discards any uncommitted changes.
+    /// state in the view). This discards any uncommitted changes. Equivalent
+    /// to `git restore`. The legacy name `reset` is kept as an alias.
     ///
     /// # Examples
     ///
     /// ```text
+    /// # Restore specific files
+    /// atomic restore src/main.rs
+    ///
     /// # Discard all uncommitted changes
-    /// atomic reset --force
+    /// atomic restore --force
     ///
-    /// # Reset specific files
-    /// atomic reset src/main.rs
-    ///
-    /// # Switch to a different view
-    /// atomic reset --view main
-    ///
-    /// # Preview what would be reset
-    /// atomic reset --dry-run
+    /// # Preview what would be restored
+    /// atomic restore --dry-run
     /// ```
-    Reset(Reset),
+    #[command(alias = "reset")]
+    Restore(Restore),
 
     /// Split a view (create a new view from an existing one).
     ///
@@ -379,8 +379,8 @@ enum Commands {
     /// # Import specific branch
     /// atomic git import --branch main
     ///
-    /// # Import all branches as views
-    /// atomic git import --all-branches
+    /// # Import all local branches as views
+    /// atomic git import --all
     ///
     /// # Preview without creating repository
     /// atomic git import --dry-run
@@ -667,6 +667,23 @@ enum Commands {
     /// atomic unrecord --dry-run
     /// ```
     Unrecord(Unrecord),
+
+    /// Check for available updates and route to the correct upgrade path.
+    ///
+    /// Detects how this binary was installed (Homebrew, Cargo, official
+    /// installer, or manual) and prints the upgrade command for that
+    /// source. With `--check`, only reports status; exits 1 if outdated.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Check status and show how to upgrade
+    /// atomic update
+    ///
+    /// # Status-only, scriptable: exit 1 if outdated
+    /// atomic update --check
+    /// ```
+    Update(Update),
 }
 
 // Main Entry Point
@@ -699,7 +716,7 @@ fn main() {
 
         Commands::Move(mv) => mv.run(),
 
-        Commands::Reset(reset) => reset.run(),
+        Commands::Restore(restore) => restore.run(),
 
         Commands::Split(split) => split.run(),
 
@@ -746,6 +763,8 @@ fn main() {
         Commands::Tag(tag) => tag.run(),
 
         Commands::Unrecord(unrecord) => unrecord.run(),
+
+        Commands::Update(update) => update.run(),
 
         Commands::Query(query) => query.run(),
 

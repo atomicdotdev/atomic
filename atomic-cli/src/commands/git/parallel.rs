@@ -52,12 +52,13 @@
 //! - Phase 2 (sequential write): ~5s
 //! - Total: ~35s vs ~5min with serial approach
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use git2::{
@@ -65,12 +66,15 @@ use git2::{
 };
 use rayon::prelude::*;
 
-use atomic_core::change::{Author, Change, ChangeHeader};
+use atomic_core::change::{
+    Atom, Author, Change, ChangeHeader, EdgeUpdate, GraphOp, Insertion, NewEdge,
+};
 use atomic_core::change::{Encoding, Local};
+use atomic_core::record::workflow::extract_filename;
 use atomic_core::record::workflow::graph_op::BuiltHunk;
 use atomic_core::record::workflow::GitDiffLine;
 use atomic_core::record::workflow::RecordedFile;
-use atomic_core::types::Hash as ContentHash;
+use atomic_core::types::{ChangePosition, EdgeFlags, GraphNode, Hash as ContentHash, Position};
 use atomic_repository::Repository;
 
 use crate::error::{CliError, CliResult};
@@ -180,6 +184,17 @@ pub struct ParallelImportOptions {
     pub imported_shas: HashSet<String>,
     /// Repository name (from remote URL or directory).
     pub repo_name: String,
+    /// Import-time ignore patterns, usually from the detected `.atomicignore`
+    /// template. These are applied before graph construction so generated
+    /// build outputs never enter the imported history.
+    pub ignored_path_patterns: Vec<String>,
+    /// Import only the selected branch's first-parent history.
+    ///
+    /// This is the default single-branch Git import mode. It treats merge
+    /// commits on the trunk branch as the landing event and avoids importing
+    /// long-running branch internals or repeated upstream merges into feature
+    /// branches.
+    pub mainline_only: bool,
 }
 
 impl Default for ParallelImportOptions {
@@ -188,7 +203,56 @@ impl Default for ParallelImportOptions {
             incremental: false,
             imported_shas: HashSet::new(),
             repo_name: "unknown".to_string(),
+            ignored_path_patterns: Vec::new(),
+            mainline_only: true,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ImportIgnoreMatcher {
+    patterns: Vec<String>,
+}
+
+impl ImportIgnoreMatcher {
+    fn new(patterns: Vec<String>) -> Self {
+        let patterns = patterns
+            .into_iter()
+            .map(|pattern| pattern.trim().replace('\\', "/"))
+            .filter(|pattern| !pattern.is_empty() && !pattern.starts_with('#'))
+            .collect();
+        Self { patterns }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        let normalized = path.trim_start_matches('/').replace('\\', "/");
+        let basename = Path::new(&normalized)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&normalized);
+
+        self.patterns.iter().any(|pattern| {
+            let pattern = pattern.trim_start_matches('/');
+            if let Some(dir) = pattern.strip_suffix('/') {
+                return normalized == dir
+                    || normalized.starts_with(&format!("{dir}/"))
+                    || normalized.contains(&format!("/{dir}/"));
+            }
+
+            if let Some(suffix) = pattern.strip_prefix("**/*") {
+                return normalized.ends_with(suffix);
+            }
+
+            if let Some(suffix) = pattern.strip_prefix('*') {
+                return basename.ends_with(suffix);
+            }
+
+            normalized == pattern || basename == pattern
+        })
     }
 }
 
@@ -203,17 +267,53 @@ impl Default for ParallelImportOptions {
 pub struct ParallelImporter {
     git_repo_path: PathBuf,
     options: ParallelImportOptions,
+    ignore_matcher: ImportIgnoreMatcher,
 }
 
 fn is_generated_diff_skip_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
     let name = Path::new(path)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(path);
+    let lower_name = name.to_ascii_lowercase();
+    let lower_path = normalized.to_ascii_lowercase();
 
-    name.ends_with(".lock")
-        || name.ends_with(".sum")
-        || matches!(name, "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml")
+    lower_name.ends_with(".lock")
+        || lower_name.ends_with(".sum")
+        || lower_name.ends_with(".min.css")
+        || lower_name.ends_with(".min.js")
+        || lower_name.ends_with(".map")
+        || matches!(
+            lower_name.as_str(),
+            "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml" | "npm-shrinkwrap.json"
+        )
+        || matches!(
+            Path::new(&lower_name)
+                .extension()
+                .and_then(|ext| ext.to_str()),
+            Some(
+                "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "webp"
+                    | "ico"
+                    | "bmp"
+                    | "tiff"
+                    | "woff"
+                    | "woff2"
+                    | "ttf"
+                    | "eot"
+                    | "otf"
+                    | "pdf"
+                    | "zip"
+                    | "gz"
+                    | "tgz"
+            )
+        )
+        || lower_path.ends_with("/website/source/stylesheets/main.css")
+        || lower_path == "website/source/stylesheets/main.css"
 }
 
 fn count_line_units(content: &[u8]) -> usize {
@@ -222,6 +322,563 @@ fn count_line_units(content: &[u8]) -> usize {
     } else {
         content.split_inclusive(|&b| b == b'\n').count()
     }
+}
+
+#[derive(Clone, Debug)]
+struct ImportLine {
+    change: ContentHash,
+    start: ChangePosition,
+    end: ChangePosition,
+    incoming_by: ContentHash,
+    content: Vec<u8>,
+}
+
+impl ImportLine {
+    fn node(&self) -> GraphNode<Option<ContentHash>> {
+        GraphNode {
+            change: Some(self.change),
+            start: self.start,
+            end: self.end,
+        }
+    }
+
+    fn start_pos(&self) -> Position<Option<ContentHash>> {
+        Position {
+            change: Some(self.change),
+            pos: self.start,
+        }
+    }
+
+    fn end_pos(&self) -> Position<Option<ContentHash>> {
+        Position {
+            change: Some(self.change),
+            pos: self.end,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ImportIndexedFile {
+    inode_pos: Position<Option<ContentHash>>,
+    lines: Vec<ImportLine>,
+    imported_commits: usize,
+}
+
+#[derive(Default)]
+struct ImportLineIndex {
+    files: HashMap<String, ImportIndexedFile>,
+}
+
+impl ImportLineIndex {
+    fn update_from_added_change(&mut self, change_hash: ContentHash, change: &Change) {
+        for graph_op in change.hunks() {
+            match graph_op {
+                GraphOp::FileAdd {
+                    add_inode,
+                    contents,
+                    path,
+                    ..
+                } => {
+                    let inode_pos = Position {
+                        change: Some(change_hash),
+                        pos: add_inode.start,
+                    };
+                    let mut lines = Vec::new();
+                    if let Some(contents) = contents {
+                        lines.push(ImportLine {
+                            change: change_hash,
+                            start: contents.start,
+                            end: contents.end,
+                            incoming_by: change_hash,
+                            content: change.contents
+                                [contents.start.as_usize()..contents.end.as_usize()]
+                                .to_vec(),
+                        });
+                    }
+                    self.files.insert(
+                        path.clone(),
+                        ImportIndexedFile {
+                            inode_pos,
+                            lines,
+                            imported_commits: 1,
+                        },
+                    );
+                }
+                GraphOp::Edit {
+                    change: Atom::Insertion(insertion),
+                    local,
+                    ..
+                } => {
+                    if let Some(indexed) = self.files.get_mut(&local.path) {
+                        indexed.lines.push(ImportLine {
+                            change: change_hash,
+                            start: insertion.start,
+                            end: insertion.end,
+                            incoming_by: change_hash,
+                            content: change.contents
+                                [insertion.start.as_usize()..insertion.end.as_usize()]
+                                .to_vec(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn seed_missing_modified_files(&mut self, repo: &Repository, parsed: &ParsedCommit) {
+        for file in &parsed.files {
+            if file.operation != FileOperation::Modified || self.files.contains_key(&file.path) {
+                continue;
+            }
+            let Some(old_content) = file.old_content.as_deref() else {
+                continue;
+            };
+
+            let old_lines: Vec<Vec<u8>> = if Encoding::detect(old_content) == Encoding::Binary
+                || is_generated_diff_skip_path(&file.path)
+            {
+                if old_content.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![old_content.to_vec()]
+                }
+            } else {
+                split_graph_first_lines(old_content)
+                    .into_iter()
+                    .map(|line| line.to_vec())
+                    .collect()
+            };
+
+            let seed = match repo.import_line_index_seed(&file.path) {
+                Ok(Some(seed)) => seed,
+                Ok(None) => continue,
+                Err(err) => {
+                    trace_git_import(format!(
+                        "{}: could not seed line index for {}: {}",
+                        parsed.short_sha, file.path, err
+                    ));
+                    continue;
+                }
+            };
+
+            if seed.lines.len() != old_lines.len() {
+                trace_git_import(format!(
+                    "{}: not seeding line index for {}: graph lines={} git old lines={}",
+                    parsed.short_sha,
+                    file.path,
+                    seed.lines.len(),
+                    old_lines.len()
+                ));
+                continue;
+            }
+
+            let mut imported_changes = HashSet::new();
+            let lines = seed
+                .lines
+                .iter()
+                .zip(old_lines)
+                .map(|(line, content)| {
+                    imported_changes.insert(line.incoming_by);
+                    ImportLine {
+                        change: line.change,
+                        start: line.start,
+                        end: line.end,
+                        incoming_by: line.incoming_by,
+                        content,
+                    }
+                })
+                .collect();
+
+            self.files.insert(
+                file.path.clone(),
+                ImportIndexedFile {
+                    inode_pos: Position {
+                        change: Some(seed.inode_pos.change),
+                        pos: seed.inode_pos.pos,
+                    },
+                    lines,
+                    imported_commits: imported_changes.len().max(1),
+                },
+            );
+        }
+    }
+
+    fn seed_file_from_graph_content(
+        &mut self,
+        repo: &Repository,
+        path: &str,
+        content: &[u8],
+        imported_commits_hint: usize,
+    ) -> bool {
+        let line_contents: Vec<Vec<u8>> =
+            if Encoding::detect(content) == Encoding::Binary || is_generated_diff_skip_path(path) {
+                if content.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![content.to_vec()]
+                }
+            } else {
+                split_graph_first_lines(content)
+                    .into_iter()
+                    .map(|line| line.to_vec())
+                    .collect()
+            };
+
+        let seed = match repo.import_line_index_seed(path) {
+            Ok(Some(seed)) => seed,
+            Ok(None) => return false,
+            Err(err) => {
+                trace_git_import(format!(
+                    "could not reseed line index for {} after fallback: {}",
+                    path, err
+                ));
+                return false;
+            }
+        };
+
+        if seed.lines.len() != line_contents.len() {
+            trace_git_import(format!(
+                "not reseeding line index for {} after fallback: graph lines={} content lines={}",
+                path,
+                seed.lines.len(),
+                line_contents.len()
+            ));
+            return false;
+        }
+
+        let mut imported_changes = HashSet::new();
+        let lines = seed
+            .lines
+            .iter()
+            .zip(line_contents)
+            .map(|(line, content)| {
+                imported_changes.insert(line.incoming_by);
+                ImportLine {
+                    change: line.change,
+                    start: line.start,
+                    end: line.end,
+                    incoming_by: line.incoming_by,
+                    content,
+                }
+            })
+            .collect();
+
+        self.files.insert(
+            path.to_string(),
+            ImportIndexedFile {
+                inode_pos: Position {
+                    change: Some(seed.inode_pos.change),
+                    pos: seed.inode_pos.pos,
+                },
+                lines,
+                imported_commits: imported_changes.len().max(imported_commits_hint).max(1),
+            },
+        );
+        true
+    }
+
+    fn reseed_from_fallback_write(&mut self, repo: &Repository, parsed: &ParsedCommit) {
+        for file in &parsed.files {
+            match file.operation {
+                FileOperation::Deleted => {
+                    self.files.remove(&file.path);
+                }
+                FileOperation::Renamed => {
+                    if let Some(old_path) = file.old_path.as_deref() {
+                        self.files.remove(old_path);
+                    }
+                    if let Some(new_content) = file.new_content.as_deref() {
+                        let hint = self
+                            .files
+                            .get(&file.path)
+                            .map(|indexed| indexed.imported_commits.saturating_add(1))
+                            .unwrap_or(1);
+                        self.seed_file_from_graph_content(repo, &file.path, new_content, hint);
+                    }
+                }
+                FileOperation::Added | FileOperation::Copied | FileOperation::Modified => {
+                    if let Some(new_content) = file.new_content.as_deref() {
+                        let hint = self
+                            .files
+                            .get(&file.path)
+                            .map(|indexed| indexed.imported_commits.saturating_add(1))
+                            .unwrap_or(1);
+                        self.seed_file_from_graph_content(repo, &file.path, new_content, hint);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PendingLineIndexUpdate {
+    Add {
+        path: String,
+        inode_pos: Position<Option<ContentHash>>,
+        new_ranges: Vec<(ChangePosition, ChangePosition)>,
+        new_lines: Vec<Vec<u8>>,
+    },
+    Modify {
+        path: String,
+        replacements: Vec<PendingLineReplacement>,
+    },
+    Rename {
+        old_path: String,
+        new_path: String,
+    },
+    Delete {
+        path: String,
+    },
+}
+
+#[derive(Debug)]
+struct PendingLineReplacement {
+    start_idx: usize,
+    old_len: usize,
+    new_ranges: Vec<(ChangePosition, ChangePosition)>,
+    new_lines: Vec<Vec<u8>>,
+    successor_incoming_by_current: bool,
+}
+
+#[derive(Debug)]
+struct GitReplacementBlock {
+    old_start: usize,
+    old_len: usize,
+    new_start: usize,
+    new_lines: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct GraphFirstSkip {
+    path: String,
+    operation: FileOperation,
+    reason: &'static str,
+}
+
+impl GraphFirstSkip {
+    fn new(file: &ParsedFile, reason: &'static str) -> Self {
+        Self {
+            path: file.path.clone(),
+            operation: file.operation,
+            reason,
+        }
+    }
+}
+
+fn position_hashes(pos: &Position<Option<ContentHash>>) -> impl Iterator<Item = ContentHash> + '_ {
+    pos.change
+        .into_iter()
+        .filter(|hash| *hash != ContentHash::NONE)
+}
+
+fn split_graph_first_lines(content: &[u8]) -> Vec<&[u8]> {
+    if content.is_empty() {
+        Vec::new()
+    } else {
+        content.split_inclusive(|&b| b == b'\n').collect()
+    }
+}
+
+fn import_shape_for_file(file: &ParsedFile, line_index: &ImportLineIndex) -> (usize, usize, usize) {
+    let indexed = line_index.files.get(&file.path).or_else(|| {
+        file.old_path
+            .as_deref()
+            .and_then(|old| line_index.files.get(old))
+    });
+    let current_lines = file
+        .new_content
+        .as_deref()
+        .or(file.old_content.as_deref())
+        .map(count_line_units)
+        .or_else(|| indexed.map(|idx| idx.lines.len()))
+        .unwrap_or(0);
+    let indexed_lines = indexed.map(|idx| idx.lines.len()).unwrap_or(0);
+    let imported_commits = indexed.map(|idx| idx.imported_commits).unwrap_or(0);
+    (current_lines, indexed_lines, imported_commits)
+}
+
+fn import_shape_summary(parsed: &ParsedCommit, line_index: &ImportLineIndex) -> String {
+    let mut entries: Vec<(usize, String)> = parsed
+        .files
+        .iter()
+        .map(|file| {
+            let (current_lines, indexed_lines, imported_commits) =
+                import_shape_for_file(file, line_index);
+            let bytes = file
+                .new_content
+                .as_ref()
+                .or(file.old_content.as_ref())
+                .map(|content| content.len())
+                .unwrap_or(0);
+            let weight = current_lines
+                .saturating_mul(imported_commits.max(1))
+                .saturating_add(indexed_lines);
+            (
+                weight,
+                format!(
+                    "{} op={:?} lines={} indexed_lines={} file_commits={} bytes={}",
+                    file.path,
+                    file.operation,
+                    current_lines,
+                    indexed_lines,
+                    imported_commits,
+                    bytes
+                ),
+            )
+        })
+        .collect();
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    entries
+        .into_iter()
+        .take(3)
+        .map(|(_, entry)| entry)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn graph_first_skip_summary(skips: &[GraphFirstSkip], parsed: &ParsedCommit) -> String {
+    if skips.is_empty() {
+        return String::new();
+    }
+
+    skips
+        .iter()
+        .take(5)
+        .map(|skip| {
+            let lines = parsed
+                .files
+                .iter()
+                .find(|file| file.path == skip.path)
+                .and_then(|file| {
+                    file.new_content
+                        .as_deref()
+                        .or(file.old_content.as_deref())
+                        .map(count_line_units)
+                })
+                .unwrap_or(0);
+            format!(
+                "{} op={:?} reason={} lines={}",
+                skip.path, skip.operation, skip.reason, lines
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn trace_git_import_enabled() -> bool {
+    std::env::var_os("ATOMIC_TRACE_GIT_IMPORT").is_some()
+}
+
+fn trace_git_import(message: impl AsRef<str>) {
+    if trace_git_import_enabled() {
+        eprintln!("[git-import] {}", message.as_ref());
+    }
+}
+
+struct SlowImportProgress {
+    done: mpsc::Sender<()>,
+    reported: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl SlowImportProgress {
+    fn start(commit: String, summary: String) -> Self {
+        let (done, rx) = mpsc::channel();
+        let reported = Arc::new(AtomicBool::new(false));
+        let reported_for_thread = Arc::clone(&reported);
+        let handle = thread::spawn(move || {
+            let started = Instant::now();
+            if rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+                return;
+            }
+
+            reported_for_thread.store(true, Ordering::Relaxed);
+            print_info(&format!(
+                "Still importing {} after {}s; please be patient. {}",
+                commit,
+                started.elapsed().as_secs(),
+                summary
+            ));
+
+            loop {
+                if rx.recv_timeout(Duration::from_secs(15)).is_ok() {
+                    break;
+                }
+                print_info(&format!(
+                    "Still importing {} after {}s; graph/CRDT writes are still running.",
+                    commit,
+                    started.elapsed().as_secs()
+                ));
+            }
+        });
+
+        Self {
+            done,
+            reported,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self) -> bool {
+        let _ = self.done.send(());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        self.reported.load(Ordering::Relaxed)
+    }
+}
+
+fn truncate_for_progress(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in input.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn format_byte_count(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.1}GiB", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.1}MiB", bytes_f / MIB)
+    } else if bytes_f >= KIB {
+        format!("{:.1}KiB", bytes_f / KIB)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+fn should_detect_renames(diff: &Diff) -> bool {
+    let mut adds = 0usize;
+    let mut deletes = 0usize;
+
+    for delta in diff.deltas() {
+        match delta.status() {
+            Delta::Added => adds += 1,
+            Delta::Deleted => deletes += 1,
+            _ => {}
+        }
+    }
+
+    if adds == 0 || deletes == 0 {
+        return false;
+    }
+
+    // libgit2 rename detection is similarity matching over candidate
+    // add/delete pairs. On root imports or vendored-tree rewrites this can
+    // dominate the whole import before Atomic sees a single ParsedCommit.
+    adds.saturating_mul(deletes) <= 250_000
 }
 
 fn record_generated_full_replace(
@@ -265,6 +922,1150 @@ fn record_generated_full_replace(
     recorded
 }
 
+fn record_git_diff_add_fast(
+    path: &str,
+    new_content: &[u8],
+    diff_lines: &[GitDiffLine],
+    kind: atomic_core::record::workflow::DetectionKind,
+) -> Option<RecordedFile> {
+    let encoding = Encoding::detect(new_content);
+    if encoding == Encoding::Binary {
+        return None;
+    }
+
+    let mut recorded = RecordedFile::new(path);
+    recorded.set_kind(kind);
+    recorded.set_encoding(encoding);
+    recorded.add_hunk(BuiltHunk::new_edit(
+        Local::new(path, 1),
+        Some(encoding),
+        0,
+        new_content.len() as u64,
+    ));
+    recorded.set_content(new_content.to_vec());
+
+    let (git_file_ops, git_stats) =
+        atomic_core::record::workflow::build_crdt_ops_from_git_diff(path, diff_lines);
+    recorded.set_crdt_ops(git_file_ops);
+    recorded.set_crdt_stats(git_stats);
+    Some(recorded)
+}
+
+fn build_linewise_crdt_ops_for_added_file(
+    path: &str,
+    content: &[u8],
+    encoding: Encoding,
+) -> (
+    atomic_core::change::FileOps,
+    atomic_core::record::workflow::CrdtBuildStats,
+) {
+    use atomic_core::change::LineOps;
+    use atomic_core::crdt::{BranchId, BranchOp, TrunkId};
+    use atomic_core::types::NodeId;
+
+    let placeholder_change_id = NodeId::new(0);
+    let trunk_id = TrunkId::new(placeholder_change_id, 0);
+    let enc = if encoding == Encoding::Binary {
+        None
+    } else {
+        Some(encoding)
+    };
+    let mut file_ops = atomic_core::change::FileOps::create(trunk_id, path.to_string(), enc);
+    let mut stats = atomic_core::record::workflow::CrdtBuildStats::new();
+    stats.files_added = 1;
+
+    let mut prev_branch: Option<BranchId> = None;
+    for (line_idx, _line) in content.split_inclusive(|&b| b == b'\n').enumerate() {
+        let branch_id = BranchId::new(placeholder_change_id, line_idx as u32);
+        let line_ops = LineOps::new_with_line_nums(
+            branch_id,
+            BranchOp::Insert {
+                after: prev_branch,
+                content: Vec::new(),
+            },
+            None,
+            Some(line_idx + 1),
+        );
+        file_ops.add_line_op(line_ops);
+        stats.lines_added += 1;
+        prev_branch = Some(branch_id);
+    }
+
+    (file_ops, stats)
+}
+
+fn build_graph_first_file_ops_for_added_file(
+    path: &str,
+    content_lines: &[Vec<u8>],
+    ranges: &[(ChangePosition, ChangePosition)],
+    encoding: Encoding,
+    file_idx: u32,
+    next_branch_idx: &mut u32,
+) -> atomic_core::change::FileOps {
+    use atomic_core::change::LineOps;
+    use atomic_core::crdt::{BranchId, BranchOp, LeafId, LeafOp, TrunkId};
+    use atomic_core::types::NodeId;
+
+    let placeholder_change_id = NodeId::ROOT;
+    let trunk_id = TrunkId::new(placeholder_change_id, file_idx);
+    let enc = if encoding == Encoding::Binary {
+        None
+    } else {
+        Some(encoding)
+    };
+    let mut file_ops = atomic_core::change::FileOps::create(trunk_id, path.to_string(), enc);
+    if encoding == Encoding::Binary {
+        return file_ops;
+    }
+
+    let mut prev_branch: Option<BranchId> = None;
+    for (line_idx, line) in content_lines.iter().enumerate() {
+        let branch_id = BranchId::new(placeholder_change_id, *next_branch_idx);
+        *next_branch_idx += 1;
+        let leaf_id = LeafId::new(placeholder_change_id, line_idx as u32);
+        let trimmed = line.strip_suffix(b"\n").unwrap_or(line);
+        let leaf_ops = if trimmed.is_empty() {
+            Vec::new()
+        } else {
+            vec![LeafOp::Insert {
+                after: None,
+                kind: atomic_core::diff::TokenKind::Word,
+                content: trimmed.to_vec(),
+            }]
+        };
+        let _ = leaf_id;
+        let mut line_ops = LineOps::new_with_line_nums(
+            branch_id,
+            BranchOp::Insert {
+                after: prev_branch,
+                content: leaf_ops,
+            },
+            None,
+            Some(line_idx + 1),
+        );
+        if let Some((start, end)) = ranges.get(line_idx) {
+            line_ops.set_content_range(*start, *end);
+        }
+        file_ops.add_line_op(line_ops);
+        prev_branch = Some(branch_id);
+    }
+
+    file_ops
+}
+
+fn record_git_import_add_linewise(path: &str, new_content: &[u8]) -> Option<RecordedFile> {
+    let encoding = Encoding::detect(new_content);
+    if encoding == Encoding::Binary {
+        return None;
+    }
+
+    let mut recorded = RecordedFile::new(path);
+    recorded.set_kind(atomic_core::record::workflow::DetectionKind::Added);
+    recorded.set_encoding(encoding);
+    recorded.add_hunk(BuiltHunk::new_edit(
+        Local::new(path, 1),
+        Some(encoding),
+        0,
+        new_content.len() as u64,
+    ));
+    recorded.set_content(new_content.to_vec());
+
+    let (file_ops, stats) = build_linewise_crdt_ops_for_added_file(path, new_content, encoding);
+    recorded.set_crdt_ops(file_ops);
+    recorded.set_crdt_stats(stats);
+    Some(recorded)
+}
+
+fn build_graph_first_change(
+    header: ChangeHeader,
+    parsed: &ParsedCommit,
+    line_index: &ImportLineIndex,
+) -> Result<(Change, Vec<PendingLineIndexUpdate>, Vec<String>), Vec<GraphFirstSkip>> {
+    if parsed.files.is_empty() {
+        return Err(vec![GraphFirstSkip {
+            path: String::new(),
+            operation: FileOperation::Modified,
+            reason: "empty_commit",
+        }]);
+    }
+
+    let mut contents = Vec::new();
+    let mut hunks = Vec::new();
+    let mut file_ops = Vec::new();
+    let mut next_file_idx = 0u32;
+    let mut next_branch_idx = 0u32;
+    let mut dependencies = HashSet::new();
+    let mut pending = Vec::new();
+    let mut deleted_paths = Vec::new();
+    let mut skips = Vec::new();
+
+    for file in &parsed.files {
+        match file.operation {
+            FileOperation::Added | FileOperation::Copied => {
+                let new_content = file.new_content.as_deref().unwrap_or(&[]);
+                let encoding = Encoding::detect(new_content);
+
+                let filename = extract_filename(&file.path);
+                let name_start = ChangePosition::new(contents.len() as u64);
+                contents.extend_from_slice(filename.as_bytes());
+                let name_end = ChangePosition::new(contents.len() as u64);
+                let inode_pos = Position {
+                    change: None,
+                    pos: name_end,
+                };
+                let name_pos = Position {
+                    change: None,
+                    pos: name_end,
+                };
+                let parent_pos = Position {
+                    change: Some(ContentHash::NONE),
+                    pos: ChangePosition::ROOT,
+                };
+
+                let new_line_contents: Vec<Vec<u8>> =
+                    if encoding == Encoding::Binary || is_generated_diff_skip_path(&file.path) {
+                        if new_content.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![new_content.to_vec()]
+                        }
+                    } else {
+                        split_graph_first_lines(new_content)
+                            .into_iter()
+                            .map(|line| line.to_vec())
+                            .collect()
+                    };
+                let mut new_ranges = Vec::new();
+                for line in &new_line_contents {
+                    let start = ChangePosition::new(contents.len() as u64);
+                    contents.extend_from_slice(line);
+                    let end = ChangePosition::new(contents.len() as u64);
+                    new_ranges.push((start, end));
+                }
+
+                let first_content = new_ranges.first().map(|&(start, end)| Insertion {
+                    predecessors: vec![inode_pos],
+                    successors: vec![],
+                    flag: EdgeFlags::BLOCK,
+                    start,
+                    end,
+                    inode: inode_pos,
+                });
+
+                hunks.push(GraphOp::FileAdd {
+                    add_name: Insertion {
+                        predecessors: vec![parent_pos],
+                        successors: vec![],
+                        flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+                        start: name_start,
+                        end: name_end,
+                        inode: parent_pos,
+                    },
+                    add_inode: Insertion {
+                        predecessors: vec![name_pos],
+                        successors: vec![],
+                        flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+                        start: name_end,
+                        end: name_end,
+                        inode: inode_pos,
+                    },
+                    contents: first_content,
+                    path: file.path.clone(),
+                    encoding: Some(encoding),
+                });
+
+                for (idx, &(start, end)) in new_ranges.iter().enumerate().skip(1) {
+                    hunks.push(GraphOp::Edit {
+                        change: Atom::Insertion(Insertion {
+                            predecessors: vec![Position {
+                                change: None,
+                                pos: new_ranges[idx - 1].1,
+                            }],
+                            successors: vec![],
+                            flag: EdgeFlags::BLOCK,
+                            start,
+                            end,
+                            inode: inode_pos,
+                        }),
+                        local: Local::new(&file.path, (idx + 1) as u64),
+                        encoding: Some(encoding),
+                    });
+                }
+
+                file_ops.push(build_graph_first_file_ops_for_added_file(
+                    &file.path,
+                    &new_line_contents,
+                    &new_ranges,
+                    encoding,
+                    next_file_idx,
+                    &mut next_branch_idx,
+                ));
+                next_file_idx += 1;
+                pending.push(PendingLineIndexUpdate::Add {
+                    path: file.path.clone(),
+                    inode_pos,
+                    new_ranges,
+                    new_lines: new_line_contents,
+                });
+                continue;
+            }
+            FileOperation::Renamed => {
+                let Some(old_path) = file.old_path.as_deref() else {
+                    skips.push(GraphFirstSkip::new(file, "rename_missing_old_path"));
+                    continue;
+                };
+                let Some(indexed) = line_index.files.get(old_path) else {
+                    skips.push(GraphFirstSkip::new(file, "rename_missing_line_index"));
+                    continue;
+                };
+                let new_content = file.new_content.as_deref().unwrap_or(&[]);
+                let encoding = Encoding::detect(new_content);
+
+                let new_filename = extract_filename(&file.path);
+                let name_start = ChangePosition::new(contents.len() as u64);
+                contents.extend_from_slice(new_filename.as_bytes());
+                let name_end = ChangePosition::new(contents.len() as u64);
+
+                let old_filename = extract_filename(old_path);
+                let old_name_end = indexed.inode_pos.pos;
+                let old_name_start = ChangePosition::new(
+                    old_name_end.get().saturating_sub(old_filename.len() as u64),
+                );
+                let parent_pos = Position {
+                    change: Some(ContentHash::NONE),
+                    pos: ChangePosition::ROOT,
+                };
+
+                dependencies.extend(position_hashes(&indexed.inode_pos));
+
+                let del = EdgeUpdate {
+                    edges: vec![NewEdge {
+                        previous: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+                        flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK | EdgeFlags::DELETED,
+                        from: parent_pos,
+                        to: GraphNode {
+                            change: indexed.inode_pos.change,
+                            start: old_name_start,
+                            end: old_name_end,
+                        },
+                        introduced_by: indexed.inode_pos.change,
+                    }],
+                    inode: indexed.inode_pos,
+                };
+
+                hunks.push(GraphOp::FileMove {
+                    del,
+                    add: Insertion {
+                        predecessors: vec![parent_pos],
+                        successors: vec![indexed.inode_pos],
+                        flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+                        start: name_start,
+                        end: name_end,
+                        inode: indexed.inode_pos,
+                    },
+                    path: file.path.clone(),
+                });
+                pending.push(PendingLineIndexUpdate::Rename {
+                    old_path: old_path.to_string(),
+                    new_path: file.path.clone(),
+                });
+
+                if encoding != Encoding::Binary && !is_generated_diff_skip_path(&file.path) {
+                    if let Some(diff_lines) = file.diff_lines.as_ref() {
+                        let (ops, _) = atomic_core::record::workflow::build_crdt_ops_from_git_diff(
+                            &file.path, diff_lines,
+                        );
+                        file_ops.push(ops);
+                    }
+                }
+
+                let replacements =
+                    if encoding == Encoding::Binary || is_generated_diff_skip_path(&file.path) {
+                        vec![GitReplacementBlock {
+                            old_start: if indexed.lines.is_empty() { 0 } else { 1 },
+                            old_len: indexed.lines.len(),
+                            new_start: 1,
+                            new_lines: if new_content.is_empty() {
+                                Vec::new()
+                            } else {
+                                vec![new_content.to_vec()]
+                            },
+                        }]
+                    } else {
+                        current_state_replacements(indexed, new_content)
+                    };
+                if !replacements.is_empty() {
+                    let mut pending_replacements = Vec::new();
+                    for replacement in replacements {
+                        let start_idx = if replacement.old_len == 0 {
+                            replacement.old_start
+                        } else {
+                            match replacement.old_start.checked_sub(1) {
+                                Some(idx) => idx,
+                                None => {
+                                    skips.push(GraphFirstSkip::new(
+                                        file,
+                                        "rename_replacement_underflow",
+                                    ));
+                                    continue;
+                                }
+                            }
+                        };
+                        let Some(end_idx) = start_idx.checked_add(replacement.old_len) else {
+                            skips.push(GraphFirstSkip::new(file, "rename_replacement_overflow"));
+                            continue;
+                        };
+                        if end_idx > indexed.lines.len() {
+                            skips.push(GraphFirstSkip::new(
+                                file,
+                                "rename_replacement_out_of_bounds",
+                            ));
+                            continue;
+                        }
+
+                        let predecessor = if start_idx == 0 {
+                            indexed.inode_pos
+                        } else {
+                            indexed.lines[start_idx - 1].end_pos()
+                        };
+                        let successor = indexed.lines.get(end_idx).map(ImportLine::start_pos);
+
+                        dependencies.extend(position_hashes(&predecessor));
+                        if let Some(successor) = successor {
+                            dependencies.extend(position_hashes(&successor));
+                        }
+
+                        let mut edge_update = EdgeUpdate {
+                            edges: Vec::with_capacity(replacement.old_len),
+                            inode: indexed.inode_pos,
+                        };
+                        for line_idx in start_idx..end_idx {
+                            let from = if line_idx == 0 {
+                                indexed.inode_pos
+                            } else {
+                                indexed.lines[line_idx - 1].end_pos()
+                            };
+                            let old_line = &indexed.lines[line_idx];
+                            dependencies.insert(old_line.change);
+                            dependencies.insert(old_line.incoming_by);
+                            edge_update.edges.push(NewEdge {
+                                previous: EdgeFlags::BLOCK,
+                                flag: EdgeFlags::BLOCK | EdgeFlags::DELETED,
+                                from,
+                                to: old_line.node(),
+                                introduced_by: Some(old_line.incoming_by),
+                            });
+                        }
+
+                        let mut new_ranges = Vec::with_capacity(replacement.new_lines.len());
+                        for new_line in &replacement.new_lines {
+                            let start = ChangePosition::new(contents.len() as u64);
+                            contents.extend_from_slice(new_line);
+                            let end = ChangePosition::new(contents.len() as u64);
+                            new_ranges.push((start, end));
+                        }
+
+                        if new_ranges.is_empty() {
+                            hunks.push(GraphOp::Edit {
+                                change: Atom::EdgeUpdate(edge_update),
+                                local: Local::new(&file.path, replacement.new_start as u64),
+                                encoding: Some(encoding),
+                            });
+                        } else if replacement.old_len == 0 {
+                            let first = new_ranges[0];
+                            let first_successors = if new_ranges.len() == 1 {
+                                successor.into_iter().collect()
+                            } else {
+                                Vec::new()
+                            };
+                            hunks.push(GraphOp::Edit {
+                                change: Atom::Insertion(Insertion {
+                                    predecessors: vec![predecessor],
+                                    successors: first_successors,
+                                    flag: EdgeFlags::BLOCK,
+                                    start: first.0,
+                                    end: first.1,
+                                    inode: indexed.inode_pos,
+                                }),
+                                local: Local::new(&file.path, replacement.new_start as u64),
+                                encoding: Some(encoding),
+                            });
+                        } else {
+                            let first = new_ranges[0];
+                            let first_successors = if new_ranges.len() == 1 {
+                                successor.into_iter().collect()
+                            } else {
+                                Vec::new()
+                            };
+                            hunks.push(GraphOp::Replacement {
+                                change: edge_update,
+                                replacement: Insertion {
+                                    predecessors: vec![predecessor],
+                                    successors: first_successors,
+                                    flag: EdgeFlags::BLOCK,
+                                    start: first.0,
+                                    end: first.1,
+                                    inode: indexed.inode_pos,
+                                },
+                                local: Local::new(&file.path, replacement.new_start as u64),
+                                encoding: Some(encoding),
+                            });
+                        }
+
+                        for (new_idx, &(start, end)) in new_ranges.iter().enumerate().skip(1) {
+                            let predecessor = Position {
+                                change: None,
+                                pos: new_ranges[new_idx - 1].1,
+                            };
+                            let successors = if new_idx + 1 == new_ranges.len() {
+                                successor.into_iter().collect()
+                            } else {
+                                Vec::new()
+                            };
+                            hunks.push(GraphOp::Edit {
+                                change: Atom::Insertion(Insertion {
+                                    predecessors: vec![predecessor],
+                                    successors,
+                                    flag: EdgeFlags::BLOCK,
+                                    start,
+                                    end,
+                                    inode: indexed.inode_pos,
+                                }),
+                                local: Local::new(
+                                    &file.path,
+                                    (replacement.new_start + new_idx) as u64,
+                                ),
+                                encoding: Some(encoding),
+                            });
+                        }
+
+                        pending_replacements.push(PendingLineReplacement {
+                            start_idx,
+                            old_len: replacement.old_len,
+                            new_ranges,
+                            new_lines: replacement.new_lines,
+                            successor_incoming_by_current: successor.is_some(),
+                        });
+                    }
+
+                    pending.push(PendingLineIndexUpdate::Modify {
+                        path: file.path.clone(),
+                        replacements: pending_replacements,
+                    });
+                }
+                continue;
+            }
+            FileOperation::Deleted => {
+                let Some(indexed) = line_index.files.get(&file.path) else {
+                    skips.push(GraphFirstSkip::new(
+                        file,
+                        "delete_missing_line_index_cleanup_only",
+                    ));
+                    deleted_paths.push(file.path.clone());
+                    pending.push(PendingLineIndexUpdate::Delete {
+                        path: file.path.clone(),
+                    });
+                    continue;
+                };
+                let mut edge_update = EdgeUpdate {
+                    edges: Vec::with_capacity(indexed.lines.len()),
+                    inode: indexed.inode_pos,
+                };
+                for line_idx in 0..indexed.lines.len() {
+                    let from = if line_idx == 0 {
+                        indexed.inode_pos
+                    } else {
+                        indexed.lines[line_idx - 1].end_pos()
+                    };
+                    let old_line = &indexed.lines[line_idx];
+                    dependencies.insert(old_line.change);
+                    dependencies.insert(old_line.incoming_by);
+                    edge_update.edges.push(NewEdge {
+                        previous: EdgeFlags::BLOCK,
+                        flag: EdgeFlags::BLOCK | EdgeFlags::DELETED,
+                        from,
+                        to: old_line.node(),
+                        introduced_by: Some(old_line.incoming_by),
+                    });
+                }
+                hunks.push(GraphOp::Edit {
+                    change: Atom::EdgeUpdate(edge_update),
+                    local: Local::new(&file.path, 1),
+                    encoding: file
+                        .old_content
+                        .as_deref()
+                        .map(Encoding::detect)
+                        .filter(|enc| *enc != Encoding::Binary)
+                        .or(Some(Encoding::Utf8)),
+                });
+                pending.push(PendingLineIndexUpdate::Delete {
+                    path: file.path.clone(),
+                });
+                deleted_paths.push(file.path.clone());
+                if let Some(diff_lines) = file.diff_lines.as_ref() {
+                    let (ops, _) = atomic_core::record::workflow::build_crdt_ops_from_git_diff(
+                        &file.path, diff_lines,
+                    );
+                    file_ops.push(ops);
+                }
+                continue;
+            }
+            FileOperation::Modified => {}
+        }
+
+        let Some(indexed) = line_index.files.get(&file.path) else {
+            skips.push(GraphFirstSkip::new(file, "modified_missing_line_index"));
+            continue;
+        };
+        let Some(new_content) = file.new_content.as_deref() else {
+            skips.push(GraphFirstSkip::new(file, "modified_missing_new_content"));
+            continue;
+        };
+        let encoding = Encoding::detect(new_content);
+        let replacements = if encoding == Encoding::Binary
+            || is_generated_diff_skip_path(&file.path)
+        {
+            vec![GitReplacementBlock {
+                old_start: if indexed.lines.is_empty() { 0 } else { 1 },
+                old_len: indexed.lines.len(),
+                new_start: 1,
+                new_lines: if new_content.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![new_content.to_vec()]
+                },
+            }]
+        } else if parsed.is_merge {
+            current_state_replacements(indexed, new_content)
+        } else {
+            let Some(diff_lines) = file.diff_lines.as_ref() else {
+                skips.push(GraphFirstSkip::new(file, "modified_missing_diff_lines"));
+                continue;
+            };
+            let (ops, _) =
+                atomic_core::record::workflow::build_crdt_ops_from_git_diff(&file.path, diff_lines);
+            file_ops.push(ops);
+            let Some(replacements) = parse_git_diff_replacements(diff_lines) else {
+                skips.push(GraphFirstSkip::new(file, "modified_unparseable_diff_lines"));
+                continue;
+            };
+            replacements
+        };
+        if replacements.is_empty() {
+            continue;
+        }
+
+        let encoding = file
+            .new_content
+            .as_deref()
+            .map(Encoding::detect)
+            .filter(|enc| *enc != Encoding::Binary)
+            .or(Some(Encoding::Utf8));
+
+        let mut pending_replacements = Vec::new();
+
+        for replacement in replacements {
+            let start_idx = if replacement.old_len == 0 {
+                replacement.old_start
+            } else {
+                let Some(idx) = replacement.old_start.checked_sub(1) else {
+                    skips.push(GraphFirstSkip::new(file, "modified_replacement_underflow"));
+                    continue;
+                };
+                idx
+            };
+            let Some(end_idx) = start_idx.checked_add(replacement.old_len) else {
+                skips.push(GraphFirstSkip::new(file, "modified_replacement_overflow"));
+                continue;
+            };
+            if end_idx > indexed.lines.len() {
+                skips.push(GraphFirstSkip::new(
+                    file,
+                    "modified_replacement_out_of_bounds",
+                ));
+                continue;
+            }
+
+            let predecessor = if start_idx == 0 {
+                indexed.inode_pos
+            } else {
+                indexed.lines[start_idx - 1].end_pos()
+            };
+            let successor = indexed.lines.get(end_idx).map(ImportLine::start_pos);
+
+            dependencies.extend(position_hashes(&predecessor));
+            if let Some(successor) = successor {
+                dependencies.extend(position_hashes(&successor));
+            }
+
+            let mut edge_update = EdgeUpdate {
+                edges: Vec::with_capacity(replacement.old_len),
+                inode: indexed.inode_pos,
+            };
+
+            for line_idx in start_idx..end_idx {
+                let from = if line_idx == 0 {
+                    indexed.inode_pos
+                } else {
+                    indexed.lines[line_idx - 1].end_pos()
+                };
+                let old_line = &indexed.lines[line_idx];
+                dependencies.insert(old_line.change);
+                dependencies.insert(old_line.incoming_by);
+                edge_update.edges.push(NewEdge {
+                    previous: EdgeFlags::BLOCK,
+                    flag: EdgeFlags::BLOCK | EdgeFlags::DELETED,
+                    from,
+                    to: old_line.node(),
+                    introduced_by: Some(old_line.incoming_by),
+                });
+            }
+
+            let mut new_ranges = Vec::with_capacity(replacement.new_lines.len());
+            for new_line in &replacement.new_lines {
+                let start = ChangePosition::new(contents.len() as u64);
+                contents.extend_from_slice(new_line);
+                let end = ChangePosition::new(contents.len() as u64);
+                new_ranges.push((start, end));
+            }
+
+            if new_ranges.is_empty() {
+                hunks.push(GraphOp::Edit {
+                    change: Atom::EdgeUpdate(edge_update),
+                    local: Local::new(&file.path, replacement.new_start as u64),
+                    encoding,
+                });
+            } else if replacement.old_len == 0 {
+                let first = new_ranges[0];
+                let first_successors = if new_ranges.len() == 1 {
+                    successor.into_iter().collect()
+                } else {
+                    Vec::new()
+                };
+                hunks.push(GraphOp::Edit {
+                    change: Atom::Insertion(Insertion {
+                        predecessors: vec![predecessor],
+                        successors: first_successors,
+                        flag: EdgeFlags::BLOCK,
+                        start: first.0,
+                        end: first.1,
+                        inode: indexed.inode_pos,
+                    }),
+                    local: Local::new(&file.path, replacement.new_start as u64),
+                    encoding,
+                });
+            } else {
+                let first = new_ranges[0];
+                let first_successors = if new_ranges.len() == 1 {
+                    successor.into_iter().collect()
+                } else {
+                    Vec::new()
+                };
+                hunks.push(GraphOp::Replacement {
+                    change: edge_update,
+                    replacement: Insertion {
+                        predecessors: vec![predecessor],
+                        successors: first_successors,
+                        flag: EdgeFlags::BLOCK,
+                        start: first.0,
+                        end: first.1,
+                        inode: indexed.inode_pos,
+                    },
+                    local: Local::new(&file.path, replacement.new_start as u64),
+                    encoding,
+                });
+            }
+
+            for (new_idx, &(start, end)) in new_ranges.iter().enumerate().skip(1) {
+                let predecessor = Position {
+                    change: None,
+                    pos: new_ranges[new_idx - 1].1,
+                };
+                let successors = if new_idx + 1 == new_ranges.len() {
+                    successor.into_iter().collect()
+                } else {
+                    Vec::new()
+                };
+                hunks.push(GraphOp::Edit {
+                    change: Atom::Insertion(Insertion {
+                        predecessors: vec![predecessor],
+                        successors,
+                        flag: EdgeFlags::BLOCK,
+                        start,
+                        end,
+                        inode: indexed.inode_pos,
+                    }),
+                    local: Local::new(&file.path, (replacement.new_start + new_idx) as u64),
+                    encoding,
+                });
+            }
+
+            pending_replacements.push(PendingLineReplacement {
+                start_idx,
+                old_len: replacement.old_len,
+                new_ranges,
+                new_lines: replacement.new_lines,
+                successor_incoming_by_current: successor.is_some(),
+            });
+        }
+
+        pending.push(PendingLineIndexUpdate::Modify {
+            path: file.path.clone(),
+            replacements: pending_replacements,
+        });
+    }
+
+    if hunks.is_empty() {
+        if skips.is_empty() {
+            skips.push(GraphFirstSkip {
+                path: String::new(),
+                operation: FileOperation::Modified,
+                reason: "no_graph_hunks",
+            });
+        }
+        return Err(skips);
+    }
+
+    let fatal_skips: Vec<GraphFirstSkip> = skips
+        .iter()
+        .filter(|skip| skip.reason != "delete_missing_line_index_cleanup_only")
+        .cloned()
+        .collect();
+    if !fatal_skips.is_empty() {
+        return Err(skips);
+    }
+
+    let mut dependencies: Vec<ContentHash> = dependencies.into_iter().collect();
+    dependencies.sort();
+    dependencies.dedup();
+    Ok((
+        Change::with_file_ops(header, hunks, file_ops, contents, dependencies),
+        pending,
+        deleted_paths,
+    ))
+}
+
+fn build_graph_first_skip_reasons(
+    parsed: &ParsedCommit,
+    line_index: &ImportLineIndex,
+) -> Vec<GraphFirstSkip> {
+    let mut skips = Vec::new();
+    for file in &parsed.files {
+        match file.operation {
+            FileOperation::Modified => {
+                if !line_index.files.contains_key(&file.path) {
+                    skips.push(GraphFirstSkip::new(file, "modified_missing_line_index"));
+                } else if file.new_content.is_none() {
+                    skips.push(GraphFirstSkip::new(file, "modified_missing_new_content"));
+                } else if !parsed.is_merge
+                    && !is_generated_diff_skip_path(&file.path)
+                    && file
+                        .new_content
+                        .as_deref()
+                        .map(Encoding::detect)
+                        .is_some_and(|encoding| encoding != Encoding::Binary)
+                    && file.diff_lines.is_none()
+                {
+                    skips.push(GraphFirstSkip::new(file, "modified_missing_diff_lines"));
+                }
+            }
+            FileOperation::Deleted => {
+                if !line_index.files.contains_key(&file.path) {
+                    skips.push(GraphFirstSkip::new(
+                        file,
+                        "delete_missing_line_index_cleanup_only",
+                    ));
+                }
+            }
+            FileOperation::Renamed => {
+                if file.old_path.is_none() {
+                    skips.push(GraphFirstSkip::new(file, "rename_missing_old_path"));
+                } else if file
+                    .old_path
+                    .as_deref()
+                    .is_some_and(|old| !line_index.files.contains_key(old))
+                {
+                    skips.push(GraphFirstSkip::new(file, "rename_missing_line_index"));
+                }
+            }
+            FileOperation::Added | FileOperation::Copied => {}
+        }
+    }
+    skips
+}
+
+fn current_state_replacements(
+    indexed: &ImportIndexedFile,
+    new_content: &[u8],
+) -> Vec<GitReplacementBlock> {
+    let old_lines = &indexed.lines;
+    let new_lines: Vec<Vec<u8>> = split_graph_first_lines(new_content)
+        .into_iter()
+        .map(|line| line.to_vec())
+        .collect();
+
+    let mut prefix = 0usize;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix].content == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+
+    let mut suffix = 0usize;
+    while suffix < old_lines.len().saturating_sub(prefix)
+        && suffix < new_lines.len().saturating_sub(prefix)
+        && old_lines[old_lines.len() - 1 - suffix].content
+            == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let old_mid_len = old_lines.len().saturating_sub(prefix + suffix);
+    let new_mid_end = new_lines.len().saturating_sub(suffix);
+    if old_mid_len == 0 && prefix == new_mid_end {
+        return Vec::new();
+    }
+
+    vec![GitReplacementBlock {
+        old_start: if old_mid_len == 0 { prefix } else { prefix + 1 },
+        old_len: old_mid_len,
+        new_start: prefix + 1,
+        new_lines: new_lines[prefix..new_mid_end].to_vec(),
+    }]
+}
+
+fn parse_git_diff_replacements(lines: &[GitDiffLine]) -> Option<Vec<GitReplacementBlock>> {
+    let mut blocks = Vec::new();
+    let mut old_start: Option<usize> = None;
+    let mut new_start: Option<usize> = None;
+    let mut old_len = 0usize;
+    let mut new_lines = Vec::new();
+    let mut old_cursor = 1usize;
+    let mut new_cursor = 1usize;
+
+    let flush = |blocks: &mut Vec<GitReplacementBlock>,
+                 old_start: &mut Option<usize>,
+                 new_start: &mut Option<usize>,
+                 old_len: &mut usize,
+                 new_lines: &mut Vec<Vec<u8>>|
+     -> Option<()> {
+        if *old_len > 0 || !new_lines.is_empty() {
+            let old = old_start.take()?;
+            let new = new_start.take().unwrap_or(old);
+            blocks.push(GitReplacementBlock {
+                old_start: old,
+                old_len: *old_len,
+                new_start: new,
+                new_lines: std::mem::take(new_lines),
+            });
+            *old_len = 0;
+        }
+        Some(())
+    };
+
+    for line in lines {
+        match line.origin {
+            ' ' => {
+                flush(
+                    &mut blocks,
+                    &mut old_start,
+                    &mut new_start,
+                    &mut old_len,
+                    &mut new_lines,
+                )?;
+                old_cursor = line
+                    .old_lineno
+                    .map(|n| n as usize + 1)
+                    .unwrap_or(old_cursor + 1);
+                new_cursor = line
+                    .new_lineno
+                    .map(|n| n as usize + 1)
+                    .unwrap_or(new_cursor + 1);
+            }
+            '-' => {
+                if old_start.is_none() {
+                    old_start = Some(line.old_lineno.map(|n| n as usize).unwrap_or(old_cursor));
+                }
+                old_cursor = line
+                    .old_lineno
+                    .map(|n| n as usize + 1)
+                    .unwrap_or(old_cursor + 1);
+                old_len += 1;
+            }
+            '+' => {
+                if new_start.is_none() {
+                    new_start = Some(line.new_lineno.map(|n| n as usize).unwrap_or(new_cursor));
+                }
+                if old_start.is_none() {
+                    old_start = Some(old_cursor.saturating_sub(1));
+                }
+                new_cursor = line
+                    .new_lineno
+                    .map(|n| n as usize + 1)
+                    .unwrap_or(new_cursor + 1);
+                new_lines.push(line.content.clone());
+            }
+            _ => {}
+        }
+    }
+
+    flush(
+        &mut blocks,
+        &mut old_start,
+        &mut new_start,
+        &mut old_len,
+        &mut new_lines,
+    )?;
+
+    Some(blocks)
+}
+
+fn apply_line_index_updates(
+    line_index: &mut ImportLineIndex,
+    change_hash: ContentHash,
+    pending: Vec<PendingLineIndexUpdate>,
+) {
+    for update in pending {
+        match update {
+            PendingLineIndexUpdate::Add {
+                path,
+                inode_pos,
+                new_ranges,
+                new_lines,
+            } => {
+                let inode_pos = Position {
+                    change: Some(change_hash),
+                    pos: inode_pos.pos,
+                };
+                let lines = new_ranges
+                    .iter()
+                    .zip(new_lines)
+                    .map(|(&(start, end), content)| ImportLine {
+                        change: change_hash,
+                        start,
+                        end,
+                        incoming_by: change_hash,
+                        content,
+                    })
+                    .collect();
+                line_index.files.insert(
+                    path,
+                    ImportIndexedFile {
+                        inode_pos,
+                        lines,
+                        imported_commits: 1,
+                    },
+                );
+            }
+            PendingLineIndexUpdate::Modify { path, replacements } => {
+                let Some(indexed) = line_index.files.get_mut(&path) else {
+                    continue;
+                };
+                if !replacements.is_empty() {
+                    indexed.imported_commits += 1;
+                }
+
+                let mut offset: isize = 0;
+                for replacement in replacements {
+                    let adjusted_start = (replacement.start_idx as isize + offset).max(0) as usize;
+                    let adjusted_end = adjusted_start
+                        .saturating_add(replacement.old_len)
+                        .min(indexed.lines.len());
+                    let new_lines: Vec<ImportLine> = replacement
+                        .new_ranges
+                        .iter()
+                        .zip(replacement.new_lines)
+                        .map(|(&(start, end), content)| ImportLine {
+                            change: change_hash,
+                            start,
+                            end,
+                            incoming_by: change_hash,
+                            content,
+                        })
+                        .collect();
+                    indexed
+                        .lines
+                        .splice(adjusted_start..adjusted_end, new_lines);
+
+                    if replacement.successor_incoming_by_current {
+                        let successor_idx = adjusted_start + replacement.new_ranges.len();
+                        if let Some(successor) = indexed.lines.get_mut(successor_idx) {
+                            successor.incoming_by = change_hash;
+                        }
+                    }
+
+                    offset += replacement.new_ranges.len() as isize - replacement.old_len as isize;
+                }
+            }
+            PendingLineIndexUpdate::Rename { old_path, new_path } => {
+                if let Some(indexed) = line_index.files.remove(&old_path) {
+                    line_index.files.insert(new_path, indexed);
+                }
+            }
+            PendingLineIndexUpdate::Delete { path } => {
+                line_index.files.remove(&path);
+            }
+        }
+    }
+}
+
+fn slow_import_commit_label(parsed: &ParsedCommit) -> String {
+    let message = truncate_for_progress(&parsed.metadata.message.replace('\n', " "), 72);
+    format!("{} \"{}\"", parsed.short_sha, message)
+}
+
+fn slow_import_record_summary(parsed: &ParsedCommit, recorded_files: &[RecordedFile]) -> String {
+    let mut added = 0usize;
+    let mut modified = 0usize;
+    let mut deleted = 0usize;
+    let mut renamed = 0usize;
+    let mut copied = 0usize;
+    let mut bytes = 0usize;
+
+    for file in &parsed.files {
+        match file.operation {
+            FileOperation::Added => added += 1,
+            FileOperation::Modified => modified += 1,
+            FileOperation::Deleted => deleted += 1,
+            FileOperation::Renamed => renamed += 1,
+            FileOperation::Copied => copied += 1,
+        }
+        bytes += file.new_content.as_ref().map(|c| c.len()).unwrap_or(0);
+        bytes += file.old_content.as_ref().map(|c| c.len()).unwrap_or(0);
+    }
+
+    let mut largest: Vec<(&str, usize)> = recorded_files
+        .iter()
+        .map(|rec| (rec.path(), rec.content().len()))
+        .collect();
+    largest.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let top_paths = largest
+        .into_iter()
+        .take(3)
+        .map(|(path, size)| format!("{} ({})", path, format_byte_count(size)))
+        .collect::<Vec<_>>();
+
+    let top = if top_paths.is_empty() {
+        "top records: none".to_string()
+    } else {
+        format!("top records: {}", top_paths.join(", "))
+    };
+
+    format!(
+        "records={}, files={}, bytes={}, ops=+{}/~{}/-{} renames={} copies={}; {}",
+        recorded_files.len(),
+        parsed.files.len(),
+        format_byte_count(bytes),
+        added,
+        modified,
+        deleted,
+        renamed,
+        copied,
+        top
+    )
+}
+
 impl ParallelImporter {
     /// Create a new parallel importer.
     pub fn new(git_repo: &GitRepository, options: ParallelImportOptions) -> Self {
@@ -273,10 +2074,12 @@ impl ParallelImporter {
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| git_repo.path().to_path_buf());
+        let ignore_matcher = ImportIgnoreMatcher::new(options.ignored_path_patterns.clone());
 
         Self {
             git_repo_path,
             options,
+            ignore_matcher,
         }
     }
 
@@ -287,19 +2090,43 @@ impl ParallelImporter {
         })
     }
 
+    fn path_ignored_for_import(&self, path: &str) -> bool {
+        !self.ignore_matcher.is_empty() && self.ignore_matcher.matches(path)
+    }
+
+    fn file_ignored_for_import(&self, file: &ParsedFile) -> bool {
+        match file.operation {
+            FileOperation::Renamed => {
+                let old_ignored = file
+                    .old_path
+                    .as_deref()
+                    .is_some_and(|old_path| self.path_ignored_for_import(old_path));
+                old_ignored && self.path_ignored_for_import(&file.path)
+            }
+            _ => self.path_ignored_for_import(&file.path),
+        }
+    }
+
+    fn apply_import_ignores(&self, commit: &mut ParsedCommit) {
+        if self.ignore_matcher.is_empty() || commit.files.is_empty() {
+            return;
+        }
+
+        commit
+            .files
+            .retain(|file| !self.file_ignored_for_import(file));
+        if commit.files.is_empty() {
+            commit.is_empty = true;
+        }
+    }
+
     /// Import commits from a branch into an Atomic repository.
     ///
     /// Commits are processed in **batches** to keep memory bounded and show
     /// progress sooner. Each batch: parse in parallel → write sequentially.
     ///
-    /// Batch sizes are tiered by total commit count:
-    ///
-    /// | Total commits | Batch size |
-    /// |---------------|------------|
-    /// | < 5,000       | 250        |
-    /// | 5,000–9,999   | 500        |
-    /// | 10,000–19,999 | 1,000      |
-    /// | ≥ 20,000      | 2,500      |
+    /// Imports use a fixed 1,000-commit batch size. This keeps progress and
+    /// memory behavior predictable across small and large repositories.
     pub fn import_branch(
         &self,
         branch_name: &str,
@@ -328,6 +2155,7 @@ impl ParallelImporter {
 
         let import_start = Instant::now();
         let mut commits_written = 0usize;
+        let mut line_index = ImportLineIndex::default();
 
         for (batch_idx, chunk) in commit_oids.chunks(batch_size).enumerate() {
             let batch_start = batch_idx * batch_size;
@@ -355,7 +2183,7 @@ impl ParallelImporter {
 
             // Phase 2: Sequential write for this batch
             let write_start = Instant::now();
-            let write_stats = self.phase2_write(repo, &parsed_commits)?;
+            let write_stats = self.phase2_write(repo, &parsed_commits, &mut line_index)?;
             let write_elapsed = write_start.elapsed();
 
             stats.phase2_duration += write_elapsed;
@@ -444,6 +2272,9 @@ impl ParallelImporter {
         if let Ok(status) = repo.status(atomic_repository::StatusOptions::default()) {
             for entry in status.untracked() {
                 let path_str = entry.path().to_string_lossy().replace('\\', "/");
+                if self.path_ignored_for_import(&path_str) {
+                    continue;
+                }
 
                 // Add to tracking
                 let _ = repo.add(&path_str, atomic_repository::TrackingOptions::default());
@@ -488,14 +2319,9 @@ impl ParallelImporter {
         Ok(stats)
     }
 
-    /// Determine batch size based on total commit count.
-    fn batch_size_for(total: usize) -> usize {
-        match total {
-            0..5_000 => 250,
-            5_000..10_000 => 500,
-            10_000..20_000 => 1_000,
-            _ => 2_500,
-        }
+    /// Determine the default import batch size.
+    fn batch_size_for(_total: usize) -> usize {
+        1_000
     }
 
     /// Collect commit OIDs in topological order (oldest first).
@@ -521,6 +2347,14 @@ impl ParallelImporter {
         revwalk.push(target_oid).map_err(|e| CliError::GitError {
             message: format!("Failed to push target to revwalk: {}", e),
         })?;
+
+        if self.options.mainline_only {
+            revwalk
+                .simplify_first_parent()
+                .map_err(|e| CliError::GitError {
+                    message: format!("Failed to simplify revwalk to first-parent history: {}", e),
+                })?;
+        }
 
         // Topological order, oldest first
         revwalk
@@ -582,7 +2416,9 @@ impl ParallelImporter {
                     message: format!("Failed to open git repository: {}", e),
                 })?;
 
-                parse_commit(&git_repo, *oid, idx, &oid_to_index)
+                let mut commit = parse_commit(&git_repo, *oid, idx, &oid_to_index)?;
+                self.apply_import_ignores(&mut commit);
+                Ok(commit)
             })
             .collect();
 
@@ -618,6 +2454,7 @@ impl ParallelImporter {
         &self,
         repo: &mut Repository,
         commits: &[ParsedCommit],
+        line_index: &mut ImportLineIndex,
     ) -> CliResult<WriteStats> {
         let mut stats = WriteStats::default();
         let total = commits.len();
@@ -645,7 +2482,7 @@ impl ParallelImporter {
             }
 
             // Write the change
-            match self.write_commit(repo, parsed) {
+            match self.write_commit(repo, parsed, line_index) {
                 Ok(written) => {
                     if written {
                         stats.changes_written += 1;
@@ -673,6 +2510,9 @@ impl ParallelImporter {
         for parsed in commits {
             for file in &parsed.files {
                 if file.operation == FileOperation::Deleted {
+                    continue;
+                }
+                if self.path_ignored_for_import(&file.path) {
                     continue;
                 }
                 let abs_path = repo_root.join(&file.path);
@@ -703,7 +2543,12 @@ impl ParallelImporter {
     }
 
     /// Write a single commit to the repository.
-    fn write_commit(&self, repo: &mut Repository, parsed: &ParsedCommit) -> CliResult<bool> {
+    fn write_commit(
+        &self,
+        repo: &mut Repository,
+        parsed: &ParsedCommit,
+        line_index: &mut ImportLineIndex,
+    ) -> CliResult<bool> {
         use atomic_core::output::memory::Memory;
         use atomic_core::record::workflow::{
             record_added_file, record_deleted_file, record_modified_file, DetectedFile,
@@ -730,6 +2575,100 @@ impl ParallelImporter {
         // Handle empty commits
         if parsed.is_empty {
             return self.write_empty_commit(repo, parsed, header);
+        }
+
+        line_index.seed_missing_modified_files(repo, parsed);
+        let graph_first_skips = build_graph_first_skip_reasons(parsed, line_index);
+        let graph_first_result = build_graph_first_change(header.clone(), parsed, line_index);
+
+        if let Ok((mut graph_change, pending_updates, graph_deleted_paths)) = graph_first_result {
+            graph_change.unhashed = Some(self.build_git_metadata(parsed, false, false));
+            let pre_write_shape = import_shape_summary(parsed, line_index);
+            let pre_write_skip_summary = graph_first_skip_summary(&graph_first_skips, parsed);
+            let progress = SlowImportProgress::start(
+                slow_import_commit_label(parsed),
+                if pre_write_shape.is_empty() && pre_write_skip_summary.is_empty() {
+                    format!(
+                        "graph-first files={}, ops={}; CRDT metadata deferred",
+                        parsed.files.len(),
+                        graph_change.hunks().len()
+                    )
+                } else {
+                    format!(
+                        "graph-first files={}, ops={}; {}{}{}CRDT metadata deferred",
+                        parsed.files.len(),
+                        graph_change.hunks().len(),
+                        pre_write_shape,
+                        if pre_write_shape.is_empty() || pre_write_skip_summary.is_empty() {
+                            ""
+                        } else {
+                            "; "
+                        },
+                        if pre_write_skip_summary.is_empty() {
+                            String::new()
+                        } else {
+                            format!("cleanup-only skips: {}; ", pre_write_skip_summary)
+                        }
+                    )
+                },
+            );
+            let write_start = Instant::now();
+            let write_result = repo.write_import_graph_change(
+                graph_change,
+                &graph_deleted_paths,
+                Default::default(),
+            );
+            let write_ms = write_start.elapsed().as_millis();
+            let progress_reported = progress.finish();
+            let write_outcome = write_result.map_err(|e| CliError::Internal(e.into()))?;
+            let shape_summary = if progress_reported
+                || write_ms >= 5_000
+                || write_outcome.timings.assemble_ms >= 5_000
+                || write_outcome.timings.apply_ms >= 5_000
+                || write_outcome.timings.direct_graph_ms >= 5_000
+            {
+                Some(pre_write_shape.clone())
+            } else {
+                None
+            };
+            apply_line_index_updates(line_index, write_outcome.hash, pending_updates);
+            if progress_reported || write_ms >= 5_000 {
+                print_info(&format!(
+                    "Imported {} in {:.1}s (graph-first assemble={}ms apply={}ms direct_graph={}ms direct_crdt={}ms commit={}ms)",
+                    slow_import_commit_label(parsed),
+                    write_ms as f64 / 1000.0,
+                    write_outcome.timings.assemble_ms,
+                    write_outcome.timings.apply_ms,
+                    write_outcome.timings.direct_graph_ms,
+                    write_outcome.timings.direct_crdt_ms,
+                    write_outcome.timings.commit_ms
+                ));
+                if let Some(shape) = shape_summary.as_ref().filter(|shape| !shape.is_empty()) {
+                    print_info(&format!("  Slow import shape: {}", shape));
+                }
+                if !pre_write_skip_summary.is_empty() {
+                    print_info(&format!(
+                        "  Graph-first cleanup-only skips: {}",
+                        pre_write_skip_summary
+                    ));
+                }
+            }
+            trace_git_import(format!(
+                "write {} files={} graph_first=1 ops={} apply={}ms direct_graph={}ms direct_crdt={}ms commit={}ms total={}ms",
+                parsed.short_sha,
+                parsed.files.len(),
+                write_outcome.insert.stats.atoms_processed,
+                write_outcome.timings.apply_ms,
+                write_outcome.timings.direct_graph_ms,
+                write_outcome.timings.direct_crdt_ms,
+                write_outcome.timings.commit_ms,
+                commit_start.elapsed().as_millis()
+            ));
+            if !graph_deleted_paths.is_empty() {
+                let del_refs: Vec<&str> = graph_deleted_paths.iter().map(|s| s.as_str()).collect();
+                let _ = repo.del_file_index_batch(&del_refs);
+            }
+            return Ok(true);
         }
 
         // Track new files so the pristine knows about them before we record.
@@ -778,6 +2717,21 @@ impl ParallelImporter {
                         Some(c) => c.as_slice(),
                         None => continue,
                     };
+                    if let Some(ref diff_lines) = file.diff_lines {
+                        if let Some(rec) = record_git_diff_add_fast(
+                            &file.path,
+                            content,
+                            diff_lines,
+                            atomic_core::record::workflow::DetectionKind::Added,
+                        ) {
+                            recorded_files.push(rec);
+                            continue;
+                        }
+                    }
+                    if let Some(rec) = record_git_import_add_linewise(&file.path, content) {
+                        recorded_files.push(rec);
+                        continue;
+                    }
                     memory_wc.add_file(&file.path, content);
                     let detected = DetectedFile::added(&file.path);
                     match record_added_file(&memory_wc, &detected, &core_options) {
@@ -1085,76 +3039,53 @@ impl ParallelImporter {
             );
         }
 
-        // Assemble the change from recorded files
-        if recorded_files.is_empty() {
-            let mut change = Change::empty(header);
-            change.unhashed = Some(self.build_git_metadata(parsed, false, true));
-            let hash = change.hash().map_err(|e| CliError::Internal(e.into()))?;
-            repo.save_change(&change)
-                .map_err(|e| CliError::Internal(e.into()))?;
-            repo.insert_change(&hash, Default::default())
-                .map_err(|e| CliError::Internal(e.into()))?;
-            return Ok(true);
-        }
-
-        let step_start = Instant::now();
-        let (mut change, hash) = match repo.assemble_and_hash(header.clone(), &recorded_files) {
-            Ok(result) => result,
-            Err(e) => {
-                // Globalization may strip all hunks (e.g., pure deletion commits
-                // where find_content_vertices returns empty for already-deleted
-                // files).  Fall back to an empty change — the explicit
-                // repo.remove() cleanup below still handles the TREE entries.
-                let err_msg = e.to_string();
-                if err_msg.contains("empty") || err_msg.contains("AllEmpty") {
-                    let mut empty = Change::empty(header);
-                    empty.unhashed = Some(self.build_git_metadata(parsed, false, true));
-                    let h = empty.hash().map_err(|e| CliError::Internal(e.into()))?;
-                    repo.save_change(&empty)
-                        .map_err(|e| CliError::Internal(e.into()))?;
-                    repo.insert_change(&h, Default::default())
-                        .map_err(|e| CliError::Internal(e.into()))?;
-
-                    // Still clean up deleted files from TREE and FILE_INDEX
-                    if !deleted_paths.is_empty() {
-                        let del_refs: Vec<&str> =
-                            deleted_paths.iter().map(|s| s.as_str()).collect();
-                        let _ = repo.remove_batch(&del_refs);
-                        let _ = repo.del_file_index_batch(&del_refs);
-                    }
-
-                    return Ok(true);
-                }
-                return Err(CliError::Internal(e.into()));
-            }
+        let metadata = self.build_git_metadata(parsed, false, recorded_files.is_empty());
+        let pre_write_shape = import_shape_summary(parsed, line_index);
+        let graph_first_skip_summary = graph_first_skip_summary(&graph_first_skips, parsed);
+        let progress_summary = if pre_write_shape.is_empty() {
+            slow_import_record_summary(parsed, &recorded_files)
+        } else {
+            format!(
+                "{}; {}",
+                slow_import_record_summary(parsed, &recorded_files),
+                pre_write_shape
+            )
         };
-        let assemble_ms = step_start.elapsed().as_millis();
-
-        change.unhashed = Some(self.build_git_metadata(parsed, false, false));
-
-        // Save and insert
-        let step_start = Instant::now();
-        repo.save_change(&change)
+        let progress =
+            SlowImportProgress::start(slow_import_commit_label(parsed), progress_summary);
+        let write_start = Instant::now();
+        let write_outcome = repo
+            .write_import_recorded(
+                header,
+                &recorded_files,
+                metadata,
+                &deleted_paths,
+                Default::default(),
+            )
             .map_err(|e| CliError::Internal(e.into()))?;
-        let save_ms = step_start.elapsed().as_millis();
-
-        let step_start = Instant::now();
-        repo.insert_change(&hash, Default::default())
-            .map_err(|e| CliError::Internal(e.into()))?;
-        let insert_ms = step_start.elapsed().as_millis();
-
-        // Log slow commits (>50ms total) so we can identify the bottleneck
-        let total_ms = assemble_ms + save_ms + insert_ms;
-        if total_ms > 50 {
-            log::info!(
-                "  SLOW commit {} ({} files): assemble={}ms save={}ms insert={}ms total={}ms",
-                parsed.short_sha,
-                parsed.files.len(),
-                assemble_ms,
-                save_ms,
-                insert_ms,
-                total_ms,
-            );
+        let write_ms = write_start.elapsed().as_millis();
+        let progress_reported = progress.finish();
+        line_index.reseed_from_fallback_write(repo, parsed);
+        if progress_reported || write_ms >= 5_000 {
+            print_info(&format!(
+                "Imported {} in {:.1}s (assemble={}ms apply={}ms direct_graph={}ms direct_crdt={}ms commit={}ms)",
+                slow_import_commit_label(parsed),
+                write_ms as f64 / 1000.0,
+                write_outcome.timings.assemble_ms,
+                write_outcome.timings.apply_ms,
+                write_outcome.timings.direct_graph_ms,
+                write_outcome.timings.direct_crdt_ms,
+                write_outcome.timings.commit_ms
+            ));
+            if !pre_write_shape.is_empty() {
+                print_info(&format!("  Slow import shape: {}", pre_write_shape));
+            }
+            if !graph_first_skip_summary.is_empty() {
+                print_info(&format!(
+                    "  Graph-first skipped: {}",
+                    graph_first_skip_summary
+                ));
+            }
         }
 
         // Files deleted via record_modified_file (the "show diff lines" path)
@@ -1164,9 +3095,44 @@ impl ParallelImporter {
         // Also remove from FILE_INDEX so status doesn't show them as deleted.
         // Batch-remove deleted files from TREE and FILE_INDEX in single write txns.
         if !deleted_paths.is_empty() {
+            let cleanup_start = Instant::now();
             let del_refs: Vec<&str> = deleted_paths.iter().map(|s| s.as_str()).collect();
-            let _ = repo.remove_batch(&del_refs);
             let _ = repo.del_file_index_batch(&del_refs);
+            let cleanup_ms = cleanup_start.elapsed().as_millis();
+            trace_git_import(format!(
+                "write {} files={} recorded={} add_batch={}ms record={}ms assemble={}ms save={}ms apply={}ms direct_graph={}ms direct_crdt={}ms commit={}ms cleanup={}ms writer_total={}ms total={}ms",
+                parsed.short_sha,
+                parsed.files.len(),
+                recorded_files.len(),
+                add_batch_ms,
+                record_ms,
+                write_outcome.timings.assemble_ms,
+                write_outcome.timings.save_ms,
+                write_outcome.timings.apply_ms,
+                write_outcome.timings.direct_graph_ms,
+                write_outcome.timings.direct_crdt_ms,
+                write_outcome.timings.commit_ms,
+                cleanup_ms,
+                write_ms,
+                commit_start.elapsed().as_millis()
+            ));
+        } else {
+            trace_git_import(format!(
+                "write {} files={} recorded={} add_batch={}ms record={}ms assemble={}ms save={}ms apply={}ms direct_graph={}ms direct_crdt={}ms commit={}ms cleanup=0ms writer_total={}ms total={}ms",
+                parsed.short_sha,
+                parsed.files.len(),
+                recorded_files.len(),
+                add_batch_ms,
+                record_ms,
+                write_outcome.timings.assemble_ms,
+                write_outcome.timings.save_ms,
+                write_outcome.timings.apply_ms,
+                write_outcome.timings.direct_graph_ms,
+                write_outcome.timings.direct_crdt_ms,
+                write_outcome.timings.commit_ms,
+                write_ms,
+                commit_start.elapsed().as_millis()
+            ));
         }
 
         Ok(true)
@@ -1179,16 +3145,23 @@ impl ParallelImporter {
         parsed: &ParsedCommit,
         header: ChangeHeader,
     ) -> CliResult<bool> {
-        let mut change = Change::empty(header);
-        change.unhashed = Some(self.build_git_metadata(parsed, true, false));
-
-        let hash = change.hash().map_err(|e| CliError::Internal(e.into()))?;
-
-        repo.save_change(&change)
+        let commit_start = Instant::now();
+        let metadata = self.build_git_metadata(parsed, true, false);
+        let write_outcome = repo
+            .write_import_recorded(header, &[], metadata, &[], Default::default())
             .map_err(|e| CliError::Internal(e.into()))?;
 
-        repo.insert_change(&hash, Default::default())
-            .map_err(|e| CliError::Internal(e.into()))?;
+        trace_git_import(format!(
+            "write {} files=0 recorded=0 add_batch=0ms record=0ms assemble={}ms save={}ms apply={}ms direct_graph={}ms direct_crdt={}ms commit={}ms cleanup=0ms total={}ms empty_commit=true",
+            parsed.short_sha,
+            write_outcome.timings.assemble_ms,
+            write_outcome.timings.save_ms,
+            write_outcome.timings.apply_ms,
+            write_outcome.timings.direct_graph_ms,
+            write_outcome.timings.direct_crdt_ms,
+            write_outcome.timings.commit_ms,
+            commit_start.elapsed().as_millis()
+        ));
 
         Ok(true)
     }
@@ -1213,6 +3186,14 @@ impl ParallelImporter {
                 file.diff_lines.as_ref().map(|lines| {
                     serde_json::json!({
                         "path": file.path,
+                        "old_path": file.old_path,
+                        "operation": match file.operation {
+                            FileOperation::Added => "added",
+                            FileOperation::Modified => "modified",
+                            FileOperation::Deleted => "deleted",
+                            FileOperation::Renamed => "renamed",
+                            FileOperation::Copied => "copied",
+                        },
                         "lines": lines,
                     })
                 })
@@ -1281,6 +3262,7 @@ fn parse_commit(
     _index: usize,
     oid_to_index: &std::collections::HashMap<Oid, usize>,
 ) -> CliResult<ParsedCommit> {
+    let parse_start = Instant::now();
     let commit = git_repo.find_commit(oid).map_err(|e| CliError::GitError {
         message: format!("Failed to find commit {}: {}", oid, e),
     })?;
@@ -1330,11 +3312,13 @@ fn parse_commit(
     let mut diff_opts = DiffOptions::new();
     diff_opts.include_untracked(false);
 
+    let diff_start = Instant::now();
     let mut diff = git_repo
         .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut diff_opts))
         .map_err(|e| CliError::GitError {
             message: format!("Failed to compute diff: {}", e),
         })?;
+    let diff_ms = diff_start.elapsed().as_millis();
 
     // Apply rename detection — mirrors what git CLI does after computing
     // the initial diff.  This correctly classifies renamed files as R deltas
@@ -1350,27 +3334,57 @@ fn parse_commit(
     // src/export/markdown.rs while adding src/export/tests.rs (52%
     // similar) would be misclassified as a rename of markdown→tests,
     // orphaning markdown.rs from the TREE.
-    let mut find_opts = DiffFindOptions::new();
-    find_opts.renames(true);
-    let _ = diff.find_similar(Some(&mut find_opts));
-
-    let stats = diff.stats().map_err(|e| CliError::GitError {
-        message: format!("Failed to get diff stats: {}", e),
-    })?;
+    let rename_start = Instant::now();
+    let detected_renames = should_detect_renames(&diff);
+    if detected_renames {
+        let mut find_opts = DiffFindOptions::new();
+        find_opts.renames(true);
+        let _ = diff.find_similar(Some(&mut find_opts));
+    } else {
+        log::debug!(
+            "parse_commit {}: skipping rename detection for large/add-only diff",
+            short_sha
+        );
+    }
+    let rename_ms = rename_start.elapsed().as_millis();
 
     // Parse files. Pure rename commits can show up as zero-stat directory
     // modifications in libgit2; when that happens, fall back to recursive
     // `git diff-tree -r -M` name-status output for per-file entries.
-    let mut files = parse_diff_files(git_repo, &diff, &tree, parent_tree.as_ref())?;
-    if stats.files_changed() == 0 {
+    let capture_diff_lines = parent_tree.is_some();
+    let files_start = Instant::now();
+    let mut files = parse_diff_files(
+        git_repo,
+        &diff,
+        &tree,
+        parent_tree.as_ref(),
+        capture_diff_lines,
+    )?;
+    let mut parse_files_ms = files_start.elapsed().as_millis();
+    if files.is_empty() {
         if let Some(ref pt) = parent_tree {
+            let fallback_start = Instant::now();
             let fallback = parse_diff_files_via_git_cli(git_repo, oid, pt.id(), &tree, pt)?;
+            parse_files_ms += fallback_start.elapsed().as_millis();
             if !fallback.is_empty() {
                 files = fallback;
             }
         }
     }
     let is_empty = files.is_empty();
+
+    trace_git_import(format!(
+        "parse {} files={} merge={} empty={} diff={}ms rename={}ms(rename_detect={}) files={}ms total={}ms",
+        short_sha,
+        files.len(),
+        is_merge,
+        is_empty,
+        diff_ms,
+        rename_ms,
+        detected_renames,
+        parse_files_ms,
+        parse_start.elapsed().as_millis()
+    ));
 
     Ok(ParsedCommit {
         git_sha: sha,
@@ -1420,6 +3434,7 @@ fn parse_diff_files(
     diff: &Diff,
     tree: &Tree,
     parent_tree: Option<&Tree>,
+    capture_diff_lines: bool,
 ) -> CliResult<Vec<ParsedFile>> {
     use std::collections::HashMap;
 
@@ -1432,32 +3447,34 @@ fn parse_diff_files(
     // Map from file path → accumulated diff lines for that file.
     let mut lines_by_path: HashMap<String, Vec<GitDiffLine>> = HashMap::new();
 
-    let _ = diff.foreach(
-        &mut |_delta, _progress| true, // file_cb  (no-op)
-        None,                          // binary_cb
-        None,                          // hunk_cb
-        Some(&mut |delta, _hunk, line| {
-            let origin = line.origin();
-            // We only keep `+`, `-`, and context (` `) lines.
-            if origin != '+' && origin != '-' && origin != ' ' {
-                return true;
-            }
-            let path = delta
-                .new_file()
-                .path()
-                .or_else(|| delta.old_file().path())
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
+    if capture_diff_lines {
+        let _ = diff.foreach(
+            &mut |_delta, _progress| true, // file_cb  (no-op)
+            None,                          // binary_cb
+            None,                          // hunk_cb
+            Some(&mut |delta, _hunk, line| {
+                let origin = line.origin();
+                // We only keep `+`, `-`, and context (` `) lines.
+                if origin != '+' && origin != '-' && origin != ' ' {
+                    return true;
+                }
+                let path = delta
+                    .new_file()
+                    .path()
+                    .or_else(|| delta.old_file().path())
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
 
-            lines_by_path.entry(path).or_default().push(GitDiffLine {
-                origin,
-                content: line.content().to_vec(),
-                old_lineno: line.old_lineno(),
-                new_lineno: line.new_lineno(),
-            });
-            true
-        }),
-    );
+                lines_by_path.entry(path).or_default().push(GitDiffLine {
+                    origin,
+                    content: line.content().to_vec(),
+                    old_lineno: line.old_lineno(),
+                    new_lineno: line.new_lineno(),
+                });
+                true
+            }),
+        );
+    }
 
     // ── Step 2: build ParsedFile entries from the delta list ─────────────
 
@@ -1487,7 +3504,7 @@ fn parse_diff_files(
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let old_path = if operation == FileOperation::Renamed {
+        let old_path = if matches!(operation, FileOperation::Renamed | FileOperation::Copied) {
             old_file.path().map(|p| p.to_string_lossy().to_string())
         } else {
             None
@@ -1627,7 +3644,7 @@ fn parse_diff_files_via_git_cli(
                 });
             }
             'C' => {
-                let _old_path = parts.next();
+                let old_path = parts.next();
                 let Some(path) = parts.next() else { continue };
                 files.push(ParsedFile {
                     path: path.to_string(),
@@ -1635,7 +3652,7 @@ fn parse_diff_files_via_git_cli(
                     new_content: get_file_content(git_repo, tree, path).ok(),
                     old_content: None,
                     diff_lines: None,
-                    old_path: None,
+                    old_path: old_path.map(|path| path.to_string()),
                 });
             }
             _ => {}
@@ -1734,5 +3751,84 @@ mod tests {
         let stats = ImportStats::default();
         assert_eq!(stats.commits_found, 0);
         assert_eq!(stats.changes_written, 0);
+    }
+
+    #[test]
+    fn test_import_batch_size_is_fixed_at_1000() {
+        assert_eq!(ParallelImporter::batch_size_for(0), 1_000);
+        assert_eq!(ParallelImporter::batch_size_for(82), 1_000);
+        assert_eq!(ParallelImporter::batch_size_for(18_000), 1_000);
+        assert_eq!(ParallelImporter::batch_size_for(100_000), 1_000);
+    }
+
+    #[test]
+    fn test_generated_diff_skip_paths_include_terraform_website_assets() {
+        assert!(is_generated_diff_skip_path(
+            "website/source/stylesheets/main.css"
+        ));
+        assert!(is_generated_diff_skip_path(
+            "website/source/images/logo-static.png"
+        ));
+        assert!(is_generated_diff_skip_path("package-lock.json"));
+        assert!(is_generated_diff_skip_path("dist/app.min.js"));
+
+        assert!(!is_generated_diff_skip_path(
+            "website/source/stylesheets/_footer.less"
+        ));
+        assert!(!is_generated_diff_skip_path(
+            "website/source/layouts/docs.erb"
+        ));
+        assert!(!is_generated_diff_skip_path("internal/style.css"));
+    }
+
+    #[test]
+    fn test_graph_first_added_file_ops_use_unique_branch_ids_and_ranges() {
+        let mut next_branch_idx = 0;
+        let first = build_graph_first_file_ops_for_added_file(
+            "a.txt",
+            &[b"one\n".to_vec(), b"two\n".to_vec()],
+            &[
+                (ChangePosition::new(0), ChangePosition::new(4)),
+                (ChangePosition::new(4), ChangePosition::new(8)),
+            ],
+            Encoding::Utf8,
+            0,
+            &mut next_branch_idx,
+        );
+        let second = build_graph_first_file_ops_for_added_file(
+            "b.txt",
+            &[b"three\n".to_vec()],
+            &[(ChangePosition::new(8), ChangePosition::new(14))],
+            Encoding::Utf8,
+            1,
+            &mut next_branch_idx,
+        );
+
+        assert_eq!(first.trunk_id().file_idx(), 0);
+        assert_eq!(second.trunk_id().file_idx(), 1);
+        assert_eq!(first.line_ops()[0].branch_id().branch_idx(), 0);
+        assert_eq!(first.line_ops()[1].branch_id().branch_idx(), 1);
+        assert_eq!(second.line_ops()[0].branch_id().branch_idx(), 2);
+        assert_eq!(
+            first.line_ops()[1].content_range(),
+            Some((ChangePosition::new(4), ChangePosition::new(8)))
+        );
+    }
+
+    #[test]
+    fn test_graph_first_binary_file_ops_create_trunk_only() {
+        let mut next_branch_idx = 0;
+        let ops = build_graph_first_file_ops_for_added_file(
+            "website/source/images/logo-static.png",
+            &[b"\x89PNG\r\n\x1a\n".to_vec()],
+            &[(ChangePosition::new(0), ChangePosition::new(8))],
+            Encoding::Binary,
+            0,
+            &mut next_branch_idx,
+        );
+
+        assert_eq!(ops.trunk_id().file_idx(), 0);
+        assert!(ops.line_ops().is_empty());
+        assert_eq!(next_branch_idx, 0);
     }
 }
