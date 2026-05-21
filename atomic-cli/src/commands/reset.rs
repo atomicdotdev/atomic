@@ -12,7 +12,6 @@
 //!   [FILES]...  Optional files/directories to reset (default: all)
 //!
 //! Options:
-//!       --view <VIEW>    Reset to a specific view and switch to it
 //!   -n, --dry-run        Preview what would be reset without changes
 //!   -f, --force          Force reset even with uncommitted changes
 //!   -h, --help           Print help information
@@ -22,9 +21,10 @@
 //!
 //! The `reset` command:
 //! 1. Compares working copy with pristine state
-//! 2. Restores files to match the view state
+//! 2. Restores files to match the last recorded state
 //! 3. Discards any unrecorded modifications
-//! 4. Optionally switches to a different view
+//!
+//! Switching views is a separate concern handled by `atomic view switch`.
 //!
 //! **Warning**: Reset discards uncommitted changes permanently.
 //!
@@ -44,13 +44,6 @@
 //! ✓ Reset 1 file
 //! ```
 //!
-//! Switch views:
-//! ```text
-//! $ atomic reset --view main
-//! Switching to view 'main'...
-//! ✓ Reset working copy to view 'main'
-//! ```
-//!
 //! Dry run (preview):
 //! ```text
 //! $ atomic reset --dry-run src/
@@ -61,7 +54,8 @@
 
 use std::path::{Path, PathBuf};
 
-use atomic_repository::{FileStatus, Repository, StatusOptions};
+use atomic_repository::tracking::TrackingOptions;
+use atomic_repository::{FileStatus, Repository, RepositoryStatus, StatusOptions};
 use clap::Parser;
 
 use crate::commands::{find_repository_root, Command};
@@ -69,6 +63,17 @@ use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success, print_warning};
 
 // Reset Command
+
+/// The result of resetting a single path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResetOutcome {
+    /// Content was restored from the pristine state.
+    Restored,
+    /// An added-but-unrecorded file was untracked (kept on disk).
+    Untracked,
+    /// Nothing was done (no pristine content available).
+    Skipped,
+}
 
 /// Reset the working copy to the last recorded state.
 ///
@@ -78,9 +83,8 @@ use crate::output::{print_hint, print_success, print_warning};
 ///
 /// # Behavior
 ///
-/// - Without arguments: Resets entire working copy
-/// - With file arguments: Resets only specified files
-/// - With `--view`: Switches to that view and resets
+/// - Without arguments: Resets entire working copy (requires `--force`)
+/// - With file arguments: Resets only the specified files
 ///
 /// # Warning
 ///
@@ -95,11 +99,12 @@ pub struct Reset {
     #[arg(value_name = "FILES")]
     pub files: Vec<String>,
 
-    /// Reset to a specific view and switch to it.
+    /// Deprecated: switching views is no longer done via reset.
     ///
-    /// The working copy will be updated to match the specified view's
-    /// pristine state.
-    #[arg(long)]
+    /// Use `atomic view switch <view>` instead. Passing `--view` here returns
+    /// an error pointing to the correct command. This flag is kept only to
+    /// give a clear migration message and will be removed in a later release.
+    #[arg(long, hide = true)]
     pub view: Option<String>,
 
     /// Dry run - show what would be reset without doing it.
@@ -161,6 +166,29 @@ impl Reset {
         !self.files.is_empty()
     }
 
+    /// Whether this invocation must be blocked until `--force` is supplied.
+    ///
+    /// Only a whole-working-copy reset (no paths named) is guarded, because it
+    /// would discard *all* uncommitted work. Naming specific files is explicit
+    /// consent (like `git restore <file>`), and `--force` / `--dry-run` always
+    /// bypass the guard.
+    fn requires_force(&self, has_changes: bool) -> bool {
+        !self.is_partial_reset() && has_changes && !self.force && !self.dry_run
+    }
+
+    /// Message shown when there is nothing to reset.
+    ///
+    /// For a partial reset we must not claim the whole working copy is clean
+    /// (other paths may still be dirty) — only that the named paths had
+    /// nothing to reset.
+    fn nothing_to_reset_message(&self) -> &'static str {
+        if self.is_partial_reset() {
+            "Nothing to reset for the specified path(s)"
+        } else {
+            "Nothing to reset - working copy is clean"
+        }
+    }
+
     /// Normalize a path relative to the repository root.
     ///
     /// If the path is absolute and under the repo root, strips the prefix.
@@ -201,28 +229,43 @@ impl Reset {
         false
     }
 
-    /// Get files that need to be reset based on status.
-    fn get_files_to_reset(&self, repo: &Repository) -> CliResult<Vec<PathBuf>> {
-        let status = repo
-            .status(StatusOptions::default())
-            .map_err(CliError::Repository)?;
+    /// Status options used by reset.
+    ///
+    /// Reset only ever touches *tracked* dirty files (Modified / Deleted /
+    /// Added), so we skip the (potentially expensive) untracked-file scan.
+    fn status_options() -> StatusOptions {
+        StatusOptions {
+            include_untracked: false,
+            ..StatusOptions::default()
+        }
+    }
 
+    /// Get the files that need to be reset, paired with their status.
+    ///
+    /// Derives the list from a status that was already computed by the
+    /// caller (so reset doesn't walk the tree twice). Only tracked, dirty
+    /// states are considered; untracked files are never touched.
+    ///
+    /// - `Modified` / `Deleted`: content will be restored from pristine.
+    /// - `Added`: tracking will be undone (file kept on disk as untracked),
+    ///   so that `status` stops reporting a pending "new file" change.
+    fn get_files_to_reset(&self, status: &RepositoryStatus) -> Vec<(PathBuf, FileStatus)> {
         let mut files_to_reset = Vec::new();
 
         for entry in status.entries() {
-            // Only reset modified, deleted files (not untracked)
-            match entry.status() {
-                FileStatus::Modified | FileStatus::Deleted => {
+            let file_status = entry.status();
+            match file_status {
+                FileStatus::Modified | FileStatus::Deleted | FileStatus::Added => {
                     let path_str = entry.path().to_string_lossy();
                     if self.matches_filter(&path_str) {
-                        files_to_reset.push(entry.path().to_path_buf());
+                        files_to_reset.push((entry.path().to_path_buf(), file_status));
                     }
                 }
                 _ => {}
             }
         }
 
-        Ok(files_to_reset)
+        files_to_reset
     }
 
     /// Execute dry-run for a single file - output pristine content to stdout.
@@ -247,9 +290,31 @@ impl Reset {
         }
     }
 
-    /// Reset a single file to pristine state.
-    fn reset_file(&self, repo: &Repository, repo_root: &Path, path: &Path) -> CliResult<bool> {
-        // Get content from pristine
+    /// Reset a single file according to its status.
+    ///
+    /// - `Added` (tracked but not recorded): undo tracking. The file stays
+    ///   on disk and becomes untracked, so we never destroy content the user
+    ///   created. This is what makes `reset <new-file>` honest about the
+    ///   "new file" change reported by `status`.
+    /// - Otherwise (`Modified` / `Deleted`): restore the file's content from
+    ///   the pristine state.
+    ///
+    /// Returns the outcome so the caller can report it accurately.
+    fn reset_file(
+        &self,
+        repo: &Repository,
+        repo_root: &Path,
+        path: &Path,
+        status: FileStatus,
+    ) -> CliResult<ResetOutcome> {
+        if status == FileStatus::Added {
+            // Undo the `add`: stop tracking, but keep the file on disk.
+            repo.remove(path, TrackingOptions::default().with_recursive(false))
+                .map_err(CliError::Repository)?;
+            return Ok(ResetOutcome::Untracked);
+        }
+
+        // Restore content from pristine.
         let content = repo.get_file_content(path).map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to get file content: {}", e))
         })?;
@@ -258,7 +323,8 @@ impl Reset {
 
         match content {
             Some(bytes) => {
-                // Ensure parent directory exists
+                // Ensure parent directory exists (a Deleted file may have had
+                // its directory removed too).
                 if let Some(parent) = full_path.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| {
                         CliError::Internal(anyhow::anyhow!("Failed to create directory: {}", e))
@@ -270,30 +336,13 @@ impl Reset {
                     CliError::Internal(anyhow::anyhow!("Failed to write file: {}", e))
                 })?;
 
-                Ok(true)
+                Ok(ResetOutcome::Restored)
             }
             None => {
-                // File doesn't exist in pristine - it was added but not recorded
-                // For reset, we leave it as-is (it's untracked)
-                Ok(false)
+                // No pristine content available; nothing safe to do.
+                Ok(ResetOutcome::Skipped)
             }
         }
-    }
-
-    /// Switch to a different view.
-    fn switch_view(&self, repo: &mut Repository, view_name: &str) -> CliResult<()> {
-        // Check view exists
-        if !repo.view_exists(view_name).map_err(CliError::Repository)? {
-            return Err(CliError::ViewNotFound {
-                name: view_name.to_string(),
-            });
-        }
-
-        // Switch view
-        repo.set_current_view(view_name)
-            .map_err(CliError::Repository)?;
-
-        Ok(())
     }
 }
 
@@ -308,50 +357,60 @@ impl Command for Reset {
     ///
     /// # Process
     ///
-    /// 1. Find and open the repository
-    /// 2. Check for uncommitted changes (unless --force)
-    /// 3. If --view, switch to that view
+    /// 1. Reject `--view` (use `atomic view switch` instead)
+    /// 2. Find and open the repository
+    /// 3. Guard a whole-tree reset behind `--force`
     /// 4. Determine files to reset
-    /// 5. If --dry-run, preview changes
+    /// 5. If `--dry-run`, preview changes
     /// 6. Otherwise, reset files to pristine state
     fn run(&self) -> CliResult<()> {
+        // `reset` is for discarding working-copy changes only. Switching views
+        // is a separate concern owned by `atomic view switch`, which performs a
+        // proper materialization. Reset must not reimplement that, so reject
+        // `--view` with a clear migration message rather than half-doing it.
+        if let Some(view_name) = &self.view {
+            return Err(CliError::InvalidArgument {
+                message: format!(
+                    "'atomic reset --view' is no longer supported. \
+                     Use 'atomic view switch {view_name}' to switch views."
+                ),
+            });
+        }
+
         // Find repository
         let repo_root = find_repository_root()?;
-        let mut repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
 
-        // Get current status
+        // Compute status once. Reset only touches tracked files, so we skip
+        // the untracked scan, and we reuse this single status for both the
+        // safety guard and the file list (no second tree walk).
         let status = repo
-            .status(StatusOptions::default())
+            .status(Self::status_options())
             .map_err(CliError::Repository)?;
 
         let has_changes = !status.is_clean();
 
-        // Check for uncommitted changes (unless force)
-        if has_changes && !self.force && !self.dry_run {
-            print_warning("Cannot reset: there are uncommitted changes.");
-            print_hint("Use 'atomic diff' to see changes");
-            print_hint("Use 'atomic reset --force' to discard changes");
-            print_hint("Use 'atomic record' to save changes first");
-            return Err(CliError::Internal(anyhow::anyhow!(
-                "Uncommitted changes would be lost"
-            )));
+        // Safety guard: only a whole-working-copy reset (no paths named)
+        // requires --force. Naming specific files is explicit consent to
+        // discard them, exactly like `git restore <file>`.
+        if self.requires_force(has_changes) {
+            return Err(CliError::RequiresForce {
+                operation: "reset".to_string(),
+            });
         }
 
-        // Handle view switching
-        if let Some(ref view_name) = self.view {
-            if !self.dry_run {
-                println!("Switching to view '{}'...", view_name);
-                self.switch_view(&mut repo, view_name)?;
-            } else {
-                println!("Would switch to view '{}'", view_name);
-            }
-        }
+        // Determine files to reset, paired with their status.
+        let files_to_reset = self.get_files_to_reset(&status);
 
-        // Get files to reset
-        let files_to_reset = self.get_files_to_reset(&repo)?;
-
-        // Handle dry-run for single file (output content)
-        if self.dry_run && self.files.len() == 1 && files_to_reset.len() <= 1 {
+        // Handle dry-run for a single file by printing its pristine content to
+        // stdout (useful for piping). This only makes sense for files that
+        // have pristine content; an Added file would be untracked, not
+        // restored, so fall through to the listing branch below.
+        let single_added = files_to_reset
+            .first()
+            .map(|(_, s)| *s == FileStatus::Added)
+            .unwrap_or(false);
+        if self.dry_run && self.files.len() == 1 && files_to_reset.len() <= 1 && !single_added {
             let path = &self.files[0];
             return self.dry_run_single_file(&repo, path);
         }
@@ -359,10 +418,14 @@ impl Command for Reset {
         // Dry run mode - just show what would happen
         if self.dry_run {
             if files_to_reset.is_empty() {
-                println!("Nothing to reset - working copy is clean");
+                println!("{}", self.nothing_to_reset_message());
             } else {
-                for path in &files_to_reset {
-                    println!("Would reset: {}", path.display());
+                for (path, file_status) in &files_to_reset {
+                    if *file_status == FileStatus::Added {
+                        println!("Would untrack: {} (kept on disk)", path.display());
+                    } else {
+                        println!("Would reset: {}", path.display());
+                    }
                 }
                 println!();
                 print_hint(&format!(
@@ -375,14 +438,7 @@ impl Command for Reset {
 
         // Check if there's anything to reset
         if files_to_reset.is_empty() {
-            if let Some(view) = &self.view {
-                print_success(&format!(
-                    "Switched to view '{}' (working copy already clean)",
-                    view
-                ));
-            } else {
-                println!("Nothing to reset - working copy is clean");
-            }
+            println!("{}", self.nothing_to_reset_message());
             return Ok(());
         }
 
@@ -392,17 +448,20 @@ impl Command for Reset {
         let mut reset_count = 0;
         let mut error_count = 0;
 
-        for path in &files_to_reset {
+        for (path, file_status) in &files_to_reset {
             let path_display = path.display();
 
-            match self.reset_file(&repo, &repo_root, path) {
-                Ok(true) => {
+            match self.reset_file(&repo, &repo_root, path, *file_status) {
+                Ok(ResetOutcome::Restored) => {
                     println!("  Reset: {}", path_display);
                     reset_count += 1;
                 }
-                Ok(false) => {
-                    // File not in pristine (was newly added)
-                    // We don't delete untracked files by default
+                Ok(ResetOutcome::Untracked) => {
+                    println!("  Untracked: {} (kept on disk)", path_display);
+                    reset_count += 1;
+                }
+                Ok(ResetOutcome::Skipped) => {
+                    // No pristine content to restore; nothing to do.
                 }
                 Err(e) => {
                     print_warning(&format!("Failed to reset '{}': {}", path_display, e));
@@ -414,15 +473,7 @@ impl Command for Reset {
         // Summary
         println!();
         if reset_count > 0 {
-            if let Some(ref view_name) = self.view {
-                print_success(&format!(
-                    "Reset {} to view '{}'",
-                    format_count(reset_count, "file"),
-                    view_name
-                ));
-            } else {
-                print_success(&format!("Reset {}", format_count(reset_count, "file")));
-            }
+            print_success(&format!("Reset {}", format_count(reset_count, "file")));
         }
 
         if error_count > 0 {
@@ -623,5 +674,161 @@ mod tests {
         assert_eq!(cloned.files, cmd.files);
         assert_eq!(cloned.view, cmd.view);
         assert_eq!(cloned.force, cmd.force);
+    }
+
+    // Guard Logic Tests (requires_force)
+
+    #[test]
+    fn test_requires_force_partial_reset_not_blocked() {
+        // Naming a file is explicit consent — never blocked, even when the
+        // tree has changes. This is the core bug fix.
+        let cmd = Reset::new().with_files(vec!["file.txt".to_string()]);
+        assert!(!cmd.requires_force(true));
+    }
+
+    #[test]
+    fn test_requires_force_whole_tree_blocked() {
+        let cmd = Reset::new();
+        assert!(cmd.requires_force(true));
+    }
+
+    #[test]
+    fn test_requires_force_whole_tree_with_force_passes() {
+        let cmd = Reset::new().with_force(true);
+        assert!(!cmd.requires_force(true));
+    }
+
+    #[test]
+    fn test_requires_force_clean_tree_passes() {
+        let cmd = Reset::new();
+        assert!(!cmd.requires_force(false));
+    }
+
+    #[test]
+    fn test_requires_force_dry_run_passes() {
+        let cmd = Reset::new().with_dry_run(true);
+        assert!(!cmd.requires_force(true));
+    }
+
+    #[test]
+    fn test_reset_view_is_rejected_before_touching_repo() {
+        // `--view` is rejected up front (before any filesystem access), with a
+        // message pointing at `atomic view switch`.
+        let cmd = Reset::new().with_view("feature");
+        match cmd.run() {
+            Err(CliError::InvalidArgument { message }) => {
+                assert!(message.contains("view switch"));
+                assert!(message.contains("feature"));
+            }
+            other => panic!("expected InvalidArgument for --view, got {other:?}"),
+        }
+    }
+
+    // Empty-result Message Tests
+
+    #[test]
+    fn test_nothing_to_reset_message_partial() {
+        let cmd = Reset::new().with_files(vec!["a.txt".to_string()]);
+        assert_eq!(
+            cmd.nothing_to_reset_message(),
+            "Nothing to reset for the specified path(s)"
+        );
+    }
+
+    #[test]
+    fn test_nothing_to_reset_message_whole_tree() {
+        let cmd = Reset::new();
+        assert_eq!(
+            cmd.nothing_to_reset_message(),
+            "Nothing to reset - working copy is clean"
+        );
+    }
+
+    // End-to-end Behavior Tests (real repository)
+
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Initialize a repository in a temp dir. Returns the guard, repo, and root.
+    fn test_repo() -> (TempDir, Repository, PathBuf) {
+        let dir = TempDir::new().expect("create tempdir");
+        let root = dir.path().to_path_buf();
+        let repo = Repository::init(&root).expect("init repository");
+        (dir, repo, root)
+    }
+
+    #[test]
+    fn test_reset_modified_restores_pristine_content() {
+        let (_dir, repo, root) = test_repo();
+        let path = Path::new("file.txt");
+        fs::write(root.join(path), b"recorded\n").unwrap();
+        repo.add(path, TrackingOptions::default()).unwrap();
+        repo.record_all("init").unwrap();
+
+        // Local edit that we want to discard.
+        fs::write(root.join(path), b"local edit\n").unwrap();
+
+        let cmd = Reset::new();
+        let outcome = cmd
+            .reset_file(&repo, &root, path, FileStatus::Modified)
+            .unwrap();
+
+        assert_eq!(outcome, ResetOutcome::Restored);
+        assert_eq!(fs::read(root.join(path)).unwrap(), b"recorded\n");
+    }
+
+    #[test]
+    fn test_reset_deleted_restores_file_from_pristine() {
+        let (_dir, repo, root) = test_repo();
+        let path = Path::new("file.txt");
+        fs::write(root.join(path), b"recorded\n").unwrap();
+        repo.add(path, TrackingOptions::default()).unwrap();
+        repo.record_all("init").unwrap();
+
+        // Delete it on disk; reset should bring it back.
+        fs::remove_file(root.join(path)).unwrap();
+        assert!(!root.join(path).exists());
+
+        let cmd = Reset::new();
+        let outcome = cmd
+            .reset_file(&repo, &root, path, FileStatus::Deleted)
+            .unwrap();
+
+        assert_eq!(outcome, ResetOutcome::Restored);
+        assert!(root.join(path).exists());
+        assert_eq!(fs::read(root.join(path)).unwrap(), b"recorded\n");
+    }
+
+    #[test]
+    fn test_reset_added_untracks_but_keeps_file_on_disk() {
+        let (_dir, repo, root) = test_repo();
+        let path = Path::new("new.txt");
+        fs::write(root.join(path), b"brand new\n").unwrap();
+        repo.add(path, TrackingOptions::default()).unwrap();
+        // Deliberately NOT recorded → status is `Added`.
+
+        let cmd = Reset::new().with_files(vec!["new.txt".to_string()]);
+
+        // Before: status reports it as a pending Added change.
+        let before = repo.status(Reset::status_options()).unwrap();
+        let listed = cmd.get_files_to_reset(&before);
+        assert!(listed
+            .iter()
+            .any(|(p, s)| p.as_path() == path && *s == FileStatus::Added));
+
+        let outcome = cmd
+            .reset_file(&repo, &root, path, FileStatus::Added)
+            .unwrap();
+        assert_eq!(outcome, ResetOutcome::Untracked);
+
+        // File is kept on disk (we never destroy user-created content)...
+        assert!(root.join(path).exists());
+        assert_eq!(fs::read(root.join(path)).unwrap(), b"brand new\n");
+
+        // ...and status no longer reports a pending change for it, so the
+        // status hint is no longer lying.
+        let after = repo.status(Reset::status_options()).unwrap();
+        let still_listed = cmd.get_files_to_reset(&after);
+        assert!(!still_listed.iter().any(|(p, _)| p.as_path() == path));
     }
 }

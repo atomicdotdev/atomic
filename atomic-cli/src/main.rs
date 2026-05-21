@@ -231,9 +231,6 @@ enum Commands {
     /// # Reset specific files
     /// atomic reset src/main.rs
     ///
-    /// # Switch to a different view
-    /// atomic reset --view main
-    ///
     /// # Preview what would be reset
     /// atomic reset --dry-run
     /// ```
