@@ -64,9 +64,9 @@ impl Command for Sign {
         })?;
 
         let mut data = Vec::new();
-        std::io::stdin().read_to_end(&mut data).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to read stdin: {}", e))
-        })?;
+        std::io::stdin()
+            .read_to_end(&mut data)
+            .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to read stdin: {}", e)))?;
 
         let sig_bytes = keypair.sign(&data);
         let signature = BASE64.encode(&sig_bytes);

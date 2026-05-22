@@ -48,14 +48,13 @@ impl Command for Verify {
         let mut sig_arr = [0u8; 64];
         sig_arr.copy_from_slice(&sig_bytes);
 
-        let public_key = PublicKey::from_base32(&self.public_key).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Invalid public key: {}", e))
-        })?;
+        let public_key = PublicKey::from_base32(&self.public_key)
+            .map_err(|e| CliError::Internal(anyhow::anyhow!("Invalid public key: {}", e)))?;
 
         let mut data = Vec::new();
-        std::io::stdin().read_to_end(&mut data).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to read stdin: {}", e))
-        })?;
+        std::io::stdin()
+            .read_to_end(&mut data)
+            .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to read stdin: {}", e)))?;
 
         match public_key.verify(&data, &sig_arr) {
             Ok(()) => {
