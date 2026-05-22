@@ -315,15 +315,26 @@ impl Repository {
                     message: format!("Intent '{}' not found", full_id),
                 })?;
 
-        let entry = self.vault_retrieve(&intent_file)?.ok_or_else(|| {
-            RepositoryError::InvalidOperation {
-                message: format!("Intent '{}' not found", full_id),
-            }
-        })?;
+        // Read from disk first so we pick up any user/agent edits to the
+        // markdown body. If the file doesn't exist on disk, fall back to
+        // the redb entry.
+        let disk_path = self.vault_dir().join(&intent_file);
+        let (content_bytes, frontmatter_json) = if disk_path.exists() {
+            let file_content = std::fs::read_to_string(&disk_path)?;
+            let (fm_json, body) = crate::repository::vault::parse_vault_frontmatter(&file_content);
+            (body.into_bytes(), fm_json)
+        } else {
+            let entry = self.vault_retrieve(&intent_file)?.ok_or_else(|| {
+                RepositoryError::InvalidOperation {
+                    message: format!("Intent '{}' not found", full_id),
+                }
+            })?;
+            (entry.content_bytes.clone(), entry.frontmatter_json.clone())
+        };
 
         // Update frontmatter
         let mut fm: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&entry.frontmatter_json).unwrap_or_default();
+            serde_json::from_str(&frontmatter_json).unwrap_or_default();
 
         if let Some(ref status) = options.status {
             fm.insert(
@@ -351,13 +362,8 @@ impl Repository {
         }
         let new_fm = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
 
-        // Re-store with updated frontmatter
-        self.vault_store(
-            &intent_file,
-            VaultEntryType::Intent,
-            entry.content_bytes.clone(),
-            new_fm,
-        )?;
+        // Re-store with updated frontmatter and current content from disk
+        self.vault_store(&intent_file, VaultEntryType::Intent, content_bytes, new_fm)?;
 
         // Update manifest
         {
@@ -422,11 +428,21 @@ impl Repository {
                     message: format!("Intent '{}' not found", full_id),
                 })?;
 
-        let entry = self.vault_retrieve(&intent_file)?.ok_or_else(|| {
-            RepositoryError::InvalidOperation {
-                message: format!("Intent '{}' not found", full_id),
-            }
-        })?;
+        // Read from disk first so we pick up any user/agent edits to the
+        // markdown body (same pattern as vault_intent_update).
+        let disk_path = self.vault_dir().join(&intent_file);
+        let (content_bytes, frontmatter_json) = if disk_path.exists() {
+            let file_content = std::fs::read_to_string(&disk_path)?;
+            let (fm_json, body) = crate::repository::vault::parse_vault_frontmatter(&file_content);
+            (body.into_bytes(), fm_json)
+        } else {
+            let entry = self.vault_retrieve(&intent_file)?.ok_or_else(|| {
+                RepositoryError::InvalidOperation {
+                    message: format!("Intent '{}' not found", full_id),
+                }
+            })?;
+            (entry.content_bytes.clone(), entry.frontmatter_json.clone())
+        };
 
         // Verify goal exists
         let goal_file = format!("goals/{}/_goal.md", goal_name);
@@ -438,7 +454,7 @@ impl Repository {
 
         // Update frontmatter to add goal to the list
         let mut fm: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&entry.frontmatter_json).unwrap_or_default();
+            serde_json::from_str(&frontmatter_json).unwrap_or_default();
 
         let goals = fm
             .entry("goals".to_string())
@@ -451,12 +467,7 @@ impl Repository {
         }
         let new_fm = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
 
-        self.vault_store(
-            &intent_file,
-            VaultEntryType::Intent,
-            entry.content_bytes.clone(),
-            new_fm,
-        )?;
+        self.vault_store(&intent_file, VaultEntryType::Intent, content_bytes, new_fm)?;
 
         // Update manifest goal count
         {
@@ -772,6 +783,89 @@ mod tests {
         // Manifest should reflect update
         let manifest = repo.vault_manifest().unwrap();
         assert_eq!(manifest.intents[&result.id].status, "in-progress");
+    }
+
+    #[test]
+    fn test_intent_update_preserves_disk_edits() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo
+            .vault_intent_create(create_opts("Preserve me"))
+            .unwrap();
+
+        // Simulate user/agent editing the intent file on disk
+        let intent_path = repo.vault_dir().join(&result.intent_file);
+        assert!(intent_path.exists(), "intent file should exist on disk");
+
+        // Read the current file, replace the template body with real content
+        let original = std::fs::read_to_string(&intent_path).unwrap();
+        assert!(
+            original.contains("REPLACE"),
+            "template should have REPLACE placeholders"
+        );
+
+        // Write a fully filled-in intent body (keep frontmatter, replace body)
+        let edited = original.split("---\n").collect::<Vec<_>>();
+        // edited[0] is empty (before first ---), edited[1] is frontmatter, edited[2..] is body
+        let new_body = r#"
+## Problem
+The authentication module has no rate limiting.
+
+## Acceptance Criteria
+- [ ] Login attempts are rate-limited to 5 per minute
+- [ ] Failed attempts return 429 status code
+
+## TODOs
+- [ ] `PRES-1/1` Add rate limiter middleware
+"#;
+        let new_content = format!("---\n{}---\n{}", edited[1], new_body);
+        std::fs::write(&intent_path, &new_content).unwrap();
+
+        // Now run update — this should preserve the disk body
+        let updated = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    status: Some("done".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated.status, "done");
+
+        // Read the file back from disk — body must still have our edits
+        let final_content = std::fs::read_to_string(&intent_path).unwrap();
+        assert!(
+            final_content.contains("rate limiting"),
+            "Problem statement should survive update. Got:\n{}",
+            final_content
+        );
+        assert!(
+            final_content.contains("429 status code"),
+            "Acceptance criteria should survive update. Got:\n{}",
+            final_content
+        );
+        assert!(
+            final_content.contains("PRES-1/1"),
+            "TODOs should survive update. Got:\n{}",
+            final_content
+        );
+        assert!(
+            !final_content.contains("REPLACE"),
+            "Template placeholders should NOT reappear. Got:\n{}",
+            final_content
+        );
+
+        // Also verify redb has the updated content
+        let entry = repo.vault_intent_show(&result.id).unwrap();
+        let stored_body = String::from_utf8_lossy(&entry.content_bytes);
+        assert!(
+            stored_body.contains("rate limiting"),
+            "redb body should have disk edits. Got:\n{}",
+            stored_body
+        );
     }
 
     #[test]

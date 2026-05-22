@@ -331,16 +331,7 @@ impl TurnOrchestrator {
     ) -> AgentResult<DispatchResult> {
         let session_id = &event.session_id;
 
-        let session = match self.session_store.load(session_id)? {
-            Some(s) => s,
-            None => {
-                log::debug!("ToolUse for unknown session {} — ignoring", session_id);
-                return Ok(DispatchResult::new(
-                    session_id,
-                    crate::turn::phase::Phase::Idle,
-                ));
-            }
-        };
+        let session = self.load_or_create_session(session_id, &event)?;
 
         // Log tool usage
         if let Some(ref tool_name) = event.tool_name {

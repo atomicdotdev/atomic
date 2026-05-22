@@ -163,6 +163,10 @@ pub(crate) fn vendor_from_agent_name(agent_name: &str) -> AIVendor {
         "claude-code" => AIVendor::Anthropic,
         "gemini-cli" => AIVendor::Google,
         "codex" => AIVendor::OpenAI,
+        "kiro" => AIVendor::AmazonBedrock,
+        "copilot" => AIVendor::Other("github".to_string()),
+        "cursor" => AIVendor::Anthropic,
+        "opencode" => AIVendor::OpenAI,
         _ => AIVendor::Other(agent_name.to_string()),
     }
 }
