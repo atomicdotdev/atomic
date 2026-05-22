@@ -258,9 +258,40 @@ impl Repository {
                     && current_nanos == cached_nanos
                     && current_size == cached_size
                 {
-                    // mtime + size match → Clean — skip entirely
-                    index_hit_count += 1;
-                    continue;
+                    if !options.hash_contents {
+                        // mtime + size match, no hash requested → Clean
+                        index_hit_count += 1;
+                        continue;
+                    }
+                    // mtime + size match but verify hash anyway — guards against
+                    // same-second writes on Linux where clock granularity is coarse
+                    hash_count += 1;
+                    match hash_file_contents(&abs_path) {
+                        Ok(current_hash) if current_hash == cached_hash => {
+                            index_hit_count += 1;
+                            continue;
+                        }
+                        Ok(current_hash) => {
+                            let mut entry =
+                                FileStatusEntry::new(path.clone(), FileStatus::Modified);
+                            if let Some(inode) = inode {
+                                entry.set_inode(inode);
+                            }
+                            entry.set_current_hash(current_hash);
+                            status.add_entry(entry);
+                            continue;
+                        }
+                        Err(_) => {
+                            let mut entry =
+                                FileStatusEntry::new(path.clone(), FileStatus::Modified);
+                            if let Some(inode) = inode {
+                                entry.set_inode(inode);
+                            }
+                            entry.set_details("Unable to read file contents".to_string());
+                            status.add_entry(entry);
+                            continue;
+                        }
+                    }
                 }
 
                 // mtime or size differ — hash to confirm

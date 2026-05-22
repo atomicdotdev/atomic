@@ -438,3 +438,108 @@ fn test_status_detects_modification_when_file_index_missing() {
         "status() must not be clean when a tracked file is modified"
     );
 }
+
+#[test]
+fn test_file_index_fast_path_same_mtime_and_size_detects_modification() {
+    // Regression test for FILE_INDEX fast path false-positive.
+    //
+    // The bug (introduced in 8ab0e7d "AI Cleanup"):
+    //   When a file's mtime AND size both matched the FILE_INDEX cache, the
+    //   fast path unconditionally declared the file Clean and skipped hashing.
+    //   On Linux, mtime has 1-second resolution. Two writes within the same
+    //   clock second produce identical mtimes. If the new content is also the
+    //   same number of bytes as the original, the fast path silently hides the
+    //   modification: status() returns no Modified entries, and record() returns
+    //   NothingToRecord even though the file changed.
+    //
+    // The fix:
+    //   When hash_contents is enabled (the default for record()), verify the
+    //   stored hash against the current file content even when mtime+size match.
+    //   Only skip hashing for StatusOptions::fast() where hash_contents=false.
+    //
+    // How this test reproduces the bug deterministically:
+    //   After recording the initial content, we capture the mtime from the
+    //   filesystem and use `filetime` to reset the mtime after writing the
+    //   modified content. This simulates the Linux coarse-clock scenario on
+    //   any platform, making the test reliable regardless of OS clock resolution.
+    use crate::record::{RecordError, RecordOptions};
+    use crate::status::FileStatus;
+    use filetime::FileTime;
+
+    let (temp_dir, repo) = create_temp_repo();
+
+    // Write and record the initial file. record() populates FILE_INDEX with
+    // (secs, nanos, size, hash) for this path.
+    let file_path = temp_dir.path().join("same_size.txt");
+    std::fs::write(&file_path, b"original\n").unwrap(); // 9 bytes
+    repo.add("same_size.txt", TrackingOptions::default()).unwrap();
+    repo.record(ChangeHeader::new("initial"), RecordOptions::new().with_all(true))
+        .expect("initial record failed");
+
+    // Capture the mtime that was indexed. We'll restore it after the write.
+    let indexed_mtime = FileTime::from_last_modification_time(
+        &std::fs::metadata(&file_path).unwrap(),
+    );
+
+    // Write different content of the SAME byte length.
+    // "modified\n" is also 9 bytes — size match is guaranteed.
+    std::fs::write(&file_path, b"modified\n").unwrap();
+
+    // Reset mtime to the indexed value, simulating Linux 1-second clock granularity.
+    // Without this the test would be flaky on macOS (nanosecond mtime would differ).
+    filetime::set_file_mtime(&file_path, indexed_mtime).unwrap();
+
+    // ── Assert status() detects the modification ──────────────────────────────
+
+    let status = repo
+        .status(StatusOptions::default())
+        .expect("status() failed");
+
+    let modified: Vec<_> = status
+        .entries()
+        .iter()
+        .filter(|e| e.status() == FileStatus::Modified)
+        .collect();
+
+    assert_eq!(
+        modified.len(),
+        1,
+        "status() must detect a same-size content change when mtime matches FILE_INDEX.\n\
+         Before the fix: the fast path declared the file Clean without hashing,\n\
+         hiding the modification entirely.\n\
+         All status entries: {:?}",
+        status
+            .entries()
+            .iter()
+            .map(|e| (e.path().display().to_string(), e.status()))
+            .collect::<Vec<_>>()
+    );
+
+    assert_eq!(
+        modified[0].path(),
+        std::path::Path::new("same_size.txt"),
+        "Modified entry must be same_size.txt"
+    );
+
+    // ── Assert record() captures the change (not NothingToRecord) ─────────────
+
+    let result = repo.record(
+        ChangeHeader::new("modify same_size.txt"),
+        RecordOptions::new().with_all(true),
+    );
+
+    assert!(
+        result.is_ok(),
+        "record() must not return NothingToRecord when file content changed.\n\
+         Before the fix: mtime+size match caused status() to return no Modified\n\
+         entries, so record() saw nothing to do and returned NothingToRecord.\n\
+         Got: {:?}",
+        result.err()
+    );
+
+    let outcome = result.unwrap();
+    assert!(
+        outcome.was_saved(),
+        "record() must produce a saved change, not an empty one"
+    );
+}
