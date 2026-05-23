@@ -60,6 +60,7 @@
 //!
 //! - [`error`] — Error types for all agent operations
 //! - [`event`] — Turn lifecycle event types (`HookType`, `TurnEvent`, `TurnChanges`)
+//! - [`discovery`] — Read-path adapters (`TraceDiscovery` trait, `DiscoveryRegistry`) for importing historical agent traces (foundation only — concrete adapters land in follow-up issues)
 //! - [`hooks`] — Agent hook adapters (`AgentHook` trait, `AgentRegistry`, Claude Code adapter)
 //! - [`provenance`] — Causal decision DAG for agent sessions
 //! - [`watcher`] — Watchman file watching integration (planned)
@@ -83,6 +84,7 @@
 //! assert_eq!(event.session_id, "abc-123");
 //! ```
 
+pub mod discovery;
 pub mod envelope;
 pub mod error;
 pub mod event;
@@ -97,6 +99,10 @@ pub mod turn;
 pub mod watcher;
 
 // Re-export primary types for convenience
+pub use discovery::{
+    DiscoveredEvent, DiscoveredEventType, DiscoveredTrace, DiscoveryRegistry, StorageKind,
+    TraceDiscovery,
+};
 pub use envelope::SessionEnvelope;
 pub use error::{AgentError, AgentResult};
 pub use event::{HookType, TurnChanges, TurnEvent};

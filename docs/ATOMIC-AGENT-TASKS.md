@@ -115,6 +115,24 @@ See **Phase 18.5** for full implementation details.
     - `detect(repo_root)`, `installed(repo_root)`, `iter()`
   - [x] Unit tests: 40 tests (MockAgent, registry CRUD, detect/installed filtering, trait object safety, Send+Sync)
 
+### 14.4 Discovery Module Foundation ✅
+_Issue #13. Read-path counterpart to hooks — adapters scan agent storage already on disk and feed the provenance import pipeline._
+
+- [x] Create `atomic-agent/src/discovery/mod.rs`
+  - [x] `TraceDiscovery` trait (dyn-compatible, `Send + Sync + Debug`): `agent_id()`, `display_name()`, `is_available()`, `list_traces()`, `read_events()`, `storage_kind()`
+  - [x] `DiscoveryRegistry` struct: `new()`, `with_defaults()` (currently empty — adapters land in #18–#28), `register()`, `get()`, `require()` (returns `AgentError::AdapterNotFound`), `list()`, `available()`, `count()`, `is_empty()`, `iter()`, `Default`, `Debug`
+- [x] Create `atomic-agent/src/discovery/types.rs`
+  - [x] `DiscoveredTrace` struct: `trace_id`, `agent_id`, `title`, `preview`, `timestamp`, `directory`, `source_path`
+  - [x] `DiscoveredEvent` struct: `event_type`, `role`, `text`, `tool_name`, `tool_call_id`, `model_id`, `timestamp`, `order`, `raw_json`
+  - [x] `DiscoveredEventType` enum: `UserMessage`, `AssistantText`, `AssistantThinking`, `ToolCall`, `ToolResult`, `Error`
+  - [x] `StorageKind` enum: `Jsonl`, `Json`, `Sqlite`
+- [x] Unit tests: 20 tests total (13 in `mod.rs` covering registry CRUD, ordering, replace semantics, `available()` filter, `Debug` format, trait object-safety, `Send + Sync`; 7 in `types.rs` covering serde round-trip and rename_all formats)
+- [ ] Concrete adapters — deferred to follow-up issues:
+  - [ ] Claude Code JSONL adapter (#18)
+  - [ ] Gemini CLI JSON adapter (#19)
+  - [ ] Codex adapter (#20)
+  - [ ] Reader helpers per issue #14
+
 ---
 
 ## Phase 15: Agent Hook Adapters

@@ -109,6 +109,15 @@ pub enum AgentError {
         available: String,
     },
 
+    /// The requested adapter id is not registered in the [`crate::discovery::DiscoveryRegistry`].
+    #[error("Unknown discovery adapter: '{name}' (available adapters: {available})")]
+    AdapterNotFound {
+        /// The adapter id that was requested.
+        name: String,
+        /// Comma-separated list of available adapter ids.
+        available: String,
+    },
+
     /// Hooks are already installed for this agent.
     #[error("Hooks already installed for {agent} (use --force to reinstall)")]
     AlreadyInstalled {
@@ -353,6 +362,9 @@ impl AgentError {
             ),
             AgentError::AgentNotFound { .. } => {
                 Some("Use `atomic agent enable --help` to see available agents.")
+            }
+            AgentError::AdapterNotFound { .. } => {
+                Some("Run `atomic agent discover --list` to see available discovery adapters.")
             }
             _ => None,
         }
