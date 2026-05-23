@@ -48,6 +48,9 @@ ignore = { workspace = true }
 # File locking (flock-based advisory locks for concurrent hook processes)
 fs2 = "0.4"
 
+# SQLite read-only access for discovery adapters (Cursor, Hermes, OpenCode)
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 # Home directory resolution (for ~/.atomic/identities/)
 dirs = { workspace = true }
 

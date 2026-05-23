@@ -276,6 +276,15 @@ pub enum AgentError {
         reason: String,
     },
 
+    /// I/O or parse failure while reading agent storage during discovery.
+    #[error("Failed to read discovery source at {path}: {reason}")]
+    DiscoveryReadFailed {
+        /// Path to the discovery source file.
+        path: PathBuf,
+        /// What went wrong.
+        reason: String,
+    },
+
     /// Failed to encode or decode a `SessionEnvelope`.
     #[error("Session envelope codec error: {reason}")]
     EnvelopeCodecError {

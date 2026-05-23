@@ -44,6 +44,7 @@
 //! let _ = registry;
 //! ```
 
+pub mod reader;
 pub mod types;
 
 pub use types::{DiscoveredEvent, DiscoveredEventType, DiscoveredTrace, StorageKind};
