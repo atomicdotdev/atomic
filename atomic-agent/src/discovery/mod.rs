@@ -40,10 +40,10 @@
 //! use atomic_agent::discovery::DiscoveryRegistry;
 //!
 //! let registry = DiscoveryRegistry::with_defaults();
-//! // No adapters wired yet — they land in follow-up issues.
 //! let _ = registry;
 //! ```
 
+pub mod hermes;
 pub mod reader;
 pub mod types;
 
@@ -120,11 +120,12 @@ impl DiscoveryRegistry {
 
     /// Create a registry pre-populated with all built-in discovery adapters.
     ///
-    /// Currently returns an empty registry — adapters are wired in follow-up
-    /// issues (#18–#28).
+    /// Registers all built-in discovery adapters. Currently: Hermes (#27).
+    /// Additional adapters land in follow-up issues (#18–#26, #28).
     pub fn with_defaults() -> Self {
-        // Adapters are wired in follow-up issues (#18–#28).
-        Self::new()
+        let mut registry = Self::new();
+        registry.register(Box::new(crate::discovery::hermes::HermesDiscovery::new()));
+        registry
     }
 
     /// Register a new discovery adapter.
@@ -271,9 +272,10 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_with_defaults_is_empty() {
+    fn test_registry_with_defaults_has_hermes() {
         let registry = DiscoveryRegistry::with_defaults();
-        assert!(registry.is_empty());
+        assert!(!registry.is_empty());
+        assert!(registry.list().contains(&"hermes"));
     }
 
     #[test]
