@@ -11,12 +11,16 @@ impl TurnOrchestrator {
     // Attestation
     // =========================================================================
 
-    /// Create an attestation covering changes in a session's agent view.
+    /// Create an attestation covering changes this session actually recorded.
     ///
-    /// On a fresh session, this covers all changes in the view. On a
-    /// resumed session (`claude --resume`), this only covers the NEW
-    /// changes that aren't already covered by a previous attestation,
-    /// and chains to that attestation via `previous_attestation`.
+    /// Coverage is based on `session.recorded_change_hashes`, not the full
+    /// agent-view history. Agent views inherit parent-view changes, so scanning
+    /// the view would over-attribute inherited baseline work to the agent.
+    ///
+    /// If this same session was already attested before, only newly recorded
+    /// hashes not covered by a same-session attestation are included and chained
+    /// via `previous_attestation`. Legacy sessions with no recorded hashes are
+    /// skipped.
     ///
     /// The attestation is enriched with data from the provenance entries
     /// embedded in each covered change: model name, token counts, cost,
