@@ -42,8 +42,7 @@ use crate::history::HistoryOptions;
 
 /// Summary of AI-vs-human change attribution for a single view.
 ///
-/// Counts changes (not lines). For a line-level summary, see follow-up
-/// work on `file_ops` line counts (not yet implemented).
+/// Counts unique changes, not lines.
 #[derive(Debug, Clone, Default)]
 pub struct ProvenanceSummary {
     /// The view this summary covers.
