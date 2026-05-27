@@ -322,10 +322,7 @@ async fn test_session_attestation_covers_only_agent_recorded_changes() {
 
     fs::write(dir.path().join("agent-p0.txt"), "agent p0 test\n").unwrap();
 
-    let turn_result = orch
-        .dispatch(turn_end_event("sess-cov-1"))
-        .await
-        .unwrap();
+    let turn_result = orch.dispatch(turn_end_event("sess-cov-1")).await.unwrap();
 
     let recorded = turn_result
         .change_recorded
