@@ -208,7 +208,10 @@ impl Attest {
         // Verbose: internal accounting.
         if self.verbose {
             println!();
-            println!("System/bootstrap changes excluded: {}", summary.system_changes);
+            println!(
+                "System/bootstrap changes excluded: {}",
+                summary.system_changes
+            );
             println!("Needs attention: {}", summary.needs_attention_changes);
             println!("Unreadable: {}", summary.unreadable_changes);
             if !summary.by_model.is_empty() {
@@ -316,7 +319,11 @@ impl Attest {
         let mut summary = format!(
             "{} {} covered",
             total_changes,
-            if total_changes == 1 { "change" } else { "changes" },
+            if total_changes == 1 {
+                "change"
+            } else {
+                "changes"
+            },
         );
         if total_cost > 0.0 {
             summary = format!("{}  ·  {}", format_cost(total_cost), summary);

@@ -74,10 +74,7 @@ impl ProvenanceSummary {
     /// Total number of changes classified (excludes `unreadable_changes`,
     /// which never enter any bucket).
     pub fn total_changes(&self) -> usize {
-        self.ai_changes
-            + self.human_changes
-            + self.needs_attention_changes
-            + self.system_changes
+        self.ai_changes + self.human_changes + self.needs_attention_changes + self.system_changes
     }
 
     /// Denominator for the headline metric: changes authored by a person or an AI.
