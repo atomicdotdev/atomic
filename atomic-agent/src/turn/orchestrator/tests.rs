@@ -272,6 +272,163 @@ async fn test_turn_end_records_untracked_only_files() {
         .contains(&"package.json".to_string()));
 }
 
+// PR0 — Attestation coverage correctness
+//
+// Regression guard: the session-end attestation must cover only the changes
+// the orchestrator actually recorded for this session — NOT the inherited
+// baseline (init) changes that the agent view picked up from its parent view.
+//
+// Before this fix, `create_session_attestation` scanned the full agent-view
+// history and reported every change as "covered by the agent". On a fresh
+// repo with 2 init changes + 1 agent file, it incorrectly reported 3 changes.
+// See: notes/2026-05-26-standup.md §3 + development/atomic-attest-fixes.md (B0).
+#[tokio::test]
+async fn test_session_attestation_covers_only_agent_recorded_changes() {
+    use atomic_core::change::ChangeHeader;
+
+    let dir = TempDir::new().unwrap();
+    Repository::init(dir.path()).unwrap();
+
+    // Pre-existing baseline: record a "human" change BEFORE the agent
+    // session starts. This change will be inherited by the agent view
+    // when the session forks. The bug we're guarding against is that
+    // this baseline used to get attributed to the agent.
+    let repo_for_baseline = Repository::open(dir.path()).unwrap();
+    fs::write(dir.path().join("baseline.txt"), "baseline content\n").unwrap();
+    repo_for_baseline
+        .add(
+            "baseline.txt",
+            atomic_repository::tracking::TrackingOptions::default(),
+        )
+        .expect("track baseline.txt");
+    let baseline_outcome = repo_for_baseline
+        .record(
+            ChangeHeader::new("baseline change"),
+            atomic_repository::record::RecordOptions::new().with_all(true),
+        )
+        .expect("baseline record should succeed");
+    let baseline_hash = *baseline_outcome.hash();
+    drop(repo_for_baseline);
+
+    let mut orch = make_orchestrator(&dir);
+    orch.set_agent("claude-code", "Claude Code");
+
+    orch.dispatch(session_start_event("sess-cov-1"))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event("sess-cov-1", "Create agent-p0.txt"))
+        .await
+        .unwrap();
+
+    fs::write(dir.path().join("agent-p0.txt"), "agent p0 test\n").unwrap();
+
+    let turn_result = orch
+        .dispatch(turn_end_event("sess-cov-1"))
+        .await
+        .unwrap();
+
+    let recorded = turn_result
+        .change_recorded
+        .as_ref()
+        .expect("turn with new file must record a change");
+    let agent_hash = recorded.hash;
+    assert_ne!(agent_hash, baseline_hash);
+
+    // The session must remember the exact hash(es) it just recorded —
+    // and NOT the baseline that the agent view inherited.
+    let session_after_turn = orch.session_store.load("sess-cov-1").unwrap().unwrap();
+    assert_eq!(
+        session_after_turn.recorded_change_hashes,
+        vec![agent_hash],
+        "session must track exactly the agent's recorded changes, not inherited baseline",
+    );
+
+    // Confirm the agent view DID inherit the baseline (otherwise the test
+    // isn't exercising the regression scenario). We must drop this repo
+    // handle before dispatching session_end — `create_session_attestation`
+    // opens its own handle and the lock is exclusive.
+    {
+        let repo = Repository::open(dir.path()).unwrap();
+        let agent_view_history = repo
+            .log(
+                atomic_repository::history::HistoryOptions::default()
+                    .view(&session_after_turn.view_name),
+            )
+            .unwrap();
+        let inherited_hashes: Vec<_> = agent_view_history.iter().map(|e| e.hash).collect();
+        assert!(
+            inherited_hashes.contains(&baseline_hash),
+            "agent view should inherit the baseline change from parent",
+        );
+        assert!(
+            inherited_hashes.contains(&agent_hash),
+            "agent view should also contain the agent's own change",
+        );
+    }
+
+    // Session end triggers create_session_attestation.
+    orch.dispatch(session_end_event("sess-cov-1"))
+        .await
+        .unwrap();
+
+    let repo = Repository::open(dir.path()).unwrap();
+
+    let attestation_hashes: Vec<_> = repo
+        .change_store()
+        .iter_attestations()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert_eq!(
+        attestation_hashes.len(),
+        1,
+        "expected exactly one attestation after session end",
+    );
+    let attest = repo.load_attestation(&attestation_hashes[0]).unwrap();
+    assert_eq!(
+        attest.changes_covered,
+        vec![agent_hash],
+        "attestation must cover only what the agent recorded ({:?}) — not the inherited baseline ({:?})",
+        agent_hash,
+        baseline_hash,
+    );
+    assert!(
+        !attest.changes_covered.contains(&baseline_hash),
+        "regression: attestation should never include the pre-session baseline change",
+    );
+}
+
+// PR0 — early-return guard
+//
+// A session that never recorded any changes (e.g. agent opened then exited
+// without doing work) must NOT create a virtual attestation by falling back
+// to the full view history.
+#[tokio::test]
+async fn test_session_end_skips_attestation_when_no_recorded_changes() {
+    let dir = TempDir::new().unwrap();
+    Repository::init(dir.path()).unwrap();
+    let mut orch = make_orchestrator(&dir);
+    orch.set_agent("claude-code", "Claude Code");
+
+    orch.dispatch(session_start_event("sess-empty"))
+        .await
+        .unwrap();
+    // No turn_end → no record_turn → recorded_change_hashes stays empty.
+    orch.dispatch(session_end_event("sess-empty"))
+        .await
+        .unwrap();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let attestations: Vec<_> = repo
+        .change_store()
+        .iter_attestations()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert!(
+        attestations.is_empty(),
+        "session with zero recorded turns must not produce an attestation",
+    );
+}
+
 #[tokio::test]
 async fn test_turn_end_with_file_changes() {
     let dir = TempDir::new().unwrap();

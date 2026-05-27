@@ -45,31 +45,27 @@ impl TurnOrchestrator {
             }
         };
 
-        // Query the agent view for all change hashes
-        let history = match repo
-            .log(atomic_repository::history::HistoryOptions::default().view(&session.view_name))
-        {
-            Ok(h) => h,
-            Err(e) => {
-                log::debug!(
-                    "Could not read history for view '{}': {} (no attestation created)",
-                    session.view_name,
-                    e,
-                );
-                return;
-            }
-        };
-
-        if history.is_empty() {
+        // Use the change hashes the orchestrator actually recorded for THIS
+        // session — not the full agent-view history. The agent view is a
+        // fork of the parent view and inherits the parent's baseline
+        // changes; scanning the full history would (incorrectly) attribute
+        // those inherited baseline changes to the agent.
+        //
+        // For sessions that pre-date this field (or that recorded zero
+        // changes), `recorded_change_hashes` is empty — we skip rather
+        // than fall back to the old "scan whole view" path, which would
+        // resurrect the over-counting bug.
+        if session.recorded_change_hashes.is_empty() {
             log::debug!(
-                "View '{}' has no changes — skipping attestation",
-                session.view_name,
+                "Session {} has no recorded change hashes — skipping attestation \
+                 (legacy session or no turns recorded)",
+                session.session_id,
             );
             return;
         }
 
         let all_change_hashes: Vec<atomic_core::types::Hash> =
-            history.iter().map(|e| e.hash).collect();
+            session.recorded_change_hashes.clone();
 
         // Handle resumed sessions: find existing attestations and determine
         // which changes are new (not yet covered by any attestation).
