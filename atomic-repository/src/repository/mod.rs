@@ -100,6 +100,7 @@ mod changes;
 mod content;
 mod history;
 mod insert;
+mod provenance_summary;
 mod record;
 mod remotes;
 mod status;
@@ -117,6 +118,7 @@ mod vault_triples;
 pub use insert::{
     ImportLineIndexSeed, ImportLineIndexSeedLine, ImportWriteOutcome, ImportWriteTimings,
 };
+pub use provenance_summary::ProvenanceSummary;
 pub use semantic_materialize::{CrdtMaterializeOptions, CrdtMaterializeOutcome};
 pub use vault_embeddings::{hash_embed, EmbedConfig, TextChunk};
 pub use vault_goal::{

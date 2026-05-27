@@ -43,7 +43,10 @@ use crate::output::print_warning;
 #[derive(Debug, Args)]
 pub struct Attest {
     /// Show details for a specific attestation by hash (or prefix).
-    #[arg(long, value_name = "HASH")]
+    ///
+    /// Cannot be combined with `--summary` / `--pending` (those are
+    /// provenance-summary modes, not attestation lookups).
+    #[arg(long, value_name = "HASH", conflicts_with_all = ["summary", "pending"])]
     hash: Option<String>,
 
     /// Filter to attestations covering changes in this view.
@@ -53,6 +56,26 @@ pub struct Attest {
     /// Show verbose output with model breakdown and coverage.
     #[arg(short, long)]
     verbose: bool,
+
+    /// Show a project-level AI provenance summary instead of the attestation list.
+    ///
+    /// Classifies each change in the view as AI / Human / Needs-attention / System
+    /// based on embedded change provenance, and reports `AI / (AI + Human)`.
+    /// Independent of attestations — works even if attestations are missing.
+    ///
+    /// Scans the full history of the selected view (good for canonical views
+    /// like `dev`). For an agent / draft view that inherits from a parent,
+    /// use `--pending <parent_view>` to summarize only the delta — otherwise
+    /// inherited human/system changes will be counted in the denominator.
+    #[arg(short, long)]
+    summary: bool,
+
+    /// Summarize the **pending delta** of `--view` relative to the given
+    /// parent view (e.g., `--pending dev`). Only changes that are in
+    /// `--view` but not in `<parent>` are classified. Implies `--summary`
+    /// and requires `--view` to be set.
+    #[arg(long, value_name = "PARENT_VIEW")]
+    pending: Option<String>,
 }
 
 impl Attest {
@@ -62,6 +85,8 @@ impl Attest {
             hash: None,
             view: None,
             verbose: false,
+            summary: false,
+            pending: None,
         }
     }
 }
@@ -75,6 +100,22 @@ impl Command for Attest {
             },
             other => CliError::Repository(other),
         })?;
+
+        // Project-level AI provenance summary (independent of attestations).
+        // `--pending <parent>` implies summary mode.
+        if self.summary || self.pending.is_some() {
+            // `--pending` compares a specific agent view against its parent;
+            // defaulting the agent view to the current view would produce a
+            // meaningless "X relative to X" empty delta, so require it.
+            if self.pending.is_some() && self.view.is_none() {
+                return Err(CliError::InvalidArgument {
+                    message:
+                        "--pending <parent_view> requires --view <agent_view> (the forked view to summarize)"
+                            .to_string(),
+                });
+            }
+            return self.show_summary(&repo);
+        }
 
         // Show details for a specific attestation
         if let Some(ref hash_prefix) = self.hash {
@@ -92,6 +133,129 @@ impl Command for Attest {
 }
 
 impl Attest {
+    /// Print a project-level AI provenance summary.
+    ///
+    /// Reads each change's embedded provenance (independent of attestations)
+    /// and classifies as AI / Human / Needs-attention / System. The headline
+    /// metric is `ai_authored_pct = AI / (AI + Human)`.
+    ///
+    /// Default output is terse and product-facing: the headline %, the human
+    /// count, and the AI source / tool breakdown. Implementation detail
+    /// (system/bootstrap exclusions, model breakdown, zero-count data-quality
+    /// lines) is shown only under `--verbose`. Non-zero data-quality
+    /// conditions (needs-attention, unreadable) always surface as warnings.
+    fn show_summary(&self, repo: &Repository) -> CliResult<()> {
+        let view_name = self
+            .view
+            .clone()
+            .unwrap_or_else(|| repo.current_view().to_string());
+
+        let (summary, header_line) = if let Some(parent_view) = self.pending.as_deref() {
+            let s = repo
+                .provenance_summary_pending(&view_name, parent_view)
+                .map_err(CliError::Repository)?;
+            (s, format!("Pending work: {} → {}", view_name, parent_view))
+        } else {
+            let s = repo
+                .provenance_summary(&view_name)
+                .map_err(CliError::Repository)?;
+            (s, format!("Project: {}", view_name))
+        };
+
+        println!("{}", header_line);
+        println!();
+
+        // Headline.
+        match summary.ai_authored_pct() {
+            None => {
+                println!("No authored changes in this view yet.");
+            }
+            Some(pct) => {
+                let denom = summary.authored_denominator();
+                println!(
+                    "AI-authored: {:.0}% ({} of {} authored change{})",
+                    pct,
+                    summary.ai_changes,
+                    denom,
+                    if denom == 1 { "" } else { "s" },
+                );
+                if summary.human_changes > 0 {
+                    println!(
+                        "Human-authored: {} change{}",
+                        summary.human_changes,
+                        if summary.human_changes == 1 { "" } else { "s" },
+                    );
+                }
+                if !summary.by_vendor.is_empty() {
+                    let parts: Vec<String> = summary
+                        .by_vendor
+                        .iter()
+                        .map(|(v, n)| format!("{} {}", pretty_vendor(v), n))
+                        .collect();
+                    println!("AI sources: {}", parts.join(" · "));
+                }
+                if !summary.by_tool.is_empty() {
+                    let parts: Vec<String> = summary
+                        .by_tool
+                        .iter()
+                        .map(|(t, n)| format!("{} {}", pretty_tool(t), n))
+                        .collect();
+                    println!("Tools: {}", parts.join(" · "));
+                }
+            }
+        }
+
+        // Verbose: internal accounting.
+        if self.verbose {
+            println!();
+            println!("System/bootstrap changes excluded: {}", summary.system_changes);
+            println!("Needs attention: {}", summary.needs_attention_changes);
+            println!("Unreadable: {}", summary.unreadable_changes);
+            if !summary.by_model.is_empty() {
+                let parts: Vec<String> = summary
+                    .by_model
+                    .iter()
+                    .map(|(m, n)| format!("{} {}", m, n))
+                    .collect();
+                println!("Models: {}", parts.join(" · "));
+            }
+        }
+
+        // Non-zero data-quality conditions always surface (even without -v).
+        if summary.needs_attention_changes > 0 {
+            println!();
+            print_warning(&format!(
+                "{} change(s) have an agent-identity author but no embedded provenance — possible recording pipeline issue. Excluded from the percentage.",
+                summary.needs_attention_changes,
+            ));
+        }
+        if summary.unreadable_changes > 0 {
+            println!();
+            print_warning(&format!(
+                "{} change(s) could not be loaded and are excluded from the percentage.",
+                summary.unreadable_changes,
+            ));
+        }
+
+        // On the canonical path, if the user actually selected a forked /
+        // draft view, point them at --pending. Detection is exact (via the
+        // view's recorded parent), so this never fires for canonical views.
+        if self.pending.is_none() {
+            if let Ok(info) = repo.get_view_info(&view_name) {
+                if let Some(parent) = info.parent_name {
+                    println!();
+                    println!("This looks like a draft view. To summarize only pending work:");
+                    println!(
+                        "  atomic agent attest --pending {} --view {}",
+                        parent, view_name,
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// List all attestations in the repository.
     fn list_all(&self, repo: &Repository) -> CliResult<()> {
         let mut attestations: Vec<(Hash, Attestation)> = Vec::new();
@@ -149,7 +313,11 @@ impl Attest {
         let total_tokens: u64 = attestations.iter().map(|(_, a)| a.total_tokens()).sum();
 
         println!("──────────────────────────────────────────");
-        let mut summary = format_count(total_changes, "change covered");
+        let mut summary = format!(
+            "{} {} covered",
+            total_changes,
+            if total_changes == 1 { "change" } else { "changes" },
+        );
         if total_cost > 0.0 {
             summary = format!("{}  ·  {}", format_cost(total_cost), summary);
         }
@@ -406,6 +574,49 @@ impl Attest {
 
 // Formatting Helpers
 
+/// Prettify a canonical vendor name (from `AIVendor::name()`, lowercase) into
+/// a product-facing label. Falls back to the raw string for unknown vendors.
+fn pretty_vendor(canonical: &str) -> String {
+    match canonical {
+        "anthropic" => "Anthropic",
+        "openai" => "OpenAI",
+        "google" => "Google",
+        "meta" => "Meta",
+        "mistral" => "Mistral",
+        "cohere" => "Cohere",
+        "amazon-bedrock" => "Amazon Bedrock",
+        "azure-openai" => "Azure OpenAI",
+        "local" => "Local",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Prettify a tool label from `AITool::description()` (e.g. "CLI: claude-code")
+/// into a product-facing name. Drops the access-method prefix, then maps the
+/// known agent registry keys to display names (e.g. "claude-code" →
+/// "Claude Code"). Unknown names and prefix-less variants (e.g. "API") pass
+/// through unchanged.
+fn pretty_tool(description: &str) -> String {
+    let name = match description.split_once(": ") {
+        Some((_prefix, name)) => name,
+        None => description,
+    };
+    match name {
+        "claude-code" => "Claude Code",
+        "codex" => "Codex",
+        "gemini-cli" => "Gemini CLI",
+        "cursor" => "Cursor",
+        "cline" => "Cline",
+        "opencode" => "OpenCode",
+        "copilot" => "Copilot",
+        "sherpa" => "Sherpa",
+        "pi" => "Pi",
+        other => other,
+    }
+    .to_string()
+}
+
 fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
@@ -454,6 +665,8 @@ mod tests {
             hash: Some("XMJZ3IPF".to_string()),
             view: None,
             verbose: false,
+            summary: false,
+            pending: None,
         };
         assert_eq!(cmd.hash.as_deref(), Some("XMJZ3IPF"));
     }
@@ -464,6 +677,8 @@ mod tests {
             hash: None,
             view: Some("dev".to_string()),
             verbose: false,
+            summary: false,
+            pending: None,
         };
         assert_eq!(cmd.view.as_deref(), Some("dev"));
     }
@@ -474,8 +689,35 @@ mod tests {
             hash: None,
             view: None,
             verbose: true,
+            summary: false,
+            pending: None,
         };
         assert!(cmd.verbose);
+    }
+
+    #[test]
+    fn test_attest_summary_flag() {
+        let cmd = Attest {
+            hash: None,
+            view: None,
+            verbose: false,
+            summary: true,
+            pending: None,
+        };
+        assert!(cmd.summary);
+    }
+
+    #[test]
+    fn test_attest_pending_flag() {
+        let cmd = Attest {
+            hash: None,
+            view: Some("solitary-flower-0915".to_string()),
+            verbose: false,
+            summary: false,
+            pending: Some("dev".to_string()),
+        };
+        assert_eq!(cmd.pending.as_deref(), Some("dev"));
+        assert_eq!(cmd.view.as_deref(), Some("solitary-flower-0915"));
     }
 
     #[test]
@@ -526,5 +768,38 @@ mod tests {
     fn test_format_count_plural() {
         assert_eq!(format_count(0, "change"), "0 changes");
         assert_eq!(format_count(5, "change"), "5 changes");
+    }
+
+    #[test]
+    fn test_pretty_vendor_known() {
+        assert_eq!(pretty_vendor("anthropic"), "Anthropic");
+        assert_eq!(pretty_vendor("openai"), "OpenAI");
+        assert_eq!(pretty_vendor("google"), "Google");
+        assert_eq!(pretty_vendor("azure-openai"), "Azure OpenAI");
+    }
+
+    #[test]
+    fn test_pretty_vendor_unknown_passes_through() {
+        assert_eq!(pretty_vendor("some-future-vendor"), "some-future-vendor");
+    }
+
+    #[test]
+    fn test_pretty_tool_strips_prefix_and_maps_display_name() {
+        assert_eq!(pretty_tool("CLI: claude-code"), "Claude Code");
+        assert_eq!(pretty_tool("Editor: cursor"), "Cursor");
+        assert_eq!(pretty_tool("IDE Plugin: copilot"), "Copilot");
+        assert_eq!(pretty_tool("CLI: gemini-cli"), "Gemini CLI");
+    }
+
+    #[test]
+    fn test_pretty_tool_unknown_strips_prefix_only() {
+        // Unknown tool keys still drop the prefix but aren't remapped.
+        assert_eq!(pretty_tool("CLI: future-agent"), "future-agent");
+    }
+
+    #[test]
+    fn test_pretty_tool_no_prefix_passes_through() {
+        assert_eq!(pretty_tool("API"), "API");
+        assert_eq!(pretty_tool("Chat"), "Chat");
     }
 }
