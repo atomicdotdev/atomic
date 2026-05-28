@@ -43,6 +43,8 @@ pub mod list;
 pub mod new;
 pub mod register;
 pub mod show;
+pub mod sign;
+pub mod verify;
 pub mod whoami;
 
 // Re-export command structs
@@ -51,6 +53,8 @@ pub use list::List;
 pub use new::New;
 pub use register::Register;
 pub use show::Show;
+pub use sign::Sign;
+pub use verify::Verify;
 pub use whoami::WhoAmI;
 
 use clap::Subcommand;
@@ -197,6 +201,38 @@ pub enum IdentityCommands {
     /// atomic identity register https://atomic.storage --identity alice-work
     /// ```
     Register(Register),
+
+    /// Sign bytes from stdin and output a JSON signature object.
+    ///
+    /// Reads raw bytes from stdin, signs them with the identity's Ed25519
+    /// secret key, and prints a JSON object containing the signature,
+    /// public key, identity name, and algorithm.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Sign with the default identity
+    /// atomic identity sign < file.bin
+    ///
+    /// # Sign with a specific identity
+    /// echo -n "hello" | atomic identity sign --identity alice-work
+    /// ```
+    Sign(Sign),
+
+    /// Verify an Ed25519 signature against bytes from stdin.
+    ///
+    /// Reads raw bytes from stdin and checks the provided signature
+    /// against the provided public key. Exits 0 if valid, 1 if invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic identity verify \
+    ///   --signature <base64-sig> \
+    ///   --public-key <base32-key> \
+    ///   < file.bin
+    /// ```
+    Verify(Verify),
 }
 
 impl Command for Identity {
@@ -209,6 +245,8 @@ impl Command for Identity {
             IdentityCommands::Delete(cmd) => cmd.run(),
             IdentityCommands::WhoAmI(cmd) => cmd.run(),
             IdentityCommands::Register(cmd) => cmd.run(),
+            IdentityCommands::Sign(cmd) => cmd.run(),
+            IdentityCommands::Verify(cmd) => cmd.run(),
         }
     }
 }
