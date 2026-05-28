@@ -100,6 +100,21 @@ impl Repository {
         // Compute files visible on the NEW view.
         let new_files = self.visible_file_paths(view)?;
 
+        if std::env::var_os("ATOMIC_TRACE_SWITCH").is_some() {
+            eprintln!("[switch] {} -> {}", old_view_name, view);
+            eprintln!(
+                "[switch] old_files={} new_files={}",
+                old_files.len(),
+                new_files.len()
+            );
+            for f in old_files.difference(&new_files) {
+                eprintln!("[switch] REMOVE (old only): {}", f);
+            }
+            for f in new_files.difference(&old_files) {
+                eprintln!("[switch] ADD (new only): {}", f);
+            }
+        }
+
         let working_copy = FileSystem::from_root(&self.root);
 
         // ── Phase 1: Shelve ignored files into the OLD view's workspace ──
@@ -135,10 +150,25 @@ impl Repository {
             }
         }
 
+        // Collect tracked file paths so we never shelve them — tracked
+        // files are managed by the graph (phases 2–4), not by shelving.
+        let tracked_paths: HashSet<String> = old_files.union(&new_files).cloned().collect();
+
         let ignored_paths: Vec<String> = self
             .collect_ignored_paths_on_disk()
             .into_iter()
             .filter(|path| {
+                // Never shelve tracked files — they belong to the graph
+                if tracked_paths.contains(path) {
+                    return false;
+                }
+                // Never shelve files under a tracked directory
+                if tracked_paths
+                    .iter()
+                    .any(|t| t.starts_with(&format!("{}/", path)))
+                {
+                    return false;
+                }
                 // Keep paths that are NOT exposed (those get shelved)
                 !expose_patterns
                     .iter()

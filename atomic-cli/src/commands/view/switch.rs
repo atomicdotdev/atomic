@@ -66,6 +66,25 @@ pub struct Switch {
     /// available views, or `atomic view create` to create a new one.
     #[arg(value_name = "NAME")]
     pub name: Option<String>,
+
+    /// Force switch even with unrecorded changes.
+    ///
+    /// By default, switching views is blocked when the working copy has
+    /// uncommitted changes (modified, added, or deleted files). This
+    /// prevents accidental loss of work during materialization.
+    ///
+    /// Use `--force` to override this check. Unrecorded changes will
+    /// be overwritten by the target view's content.
+    #[arg(long, short = 'f')]
+    pub force: bool,
+
+    /// Stash unrecorded changes before switching.
+    ///
+    /// Automatically runs `atomic stash push` to save your uncommitted
+    /// changes, then switches views. Use `atomic stash pop` after
+    /// switching back to restore your changes.
+    #[arg(long, short = 's')]
+    pub stash: bool,
 }
 
 impl Switch {
@@ -73,6 +92,8 @@ impl Switch {
     pub fn with_name(name: impl Into<String>) -> Self {
         Self {
             name: Some(name.into()),
+            force: false,
+            stash: false,
         }
     }
 }
@@ -100,6 +121,43 @@ impl Command for Switch {
         if repo.current_view() == name {
             print_success(&format!("Already on view: {}", style_view(name)));
             return Ok(());
+        }
+
+        // Block switch if working copy has unrecorded changes
+        if !self.force {
+            let status = repo
+                .status(atomic_repository::StatusOptions::default())
+                .map_err(|e| CliError::Repository(e))?;
+
+            if !status.is_clean() {
+                if self.stash {
+                    // Auto-stash: save changes before switching
+                    let stash_cmd = crate::commands::stash::Stash::new()
+                        .with_message(format!("Auto-stash before switching to {}", name));
+                    stash_cmd.run_push_on(&mut repo, None, false, false)?;
+                } else {
+                    let dirty: Vec<String> = status
+                        .entries()
+                        .iter()
+                        .filter(|e| e.status().is_dirty())
+                        .map(|e| format!("  {} {}", e.status().short_code(), e.path().display()))
+                        .collect();
+
+                    crate::output::print_error(&format!(
+                        "Cannot switch views with unrecorded changes ({} file{}):",
+                        dirty.len(),
+                        if dirty.len() == 1 { "" } else { "s" },
+                    ));
+                    for line in &dirty {
+                        eprintln!("{}", line);
+                    }
+                    eprintln!();
+                    eprintln!("Use 'atomic record' to save changes, 'atomic view switch --stash' to stash them, or '--force' to discard them.");
+                    return Err(CliError::InvalidArgument {
+                        message: "Working copy has unrecorded changes".to_string(),
+                    });
+                }
+            }
         }
 
         // Switch to the view and update working copy

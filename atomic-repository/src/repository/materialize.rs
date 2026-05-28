@@ -2,20 +2,18 @@ use super::*;
 use atomic_core::pristine::CachedGraphTxn;
 
 impl Repository {
-    /// Compute the set of file paths whose creating change is on a view.
+    /// Compute the set of file paths visible on a view.
     ///
-    /// Visibility is determined by the view's **change log**, not the
-    /// overlay chain.  The overlay provides graph-level read access for
-    /// record / diff operations, but file *materialization* (what shows
-    /// up on disk after `switch_view`) is governed by which changes have
-    /// been explicitly inserted into the view.
+    /// Visibility includes the view's own changes AND all changes
+    /// inherited through the parent chain.  A draft view parented on
+    /// dev sees dev's files without requiring an explicit insert.
     ///
     /// A file is visible on a view when:
     /// 1. It appears in the global TREE table (has been `add`ed).
     /// 2. Its inode has a graph position in the INODES table (has been
     ///    `record`ed).
-    /// 3. The change that introduced that position is present in the
-    ///    view's change log (via `iter_changes`).
+    /// 3. The change that introduced that position is visible to the
+    ///    view (own changes + parent chain).
     ///
     /// Files that have been `add`ed but not yet `record`ed (no INODES
     /// entry) are NOT returned — they persist across switches as
@@ -34,7 +32,9 @@ impl Repository {
             None => return Ok(HashSet::new()),
         };
 
-        let view_change_ids = collect_view_change_ids(&txn, &view)?;
+        // Use the FULL visible change set (own + parent chain) so that
+        // draft views parented on dev see dev's files.
+        let view_change_ids = collect_visible_change_ids(&txn, &view)?;
 
         // Walk TREE and keep paths whose introducing change is in the log.
         let mut paths: HashSet<String> = HashSet::new();
