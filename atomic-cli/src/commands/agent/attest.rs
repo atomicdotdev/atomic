@@ -3,8 +3,8 @@
 //! Lists attestations in the repository — graph-level audit nodes that
 //! capture AI cost, token usage, model breakdown, and session metadata.
 //!
-//! Attestations are not tied to any view. They live in the graph as
-//! standalone nodes with dependencies pointing to the changes they cover.
+//! Attestations cover concrete changes. Views provide the query and
+//! aggregation scope for listing receipts and provenance summaries.
 //!
 //! # Examples
 //!
@@ -38,8 +38,8 @@ use crate::output::print_warning;
 ///
 /// Attestations are graph-level audit nodes that capture metadata about
 /// AI agent sessions: cost, token usage per model, duration, and which
-/// changes are covered. They transcend views — one attestation can
-/// cover changes across multiple views.
+/// changes are covered. Views are the scope for asking which covered
+/// changes, receipts, or provenance summaries are relevant.
 #[derive(Debug, Args)]
 pub struct Attest {
     /// Show details for a specific attestation by hash (or prefix).

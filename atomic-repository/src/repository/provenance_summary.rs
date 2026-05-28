@@ -1,9 +1,10 @@
 //! Project-level AI provenance summary.
 //!
-//! Computes "what fraction of a view's changes are AI-authored" by reading
-//! each change's embedded [`Change::provenance()`](atomic_core::change::Change::provenance).
-//! This is decoupled from attestations: the summary is correct even when
-//! attestations are missing or have incorrect coverage.
+//! Computes "what fraction of a view's changes are AI-authored" by using
+//! the view as the aggregation scope and reading each reachable change's
+//! embedded [`Change::provenance()`](atomic_core::change::Change::provenance).
+//! This is decoupled from attestation receipts: the summary is correct even
+//! when receipts are missing or have incorrect coverage.
 //!
 //! # Classification (four buckets — see development/atomic-attest-fixes.md §3.2)
 //!
