@@ -63,6 +63,7 @@ console = "0.15"
 
 # Async
 tokio = { version = "1.36", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 bytes = "1.5"
 

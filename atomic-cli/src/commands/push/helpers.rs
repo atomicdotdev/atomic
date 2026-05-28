@@ -170,14 +170,31 @@ pub fn has_diverged(local_entries: &[HistoryEntry], remote_entries: &[Changelist
 /// Returns `CliError::ChangeNotFound` if the change doesn't exist,
 /// or `CliError::Internal` if serialization fails.
 pub fn load_change_data(repo: &Repository, hash: &Hash) -> CliResult<Bytes> {
-    // Load the change
+    // Read the raw V3 change file from disk instead of deserializing and
+    // re-serializing.  This is faster, uses less memory, and — critically —
+    // preserves the exact bytes that produced the content hash.  Re-serializing
+    // can produce different bytes (field ordering, padding) which would break
+    // hash verification on the server.
+    let change_path = repo.change_store().change_path(hash);
+    if change_path.exists() {
+        let data = std::fs::read(&change_path).map_err(|e| {
+            CliError::Internal(anyhow::anyhow!(
+                "Failed to read change file {:?}: {}",
+                change_path,
+                e
+            ))
+        })?;
+        return Ok(Bytes::from(data));
+    }
+
+    // Fallback: deserialize + re-serialize (legacy path for changes
+    // whose on-disk file was cleaned up or doesn't exist).
     let change = repo
         .load_change(hash)
         .map_err(|_| CliError::ChangeNotFound {
             hash: hash.to_base32(),
         })?;
 
-    // Serialize to bytes
     let mut buffer = Vec::new();
     change
         .serialize(&mut buffer)
@@ -289,63 +306,46 @@ pub async fn upload_change_smart(
     hash: &Hash,
     view: &str,
 ) -> CliResult<PushTransferResult> {
-    let change_data = load_change_data(repo, hash)?;
-    let data_len = change_data.len();
     let hash_str = hash.to_base32();
 
-    if data_len < DELTA_TRANSFER_THRESHOLD {
-        // FAST PATH: small change — send directly, no negotiation.
-        // This covers 99% of source code changes.
+    // Prefer streaming from the on-disk change file for large changes.
+    // This avoids loading 50MB+ into memory and uses chunked transfer
+    // encoding so the server can stream-to-disk instead of buffering.
+    let change_path = repo.change_store().change_path(hash);
+    let file_size = change_path.metadata().map(|m| m.len()).unwrap_or(0);
+
+    log::debug!(
+        "push: uploading {} ({} bytes / {}){}",
+        &hash_str[..12.min(hash_str.len())],
+        file_size,
+        format_bytes(file_size),
+        if file_size as usize >= DELTA_TRANSFER_THRESHOLD {
+            " [streamed]"
+        } else {
+            ""
+        },
+    );
+
+    // For large changes, stream directly from disk.
+    if file_size as usize >= DELTA_TRANSFER_THRESHOLD && change_path.exists() {
         remote
-            .upload_change(&hash_str, view, change_data)
+            .upload_change_streamed(&hash_str, view, &change_path)
             .await
             .map_err(|e| convert_remote_error(e, remote.url().as_ref()))?;
 
-        Ok(PushTransferResult::direct(data_len as u64))
-    } else {
-        // LARGE PATH: try delta transfer — negotiate chunks first.
-        //
-        // 1. Ask server for chunk manifest support
-        // 2. If supported: send our manifest, get back "need" list, send only missing chunks
-        // 3. If not supported: fall back to direct send
-        let manifest_result = remote.get_chunk_manifest(&hash_str).await;
-
-        match manifest_result {
-            Ok(Some(_server_manifest)) => {
-                // Server supports manifests and returned one for a prior version
-                // of this content. But wait — we're pushing a NEW change, not
-                // updating an existing one. The manifest endpoint returns chunks
-                // for an existing change hash on the server.
-                //
-                // For delta to work, we'd need to:
-                // 1. Push our manifest (our chunk hashes) to the server
-                // 2. Server checks which of our chunks it already has in CONTENT_CHUNKS
-                // 3. Server tells us which chunks to send
-                //
-                // The current ?manifest endpoint returns the SERVER's manifest for
-                // a hash, not a negotiation. For now, fall back to direct send.
-                // The delta protocol needs a dedicated negotiation endpoint.
-                //
-                // TODO: Implement POST ?negotiate_chunks with our manifest body
-                //       Server responds with { "need": [indices] }
-                remote
-                    .upload_change(&hash_str, view, change_data)
-                    .await
-                    .map_err(|e| convert_remote_error(e, remote.url().as_ref()))?;
-
-                Ok(PushTransferResult::direct(data_len as u64))
-            }
-            Ok(None) | Err(_) => {
-                // Server doesn't support manifests or error — direct send.
-                remote
-                    .upload_change(&hash_str, view, change_data)
-                    .await
-                    .map_err(|e| convert_remote_error(e, remote.url().as_ref()))?;
-
-                Ok(PushTransferResult::direct(data_len as u64))
-            }
-        }
+        return Ok(PushTransferResult::direct(file_size));
     }
+
+    // Small changes: load into memory and send directly.
+    let change_data = load_change_data(repo, hash)?;
+    let data_len = change_data.len();
+
+    remote
+        .upload_change(&hash_str, view, change_data)
+        .await
+        .map_err(|e| convert_remote_error(e, remote.url().as_ref()))?;
+
+    Ok(PushTransferResult::direct(data_len as u64))
 }
 
 /// Format a byte count for display.
@@ -414,6 +414,14 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
         },
         RemoteError::Timeout { seconds } => CliError::RemoteError {
             message: format!("Request timed out after {} seconds", seconds),
+            url: Some(url.to_string()),
+        },
+        RemoteError::HttpError { status: 413, .. } => CliError::RemoteError {
+            message: format!(
+                "Change too large for server (413 Payload Too Large). \
+                 The server's body size limit is too small. \
+                 Ask the server admin to increase MAX_BODY_SIZE_MB."
+            ),
             url: Some(url.to_string()),
         },
         _ => CliError::RemoteError {
