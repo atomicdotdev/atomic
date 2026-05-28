@@ -33,7 +33,7 @@ impl TurnOrchestrator {
         use atomic_core::types::Base32;
 
         // Open the repository
-        let repo = match atomic_repository::Repository::open(&self.repo_root) {
+        let repo = match atomic_repository::Repository::open_existing(&self.repo_root) {
             Ok(r) => r,
             Err(e) => {
                 log::warn!(

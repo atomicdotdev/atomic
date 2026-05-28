@@ -90,7 +90,7 @@ impl Command for Record {
         if !outcome.skipped_files().is_empty() {
             println!();
             print_hint(&format!(
-                "{} skipped (empty, binary, or too large)",
+                "{} skipped (unchanged, empty, binary, or too large)",
                 format_count(outcome.skipped_files().len(), "file")
             ));
         }
