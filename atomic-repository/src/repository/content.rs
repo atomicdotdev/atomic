@@ -1,4 +1,5 @@
 use super::*;
+use atomic_core::pristine::CachedGraphTxn;
 
 impl Repository {
     /// Get the recorded content for a tracked file.
@@ -93,9 +94,16 @@ impl Repository {
 
         // All edges are in GRAPH — raw transaction sees everything.
         // The change_filter handles view isolation.
-        let content =
-            retrieve_content_with_filter_fast(&txn, &self.change_store, inode, position, options)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let content = retrieve_content_with_filter_fast(
+            &cached_txn,
+            &self.change_store,
+            inode,
+            position,
+            options,
+        )
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if content.is_empty() {
             Ok(None)
@@ -213,9 +221,16 @@ impl Repository {
 
         let options = RetrieveOptions::new().with_change_filter(change_filter);
 
-        let content =
-            retrieve_content_with_filter_fast(&txn, &self.change_store, inode, position, options)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let content = retrieve_content_with_filter_fast(
+            &cached_txn,
+            &self.change_store,
+            inode,
+            position,
+            options,
+        )
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if content.is_empty() {
             Ok(None)
@@ -372,8 +387,10 @@ impl Repository {
             collect_visible_change_ids_with_deps(&txn, &view)?
         };
 
-        // Use the filtered retrieval method
-        self.get_file_content_with_filter(&txn, &normalized, change_filter, true)
+        // Use the filtered retrieval method with cached graph access
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        self.get_file_content_with_filter(&cached_txn, &normalized, change_filter, true)
     }
 
     /// Get the recorded content for a tracked file with options.
@@ -440,8 +457,11 @@ impl Repository {
         };
 
         // Retrieve content from the graph with options
-        let result = retrieve_content_with_options(&txn, &self.change_store, position, options)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let result =
+            retrieve_content_with_options(&cached_txn, &self.change_store, position, options)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         Ok(Some(result))
     }
@@ -590,7 +610,9 @@ impl Repository {
         // Retrieve content with the change filter.
         // Pass require_tracked=false: the file may have been deleted after
         // this point, but we want its content as it existed before the change.
-        self.get_file_content_with_filter(&txn, &normalized, change_set, false)
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        self.get_file_content_with_filter(&cached_txn, &normalized, change_set, false)
     }
 
     /// Get file content as it was AFTER a specific change was applied.
@@ -659,7 +681,9 @@ impl Repository {
         // Retrieve content with the change filter.
         // require_tracked=true: if the file was deleted before this point,
         // there is no "after" content to return.
-        self.get_file_content_with_filter(&txn, &normalized, change_set, true)
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        self.get_file_content_with_filter(&cached_txn, &normalized, change_set, true)
     }
 
     /// Get file content at a specific sequence number.
@@ -716,7 +740,9 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Retrieve content with the change filter
-        self.get_file_content_with_filter(&txn, &normalized, change_set, true)
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        self.get_file_content_with_filter(&cached_txn, &normalized, change_set, true)
     }
 
     /// Internal helper to retrieve file content with a change filter.

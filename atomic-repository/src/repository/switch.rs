@@ -192,7 +192,67 @@ impl Repository {
         cleanup_empty_ancestors(&self.root, all_removed);
 
         // ── Phase 4: Materialize the new view's tracked files from graph ─
-        let result = self.materialize()?;
+        //
+        // Instead of materializing ALL files, compute which files differ
+        // between the old and new views and only materialize those.
+        // Files shared between views with identical content are untouched.
+        let result = {
+            let mut affected_paths: HashSet<String> = HashSet::new();
+
+            // Files only on the new view must always be materialized.
+            for path in new_files.difference(&old_files) {
+                affected_paths.insert(path.clone());
+            }
+
+            // Find changes that differ between the two views.
+            // Use the FULL visible change sets (including parent chains)
+            // so that inherited changes don't show up as differences.
+            // get_view_changes only returns a view's OWN change log,
+            // which would flag every inherited change as "different".
+            {
+                let txn = self
+                    .pristine
+                    .read_txn()
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+                let old_view = txn
+                    .get_view(&old_view_name)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .ok_or_else(|| RepositoryError::ViewNotFound {
+                        name: old_view_name.clone(),
+                    })?;
+                let new_view = txn
+                    .get_view(view)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .ok_or_else(|| RepositoryError::ViewNotFound {
+                        name: view.to_string(),
+                    })?;
+
+                let old_ids = collect_visible_change_ids(&txn, &old_view)?;
+                let new_ids = collect_visible_change_ids(&txn, &new_view)?;
+
+                // NodeIds that are in one view but not the other
+                let diff_ids: Vec<_> = old_ids.symmetric_difference(&new_ids).copied().collect();
+
+                for node_id in &diff_ids {
+                    if let Ok(Some(hash)) = txn.get_external(*node_id) {
+                        if let Ok(change) = self.load_change(&hash) {
+                            for op in change.hunks() {
+                                if let Some(p) = op.path() {
+                                    affected_paths.insert(p.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if affected_paths.is_empty() {
+                self.materialize()?
+            } else {
+                self.materialize_paths(affected_paths)?
+            }
+        };
 
         // ── Phase 5: Restore ignored files from the NEW view's workspace ─
         //

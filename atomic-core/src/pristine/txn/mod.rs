@@ -15,5 +15,7 @@ mod write;
 
 pub use helpers::AdjIterator;
 pub use pristine::Pristine;
+pub use read::CachedGraphTxn;
+pub use read::InodePreloadTxn;
 pub use read::ReadTxn;
 pub use write::WriteTxn;

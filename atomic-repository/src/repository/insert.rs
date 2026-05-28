@@ -1563,8 +1563,21 @@ impl Repository {
         hash: &Hash,
         options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
+        let trace_insert = std::env::var_os("ATOMIC_TRACE_INSERT").is_some();
+        let t0 = std::time::Instant::now();
+
         // Load the change from the store
         let change = self.load_change(hash)?;
+
+        if trace_insert {
+            eprintln!(
+                "[insert_change] hash={} load_change elapsed={:?} hunks={} deps={}",
+                &hash.to_base32()[..12],
+                t0.elapsed(),
+                change.hunks().len(),
+                change.dependencies().len(),
+            );
+        }
 
         // Get write transaction
         let mut txn = self
@@ -1587,6 +1600,7 @@ impl Repository {
         //     → returns true, so redundant hunk application is skipped
         //   - Changes with only EdgeUpdate hunks (no FileAdd/DirAdd)
         //     → correctly detected via the range scan
+        let t_check = std::time::Instant::now();
         let already_in_graph = if let Some(node_id) = txn
             .get_internal(hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
@@ -1608,6 +1622,15 @@ impl Repository {
             );
             false
         };
+
+        if trace_insert {
+            eprintln!(
+                "[insert_change] hash={} already_in_graph={} check elapsed={:?}",
+                &hash.to_base32()[..12],
+                already_in_graph,
+                t_check.elapsed(),
+            );
+        }
 
         // Register the change to get an internal ID (or get existing ID).
         // (If get_internal succeeded above, register_change just returns
@@ -1632,6 +1655,7 @@ impl Repository {
         // This creates the path→inode→position mappings that materialize
         // needs to reconstruct files. Without this, server-side repos (which
         // receive changes via push rather than record) would have an empty tree.
+        let t_tree = std::time::Instant::now();
         if !already_in_graph {
             for graph_op in change.hunks() {
                 match graph_op {
@@ -1707,9 +1731,18 @@ impl Repository {
                     _ => {}
                 }
             }
+
+            if trace_insert {
+                eprintln!(
+                    "[insert_change] hash={} tree_tables elapsed={:?}",
+                    &hash.to_base32()[..12],
+                    t_tree.elapsed(),
+                );
+            }
         }
 
         // Apply to the graph (skips hunk application if already_in_graph)
+        let t_graph = std::time::Instant::now();
         let outcome = write_change_to_graph(
             &mut txn,
             view_name,
@@ -1721,12 +1754,28 @@ impl Repository {
         )
         .map_err(|e| RepositoryError::Apply(e.to_string()))?;
 
+        if trace_insert {
+            eprintln!(
+                "[insert_change] hash={} write_graph elapsed={:?} atoms={}",
+                &hash.to_base32()[..12],
+                t_graph.elapsed(),
+                outcome.stats.atoms_processed,
+            );
+        }
+
         // Commit the transaction
         log::debug!("insert_change: committing transaction...");
         let commit_start = std::time::Instant::now();
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         let commit_ms = commit_start.elapsed().as_millis();
+        if trace_insert {
+            eprintln!(
+                "[insert_change] hash={} txn.commit elapsed={:?}",
+                &hash.to_base32()[..12],
+                commit_start.elapsed(),
+            );
+        }
         if commit_ms > 50 {
             log::warn!(
                 "insert_change: SLOW txn.commit() took {}ms (change_id={:?})",
@@ -1735,6 +1784,14 @@ impl Repository {
             );
         } else {
             log::debug!("insert_change: txn.commit() took {}ms", commit_ms);
+        }
+
+        if trace_insert {
+            eprintln!(
+                "[insert_change] hash={} complete total_elapsed={:?}",
+                &hash.to_base32()[..12],
+                t0.elapsed(),
+            );
         }
 
         Ok(outcome)
@@ -1773,11 +1830,22 @@ impl Repository {
         hash: &Hash,
         options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
+        let trace_insert = std::env::var_os("ATOMIC_TRACE_INSERT").is_some();
+        let t0 = std::time::Instant::now();
+
         // Load the target change to get its dependencies
         let _change = self.load_change(hash)?;
 
         // Get the view name
         let view_name = options.view.as_deref().unwrap_or(&self.current_view);
+
+        if trace_insert {
+            eprintln!(
+                "[insert_change_rec] start hash={} view={}",
+                &hash.to_base32()[..12],
+                view_name,
+            );
+        }
 
         // Get a read transaction to check what's already inserted
         let read_txn = self
@@ -1827,20 +1895,48 @@ impl Repository {
         // Reverse to get topological order (dependencies first)
         to_insert.reverse();
 
+        if trace_insert {
+            eprintln!(
+                "[insert_change_rec] dep_resolution complete to_insert={} visited={} elapsed={:?}",
+                to_insert.len(),
+                visited.len(),
+                t0.elapsed(),
+            );
+        }
+
         // Now insert all changes in order
         let mut aggregate_stats = InsertStats::new();
         let mut final_state = Merkle::ZERO;
         let mut final_sequence = 0u64;
         let mut has_conflicts = false;
+        let total = to_insert.len();
 
-        for change_hash in &to_insert {
+        for (i, change_hash) in to_insert.iter().enumerate() {
+            let change_start = std::time::Instant::now();
             let outcome = self.insert_change(change_hash, options.clone())?;
+            if trace_insert {
+                eprintln!(
+                    "[insert_change_rec] applied {}/{} hash={} elapsed={:?}",
+                    i + 1,
+                    total,
+                    &change_hash.to_base32()[..12],
+                    change_start.elapsed(),
+                );
+            }
             aggregate_stats.merge(outcome.stats);
             final_state = outcome.new_state;
             final_sequence = outcome.sequence;
             if outcome.has_conflicts {
                 has_conflicts = true;
             }
+        }
+
+        if trace_insert {
+            eprintln!(
+                "[insert_change_rec] complete total_inserted={} total_elapsed={:?}",
+                total,
+                t0.elapsed(),
+            );
         }
 
         Ok(InsertOutcome::new(
@@ -2230,6 +2326,9 @@ impl Repository {
         &self,
         options: CrossViewInsertOptions,
     ) -> Result<CrossViewInsertOutcome, RepositoryError> {
+        let trace_insert = std::env::var_os("ATOMIC_TRACE_INSERT").is_some();
+        let t0 = std::time::Instant::now();
+
         let mut outcome = CrossViewInsertOutcome::new();
         outcome.was_dry_run = options.dry_run;
 
@@ -2247,6 +2346,20 @@ impl Repository {
                 .map(|(_, hash)| hash)
                 .collect()
         };
+
+        if trace_insert {
+            eprintln!(
+                "[insert_from_view] start from={} to={} source_changes={}",
+                options.from_view,
+                options.to_view,
+                source_changes.len(),
+            );
+            eprintln!(
+                "[insert_from_view] source_changes collected count={} elapsed={:?}",
+                source_changes.len(),
+                t0.elapsed(),
+            );
+        }
 
         // Filter to changes not already in target
         let txn = self
@@ -2270,6 +2383,15 @@ impl Repository {
             if !missing_set.contains(hash) {
                 outcome.skipped_hashes.push(*hash);
             }
+        }
+
+        if trace_insert {
+            eprintln!(
+                "[insert_from_view] filter_missing complete missing={} skipped={} elapsed={:?}",
+                missing.len(),
+                outcome.skipped_hashes.len(),
+                t0.elapsed(),
+            );
         }
 
         drop(txn);
@@ -2317,7 +2439,10 @@ impl Repository {
             .view(&options.to_view)
             .allow_conflict(options.allow_conflicts || source_is_draft);
 
-        for hash in &missing {
+        let total_missing = missing.len();
+        for (i, hash) in missing.iter().enumerate() {
+            let change_start = std::time::Instant::now();
+
             let result = if options.apply_dependencies {
                 self.insert_change_rec(hash, apply_opts.clone())
             } else {
@@ -2326,6 +2451,25 @@ impl Repository {
 
             match result {
                 Ok(apply_outcome) => {
+                    if trace_insert {
+                        let change_elapsed = change_start.elapsed();
+                        eprintln!(
+                            "[insert_from_view] change {}/{} hash={} elapsed={:?} cumulative={:?}",
+                            i + 1,
+                            total_missing,
+                            &hash.to_base32()[..12],
+                            change_elapsed,
+                            t0.elapsed(),
+                        );
+                        if change_elapsed > std::time::Duration::from_millis(200) {
+                            eprintln!(
+                                "[insert_from_view] SLOW change hash={} took {:?}",
+                                &hash.to_base32()[..12],
+                                change_elapsed,
+                            );
+                        }
+                    }
+
                     outcome.applied_hashes.push(*hash);
                     outcome.changes_applied += 1;
                     outcome.new_state = apply_outcome.new_state;
@@ -2338,6 +2482,16 @@ impl Repository {
                     return Err(e);
                 }
             }
+        }
+
+        if trace_insert {
+            eprintln!(
+                "[insert_from_view] complete applied={} skipped={} conflicts={} total_elapsed={:?}",
+                outcome.changes_applied,
+                outcome.skipped_hashes.len(),
+                outcome.has_conflicts,
+                t0.elapsed(),
+            );
         }
 
         Ok(outcome)

@@ -167,7 +167,7 @@ pub use traits::{
     KgMutTxnT, KgTxnT, MutTxnT, TreeTxnT, VaultEntryMeta, VaultMutTxnT, VaultTxnT, VertexExt,
     ViewScope, ViewState, ViewTxnT,
 };
-pub use txn::{AdjIterator, Pristine, ReadTxn, WriteTxn};
+pub use txn::{AdjIterator, CachedGraphTxn, InodePreloadTxn, Pristine, ReadTxn, WriteTxn};
 pub use vault::{
     EmbeddingRecord, GoalSummary, IndexStats, IntentSummary, KgEdge, KgNode, KgQueryResponse,
     KgSubgraph, MemorySummary, SearchResult, SkillSummary, TokenCounts, VaultEntry, VaultEntryType,

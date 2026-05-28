@@ -262,15 +262,43 @@ fn run_from_view(repo: &Repository, args: &FromViewArgs) -> CliResult<()> {
 
     print_cross_view_outcome(&outcome, args.dry_run);
 
-    // Update working copy if we inserted into the current view
+    // Update working copy if we inserted into the current view.
+    // Collect affected file paths from the inserted changes and only
+    // materialize those, avoiding a full rematerialization of the
+    // entire working copy.
     if is_current_view && !args.dry_run && outcome.changes_applied > 0 {
-        let output_result = repo.materialize().map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
-        })?;
-        output::print_success(&format!(
-            "{} files updated, {} directories",
-            output_result.files_written, output_result.directories_created
-        ));
+        let spinner = output::create_spinner("Materializing files for view...");
+
+        let mut affected_paths = std::collections::HashSet::new();
+        for hash in &outcome.applied_hashes {
+            if let Ok(change) = repo.load_change(hash) {
+                for op in change.hunks() {
+                    if let Some(p) = op.path() {
+                        affected_paths.insert(p.to_string());
+                    }
+                }
+            }
+        }
+
+        let output_result = if affected_paths.is_empty() {
+            // No path info available (e.g. AddRoot-only changes) —
+            // fall back to full materialize.
+            repo.materialize().map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
+            })?
+        } else {
+            repo.materialize_paths(affected_paths).map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
+            })?
+        };
+
+        output::finish_success(
+            &spinner,
+            &format!(
+                "{} files updated, {} directories",
+                output_result.files_written, output_result.directories_created
+            ),
+        );
     }
 
     Ok(())
@@ -307,15 +335,38 @@ fn run_tag(repo: &Repository, args: &TagArgs) -> CliResult<()> {
 
     print_cross_view_outcome(&outcome, args.dry_run);
 
-    // Update working copy if we inserted into the current view
+    // Update working copy if we inserted into the current view.
     if is_current_view && !args.dry_run && outcome.changes_applied > 0 {
-        let output_result = repo.materialize().map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
-        })?;
-        output::print_success(&format!(
-            "{} files updated, {} directories",
-            output_result.files_written, output_result.directories_created
-        ));
+        let spinner = output::create_spinner("Materializing files for view...");
+
+        let mut affected_paths = std::collections::HashSet::new();
+        for hash in &outcome.applied_hashes {
+            if let Ok(change) = repo.load_change(hash) {
+                for op in change.hunks() {
+                    if let Some(p) = op.path() {
+                        affected_paths.insert(p.to_string());
+                    }
+                }
+            }
+        }
+
+        let output_result = if affected_paths.is_empty() {
+            repo.materialize().map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
+            })?
+        } else {
+            repo.materialize_paths(affected_paths).map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
+            })?
+        };
+
+        output::finish_success(
+            &spinner,
+            &format!(
+                "{} files updated, {} directories",
+                output_result.files_written, output_result.directories_created
+            ),
+        );
     }
 
     Ok(())

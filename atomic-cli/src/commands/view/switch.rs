@@ -103,6 +103,8 @@ impl Command for Switch {
         }
 
         // Switch to the view and update working copy
+        let spinner = crate::output::create_spinner("Materializing files for view...");
+
         let result = repo.switch_view(name).map_err(|e| match e {
             atomic_repository::RepositoryError::ViewNotFound { name } => {
                 CliError::ViewNotFound { name }
@@ -110,15 +112,15 @@ impl Command for Switch {
             other => CliError::Repository(other),
         })?;
 
-        print_success(&format!("Switched to view: {}", style_view(name)));
-
-        // Show output statistics if any files were updated
-        if result.files_written > 0 || result.directories_created > 0 {
-            println!(
-                "  {} files updated, {} directories",
-                result.files_written, result.directories_created
-            );
-        }
+        crate::output::finish_success(
+            &spinner,
+            &format!(
+                "Switched to view: {} ({} files updated, {} directories)",
+                style_view(name),
+                result.files_written,
+                result.directories_created,
+            ),
+        );
 
         if result.has_conflicts() {
             crate::output::print_warning(&format!(

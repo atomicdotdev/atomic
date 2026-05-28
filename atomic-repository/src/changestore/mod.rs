@@ -84,9 +84,12 @@ pub(crate) use iterators::ChangeIterator;
 
 /// Default LRU cache capacity for changes.
 ///
-/// This value balances memory usage against cache hit rate. A typical change
-/// might be 10-100KB, so 100 changes ≈ 1-10MB of memory.
-pub const DEFAULT_CACHE_CAPACITY: usize = 100;
+/// Default number of changes to cache in memory.
+///
+/// A typical change is 10-100KB. With 1024 entries, the cache uses
+/// 10-100MB of memory — a reasonable trade-off for avoiding disk I/O
+/// and lock contention during parallel materialization.
+pub const DEFAULT_CACHE_CAPACITY: usize = 1024;
 
 /// File extension for change files.
 ///
@@ -413,11 +416,12 @@ impl ChangeStore {
         end: usize,
         buf: &mut [u8],
     ) -> ChangeStoreResult<usize> {
-        {
-            if let Ok(mut cache) = self.cache.write() {
-                if let Some(change) = cache.get(hash) {
-                    return copy_content_from_change(hash, change, start, end, buf);
-                }
+        // Fast path: shared read lock — multiple threads can read concurrently.
+        // peek() doesn't update LRU order, which is an acceptable trade-off
+        // to avoid serializing all readers on a write lock.
+        if let Ok(cache) = self.cache.read() {
+            if let Some(change) = cache.peek(hash) {
+                return copy_content_from_change(hash, change, start, end, buf);
             }
         }
 

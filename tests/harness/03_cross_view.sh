@@ -1353,6 +1353,185 @@ assert_status_not_contains \
     "deleted:"
 assert_clean "dev is clean after insert from child"
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+begin_section "Cross-View: Unrecorded files survive draft→shared→draft round-trip"
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Regression test for file mangling during view switches.
+#
+# Bug scenario:
+#   1. On a draft view, create 2–3 files with content, add them, but DON’T record
+#   2. Switch to the shared view (dev)
+#   3. On dev, create 1–2 NEW files, add and record them
+#   4. Switch back to the draft view
+#   5. The original unrecorded files should have their original content intact
+#
+# The bug was that switching views would mangle the unrecorded files —
+# their content would be corrupted, truncated, or replaced with content
+# from other files or graph artifacts.
+
+make_temp_repo "cross-unrecorded-roundtrip"
+init_repo
+
+# Step 1: Create a draft view and add files WITHOUT recording
+new_view "draft-work" >/dev/null 2>&1 || true
+switch_view "draft-work" >/dev/null 2>&1 || true
+assert_current_view "on draft-work" "draft-work"
+
+create_file "draft_a.txt" "Draft file alpha content"
+create_file "draft_b.txt" "Draft file beta content"
+create_file "src/draft_c.rs" "fn draft_c() { println!(\"hello\"); }"
+assert_success "add draft_a.txt" atomic add draft_a.txt
+assert_success "add draft_b.txt" atomic add draft_b.txt
+assert_success "add src/draft_c.rs" atomic add src/draft_c.rs
+
+# Verify content before switching
+assert_file_content "draft_a.txt has correct content before switch" "draft_a.txt" "Draft file alpha content"
+assert_file_content "draft_b.txt has correct content before switch" "draft_b.txt" "Draft file beta content"
+assert_file_content "src/draft_c.rs has correct content before switch" "src/draft_c.rs" 'fn draft_c() { println!("hello"); }'
+assert_status_flag "draft_a.txt is Added" "A" "draft_a.txt"
+assert_status_flag "draft_b.txt is Added" "A" "draft_b.txt"
+
+# Step 2: Switch to dev (shared view)
+switch_view "dev" >/dev/null 2>&1 || true
+assert_current_view "on dev" "dev"
+
+# Step 3: On dev, create and record new files
+create_file "dev_new.txt" "New file on dev"
+create_file "dev_extra.txt" "Another dev file"
+assert_success "add dev_new.txt" atomic add dev_new.txt
+assert_success "add dev_extra.txt" atomic add dev_extra.txt
+record_change "Add dev files" >/dev/null 2>&1 || true
+
+# Verify dev files are clean
+assert_file_content "dev_new.txt recorded correctly" "dev_new.txt" "New file on dev"
+assert_file_content "dev_extra.txt recorded correctly" "dev_extra.txt" "Another dev file"
+
+# Step 4: Switch back to draft view
+switch_view "draft-work" >/dev/null 2>&1 || true
+assert_current_view "back on draft-work" "draft-work"
+
+# Step 5: CRITICAL — unrecorded files must have their original content
+assert_file_exists "draft_a.txt exists after round-trip" "draft_a.txt"
+assert_file_exists "draft_b.txt exists after round-trip" "draft_b.txt"
+assert_file_exists "src/draft_c.rs exists after round-trip" "src/draft_c.rs"
+
+assert_file_content \
+    "draft_a.txt content intact after round-trip" \
+    "draft_a.txt" \
+    "Draft file alpha content"
+assert_file_content \
+    "draft_b.txt content intact after round-trip" \
+    "draft_b.txt" \
+    "Draft file beta content"
+assert_file_content \
+    "src/draft_c.rs content intact after round-trip" \
+    "src/draft_c.rs" \
+    'fn draft_c() { println!("hello"); }'
+
+# The draft files should still be Added (not recorded)
+assert_status_flag "draft_a.txt still Added after round-trip" "A" "draft_a.txt"
+assert_status_flag "draft_b.txt still Added after round-trip" "A" "draft_b.txt"
+
+# Dev files should NOT be on the draft view (they weren't inserted)
+assert_file_not_exists "dev_new.txt NOT on draft-work" "dev_new.txt"
+assert_file_not_exists "dev_extra.txt NOT on draft-work" "dev_extra.txt"
+
+# ═══════════════════════════════════════════════════════════════════════
+begin_section "Cross-View: Unrecorded files survive with recorded files present"
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Variant: draft view has BOTH recorded AND unrecorded files.
+# Only the unrecorded ones are at risk of mangling.
+#
+# Workflow:
+#   1. On draft, record file_recorded.txt
+#   2. On draft, add but DON’T record file_pending.txt
+#   3. Switch to dev, record something
+#   4. Switch back to draft
+#   5. Both files should be intact
+
+make_temp_repo "cross-mixed-recorded-pending"
+init_repo
+
+# Record base on dev first
+create_file "base.txt" "base"
+assert_success "add base.txt" atomic add base.txt
+record_change "Add base on dev" >/dev/null 2>&1 || true
+
+# Create draft view from dev
+new_view "draft-mixed" >/dev/null 2>&1 || true
+insert_from_view "dev" "draft-mixed" >/dev/null 2>&1 || true
+switch_view "draft-mixed" >/dev/null 2>&1 || true
+
+# Record one file on draft
+create_file "file_recorded.txt" "I am recorded on draft"
+assert_success "add file_recorded.txt" atomic add file_recorded.txt
+record_change "Record file on draft" >/dev/null 2>&1 || true
+
+# Add but DON'T record another file
+create_file "file_pending.txt" "I am pending on draft"
+assert_success "add file_pending.txt" atomic add file_pending.txt
+assert_status_flag "file_pending.txt is Added" "A" "file_pending.txt"
+
+# Switch to dev and record something
+switch_view "dev" >/dev/null 2>&1 || true
+create_file "dev_work.txt" "dev work"
+assert_success "add dev_work.txt" atomic add dev_work.txt
+record_change "Dev work" >/dev/null 2>&1 || true
+
+# Switch back to draft
+switch_view "draft-mixed" >/dev/null 2>&1 || true
+assert_current_view "back on draft-mixed" "draft-mixed"
+
+# CRITICAL: both files must be intact
+assert_file_exists "file_recorded.txt exists" "file_recorded.txt"
+assert_file_content \
+    "file_recorded.txt content intact" \
+    "file_recorded.txt" \
+    "I am recorded on draft"
+
+assert_file_exists "file_pending.txt exists" "file_pending.txt"
+assert_file_content \
+    "file_pending.txt content intact (not mangled!)" \
+    "file_pending.txt" \
+    "I am pending on draft"
+
+assert_status_flag "file_pending.txt still Added" "A" "file_pending.txt"
+
+# ═══════════════════════════════════════════════════════════════════════
+begin_section "Cross-View: Multiple round-trips with pending files"
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Stress variant: switch back and forth multiple times with
+# unrecorded files. Content must never get mangled.
+
+make_temp_repo "cross-roundtrip-stress"
+init_repo
+
+new_view "wip" >/dev/null 2>&1 || true
+switch_view "wip" >/dev/null 2>&1 || true
+
+create_file "fragile.txt" "This content must not change"
+assert_success "add fragile.txt" atomic add fragile.txt
+
+# Round-trip 3 times, recording on dev each time
+for i in 1 2 3; do
+    switch_view "dev" >/dev/null 2>&1 || true
+    create_file "dev_iter_${i}.txt" "dev iteration ${i}"
+    assert_success "add dev_iter_${i}.txt" atomic add "dev_iter_${i}.txt"
+    record_change "Dev iteration ${i}" >/dev/null 2>&1 || true
+
+    switch_view "wip" >/dev/null 2>&1 || true
+    assert_file_exists "fragile.txt exists (iteration $i)" "fragile.txt"
+    assert_file_content \
+        "fragile.txt content intact (iteration $i)" \
+        "fragile.txt" \
+        "This content must not change"
+done
+
+_pass "3 round-trips with pending files: content never mangled"
+
+# ═══════════════════════════════════════════════════════════════════════
 
 print_summary
