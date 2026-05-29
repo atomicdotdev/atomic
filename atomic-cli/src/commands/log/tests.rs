@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::module_inception)]
 mod tests {
     use super::*;
     use atomic_core::change::{Author, ChangeHeader};
@@ -69,7 +70,7 @@ mod tests {
     #[test]
     fn test_log_format_clone() {
         let format = LogFormat::Short;
-        let cloned = format.clone();
+        let cloned = format;
         assert_eq!(format, cloned);
     }
 

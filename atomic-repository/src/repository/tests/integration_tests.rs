@@ -455,7 +455,7 @@ fn test_switch_view_preserves_harness_08_sequence_through_v8() {
         }
 
         repo.record(
-            ChangeHeader::new(&format!("v{}", idx + 1)),
+            ChangeHeader::new(format!("v{}", idx + 1)),
             RecordOptions::new()
                 .with_all(true)
                 .save_to_store(true)
@@ -496,7 +496,7 @@ fn test_switch_view_preserves_harness_08_sequence_through_v9() {
         }
 
         repo.record(
-            ChangeHeader::new(&format!("v{}", idx + 1)),
+            ChangeHeader::new(format!("v{}", idx + 1)),
             RecordOptions::new()
                 .with_all(true)
                 .save_to_store(true)
@@ -537,7 +537,7 @@ fn test_switch_view_preserves_harness_08_sequence_through_v10() {
         }
 
         repo.record(
-            ChangeHeader::new(&format!("v{}", idx + 1)),
+            ChangeHeader::new(format!("v{}", idx + 1)),
             RecordOptions::new()
                 .with_all(true)
                 .save_to_store(true)
@@ -591,7 +591,7 @@ fn test_insert_change_preserves_harness_08_sequence_through_v9() {
 
         let outcome = client
             .record(
-                ChangeHeader::new(&format!("v{}", idx + 1)),
+                ChangeHeader::new(format!("v{}", idx + 1)),
                 RecordOptions::new()
                     .with_all(true)
                     .save_to_store(true)
@@ -653,7 +653,7 @@ fn test_insert_change_preserves_harness_08_sequence_through_v10() {
 
         let outcome = client
             .record(
-                ChangeHeader::new(&format!("v{}", idx + 1)),
+                ChangeHeader::new(format!("v{}", idx + 1)),
                 RecordOptions::new()
                     .with_all(true)
                     .save_to_store(true)

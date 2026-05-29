@@ -127,7 +127,7 @@ impl Command for Switch {
         if !self.force {
             let status = repo
                 .status(atomic_repository::StatusOptions::default())
-                .map_err(|e| CliError::Repository(e))?;
+                .map_err(CliError::Repository)?;
 
             if !status.is_clean() {
                 if self.stash {

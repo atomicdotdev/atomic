@@ -417,11 +417,10 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
             url: Some(url.to_string()),
         },
         RemoteError::HttpError { status: 413, .. } => CliError::RemoteError {
-            message: format!(
-                "Change too large for server (413 Payload Too Large). \
+            message: "Change too large for server (413 Payload Too Large). \
                  The server's body size limit is too small. \
                  Ask the server admin to increase MAX_BODY_SIZE_MB."
-            ),
+                .to_string(),
             url: Some(url.to_string()),
         },
         _ => CliError::RemoteError {

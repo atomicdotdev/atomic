@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn test_clone_copy() {
         let algo = Algorithm::Myers;
-        let cloned = algo.clone();
+        let cloned = algo;
         let copied = algo;
         assert_eq!(algo, cloned);
         assert_eq!(algo, copied);

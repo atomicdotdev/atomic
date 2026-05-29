@@ -459,7 +459,7 @@ fn test_error_is_not_found() {
     };
     assert!(err.is_not_found());
 
-    let err = ChangeStoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, "test"));
+    let err = ChangeStoreError::Io(std::io::Error::other("test"));
     assert!(!err.is_not_found());
 }
 

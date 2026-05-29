@@ -151,6 +151,7 @@ impl Repository {
     }
 
     /// Sequential materialize for a specific set of paths (fallback).
+    #[allow(dead_code)]
     fn materialize_paths_sequential(
         &self,
         paths: std::collections::HashSet<String>,
@@ -358,7 +359,8 @@ impl Repository {
 
         // Phase 5c: Process files in parallel — retrieve graph, buffer content,
         // check content-hash, write to disk only if changed
-        let file_results: Vec<Result<Option<(String, u64, Hash, bool)>, String>> = file_items
+        type FileResult = Result<Option<(String, u64, Hash, bool)>, String>;
+        let file_results: Vec<FileResult> = file_items
             .par_iter()
             .map(|item| {
                 let file_start = std::time::Instant::now();
@@ -621,6 +623,7 @@ impl Repository {
     /// Reads only the specified files from disk to compute their content
     /// hashes, rather than re-reading every tracked file. This is used
     /// after selective materialization to update only the affected entries.
+    #[allow(dead_code)]
     fn populate_file_index_for_paths(&self, paths: &std::collections::HashSet<String>) {
         use std::time::SystemTime;
 

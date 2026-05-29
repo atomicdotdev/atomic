@@ -29,7 +29,7 @@
 //! highlighting in code reviews.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use atomic_core::change::{Author, ChangeHeader};
 use atomic_core::types::{Base32, Hash};
@@ -49,7 +49,7 @@ fn create_test_repo() -> (Repository, TempDir, PathBuf) {
 }
 
 /// Helper to create a file in the repository and add it.
-fn create_and_add_file(repo: &Repository, repo_path: &PathBuf, name: &str, content: &str) {
+fn create_and_add_file(repo: &Repository, repo_path: &Path, name: &str, content: &str) {
     let file_path = repo_path.join(name);
     fs::write(&file_path, content).expect("Failed to write file");
     repo.add(name, Default::default())
@@ -67,7 +67,7 @@ fn record_change(repo: &Repository, message: &str) -> Hash {
         .record(header, RecordOptions::default())
         .expect("Failed to record");
 
-    outcome.hash().clone()
+    *outcome.hash()
 }
 
 // StateBeforeChange Tests
@@ -75,8 +75,8 @@ fn record_change(repo: &Repository, message: &str) -> Hash {
 #[test]
 fn test_state_before_change_struct() {
     // Test the StateBeforeChange struct directly
-    let parent_state = Hash::of(b"parent").into();
-    let change_state = Hash::of(b"change").into();
+    let parent_state = Hash::of(b"parent");
+    let change_state = Hash::of(b"change");
 
     let state = StateBeforeChange::new(Some(5), parent_state, 6, change_state);
 
@@ -88,9 +88,9 @@ fn test_state_before_change_struct() {
 
 #[test]
 fn test_state_before_change_first() {
-    let change_state = Hash::of(b"first").into();
+    let change_state = Hash::of(b"first");
 
-    let state = StateBeforeChange::new(None, Hash::NONE.into(), 0, change_state);
+    let state = StateBeforeChange::new(None, Hash::NONE, 0, change_state);
 
     assert!(state.is_first_change());
     assert_eq!(state.parent_max_sequence_exclusive(), 0);

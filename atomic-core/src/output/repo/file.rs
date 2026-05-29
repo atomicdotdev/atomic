@@ -294,7 +294,7 @@ pub struct FileOutputResult {
 
     /// Blake3 content hash of the written file content.
     ///
-    /// Computed during the write pass via [`HashingWriter`], eliminating
+    /// Computed during the write pass via `HashingWriter`, eliminating
     /// the need to re-read the file from disk for FILE_INDEX population.
     pub content_hash: Option<crate::types::Hash>,
 }
@@ -1305,7 +1305,7 @@ mod tests {
 
     #[test]
     fn test_error_from_io() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test error");
+        let io_err = std::io::Error::other("test error");
         let err: FileOutputError<std::io::Error> = io_err.into();
 
         match err {
@@ -1329,7 +1329,7 @@ mod tests {
 
     #[test]
     fn test_error_from_output_error_io() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let io_err = std::io::Error::other("test");
         let output_err = OutputError::Io(io_err);
         let err: FileOutputError<std::io::Error> = output_err.into();
 
@@ -1376,7 +1376,7 @@ mod tests {
     fn test_error_source_io() {
         use std::error::Error;
 
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let io_err = std::io::Error::other("test");
         let err: FileOutputError<std::io::Error> = FileOutputError::Io(io_err);
 
         assert!(err.source().is_some());

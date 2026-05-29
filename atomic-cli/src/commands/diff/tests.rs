@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::module_inception)]
 mod tests {
     use super::*;
 
@@ -83,7 +84,7 @@ mod tests {
     #[test]
     fn test_diff_format_clone() {
         let format = DiffFormat::Stat;
-        let cloned = format.clone();
+        let cloned = format;
         assert_eq!(format, cloned);
     }
 

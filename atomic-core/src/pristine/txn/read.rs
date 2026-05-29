@@ -1591,7 +1591,7 @@ impl<'txn> crate::pristine::InodeGraphOps for CachedGraphTxn<'txn> {
             return None;
         }
         if adj.position < adj.edges.len() {
-            let edge = adj.edges[adj.position].clone();
+            let edge = adj.edges[adj.position];
             adj.advance();
             Some(Ok(edge))
         } else {

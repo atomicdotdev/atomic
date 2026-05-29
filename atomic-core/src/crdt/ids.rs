@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn test_trunk_id_clone() {
         let id = TrunkId::new(NodeId::new(1), 0);
-        let cloned = id.clone();
+        let cloned = id;
         assert_eq!(id, cloned);
     }
 

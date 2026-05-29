@@ -3,6 +3,7 @@ use super::*;
 // Tests
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use super::*;
     use serial_test::serial;
@@ -545,7 +546,7 @@ mod tests {
     #[test]
     fn test_record_with_iterator() {
         let files = vec!["a.rs", "b.rs", "c.rs"];
-        let record = Record::new().with_files(files.into_iter());
+        let record = Record::new().with_files(files);
         assert_eq!(record.files.len(), 3);
     }
 

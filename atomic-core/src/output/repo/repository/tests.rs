@@ -1,6 +1,7 @@
 //! Tests for the repository output module.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::output::repo::conflict::{FileConflict, FileConflictType};
     use crate::output::repo::file::FileOutputResult;
@@ -471,7 +472,7 @@ mod tests {
 
     #[test]
     fn test_error_from_io() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let io_err = std::io::Error::other("test");
         let err: MaterializeError<std::io::Error> = io_err.into();
 
         match err {
@@ -517,7 +518,7 @@ mod tests {
     fn test_error_source_io() {
         use std::error::Error;
 
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let io_err = std::io::Error::other("test");
         let err: MaterializeError<std::io::Error> = MaterializeError::Io(io_err);
 
         assert!(err.source().is_some());

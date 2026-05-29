@@ -10,7 +10,7 @@
 //! were last written to disk before recording.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use atomic_core::change::{Author, ChangeHeader};
 use atomic_core::types::Hash;
@@ -24,7 +24,7 @@ fn create_test_repo() -> (Repository, TempDir, PathBuf) {
     (repo, temp, repo_path)
 }
 
-fn write_file(repo_path: &PathBuf, name: &str, content: &str) {
+fn write_file(repo_path: &Path, name: &str, content: &str) {
     let file_path = repo_path.join(name);
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent).expect("Failed to create dirs");

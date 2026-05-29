@@ -1,6 +1,7 @@
 //! Tests for the content tokenization module.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::diff::token::TokenKind;
     use crate::record::workflow::crdt::tokenize::{
@@ -741,7 +742,7 @@ mod tests {
             .tokens()
             .iter()
             .any(|t| t.kind() == TokenKind::Comment || t.as_str().starts_with("//"));
-        assert!(has_comment || lines[0].tokens().len() > 0);
+        assert!(has_comment || !lines[0].tokens().is_empty());
     }
 
     #[test]

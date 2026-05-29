@@ -160,7 +160,7 @@ impl Drop for FileWriter {
 /// A writer wrapper that computes a Blake3 content hash while writing.
 ///
 /// Wraps any `Write` implementation and feeds all written bytes into a
-/// `blake3::Hasher`. After writing is complete, call [`finalize`] to
+/// `blake3::Hasher`. After writing is complete, call `finalize()` to
 /// get the content hash.
 ///
 /// This eliminates the need to re-read files from disk to compute their
