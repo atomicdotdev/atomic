@@ -495,7 +495,7 @@ mod tests {
         let err = FormatError::Compress("x".into());
         assert!(!err.is_serialization());
 
-        let io_err: FormatError = std::io::Error::new(std::io::ErrorKind::Other, "x").into();
+        let io_err: FormatError = std::io::Error::other("x").into();
         assert!(!io_err.is_serialization());
     }
 

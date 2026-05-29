@@ -5,9 +5,10 @@
 
 use bytes::Bytes;
 use log::{debug, info};
-use reqwest::header::CONTENT_TYPE;
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::StatusCode;
 use std::path::Path;
+use tokio_util::io::ReaderStream;
 
 use crate::error::{RemoteError, RemoteResult};
 
@@ -278,12 +279,11 @@ impl HttpRemote {
 
     // Streaming V3 Protocol — Upload Methods
 
-    /// Upload a change file by reading directly from disk.
+    /// Upload a change file by streaming from disk.
     ///
-    /// Instead of loading the change into a `Change` struct and re-serializing,
-    /// this reads the raw `.change` file bytes from disk and uploads them.
-    /// For very large changes, this avoids the overhead of deserialization +
-    /// re-serialization.
+    /// Uses reqwest's streaming body support to avoid loading the entire file
+    /// into memory.  The `Content-Length` header is set from file metadata so
+    /// the server can validate the upload without buffering.
     ///
     /// # Arguments
     ///
@@ -293,29 +293,40 @@ impl HttpRemote {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file can't be read, the upload fails, or
+    /// Returns an error if the file can't be opened, the upload fails, or
     /// the server rejects the change.
-    pub async fn upload_change_file(
+    pub async fn upload_change_streamed(
         &self,
         hash: &str,
         view: &str,
-        path: &Path,
+        path: &std::path::Path,
     ) -> RemoteResult<()> {
         let url = format!("{}?insert={}&view={}", self.base_url, hash, view);
-        debug!("POST insert (from file): {} from {:?}", url, path);
+        debug!("POST insert (streamed): {} from {:?}", url, path);
 
-        let data = tokio::fs::read(path).await.map_err(|e| {
-            RemoteError::other(format!("Failed to read change file {:?}: {}", path, e))
+        let file = tokio::fs::File::open(path).await.map_err(|e| {
+            RemoteError::other(format!("Failed to open change file {:?}: {}", path, e))
         })?;
 
-        let file_size = data.len();
-        info!("Uploading change {} from disk ({} bytes)", hash, file_size);
+        let file_size = file
+            .metadata()
+            .await
+            .map_err(|e| {
+                RemoteError::other(format!("Failed to read metadata for {:?}: {}", path, e))
+            })?
+            .len();
+
+        info!("Streaming upload of change {} ({} bytes)", hash, file_size);
+
+        let stream = ReaderStream::new(file);
+        let body = reqwest::Body::wrap_stream(stream);
 
         let response = self
             .client
             .post(&url)
             .header(CONTENT_TYPE, "application/octet-stream")
-            .body(data)
+            .header(CONTENT_LENGTH, file_size)
+            .body(body)
             .send()
             .await
             .map_err(|e| RemoteError::connection_failed(&url, e))?;
@@ -324,7 +335,7 @@ impl HttpRemote {
 
         match status {
             StatusCode::OK => {
-                debug!("Successfully uploaded change {} from file", hash);
+                debug!("Successfully streamed change {} from file", hash);
                 Ok(())
             }
             StatusCode::NOT_FOUND => Err(RemoteError::repo_not_found(&url)),
@@ -345,5 +356,30 @@ impl HttpRemote {
                 Err(RemoteError::http(status.as_u16(), msg))
             }
         }
+    }
+
+    /// Upload a change file by reading directly from disk.
+    ///
+    /// This is a convenience wrapper around [`upload_change_streamed`](Self::upload_change_streamed)
+    /// that streams the file from disk instead of loading it entirely into
+    /// memory. Suitable for change files of any size.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - The base32-encoded hash of the change.
+    /// * `view` - The target view name.
+    /// * `path` - Path to the `.change` file on disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file can't be read, the upload fails, or
+    /// the server rejects the change.
+    pub async fn upload_change_file(
+        &self,
+        hash: &str,
+        view: &str,
+        path: &Path,
+    ) -> RemoteResult<()> {
+        self.upload_change_streamed(hash, view, path).await
     }
 }

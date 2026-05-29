@@ -741,6 +741,7 @@ fn truncate(s: &str, max_len: usize) -> String {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 

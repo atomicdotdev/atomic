@@ -1,6 +1,7 @@
 //! Tests for the Claude Code hook adapter.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::event::HookType;
     use crate::hooks::claude_code::{

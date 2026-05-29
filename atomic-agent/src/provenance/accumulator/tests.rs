@@ -849,13 +849,13 @@ fn test_short_hash() {
 #[test]
 fn test_node_ids_are_unique() {
     let mut acc = ProvenanceAccumulator::new("s1");
-    let mut ids = Vec::new();
-
-    ids.push(acc.append_goal("g1", 1000));
-    ids.push(acc.append_tool_call("read", None, None, None, None, None, 1001));
-    ids.push(acc.append_tool_call("edit", None, None, None, None, None, 1002));
-    ids.push(acc.append_human_gate("gate", 1003));
-    ids.push(acc.append_patch_proposal("HASH", &[], 1004));
+    let ids = vec![
+        acc.append_goal("g1", 1000),
+        acc.append_tool_call("read", None, None, None, None, None, 1001),
+        acc.append_tool_call("edit", None, None, None, None, None, 1002),
+        acc.append_human_gate("gate", 1003),
+        acc.append_patch_proposal("HASH", &[], 1004),
+    ];
 
     // All IDs should be unique
     let mut unique = ids.clone();

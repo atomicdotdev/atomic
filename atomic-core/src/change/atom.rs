@@ -536,7 +536,7 @@ mod tests {
             flag: EdgeFlags::BLOCK,
             start: ChangePosition::new(0),
             end: ChangePosition::new(10),
-            inode: inode.clone(),
+            inode,
         });
 
         assert_eq!(atom.inode().pos, inode.pos);
@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn test_edge_map_new() {
         let inode = test_hash_position(42);
-        let em = EdgeUpdate::<Hash>::new(inode.clone());
+        let em = EdgeUpdate::<Hash>::new(inode);
 
         assert!(em.is_empty());
         assert_eq!(em.len(), 0);
@@ -716,7 +716,7 @@ mod tests {
     #[test]
     fn test_edge_map_concat() {
         let inode = test_hash_position(42);
-        let mut em1 = EdgeUpdate::<Hash>::new(inode.clone());
+        let mut em1 = EdgeUpdate::<Hash>::new(inode);
         let mut em2 = EdgeUpdate::<Hash>::new(inode);
 
         let edge = NewEdge {

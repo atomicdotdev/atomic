@@ -424,33 +424,87 @@ impl TurnOrchestrator {
                 graph.profile = Some("sherpa-trace/1.0.0".to_string());
             }
 
-            // Save to the repository
-            match atomic_repository::Repository::open(&self.repo_root) {
-                Ok(repo) => match repo.save_provenance_graph(&graph) {
-                    Ok(hash) => {
-                        acc.set_last_provenance_hash(hash.to_base32());
-                        log::info!(
-                            "Saved provenance graph {} for session {} \
-                             ({} nodes, {} edges, {} changes)",
-                            hash.to_base32(),
-                            session_id,
-                            graph.node_count(),
-                            graph.edge_count(),
-                            graph.change_count(),
-                        );
-                    }
+            // Save the provenance graph in two phases:
+            //
+            // Phase 1 (non-blocking): Write the content-addressed file to
+            // disk via ChangeStore.  This is pure filesystem I/O and never
+            // contends on the redb write lock.
+            //
+            // Phase 2 (best-effort): Open the repository and register the
+            // provenance in the pristine database (change deps, session
+            // tables).  We use Repository::open_existing() which calls
+            // Pristine::open_existing() — this skips the table-init write
+            // transaction so it never blocks on the redb write lock.
+            // Failure is still treated as non-fatal; the provenance chain
+            // remains intact and the DB metadata can be rebuilt later.
+
+            let dot_dir = self.repo_root.join(atomic_repository::DOT_DIR);
+            let changes_dir = dot_dir.join("changes");
+
+            // Phase 1: Filesystem write — never blocks on redb.
+            let hash = match atomic_repository::ChangeStore::new(
+                changes_dir,
+                atomic_repository::DEFAULT_CACHE_CAPACITY,
+            ) {
+                Ok(store) => match store.save_provenance_graph(&graph) {
+                    Ok(h) => h,
                     Err(e) => {
                         log::warn!(
-                            "Failed to save provenance graph for session {}: {}",
+                            "Failed to write provenance graph to disk for \
+                             session {}: {}",
                             session_id,
                             e,
                         );
+                        return true;
                     }
                 },
                 Err(e) => {
                     log::warn!(
-                        "Could not open repository to save provenance graph \
-                         for session {}: {}",
+                        "Could not open change store to save provenance \
+                         graph for session {}: {}",
+                        session_id,
+                        e,
+                    );
+                    return true;
+                }
+            };
+
+            acc.set_last_provenance_hash(hash.to_base32());
+            log::info!(
+                "Saved provenance graph {} for session {} \
+                 ({} nodes, {} edges, {} changes)",
+                hash.to_base32(),
+                session_id,
+                graph.node_count(),
+                graph.edge_count(),
+                graph.change_count(),
+            );
+
+            // Phase 2: Database registration — best-effort.
+            // We use open_existing() which skips the table-init write
+            // transaction, so it won't block on the redb write lock.
+            // Failure here is still non-fatal: the provenance file is on
+            // disk and the DB metadata (EXTERNAL/INTERNAL mapping, DEPS,
+            // session tables) can be populated on a subsequent open or
+            // explicit rebuild.
+            match atomic_repository::Repository::open_existing(&self.repo_root) {
+                Ok(repo) => {
+                    if let Err(e) = repo.save_provenance_graph(&graph) {
+                        log::warn!(
+                            "Provenance graph {} saved to disk but database \
+                             registration failed for session {}: {}",
+                            hash.to_base32(),
+                            session_id,
+                            e,
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Provenance graph {} saved to disk but could not \
+                         open repository for database registration \
+                         (session {}): {}",
+                        hash.to_base32(),
                         session_id,
                         e,
                     );

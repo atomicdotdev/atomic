@@ -954,6 +954,6 @@ mod integration_tests {
         };
 
         // The span itself doesn't know its inode - that's stored in the graph index
-        assert!(v.len() > 0);
+        assert!(!v.is_empty());
     }
 }

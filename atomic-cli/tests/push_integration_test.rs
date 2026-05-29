@@ -150,7 +150,7 @@ fn make_changelist_entry(sequence: u64, hash_seed: &str) -> ChangelistEntry {
     let hash = Hash::of(hash_seed.as_bytes());
     ChangelistEntry::new(
         sequence,
-        &hash.to_base32(),
+        hash.to_base32(),
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         false,
     )

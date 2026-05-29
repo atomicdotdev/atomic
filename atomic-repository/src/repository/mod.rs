@@ -322,6 +322,39 @@ default = "{}"
         })
     }
 
+    /// Open an existing repository without the table-init write lock.
+    ///
+    /// Like [`open`](Self::open) but uses [`Pristine::open_existing`] which
+    /// skips the `begin_write()` table-initialization transaction.  The
+    /// returned repository still supports write operations — the write lock
+    /// is deferred until `write_txn()` is actually called.
+    ///
+    /// Use this for short-lived processes (agent hooks, background jobs)
+    /// where blocking on the init write lock would hang the process.
+    pub fn open_existing<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
+        let root = Self::find_root(path.as_ref())?;
+        let dot_dir = root.join(DOT_DIR);
+
+        let pristine = Arc::new(
+            Pristine::open_existing(dot_dir.join("pristine.redb"))
+                .map_err(|e| RepositoryError::Database(e.to_string()))?,
+        );
+
+        let current_view =
+            Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
+
+        let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(Self {
+            root,
+            dot_dir,
+            current_view,
+            pristine,
+            change_store,
+        })
+    }
+
     /// Open an existing repository in read-only mode.
     ///
     /// This method opens the repository without acquiring a write lock on the

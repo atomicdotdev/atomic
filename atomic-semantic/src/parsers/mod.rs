@@ -43,6 +43,7 @@ pub mod go;
 pub mod java;
 pub mod python;
 pub mod rust;
+pub mod swift;
 pub mod typescript;
 
 use crate::entity::{Entity, Reference};
@@ -72,6 +73,8 @@ pub enum Language {
     Cpp,
     /// C (.c)
     C,
+    /// Swift (.swift)
+    Swift,
 }
 
 impl Language {
@@ -105,6 +108,8 @@ impl Language {
             Some(Language::Cpp)
         } else if lower.ends_with(".c") {
             Some(Language::C)
+        } else if lower.ends_with(".swift") {
+            Some(Language::Swift)
         } else {
             None
         }
@@ -121,6 +126,7 @@ impl Language {
             Language::Java => "Java",
             Language::Cpp => "C++",
             Language::C => "C",
+            Language::Swift => "Swift",
         }
     }
 
@@ -135,6 +141,7 @@ impl Language {
             Language::Java => &[".java"],
             Language::Cpp => &[".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".h"],
             Language::C => &[".c"],
+            Language::Swift => &[".swift"],
         }
     }
 }
@@ -153,7 +160,7 @@ pub fn is_supported(path: &str) -> bool {
 /// All supported file extensions across all languages.
 pub const ALL_EXTENSIONS: &[&str] = &[
     ".ts", ".mts", ".cts", ".tsx", ".py", ".pyi", ".rs", ".go", ".java", ".cpp", ".cc", ".cxx",
-    ".hpp", ".hxx", ".h", ".c",
+    ".hpp", ".hxx", ".h", ".c", ".swift",
 ];
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -258,6 +265,7 @@ impl ParserRegistry {
         parsers.insert(Language::Java, Box::new(java::JavaParser::new()));
         parsers.insert(Language::Cpp, Box::new(cpp::CppParser::new()));
         parsers.insert(Language::C, Box::new(cpp::CppParser::new_c()));
+        parsers.insert(Language::Swift, Box::new(swift::SwiftParser::new()));
 
         Self { parsers }
     }
@@ -477,7 +485,8 @@ mod tests {
         assert!(langs.contains(&Language::Java));
         assert!(langs.contains(&Language::Cpp));
         assert!(langs.contains(&Language::C));
-        assert_eq!(langs.len(), 8);
+        assert!(langs.contains(&Language::Swift));
+        assert_eq!(langs.len(), 9);
     }
 
     #[test]

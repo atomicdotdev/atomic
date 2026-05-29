@@ -599,7 +599,7 @@ mod tests {
     #[test]
     fn test_options_clone() {
         let opts = RetrieveContentOptions::new().max_vertices(100);
-        let cloned = opts.clone();
+        let cloned = opts;
 
         assert_eq!(cloned.max_vertices, Some(100));
     }

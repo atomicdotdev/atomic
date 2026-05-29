@@ -1047,7 +1047,7 @@ mod tests {
     #[test]
     fn test_content_ranges_are_contiguous_for_multi_file() {
         // In a typical change, content ranges are contiguous across files
-        let pairs = vec![
+        let pairs = [
             GraphSectionPayload::new("a.rs".to_string(), vec![], 0, 100),
             GraphSectionPayload::new("b.rs".to_string(), vec![], 100, 350),
             GraphSectionPayload::new("c.rs".to_string(), vec![], 350, 400),

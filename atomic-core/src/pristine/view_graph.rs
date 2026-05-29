@@ -95,7 +95,21 @@ impl<'a, T: InodeGraphOps> InodeGraphOps for ViewGraph<'a, T> {
         &self,
         adj: &mut InodeAdjState,
     ) -> Option<Result<SerializedGraphEdge, Self::InodeError>> {
-        self.inner.next_inode_adj(adj)
+        // Filter inode edges by the view's visible change set,
+        // same as iter_adjacent does for the global GRAPH.
+        loop {
+            match self.inner.next_inode_adj(adj) {
+                Some(Ok(edge)) => {
+                    let introduced = edge.introduced_by();
+                    if introduced.is_root() || self.visible.contains(&introduced) {
+                        return Some(Ok(edge));
+                    }
+                    // Edge from a non-visible change — skip it
+                    continue;
+                }
+                other => return other,
+            }
+        }
     }
 
     fn find_block_in_inode(
@@ -123,7 +137,9 @@ impl<'a, T: InodeGraphOps> InodeGraphOps for ViewGraph<'a, T> {
     }
 
     fn inode_graph_needs_view_filter(&self) -> bool {
-        true
+        // ViewGraph now filters inode edges in next_inode_adj,
+        // so callers can safely use the INODE_GRAPH fast path.
+        false
     }
 }
 

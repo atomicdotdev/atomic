@@ -382,6 +382,19 @@ impl Stash {
             })
     }
 
+    /// Execute stash push from another command (e.g., `view switch --stash`).
+    ///
+    /// This is the public entry point for programmatic stash push.
+    pub fn run_push_on(
+        &self,
+        repo: &mut Repository,
+        message: Option<String>,
+        include_untracked: bool,
+        keep: bool,
+    ) -> CliResult<()> {
+        self.run_push(repo, message, include_untracked, keep)
+    }
+
     /// Execute stash push (save changes).
     fn run_push(
         &self,

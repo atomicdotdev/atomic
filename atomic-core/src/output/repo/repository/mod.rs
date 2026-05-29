@@ -233,6 +233,14 @@ where
                 result.record_skipped();
                 continue;
             }
+            // Selective materialize: skip directories with no target files.
+            if let Some(ref paths) = options.only_paths {
+                let has_target = paths.iter().any(|p| p.starts_with(&item.path));
+                if !has_target {
+                    result.record_skipped();
+                    continue;
+                }
+            }
             // Create directory
             working_copy
                 .create_dir_all(&item.path)
@@ -243,6 +251,14 @@ where
             if !options.matches_prefix(&item.path) {
                 result.record_skipped();
                 continue;
+            }
+
+            // Selective materialize: skip files not in the explicit path set.
+            if let Some(ref paths) = options.only_paths {
+                if !paths.contains(&item.path) {
+                    result.record_skipped();
+                    continue;
+                }
             }
 
             // View-aware skip: if the file's introducing change is not in the

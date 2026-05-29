@@ -291,6 +291,12 @@ pub struct FileOutputResult {
 
     /// Conflicts detected during output.
     pub conflicts: Vec<FileConflict>,
+
+    /// Blake3 content hash of the written file content.
+    ///
+    /// Computed during the write pass via `HashingWriter`, eliminating
+    /// the need to re-read the file from disk for FILE_INDEX population.
+    pub content_hash: Option<crate::types::Hash>,
 }
 
 impl FileOutputResult {
@@ -309,6 +315,7 @@ impl FileOutputResult {
             edges_traversed: 0,
             was_truncated: false,
             conflicts: Vec::new(),
+            content_hash: None,
         }
     }
 
@@ -648,10 +655,12 @@ where
         let writer = working_copy
             .write_file(path, inode)
             .map_err(FileOutputError::WorkingCopy)?;
-        let mut writer = Writer::new(writer);
+        let hashing_writer = crate::output::filesystem::HashingWriter::new(writer);
+        let mut writer = Writer::new(hashing_writer);
         if options.flush_after_write {
             writer.inner_mut().flush()?;
         }
+        result.content_hash = Some(writer.inner_mut().finalize());
         return Ok(result);
     }
 
@@ -662,11 +671,12 @@ where
     // Attempt semantic merge for any conflicting SCCs
     let resolved = resolve_conflicts_semantically(txn, changes, &graph, &order);
 
-    // Create writer
+    // Create writer with hashing layer
     let file_writer = working_copy
         .write_file(path, inode)
         .map_err(FileOutputError::WorkingCopy)?;
-    let mut writer = Writer::new(file_writer);
+    let hashing_writer = crate::output::filesystem::HashingWriter::new(file_writer);
+    let mut writer = Writer::new(hashing_writer);
 
     // Hash function for conflict markers
     let hash_fn = |node_id: NodeId| -> Option<Hash> {
@@ -683,6 +693,10 @@ where
     if options.flush_after_write {
         writer.inner_mut().flush()?;
     }
+
+    // Extract the content hash from the hashing writer
+    let content_hash = writer.inner_mut().finalize();
+    result.content_hash = Some(content_hash);
 
     // Extract conflicts from order result.
     // Only count SCCs that were NOT resolved by the semantic merge engine.
@@ -1291,7 +1305,7 @@ mod tests {
 
     #[test]
     fn test_error_from_io() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test error");
+        let io_err = std::io::Error::other("test error");
         let err: FileOutputError<std::io::Error> = io_err.into();
 
         match err {
@@ -1315,7 +1329,7 @@ mod tests {
 
     #[test]
     fn test_error_from_output_error_io() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let io_err = std::io::Error::other("test");
         let output_err = OutputError::Io(io_err);
         let err: FileOutputError<std::io::Error> = output_err.into();
 
@@ -1362,7 +1376,7 @@ mod tests {
     fn test_error_source_io() {
         use std::error::Error;
 
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let io_err = std::io::Error::other("test");
         let err: FileOutputError<std::io::Error> = FileOutputError::Io(io_err);
 
         assert!(err.source().is_some());

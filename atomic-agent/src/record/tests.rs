@@ -186,7 +186,7 @@ fn test_message_file_summary_beats_transcript() {
     // (planning text, not summary)
     let dir = tempfile::tempdir().unwrap();
     let transcript_path = dir.path().join("transcript.jsonl");
-    let lines = vec![
+    let lines = [
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"This appears to be a minimal repository managed by Atomic."}]}}"#,
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"CLAUDE.md"}}]}}"#,
     ];
@@ -352,7 +352,7 @@ fn test_summarize_skips_text_before_tool_calls() {
 
     // Claude analyzes BEFORE tool calls, then writes a file.
     // The pre-tool text should NOT be used as a commit message.
-    let lines = vec![
+    let lines = [
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"This appears to be a minimal repository managed by Atomic."}]}}"#,
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"CLAUDE.md"}}]}}"#,
     ];
@@ -369,7 +369,7 @@ fn test_summarize_uses_text_after_last_tool_call() {
 
     // Claude plans, uses tools, then summarizes what it did.
     // Only the post-tool summary should be used.
-    let lines = vec![
+    let lines = [
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Let me analyze the codebase first."}]}}"#,
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"src/main.rs"}}]}}"#,
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/auth.rs"}}]}}"#,
@@ -391,7 +391,7 @@ fn test_summarize_no_tool_calls_returns_none() {
 
     // Only assistant text, no tool calls — can't distinguish
     // planning from summary, so return None.
-    let lines = vec![
+    let lines = [
         r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"fix it"}]}}"#,
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I will look into this."}]}}"#,
     ];
@@ -405,7 +405,7 @@ fn test_summarize_with_file_extensions_after_tool() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("transcript.jsonl");
 
-    let lines = vec![
+    let lines = [
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"src/index.ts"}}]}}"#,
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Created src/index.ts, package.json, and tsconfig.json for the project. All dependencies are installed."}]}}"#,
     ];
@@ -428,7 +428,7 @@ fn test_message_transcript_used_when_prompt_and_files_unavailable() {
     // Write a transcript with a post-tool summary
     let dir = tempfile::tempdir().unwrap();
     let transcript_path = dir.path().join("transcript.jsonl");
-    let lines = vec![
+    let lines = [
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"README.md"}}]}}"#,
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Created the project README with setup instructions. The documentation covers installation and usage."}]}}"#,
     ];
