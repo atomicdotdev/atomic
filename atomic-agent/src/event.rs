@@ -56,14 +56,14 @@ use serde::{Deserialize, Serialize};
 ///
 /// These map to agent-specific hook names:
 ///
-/// | HookType       | Claude Code            | Gemini CLI        |
-/// |----------------|------------------------|-------------------|
-/// | SessionStart   | session-start          | session-start     |
-/// | SessionEnd     | session-end            | session-end       |
-/// | TurnStart      | user-prompt-submit     | before-model      |
-/// | TurnEnd        | stop                   | after-model       |
-/// | PreToolUse     | pre-task               | before-tool       |
-/// | PostToolUse    | post-task / post-todo  | after-tool        |
+/// | HookType       | Claude Code            | Gemini CLI        | Hermes Agent     |
+/// |----------------|------------------------|-------------------|------------------|
+/// | SessionStart   | session-start          | session-start     | on_session_start |
+/// | SessionEnd     | session-end            | session-end       | on_session_end   |
+/// | TurnStart      | user-prompt-submit     | before-model      | pre_llm_call     |
+/// | TurnEnd        | stop                   | after-model       | post_llm_call    |
+/// | PreToolUse     | pre-task               | before-tool       | pre_tool_call    |
+/// | PostToolUse    | post-task / post-todo  | after-tool        | post_tool_call   |
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookType {
@@ -148,6 +148,10 @@ impl HookType {
     /// // OpenCode verbs
     /// assert_eq!(HookType::from_verb("user-prompt"), Some(HookType::TurnStart));
     ///
+    /// // Hermes Agent verbs
+    /// assert_eq!(HookType::from_verb("pre_llm_call"), Some(HookType::TurnStart));
+    /// assert_eq!(HookType::from_verb("post_tool_call"), Some(HookType::PostToolUse));
+    ///
     /// // Unknown verb
     /// assert_eq!(HookType::from_verb("unknown"), None);
     /// ```
@@ -165,6 +169,12 @@ impl HookType {
             // Claude Code turn boundaries
             "user-prompt-submit" => Some(HookType::TurnStart),
             "stop" => Some(HookType::TurnEnd),
+
+            // Hermes Agent plugin/shell hook events
+            "on-session-start" | "on_session_start" => Some(HookType::SessionStart),
+            "on-session-end" | "on_session_end" => Some(HookType::SessionEnd),
+            "pre-llm-call" | "pre_llm_call" => Some(HookType::TurnStart),
+            "post-llm-call" | "post_llm_call" => Some(HookType::TurnEnd),
 
             // Gemini CLI turn boundaries
             "before-agent" => Some(HookType::TurnStart),
@@ -185,15 +195,15 @@ impl HookType {
             "pre-task" => Some(HookType::PreToolUse),
             "post-task" | "post-todo" | "post-tool" => Some(HookType::PostToolUse),
 
-            // Codex + Copilot pre-tool use
-            "pre-tool" => Some(HookType::PreToolUse),
+            // Codex + Copilot + Hermes pre-tool use
+            "pre-tool" | "pre_tool_call" => Some(HookType::PreToolUse),
 
             // Cursor thinking blocks
             "after-thought" => Some(HookType::PostToolUse),
 
             // Gemini CLI / OpenCode / Pi tool use (shared verbs)
             "before-tool" => Some(HookType::PreToolUse),
-            "after-tool" => Some(HookType::PostToolUse),
+            "after-tool" | "post_tool_call" => Some(HookType::PostToolUse),
 
             _ => None,
         }
@@ -664,6 +674,34 @@ mod tests {
         );
         assert_eq!(
             HookType::from_verb("after-tool"),
+            Some(HookType::PostToolUse)
+        );
+    }
+
+    #[test]
+    fn test_hook_type_from_verb_hermes() {
+        assert_eq!(
+            HookType::from_verb("on_session_start"),
+            Some(HookType::SessionStart)
+        );
+        assert_eq!(
+            HookType::from_verb("on_session_end"),
+            Some(HookType::SessionEnd)
+        );
+        assert_eq!(
+            HookType::from_verb("pre_llm_call"),
+            Some(HookType::TurnStart)
+        );
+        assert_eq!(
+            HookType::from_verb("post_llm_call"),
+            Some(HookType::TurnEnd)
+        );
+        assert_eq!(
+            HookType::from_verb("pre_tool_call"),
+            Some(HookType::PreToolUse)
+        );
+        assert_eq!(
+            HookType::from_verb("post_tool_call"),
             Some(HookType::PostToolUse)
         );
     }
