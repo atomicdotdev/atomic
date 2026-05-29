@@ -3,7 +3,7 @@ use std::sync::Arc;
 use super::*;
 use crate::apply::InsertOptions;
 use crate::repository::collect_visible_change_ids;
-use atomic_core::pristine::ViewGraph;
+use atomic_core::pristine::{CachedGraphTxn, ViewGraph};
 
 impl Repository {
     /// This is the main entry point for creating a change from working copy
@@ -530,10 +530,25 @@ impl Repository {
 
                     // Step 3: Check if content actually changed
                     if old_content == new_content {
-                        // No actual change - skip
+                        if trace_record {
+                            eprintln!(
+                                "[record] skip '{}': graph content ({} bytes) matches working copy",
+                                path,
+                                old_content.len(),
+                            );
+                        }
                         skipped_paths.push(path.clone());
                         stats.files_skipped += 1;
                         continue;
+                    }
+
+                    if trace_record {
+                        eprintln!(
+                            "[record] diff '{}': old={} bytes, new={} bytes",
+                            path,
+                            old_content.len(),
+                            new_content.len(),
+                        );
                     }
 
                     // Step 4: Write to memory working copy for the recording workflow
@@ -625,7 +640,13 @@ impl Repository {
                                 recorded_paths.push(path.clone());
                                 recorded_files.push(recorded);
                             } else {
-                                // No hunks generated - content might be identical
+                                // No hunks generated despite content difference
+                                if trace_record {
+                                    eprintln!(
+                                        "[record] skip '{}': record_modified_file produced 0 hunks",
+                                        path,
+                                    );
+                                }
                                 skipped_paths.push(path.clone());
                                 stats.files_skipped += 1;
                             }
@@ -662,18 +683,24 @@ impl Repository {
             .map_err(|e| RecordError::Database(e.to_string()))?;
 
         let view_name = options.get_view().unwrap_or(&self.current_view);
+        // Wrap the read transaction in CachedGraphTxn to avoid reopening
+        // the GRAPH table on every find_block/iter_adjacent call during
+        // globalization. This alone eliminates ~90% of the per-vertex
+        // overhead in the recording pipeline.
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RecordError::Database(e.to_string()))?;
+
+        // Use the raw txn for view operations (ViewTxnT), but the
+        // cached txn for graph traversal (GraphTxnT + InodeGraphOps).
         let view_graph = if let Some(view) = txn
             .get_view(view_name)
             .map_err(|e| RecordError::Database(e.to_string()))?
         {
             let change_filter = collect_visible_change_ids(&txn, &view)
                 .map_err(|e| RecordError::Database(e.to_string()))?;
-            ViewGraph::new(&txn, Arc::new(change_filter))
+            ViewGraph::new(&cached_txn, Arc::new(change_filter))
         } else {
-            // No view found — use an empty filter (ROOT-only visibility).
-            // In practice this shouldn't happen because the repository
-            // always has at least one view, but we handle it gracefully.
-            ViewGraph::new(&txn, Arc::new(std::collections::HashSet::new()))
+            ViewGraph::new(&cached_txn, Arc::new(std::collections::HashSet::new()))
         };
 
         let assembly_options = options.to_assembly_options();
@@ -786,6 +813,44 @@ impl Repository {
                                 );
                             }
                         }
+
+                        // Also update FILE_INDEX for skipped files.
+                        //
+                        // Files are skipped when their graph content already
+                        // matches the working copy (old == new). Without this,
+                        // files missing a FILE_INDEX entry are perpetually
+                        // reported as Modified by status (conservative mtime
+                        // check) and perpetually skipped by record (content
+                        // unchanged) — an infinite loop.
+                        for path_str in outcome.skipped_files() {
+                            let clean_path =
+                                path_str.strip_suffix("/ (directory)").unwrap_or(path_str);
+                            let abs_path = self.root.join(clean_path);
+                            if let Ok(metadata) = std::fs::metadata(&abs_path) {
+                                use std::time::SystemTime;
+                                let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                                let duration = mtime
+                                    .duration_since(SystemTime::UNIX_EPOCH)
+                                    .unwrap_or_default();
+                                let content_hash = std::fs::read(&abs_path)
+                                    .map(|bytes| Hash::of(&bytes))
+                                    .unwrap_or(Hash::ZERO);
+                                let _ = idx_txn.put_file_index(
+                                    clean_path,
+                                    duration.as_secs() as i64,
+                                    duration.subsec_nanos(),
+                                    metadata.len(),
+                                    &content_hash,
+                                );
+                            }
+                        }
+
+                        // Remove FILE_INDEX entries for deleted files so
+                        // they don't linger as stale entries.
+                        for path_str in outcome.deleted_files() {
+                            let _ = idx_txn.del_file_index(path_str);
+                        }
+
                         let _ = idx_txn.commit();
                         if trace_record {
                             eprintln!(

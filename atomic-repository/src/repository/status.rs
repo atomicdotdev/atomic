@@ -208,7 +208,32 @@ impl Repository {
             let metadata = match std::fs::metadata(&abs_path) {
                 Ok(m) if m.is_file() => m,
                 _ => {
-                    // File missing from disk → Deleted
+                    // File missing from disk.  Check whether the deletion
+                    // has already been recorded in the graph.
+                    //
+                    // The graph uses an additive-only edge model: the
+                    // original alive BLOCK edge and the new BLOCK|DELETED
+                    // edge coexist.  A simple "any alive edge?" check
+                    // gives wrong answers.  Instead, use the
+                    // change-filter-aware retrieval path (the same one
+                    // materialize uses) to ask: does this file have
+                    // content from this view's perspective?  If not, the
+                    // deletion is already recorded.
+                    if has_graph {
+                        if let Some(inode_val) = inode {
+                            if let Ok(Some(position)) = txn.inode_position(inode_val) {
+                                if let Some(ref ids) = current_view_change_ids {
+                                    if !is_file_alive_via_retrieval(&txn, inode_val, position, ids)
+                                    {
+                                        // Deletion already recorded — skip
+                                        found_on_disk.insert(path.clone());
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // File is genuinely missing and deletion not yet recorded
                     let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Deleted);
                     if let Some(inode) = inode {
                         entry.set_inode(inode);
@@ -469,6 +494,60 @@ impl Repository {
         let status = self.status(StatusOptions::default())?;
         Ok(status.deleted().map(|e| e.path().to_path_buf()).collect())
     }
+}
+
+/// Check whether a file has live content from a view's perspective.
+///
+/// Uses the change-filter-aware `is_vertex_alive` logic from the retrieval
+/// pipeline.  In Atomic's additive-only graph model, both the original alive
+/// edge and the DELETED edge coexist.  The retrieval path correctly handles
+/// supersession: a vertex is dead when a DELETED parent edge was introduced
+/// by a change *in* the filter, even if an older alive parent edge also
+/// exists.
+///
+/// Returns `false` when the deletion has been recorded (no alive content
+/// from this view's perspective).
+fn is_file_alive_via_retrieval<T: GraphTxnT>(
+    txn: &T,
+    _inode: Inode,
+    position: Position<NodeId>,
+    visible_changes: &HashSet<NodeId>,
+) -> bool {
+    use atomic_core::output::alive::RetrieveOptions;
+
+    let inode_node = position.inode_node();
+    let options = RetrieveOptions::new().with_change_filter(visible_changes.clone());
+
+    // Check forward edges from the inode vertex.  If any destination
+    // content vertex is alive (per the full supersession logic), the
+    // file has live content.
+    let edges = match txn.iter_forward(inode_node, false) {
+        Ok(edges) => edges,
+        Err(_) => return false,
+    };
+
+    if edges.is_empty() {
+        return false;
+    }
+
+    for edge in &edges {
+        // Only consider edges introduced by visible changes
+        if !edge.introduced_by.is_root() && !visible_changes.contains(&edge.introduced_by) {
+            continue;
+        }
+        // Build the destination vertex from the edge
+        let dest_vertex = match txn.find_block(edge.dest) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Use the retrieval pipeline's supersession-aware aliveness check
+        match options.is_vertex_alive(txn, dest_vertex) {
+            Ok(true) => return true,
+            _ => continue,
+        }
+    }
+
+    false
 }
 
 /// Normalize a tracked path from the TREE table to a relative PathBuf

@@ -74,7 +74,7 @@ impl TurnOrchestrator {
         // to the agent view so that all file writes happened there. Now
         // that the session is over, restore the user's view.
         if let Some(ref parent) = session.parent_view {
-            match atomic_repository::Repository::open(&self.repo_root) {
+            match atomic_repository::Repository::open_existing(&self.repo_root) {
                 Ok(mut repo) => {
                     if let Err(e) = repo.switch_view(parent) {
                         log::warn!(

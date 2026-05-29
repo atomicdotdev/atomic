@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::module_inception)]
 mod tests {
     use super::*;
     use atomic_core::change::ChangeHeader;
@@ -77,7 +78,7 @@ mod tests {
     #[test]
     fn test_change_format_clone() {
         let format = ChangeFormat::Short;
-        let cloned = format.clone();
+        let cloned = format;
         assert_eq!(format, cloned);
     }
 

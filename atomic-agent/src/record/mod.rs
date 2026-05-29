@@ -137,13 +137,16 @@ pub fn record_turn(
     repo_root: &Path,
     options: &TurnRecordOptions<'_>,
 ) -> AgentResult<TurnRecordOutcome> {
-    // Step 1: Open the repository
-    let repo =
-        atomic_repository::Repository::open(repo_root).map_err(|e| AgentError::RecordFailed {
+    // Step 1: Open the repository read-only for the initial status check.
+    // This avoids blocking on the redb write lock — we only need read access
+    // to decide whether there's work to do and which files are untracked.
+    let repo = atomic_repository::Repository::open_readonly(repo_root).map_err(|e| {
+        AgentError::RecordFailed {
             session_id: options.session.session_id.clone(),
             turn_number: options.turn_number,
-            reason: format!("Failed to open repository: {}", e),
-        })?;
+            reason: format!("Failed to open repository (readonly): {}", e),
+        }
+    })?;
 
     // Step 2: Status — find out what the agent changed.
     // Include untracked files because agent turns commonly create new source,
@@ -183,6 +186,22 @@ pub fn record_turn(
         .filter(|p| !should_ignore_untracked(p))
         .collect();
 
+    // Drop the read-only handle before opening with write access.
+    // This ensures we don't hold two database handles simultaneously.
+    drop(repo);
+
+    // Re-open with write capability for add + record.  `open_existing()`
+    // skips the table-init `begin_write()` that `open()` does — the tables
+    // already exist and that write lock is the primary cause of hook hangs
+    // when another process holds a transaction.
+    let repo = atomic_repository::Repository::open_existing(repo_root).map_err(|e| {
+        AgentError::RecordFailed {
+            session_id: options.session.session_id.clone(),
+            turn_number: options.turn_number,
+            reason: format!("Failed to open repository for recording: {}", e),
+        }
+    })?;
+
     if !untracked_paths.is_empty() {
         log::info!(
             "Adding {} untracked file{} created by agent",
@@ -208,8 +227,9 @@ pub fn record_turn(
     // Refresh status after auto-adding new files. The initial status sees them
     // as Untracked, which `repo.record(all: true)` does not record directly;
     // after add they become Added entries and are recordable.
+    // No untracked walk needed — we already added untracked files above.
     let status = repo
-        .status(atomic_repository::status::StatusOptions::fast())
+        .status(atomic_repository::status::StatusOptions::fast().with_untracked(false))
         .map_err(|e| AgentError::RecordFailed {
             session_id: options.session.session_id.clone(),
             turn_number: options.turn_number,

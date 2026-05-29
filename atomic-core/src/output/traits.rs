@@ -827,7 +827,7 @@ mod tests {
 
     #[test]
     fn test_sink_default() {
-        let sink = Sink::default();
+        let sink = Sink;
         assert!(format!("{:?}", sink).contains("Sink"));
     }
 

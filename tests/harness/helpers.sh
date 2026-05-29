@@ -37,15 +37,16 @@ FAIL_MESSAGES=()
 
 # ── Binary discovery ────────────────────────────────────────────────────────
 
-# Allow overriding via $ATOMIC_BIN; otherwise build in release-dev profile.
+# Allow overriding via $ATOMIC_BIN; otherwise discover the best available binary.
+# Prefer release (60% faster on git import and large operations).
 if [[ -z "${ATOMIC_BIN:-}" ]]; then
     REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-    # Try the debug binary first (most likely during development)
-    if [[ -x "$REPO_ROOT/target/debug/atomic" ]]; then
-        ATOMIC_BIN="$REPO_ROOT/target/debug/atomic"
-    elif [[ -x "$REPO_ROOT/target/release/atomic" ]]; then
+    # Prefer release binary — significantly faster for large test suites
+    if [[ -x "$REPO_ROOT/target/release/atomic" ]]; then
         ATOMIC_BIN="$REPO_ROOT/target/release/atomic"
+    elif [[ -x "$REPO_ROOT/target/debug/atomic" ]]; then
+        ATOMIC_BIN="$REPO_ROOT/target/debug/atomic"
     else
         echo "${YELLOW}Building atomic binary …${RESET}" >&2
         (cd "$REPO_ROOT" && cargo build -p atomic-cli --quiet 2>/dev/null) || true
@@ -59,6 +60,9 @@ if [[ -z "${ATOMIC_BIN:-}" ]]; then
 fi
 
 export ATOMIC_BIN
+
+# Show which binary is being used (helps catch stale-binary issues)
+echo "${CYAN}Using: $ATOMIC_BIN${RESET}" >&2
 
 # Convenience wrapper so tests can just write `atomic …`
 atomic() {
@@ -165,7 +169,7 @@ new_view() {
 # Switch to a view.
 switch_view() {
     local name="$1"
-    atomic view switch "$name" 2>&1
+    atomic view switch "$name" --force 2>&1
 }
 
 # Insert changes from one view to another.

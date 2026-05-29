@@ -3,6 +3,7 @@ use super::*;
 // Tests
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use super::*;
 
@@ -481,7 +482,7 @@ mod tests {
             .collect();
         // Note: The tokenizer may not perfectly handle all scientific notation
         // The important thing is that numeric content is captured
-        assert!(nums.len() >= 1);
+        assert!(!nums.is_empty());
         assert!(nums
             .iter()
             .any(|t| t.as_str().contains("1e10") || t.as_str() == "1e10"));
@@ -702,7 +703,7 @@ mod tests {
         let tokens: Vec<Token> = Tokenizer::new(code).collect();
 
         // ASCII part is Word, then 'é' bytes are Other
-        assert!(tokens.len() >= 1);
+        assert!(!tokens.is_empty());
     }
 
     // Tokenizer convenience method tests

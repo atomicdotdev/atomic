@@ -35,6 +35,16 @@ impl ReadTxn {
     pub(crate) fn new(txn: ReadTransaction) -> Self {
         Self { txn }
     }
+
+    /// Open the INODE_GRAPH table for shared use across multiple operations.
+    ///
+    /// The returned handle can be passed to [`InodePreloadTxn::from_table`]
+    /// to avoid reopening the table for each file during parallel materialize.
+    pub fn open_inode_graph_table(
+        &self,
+    ) -> PristineResult<redb::ReadOnlyMultimapTable<&'static [u8; 32], &'static [u8; 24]>> {
+        Ok(self.txn.open_multimap_table(INODE_GRAPH)?)
+    }
 }
 
 // GraphTxnT Implementation
@@ -1273,6 +1283,738 @@ impl crate::pristine::traits::CrdtTxnT for ReadTxn {
             }
             None => Ok(None),
         }
+    }
+}
+
+// CachedGraphTxn Implementation
+
+/// A graph transaction wrapper that caches the opened GRAPH table handle.
+///
+/// redb's `open_multimap_table` acquires a mutex, looks up the table
+/// in the system catalog, and constructs a new handle on every call.
+/// For `retrieve_graph` which calls `find_block` / `iter_adjacent`
+/// hundreds of times per file, this overhead dominates — ~20ms per
+/// table open under parallel contention.
+///
+/// `CachedGraphTxn` opens the GRAPH table once at construction and
+/// reuses the handle for all subsequent operations, eliminating the
+/// per-call overhead entirely.
+pub struct CachedGraphTxn<'txn> {
+    txn: &'txn ReadTxn,
+    graph_table: redb::ReadOnlyMultimapTable<&'static [u8; 24], &'static [u8; 24]>,
+    inode_graph_table: redb::ReadOnlyMultimapTable<&'static [u8; 32], &'static [u8; 24]>,
+}
+
+impl<'txn> CachedGraphTxn<'txn> {
+    /// Create a cached graph transaction by opening GRAPH and INODE_GRAPH once.
+    pub fn new(txn: &'txn ReadTxn) -> PristineResult<Self> {
+        let graph_table = txn.txn.open_multimap_table(GRAPH)?;
+        let inode_graph_table = txn.txn.open_multimap_table(INODE_GRAPH)?;
+        Ok(Self {
+            txn,
+            graph_table,
+            inode_graph_table,
+        })
+    }
+}
+
+impl<'txn> GraphTxnT for CachedGraphTxn<'txn> {
+    type Adj = AdjIterator;
+
+    fn get_external(&self, id: NodeId) -> PristineResult<Option<Hash>> {
+        self.txn.get_external(id)
+    }
+
+    fn get_internal(&self, hash: &Hash) -> PristineResult<Option<NodeId>> {
+        self.txn.get_internal(hash)
+    }
+
+    fn list_registered_changes(&self) -> PristineResult<Vec<(NodeId, Hash)>> {
+        self.txn.list_registered_changes()
+    }
+
+    fn iter_adjacent(
+        &self,
+        node: GraphNode<NodeId>,
+        min_flag: EdgeFlags,
+        max_flag: EdgeFlags,
+    ) -> PristineResult<Self::Adj> {
+        let table = &self.graph_table;
+        let key = encode_vertex(node.change.get(), node.start.get(), node.end.get());
+
+        let mut edges = Vec::new();
+        for v in table.get(&key)?.filter_map(|r| r.ok()) {
+            let bytes: &[u8; 24] = v.value();
+            let edge = deserialize_edge(bytes);
+            let flag = edge.flag();
+            if flag >= min_flag && flag <= max_flag {
+                edges.push(edge);
+            }
+        }
+
+        Ok(AdjIterator::new(edges))
+    }
+
+    fn find_block(&self, pos: Position<NodeId>) -> PristineResult<GraphNode<NodeId>> {
+        if pos.change.is_root() {
+            return Ok(GraphNode::ROOT);
+        }
+
+        let table = &self.graph_table;
+
+        let change_id = pos.change.get();
+        let target_pos = pos.pos.get();
+
+        let start_key = encode_vertex(change_id, 0, 0);
+        let end_key = encode_vertex(change_id, u64::MAX, u64::MAX);
+
+        let mut empty_vertex_match: Option<GraphNode<NodeId>> = None;
+
+        for result in table.range::<&[u8; 24]>(&start_key..=&end_key)? {
+            let (key, _values) = result?;
+            let (v_change, v_start, v_end) = decode_vertex(key.value());
+
+            if v_change != change_id {
+                continue;
+            }
+
+            if v_start != v_end && v_start <= target_pos && target_pos < v_end {
+                return Ok(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                });
+            }
+
+            if v_start == v_end && v_start == target_pos && empty_vertex_match.is_none() {
+                empty_vertex_match = Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                });
+            }
+        }
+
+        if let Some(found) = empty_vertex_match {
+            return Ok(found);
+        }
+
+        Err(PristineError::BlockNotFound {
+            change: change_id,
+            pos: target_pos,
+        })
+    }
+
+    fn find_block_end(&self, pos: Position<NodeId>) -> PristineResult<GraphNode<NodeId>> {
+        if pos.change.is_root() {
+            return Ok(GraphNode::ROOT);
+        }
+
+        let table = &self.graph_table;
+
+        let change_id = pos.change.get();
+        let target_pos = pos.pos.get();
+
+        let empty_key = encode_vertex(change_id, target_pos, target_pos);
+        if table.get(&empty_key)?.next().is_some() {
+            return Ok(GraphNode {
+                change: NodeId::new(change_id),
+                start: ChangePosition::new(target_pos),
+                end: ChangePosition::new(target_pos),
+            });
+        }
+
+        let start_key = encode_vertex(change_id, 0, 0);
+        let end_key = encode_vertex(change_id, u64::MAX, u64::MAX);
+
+        for result in table.range::<&[u8; 24]>(&start_key..=&end_key)? {
+            let (key, _values) = result?;
+            let (v_change, v_start, v_end) = decode_vertex(key.value());
+
+            if v_change != change_id {
+                continue;
+            }
+
+            if v_end == target_pos && v_start < v_end {
+                return Ok(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                });
+            }
+
+            if v_start <= target_pos && target_pos < v_end {
+                return Ok(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                });
+            }
+        }
+
+        Err(PristineError::BlockNotFound {
+            change: change_id,
+            pos: target_pos,
+        })
+    }
+
+    fn has_vertex(&self, node: GraphNode<NodeId>) -> PristineResult<bool> {
+        let table = &self.graph_table;
+        let key = encode_vertex(node.change.get(), node.start.get(), node.end.get());
+        let has = table.get(&key)?.next().is_some();
+        Ok(has)
+    }
+
+    fn get_node_type(&self, node_id: NodeId) -> PristineResult<Option<u8>> {
+        self.txn.get_node_type(node_id)
+    }
+
+    fn get_rev_deps(&self, dep_id: NodeId) -> PristineResult<Vec<NodeId>> {
+        self.txn.get_rev_deps(dep_id)
+    }
+
+    fn get_change_deps(&self, change_id: NodeId) -> PristineResult<Vec<Hash>> {
+        self.txn.get_change_deps(change_id)
+    }
+
+    fn is_change_deps_indexed(&self, change_id: NodeId) -> PristineResult<bool> {
+        self.txn.is_change_deps_indexed(change_id)
+    }
+
+    fn get_rev_change_deps(&self, dep_hash: &Hash) -> PristineResult<Vec<NodeId>> {
+        self.txn.get_rev_change_deps(dep_hash)
+    }
+
+    fn has_change_in_graph(&self, change_id: NodeId) -> PristineResult<bool> {
+        let table = &self.graph_table;
+        let start_key = encode_vertex(change_id.get(), 0, 0);
+        let end_key = encode_vertex(change_id.get(), u64::MAX, u64::MAX);
+        let has = table
+            .range::<&[u8; 24]>(&start_key..=&end_key)?
+            .next()
+            .is_some();
+        Ok(has)
+    }
+}
+
+impl<'txn> TreeTxnT for CachedGraphTxn<'txn> {
+    fn get_inode(&self, path: &str) -> PristineResult<Option<Inode>> {
+        self.txn.get_inode(path)
+    }
+
+    fn get_directory_flags(&self, inode: Inode) -> PristineResult<Option<u8>> {
+        self.txn.get_directory_flags(inode)
+    }
+
+    fn get_path(&self, inode: Inode) -> PristineResult<Option<String>> {
+        self.txn.get_path(inode)
+    }
+
+    fn inode_position(&self, inode: Inode) -> PristineResult<Option<Position<NodeId>>> {
+        self.txn.inode_position(inode)
+    }
+
+    fn position_inode(&self, pos: Position<NodeId>) -> PristineResult<Option<Inode>> {
+        self.txn.position_inode(pos)
+    }
+
+    fn iter_tree(
+        &self,
+    ) -> PristineResult<Box<dyn Iterator<Item = Result<(String, Inode), PristineError>> + '_>> {
+        self.txn.iter_tree()
+    }
+
+    fn iter_inode_vertices(
+        &self,
+        inode: Inode,
+    ) -> PristineResult<
+        Box<
+            dyn Iterator<Item = Result<(GraphNode<NodeId>, SerializedGraphEdge), PristineError>>
+                + '_,
+        >,
+    > {
+        self.txn.iter_inode_vertices(inode)
+    }
+
+    fn get_file_index(&self, path: &str) -> PristineResult<Option<FileIndexMetadata>> {
+        self.txn.get_file_index(path)
+    }
+
+    fn iter_file_index(&self) -> PristineResult<Vec<FileIndexEntry>> {
+        self.txn.iter_file_index()
+    }
+}
+
+impl<'txn> crate::pristine::InodeGraphOps for CachedGraphTxn<'txn> {
+    type InodeError = crate::pristine::PristineError;
+
+    fn init_inode_adj(
+        &self,
+        inode: Inode,
+        node: GraphNode<NodeId>,
+        min_flag: EdgeFlags,
+        max_flag: EdgeFlags,
+    ) -> Result<crate::pristine::InodeAdjState, Self::InodeError> {
+        // Use the cached INODE_GRAPH table handle directly instead of
+        // delegating to self.txn (which would reopen the table).
+        let mut adj = crate::pristine::InodeAdjState::new(inode, node, min_flag, max_flag);
+
+        // Pre-load edges from the cached table on first init
+        // (same logic as ReadTxn::next_inode_adj but using cached handle)
+        let inode_id = inode.get();
+        let key = encode_inode_vertex(
+            inode_id,
+            node.change.get(),
+            node.start.get(),
+            node.end.get(),
+        );
+        let mut edges = Vec::new();
+        for v in self.inode_graph_table.get(&key)?.filter_map(|r| r.ok()) {
+            let bytes: &[u8; 24] = v.value();
+            let edge = deserialize_edge(bytes);
+            let flag = edge.flag();
+            if flag >= min_flag && flag <= max_flag {
+                edges.push(edge);
+            }
+        }
+        adj.set_edges(edges);
+
+        Ok(adj)
+    }
+
+    fn next_inode_adj(
+        &self,
+        adj: &mut crate::pristine::InodeAdjState,
+    ) -> Option<Result<SerializedGraphEdge, Self::InodeError>> {
+        // Edges were pre-loaded in init_inode_adj, just iterate
+        if adj.is_exhausted() {
+            return None;
+        }
+        if adj.position < adj.edges.len() {
+            let edge = adj.edges[adj.position];
+            adj.advance();
+            Some(Ok(edge))
+        } else {
+            adj.mark_exhausted();
+            None
+        }
+    }
+
+    fn find_block_in_inode(
+        &self,
+        inode: Inode,
+        pos: Position<NodeId>,
+    ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
+        let table = &self.inode_graph_table;
+        let inode_id = inode.get();
+        let change_id = pos.change.get();
+        let target_pos = pos.pos.get();
+
+        // Fast path: probe exact start position
+        let exact_start = encode_inode_vertex(inode_id, change_id, target_pos, 0);
+        let exact_end = encode_inode_vertex(inode_id, change_id, target_pos, u64::MAX);
+        let mut empty_match = None;
+
+        for result in table.range::<&[u8; 32]>(&exact_start..=&exact_end)? {
+            let (key, _) = result?;
+            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
+            if v_change != change_id || v_start != target_pos {
+                continue;
+            }
+            if v_start != v_end {
+                return Ok(Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                }));
+            }
+            if empty_match.is_none() {
+                empty_match = Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                });
+            }
+        }
+
+        if let Some(m) = empty_match {
+            return Ok(Some(m));
+        }
+
+        // Slow path: scan all vertices for this change within the inode
+        let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
+        let end_key = encode_inode_vertex(inode_id, change_id, u64::MAX, u64::MAX);
+
+        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
+            let (key, _) = result?;
+            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
+            if v_change == change_id && v_start <= target_pos && target_pos < v_end {
+                return Ok(Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn find_block_end_in_inode(
+        &self,
+        inode: Inode,
+        pos: Position<NodeId>,
+    ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
+        let table = &self.inode_graph_table;
+        let inode_id = inode.get();
+        let change_id = pos.change.get();
+        let target_pos = pos.pos.get();
+
+        // Check for empty vertex at exact position
+        let empty_key = encode_inode_vertex(inode_id, change_id, target_pos, target_pos);
+        if table.get(&empty_key)?.next().is_some() {
+            return Ok(Some(GraphNode {
+                change: NodeId::new(change_id),
+                start: ChangePosition::new(target_pos),
+                end: ChangePosition::new(target_pos),
+            }));
+        }
+
+        // Scan for vertex ending at this position
+        let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
+        let end_key = encode_inode_vertex(inode_id, change_id, target_pos, u64::MAX);
+
+        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
+            let (key, _) = result?;
+            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
+            if v_change != change_id {
+                continue;
+            }
+            if v_end == target_pos && v_start < v_end {
+                return Ok(Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                }));
+            }
+            if v_start <= target_pos && target_pos < v_end {
+                return Ok(Some(GraphNode {
+                    change: NodeId::new(v_change),
+                    start: ChangePosition::new(v_start),
+                    end: ChangePosition::new(v_end),
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn count_inode_vertices(&self, inode: Inode) -> Result<usize, Self::InodeError> {
+        let table = &self.inode_graph_table;
+        let inode_id = inode.get();
+        let start_key = encode_inode_vertex(inode_id, 0, 0, 0);
+        let end_key = encode_inode_vertex(inode_id, u64::MAX, u64::MAX, u64::MAX);
+
+        let mut count = 0;
+        let mut last: Option<(u64, u64, u64)> = None;
+
+        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
+            let (key, _) = result?;
+            let (_, cid, s, e) = decode_inode_vertex(key.value());
+            let current = (cid, s, e);
+            if last != Some(current) {
+                count += 1;
+                last = Some(current);
+            }
+        }
+
+        Ok(count)
+    }
+
+    fn inode_graph_is_populated(&self, inode: Inode) -> Result<bool, Self::InodeError> {
+        let table = &self.inode_graph_table;
+        let inode_id = inode.get();
+        let start_key = encode_inode_vertex(inode_id, 0, 0, 0);
+        let end_key = encode_inode_vertex(inode_id, u64::MAX, u64::MAX, u64::MAX);
+        Ok(table
+            .range::<&[u8; 32]>(&start_key..=&end_key)?
+            .next()
+            .is_some())
+    }
+
+    fn inode_graph_needs_view_filter(&self) -> bool {
+        false
+    }
+}
+
+// InodePreloadTxn Implementation
+
+/// Pre-loaded inode graph for O(1) edge lookups during file traversal.
+///
+/// Instead of hitting the B-tree for every `find_block` and `iter_adjacent`
+/// call (O(log N) per probe, thousands of probes per file), this struct
+/// does ONE sequential range scan of `INODE_GRAPH` at construction and
+/// loads all edges into a `HashMap`. The existing `retrieve_graph` DFS
+/// then runs over this HashMap with O(1) lookups.
+///
+/// For a file with 21,867 vertices: scan = ~25ms, vs 14.2s of individual probes.
+pub struct InodePreloadTxn<'txn> {
+    txn: &'txn ReadTxn,
+    /// All edges for this inode, keyed by source vertex.
+    edges: std::collections::HashMap<GraphNode<NodeId>, Vec<SerializedGraphEdge>>,
+    /// All vertices for this inode (for find_block), sorted by (change, start, end).
+    vertices: Vec<GraphNode<NodeId>>,
+}
+
+impl<'txn> InodePreloadTxn<'txn> {
+    /// Pre-load all edges for the given inode from INODE_GRAPH.
+    pub fn new(txn: &'txn ReadTxn, inode: Inode) -> PristineResult<Self> {
+        let table = txn.txn.open_multimap_table(INODE_GRAPH)?;
+        Self::from_table(txn, inode, &table)
+    }
+
+    /// Pre-load using an already-opened INODE_GRAPH table handle.
+    ///
+    /// This avoids the per-file `open_multimap_table` overhead when
+    /// processing many files in parallel — the caller opens the table
+    /// once and passes the handle to each file's preloader.
+    pub fn from_table(
+        txn: &'txn ReadTxn,
+        inode: Inode,
+        table: &redb::ReadOnlyMultimapTable<&'static [u8; 32], &'static [u8; 24]>,
+    ) -> PristineResult<Self> {
+        let inode_id = inode.get();
+        let start_key = encode_inode_vertex(inode_id, 0, 0, 0);
+        let end_key = encode_inode_vertex(inode_id, u64::MAX, u64::MAX, u64::MAX);
+
+        let mut edges: std::collections::HashMap<GraphNode<NodeId>, Vec<SerializedGraphEdge>> =
+            std::collections::HashMap::new();
+        let mut vertex_set: std::collections::HashSet<GraphNode<NodeId>> =
+            std::collections::HashSet::new();
+
+        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
+            let (key, values) = result?;
+            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
+
+            let vertex = GraphNode {
+                change: NodeId::new(v_change),
+                start: ChangePosition::new(v_start),
+                end: ChangePosition::new(v_end),
+            };
+            vertex_set.insert(vertex);
+
+            let edge_list = edges.entry(vertex).or_default();
+            for v in values.filter_map(|r| r.ok()) {
+                let bytes: &[u8; 24] = v.value();
+                let edge = deserialize_edge(bytes);
+                edge_list.push(edge);
+            }
+        }
+
+        let mut vertices: Vec<GraphNode<NodeId>> = vertex_set.into_iter().collect();
+        vertices.sort_by(|a, b| {
+            a.change
+                .get()
+                .cmp(&b.change.get())
+                .then(a.start.get().cmp(&b.start.get()))
+                .then(a.end.get().cmp(&b.end.get()))
+        });
+
+        Ok(Self {
+            txn,
+            edges,
+            vertices,
+        })
+    }
+}
+
+impl<'txn> GraphTxnT for InodePreloadTxn<'txn> {
+    type Adj = AdjIterator;
+
+    fn get_external(&self, id: NodeId) -> PristineResult<Option<Hash>> {
+        self.txn.get_external(id)
+    }
+
+    fn get_internal(&self, hash: &Hash) -> PristineResult<Option<NodeId>> {
+        self.txn.get_internal(hash)
+    }
+
+    fn list_registered_changes(&self) -> PristineResult<Vec<(NodeId, Hash)>> {
+        self.txn.list_registered_changes()
+    }
+
+    fn iter_adjacent(
+        &self,
+        node: GraphNode<NodeId>,
+        min_flag: EdgeFlags,
+        max_flag: EdgeFlags,
+    ) -> PristineResult<Self::Adj> {
+        let filtered = if let Some(edge_list) = self.edges.get(&node) {
+            edge_list
+                .iter()
+                .filter(|edge| {
+                    let flag = edge.flag();
+                    flag >= min_flag && flag <= max_flag
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(AdjIterator::new(filtered))
+    }
+
+    fn find_block(&self, pos: Position<NodeId>) -> PristineResult<GraphNode<NodeId>> {
+        if pos.change.is_root() {
+            return Ok(GraphNode::ROOT);
+        }
+
+        let target_change = pos.change.get();
+        let target_pos = pos.pos.get();
+        let mut empty_match: Option<GraphNode<NodeId>> = None;
+
+        for v in &self.vertices {
+            if v.change.get() != target_change {
+                continue;
+            }
+            let v_start = v.start.get();
+            let v_end = v.end.get();
+
+            // Prefer non-empty vertex containing this position
+            if v_start != v_end && v_start <= target_pos && target_pos < v_end {
+                return Ok(*v);
+            }
+            // Track empty vertex as fallback
+            if v_start == v_end && v_start == target_pos && empty_match.is_none() {
+                empty_match = Some(*v);
+            }
+        }
+
+        if let Some(found) = empty_match {
+            return Ok(found);
+        }
+
+        Err(PristineError::BlockNotFound {
+            change: target_change,
+            pos: target_pos,
+        })
+    }
+
+    fn find_block_end(&self, pos: Position<NodeId>) -> PristineResult<GraphNode<NodeId>> {
+        if pos.change.is_root() {
+            return Ok(GraphNode::ROOT);
+        }
+
+        let target_change = pos.change.get();
+        let target_pos = pos.pos.get();
+
+        // Check for empty vertex at exact position first
+        for v in &self.vertices {
+            if v.change.get() == target_change
+                && v.start.get() == target_pos
+                && v.end.get() == target_pos
+            {
+                return Ok(*v);
+            }
+        }
+
+        // Then check for vertex ending at this position
+        for v in &self.vertices {
+            if v.change.get() != target_change {
+                continue;
+            }
+            let v_start = v.start.get();
+            let v_end = v.end.get();
+
+            if v_end == target_pos && v_start < v_end {
+                return Ok(*v);
+            }
+            if v_start <= target_pos && target_pos < v_end {
+                return Ok(*v);
+            }
+        }
+
+        Err(PristineError::BlockNotFound {
+            change: target_change,
+            pos: target_pos,
+        })
+    }
+
+    fn has_vertex(&self, node: GraphNode<NodeId>) -> PristineResult<bool> {
+        Ok(self.edges.contains_key(&node))
+    }
+
+    fn get_node_type(&self, node_id: NodeId) -> PristineResult<Option<u8>> {
+        self.txn.get_node_type(node_id)
+    }
+
+    fn get_rev_deps(&self, dep_id: NodeId) -> PristineResult<Vec<NodeId>> {
+        self.txn.get_rev_deps(dep_id)
+    }
+
+    fn get_change_deps(&self, change_id: NodeId) -> PristineResult<Vec<Hash>> {
+        self.txn.get_change_deps(change_id)
+    }
+
+    fn is_change_deps_indexed(&self, change_id: NodeId) -> PristineResult<bool> {
+        self.txn.is_change_deps_indexed(change_id)
+    }
+
+    fn get_rev_change_deps(&self, dep_hash: &Hash) -> PristineResult<Vec<NodeId>> {
+        self.txn.get_rev_change_deps(dep_hash)
+    }
+
+    fn has_change_in_graph(&self, change_id: NodeId) -> PristineResult<bool> {
+        // Check the preloaded vertices
+        Ok(self.vertices.iter().any(|v| v.change == change_id))
+    }
+}
+
+impl<'txn> TreeTxnT for InodePreloadTxn<'txn> {
+    fn get_inode(&self, path: &str) -> PristineResult<Option<Inode>> {
+        self.txn.get_inode(path)
+    }
+
+    fn get_directory_flags(&self, inode: Inode) -> PristineResult<Option<u8>> {
+        self.txn.get_directory_flags(inode)
+    }
+
+    fn get_path(&self, inode: Inode) -> PristineResult<Option<String>> {
+        self.txn.get_path(inode)
+    }
+
+    fn inode_position(&self, inode: Inode) -> PristineResult<Option<Position<NodeId>>> {
+        self.txn.inode_position(inode)
+    }
+
+    fn position_inode(&self, pos: Position<NodeId>) -> PristineResult<Option<Inode>> {
+        self.txn.position_inode(pos)
+    }
+
+    fn iter_tree(
+        &self,
+    ) -> PristineResult<Box<dyn Iterator<Item = Result<(String, Inode), PristineError>> + '_>> {
+        self.txn.iter_tree()
+    }
+
+    fn iter_inode_vertices(
+        &self,
+        inode: Inode,
+    ) -> PristineResult<
+        Box<
+            dyn Iterator<Item = Result<(GraphNode<NodeId>, SerializedGraphEdge), PristineError>>
+                + '_,
+        >,
+    > {
+        self.txn.iter_inode_vertices(inode)
+    }
+
+    fn get_file_index(&self, path: &str) -> PristineResult<Option<FileIndexMetadata>> {
+        self.txn.get_file_index(path)
+    }
+
+    fn iter_file_index(&self) -> PristineResult<Vec<FileIndexEntry>> {
+        self.txn.iter_file_index()
     }
 }
 

@@ -155,6 +155,60 @@ impl Drop for FileWriter {
     }
 }
 
+// HASHING WRITER
+
+/// A writer wrapper that computes a Blake3 content hash while writing.
+///
+/// Wraps any `Write` implementation and feeds all written bytes into a
+/// `blake3::Hasher`. After writing is complete, call `finalize()` to
+/// get the content hash.
+///
+/// This eliminates the need to re-read files from disk to compute their
+/// content hash for the FILE_INDEX.
+pub struct HashingWriter<W> {
+    inner: W,
+    hasher: blake3::Hasher,
+}
+
+impl<W> HashingWriter<W> {
+    /// Wrap a writer with a hashing layer.
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+        }
+    }
+
+    /// Finalize the hash and return the content hash.
+    ///
+    /// This can be called after all writes are complete (and flushed).
+    pub fn finalize(&self) -> crate::types::Merkle {
+        crate::types::Merkle(self.hasher.finalize().into())
+    }
+
+    /// Get a mutable reference to the inner writer.
+    pub fn inner_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Consume this wrapper and return the inner writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 impl WorkingCopy for FileSystem {
     type Writer = FileWriter;
 

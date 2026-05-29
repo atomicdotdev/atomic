@@ -17,6 +17,7 @@ reqwest = { workspace = true, features = ["json", "gzip", "deflate", "stream"] }
 
 # Async runtime
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 # Serialization
 serde = { workspace = true }

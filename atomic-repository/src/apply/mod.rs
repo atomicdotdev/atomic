@@ -238,7 +238,8 @@ pub fn write_change_to_graph(
     let mut workspace = Workspace::new();
     let mut conflict_tracker = ConflictTracker::new();
     let mut stats = InsertStats::new();
-    let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some();
+    let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some()
+        || std::env::var_os("ATOMIC_TRACE_INSERT").is_some();
 
     // Get the current view
     let mut view = txn

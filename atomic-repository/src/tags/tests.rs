@@ -1,6 +1,7 @@
 //! Tests for the tag management module.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::tags::{
         count_all_tags, count_tags, delete_tag, list_all_tags, list_tag_views, list_tags,

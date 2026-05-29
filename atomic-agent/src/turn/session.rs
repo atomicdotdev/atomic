@@ -179,6 +179,18 @@ pub struct AgentSession {
     /// for the `SessionEnvelope`.
     #[serde(default)]
     pub current_turn_started_at: Option<DateTime<Utc>>,
+
+    /// Change hashes the orchestrator actually recorded for this session.
+    ///
+    /// Appended on each successful `record_turn()` (see `handle_turn_end`).
+    /// Used by `create_session_attestation` as the authoritative coverage set
+    /// — replaces the previous "scan the whole agent-view history" path, which
+    /// over-counted inherited baseline changes from the parent view.
+    ///
+    /// `#[serde(default)]` keeps existing session JSON files (written before
+    /// this field existed) loadable as an empty vec.
+    #[serde(default)]
+    pub recorded_change_hashes: Vec<atomic_core::types::Hash>,
 }
 
 impl AgentSession {
@@ -219,6 +231,7 @@ impl AgentSession {
             current_prompt: None,
             files_touched: Vec::new(),
             current_turn_started_at: None,
+            recorded_change_hashes: Vec::new(),
         }
     }
 
@@ -978,6 +991,24 @@ mod tests {
         assert!(loaded.transcript_path.is_none());
         assert!(loaded.first_prompt.is_none());
         assert!(loaded.files_touched.is_empty());
+        // recorded_change_hashes was added later — old session files must
+        // still load with this field as an empty vec (#[serde(default)])
+        assert!(loaded.recorded_change_hashes.is_empty());
+    }
+
+    #[test]
+    fn test_serde_roundtrip_with_recorded_hashes() {
+        use atomic_core::types::Hash;
+
+        let mut s = make_session();
+        // Push a couple of hashes (use deterministic content for stability)
+        s.recorded_change_hashes.push(Hash::of(b"change-a"));
+        s.recorded_change_hashes.push(Hash::of(b"change-b"));
+
+        let json = serde_json::to_string_pretty(&s).unwrap();
+        let loaded: AgentSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.recorded_change_hashes.len(), 2);
+        assert_eq!(loaded.recorded_change_hashes, s.recorded_change_hashes);
     }
 
     // Validation

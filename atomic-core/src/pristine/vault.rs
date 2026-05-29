@@ -542,8 +542,10 @@ mod tests {
 
     #[test]
     fn vault_manifest_allocate_intent_id() {
-        let mut manifest = VaultManifest::default();
-        manifest.intent_prefix = "PIMO".to_string();
+        let mut manifest = VaultManifest {
+            intent_prefix: "PIMO".to_string(),
+            ..Default::default()
+        };
 
         assert_eq!(manifest.allocate_intent_id(), "PIMO-1");
         assert_eq!(manifest.allocate_intent_id(), "PIMO-2");

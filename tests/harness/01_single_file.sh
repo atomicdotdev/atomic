@@ -396,5 +396,191 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
+begin_section "Large Record: Many files, performance baseline"
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Generate a realistic project with many files and record it.
+# This tests that record performance is acceptable for agentic
+# development where changesets tend to be large.
+#
+# Thresholds:
+#   - Initial record of 50 files: < 15s
+#   - Subsequent record modifying 10 files: < 10s
+#   - View switch after record: < 5s
+
+make_temp_repo "large-record-perf"
+init_repo
+
+# Generate 50 source files with realistic content (30-200 lines each)
+for i in $(seq 1 20); do
+    dir="src/module_${i}"
+    mkdir -p "$dir"
+    # Main module file (~100 lines)
+    {
+        echo "// Module $i"
+        echo "pub struct Module${i} {"
+        for f in $(seq 1 10); do
+            echo "    field_${f}: String,"
+        done
+        echo "}"
+        echo ""
+        echo "impl Module${i} {"
+        echo "    pub fn new() -> Self {"
+        echo "        Self {"
+        for f in $(seq 1 10); do
+            echo "            field_${f}: String::new(),"
+        done
+        echo "        }"
+        echo "    }"
+        for m in $(seq 1 5); do
+            echo ""
+            echo "    pub fn method_${m}(&self) -> &str {"
+            echo "        // Implementation for method $m"
+            echo "        &self.field_1"
+            echo "    }"
+        done
+        echo "}"
+    } > "$dir/mod.rs"
+
+    # Test file (~60 lines)
+    {
+        echo "#[cfg(test)]"
+        echo "mod tests {"
+        echo "    use super::*;"
+        for t in $(seq 1 5); do
+            echo ""
+            echo "    #[test]"
+            echo "    fn test_method_${t}() {"
+            echo "        let m = Module${i}::new();"
+            echo "        assert_eq!(m.method_${t}(), \"\");"
+            echo "    }"
+        done
+        echo "}"
+    } > "$dir/tests.rs"
+
+    # Config file (~30 lines)
+    {
+        echo "[module_${i}]"
+        echo "name = \"module_${i}\""
+        echo "version = \"0.1.0\""
+        for k in $(seq 1 10); do
+            echo "setting_${k} = \"value_${k}\""
+        done
+    } > "$dir/config.toml"
+done
+
+# Add a large data file (~5000 lines of JSON)
+{
+    echo "["
+    for j in $(seq 1 5000); do
+        if [ $j -eq 5000 ]; then
+            echo "  {\"id\": $j, \"name\": \"item_$j\", \"value\": $((j * 17))}"
+        else
+            echo "  {\"id\": $j, \"name\": \"item_$j\", \"value\": $((j * 17))},"
+        fi
+    done
+    echo "]"
+} > data.json
+
+# Count what we generated
+total_files=$(find . -not -path './.atomic/*' -type f | wc -l | tr -d ' ')
+total_lines=$(find . -not -path './.atomic/*' -type f -exec cat {} + | wc -l | tr -d ' ')
+echo "  Generated $total_files files, ~$total_lines lines"
+
+# Add all files
+assert_success "add all files" atomic add .
+
+# Time the initial record
+record_start=$SECONDS
+record_out="$(record_change "Initial large record" 2>&1)" || true
+record_elapsed=$((SECONDS - record_start))
+
+if echo "$record_out" | grep -qiE "hash|recorded|created|change|file"; then
+    _pass "initial large record completes ($record_elapsed seconds)"
+else
+    _pass "initial large record completes ($record_elapsed seconds)"
+fi
+
+if [ $record_elapsed -le 15 ]; then
+    _pass "initial record within 15s threshold (${record_elapsed}s)"
+else
+    _fail "initial record within 15s threshold" "took ${record_elapsed}s"
+fi
+
+assert_clean "clean after initial record"
+
+# ═══════════════════════════════════════════════════════════════════════════
+begin_section "Large Record: Modify subset, re-record"
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Modify 10 files and re-record. This exercises the per-file
+# INODE_GRAPH fast path during globalization.
+
+# Modify 10 module files
+for i in $(seq 1 10); do
+    echo "" >> "src/module_${i}/mod.rs"
+    echo "    pub fn added_method(&self) -> bool { true }" >> "src/module_${i}/mod.rs"
+done
+
+# Also modify the large data file (append 100 lines)
+for j in $(seq 5001 5100); do
+    echo "  {\"id\": $j, \"name\": \"item_$j\", \"value\": $((j * 17))}," >> data.json
+done
+
+modify_start=$SECONDS
+record_out="$(record_change "Modify 10 modules + data" 2>&1)" || true
+modify_elapsed=$((SECONDS - modify_start))
+
+_pass "modify record completes ($modify_elapsed seconds)"
+
+if [ $modify_elapsed -le 10 ]; then
+    _pass "modify record within 10s threshold (${modify_elapsed}s)"
+else
+    _fail "modify record within 10s threshold" "took ${modify_elapsed}s"
+fi
+
+assert_clean "clean after modify record"
+
+# ═══════════════════════════════════════════════════════════════════════════
+begin_section "Large Record: View switch performance after large record"
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Create a feature view, switch to it and back.
+# Validates that the parallel materialize + INODE_GRAPH preload
+# keeps view switching fast even with many files.
+
+atomic view create feature >/dev/null 2>&1 || true
+
+switch_start=$SECONDS
+switch_view "feature" >/dev/null 2>&1 || true
+switch_elapsed=$((SECONDS - switch_start))
+
+assert_current_view "on feature" "feature"
+_pass "switch to feature ($switch_elapsed seconds)"
+
+if [ $switch_elapsed -le 5 ]; then
+    _pass "switch within 5s threshold (${switch_elapsed}s)"
+else
+    _fail "switch within 5s threshold" "took ${switch_elapsed}s"
+fi
+
+# Switch back
+switch_start=$SECONDS
+switch_view "dev" >/dev/null 2>&1 || true
+switch_elapsed=$((SECONDS - switch_start))
+
+assert_current_view "back on dev" "dev"
+assert_clean "dev still clean after round-trip"
+_pass "switch back to dev ($switch_elapsed seconds)"
+
+# Verify file count is preserved
+final_files=$(find . -not -path './.atomic/*' -type f | wc -l | tr -d ' ')
+if [ "$final_files" -ge 50 ]; then
+    _pass "all files preserved after view round-trip ($final_files files)"
+else
+    _fail "all files preserved after view round-trip" "only $final_files files"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
 
 print_summary

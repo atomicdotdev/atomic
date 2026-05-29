@@ -762,9 +762,7 @@ mod tests {
         .is_user_fixable());
 
         assert!(!CliError::Cancelled.is_user_fixable());
-        assert!(
-            !CliError::Io(std::io::Error::new(std::io::ErrorKind::Other, "test")).is_user_fixable()
-        );
+        assert!(!CliError::Io(std::io::Error::other("test")).is_user_fixable());
     }
 
     #[test]

@@ -66,6 +66,13 @@ pub struct MaterializeOptions {
     ///
     /// The filter is wrapped in `Arc` for efficient sharing across files.
     pub change_filter: Option<Arc<HashSet<NodeId>>>,
+
+    /// Optional set of specific file paths to materialize.
+    ///
+    /// When set, only files whose path is in this set will be written.
+    /// All other files are skipped. This enables selective materialization
+    /// after operations like `insert` that only affect a subset of files.
+    pub only_paths: Option<HashSet<String>>,
 }
 
 impl MaterializeOptions {
@@ -134,6 +141,15 @@ impl MaterializeOptions {
         self
     }
 
+    /// Set specific paths to materialize.
+    ///
+    /// Only files in this set will be written to the working copy.
+    /// Other files are skipped entirely (no graph traversal, no I/O).
+    pub fn only_paths(mut self, paths: HashSet<String>) -> Self {
+        self.only_paths = Some(paths);
+        self
+    }
+
     /// Convert to file output options.
     pub(crate) fn to_file_options(&self) -> FileOutputOptions {
         let mut opts = FileOutputOptions::new();
@@ -168,6 +184,7 @@ impl Default for MaterializeOptions {
             parallel: false,
             num_workers: 1,
             change_filter: None,
+            only_paths: None,
         }
     }
 }

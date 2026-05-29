@@ -59,6 +59,17 @@ impl<K: Eq + std::hash::Hash + Clone, V> LruCache<K, V> {
         }
     }
 
+    /// Read an entry without updating its access time.
+    ///
+    /// This is safe to call with only a shared reference (`&self`),
+    /// making it suitable for use behind a `RwLock::read()` guard.
+    /// The trade-off is that accessed entries don't get promoted in
+    /// the LRU order, but this is acceptable when the alternative
+    /// is serializing all readers on a write lock.
+    pub(crate) fn peek(&self, key: &K) -> Option<&V> {
+        self.entries.get(key).map(|entry| &entry.value)
+    }
+
     /// Insert an entry into the cache.
     ///
     /// If the cache is at capacity, the least recently used entry

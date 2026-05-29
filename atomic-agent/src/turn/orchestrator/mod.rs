@@ -347,7 +347,7 @@ impl TurnOrchestrator {
     /// here, a turn that only creates new files exits before `record_turn()`
     /// can auto-add and record them with provenance.
     pub(crate) fn has_working_copy_changes(&self) -> bool {
-        let repo = match atomic_repository::Repository::open(&self.repo_root) {
+        let repo = match atomic_repository::Repository::open_readonly(&self.repo_root) {
             Ok(r) => r,
             Err(_) => return true, // can't check — assume changes
         };
