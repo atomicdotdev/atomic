@@ -107,10 +107,48 @@ pub(crate) fn write_settings(
         output.push('\n');
     }
 
-    std::fs::write(settings_path, output.as_bytes()).map_err(|e| AgentError::ConfigError {
-        operation: "write".to_string(),
-        path: settings_path.to_path_buf(),
-        reason: e.to_string(),
+    // Atomic write (temp + rename) so a settings watcher never reads a
+    // half-written file (`std::fs::write` truncates the target first).
+    use std::io::Write as _;
+
+    let parent = settings_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = settings_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "settings.json".to_string());
+    // Same-dir, pid-suffixed temp: rename stays atomic, no clobber between writers.
+    let tmp_path = parent.join(format!(".{}.{}.tmp", file_name, std::process::id()));
+
+    // Preserve existing permissions.
+    let existing_perms = std::fs::metadata(settings_path)
+        .ok()
+        .map(|m| m.permissions());
+
+    if let Err(e) = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(output.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    })() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(AgentError::ConfigError {
+            operation: "write temp file".to_string(),
+            path: tmp_path,
+            reason: e.to_string(),
+        });
+    }
+
+    if let Some(perms) = existing_perms {
+        let _ = std::fs::set_permissions(&tmp_path, perms);
+    }
+
+    std::fs::rename(&tmp_path, settings_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        AgentError::ConfigError {
+            operation: "rename temp file into place".to_string(),
+            path: settings_path.to_path_buf(),
+            reason: e.to_string(),
+        }
     })
 }
 
