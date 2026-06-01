@@ -63,6 +63,7 @@ pub mod copilot;
 pub mod cursor;
 pub mod gemini_cli;
 pub mod hermes;
+pub mod manifest;
 pub mod opencode;
 pub mod pi;
 pub mod sherpa;

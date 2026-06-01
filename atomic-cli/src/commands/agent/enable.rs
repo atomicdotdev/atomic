@@ -68,6 +68,17 @@ pub struct Enable {
     /// install once, works everywhere that has a `.atomic/` directory.
     #[arg(short, long)]
     global: bool,
+
+    /// Install hooks from an integration-supplied manifest file.
+    ///
+    /// The manifest (shipped by an integration package such as atomic-codex)
+    /// names its own target settings file and the hook commands to register,
+    /// and is merged in idempotently — preserving non-Atomic hooks. Because the
+    /// definitions live in the integration repo, updating an agent's hook
+    /// wiring never requires rebuilding `atomic`. When set, `--agent`/`--global`
+    /// are not needed; the manifest is self-describing.
+    #[arg(long, value_name = "FILE")]
+    hooks: Option<std::path::PathBuf>,
 }
 
 impl Enable {
@@ -79,12 +90,18 @@ impl Enable {
             force: false,
             all: false,
             global: false,
+            hooks: None,
         }
     }
 }
 
 impl Command for Enable {
     fn run(&self) -> CliResult<()> {
+        // Data-driven install — definitions come from the integration's manifest.
+        if let Some(ref manifest) = self.hooks {
+            return self.run_manifest(manifest);
+        }
+
         // Global install — writes to ~/.claude/settings.json
         if self.global {
             return self.run_global();
@@ -241,6 +258,42 @@ impl Command for Enable {
 }
 
 impl Enable {
+    /// Install hooks from an integration-supplied manifest file.
+    ///
+    /// The manifest names its own target settings file and the hook commands to
+    /// register; this merges them in idempotently, preserving any non-Atomic
+    /// hooks. The hook definitions live in the integration repo, so this path
+    /// never needs the per-agent definitions baked into this binary.
+    fn run_manifest(&self, manifest: &std::path::Path) -> CliResult<()> {
+        use atomic_agent::hooks::manifest::install_from_manifest;
+
+        match install_from_manifest(manifest) {
+            Ok(outcome) => {
+                print_success(&format!(
+                    "Installed hooks from {} → {}",
+                    manifest.display(),
+                    outcome.target.display(),
+                ));
+                let mut summary = format!("{} hook command(s) registered", outcome.added);
+                if outcome.removed > 0 {
+                    summary.push_str(&format!(", {} stale entr(y/ies) replaced", outcome.removed));
+                }
+                println!("  {summary}");
+                println!();
+                println!("Each agent turn in a project with .atomic/ will be recorded");
+                println!("as an Atomic change with full AI provenance.");
+            }
+            Err(e) => {
+                print_error(&format!(
+                    "Failed to install hooks from manifest {}: {}",
+                    manifest.display(),
+                    e,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Install hooks globally to the agent's user-level settings.
     ///
     /// Supports:
@@ -390,6 +443,7 @@ mod tests {
             force: false,
             all: false,
             global: false,
+            hooks: None,
         };
     }
 
@@ -400,6 +454,7 @@ mod tests {
             force: true,
             all: false,
             global: false,
+            hooks: None,
         };
         assert!(cmd.force);
         assert_eq!(cmd.agent.as_deref(), Some("claude-code"));
@@ -412,6 +467,7 @@ mod tests {
             force: false,
             all: true,
             global: false,
+            hooks: None,
         };
         assert!(cmd.all);
         assert!(cmd.agent.is_none());
@@ -424,6 +480,7 @@ mod tests {
             force: false,
             all: false,
             global: true,
+            hooks: None,
         };
         assert!(cmd.global);
         assert_eq!(cmd.agent.as_deref(), Some("claude-code"));
