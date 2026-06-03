@@ -55,6 +55,14 @@ pub struct Disable {
     /// `atomic agent enable --global`.
     #[arg(short, long)]
     global: bool,
+
+    /// Remove hooks described by an integration-supplied manifest file.
+    ///
+    /// Reads the same manifest used by `atomic agent enable --hooks`, and
+    /// removes only the entries whose command matches the manifest's
+    /// `command_prefix` from its target file. Non-Atomic hooks are preserved.
+    #[arg(long, value_name = "FILE")]
+    hooks: Option<std::path::PathBuf>,
 }
 
 impl Disable {
@@ -65,12 +73,18 @@ impl Disable {
             agent: None,
             all: false,
             global: false,
+            hooks: None,
         }
     }
 }
 
 impl Command for Disable {
     fn run(&self) -> CliResult<()> {
+        // Data-driven uninstall — mirrors `enable --hooks`.
+        if let Some(ref manifest) = self.hooks {
+            return self.run_manifest(manifest);
+        }
+
         // Global uninstall — removes from ~/.claude/settings.json
         if self.global {
             return self.run_global();
@@ -158,6 +172,38 @@ impl Command for Disable {
 }
 
 impl Disable {
+    /// Remove hooks described by an integration-supplied manifest file.
+    ///
+    /// Mirrors `atomic agent enable --hooks`: removes only the entries whose
+    /// command matches the manifest's `command_prefix` from its target file.
+    fn run_manifest(&self, manifest: &std::path::Path) -> CliResult<()> {
+        use atomic_agent::hooks::manifest::uninstall_from_manifest;
+
+        match uninstall_from_manifest(manifest) {
+            Ok(outcome) => {
+                if outcome.removed > 0 {
+                    print_success(&format!(
+                        "Removed {} hook command(s) from {}",
+                        outcome.removed,
+                        outcome.target.display(),
+                    ));
+                    println!();
+                    println!("Agent turns will no longer be recorded automatically.");
+                } else {
+                    println!("No Atomic hooks found in {}.", outcome.target.display());
+                }
+            }
+            Err(e) => {
+                print_error(&format!(
+                    "Failed to remove hooks from manifest {}: {}",
+                    manifest.display(),
+                    e,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Remove hooks from global agent settings.
     ///
     /// Supports:
@@ -266,6 +312,7 @@ mod tests {
             agent: Some("claude-code".to_string()),
             all: false,
             global: false,
+            hooks: None,
         };
         assert_eq!(cmd.agent.as_deref(), Some("claude-code"));
     }
@@ -276,6 +323,7 @@ mod tests {
             agent: None,
             all: true,
             global: false,
+            hooks: None,
         };
         assert!(cmd.all);
     }
@@ -286,6 +334,7 @@ mod tests {
             agent: None,
             all: false,
             global: true,
+            hooks: None,
         };
         assert!(cmd.global);
     }

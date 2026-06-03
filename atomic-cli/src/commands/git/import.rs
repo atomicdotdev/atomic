@@ -23,6 +23,10 @@
 //! - Binary files are imported as-is
 //! - Default imports are mainline-only (first parent)
 //! - Use `--all` to import all local branches as views
+//! - Imports build only the graph layer by default. Git has no token-level
+//!   data, so the semantic (Trunk → Branch → Leaf) layer for imported history
+//!   is synthesized and derived on demand. Use `--with-crdt` to pre-materialize
+//!   it for token-level blame and word-diff.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -35,7 +39,7 @@ use atomic_repository::Repository;
 use super::parallel::{ParallelImportOptions, ParallelImporter};
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{print_info, print_success, print_warning};
+use crate::output::{print_hint, print_info, print_success, print_warning};
 
 /// Import a Git repository into Atomic.
 ///
@@ -87,6 +91,22 @@ pub struct Import {
     /// Use this flag to skip vault setup.
     #[arg(long)]
     pub no_vault: bool,
+
+    /// Eagerly build the semantic (Trunk → Branch → Leaf) layer during import.
+    ///
+    /// By default, `git import` imports only the graph shape of each commit.
+    /// Git stores no token-level (or even line-level) data — diffs and blame
+    /// are computed, not stored — so the semantic layer for imported history
+    /// is synthesized and fully derivable from the graph content plus commit
+    /// metadata already written. Skipping it keeps imports smaller and faster
+    /// while files and diffs still work.
+    ///
+    /// Use this flag to pre-materialize that synthesized layer up front (for
+    /// token-level blame and word-diff on imported history) instead of
+    /// deriving it on demand. Changes recorded after the import always build
+    /// the semantic layer regardless of this flag.
+    #[arg(long = "with-crdt")]
+    pub with_crdt: bool,
 }
 
 fn import_ignore_patterns(workdir: &Path, kind: Option<&str>) -> Vec<String> {
@@ -160,6 +180,7 @@ impl Import {
                 self.kind.as_deref(),
             ),
             mainline_only,
+            graph_only: !self.with_crdt,
         };
 
         let importer = ParallelImporter::new(git_repo, options);
@@ -368,6 +389,17 @@ impl Command for Import {
         } else {
             HashSet::new()
         };
+
+        if self.with_crdt {
+            print_info(
+                "Building the semantic (Trunk → Branch → Leaf) layer during import (--with-crdt).",
+            );
+        } else {
+            print_hint(
+                "Importing graph only; the semantic layer is derived on demand. \
+                 Pass --with-crdt to pre-materialize token-level blame/diff for imported history.",
+            );
+        }
 
         // Determine which branches to import
         let default_branch = self.get_default_branch(&git_repo)?;
@@ -658,6 +690,16 @@ mod tests {
 
         let import = Import::try_parse_from(["import", "--all-branches"]).unwrap();
         assert!(import.all_branches);
+    }
+
+    #[test]
+    fn test_with_crdt_flag_defaults_to_graph_only() {
+        // Default import is graph-only: the semantic layer is opt-in.
+        let import = Import::try_parse_from(["import"]).unwrap();
+        assert!(!import.with_crdt);
+
+        let import = Import::try_parse_from(["import", "--with-crdt"]).unwrap();
+        assert!(import.with_crdt);
     }
 
     #[test]
