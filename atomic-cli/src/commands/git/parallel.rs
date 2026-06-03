@@ -195,6 +195,14 @@ pub struct ParallelImportOptions {
     /// long-running branch internals or repeated upstream merges into feature
     /// branches.
     pub mainline_only: bool,
+    /// Import only the graph shape of each commit, skipping the semantic
+    /// (Trunk → Branch → Leaf) FileOps layer.
+    ///
+    /// Graph operations and Git diff metadata are still written, so files
+    /// materialize and diffs render normally. The per-line CRDT FileOps that
+    /// duplicate file content are omitted, which significantly reduces change
+    /// size and import time for large repositories.
+    pub graph_only: bool,
 }
 
 impl Default for ParallelImportOptions {
@@ -205,6 +213,7 @@ impl Default for ParallelImportOptions {
             repo_name: "unknown".to_string(),
             ignored_path_patterns: Vec::new(),
             mainline_only: true,
+            graph_only: false,
         }
     }
 }
@@ -1080,6 +1089,7 @@ fn build_graph_first_change(
     header: ChangeHeader,
     parsed: &ParsedCommit,
     line_index: &ImportLineIndex,
+    graph_only: bool,
 ) -> Result<(Change, Vec<PendingLineIndexUpdate>, Vec<String>), Vec<GraphFirstSkip>> {
     if parsed.files.is_empty() {
         return Err(vec![GraphFirstSkip {
@@ -1192,15 +1202,17 @@ fn build_graph_first_change(
                     });
                 }
 
-                file_ops.push(build_graph_first_file_ops_for_added_file(
-                    &file.path,
-                    &new_line_contents,
-                    &new_ranges,
-                    encoding,
-                    next_file_idx,
-                    &mut next_branch_idx,
-                ));
-                next_file_idx += 1;
+                if !graph_only {
+                    file_ops.push(build_graph_first_file_ops_for_added_file(
+                        &file.path,
+                        &new_line_contents,
+                        &new_ranges,
+                        encoding,
+                        next_file_idx,
+                        &mut next_branch_idx,
+                    ));
+                    next_file_idx += 1;
+                }
                 pending.push(PendingLineIndexUpdate::Add {
                     path: file.path.clone(),
                     inode_pos,
@@ -1270,7 +1282,10 @@ fn build_graph_first_change(
                     new_path: file.path.clone(),
                 });
 
-                if encoding != Encoding::Binary && !is_generated_diff_skip_path(&file.path) {
+                if !graph_only
+                    && encoding != Encoding::Binary
+                    && !is_generated_diff_skip_path(&file.path)
+                {
                     if let Some(diff_lines) = file.diff_lines.as_ref() {
                         let (ops, _) = atomic_core::record::workflow::build_crdt_ops_from_git_diff(
                             &file.path, diff_lines,
@@ -1502,11 +1517,13 @@ fn build_graph_first_change(
                     path: file.path.clone(),
                 });
                 deleted_paths.push(file.path.clone());
-                if let Some(diff_lines) = file.diff_lines.as_ref() {
-                    let (ops, _) = atomic_core::record::workflow::build_crdt_ops_from_git_diff(
-                        &file.path, diff_lines,
-                    );
-                    file_ops.push(ops);
+                if !graph_only {
+                    if let Some(diff_lines) = file.diff_lines.as_ref() {
+                        let (ops, _) = atomic_core::record::workflow::build_crdt_ops_from_git_diff(
+                            &file.path, diff_lines,
+                        );
+                        file_ops.push(ops);
+                    }
                 }
                 continue;
             }
@@ -1522,35 +1539,37 @@ fn build_graph_first_change(
             continue;
         };
         let encoding = Encoding::detect(new_content);
-        let replacements = if encoding == Encoding::Binary
-            || is_generated_diff_skip_path(&file.path)
-        {
-            vec![GitReplacementBlock {
-                old_start: if indexed.lines.is_empty() { 0 } else { 1 },
-                old_len: indexed.lines.len(),
-                new_start: 1,
-                new_lines: if new_content.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![new_content.to_vec()]
-                },
-            }]
-        } else if parsed.is_merge {
-            current_state_replacements(indexed, new_content)
-        } else {
-            let Some(diff_lines) = file.diff_lines.as_ref() else {
-                skips.push(GraphFirstSkip::new(file, "modified_missing_diff_lines"));
-                continue;
+        let replacements =
+            if encoding == Encoding::Binary || is_generated_diff_skip_path(&file.path) {
+                vec![GitReplacementBlock {
+                    old_start: if indexed.lines.is_empty() { 0 } else { 1 },
+                    old_len: indexed.lines.len(),
+                    new_start: 1,
+                    new_lines: if new_content.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![new_content.to_vec()]
+                    },
+                }]
+            } else if parsed.is_merge {
+                current_state_replacements(indexed, new_content)
+            } else {
+                let Some(diff_lines) = file.diff_lines.as_ref() else {
+                    skips.push(GraphFirstSkip::new(file, "modified_missing_diff_lines"));
+                    continue;
+                };
+                if !graph_only {
+                    let (ops, _) = atomic_core::record::workflow::build_crdt_ops_from_git_diff(
+                        &file.path, diff_lines,
+                    );
+                    file_ops.push(ops);
+                }
+                let Some(replacements) = parse_git_diff_replacements(diff_lines) else {
+                    skips.push(GraphFirstSkip::new(file, "modified_unparseable_diff_lines"));
+                    continue;
+                };
+                replacements
             };
-            let (ops, _) =
-                atomic_core::record::workflow::build_crdt_ops_from_git_diff(&file.path, diff_lines);
-            file_ops.push(ops);
-            let Some(replacements) = parse_git_diff_replacements(diff_lines) else {
-                skips.push(GraphFirstSkip::new(file, "modified_unparseable_diff_lines"));
-                continue;
-            };
-            replacements
-        };
         if replacements.is_empty() {
             continue;
         }
@@ -2579,7 +2598,8 @@ impl ParallelImporter {
 
         line_index.seed_missing_modified_files(repo, parsed);
         let graph_first_skips = build_graph_first_skip_reasons(parsed, line_index);
-        let graph_first_result = build_graph_first_change(header.clone(), parsed, line_index);
+        let graph_first_result =
+            build_graph_first_change(header.clone(), parsed, line_index, self.options.graph_only);
 
         if let Ok((mut graph_change, pending_updates, graph_deleted_paths)) = graph_first_result {
             graph_change.unhashed = Some(self.build_git_metadata(parsed, false, false));
