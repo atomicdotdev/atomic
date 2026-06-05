@@ -132,7 +132,7 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT + super::CrdtTxnT {
     ///
     /// - Updates `view.state` with the new Merkle hash
     /// - Increments `view.change_count`
-    /// - Records the state in the TAGS table
+    /// - Records the state in the MERKLE_CHAIN table
     /// - Records state→sequence mapping in STATES table
     fn put_change(
         &mut self,
@@ -172,7 +172,7 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT + super::CrdtTxnT {
     ///
     /// Only **Draft** views can be deleted. Shared views return
     /// `CannotDeleteSharedView`. Views with children return `ViewHasChildren`.
-    /// Cleans up: VIEW_CHANGES, REV_VIEW_CHANGES, STATES, TAGS.
+    /// Cleans up: VIEW_CHANGES, REV_VIEW_CHANGES, STATES, MERKLE_CHAIN.
     fn del_view(&mut self, view: &ViewState) -> Result<(), PristineError>;
 
     // ── Tree Operations ─────────────────────────────────────────

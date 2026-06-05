@@ -222,6 +222,11 @@ impl Import {
     fn get_imported_shas(&self, repo: &Repository) -> HashSet<String> {
         use atomic_repository::HistoryOptions;
 
+        // Ensure the GIT_SHA_INDEX is populated for repos imported before
+        // the index existed. This is a one-time O(n) scan that makes all
+        // subsequent --incremental runs O(1) per commit.
+        let _ = repo.backfill_git_sha_index();
+
         let mut shas = HashSet::new();
 
         // Iterate through all changes on the current view via log

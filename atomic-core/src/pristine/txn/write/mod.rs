@@ -290,6 +290,7 @@ fn format_timestamp_ms(epoch_ms: i64) -> String {
 
 mod embeddings;
 mod graph;
+mod tag;
 mod tree;
 mod triples;
 mod vault;
@@ -298,131 +299,62 @@ mod view;
 #[cfg(test)]
 mod tests;
 
+// Entity registration helper
+
+impl<'a> WriteTxn<'a> {
+    /// Register an entity in the identity tables.
+    ///
+    /// Creates INTERNAL (hash → id), EXTERNAL (id → hash), and NODE_TYPES (id → type)
+    /// entries. Returns existing id if already registered.
+    fn register_entity(&mut self, hash: &Hash, entity_type: u8) -> PristineResult<NodeId> {
+        // Check if already registered
+        {
+            let table = self.txn.open_table(INTERNAL)?;
+            let result = table.get(hash.as_bytes())?;
+            if let Some(value) = result {
+                return Ok(NodeId::new(value.value()));
+            }
+        }
+
+        // Allocate a new ID
+        let id = self.next_node_id.fetch_add(1, Ordering::SeqCst);
+        let node_id = NodeId::new(id);
+
+        // Insert into both tables
+        {
+            let mut external = self.txn.open_table(EXTERNAL)?;
+            external.insert(id, hash.as_bytes())?;
+        }
+        {
+            let mut internal = self.txn.open_table(INTERNAL)?;
+            internal.insert(hash.as_bytes(), id)?;
+        }
+        {
+            let mut node_types = self.txn.open_table(NODE_TYPES)?;
+            node_types.insert(id, entity_type)?;
+        }
+
+        Ok(node_id)
+    }
+}
+
 // MutTxnT Implementation
 
 impl<'a> MutTxnT for WriteTxn<'a> {
     fn register_change(&mut self, hash: &Hash) -> PristineResult<NodeId> {
-        // Check if already registered
-        {
-            let table = self.txn.open_table(INTERNAL)?;
-            let result = table.get(hash.as_bytes())?;
-            if let Some(value) = result {
-                return Ok(NodeId::new(value.value()));
-            }
-        }
-
-        // Allocate a new ID
-        let id = self.next_node_id.fetch_add(1, Ordering::SeqCst);
-        let node_id = NodeId::new(id);
-
-        // Insert into both tables
-        {
-            let mut external = self.txn.open_table(EXTERNAL)?;
-            external.insert(id, hash.as_bytes())?;
-        }
-        {
-            let mut internal = self.txn.open_table(INTERNAL)?;
-            internal.insert(hash.as_bytes(), id)?;
-        }
-        {
-            let mut node_types = self.txn.open_table(NODE_TYPES)?;
-            node_types.insert(id, node_type::CHANGE)?;
-        }
-
-        Ok(node_id)
+        self.register_entity(hash, node_type::CHANGE)
     }
 
     fn register_tag(&mut self, hash: &Hash) -> PristineResult<NodeId> {
-        // Check if already registered
-        {
-            let table = self.txn.open_table(INTERNAL)?;
-            let result = table.get(hash.as_bytes())?;
-            if let Some(value) = result {
-                return Ok(NodeId::new(value.value()));
-            }
-        }
-
-        // Allocate a new ID
-        let id = self.next_node_id.fetch_add(1, Ordering::SeqCst);
-        let node_id = NodeId::new(id);
-
-        // Insert into both tables
-        {
-            let mut external = self.txn.open_table(EXTERNAL)?;
-            external.insert(id, hash.as_bytes())?;
-        }
-        {
-            let mut internal = self.txn.open_table(INTERNAL)?;
-            internal.insert(hash.as_bytes(), id)?;
-        }
-        {
-            let mut node_types = self.txn.open_table(NODE_TYPES)?;
-            node_types.insert(id, node_type::TAG)?;
-        }
-
-        Ok(node_id)
+        self.register_entity(hash, node_type::TAG)
     }
 
     fn register_attestation(&mut self, hash: &Hash) -> PristineResult<NodeId> {
-        // Check if already registered
-        {
-            let table = self.txn.open_table(INTERNAL)?;
-            let result = table.get(hash.as_bytes())?;
-            if let Some(value) = result {
-                return Ok(NodeId::new(value.value()));
-            }
-        }
-
-        // Allocate a new ID
-        let id = self.next_node_id.fetch_add(1, Ordering::SeqCst);
-        let node_id = NodeId::new(id);
-
-        // Insert into both tables
-        {
-            let mut external = self.txn.open_table(EXTERNAL)?;
-            external.insert(id, hash.as_bytes())?;
-        }
-        {
-            let mut internal = self.txn.open_table(INTERNAL)?;
-            internal.insert(hash.as_bytes(), id)?;
-        }
-        {
-            let mut node_types = self.txn.open_table(NODE_TYPES)?;
-            node_types.insert(id, node_type::ATTESTATION)?;
-        }
-
-        Ok(node_id)
+        self.register_entity(hash, node_type::ATTESTATION)
     }
 
     fn register_provenance(&mut self, hash: &Hash) -> PristineResult<NodeId> {
-        // Check if already registered
-        {
-            let table = self.txn.open_table(INTERNAL)?;
-            let result = table.get(hash.as_bytes())?;
-            if let Some(value) = result {
-                return Ok(NodeId::new(value.value()));
-            }
-        }
-
-        // Allocate a new ID
-        let id = self.next_node_id.fetch_add(1, Ordering::SeqCst);
-        let node_id = NodeId::new(id);
-
-        // Insert into both tables
-        {
-            let mut external = self.txn.open_table(EXTERNAL)?;
-            external.insert(id, hash.as_bytes())?;
-        }
-        {
-            let mut internal = self.txn.open_table(INTERNAL)?;
-            internal.insert(hash.as_bytes(), id)?;
-        }
-        {
-            let mut node_types = self.txn.open_table(NODE_TYPES)?;
-            node_types.insert(id, node_type::PROVENANCE)?;
-        }
-
-        Ok(node_id)
+        self.register_entity(hash, node_type::PROVENANCE)
     }
 
     fn put_graph(
@@ -605,7 +537,7 @@ impl<'a> MutTxnT for WriteTxn<'a> {
 
         // Store the merkle state at this sequence
         {
-            let mut table = self.txn.open_table(TAGS)?;
+            let mut table = self.txn.open_table(MERKLE_CHAIN)?;
             let key = encode_view_seq(view.id, seq);
             table.insert(&key, view.state.as_bytes())?;
         }
@@ -655,9 +587,9 @@ impl<'a> MutTxnT for WriteTxn<'a> {
             table.remove(&key)?;
         }
 
-        // Remove from TAGS (the merkle state at this sequence)
+        // Remove from MERKLE_CHAIN (the merkle state at this sequence)
         {
-            let mut table = self.txn.open_table(TAGS)?;
+            let mut table = self.txn.open_table(MERKLE_CHAIN)?;
             let key = encode_view_seq(view.id, seq);
             table.remove(&key)?;
         }
@@ -729,9 +661,9 @@ impl<'a> MutTxnT for WriteTxn<'a> {
 
             view.state = view.state.next(&hash);
 
-            // Update TAGS with the new merkle state at this sequence
+            // Update MERKLE_CHAIN with the new merkle state at this sequence
             {
-                let mut table = self.txn.open_table(TAGS)?;
+                let mut table = self.txn.open_table(MERKLE_CHAIN)?;
                 let key = encode_view_seq(view.id, s);
                 table.insert(&key, view.state.as_bytes())?;
             }
@@ -840,9 +772,9 @@ impl<'a> MutTxnT for WriteTxn<'a> {
 
             view.state = view.state.next(&hash);
 
-            // Update TAGS with the new merkle state at this sequence
+            // Update MERKLE_CHAIN with the new merkle state at this sequence
             {
-                let mut table = self.txn.open_table(TAGS)?;
+                let mut table = self.txn.open_table(MERKLE_CHAIN)?;
                 let key = encode_view_seq(view.id, s);
                 table.insert(&key, view.state.as_bytes())?;
             }
@@ -915,10 +847,10 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         // Remove all state/sequence mappings from STATES table
         {
             let mut table = self.txn.open_table(STATES)?;
-            let tags_table = self.txn.open_table(TAGS)?;
+            let merkle_table = self.txn.open_table(MERKLE_CHAIN)?;
             for seq in 0..view.change_count {
                 let key = encode_view_seq(view.id, seq);
-                if let Some(merkle_bytes) = tags_table.get(&key)? {
+                if let Some(merkle_bytes) = merkle_table.get(&key)? {
                     let merkle = merkle_bytes.value();
                     let state_key = encode_view_merkle(view.id, merkle);
                     table.remove(&state_key)?;
@@ -926,14 +858,18 @@ impl<'a> MutTxnT for WriteTxn<'a> {
             }
         }
 
-        // Remove all tag entries from TAGS table
+        // Remove all entries from MERKLE_CHAIN table
         {
-            let mut table = self.txn.open_table(TAGS)?;
+            let mut table = self.txn.open_table(MERKLE_CHAIN)?;
             for seq in 0..view.change_count {
                 let key = encode_view_seq(view.id, seq);
                 table.remove(&key)?;
             }
         }
+
+        // Remove all named tags for this view from TAG_RECORDS + TAG_NAME_INDEX
+        use crate::pristine::traits::tag::TagMutTxnT;
+        self.del_tags_for_view(&view.name)?;
 
         Ok(())
     }

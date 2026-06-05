@@ -385,6 +385,17 @@ enum ImportedCommitKind {
 }
 ```
 
+**Performance note**: The post-import classification loop calls
+`GIT_SHA_INDEX` lookups and `put_tag` for each newly imported commit.
+For large incremental imports (hundreds of new commits), the per-call
+`open_table` overhead in redb (~20μs per call, mutex on system catalog)
+can add up. If this becomes a bottleneck, follow the `CachedGraphTxn`
+pattern from `atomic-core/src/pristine/txn/read.rs`: pre-open the
+`TAG_RECORDS`, `TAG_NAME_INDEX`, and `GIT_SHA_INDEX` table handles once
+before the loop and reuse them for all iterations. This is the same
+optimization that solved the parallel git import performance issue
+with `GRAPH`/`INODE_GRAPH` table opens.
+
 **Classification algorithm**:
 
 ```
@@ -607,25 +618,6 @@ not a requirement.
 | 2.11 | Workflow documentation | all above | half day |
 
 **Total Part 2**: ~10 days
-
----
-
-## Part 3: Shadow Mode (Future)
-
-Once Parts 1 and 2 are in place, the shadow mode design from
-`git-shadow-tasks.md` simplifies dramatically:
-
-- **`post-commit` hook** → calls `atomic git import --incremental`
-- **`post-merge` hook** → calls `atomic git import --incremental`
-  (squash classification creates ReviewGate tags automatically)
-- **`post-rewrite` hook** → `--incremental` with `GIT_SHA_INDEX` detects
-  that rebased commits are new SHAs for equivalent content
-- **Provenance edges** (`Rewrote`, `Absorbed`) → link to ReviewGate tag
-  metadata instead of a parallel data model
-
-Shadow mode becomes a hook installer + the existing import pipeline. No
-new data model, no new commands, no new tables beyond what Parts 1 and 2
-already provide.
 
 ---
 

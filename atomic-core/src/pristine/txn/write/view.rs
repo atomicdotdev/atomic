@@ -64,7 +64,7 @@ impl<'a> ViewTxnT for WriteTxn<'a> {
     ) -> PristineResult<Box<dyn Iterator<Item = Result<(u64, NodeId, Merkle), PristineError>> + '_>>
     {
         let changes_table = self.txn.open_table(VIEW_CHANGES)?;
-        let tags_table = self.txn.open_table(TAGS)?;
+        let tags_table = self.txn.open_table(MERKLE_CHAIN)?;
 
         let view_id = view.id;
         let start_key = encode_view_seq(view_id, from_seq);

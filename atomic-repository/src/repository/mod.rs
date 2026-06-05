@@ -41,7 +41,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use atomic_core::change::{Author, Change, ChangeHeader, GraphOp};
+use atomic_core::change::{Change, ChangeHeader, GraphOp};
 use atomic_core::output::repo::{materialize_view, MaterializeOptions, MaterializeResult};
 use atomic_core::output::FileSystem;
 use atomic_core::output::WorkingCopy;
@@ -63,7 +63,7 @@ use crate::status::{
     collect_working_copy_files_with_rules, hash_file_contents, FileStatus, FileStatusEntry,
     RepositoryStatus, StatusOptions,
 };
-use crate::tags::{save_tag, save_tag_force, validate_tag_name, Tag, TagFilter, TagOptions};
+
 use crate::tracking::{
     add_to_tree, collect_files_for_tracking_with_rules, get_inode, is_tracked, list_tracked,
     move_tracked, normalize_path, normalize_path_with_root, remove_from_tree,
@@ -120,6 +120,7 @@ pub use insert::{
 };
 pub use provenance_summary::ProvenanceSummary;
 pub use semantic_materialize::{CrdtMaterializeOptions, CrdtMaterializeOutcome};
+pub use tags::{deserialize_tag, serialize_tag};
 pub use vault_embeddings::{hash_embed, EmbedConfig, TextChunk};
 pub use vault_goal::{
     GoalInfo, GoalStartOptions, GoalStartResult, GoalStopOptions, GoalStopResult,

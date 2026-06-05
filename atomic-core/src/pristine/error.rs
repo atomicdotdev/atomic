@@ -220,6 +220,18 @@ pub enum PristineError {
         message: String,
     },
 
+    /// Ambiguous SHA prefix
+    ///
+    /// The given SHA prefix matches more than one entry in the
+    /// `GIT_SHA_INDEX` table. The caller should provide more characters
+    /// to disambiguate.
+    AmbiguousPrefix {
+        /// The prefix that was looked up
+        prefix: String,
+        /// The full SHAs that matched (may be truncated for display)
+        matches: Vec<String>,
+    },
+
     // Serialization Errors
     /// Failed to serialize or deserialize data
     ///
@@ -283,6 +295,16 @@ impl fmt::Display for PristineError {
                 write!(f, "block not found for position {}:{}", change, pos)
             }
             Self::Inconsistent { message } => write!(f, "inconsistent state: {}", message),
+
+            // Ambiguity errors
+            Self::AmbiguousPrefix { prefix, matches } => {
+                write!(
+                    f,
+                    "ambiguous SHA prefix '{}': matches {}",
+                    prefix,
+                    matches.join(", ")
+                )
+            }
 
             // Serialization errors
             Self::Serialization { message } => write!(f, "serialization error: {}", message),

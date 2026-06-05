@@ -6,7 +6,9 @@
 use redb::{ReadTransaction, ReadableTable, ReadableTableMetadata};
 
 use crate::pristine::tables::{VAULT_ENTRIES, VAULT_MANIFEST};
-use crate::pristine::traits::{EmbeddingsTxnT, KgTxnT, VaultEntryMeta, VaultTxnT};
+use crate::pristine::traits::tag::GitShaIndexTxnT;
+use crate::pristine::traits::tag::TagRecord;
+use crate::pristine::traits::{EmbeddingsTxnT, KgTxnT, TagTxnT, VaultEntryMeta, VaultTxnT};
 use crate::pristine::vault::{EmbeddingRecord, KgEdge, KgNode, SearchResult};
 use crate::pristine::{VaultEntry, VaultEntryType, VaultManifest};
 use crate::types::{
@@ -16,6 +18,7 @@ use crate::types::{
 
 use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
+use crate::pristine::tables::{TAG_NAME_INDEX, TAG_RECORDS};
 use crate::pristine::traits::{
     FileIndexEntry, FileIndexMetadata, GraphTxnT, TreeTxnT, ViewState, ViewTxnT,
 };
@@ -366,7 +369,7 @@ impl ViewTxnT for ReadTxn {
     ) -> PristineResult<Box<dyn Iterator<Item = Result<(u64, NodeId, Merkle), PristineError>> + '_>>
     {
         let changes_table = self.txn.open_table(VIEW_CHANGES)?;
-        let tags_table = self.txn.open_table(TAGS)?;
+        let tags_table = self.txn.open_table(MERKLE_CHAIN)?;
 
         let view_id = view.id;
         let start_key = encode_view_seq(view_id, from_seq);
@@ -2015,6 +2018,185 @@ impl<'txn> TreeTxnT for InodePreloadTxn<'txn> {
 
     fn iter_file_index(&self) -> PristineResult<Vec<FileIndexEntry>> {
         self.txn.iter_file_index()
+    }
+}
+
+// TagTxnT Implementation
+
+impl TagTxnT for ReadTxn {
+    fn get_tag(&self, view: &str, name: &str) -> PristineResult<Option<TagRecord>> {
+        let key = format!("{}\0{}", view, name);
+        let entity_id = {
+            let table = match self.txn.open_table(TAG_NAME_INDEX) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(e) => return Err(PristineError::from(e)),
+            };
+            match table.get(key.as_str())? {
+                Some(value) => value.value(),
+                None => return Ok(None),
+            }
+        };
+        let table = match self.txn.open_table(TAG_RECORDS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+        match table.get(entity_id)? {
+            Some(value) => {
+                let record: TagRecord = postcard::from_bytes(value.value()).map_err(|e| {
+                    PristineError::Serialization {
+                        message: format!(
+                            "failed to deserialize TagRecord for '{}\\0{}': {}",
+                            view, name, e
+                        ),
+                    }
+                })?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn list_tags(&self, view: &str) -> PristineResult<Vec<TagRecord>> {
+        let prefix = format!("{}\0", view);
+        let index_table = match self.txn.open_table(TAG_NAME_INDEX) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+        let records_table = match self.txn.open_table(TAG_RECORDS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+
+        let mut results = Vec::new();
+        for item in index_table.range(prefix.as_str()..)? {
+            let (key, value) = item?;
+            let key_str = key.value();
+            if !key_str.starts_with(prefix.as_str()) {
+                break;
+            }
+            let entity_id = value.value();
+            if let Some(record_guard) = records_table.get(entity_id)? {
+                let record: TagRecord =
+                    postcard::from_bytes(record_guard.value()).map_err(|e| {
+                        PristineError::Serialization {
+                            message: format!(
+                                "failed to deserialize TagRecord (entity_id={}): {}",
+                                entity_id, e
+                            ),
+                        }
+                    })?;
+                results.push(record);
+            }
+        }
+        Ok(results)
+    }
+
+    fn list_all_tags(&self) -> PristineResult<Vec<TagRecord>> {
+        let table = match self.txn.open_table(TAG_RECORDS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+
+        let mut results = Vec::new();
+        for item in table.iter()? {
+            let (_key, value) = item?;
+            let record: TagRecord =
+                postcard::from_bytes(value.value()).map_err(|e| PristineError::Serialization {
+                    message: format!("failed to deserialize TagRecord: {}", e),
+                })?;
+            results.push(record);
+        }
+        Ok(results)
+    }
+
+    fn find_tag_by_hash(&self, hash: &Hash) -> PristineResult<Option<TagRecord>> {
+        // Look up the hash in INTERNAL to get entity_id
+        let entity_id = {
+            let table = self.txn.open_table(INTERNAL)?;
+            match table.get(hash.as_bytes())? {
+                Some(value) => value.value(),
+                None => return Ok(None),
+            }
+        };
+
+        // Check NODE_TYPES to verify this is a TAG entity
+        {
+            let table = self.txn.open_table(NODE_TYPES)?;
+            match table.get(entity_id)? {
+                Some(value) if value.value() == node_type::TAG => {}
+                _ => return Ok(None),
+            }
+        }
+
+        // Look up the tag record
+        let table = match self.txn.open_table(TAG_RECORDS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+        match table.get(entity_id)? {
+            Some(value) => {
+                let record: TagRecord = postcard::from_bytes(value.value()).map_err(|e| {
+                    PristineError::Serialization {
+                        message: format!(
+                            "failed to deserialize TagRecord (entity_id={}): {}",
+                            entity_id, e
+                        ),
+                    }
+                })?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+// ============================================================================
+// GIT SHA INDEX
+// ============================================================================
+
+impl GitShaIndexTxnT for ReadTxn {
+    fn get_by_git_sha(&self, sha: &str) -> PristineResult<Option<NodeId>> {
+        let table = match self.txn.open_table(GIT_SHA_INDEX) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+        match table.get(sha)? {
+            Some(v) => Ok(Some(NodeId::new(v.value()))),
+            None => Ok(None),
+        }
+    }
+
+    fn has_git_sha(&self, sha: &str) -> PristineResult<bool> {
+        Ok(self.get_by_git_sha(sha)?.is_some())
+    }
+
+    fn find_by_git_sha_prefix(&self, prefix: &str) -> PristineResult<Option<NodeId>> {
+        let table = match self.txn.open_table(GIT_SHA_INDEX) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+        // Range scan: prefix to prefix + "g" (one past hex range 0-f)
+        let upper = format!("{}g", prefix);
+        let mut matches = Vec::new();
+        for item in table.range(prefix..upper.as_str())? {
+            let (key, value) = item?;
+            matches.push((key.value().to_string(), NodeId::new(value.value())));
+            if matches.len() > 1 {
+                return Err(PristineError::AmbiguousPrefix {
+                    prefix: prefix.to_string(),
+                    matches: matches.iter().map(|(k, _)| k.clone()).collect(),
+                });
+            }
+        }
+        Ok(matches.into_iter().next().map(|(_, id)| id))
     }
 }
 
