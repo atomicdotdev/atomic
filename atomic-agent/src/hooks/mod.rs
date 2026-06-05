@@ -61,6 +61,7 @@ pub mod cline;
 pub mod codex;
 pub mod copilot;
 pub mod cursor;
+pub mod devin;
 pub mod gemini_cli;
 pub mod hermes;
 pub mod manifest;
@@ -248,6 +249,7 @@ impl AgentRegistry {
     /// - Codex (`codex`)
     /// - Copilot (`copilot`)
     /// - Cursor (`cursor`)
+    /// - Devin Desktop (`devin`)
     /// - Gemini CLI (`gemini-cli`)
     /// - Hermes Agent (`hermes`)
     /// - OpenCode (`opencode`)
@@ -260,6 +262,7 @@ impl AgentRegistry {
         registry.register(Box::new(codex::CodexHook::new()));
         registry.register(Box::new(copilot::CopilotHook::new()));
         registry.register(Box::new(cursor::CursorHook::new()));
+        registry.register(Box::new(devin::DevinHook::new()));
         registry.register(Box::new(gemini_cli::GeminiCliHook::new()));
         registry.register(Box::new(hermes::HermesHook::new()));
         registry.register(Box::new(opencode::OpenCodeHook::new()));
