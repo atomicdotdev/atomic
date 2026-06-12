@@ -45,7 +45,9 @@ use atomic_core::change::{Author, Change, ChangeHeader, GraphOp};
 use atomic_core::output::repo::{materialize_view, MaterializeOptions, MaterializeResult};
 use atomic_core::output::FileSystem;
 use atomic_core::output::WorkingCopy;
-use atomic_core::pristine::{GraphTxnT, MutTxnT, Pristine, TreeTxnT, ViewScope, ViewTxnT};
+use atomic_core::pristine::{
+    CachedGraphTxn, GraphTxnT, MutTxnT, Pristine, TreeTxnT, ViewScope, ViewTxnT,
+};
 use atomic_core::record::workflow::retrieve::{RetrieveContentOptions, RetrieveResult};
 use atomic_core::types::{Base32, Hash, Inode, Merkle, NodeId, Position};
 

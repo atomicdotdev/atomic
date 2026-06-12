@@ -127,7 +127,7 @@ pub(crate) use helpers::{
     node_id_to_option_hash, position_to_option_hash, position_to_option_hash_resolved,
     vertex_to_option_hash,
 };
-pub use hunk::globalize_hunk;
+pub use hunk::{globalize_hunk, should_use_opaque_generated_vertices, CRDT_DIFF_LINE_THRESHOLD};
 pub use options::*;
 pub use pipeline::globalize_recorded_file;
 pub use resolve::*;

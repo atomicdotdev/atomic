@@ -210,6 +210,27 @@ impl Repository {
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        // ── Post-unrecord: invalidate file index for affected paths ───
+        //
+        // After removing a change from VIEW_CHANGES, the FILE_INDEX is
+        // stale — it still has entries keyed to the old content hashes.
+        // This causes `status` to think files are clean when they're not.
+        //
+        // We do NOT re-materialize the working copy (that would overwrite
+        // the user's disk changes). Instead, we just delete FILE_INDEX
+        // entries for affected paths so that the next `status` call does
+        // a full content comparison against the graph.
+        if let Ok(change) = self.load_change(hash) {
+            if let Ok(mut idx_txn) = self.pristine.write_txn() {
+                for op in change.hunks() {
+                    if let Some(p) = op.path() {
+                        let _ = idx_txn.del_file_index(p);
+                    }
+                }
+                let _ = idx_txn.commit();
+            }
+        }
+
         // Build outcome
         let mut outcome = UnrecordOutcome::new(vec![*hash], view.state, view.change_count);
         outcome.stats.direct_unrecords = 1;

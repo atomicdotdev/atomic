@@ -43,14 +43,11 @@
 //! These are tracked in the workspace for later resolution.
 
 use crate::change::{Change, EdgeUpdate, NewEdge};
-use crate::pristine::{GraphTxnT, MutTxnT, TreeTxnT};
-use crate::types::{
-    ChangePosition, EdgeFlags, EdgeKind, GraphNode, Hash, Inode, NodeId, Position,
-    SerializedGraphEdge,
-};
+use crate::pristine::GraphTxnT;
+use crate::types::{ChangePosition, EdgeKind, GraphNode, Hash, NodeId, Position};
 
 use super::error::LocalApplyError;
-use super::graph_batch::GraphWriteBatch;
+use super::graph_batch::{add_edge_with_reverse, CachedWriteGraphTxn};
 use super::position::{
     resolve_inode, resolve_introduced_by, resolve_position, resolve_vertex as resolve_exact_vertex,
 };
@@ -80,8 +77,8 @@ use super::workspace::Workspace;
 /// - `DependencyMissing`: Referenced change not found
 /// - `BlockNotFound`: Source or target span doesn't exist
 /// - `Internal`: Database error
-pub fn write_edge_map<T: MutTxnT>(
-    txn: &mut T,
+pub fn write_edge_map(
+    txn: &mut CachedWriteGraphTxn<'_, '_>,
     workspace: &mut Workspace,
     change_id: NodeId,
     edge_update: &EdgeUpdate<Option<Hash>>,
@@ -90,31 +87,6 @@ pub fn write_edge_map<T: MutTxnT>(
     // Process each edge in the map
     for edge in &edge_update.edges {
         write_new_edge(txn, workspace, change_id, &edge_update.inode, edge, change)?;
-    }
-
-    Ok(())
-}
-
-/// Batched variant of [`write_edge_map`] that keeps graph tables open across
-/// the full hunk pass.
-pub fn write_edge_map_batched<T: GraphTxnT + TreeTxnT>(
-    txn: &T,
-    graph_batch: &mut GraphWriteBatch<'_>,
-    workspace: &mut Workspace,
-    change_id: NodeId,
-    edge_update: &EdgeUpdate<Option<Hash>>,
-    change: &Change,
-) -> Result<(), LocalApplyError> {
-    for edge in &edge_update.edges {
-        write_new_edge_batched(
-            txn,
-            graph_batch,
-            workspace,
-            change_id,
-            &edge_update.inode,
-            edge,
-            change,
-        )?;
     }
 
     Ok(())
@@ -160,8 +132,8 @@ pub(super) fn resolve_vertex<T: GraphTxnT>(
 /// * `inode` - File inode position for indexing
 /// * `edge` - The edge to write
 /// * `change` - Full change for dependency checking
-fn write_new_edge<T: MutTxnT>(
-    txn: &mut T,
+fn write_new_edge(
+    txn: &mut CachedWriteGraphTxn<'_, '_>,
     workspace: &mut Workspace,
     change_id: NodeId,
     inode: &Position<Option<Hash>>,
@@ -252,77 +224,6 @@ fn write_new_edge<T: MutTxnT>(
     Ok(())
 }
 
-fn write_new_edge_batched<T: GraphTxnT + TreeTxnT>(
-    txn: &T,
-    graph_batch: &mut GraphWriteBatch<'_>,
-    workspace: &mut Workspace,
-    change_id: NodeId,
-    inode: &Position<Option<Hash>>,
-    edge: &NewEdge<Option<Hash>>,
-    change: &Change,
-) -> Result<(), LocalApplyError> {
-    log::debug!(
-        "write_new_edge_batched: flag={:?} from={:?} to={:?}",
-        edge.flag,
-        edge.from,
-        edge.to
-    );
-
-    let _ = resolve_introduced_by(txn, &edge.introduced_by, change_id)?;
-
-    let source_pos = resolve_position(txn, &edge.from, change_id)?;
-    let source = resolve_vertex(txn, source_pos, true)?;
-
-    let exact_target = resolve_exact_vertex(txn, &edge.to, change_id)?;
-    let mut target =
-        if graph_batch
-            .has_graph_vertex(exact_target)
-            .map_err(|e| LocalApplyError::Internal {
-                message: format!("Failed to check target vertex: {}", e),
-            })?
-        {
-            exact_target
-        } else {
-            let target_pos = resolve_position(txn, &edge.to.start_pos(), change_id)?;
-            resolve_vertex(txn, target_pos, false)?
-        };
-
-    let resolved_inode = resolve_inode(txn, inode, change_id)?;
-    let kind = EdgeKind::from_flags(edge.flag);
-
-    if kind.is_some_and(|k| k.is_folder()) {
-        workspace.mark_rooted(target.start_pos());
-    }
-
-    let target_end_pos = resolve_position(txn, &edge.to.end_pos(), change_id)?;
-    if target.end > target_end_pos.pos {
-        target = GraphNode {
-            change: target.change,
-            start: target.start,
-            end: target_end_pos.pos,
-        };
-    }
-
-    if kind.is_some_and(|k| k.is_deleted()) {
-        collect_pseudo_edges_for_reconnection(txn, workspace, target)?;
-    }
-
-    add_edge_with_reverse_batched(
-        graph_batch,
-        resolved_inode,
-        edge.flag,
-        source,
-        target,
-        change_id,
-    )?;
-
-    if kind.is_some_and(|k| k.is_deleted() && !k.is_folder()) {
-        collect_zombie_context(txn, workspace, change, edge, change_id)?;
-    }
-
-    Ok(())
-}
-
 // Span Finding
 
 /// Find the source span for an edge operation.
@@ -393,116 +294,6 @@ pub fn find_target_vertex<T: GraphTxnT>(
 
     txn.find_block(pos)
         .map_err(|_| LocalApplyError::BlockNotFound { position: pos })
-}
-
-// Edge Operations
-
-/// Remove a forward edge and its reverse (PARENT) counterpart from
-/// GRAPH and INODE_GRAPH.
-///
-/// Errors are silently ignored (the edge may not exist if this is the
-/// first time the graph is being written).
-#[allow(dead_code)]
-fn del_edge_with_reverse<T: MutTxnT>(
-    txn: &mut T,
-    inode: Option<Inode>,
-    flag: EdgeFlags,
-    source: GraphNode<NodeId>,
-    dest: GraphNode<NodeId>,
-    introduced_by: NodeId,
-) -> Result<(), LocalApplyError> {
-    let forward_edge = SerializedGraphEdge::new(flag, dest.start_pos(), introduced_by);
-    let reverse_flag = flag | EdgeFlags::PARENT;
-    let reverse_edge = SerializedGraphEdge::new(reverse_flag, source.end_pos(), introduced_by);
-
-    let _ = txn.del_graph(source, forward_edge);
-    let _ = txn.del_graph(dest, reverse_edge);
-
-    if let Some(inode_val) = inode {
-        let _ = txn.del_inode_graph(inode_val, source, forward_edge);
-        let _ = txn.del_inode_graph(inode_val, dest, reverse_edge);
-    }
-
-    Ok(())
-}
-
-/// Write an edge and its reverse to the graph.
-///
-/// In the Atomic graph model, edges come in pairs:
-/// - Forward edge: `source → target` with base flags
-/// - Reverse edge: `target → source` with PARENT flag added
-///
-/// Writes both edges to the global GRAPH table and, when an inode is
-/// provided, to the INODE_GRAPH secondary index.
-fn add_edge_with_reverse<T: MutTxnT>(
-    txn: &mut T,
-    inode: Option<Inode>,
-    flag: EdgeFlags,
-    source: GraphNode<NodeId>,
-    dest: GraphNode<NodeId>,
-    introduced_by: NodeId,
-) -> Result<(), LocalApplyError> {
-    // Create forward edge
-    let forward_edge = SerializedGraphEdge::new(flag, dest.start_pos(), introduced_by);
-
-    // Create reverse edge (same flags + PARENT)
-    let reverse_flag = flag | EdgeFlags::PARENT;
-    let reverse_edge = SerializedGraphEdge::new(reverse_flag, source.end_pos(), introduced_by);
-
-    log::debug!(
-        "add_edge_with_reverse: flag={:?} source=[{:?} {:?}:{:?}] dest=[{:?} {:?}:{:?}] introduced_by={:?}",
-        flag, source.change, source.start, source.end,
-        dest.change, dest.start, dest.end,
-        introduced_by
-    );
-
-    // Write to global GRAPH
-    txn.put_graph(source, forward_edge)
-        .map_err(|e| LocalApplyError::Internal {
-            message: format!("Failed to add forward edge: {}", e),
-        })?;
-
-    txn.put_graph(dest, reverse_edge)
-        .map_err(|e| LocalApplyError::Internal {
-            message: format!("Failed to add reverse edge: {}", e),
-        })?;
-
-    // Write to INODE_GRAPH secondary index
-    if let Some(inode_val) = inode {
-        txn.put_inode_graph(inode_val, source, forward_edge)
-            .map_err(|e| LocalApplyError::Internal {
-                message: format!("Failed to add forward inode edge: {}", e),
-            })?;
-
-        txn.put_inode_graph(inode_val, dest, reverse_edge)
-            .map_err(|e| LocalApplyError::Internal {
-                message: format!("Failed to add reverse inode edge: {}", e),
-            })?;
-    }
-
-    Ok(())
-}
-
-fn add_edge_with_reverse_batched(
-    graph_batch: &mut GraphWriteBatch<'_>,
-    inode: Option<Inode>,
-    flag: EdgeFlags,
-    source: GraphNode<NodeId>,
-    dest: GraphNode<NodeId>,
-    introduced_by: NodeId,
-) -> Result<(), LocalApplyError> {
-    log::debug!(
-        "add_edge_with_reverse_batched: flag={:?} source=[{:?} {:?}:{:?}] dest=[{:?} {:?}:{:?}] introduced_by={:?}",
-        flag, source.change, source.start, source.end,
-        dest.change, dest.start, dest.end,
-        introduced_by
-    );
-
-    graph_batch
-        .add_edge_with_reverse(inode, flag, source, dest, introduced_by)
-        .map_err(|e| LocalApplyError::Internal {
-            message: format!("Failed to add edge pair: {}", e),
-        })
 }
 
 // Deletion Handling
@@ -671,7 +462,7 @@ fn check_vertex_for_zombies<T: GraphTxnT>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ChangePosition;
+    use crate::types::{ChangePosition, EdgeFlags, SerializedGraphEdge};
 
     // Test Helpers
 

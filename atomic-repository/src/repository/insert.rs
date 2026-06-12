@@ -504,7 +504,7 @@ where
 }
 
 fn import_direct_write_insertion(
-    batch: &mut atomic_core::apply::GraphWriteBatch<'_>,
+    batch: &mut atomic_core::apply::CachedWriteGraphTxn<'_, '_>,
     change_id: NodeId,
     insertion: &Insertion<Option<Hash>>,
     by_end: &mut HashMap<ChangePosition, GraphNode<NodeId>>,
@@ -1335,7 +1335,7 @@ impl Repository {
         }
 
         {
-            let mut graph_batch = atomic_core::apply::GraphWriteBatch::new(&*txn)
+            let mut graph_batch = atomic_core::apply::CachedWriteGraphTxn::new(&*txn)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             for (inode, flag, source, target) in pending_edges {
                 graph_batch
@@ -1416,7 +1416,7 @@ impl Repository {
 
         let graph_start = std::time::Instant::now();
         {
-            let mut batch = atomic_core::apply::GraphWriteBatch::new(&*txn)
+            let mut batch = atomic_core::apply::CachedWriteGraphTxn::new(&*txn)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let mut inode_sources: HashSet<(u64, GraphNode<NodeId>)> = HashSet::new();
             let mut inode_terminal_candidates: Vec<(
