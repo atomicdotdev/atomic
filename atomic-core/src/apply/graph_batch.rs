@@ -1,8 +1,9 @@
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 use redb::{MultimapTable, ReadableMultimapTable};
 
+use crate::pristine::span_index::VertexSpanIndex;
 use crate::pristine::tables::{
     decode_vertex, encode_inode_vertex, encode_vertex, GRAPH, INODE_GRAPH,
 };
@@ -15,37 +16,6 @@ use crate::types::{
 };
 
 use super::error::LocalApplyError;
-
-/// In-memory index of a change's vertex spans, keyed by change id.
-///
-/// `find_block` / `find_block_end` would otherwise scan the GRAPH B-tree range
-/// for a change on every call. During a large modify (thousands of hunks) the
-/// scanned change accumulates thousands of spans, making each lookup O(n) and
-/// the whole apply pass O(n²). This index loads a change's spans once (a single
-/// range scan) and answers subsequent lookups in O(log n) against an in-memory
-/// `BTreeSet`, staying current as new spans are written during the batch.
-///
-/// This is the patch-theory analogue of the in-memory vertex cache the
-/// git-import path already uses: the alive-vertex graph is the pointer, and we
-/// write new spans straight back into the in-memory set while persisting edges
-/// to the B-tree.
-#[derive(Default)]
-struct VertexSpanIndex {
-    /// change_id -> sorted set of (start, end) spans present in GRAPH.
-    spans: HashMap<u64, BTreeSet<(u64, u64)>>,
-}
-
-impl VertexSpanIndex {
-    /// Record a newly written span for an already-tracked change.
-    ///
-    /// Untracked changes are skipped: they will be fully loaded from GRAPH
-    /// (which already contains this write) the first time they are queried.
-    fn note_write(&mut self, change_id: u64, start: u64, end: u64) {
-        if let Some(set) = self.spans.get_mut(&change_id) {
-            set.insert((start, end));
-        }
-    }
-}
 
 /// Cached write-side graph transaction.
 ///
@@ -83,10 +53,8 @@ impl<'txn, 'a> CachedWriteGraphTxn<'txn, 'a> {
     /// calls are no-ops. Writes during the batch keep the set current via
     /// [`VertexSpanIndex::note_write`], so the scan never has to be repeated.
     fn ensure_loaded(&self, change_id: u64) -> PristineResult<()> {
-        {
-            if self.index.borrow().spans.contains_key(&change_id) {
-                return Ok(());
-            }
+        if self.index.borrow().contains_change(change_id) {
+            return Ok(());
         }
         let start_key = encode_vertex(change_id, 0, 0);
         let end_key = encode_vertex(change_id, u64::MAX, u64::MAX);
@@ -99,7 +67,7 @@ impl<'txn, 'a> CachedWriteGraphTxn<'txn, 'a> {
             }
             set.insert((v_start, v_end));
         }
-        self.index.borrow_mut().spans.insert(change_id, set);
+        self.index.borrow_mut().insert_change(change_id, set);
         Ok(())
     }
 
@@ -236,34 +204,13 @@ impl<'txn, 'a> GraphTxnT for CachedWriteGraphTxn<'txn, 'a> {
         let change_id = pos.change.get();
         let target_pos = pos.pos.get();
         self.ensure_loaded(change_id)?;
-        let index = self.index.borrow();
 
-        if let Some(set) = index.spans.get(&change_id) {
-            // Prefer the non-empty span containing target_pos. Spans within a
-            // change do not overlap, so the candidate is the greatest-start
-            // non-empty span with start <= target_pos; if its range doesn't
-            // contain target_pos, no non-empty span does.
-            for &(s, e) in set.range(..=(target_pos, u64::MAX)).rev() {
-                if s == e {
-                    continue;
-                }
-                if s <= target_pos && target_pos < e {
-                    return Ok(GraphNode {
-                        change: NodeId::new(change_id),
-                        start: ChangePosition::new(s),
-                        end: ChangePosition::new(e),
-                    });
-                }
-                break;
-            }
-            // Fall back to an empty marker at exactly target_pos.
-            if set.contains(&(target_pos, target_pos)) {
-                return Ok(GraphNode {
-                    change: NodeId::new(change_id),
-                    start: ChangePosition::new(target_pos),
-                    end: ChangePosition::new(target_pos),
-                });
-            }
+        if let Some((s, e)) = self.index.borrow().find_block(change_id, target_pos) {
+            return Ok(GraphNode {
+                change: NodeId::new(change_id),
+                start: ChangePosition::new(s),
+                end: ChangePosition::new(e),
+            });
         }
 
         Err(PristineError::BlockNotFound {
@@ -280,43 +227,13 @@ impl<'txn, 'a> GraphTxnT for CachedWriteGraphTxn<'txn, 'a> {
         let change_id = pos.change.get();
         let target_pos = pos.pos.get();
         self.ensure_loaded(change_id)?;
-        let index = self.index.borrow();
 
-        if let Some(set) = index.spans.get(&change_id) {
-            // An empty marker at exactly target_pos wins (e.g. inode markers
-            // like V[9:9] over a name vertex V[0:9] that also ends at 9).
-            if set.contains(&(target_pos, target_pos)) {
-                return Ok(GraphNode {
-                    change: NodeId::new(change_id),
-                    start: ChangePosition::new(target_pos),
-                    end: ChangePosition::new(target_pos),
-                });
-            }
-            // The non-empty span immediately left of target_pos either ends
-            // exactly at target_pos (an up-context predecessor) or contains it.
-            for &(s, e) in set.range(..(target_pos, 0u64)).rev() {
-                if s == e {
-                    continue;
-                }
-                if e == target_pos || (s <= target_pos && target_pos < e) {
-                    return Ok(GraphNode {
-                        change: NodeId::new(change_id),
-                        start: ChangePosition::new(s),
-                        end: ChangePosition::new(e),
-                    });
-                }
-                break;
-            }
-            // Otherwise a non-empty span starting exactly at target_pos contains it.
-            for &(s, e) in set.range((target_pos, 0u64)..=(target_pos, u64::MAX)) {
-                if s != e {
-                    return Ok(GraphNode {
-                        change: NodeId::new(change_id),
-                        start: ChangePosition::new(s),
-                        end: ChangePosition::new(e),
-                    });
-                }
-            }
+        if let Some((s, e)) = self.index.borrow().find_block_end(change_id, target_pos) {
+            return Ok(GraphNode {
+                change: NodeId::new(change_id),
+                start: ChangePosition::new(s),
+                end: ChangePosition::new(e),
+            });
         }
 
         Err(PristineError::BlockNotFound {

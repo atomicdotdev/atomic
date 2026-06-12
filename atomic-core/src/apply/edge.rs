@@ -83,10 +83,19 @@ pub fn write_edge_map(
     change_id: NodeId,
     edge_update: &EdgeUpdate<Option<Hash>>,
     change: &Change,
+    detect_conflicts: bool,
 ) -> Result<(), LocalApplyError> {
     // Process each edge in the map
     for edge in &edge_update.edges {
-        write_new_edge(txn, workspace, change_id, &edge_update.inode, edge, change)?;
+        write_new_edge(
+            txn,
+            workspace,
+            change_id,
+            &edge_update.inode,
+            edge,
+            change,
+            detect_conflicts,
+        )?;
     }
 
     Ok(())
@@ -139,6 +148,7 @@ fn write_new_edge(
     inode: &Position<Option<Hash>>,
     edge: &NewEdge<Option<Hash>>,
     change: &Change,
+    detect_conflicts: bool,
 ) -> Result<(), LocalApplyError> {
     log::debug!(
         "write_new_edge: flag={:?} from={:?} to={:?}",
@@ -195,12 +205,12 @@ fn write_new_edge(
         };
     }
 
-    // Handle deletion: collect pseudo-edges for reconnection
-    if kind.is_some_and(|k| k.is_deleted()) {
-        log::debug!("write_new_edge: collect_pseudo_edges starting");
-        collect_pseudo_edges_for_reconnection(txn, workspace, target)?;
-        log::debug!("write_new_edge: collect_pseudo_edges complete");
-    }
+    // NOTE: no pseudo-edge reconnection pass here. The additive model keeps the
+    // original alive edge in place and reconnects across deleted spans at read
+    // time (`retrieve_graph`'s walk-through-dead). The former
+    // `collect_pseudo_edges_for_reconnection` only populated a workspace
+    // parent/child map that nothing in the apply pipeline consumed, so it was
+    // an `iter_adjacent` per deletion doing no work.
 
     // ADDITIVE-ONLY: do NOT delete the old edge.  In a patch-theory
     // graph database, every change adds new edges — it never removes
@@ -215,7 +225,7 @@ fn write_new_edge(
     add_edge_with_reverse(txn, resolved_inode, edge.flag, source, target, change_id)?;
 
     // For non-folder deletions, check for zombie context
-    if kind.is_some_and(|k| k.is_deleted() && !k.is_folder()) {
+    if detect_conflicts && kind.is_some_and(|k| k.is_deleted() && !k.is_folder()) {
         log::debug!("write_new_edge: collect_zombie_context starting");
         collect_zombie_context(txn, workspace, change, edge, change_id)?;
         log::debug!("write_new_edge: collect_zombie_context complete");
@@ -297,46 +307,6 @@ pub fn find_target_vertex<T: GraphTxnT>(
 }
 
 // Deletion Handling
-
-/// Collect pseudo-edges for reconnection when deleting a span.
-///
-/// When we delete content, we may need to reconnect the graph to maintain
-/// connectivity. This collects information about children that need
-/// reconnection to their grandparents.
-///
-/// # Arguments
-///
-/// * `txn` - Transaction for graph queries
-/// * `workspace` - Workspace to track reconnection info
-/// * `target` - Span being deleted
-fn collect_pseudo_edges_for_reconnection<T: GraphTxnT>(
-    txn: &T,
-    workspace: &mut Workspace,
-    target: GraphNode<NodeId>,
-) -> Result<(), LocalApplyError> {
-    // Skip ROOT span
-    if target.is_root() {
-        return Ok(());
-    }
-
-    // Collect children of the target span that need reconnection.
-    // Use typed `iter_forward` — we want all alive forward edges
-    // (block, folder, pseudo) but NOT deleted ones.
-    let children = txn
-        .iter_forward(target, false)
-        .map_err(|e| LocalApplyError::Internal {
-            message: format!("Failed to iterate children: {}", e),
-        })?;
-
-    for child in children {
-        if !child.kind.is_pseudo() {
-            // Track this child as needing reconnection
-            workspace.set_parent(child.dest, target.end_pos());
-        }
-    }
-
-    Ok(())
-}
 
 /// Collect zombie context when deleting content.
 ///

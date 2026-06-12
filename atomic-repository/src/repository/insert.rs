@@ -1983,11 +1983,19 @@ impl Repository {
     pub fn write_recorded(
         &self,
         outcome: &RecordOutcome,
-        options: InsertOptions,
+        mut options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
         let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some();
         let change = outcome.change();
         let hash = outcome.hash();
+
+        // A freshly-recorded change is applied to the view it was recorded on.
+        // Its dependency closure is complete by construction, so it cannot
+        // produce zombie or missing-context conflicts. Disable conflict
+        // detection to skip the per-hunk zombie/deleted-context graph scans
+        // (the dominant apply cost on large changes); the graph written is
+        // identical, only the (empty) conflict report is skipped.
+        options.track_conflicts = false;
 
         // Get write transaction
         let mut txn = self

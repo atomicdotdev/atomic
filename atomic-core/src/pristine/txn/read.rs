@@ -1303,6 +1303,13 @@ pub struct CachedGraphTxn<'txn> {
     txn: &'txn ReadTxn,
     graph_table: redb::ReadOnlyMultimapTable<&'static [u8; 24], &'static [u8; 24]>,
     inode_graph_table: redb::ReadOnlyMultimapTable<&'static [u8; 32], &'static [u8; 24]>,
+    /// Lazily-loaded per-change span index, so `find_block` / `find_block_end`
+    /// are O(log n) instead of an O(n) GRAPH range scan per call. A `Mutex`
+    /// (not `RefCell`) keeps the type `Sync`, since a `&CachedGraphTxn` is
+    /// shared across rayon threads during parallel record/materialize; the
+    /// parallel paths use the inode-linear walk and don't hit these finders,
+    /// so the lock is effectively uncontended.
+    span_index: std::sync::Mutex<crate::pristine::span_index::VertexSpanIndex>,
 }
 
 impl<'txn> CachedGraphTxn<'txn> {
@@ -1314,7 +1321,31 @@ impl<'txn> CachedGraphTxn<'txn> {
             txn,
             graph_table,
             inode_graph_table,
+            span_index: std::sync::Mutex::new(Default::default()),
         })
+    }
+
+    /// Load `change_id`'s spans into the in-memory index on first access.
+    fn ensure_span_index(&self, change_id: u64) -> PristineResult<()> {
+        if self.span_index.lock().unwrap().contains_change(change_id) {
+            return Ok(());
+        }
+        let start_key = encode_vertex(change_id, 0, 0);
+        let end_key = encode_vertex(change_id, u64::MAX, u64::MAX);
+        let mut set = std::collections::BTreeSet::new();
+        for result in self.graph_table.range::<&[u8; 24]>(&start_key..=&end_key)? {
+            let (key, _values) = result?;
+            let (v_change, v_start, v_end) = decode_vertex(key.value());
+            if v_change != change_id {
+                continue;
+            }
+            set.insert((v_start, v_end));
+        }
+        self.span_index
+            .lock()
+            .unwrap()
+            .insert_change(change_id, set);
+        Ok(())
     }
 }
 
@@ -1360,43 +1391,21 @@ impl<'txn> GraphTxnT for CachedGraphTxn<'txn> {
             return Ok(GraphNode::ROOT);
         }
 
-        let table = &self.graph_table;
-
         let change_id = pos.change.get();
         let target_pos = pos.pos.get();
+        self.ensure_span_index(change_id)?;
 
-        let start_key = encode_vertex(change_id, 0, 0);
-        let end_key = encode_vertex(change_id, u64::MAX, u64::MAX);
-
-        let mut empty_vertex_match: Option<GraphNode<NodeId>> = None;
-
-        for result in table.range::<&[u8; 24]>(&start_key..=&end_key)? {
-            let (key, _values) = result?;
-            let (v_change, v_start, v_end) = decode_vertex(key.value());
-
-            if v_change != change_id {
-                continue;
-            }
-
-            if v_start != v_end && v_start <= target_pos && target_pos < v_end {
-                return Ok(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                });
-            }
-
-            if v_start == v_end && v_start == target_pos && empty_vertex_match.is_none() {
-                empty_vertex_match = Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                });
-            }
-        }
-
-        if let Some(found) = empty_vertex_match {
-            return Ok(found);
+        if let Some((s, e)) = self
+            .span_index
+            .lock()
+            .unwrap()
+            .find_block(change_id, target_pos)
+        {
+            return Ok(GraphNode {
+                change: NodeId::new(change_id),
+                start: ChangePosition::new(s),
+                end: ChangePosition::new(e),
+            });
         }
 
         Err(PristineError::BlockNotFound {
@@ -1410,46 +1419,21 @@ impl<'txn> GraphTxnT for CachedGraphTxn<'txn> {
             return Ok(GraphNode::ROOT);
         }
 
-        let table = &self.graph_table;
-
         let change_id = pos.change.get();
         let target_pos = pos.pos.get();
+        self.ensure_span_index(change_id)?;
 
-        let empty_key = encode_vertex(change_id, target_pos, target_pos);
-        if table.get(&empty_key)?.next().is_some() {
+        if let Some((s, e)) = self
+            .span_index
+            .lock()
+            .unwrap()
+            .find_block_end(change_id, target_pos)
+        {
             return Ok(GraphNode {
                 change: NodeId::new(change_id),
-                start: ChangePosition::new(target_pos),
-                end: ChangePosition::new(target_pos),
+                start: ChangePosition::new(s),
+                end: ChangePosition::new(e),
             });
-        }
-
-        let start_key = encode_vertex(change_id, 0, 0);
-        let end_key = encode_vertex(change_id, u64::MAX, u64::MAX);
-
-        for result in table.range::<&[u8; 24]>(&start_key..=&end_key)? {
-            let (key, _values) = result?;
-            let (v_change, v_start, v_end) = decode_vertex(key.value());
-
-            if v_change != change_id {
-                continue;
-            }
-
-            if v_end == target_pos && v_start < v_end {
-                return Ok(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                });
-            }
-
-            if v_start <= target_pos && target_pos < v_end {
-                return Ok(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                });
-            }
         }
 
         Err(PristineError::BlockNotFound {

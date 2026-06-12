@@ -89,6 +89,7 @@ pub fn write_new_vertex(
     change_id: NodeId,
     insertion: &Insertion<Option<Hash>>,
     change: &Change,
+    detect_conflicts: bool,
 ) -> Result<(), LocalApplyError> {
     // Create the new span
     let node = GraphNode {
@@ -130,7 +131,9 @@ pub fn write_new_vertex(
         workspace.add_up_context_vertex(up_vertex);
 
         // Check if predecessors was deleted by an unknown change
-        check_deleted_context(txn, workspace, change, up_vertex)?;
+        if detect_conflicts {
+            check_deleted_context(txn, workspace, change, up_vertex)?;
+        }
     }
 
     let exact_inode_successor = resolve_position(txn, &insertion.inode, change_id).ok();
@@ -175,7 +178,9 @@ pub fn write_new_vertex(
         workspace.add_down_context_vertex(down_vertex);
 
         // Check if successors was deleted by an unknown change
-        check_deleted_context(txn, workspace, change, down_vertex)?;
+        if detect_conflicts {
+            check_deleted_context(txn, workspace, change, down_vertex)?;
+        }
     }
 
     // Resolve inode for inode_graph indexing

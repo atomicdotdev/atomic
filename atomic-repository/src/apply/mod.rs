@@ -396,26 +396,48 @@ fn write_hunk(
     change_id: NodeId,
     graph_op: &GraphOp<Option<Hash>>,
     change: &Change,
-    _options: &InsertOptions,
+    options: &InsertOptions,
     stats: &mut InsertStats,
 ) -> InsertResult<()> {
+    // Conflict detection (zombie / deleted-context scanning) is only meaningful
+    // when applying a change that may race with content the change doesn't know
+    // about — i.e. cross-view insert. A freshly-recorded change applied to its
+    // own view (write_recorded sets `track_conflicts = false`) has a complete
+    // dependency closure by construction and cannot conflict, so we skip the
+    // scans. They only populate the conflict report; the graph written is
+    // identical either way.
+    let detect_conflicts = options.track_conflicts;
     for atom_ref in graph_op.atoms() {
         match atom_ref {
             AtomRef::Insertion(insertion) => {
-                write_new_vertex(txn, workspace, change_id, insertion, change)?;
+                write_new_vertex(
+                    txn,
+                    workspace,
+                    change_id,
+                    insertion,
+                    change,
+                    detect_conflicts,
+                )?;
                 stats.atoms_processed += 1;
             }
             AtomRef::EdgeUpdate(edge_update) => {
-                write_edge_map(txn, workspace, change_id, edge_update, change)?;
+                write_edge_map(
+                    txn,
+                    workspace,
+                    change_id,
+                    edge_update,
+                    change,
+                    detect_conflicts,
+                )?;
                 stats.atoms_processed += 1;
             }
             AtomRef::Atom(atom) => match atom {
                 Atom::Insertion(nv) => {
-                    write_new_vertex(txn, workspace, change_id, nv, change)?;
+                    write_new_vertex(txn, workspace, change_id, nv, change, detect_conflicts)?;
                     stats.atoms_processed += 1;
                 }
                 Atom::EdgeUpdate(em) => {
-                    write_edge_map(txn, workspace, change_id, em, change)?;
+                    write_edge_map(txn, workspace, change_id, em, change, detect_conflicts)?;
                     stats.atoms_processed += 1;
                 }
             },
