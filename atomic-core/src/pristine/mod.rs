@@ -21,7 +21,7 @@
 //! │  │  File Tree  │  │Dependencies │  │         State           │  │
 //! │  │             │  │             │  │                         │  │
 //! │  │ TREE        │  │ DEPS        │  │ STATES                  │  │
-//! │  │ REV_TREE    │  │ REV_DEPS    │  │ TAGS                    │  │
+//! │  │ REV_TREE    │  │ REV_DEPS    │  │ MERKLE_CHAIN            │  │
 //! │  │ INODES      │  │             │  │                         │  │
 //! │  │ REV_INODES  │  │             │  │                         │  │
 //! │  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
@@ -132,7 +132,7 @@
 //! | `DEPS` | change_id | `dep_id` | Dependencies (multimap) |
 //! | `REV_DEPS` | dep_id | `change_id` | Reverse dependencies |
 //! | `STATES` | (view_id, merkle) | seq | State → sequence lookup |
-//! | `TAGS` | (view_id, seq) | merkle | Tagged states |
+//! | `MERKLE_CHAIN` | (view_id, seq) | merkle | Per-sequence Merkle state chain |
 //!
 //! # Performance Characteristics
 //!
@@ -163,8 +163,9 @@ pub use inode_graph::{
 pub use tables::directory_flags;
 pub use tables::*;
 pub use traits::{
-    CrdtTxnT, EmbeddingsMutTxnT, EmbeddingsTxnT, FileIndexEntry, FileIndexMetadata, GraphTxnT,
-    KgMutTxnT, KgTxnT, MutTxnT, TreeTxnT, VaultEntryMeta, VaultMutTxnT, VaultTxnT, VertexExt,
+    CrdtTxnT, EmbeddingsMutTxnT, EmbeddingsTxnT, FileIndexEntry, FileIndexMetadata,
+    GitShaIndexMutTxnT, GitShaIndexTxnT, GraphTxnT, KgMutTxnT, KgTxnT, MutTxnT, TagKind,
+    TagMutTxnT, TagRecord, TagTxnT, TreeTxnT, VaultEntryMeta, VaultMutTxnT, VaultTxnT, VertexExt,
     ViewScope, ViewState, ViewTxnT,
 };
 pub use txn::{AdjIterator, CachedGraphTxn, InodePreloadTxn, Pristine, ReadTxn, WriteTxn};

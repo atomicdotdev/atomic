@@ -2175,6 +2175,7 @@ impl ParallelImporter {
         let import_start = Instant::now();
         let mut commits_written = 0usize;
         let mut line_index = ImportLineIndex::default();
+        let mut all_imported_commits: Vec<ImportedCommitInfo> = Vec::new();
 
         for (batch_idx, chunk) in commit_oids.chunks(batch_size).enumerate() {
             let batch_start = batch_idx * batch_size;
@@ -2202,7 +2203,8 @@ impl ParallelImporter {
 
             // Phase 2: Sequential write for this batch
             let write_start = Instant::now();
-            let write_stats = self.phase2_write(repo, &parsed_commits, &mut line_index)?;
+            let (write_stats, batch_imported) =
+                self.phase2_write(repo, &parsed_commits, &mut line_index)?;
             let write_elapsed = write_start.elapsed();
 
             stats.phase2_duration += write_elapsed;
@@ -2213,6 +2215,7 @@ impl ParallelImporter {
 
             commits_written +=
                 write_stats.changes_written + write_stats.empty_commits + write_stats.merge_commits;
+            all_imported_commits.extend(batch_imported);
 
             let total_elapsed = import_start.elapsed();
             let avg_ms = if commits_written > 0 {
@@ -2242,6 +2245,28 @@ impl ParallelImporter {
                 0.0
             },
         ));
+
+        // Post-import classification: detect merge/squash commits and
+        // create ReviewGate tags.
+        if self.options.incremental && !all_imported_commits.is_empty() {
+            let classify_start = Instant::now();
+            match self.classify_and_tag_imports(repo, &all_imported_commits) {
+                Ok(class_stats) => {
+                    if class_stats.merges > 0 || class_stats.squashes > 0 {
+                        print_info(&format!(
+                            "Classification: {} normal, {} merges, {} squashes ({:.1}s)",
+                            class_stats.normal,
+                            class_stats.merges,
+                            class_stats.squashes,
+                            classify_start.elapsed().as_secs_f64()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    print_warning(&format!("Post-import classification failed: {}", e));
+                }
+            }
+        }
 
         // Phase 3: Reconciliation — remove TREE entries for files that
         // don't exist on disk.
@@ -2474,8 +2499,9 @@ impl ParallelImporter {
         repo: &mut Repository,
         commits: &[ParsedCommit],
         line_index: &mut ImportLineIndex,
-    ) -> CliResult<WriteStats> {
+    ) -> CliResult<(WriteStats, Vec<ImportedCommitInfo>)> {
         let mut stats = WriteStats::default();
+        let mut imported_commits = Vec::new();
         let total = commits.len();
         let phase2_start = Instant::now();
         let mut batch_start = Instant::now();
@@ -2502,15 +2528,16 @@ impl ParallelImporter {
 
             // Write the change
             match self.write_commit(repo, parsed, line_index) {
-                Ok(written) => {
-                    if written {
-                        stats.changes_written += 1;
-                    } else if parsed.is_empty {
+                Ok(info) => {
+                    if parsed.is_empty {
                         stats.empty_commits += 1;
-                    } else {
+                    } else if parsed.is_merge {
                         stats.merge_commits += 1;
+                    } else {
+                        stats.changes_written += 1;
                     }
                     stats.files_processed += parsed.files.len();
+                    imported_commits.push(info);
                 }
                 Err(e) => {
                     print_warning(&format!("Failed to write {}: {}", parsed.short_sha, e));
@@ -2558,16 +2585,19 @@ impl ParallelImporter {
             let _ = repo.update_file_index(&index_entries);
         }
 
-        Ok(stats)
+        Ok((stats, imported_commits))
     }
 
     /// Write a single commit to the repository.
+    ///
+    /// Returns metadata about the imported commit for post-import
+    /// classification and ReviewGate tagging.
     fn write_commit(
         &self,
         repo: &mut Repository,
         parsed: &ParsedCommit,
         line_index: &mut ImportLineIndex,
-    ) -> CliResult<bool> {
+    ) -> CliResult<ImportedCommitInfo> {
         use atomic_core::output::memory::Memory;
         use atomic_core::record::workflow::{
             record_added_file, record_deleted_file, record_modified_file, DetectedFile,
@@ -2684,11 +2714,19 @@ impl ParallelImporter {
                 write_outcome.timings.commit_ms,
                 commit_start.elapsed().as_millis()
             ));
+            // Index git SHA → Atomic change in GIT_SHA_INDEX
+            let _ = repo.index_git_sha(&parsed.git_sha, &write_outcome.hash);
             if !graph_deleted_paths.is_empty() {
                 let del_refs: Vec<&str> = graph_deleted_paths.iter().map(|s| s.as_str()).collect();
                 let _ = repo.del_file_index_batch(&del_refs);
             }
-            return Ok(true);
+            return Ok(ImportedCommitInfo {
+                git_sha: parsed.git_sha.clone(),
+                short_sha: parsed.short_sha.clone(),
+                atomic_hash: write_outcome.hash,
+                is_merge: parsed.is_merge,
+                message: parsed.metadata.message.clone(),
+            });
         }
 
         // Track new files so the pristine knows about them before we record.
@@ -3083,6 +3121,8 @@ impl ParallelImporter {
                 Default::default(),
             )
             .map_err(|e| CliError::Internal(e.into()))?;
+        // Index git SHA → Atomic change in GIT_SHA_INDEX
+        let _ = repo.index_git_sha(&parsed.git_sha, &write_outcome.hash);
         let write_ms = write_start.elapsed().as_millis();
         let progress_reported = progress.finish();
         line_index.reseed_from_fallback_write(repo, parsed);
@@ -3155,7 +3195,13 @@ impl ParallelImporter {
             ));
         }
 
-        Ok(true)
+        Ok(ImportedCommitInfo {
+            git_sha: parsed.git_sha.clone(),
+            short_sha: parsed.short_sha.clone(),
+            atomic_hash: write_outcome.hash,
+            is_merge: parsed.is_merge,
+            message: parsed.metadata.message.clone(),
+        })
     }
 
     /// Write an empty commit (no file changes).
@@ -3164,12 +3210,14 @@ impl ParallelImporter {
         repo: &mut Repository,
         parsed: &ParsedCommit,
         header: ChangeHeader,
-    ) -> CliResult<bool> {
+    ) -> CliResult<ImportedCommitInfo> {
         let commit_start = Instant::now();
         let metadata = self.build_git_metadata(parsed, true, false);
         let write_outcome = repo
             .write_import_recorded(header, &[], metadata, &[], Default::default())
             .map_err(|e| CliError::Internal(e.into()))?;
+        // Index git SHA → Atomic change in GIT_SHA_INDEX
+        let _ = repo.index_git_sha(&parsed.git_sha, &write_outcome.hash);
 
         trace_git_import(format!(
             "write {} files=0 recorded=0 add_batch=0ms record=0ms assemble={}ms save={}ms apply={}ms direct_graph={}ms direct_crdt={}ms commit={}ms cleanup=0ms total={}ms empty_commit=true",
@@ -3183,7 +3231,13 @@ impl ParallelImporter {
             commit_start.elapsed().as_millis()
         ));
 
-        Ok(true)
+        Ok(ImportedCommitInfo {
+            git_sha: parsed.git_sha.clone(),
+            short_sha: parsed.short_sha.clone(),
+            atomic_hash: write_outcome.hash,
+            is_merge: parsed.is_merge,
+            message: parsed.metadata.message.clone(),
+        })
     }
 
     /// Build git metadata for the change's unhashed field.
@@ -3235,6 +3289,93 @@ impl ParallelImporter {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // Post-Import Classification
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Classify newly imported commits and create ReviewGate tags for
+    /// merge/squash commits.
+    ///
+    /// This runs after all phase 2 writes complete. It examines each
+    /// newly imported commit's metadata to detect merges and squash
+    /// merges, then creates ReviewGate tags linking back to the original
+    /// changes.
+    fn classify_and_tag_imports(
+        &self,
+        repo: &mut Repository,
+        imported: &[ImportedCommitInfo],
+    ) -> CliResult<ClassificationStats> {
+        use atomic_core::pristine::TagKind;
+
+        let mut stats = ClassificationStats::default();
+
+        for info in imported {
+            let classification = classify_commit(info);
+            match classification {
+                CommitClassification::Normal => {
+                    stats.normal += 1;
+                }
+                CommitClassification::Merge => {
+                    stats.merges += 1;
+                    let tag_name = format!("merge-{}", &info.short_sha);
+                    let metadata = serde_json::json!({
+                        "git": {
+                            "sha": info.git_sha,
+                            "merge_strategy": "merge",
+                        }
+                    });
+                    if let Err(e) = repo.create_tag_with_metadata(
+                        &tag_name,
+                        Some(&format!("Merge commit {}", info.short_sha)),
+                        TagKind::ReviewGate,
+                        Some(metadata),
+                    ) {
+                        log::warn!(
+                            "Failed to create ReviewGate tag for merge {}: {}",
+                            info.short_sha,
+                            e
+                        );
+                    }
+                }
+                CommitClassification::Squash {
+                    ref original_hashes,
+                    ref pr_number,
+                } => {
+                    stats.squashes += 1;
+                    let tag_name = if let Some(pr) = pr_number {
+                        format!("pr-{}", pr)
+                    } else {
+                        format!("squash-{}", &info.short_sha)
+                    };
+                    let metadata = serde_json::json!({
+                        "git": {
+                            "sha": info.git_sha,
+                            "merge_strategy": "squash",
+                            "pr_number": pr_number,
+                        },
+                        "changes": {
+                            "original_hashes": original_hashes,
+                        }
+                    });
+                    if let Err(e) = repo.create_tag_with_metadata(
+                        &tag_name,
+                        Some(&format!("Squash merge {}", info.short_sha)),
+                        TagKind::ReviewGate,
+                        Some(metadata),
+                    ) {
+                        log::warn!(
+                            "Failed to create ReviewGate tag for squash {}: {}",
+                            info.short_sha,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(stats)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Phase 3: Finalization
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -3268,7 +3409,181 @@ struct WriteStats {
     files_processed: usize,
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+/// Metadata about an imported commit, retained for post-import classification.
+#[derive(Debug, Clone)]
+struct ImportedCommitInfo {
+    /// Git SHA of the commit.
+    git_sha: String,
+    /// Short SHA for display.
+    short_sha: String,
+    /// Atomic change hash (Blake3).
+    atomic_hash: ContentHash,
+    /// Whether this was a merge commit (2+ parents).
+    is_merge: bool,
+    /// The commit message (for squash detection).
+    message: String,
+}
+
+/// Classification of a commit detected during post-import analysis.
+#[derive(Debug)]
+enum CommitClassification {
+    Normal,
+    Merge,
+    Squash {
+        original_hashes: Vec<String>,
+        pr_number: Option<u32>,
+    },
+}
+
+/// Statistics from post-import classification.
+#[derive(Debug, Default)]
+struct ClassificationStats {
+    normal: usize,
+    merges: usize,
+    squashes: usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Commit Classification
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Classify an imported commit as normal, merge, or squash.
+fn classify_commit(info: &ImportedCommitInfo) -> CommitClassification {
+    // 1. Multi-parent merge commits
+    if info.is_merge {
+        return CommitClassification::Merge;
+    }
+
+    // 2. Atomic-Changes trailer (written by `atomic git push`)
+    if let Some(hashes) = parse_atomic_changes_trailer(&info.message) {
+        let pr = parse_pr_number(&info.message);
+        return CommitClassification::Squash {
+            original_hashes: hashes,
+            pr_number: pr,
+        };
+    }
+
+    // 3. Squash merge format (GitHub, GitLab, Azure DevOps)
+    if let Some(pr) = parse_squash_merge_format(&info.message) {
+        return CommitClassification::Squash {
+            original_hashes: Vec::new(),
+            pr_number: Some(pr),
+        };
+    }
+
+    CommitClassification::Normal
+}
+
+/// Parse "Atomic-Changes: HASH1, HASH2, ..." from a commit message.
+fn parse_atomic_changes_trailer(message: &str) -> Option<Vec<String>> {
+    for line in message.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Atomic-Changes:") {
+            let hashes: Vec<String> = rest
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !hashes.is_empty() {
+                return Some(hashes);
+            }
+        }
+    }
+    None
+}
+
+/// Parse a PR/MR number from a commit message.
+///
+/// Supports multiple forge formats:
+/// - GitHub:     `(#42)` or `Merge pull request #42 from ...`
+/// - GitLab:     `See merge request group/project!42`
+/// - Bitbucket:  `Merged in branch (pull request #42)`
+/// - Azure DevOps: `Merged PR 42: title`
+fn parse_pr_number(message: &str) -> Option<u32> {
+    for line in message.lines() {
+        let line = line.trim();
+
+        // GitHub: "(#N)" anywhere in the line
+        if let Some(start) = line.rfind("(#") {
+            if let Some(end) = line[start..].find(')') {
+                if let Ok(n) = line[start + 2..start + end].parse::<u32>() {
+                    return Some(n);
+                }
+            }
+        }
+
+        // GitHub: "Merge pull request #N"
+        if let Some(idx) = line.find("pull request #") {
+            let after = &line[idx + "pull request #".len()..];
+            let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = num_str.parse::<u32>() {
+                return Some(n);
+            }
+        }
+
+        // GitLab: "See merge request group/project!N" or just "!N"
+        if let Some(idx) = line.rfind('!') {
+            let after = &line[idx + 1..];
+            let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !num_str.is_empty() {
+                if let Ok(n) = num_str.parse::<u32>() {
+                    // Verify it's a merge request reference, not a random "!"
+                    if line.contains("merge request") || line.ends_with(&format!("!{}", n)) {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+
+        // Azure DevOps: "Merged PR N: title"
+        if let Some(rest) = line.strip_prefix("Merged PR ") {
+            let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = num_str.parse::<u32>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// Detect squash merge format from various Git forges.
+///
+/// Supported formats:
+/// - GitHub:  `title (#42)\n\n* commit msg 1\n* commit msg 2`
+/// - GitLab:  `title\n\nSee merge request group/project!42`
+/// - Azure DevOps: `Merged PR 42: title\n\n...`
+fn parse_squash_merge_format(message: &str) -> Option<u32> {
+    let lines: Vec<&str> = message.lines().collect();
+    if lines.len() < 2 {
+        return None;
+    }
+
+    // GitHub: first line has (#N), followed by blank line + bullet points
+    if let Some(pr) = parse_pr_number(lines[0]) {
+        if lines.len() >= 3 {
+            let has_bullets = lines[2..].iter().any(|l| l.trim().starts_with("* "));
+            if has_bullets {
+                return Some(pr);
+            }
+        }
+    }
+
+    // GitLab: body contains "See merge request ...!N"
+    for line in &lines[1..] {
+        if line.contains("See merge request") {
+            return parse_pr_number(line);
+        }
+    }
+
+    // Azure DevOps: "Merged PR N: title"
+    if lines[0].starts_with("Merged PR ") {
+        return parse_pr_number(lines[0]);
+    }
+
+    None
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Free Functions for Parallel Parsing
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -3850,5 +4165,148 @@ mod tests {
         assert_eq!(ops.trunk_id().file_idx(), 0);
         assert!(ops.line_ops().is_empty());
         assert_eq!(next_branch_idx, 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Classification tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    fn test_info(message: &str, is_merge: bool) -> ImportedCommitInfo {
+        ImportedCommitInfo {
+            git_sha: "aabbccdd11223344".to_string(),
+            short_sha: "aabbccdd".to_string(),
+            atomic_hash: ContentHash::ZERO,
+            is_merge,
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_classify_normal_commit() {
+        let info = test_info("fix: typo in readme", false);
+        assert!(matches!(
+            classify_commit(&info),
+            CommitClassification::Normal
+        ));
+    }
+
+    #[test]
+    fn test_classify_merge_commit() {
+        let info = test_info("Merge branch 'feature' into main", true);
+        assert!(matches!(
+            classify_commit(&info),
+            CommitClassification::Merge
+        ));
+    }
+
+    #[test]
+    fn test_classify_squash_with_atomic_trailer() {
+        let msg = "feat: add login (#42)\n\nAtomic-Changes: ABC123, DEF456";
+        let info = test_info(msg, false);
+        match classify_commit(&info) {
+            CommitClassification::Squash {
+                original_hashes,
+                pr_number,
+            } => {
+                assert_eq!(original_hashes, vec!["ABC123", "DEF456"]);
+                assert_eq!(pr_number, Some(42));
+            }
+            other => panic!("expected Squash, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_classify_github_squash_format() {
+        let msg = "Add feature (#99)\n\n* first commit\n* second commit";
+        let info = test_info(msg, false);
+        match classify_commit(&info) {
+            CommitClassification::Squash {
+                original_hashes,
+                pr_number,
+            } => {
+                assert!(original_hashes.is_empty());
+                assert_eq!(pr_number, Some(99));
+            }
+            other => panic!("expected Squash, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_pr_number_github_squash() {
+        assert_eq!(parse_pr_number("feat: add login (#42)"), Some(42));
+    }
+
+    #[test]
+    fn test_parse_pr_number_merge_pull_request() {
+        assert_eq!(
+            parse_pr_number("Merge pull request #123 from user/branch"),
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_number_none() {
+        assert_eq!(parse_pr_number("fix: typo"), None);
+    }
+
+    #[test]
+    fn test_parse_atomic_changes_trailer() {
+        let msg = "msg\n\nAtomic-Changes: HASH1, HASH2, HASH3";
+        let result = parse_atomic_changes_trailer(msg);
+        assert_eq!(
+            result,
+            Some(vec![
+                "HASH1".to_string(),
+                "HASH2".to_string(),
+                "HASH3".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_atomic_changes_trailer_none() {
+        assert_eq!(parse_atomic_changes_trailer("normal commit"), None);
+    }
+
+    #[test]
+    fn test_parse_squash_format_github() {
+        let msg = "Title (#10)\n\n* commit 1\n* commit 2";
+        assert_eq!(parse_squash_merge_format(msg), Some(10));
+    }
+
+    #[test]
+    fn test_parse_squash_format_github_no_bullets() {
+        let msg = "Title (#10)\n\nJust a description";
+        assert_eq!(parse_squash_merge_format(msg), None);
+    }
+
+    #[test]
+    fn test_parse_squash_format_github_too_short() {
+        assert_eq!(parse_squash_merge_format("Title (#10)"), None);
+    }
+
+    #[test]
+    fn test_parse_pr_number_gitlab() {
+        assert_eq!(
+            parse_pr_number("See merge request mygroup/myproject!42"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_number_azure_devops() {
+        assert_eq!(parse_pr_number("Merged PR 99: add feature"), Some(99));
+    }
+
+    #[test]
+    fn test_parse_squash_format_gitlab() {
+        let msg = "Add feature\n\nSee merge request mygroup/myproject!55";
+        assert_eq!(parse_squash_merge_format(msg), Some(55));
+    }
+
+    #[test]
+    fn test_parse_squash_format_azure_devops() {
+        let msg = "Merged PR 77: add login\n\nDetails here";
+        assert_eq!(parse_squash_merge_format(msg), Some(77));
     }
 }

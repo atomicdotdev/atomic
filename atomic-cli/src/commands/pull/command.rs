@@ -591,6 +591,58 @@ impl Pull {
             }
         }
 
+        // Download tags from the remote view.
+        let mut tags_downloaded: usize = 0;
+        {
+            let remote_tags = remote
+                .list_remote_tags(&remote_view)
+                .await
+                .unwrap_or_default();
+
+            for (tag_hash, tag_name) in &remote_tags {
+                // Skip tags we already have locally
+                if let Ok(Some(_)) = repo.get_tag_from_view(tag_name, &local_view) {
+                    continue;
+                }
+
+                match remote.download_tag(tag_hash).await {
+                    Ok(tag_bytes) => match atomic_repository::deserialize_tag(&tag_bytes) {
+                        Ok(tag) => {
+                            let tag_len = tag_bytes.len() as u64;
+                            if let Err(e) = repo.save_synced_tag(&tag) {
+                                print_warning(&format!("Failed to save tag '{}': {}", tag_name, e));
+                            } else {
+                                tags_downloaded += 1;
+                                stats.record_tag_downloaded(tag_len);
+                                println!(
+                                    "  {} tag '{}' ({})",
+                                    success("\u{2713}"),
+                                    tag_name,
+                                    tag.kind,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            print_warning(&format!(
+                                "Failed to deserialize tag '{}': {}",
+                                tag_name, e
+                            ));
+                        }
+                    },
+                    Err(e) => {
+                        log::debug!("Tag download failed for '{}': {}", tag_name, e);
+                    }
+                }
+            }
+        }
+
+        if tags_downloaded > 0 {
+            print_info(&format!(
+                "Downloaded {}",
+                format_count(tags_downloaded, "tag")
+            ));
+        }
+
         // Bootstrap vault if .vault/ files were pulled but redb tables don't exist.
         // This happens when another user initialized the vault and pushed changes
         // that were then pulled by a collaborator who hasn't run `vault init`.

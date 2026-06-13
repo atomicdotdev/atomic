@@ -17,7 +17,6 @@
 //! - [`ChangeStore`] - Filesystem-backed storage for change files
 //! - [`RepositoryError`] - Comprehensive error types for all operations
 //! - [`history`] - History querying and traversal
-//! - [`tags`] - Named state snapshots
 //! - [`unrecord`] - Undo applied changes
 //! - [`archive`] - Export repository state
 //!
@@ -41,8 +40,8 @@
 //! let history = repo.log(HistoryOptions::default())?;
 //!
 //! // Create tags
-//! use atomic_repository::TagOptions;
-//! repo.create_tag("v1.0.0", TagOptions::default())?;
+//! use atomic_repository::TagKind;
+//! repo.create_tag("v1.0.0", None, TagKind::Release)?;
 //!
 //! // Create archives
 //! use atomic_repository::ArchiveOptions;
@@ -84,7 +83,6 @@
 //! - [`remote`] - Remote repository configuration
 //! - [`repository`] - Main Repository struct and operations
 //! - [`status`] - Working copy status tracking
-//! - [`tags`] - Named state snapshots
 //! - [`tracking`] - File tracking operations
 //! - [`unrecord`] - Undo applied changes
 
@@ -101,7 +99,6 @@ pub mod tracking;
 // Phase 7 additions
 pub mod archive;
 pub mod history;
-pub mod tags;
 pub mod unrecord;
 
 // Phase 9 additions
@@ -201,15 +198,11 @@ pub use history::{
     StateBeforeChange,
 };
 
-// Tags exports
-pub use tags::{
-    count_all_tags, count_tags, delete_tag, list_all_tags, list_tag_views, list_tags,
-    list_tags_filtered, load_tag, load_tag_any_view, save_tag, save_tag_force, tag_file_path,
-    validate_tag_name, view_tags_dir, Tag, TagError, TagFilter, TagOptions, TagResult, TagSort,
-};
+// Tags exports (first-class redb backend)
+pub use atomic_core::pristine::{TagKind, TagMutTxnT, TagRecord, TagTxnT};
 
-// Backward-compatible aliases for renamed tag functions
-pub use tags::{list_tag_stacks, load_tag_any_stack, stack_tags_dir};
+// Git SHA index exports
+pub use atomic_core::pristine::{GitShaIndexMutTxnT, GitShaIndexTxnT};
 
 // Unrecord exports
 pub use unrecord::{

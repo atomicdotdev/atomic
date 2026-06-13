@@ -13,7 +13,7 @@ mod init_tests;
 mod integration_tests;
 mod record_tests;
 mod status_tests;
-mod tag_tests;
+
 mod tracking_tests;
 mod view_tests;
 
