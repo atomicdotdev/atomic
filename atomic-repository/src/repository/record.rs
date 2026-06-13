@@ -420,7 +420,9 @@ impl Repository {
         use rayon::prelude::*;
 
         enum ModifiedResult {
-            Recorded(String, RecordedFile),
+            // `RecordedFile` is large; box it so the enum's variants stay
+            // similarly sized (clippy::large_enum_variant).
+            Recorded(String, Box<RecordedFile>),
             Skipped(String),
             Error(String, String),
         }
@@ -452,8 +454,64 @@ impl Repository {
                     }
                 };
 
-                // Build line-level hunks via the globalize-compatible path.
-                // `record_modified_file` reads the new content from disk,
+                // Resolve the file's existing **alive** CRDT branches in file
+                // order. The CRDT op recipe binds Delete/Modify ops to these
+                // real BranchIds so the old-content lines get tombstoned;
+                // without them the CRDT walker leaves stale lines alive after a
+                // modify/delete. Empty when the file has no CRDT rows yet.
+                use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
+                use atomic_core::crdt::tables::{decode_trunk_id, encode_branch_id};
+                use atomic_core::pristine::CrdtTxnT;
+                let inode_u64 = file_inode.get();
+                let existing_trunk_id = match shared_txn.get_crdt_inode_trunk(inode_u64) {
+                    Ok(Some(trunk_key)) => Some(decode_trunk_id(&trunk_key)),
+                    _ => None,
+                };
+                let existing_branches = match existing_trunk_id {
+                    Some(trunk_id) => {
+                        match iter_trunk_branches_in_file_order(&shared_txn, trunk_id) {
+                            Ok(all) => {
+                                let mut alive = Vec::with_capacity(all.len());
+                                for b in all {
+                                    let bk = encode_branch_id(&b);
+                                    if let Ok(Some(bd)) = shared_txn.get_crdt_branch(&bk) {
+                                        if bd.state.is_alive() {
+                                            alive.push(b);
+                                        }
+                                    }
+                                }
+                                alive
+                            }
+                            Err(_) => Vec::new(),
+                        }
+                    }
+                    None => Vec::new(),
+                };
+
+                // Reuse the CRDT-materialized baseline only when every existing
+                // branch belongs to a change visible on this view. That keeps
+                // single-view linear histories on the CRDT cleanup path without
+                // leaking sibling-view branches into cross-view recording.
+                let can_use_crdt_old_content = !existing_branches.is_empty()
+                    && existing_branches
+                        .iter()
+                        .all(|b| shared_change_filter.contains(&b.change_id()));
+                let crdt_old_content: Option<Vec<u8>> = if can_use_crdt_old_content {
+                    match self.get_file_content_via_crdt(path.as_str()) {
+                        Ok(Some(content)) if content == old_content => Some(content),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let existing_branches_slice: Option<&[_]> = if existing_branches.is_empty() {
+                    None
+                } else {
+                    Some(existing_branches.as_slice())
+                };
+
+                // Build line-level hunks + CRDT ops via the globalize-compatible
+                // path. `record_modified_file` reads the new content from disk,
                 // handles opaque/binary files, and emits BuiltHunks plus CRDT
                 // ops; vertex resolution happens later during assembly.
                 let mut detected =
@@ -465,13 +523,13 @@ impl Repository {
                     &working_copy,
                     &detected,
                     &old_content,
-                    Some(&old_content),
+                    crdt_old_content.as_deref(),
                     &core_options,
-                    None,
-                    None,
+                    existing_trunk_id,
+                    existing_branches_slice,
                 ) {
                     Ok(recorded) if recorded.is_empty() => ModifiedResult::Skipped(path.clone()),
-                    Ok(recorded) => ModifiedResult::Recorded(path.clone(), recorded),
+                    Ok(recorded) => ModifiedResult::Recorded(path.clone(), Box::new(recorded)),
                     Err(e) => ModifiedResult::Error(path.clone(), e),
                 }
             })
@@ -500,7 +558,7 @@ impl Repository {
                         stats.content_bytes += hunk.content_len();
                     }
                     recorded_paths.push(path);
-                    recorded_files.push(recorded);
+                    recorded_files.push(*recorded);
                 }
                 ModifiedResult::Skipped(path) => {
                     skipped_paths.push(path);

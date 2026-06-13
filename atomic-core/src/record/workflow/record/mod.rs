@@ -515,39 +515,35 @@ where
         recorded.add_hunk(graph_op);
     }
 
-    // Skip CRDT tokenization when the diff is large (>500 changed lines).
-    // Machine-generated files already early-returned above; this catches
-    // large refactors on normal source files where token-level tracking
-    // isn't worth the cost.
-    let changed_lines: usize = comparison
-        .diff_ops
-        .iter()
-        .map(|op| match op {
-            crate::diff::DiffOp::Insert { len, .. } => *len,
-            crate::diff::DiffOp::Delete { len, .. } => *len,
-            crate::diff::DiffOp::Replace {
-                old_len, new_len, ..
-            } => old_len + new_len,
-            crate::diff::DiffOp::Equal { .. } => 0,
-        })
-        .sum();
-    // Build CRDT ops directly from the diff ops we already computed.
-    // Only changed lines are tokenized — O(diff_size) not O(file_size).
-    // This replaces the Recipe pipeline which re-analyzed the entire file.
-    let _ = crdt_old_content;
-    let _ = existing_branches;
-    let _ = existing_trunk_id;
-    let _ = changed_lines;
-    {
-        let (crdt_ops, crdt_stats) = build_crdt_ops_from_diff_ops(
-            &detected.path,
-            &comparison.diff_ops,
-            old_content,
-            &new_content,
-        );
-        recorded.set_crdt_ops(crdt_ops);
-        recorded.set_crdt_stats(crdt_stats);
-    }
+    // Generate CRDT (Trunk → Branch → Leaf) operations for token-level diff
+    // tracking via the Recipe pipeline.
+    //
+    // Load-bearing subtlety: CRDT cleanup must diff against the prior CRDT
+    // materialization when available, not only the byte-graph read. If the CRDT
+    // layer has already drifted from the byte graph, using the byte-graph
+    // content here leaves CRDT-only stale branches alive forever because the
+    // diff never "sees" them to delete them. Graph hunks above still use
+    // `old_content` (the byte-graph source of truth); only the CRDT op builder
+    // uses the optional `crdt_old_content`.
+    //
+    // NOTE: an earlier experiment swapped this for `build_crdt_ops_from_diff_ops`
+    // (O(diff) instead of re-analyzing the whole file). It was faster but the
+    // resulting BranchOps didn't materialize correctly through the CRDT walker
+    // (stale content survived modifies/deletes), so the Recipe pipeline is the
+    // authoritative path.
+    use crate::record::workflow::recipes::{Recipe, RecipeContext};
+    let recipe_ctx = RecipeContext {
+        path: &detected.path,
+        old_content: crdt_old_content.unwrap_or(old_content),
+        new_content: &new_content,
+        existing_branches,
+        existing_trunk_id,
+        encoding,
+        algorithm: options.get_algorithm(),
+    };
+    let (crdt_ops, crdt_stats) = Recipe::detect(&recipe_ctx).build_ops(&recipe_ctx);
+    recorded.set_crdt_ops(crdt_ops);
+    recorded.set_crdt_stats(crdt_stats);
 
     // Store the new content
     recorded.set_content(new_content);
