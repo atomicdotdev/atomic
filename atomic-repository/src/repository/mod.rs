@@ -41,7 +41,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use atomic_core::change::{Author, Change, ChangeHeader, GraphOp};
+use atomic_core::change::{Change, ChangeHeader, GraphOp};
 use atomic_core::output::repo::{materialize_view, MaterializeOptions, MaterializeResult};
 use atomic_core::output::FileSystem;
 use atomic_core::output::WorkingCopy;
@@ -63,7 +63,7 @@ use crate::status::{
     collect_working_copy_files_with_rules, hash_file_contents, FileStatus, FileStatusEntry,
     RepositoryStatus, StatusOptions,
 };
-use crate::tags::{save_tag, save_tag_force, validate_tag_name, Tag, TagFilter, TagOptions};
+
 use crate::tracking::{
     add_to_tree, collect_files_for_tracking_with_rules, get_inode, is_tracked, list_tracked,
     move_tracked, normalize_path, normalize_path_with_root, remove_from_tree,
@@ -100,6 +100,7 @@ mod changes;
 mod content;
 mod history;
 mod insert;
+mod provenance_summary;
 mod record;
 mod remotes;
 mod status;
@@ -117,7 +118,9 @@ mod vault_triples;
 pub use insert::{
     ImportLineIndexSeed, ImportLineIndexSeedLine, ImportWriteOutcome, ImportWriteTimings,
 };
+pub use provenance_summary::ProvenanceSummary;
 pub use semantic_materialize::{CrdtMaterializeOptions, CrdtMaterializeOutcome};
+pub use tags::{deserialize_tag, serialize_tag};
 pub use vault_embeddings::{hash_embed, EmbedConfig, TextChunk};
 pub use vault_goal::{
     GoalInfo, GoalStartOptions, GoalStartResult, GoalStopOptions, GoalStopResult,
@@ -308,6 +311,39 @@ default = "{}"
             Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
 
         // Open the change store
+        let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(Self {
+            root,
+            dot_dir,
+            current_view,
+            pristine,
+            change_store,
+        })
+    }
+
+    /// Open an existing repository without the table-init write lock.
+    ///
+    /// Like [`open`](Self::open) but uses [`Pristine::open_existing`] which
+    /// skips the `begin_write()` table-initialization transaction.  The
+    /// returned repository still supports write operations — the write lock
+    /// is deferred until `write_txn()` is actually called.
+    ///
+    /// Use this for short-lived processes (agent hooks, background jobs)
+    /// where blocking on the init write lock would hang the process.
+    pub fn open_existing<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
+        let root = Self::find_root(path.as_ref())?;
+        let dot_dir = root.join(DOT_DIR);
+
+        let pristine = Arc::new(
+            Pristine::open_existing(dot_dir.join("pristine.redb"))
+                .map_err(|e| RepositoryError::Database(e.to_string()))?,
+        );
+
+        let current_view =
+            Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
+
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 

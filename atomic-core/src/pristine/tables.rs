@@ -9,7 +9,7 @@
 //! - **File Tree**: `TREE`, `REV_TREE`, `INODES`, `REV_INODES`, `DIRECTORIES` - file system mappings
 //! - **Dependencies**: `DEPS`, `REV_DEPS` - node dependency tracking for attestations/provenance
 //! - **Change Dependencies**: `CHANGE_DEPS`, `REV_CHANGE_DEPS`, `CHANGE_DEPS_INDEXED` - normal change dependency index
-//! - **State**: `STATES`, `TAGS` - view state and tag tracking
+//! - **State**: `STATES`, `MERKLE_CHAIN` - view state and Merkle chain
 
 use redb::{MultimapTableDefinition, TableDefinition};
 
@@ -267,13 +267,40 @@ pub const CHANGE_DEPS_INDEXED: TableDefinition<u64, u64> =
 /// Allows looking up when a view reached a particular state.
 pub const STATES: TableDefinition<&[u8; 40], u64> = TableDefinition::new("states");
 
-/// View tags: (view_id, sequence) → merkle
+/// Per-sequence Merkle state chain: (view_id, sequence) → merkle hash.
 ///
-/// Key: 16 bytes encoding (view_id: u64, sequence: u64)
-/// Value: merkle hash at that sequence
+/// Records the cumulative Merkle state at each change sequence in a view.
+/// Written automatically by `put_change`. Not to be confused with user-facing
+/// named tags which live in `TAG_RECORDS`.
+pub const MERKLE_CHAIN: TableDefinition<&[u8; 16], &[u8; 32]> = TableDefinition::new("tags");
+
+// ============================================================================
+// Tag Record Tables
+// ============================================================================
+
+/// Tag-specific data, keyed by entity_id from INTERNAL/EXTERNAL.
 ///
-/// Stores tagged states (named snapshots) for views.
-pub const TAGS: TableDefinition<&[u8; 16], &[u8; 32]> = TableDefinition::new("tags");
+/// Same pattern as CHANGE_META for changes. The entity identity layer
+/// (INTERNAL, EXTERNAL, NODE_TYPES) handles hash ↔ id mapping and type
+/// discrimination. This table stores the tag-specific payload (postcard serialized).
+pub const TAG_RECORDS: TableDefinition<u64, &[u8]> = TableDefinition::new("tag_records");
+
+/// Tag name index: "{view}\0{tag_name}" → entity_id.
+///
+/// Enables O(1) lookup by (view, name) without scanning TAG_RECORDS.
+/// Null byte separator enables prefix scan for "all tags in view X".
+pub const TAG_NAME_INDEX: TableDefinition<&str, u64> = TableDefinition::new("tag_name_index");
+
+// ============================================================================
+// Git SHA Index
+// ============================================================================
+
+/// Git commit SHA → Atomic entity_id.
+///
+/// Maps a 40-character hex Git SHA-1 to the entity_id of the corresponding
+/// Atomic change (or tag). Populated during `atomic git import` to replace
+/// the O(n) `get_imported_shas()` scan with O(1) lookups.
+pub const GIT_SHA_INDEX: TableDefinition<&str, u64> = TableDefinition::new("git_sha_index");
 
 // File Mtime Cache Table
 //

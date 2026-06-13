@@ -560,10 +560,12 @@ fn test_stats_default_is_empty() {
 
 #[test]
 fn test_stats_display() {
-    let mut stats = ProvenanceStats::default();
-    stats.goal_count = 1;
-    stats.commitment_count = 2;
-    stats.edge_count = 3;
+    let stats = ProvenanceStats {
+        goal_count: 1,
+        commitment_count: 2,
+        edge_count: 3,
+        ..Default::default()
+    };
 
     let display = format!("{}", stats);
     assert!(display.contains("1 goal"));

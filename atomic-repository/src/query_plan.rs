@@ -688,7 +688,7 @@ mod tests {
 
     #[test]
     fn test_filter_nodes() {
-        let nodes = vec![
+        let nodes = [
             KgNode::new("a", "intent", "A", "test")
                 .with_metadata(serde_json::json!({"status": "done"})),
             KgNode::new("b", "intent", "B", "test")

@@ -280,7 +280,7 @@ pub fn resolve_context_vertex<T: GraphTxnT>(
 /// This helper is used by `resolve_context_vertex` so the splitting
 /// logic has a single definition.
 #[inline]
-fn adjust_for_mid_span(
+pub(crate) fn adjust_for_mid_span(
     found: GraphNode<NodeId>,
     pos: Position<NodeId>,
     is_predecessor: bool,

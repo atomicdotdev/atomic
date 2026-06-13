@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_from_io_error() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let io_err = std::io::Error::other("test");
         let err: OutputError = io_err.into();
 
         assert!(err.is_io());
@@ -490,8 +490,7 @@ mod tests {
 
     #[test]
     fn test_display_working_copy() {
-        let err =
-            OutputError::working_copy(std::io::Error::new(std::io::ErrorKind::Other, "failed"));
+        let err = OutputError::working_copy(std::io::Error::other("failed"));
         let display = err.to_string();
 
         assert!(display.contains("Working copy"));
@@ -499,8 +498,7 @@ mod tests {
 
     #[test]
     fn test_display_change_store() {
-        let err =
-            OutputError::change_store(std::io::Error::new(std::io::ErrorKind::Other, "failed"));
+        let err = OutputError::change_store(std::io::Error::other("failed"));
         let display = err.to_string();
 
         assert!(display.contains("Change store"));
@@ -508,7 +506,7 @@ mod tests {
 
     #[test]
     fn test_display_graph() {
-        let err = OutputError::graph(std::io::Error::new(std::io::ErrorKind::Other, "failed"));
+        let err = OutputError::graph(std::io::Error::other("failed"));
         let display = err.to_string();
 
         assert!(display.contains("Graph"));
@@ -549,6 +547,7 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[test]
+    #[allow(clippy::unnecessary_literal_unwrap)]
     fn test_output_result_ok() {
         let result: OutputResult<i32> = Ok(42);
         assert_eq!(result.unwrap(), 42);
@@ -566,7 +565,7 @@ mod tests {
 
     #[test]
     fn test_all_type_checks() {
-        let io = OutputError::io(std::io::Error::new(std::io::ErrorKind::Other, ""));
+        let io = OutputError::io(std::io::Error::other(""));
         assert!(io.is_io());
         assert!(!io.is_working_copy());
         assert!(!io.is_change_store());
@@ -574,14 +573,14 @@ mod tests {
         assert!(!io.is_pristine());
         assert!(!io.is_not_found());
 
-        let wc = OutputError::working_copy(std::io::Error::new(std::io::ErrorKind::Other, ""));
+        let wc = OutputError::working_copy(std::io::Error::other(""));
         assert!(!wc.is_io());
         assert!(wc.is_working_copy());
 
-        let cs = OutputError::change_store(std::io::Error::new(std::io::ErrorKind::Other, ""));
+        let cs = OutputError::change_store(std::io::Error::other(""));
         assert!(cs.is_change_store());
 
-        let g = OutputError::graph(std::io::Error::new(std::io::ErrorKind::Other, ""));
+        let g = OutputError::graph(std::io::Error::other(""));
         assert!(g.is_graph());
 
         let p: OutputError = PristineError::ViewNotFound {

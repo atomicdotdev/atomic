@@ -158,7 +158,7 @@ impl TurnOrchestrator {
         // exists (resumed session), we log and continue — recording will
         // still work, it just won't have the parent's history.
         if session.parent_view.is_none() {
-            match atomic_repository::Repository::open(&self.repo_root) {
+            match atomic_repository::Repository::open_existing(&self.repo_root) {
                 Ok(mut repo) => {
                     let current = repo.current_view().to_string();
                     session.set_parent_view(&current);
@@ -263,7 +263,8 @@ impl TurnOrchestrator {
                 // view from the user's view so that the agent's changes
                 // are isolated and the view filter only exposes the
                 // parent's files.
-                if let Ok(mut repo) = atomic_repository::Repository::open(&self.repo_root) {
+                if let Ok(mut repo) = atomic_repository::Repository::open_existing(&self.repo_root)
+                {
                     let current = repo.current_view().to_string();
 
                     if current != "dev" && current != "main" && current != "release" {

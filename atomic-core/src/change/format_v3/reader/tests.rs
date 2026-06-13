@@ -718,7 +718,7 @@ fn test_roundtrip_change_header_content() {
 
 #[test]
 fn test_roundtrip_content_chunks() {
-    let chunk_data = vec![
+    let chunk_data = [
         b"The quick brown fox".to_vec(),
         b"jumps over".to_vec(),
         b"the lazy dog".to_vec(),

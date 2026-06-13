@@ -155,9 +155,11 @@ fn test_history_entry_builder_pattern() {
 fn test_history_entry_accessors() {
     let hash = Hash::of(b"test");
     let state = Merkle::of(b"state");
-    let mut header = ChangeHeader::default();
-    header.message = "Test message".to_string();
-    header.description = Some("Test description".to_string());
+    let header = ChangeHeader {
+        message: "Test message".to_string(),
+        description: Some("Test description".to_string()),
+        ..Default::default()
+    };
 
     let entry = HistoryEntry::with_header(0, NodeId::new(1), hash, state, header, false);
 

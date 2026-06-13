@@ -112,7 +112,14 @@ impl Pristine {
 
             // State tables
             write_txn.open_table(STATES)?;
-            write_txn.open_table(TAGS)?;
+            write_txn.open_table(MERKLE_CHAIN)?;
+
+            // Tag record tables
+            write_txn.open_table(TAG_RECORDS)?;
+            write_txn.open_table(TAG_NAME_INDEX)?;
+
+            // Git SHA index (git commit SHA → entity_id)
+            write_txn.open_table(GIT_SHA_INDEX)?;
 
             // Session tables (Sherpa-enriched provenance data)
             write_txn.open_table(SESSION_EVENTS)?;
@@ -167,6 +174,29 @@ impl Pristine {
         })
     }
 
+    /// Open an existing pristine database without the table-init write lock.
+    ///
+    /// Unlike [`open`](Self::open), this method skips the `begin_write()` +
+    /// table-initialization transaction.  It assumes all tables already exist
+    /// (true for any database previously created by `open` or `init`).
+    ///
+    /// The returned `Pristine` still supports [`write_txn`](Self::write_txn)
+    /// — the write lock is deferred until you actually need one.  This is
+    /// critical for the agent hook path where `Repository::open()` is called
+    /// from a short-lived process: `begin_write()` blocks **indefinitely**
+    /// if another process holds a write transaction, so skipping the
+    /// init-only write eliminates the most common cause of hook hangs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database file doesn't exist, is corrupted,
+    /// or the ID-scan read transaction fails.
+    pub fn open_existing<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
+        let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
+        let db = Builder::new().set_cache_size(cache_bytes).open(path)?;
+        Self::scan_ids(db)
+    }
+
     /// Open an existing pristine database in read-only mode
     ///
     /// This method opens the database without acquiring a write lock, allowing
@@ -192,11 +222,15 @@ impl Pristine {
         // Use the same 8 GiB cache as open() for consistent performance.
         let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
         let db = Builder::new().set_cache_size(cache_bytes).open(path)?;
+        Self::scan_ids(db)
+    }
 
-        // Determine the next available IDs by scanning existing data.
-        // Errors are propagated (not silently skipped) so that open()
-        // fails fast on corrupted data rather than underestimating the
-        // max ID and reusing an already-allocated slot.
+    /// Scan existing tables for the next available IDs.
+    ///
+    /// Shared implementation for `open_existing` and `open_readonly` — both
+    /// skip the table-init write transaction and only need a read pass to
+    /// discover the max allocated node, view, and inode IDs.
+    fn scan_ids(db: Database) -> PristineResult<Self> {
         let read_txn = db.begin_read()?;
 
         let next_node_id = {

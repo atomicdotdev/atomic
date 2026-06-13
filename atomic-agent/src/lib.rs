@@ -175,6 +175,14 @@ mod tests {
     }
 
     #[test]
+    fn test_default_registry_has_hermes() {
+        let registry = AgentRegistry::with_defaults();
+        let agent = registry.get("hermes");
+        assert!(agent.is_some(), "Default registry should include hermes");
+        assert_eq!(agent.unwrap().display_name(), "Hermes Agent");
+    }
+
+    #[test]
     fn test_default_registry_has_kiro() {
         let registry = AgentRegistry::with_defaults();
         let agent = registry.get("kiro");

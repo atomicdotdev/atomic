@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn test_push_outcome_with_remote_state() {
         let stats = PushStats::new();
-        let state = Hash::of(b"state").into();
+        let state = Hash::of(b"state");
         let outcome = PushOutcome::new(stats).with_remote_state(state);
 
         assert_eq!(outcome.remote_state, Some(state));

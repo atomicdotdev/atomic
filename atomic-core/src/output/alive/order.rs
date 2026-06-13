@@ -395,71 +395,125 @@ impl TarjanState {
     }
 }
 
-/// Recursive Tarjan visit function.
+/// Frame for the iterative Tarjan work stack.
+///
+/// Each frame represents a vertex being processed and tracks how far
+/// through its children list we've progressed.
+struct TarjanFrame {
+    v: VertexId,
+    children: Vec<VertexId>,
+    child_idx: usize,
+}
+
+/// Iterative Tarjan visit function.
+///
+/// Equivalent to the classic recursive Tarjan's SCC algorithm, but uses
+/// an explicit work stack instead of the call stack.  This avoids stack
+/// overflow for files with tens of thousands of vertices.
 fn tarjan_visit(
     graph: &mut AliveGraph,
-    v: VertexId,
+    start: VertexId,
     state: &mut TarjanState,
     result: &mut OrderResult,
 ) {
-    // Initialize vertex
+    let mut work: Vec<TarjanFrame> = Vec::new();
+
+    // Initialize the start vertex
     {
-        let vertex = graph.vertex_mut(v);
+        let vertex = graph.vertex_mut(start);
         vertex.index = state.index;
         vertex.lowlink = state.index;
         vertex.mark_visited();
         vertex.push_stack();
     }
     state.index += 1;
-    state.stack.push(v);
+    state.stack.push(start);
 
-    // Process successors
-    let children: Vec<_> = graph.children(v).map(|(_, child)| *child).collect();
+    let children: Vec<VertexId> = graph
+        .children(start)
+        .map(|(_, child)| *child)
+        .filter(|c| !c.is_dummy())
+        .collect();
+    work.push(TarjanFrame {
+        v: start,
+        children,
+        child_idx: 0,
+    });
 
-    for w in children {
-        if w.is_dummy() {
-            continue;
-        }
+    while let Some(frame) = work.last_mut() {
+        if frame.child_idx < frame.children.len() {
+            let w = frame.children[frame.child_idx];
+            frame.child_idx += 1;
 
-        let w_visited = graph.get_vertex(w).is_visited();
-        let w_on_stack = graph.get_vertex(w).is_on_stack();
+            let w_visited = graph.get_vertex(w).is_visited();
+            let w_on_stack = graph.get_vertex(w).is_on_stack();
 
-        if !w_visited {
-            // Successor not yet visited; recurse
-            tarjan_visit(graph, w, state, result);
+            if !w_visited {
+                // Initialize w and push a new frame (replaces recursive call)
+                {
+                    let vertex = graph.vertex_mut(w);
+                    vertex.index = state.index;
+                    vertex.lowlink = state.index;
+                    vertex.mark_visited();
+                    vertex.push_stack();
+                }
+                state.index += 1;
+                state.stack.push(w);
 
-            // Update lowlink
-            let w_lowlink = graph.get_vertex(w).lowlink;
-            let v_vertex = graph.vertex_mut(v);
-            v_vertex.lowlink = v_vertex.lowlink.min(w_lowlink);
-        } else if w_on_stack {
-            // Successor is on stack, hence in current SCC
-            let w_index = graph.get_vertex(w).index;
-            let v_vertex = graph.vertex_mut(v);
-            v_vertex.lowlink = v_vertex.lowlink.min(w_index);
-        }
-    }
+                let w_children: Vec<VertexId> = graph
+                    .children(w)
+                    .map(|(_, child)| *child)
+                    .filter(|c| !c.is_dummy())
+                    .collect();
+                work.push(TarjanFrame {
+                    v: w,
+                    children: w_children,
+                    child_idx: 0,
+                });
+            } else if w_on_stack {
+                // Successor is on stack, hence in current SCC
+                let w_index = graph.get_vertex(w).index;
+                let v = frame.v;
+                let v_vertex = graph.vertex_mut(v);
+                v_vertex.lowlink = v_vertex.lowlink.min(w_index);
+            }
+        } else {
+            // All children processed — equivalent to the return from
+            // the recursive call.  Pop this frame and propagate lowlink
+            // to the parent.
+            let finished = work.pop().unwrap();
+            let v = finished.v;
 
-    // If v is a root node, pop the stack and generate an SCC
-    let v_index = graph.get_vertex(v).index;
-    let v_lowlink = graph.get_vertex(v).lowlink;
+            // Propagate lowlink to parent frame
+            if let Some(parent) = work.last() {
+                let v_lowlink = graph.get_vertex(v).lowlink;
+                let parent_v = parent.v;
+                let pv = graph.vertex_mut(parent_v);
+                pv.lowlink = pv.lowlink.min(v_lowlink);
+            }
 
-    if v_lowlink == v_index {
-        let mut scc = Vec::new();
-        let scc_id = SccId::new(result.sccs.len());
+            // If v is a root node, pop the SCC stack and emit the SCC
+            let v_index = graph.get_vertex(v).index;
+            let v_lowlink = graph.get_vertex(v).lowlink;
 
-        loop {
-            let w = state.stack.pop().expect("stack should not be empty");
-            graph.vertex_mut(w).pop_stack();
-            graph.vertex_mut(w).scc = scc_id.index();
-            scc.push(w);
+            if v_lowlink == v_index {
+                let mut scc = Vec::new();
+                let scc_id = SccId::new(result.sccs.len());
 
-            if w == v {
-                break;
+                loop {
+                    let w = state.stack.pop().expect("stack should not be empty");
+                    graph.vertex_mut(w).pop_stack();
+                    graph.vertex_mut(w).scc = scc_id.index();
+                    scc.push(w);
+
+                    if w == v {
+                        break;
+                    }
+                }
+
+                result.sccs.push(scc);
             }
         }
-
-        result.sccs.push(scc);
     }
 }
 

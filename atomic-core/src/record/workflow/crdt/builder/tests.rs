@@ -1,6 +1,7 @@
 //! Tests for the CRDT change builder module.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::change::Encoding;
     use crate::crdt::{BranchId, BranchOp, LeafId, LeafOp, TrunkId, TrunkOp};

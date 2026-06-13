@@ -440,7 +440,7 @@ fn build_files_and_metadata(graph: &ProvenanceGraph) -> (Vec<FileEntry>, Value) 
 /// Returns `None` if the directory is not an Atomic repository or any error
 /// occurs — callers treat absence of VCS info as non-fatal.
 fn atomic_revision(root: &Path) -> Option<(String, String)> {
-    let repo = atomic_repository::Repository::open(root).ok()?;
+    let repo = atomic_repository::Repository::open_existing(root).ok()?;
     let view_name = repo.current_view().to_string();
     let info = repo.get_view_info(&view_name).ok()?;
     Some((view_name, info.state.to_base32()))

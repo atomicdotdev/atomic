@@ -245,6 +245,11 @@ impl TurnOrchestrator {
                             let recorded_files: Vec<String> = outcome.recorded_file_list().to_vec();
                             session.add_files_touched(&recorded_files);
 
+                            // Track the change hash so the session-end attestation
+                            // covers only what the agent actually recorded — not
+                            // inherited baseline changes from the parent view.
+                            session.recorded_change_hashes.push(outcome.hash);
+
                             // Clear current_prompt so the next turn doesn't
                             // reuse this turn's prompt as the change message.
                             session.clear_current_prompt();

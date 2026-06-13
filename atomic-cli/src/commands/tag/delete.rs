@@ -95,7 +95,7 @@ impl Command for Delete {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomic_repository::TagOptions;
+    use atomic_repository::TagKind;
     use serial_test::serial;
 
     // -------------------------------------------------------------------------
@@ -169,7 +169,7 @@ mod tests {
         // Initialize a repository and create a tag
         {
             let repo = Repository::init(repo_path).unwrap();
-            repo.create_tag("v1.0.0", TagOptions::default()).unwrap();
+            repo.create_tag("v1.0.0", None, TagKind::Release).unwrap();
         }
 
         // Change to the repo directory
@@ -221,8 +221,8 @@ mod tests {
         // Initialize a repository and create multiple tags
         {
             let repo = Repository::init(repo_path).unwrap();
-            repo.create_tag("v1.0.0", TagOptions::default()).unwrap();
-            repo.create_tag("v2.0.0", TagOptions::default()).unwrap();
+            repo.create_tag("v1.0.0", None, TagKind::Release).unwrap();
+            repo.create_tag("v2.0.0", None, TagKind::Release).unwrap();
         }
 
         // Change to the repo directory

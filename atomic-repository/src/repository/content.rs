@@ -1,4 +1,5 @@
 use super::*;
+use atomic_core::pristine::CachedGraphTxn;
 
 impl Repository {
     /// Get the recorded content for a tracked file.
@@ -93,9 +94,16 @@ impl Repository {
 
         // All edges are in GRAPH — raw transaction sees everything.
         // The change_filter handles view isolation.
-        let content =
-            retrieve_content_with_filter_fast(&txn, &self.change_store, inode, position, options)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let content = retrieve_content_with_filter_fast(
+            &cached_txn,
+            &self.change_store,
+            inode,
+            position,
+            options,
+        )
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if content.is_empty() {
             Ok(None)
@@ -213,9 +221,16 @@ impl Repository {
 
         let options = RetrieveOptions::new().with_change_filter(change_filter);
 
-        let content =
-            retrieve_content_with_filter_fast(&txn, &self.change_store, inode, position, options)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let content = retrieve_content_with_filter_fast(
+            &cached_txn,
+            &self.change_store,
+            inode,
+            position,
+            options,
+        )
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if content.is_empty() {
             Ok(None)
@@ -372,8 +387,10 @@ impl Repository {
             collect_visible_change_ids_with_deps(&txn, &view)?
         };
 
-        // Use the filtered retrieval method
-        self.get_file_content_with_filter(&txn, &normalized, change_filter, true)
+        // Use the filtered retrieval method with cached graph access
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        self.get_file_content_with_filter(&cached_txn, &normalized, change_filter, true)
     }
 
     /// Get the recorded content for a tracked file with options.
@@ -440,8 +457,11 @@ impl Repository {
         };
 
         // Retrieve content from the graph with options
-        let result = retrieve_content_with_options(&txn, &self.change_store, position, options)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let result =
+            retrieve_content_with_options(&cached_txn, &self.change_store, position, options)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         Ok(Some(result))
     }
@@ -590,7 +610,9 @@ impl Repository {
         // Retrieve content with the change filter.
         // Pass require_tracked=false: the file may have been deleted after
         // this point, but we want its content as it existed before the change.
-        self.get_file_content_with_filter(&txn, &normalized, change_set, false)
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        self.get_file_content_with_filter(&cached_txn, &normalized, change_set, false)
     }
 
     /// Get file content as it was AFTER a specific change was applied.
@@ -659,7 +681,9 @@ impl Repository {
         // Retrieve content with the change filter.
         // require_tracked=true: if the file was deleted before this point,
         // there is no "after" content to return.
-        self.get_file_content_with_filter(&txn, &normalized, change_set, true)
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        self.get_file_content_with_filter(&cached_txn, &normalized, change_set, true)
     }
 
     /// Get file content at a specific sequence number.
@@ -716,7 +740,9 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Retrieve content with the change filter
-        self.get_file_content_with_filter(&txn, &normalized, change_set, true)
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        self.get_file_content_with_filter(&cached_txn, &normalized, change_set, true)
     }
 
     /// Internal helper to retrieve file content with a change filter.
@@ -812,7 +838,7 @@ impl Repository {
     }
 }
 
-fn retrieve_content_with_filter_fast<T, C>(
+pub(crate) fn retrieve_content_with_filter_fast<T, C>(
     txn: &T,
     changes: &C,
     inode: Inode,
@@ -825,22 +851,7 @@ where
 {
     let trace_retrieve = std::env::var_os("ATOMIC_TRACE_RETRIEVE").is_some();
 
-    // The inode-linear fast path is only safe for unfiltered materialization.
-    // When a change filter is active, divergent view-local edits can produce
-    // dead-chain bypasses that the linear walk cannot represent correctly,
-    // causing one side's visible content to disappear. Fall back to the full
-    // alive-graph retrieval for correctness in filtered reads.
-    if options.has_filter() {
-        if trace_retrieve {
-            eprintln!(
-                "[retrieve_content_with_filter_fast] filtered read; falling back to retrieve_graph"
-            );
-        }
-        return atomic_core::record::workflow::retrieve::retrieve_content_with_filter(
-            txn, changes, position, options,
-        );
-    }
-
+    // Try the inode-linear fast path first (works with or without filter).
     if let Some(content) =
         try_retrieve_linear_content_with_filter(txn, changes, inode, position, &options)?
     {
@@ -862,6 +873,91 @@ where
     )
 }
 
+/// Outcome of choosing the next vertex in a linear (single-path) content walk.
+enum LinearStep {
+    /// Exactly one live successor — continue the walk.
+    Follow(atomic_core::types::GraphNode<NodeId>),
+    /// No successor — the chain ends here.
+    End,
+    /// The structure cannot be linearised (a conflict fork with more than one
+    /// live successor, or a delete-through where the live continuation is only
+    /// reachable past a deleted vertex). Callers fall back to `retrieve_graph`.
+    Bail,
+}
+
+/// Choose the single live successor of `current` for a linear content walk.
+///
+/// In the additive graph model a superseded span keeps its original alive
+/// `BLOCK` edge *alongside* a new `DELETED` edge. A walk that merely skipped
+/// `DELETED` edges would therefore still follow the alive edge into the
+/// superseded span and resurrect stale content. This helper instead treats any
+/// destination that has a visible `DELETED` edge as dead, so an in-place
+/// replacement (delete old span + insert new span off the same predecessor)
+/// resolves to just the new span. Genuine conflict forks and delete-throughs
+/// return [`LinearStep::Bail`] so the caller defers to the full graph walk.
+fn select_linear_successor<T>(
+    txn: &T,
+    inode: Inode,
+    adj: &mut atomic_core::pristine::InodeAdjState,
+    options: &atomic_core::output::alive::RetrieveOptions,
+) -> atomic_core::record::RecordResult<LinearStep>
+where
+    T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::InodeGraphOps,
+{
+    use atomic_core::types::EdgeFlags;
+
+    let mut alive: Vec<atomic_core::types::GraphNode<NodeId>> = Vec::new();
+    let mut deleted: std::collections::HashSet<atomic_core::types::GraphNode<NodeId>> =
+        std::collections::HashSet::new();
+
+    while let Some(edge_result) = txn.next_inode_adj(adj) {
+        let edge = match edge_result {
+            Ok(edge) => edge,
+            Err(_) => return Ok(LinearStep::Bail),
+        };
+        let flags = edge.flag();
+        if flags.contains(EdgeFlags::PARENT)
+            || flags.contains(EdgeFlags::PSEUDO)
+            || flags.contains(EdgeFlags::FOLDER)
+        {
+            continue;
+        }
+        if !options.passes_filter(edge.introduced_by()) {
+            continue;
+        }
+        let dest = match txn.find_block_in_inode(inode, edge.dest()) {
+            Ok(Some(d)) => d,
+            Ok(None) | Err(_) => return Ok(LinearStep::Bail),
+        };
+        if !options.passes_filter(dest.change) {
+            continue;
+        }
+        if flags.contains(EdgeFlags::DELETED) {
+            deleted.insert(dest);
+        } else if !alive.contains(&dest) {
+            alive.push(dest);
+        }
+    }
+
+    // A destination that is both alive (original edge) and deleted (superseding
+    // edge) is dead from this view's perspective.
+    alive.retain(|d| !deleted.contains(d));
+
+    match alive.len() {
+        0 => {
+            if deleted.is_empty() {
+                Ok(LinearStep::End)
+            } else {
+                // The only successors here were deleted; the live continuation
+                // lies past a dead vertex — defer to the full graph walk.
+                Ok(LinearStep::Bail)
+            }
+        }
+        1 => Ok(LinearStep::Follow(alive[0])),
+        _ => Ok(LinearStep::Bail),
+    }
+}
+
 fn try_retrieve_linear_content_with_filter<T, C>(
     txn: &T,
     changes: &C,
@@ -873,6 +969,7 @@ where
     T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::InodeGraphOps,
     C: atomic_core::change::ChangeStore,
 {
+    #[allow(unused_imports)]
     use atomic_core::types::EdgeFlags;
     let trace_retrieve = std::env::var_os("ATOMIC_TRACE_RETRIEVE").is_some();
 
@@ -905,83 +1002,12 @@ where
                 )))
             })?;
 
-        let mut next_vertex = None;
-
-        while let Some(edge_result) = txn.next_inode_adj(&mut adj) {
-            let edge = match edge_result {
-                Ok(edge) => edge,
-                Err(_) => {
-                    if trace_retrieve {
-                        eprintln!(
-                            "[try_retrieve_linear_content_with_filter] inode adj read error at {}",
-                            current
-                        );
-                    }
-                    return Ok(None);
-                }
-            };
-
-            let flags = edge.flag();
-            if flags.contains(EdgeFlags::PARENT)
-                || flags.contains(EdgeFlags::PSEUDO)
-                || flags.contains(EdgeFlags::FOLDER)
-            {
-                continue;
-            }
-
-            if !options.passes_filter(edge.introduced_by()) {
-                continue;
-            }
-
-            if flags.contains(EdgeFlags::DELETED) {
-                if trace_retrieve {
-                    eprintln!(
-                        "[try_retrieve_linear_content_with_filter] deleted edge from {} to {}",
-                        current,
-                        edge.dest()
-                    );
-                }
-                return Ok(None);
-            }
-
-            let Some(dest) = (match txn.find_block_in_inode(inode, edge.dest()) {
-                Ok(dest) => dest,
-                Err(_) => {
-                    if trace_retrieve {
-                        eprintln!(
-                            "[try_retrieve_linear_content_with_filter] find_block_in_inode error for {}",
-                            edge.dest()
-                        );
-                    }
-                    return Ok(None);
-                }
-            }) else {
-                if trace_retrieve {
-                    eprintln!(
-                        "[try_retrieve_linear_content_with_filter] no inode block for {}",
-                        edge.dest()
-                    );
-                }
-                return Ok(None);
-            };
-
-            if !options.passes_filter(dest.change) {
-                continue;
-            }
-
-            if next_vertex.replace(dest).is_some() {
-                if trace_retrieve {
-                    eprintln!(
-                        "[try_retrieve_linear_content_with_filter] multiple successors from {}",
-                        current
-                    );
-                }
-                return Ok(None);
-            }
-        }
-
-        let Some(dest) = next_vertex else {
-            break;
+        let dest = match select_linear_successor(txn, inode, &mut adj, options)? {
+            LinearStep::Follow(d) => d,
+            LinearStep::End => break,
+            // A conflict fork or delete-through that the linear walk cannot
+            // represent: defer to the full graph retrieval.
+            LinearStep::Bail => return Ok(None),
         };
 
         let is_inode_marker = dest.start == dest.end && dest.start == position.pos;

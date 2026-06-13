@@ -36,7 +36,7 @@
 
 use clap::Parser;
 
-use atomic_repository::{Repository, TagOptions};
+use atomic_repository::{Repository, TagKind};
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
@@ -183,43 +183,39 @@ impl Command for Create {
             other => CliError::Repository(other),
         })?;
 
-        // Build tag options
-        let mut options = TagOptions::new();
-
-        if let Some(msg) = &self.message {
-            options = options.message(msg);
-        }
-
-        if let Some(author_str) = &self.author {
-            let (name, email) = parse_author(author_str);
-            options = options.author(name, email);
-        }
-
-        if let Some(view) = &self.view {
-            options = options.view(view);
-        }
-
-        if self.force {
-            options = options.force(true);
+        // Check for existing tag — fail unless --force
+        if let Ok(Some(_)) = repo.get_tag(name) {
+            if self.force {
+                let _ = repo.delete_tag(name);
+            } else {
+                return Err(CliError::InvalidArgument {
+                    message: format!("Tag '{}' already exists. Use --force to overwrite.", name),
+                });
+            }
         }
 
         // Create the tag
-        let tag = repo.create_tag(name, options).map_err(|e| match e {
-            atomic_repository::RepositoryError::TagAlreadyExists { name } => {
-                CliError::InvalidArgument {
-                    message: format!("Tag '{}' already exists. Use --force to overwrite.", name),
+        let tag = repo
+            .create_tag(name, self.message.as_deref(), TagKind::Release)
+            .map_err(|e| match e {
+                atomic_repository::RepositoryError::TagAlreadyExists { name } => {
+                    CliError::InvalidArgument {
+                        message: format!(
+                            "Tag '{}' already exists. Use --force to overwrite.",
+                            name
+                        ),
+                    }
                 }
-            }
-            atomic_repository::RepositoryError::InvalidTagName { name, reason } => {
-                CliError::InvalidArgument {
-                    message: format!("Invalid tag name '{}': {}", name, reason),
+                atomic_repository::RepositoryError::InvalidTagName { name, reason } => {
+                    CliError::InvalidArgument {
+                        message: format!("Invalid tag name '{}': {}", name, reason),
+                    }
                 }
-            }
-            atomic_repository::RepositoryError::ViewNotFound { name } => {
-                CliError::ViewNotFound { name }
-            }
-            other => CliError::Repository(other),
-        })?;
+                atomic_repository::RepositoryError::ViewNotFound { name } => {
+                    CliError::ViewNotFound { name }
+                }
+                other => CliError::Repository(other),
+            })?;
 
         // Print success message
         if tag.is_annotated() {
@@ -387,7 +383,8 @@ mod tests {
         let repo = Repository::open(repo_path).unwrap();
         let tag = repo.get_tag("v1.0.0").unwrap();
         assert!(tag.is_some());
-        assert!(!tag.unwrap().is_annotated());
+        let t = tag.unwrap();
+        assert!(!t.is_annotated());
     }
 
     #[test]
@@ -417,7 +414,7 @@ mod tests {
         let repo = Repository::open(repo_path).unwrap();
         let tag = repo.get_tag("v1.0.0").unwrap().unwrap();
         assert!(tag.is_annotated());
-        assert_eq!(tag.message(), Some("Release version 1.0.0"));
+        assert_eq!(tag.message.as_deref(), Some("Release version 1.0.0"));
     }
 
     #[test]
@@ -432,7 +429,7 @@ mod tests {
         // Initialize a repository and create a tag
         {
             let repo = Repository::init(repo_path).unwrap();
-            repo.create_tag("v1.0.0", TagOptions::default()).unwrap();
+            repo.create_tag("v1.0.0", None, TagKind::Release).unwrap();
         }
 
         // Change to the repo directory
@@ -456,7 +453,7 @@ mod tests {
         // Initialize a repository and create a tag
         {
             let repo = Repository::init(repo_path).unwrap();
-            repo.create_tag("v1.0.0", TagOptions::default()).unwrap();
+            repo.create_tag("v1.0.0", None, TagKind::Release).unwrap();
         }
 
         // Change to the repo directory

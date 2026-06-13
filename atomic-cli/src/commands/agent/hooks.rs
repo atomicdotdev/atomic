@@ -160,9 +160,13 @@ impl Command for Hooks {
         let agent_name = agent.name().to_string();
         let agent_display = agent.display_name().to_string();
 
-        eprintln!(
-            "[atomic-debug] hooks: agent={} display={} verb={}",
-            agent_name, agent_display, self.verb
+        // Keep hooks quiet on stdout/stderr — Claude Code surfaces both, so
+        // route diagnostics through `log` instead.
+        log::debug!(
+            "hooks: agent={} display={} verb={}",
+            agent_name,
+            agent_display,
+            self.verb
         );
 
         let result = rt.block_on(async {

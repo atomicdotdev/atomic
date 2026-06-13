@@ -612,23 +612,29 @@ fn test_validate_builder_header() {
 
 #[test]
 fn test_validate_hash_table_too_large() {
-    let mut header = FileHeader::default();
-    header.hash_table_entries = (MAX_HASH_TABLE_ENTRIES as u32) + 1;
+    let header = FileHeader {
+        hash_table_entries: (MAX_HASH_TABLE_ENTRIES as u32) + 1,
+        ..Default::default()
+    };
     assert!(header.validate().is_err());
 }
 
 #[test]
 fn test_validate_semantic_flag_mismatch_flag_set_count_zero() {
-    let mut header = FileHeader::default();
+    let mut header = FileHeader {
+        semantic_section_count: 0,
+        ..Default::default()
+    };
     header.flags.set(FileHeaderFlags::HAS_SEMANTIC);
-    header.semantic_section_count = 0;
     assert!(header.validate().is_err());
 }
 
 #[test]
 fn test_validate_semantic_flag_mismatch_count_set_flag_clear() {
-    let mut header = FileHeader::default();
-    header.semantic_section_count = 5;
+    let header = FileHeader {
+        semantic_section_count: 5,
+        ..Default::default()
+    };
     // Don't set HAS_SEMANTIC flag
     assert!(header.validate().is_err());
 }
@@ -835,7 +841,7 @@ fn test_file_header_preserved_in_bytes() {
         .build();
 
     let bytes = header.to_bytes();
-    for i in 36..64 {
-        assert_eq!(bytes[i], 0, "reserved byte at index {} should be zero", i);
+    for (i, byte) in bytes.iter().enumerate().skip(36).take(28) {
+        assert_eq!(*byte, 0, "reserved byte at index {} should be zero", i);
     }
 }

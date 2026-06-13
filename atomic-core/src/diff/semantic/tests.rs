@@ -3,6 +3,7 @@ use super::*;
 // Tests
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use super::*;
 
@@ -192,8 +193,10 @@ mod tests {
 
     #[test]
     fn test_semantic_diff_stats_has_changes() {
-        let mut stats = SemanticDiffStats::default();
-        stats.lines_added = 1;
+        let stats = SemanticDiffStats {
+            lines_added: 1,
+            ..Default::default()
+        };
         assert!(stats.has_changes());
     }
 

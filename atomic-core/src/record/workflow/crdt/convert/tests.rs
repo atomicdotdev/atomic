@@ -346,7 +346,7 @@ fn test_hunk_converter_convert_file_content_simple() {
 
     assert!(!ops.is_empty());
     assert_eq!(ops.trunk_ops().len(), 1);
-    assert!(ops.branch_ops().len() >= 1);
+    assert!(!ops.branch_ops().is_empty());
     assert_eq!(ops.stats().files_added, 1);
 }
 
