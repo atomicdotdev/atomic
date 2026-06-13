@@ -259,11 +259,13 @@ where
     let graph_op = BuiltHunk::new_edit(local, Some(encoding), 0, content_len);
     recorded.add_hunk(graph_op);
 
-    // Generate CRDT operations for token-level tracking
-    // Use NodeId(0) as placeholder - will be resolved during change finalization
-    let crdt_ops = crdt::build_crdt_ops_for_added_file(&detected.path, &content, encoding);
-    recorded.set_crdt_ops(crdt_ops.0);
-    recorded.set_crdt_stats(crdt_ops.1);
+    // Build the CRDT (Trunk → Branch → Leaf) operations for the new file so
+    // the semantic layer (token-level diff / blame) is populated, matching
+    // the modified-file path.
+    let (crdt_ops, crdt_stats) =
+        crdt::build_crdt_ops_for_added_file(&detected.path, &content, encoding);
+    recorded.set_crdt_ops(crdt_ops);
+    recorded.set_crdt_stats(crdt_stats);
 
     // Store the content
     recorded.set_content(content);
@@ -411,6 +413,26 @@ where
         return Err(format!("Skipping binary file {}", detected.path));
     }
 
+    // Fast path: machine-generated files (lockfiles, bundled output) skip
+    // both the expensive diff computation AND CRDT tokenization.  We treat
+    // them as a whole-file replace — one vertex in, one vertex out.
+    if super::globalize::should_use_opaque_generated_vertices(&detected.path) {
+        let mut replace_hunk = BuiltHunk::new_replace_with_lines(
+            Local::new(&detected.path, 1),
+            Some(encoding),
+            Vec::new(),
+            0,
+            0,
+            1,
+        );
+        replace_hunk.content_start = Some(0);
+        replace_hunk.content_end = Some(new_content.len() as u64);
+        recorded.add_hunk(replace_hunk);
+        recorded.set_content(new_content);
+        recorded.set_opaque_generated(true);
+        return Ok(recorded);
+    }
+
     // Compare content and build hunks
     let comparison = compare_content(old_content, &new_content, options.get_algorithm());
 
@@ -493,17 +515,22 @@ where
         recorded.add_hunk(graph_op);
     }
 
-    // Generate CRDT operations for token-level diff tracking.
+    // Generate CRDT (Trunk → Branch → Leaf) operations for token-level diff
+    // tracking via the Recipe pipeline.
     //
-    // Load-bearing subtlety: CRDT cleanup must diff against the prior
-    // CRDT materialization when available, not only the byte-graph read.
-    // If the CRDT layer has already drifted from the byte graph, using the
-    // byte-graph content here leaves CRDT-only stale branches alive forever
-    // because the diff never "sees" them to delete them.
+    // Load-bearing subtlety: CRDT cleanup must diff against the prior CRDT
+    // materialization when available, not only the byte-graph read. If the CRDT
+    // layer has already drifted from the byte graph, using the byte-graph
+    // content here leaves CRDT-only stale branches alive forever because the
+    // diff never "sees" them to delete them. Graph hunks above still use
+    // `old_content` (the byte-graph source of truth); only the CRDT op builder
+    // uses the optional `crdt_old_content`.
     //
-    // Graph hunks above still use `old_content` (the byte-graph source of
-    // truth for patch theory).  Only the CRDT op builder uses the optional
-    // `crdt_old_content`.
+    // NOTE: an earlier experiment swapped this for `build_crdt_ops_from_diff_ops`
+    // (O(diff) instead of re-analyzing the whole file). It was faster but the
+    // resulting BranchOps didn't materialize correctly through the CRDT walker
+    // (stale content survived modifies/deletes), so the Recipe pipeline is the
+    // authoritative path.
     use crate::record::workflow::recipes::{Recipe, RecipeContext};
     let recipe_ctx = RecipeContext {
         path: &detected.path,
@@ -514,9 +541,9 @@ where
         encoding,
         algorithm: options.get_algorithm(),
     };
-    let crdt_ops = Recipe::detect(&recipe_ctx).build_ops(&recipe_ctx);
-    recorded.set_crdt_ops(crdt_ops.0);
-    recorded.set_crdt_stats(crdt_ops.1);
+    let (crdt_ops, crdt_stats) = Recipe::detect(&recipe_ctx).build_ops(&recipe_ctx);
+    recorded.set_crdt_ops(crdt_ops);
+    recorded.set_crdt_stats(crdt_stats);
 
     // Store the new content
     recorded.set_content(new_content);
@@ -672,6 +699,163 @@ pub fn build_crdt_ops_from_git_diff(
     }
 
     (file_ops.into_change_ops(), stats)
+}
+
+/// Build CRDT ops from native `DiffOp`s and raw old/new content.
+///
+/// Only changed lines (inserted/deleted/replaced) are tokenized.
+/// Context (Equal) lines just advance the branch cursor.
+/// This is O(diff_size), not O(file_size).
+pub fn build_crdt_ops_from_diff_ops(
+    path: &str,
+    diff_ops: &[crate::diff::DiffOp],
+    old_content: &[u8],
+    new_content: &[u8],
+) -> (FileOps, CrdtBuildStats) {
+    use super::crdt::FileOps as BuilderFileOps;
+    use super::crdt::LineOps as BuilderLineOps;
+    use crate::crdt::LeafOp;
+
+    let placeholder_change_id = NodeId::new(0);
+    let trunk_id = TrunkId::new(placeholder_change_id, 0);
+    let mut file_ops = BuilderFileOps::new(trunk_id, path.to_string(), None);
+
+    let mut stats = CrdtBuildStats::new();
+    let mut next_branch_idx: u32 = 0;
+    let mut next_leaf_idx: u32 = 0;
+
+    let mut alloc_branch = || {
+        let id = BranchId::new(placeholder_change_id, next_branch_idx);
+        next_branch_idx += 1;
+        id
+    };
+
+    let mut alloc_leaf = || {
+        let id = crate::crdt::LeafId::new(placeholder_change_id, next_leaf_idx);
+        next_leaf_idx += 1;
+        id
+    };
+
+    // Split content into lines (keeping line endings)
+    let old_lines = split_content_lines(old_content);
+    let new_lines = split_content_lines(new_content);
+
+    let mut prev_branch: Option<BranchId> = None;
+
+    for op in diff_ops {
+        match op {
+            crate::diff::DiffOp::Equal { len, .. } => {
+                // Context lines: advance the branch cursor without emitting ops
+                for _ in 0..*len {
+                    let phantom = alloc_branch();
+                    prev_branch = Some(phantom);
+                }
+            }
+            crate::diff::DiffOp::Delete { old_pos, len, .. } => {
+                for i in 0..*len {
+                    let branch_id = alloc_branch();
+                    let line_bytes = old_lines.get(old_pos + i).copied().unwrap_or(b"");
+                    let trimmed = line_bytes.strip_suffix(b"\n").unwrap_or(line_bytes);
+
+                    let leaf_ops = vec![LeafOp::Insert {
+                        after: None,
+                        kind: crate::diff::TokenKind::Word,
+                        content: trimmed.to_vec(),
+                    }];
+
+                    let line_op = BuilderLineOps::delete(branch_id, leaf_ops)
+                        .with_old_line_num(old_pos + i + 1);
+                    file_ops.add_line_op(line_op);
+                    stats.lines_deleted += 1;
+                }
+            }
+            crate::diff::DiffOp::Insert { new_pos, len, .. } => {
+                for i in 0..*len {
+                    let branch_id = alloc_branch();
+                    let line_bytes = new_lines.get(new_pos + i).copied().unwrap_or(b"");
+                    let trimmed = line_bytes.strip_suffix(b"\n").unwrap_or(line_bytes);
+
+                    let _leaf_id = alloc_leaf();
+                    let leaf_ops = vec![LeafOp::Insert {
+                        after: None,
+                        kind: crate::diff::TokenKind::Word,
+                        content: trimmed.to_vec(),
+                    }];
+
+                    let line_op = BuilderLineOps::insert(branch_id, prev_branch, leaf_ops)
+                        .with_new_line_num(new_pos + i + 1);
+                    file_ops.add_line_op(line_op);
+                    stats.lines_added += 1;
+                    prev_branch = Some(branch_id);
+                }
+            }
+            crate::diff::DiffOp::Replace {
+                old_pos,
+                old_len,
+                new_pos,
+                new_len,
+            } => {
+                // Delete old lines
+                for i in 0..*old_len {
+                    let branch_id = alloc_branch();
+                    let line_bytes = old_lines.get(old_pos + i).copied().unwrap_or(b"");
+                    let trimmed = line_bytes.strip_suffix(b"\n").unwrap_or(line_bytes);
+
+                    let leaf_ops = vec![LeafOp::Insert {
+                        after: None,
+                        kind: crate::diff::TokenKind::Word,
+                        content: trimmed.to_vec(),
+                    }];
+
+                    let line_op = BuilderLineOps::delete(branch_id, leaf_ops)
+                        .with_old_line_num(old_pos + i + 1);
+                    file_ops.add_line_op(line_op);
+                    stats.lines_deleted += 1;
+                }
+                // Insert new lines
+                for i in 0..*new_len {
+                    let branch_id = alloc_branch();
+                    let line_bytes = new_lines.get(new_pos + i).copied().unwrap_or(b"");
+                    let trimmed = line_bytes.strip_suffix(b"\n").unwrap_or(line_bytes);
+
+                    let _leaf_id = alloc_leaf();
+                    let leaf_ops = vec![LeafOp::Insert {
+                        after: None,
+                        kind: crate::diff::TokenKind::Word,
+                        content: trimmed.to_vec(),
+                    }];
+
+                    let line_op = BuilderLineOps::insert(branch_id, prev_branch, leaf_ops)
+                        .with_new_line_num(new_pos + i + 1);
+                    file_ops.add_line_op(line_op);
+                    stats.lines_added += 1;
+                    prev_branch = Some(branch_id);
+                }
+            }
+        }
+    }
+
+    (file_ops.into_change_ops(), stats)
+}
+
+/// Split content into lines, preserving line endings.
+/// Returns slices into the original content.
+fn split_content_lines(content: &[u8]) -> Vec<&[u8]> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (i, &byte) in content.iter().enumerate() {
+        if byte == b'\n' {
+            lines.push(&content[start..=i]);
+            start = i + 1;
+        }
+    }
+    if start < content.len() {
+        lines.push(&content[start..]);
+    }
+    lines
 }
 
 /// Calculate byte offsets for each line in content.

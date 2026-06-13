@@ -267,6 +267,61 @@ impl HttpRemote {
         }
     }
 
+    /// List tag content hashes for a remote view.
+    ///
+    /// Returns `(hash, name)` pairs for all tags in the view.
+    /// The client can then download each tag individually with
+    /// [`download_tag`](Self::download_tag).
+    pub async fn list_remote_tags(&self, view: &str) -> RemoteResult<Vec<(String, String)>> {
+        let url = format!("{}?tags={}", self.base_url, view);
+        debug!("GET tags: {}", url);
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| RemoteError::connection_failed(&url, e))?;
+
+        let status = response.status();
+
+        match status {
+            StatusCode::OK => {
+                let body = response
+                    .text()
+                    .await
+                    .map_err(|e| RemoteError::connection_failed(&url, e))?;
+
+                let mut tags = Vec::new();
+                for line in body.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    // Format: "HASH NAME"
+                    if let Some((hash, name)) = line.split_once(' ') {
+                        tags.push((hash.to_string(), name.to_string()));
+                    }
+                }
+
+                debug!("Found {} remote tags for view '{}'", tags.len(), view);
+                Ok(tags)
+            }
+            StatusCode::NOT_FOUND => {
+                // View doesn't exist or no tags — return empty
+                Ok(Vec::new())
+            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::auth_failed(&url, msg))
+            }
+            _ => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::http(status.as_u16(), msg))
+            }
+        }
+    }
+
     /// Download an attestation from the remote server.
     ///
     /// # Arguments

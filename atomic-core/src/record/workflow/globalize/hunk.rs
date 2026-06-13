@@ -38,18 +38,55 @@ use super::*;
 use crate::change::Local;
 use crate::pristine::InodeGraphOps;
 
-fn should_use_opaque_generated_vertices(path: &str) -> bool {
+/// Returns `true` for machine-generated files (lockfiles, checksums, bundled
+/// output) that should be treated as opaque blobs — skipping CRDT tokenization
+/// and using single-vertex graph operations instead of per-line/per-token ops.
+pub fn should_use_opaque_generated_vertices(path: &str) -> bool {
     let Some(name) = std::path::Path::new(path).file_name() else {
         return false;
     };
     let name = name.to_string_lossy();
-    name.ends_with(".lock")
+
+    // Lockfiles and checksums
+    if name.ends_with(".lock")
         || name.ends_with(".sum")
         || matches!(
             name.as_ref(),
             "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml"
         )
+    {
+        return true;
+    }
+
+    // Minified / bundled output (typically machine-generated, huge, not human-edited)
+    if name.ends_with(".min.js")
+        || name.ends_with(".min.css")
+        || name.ends_with(".bundle.js")
+        || name.ends_with(".chunk.js")
+    {
+        return true;
+    }
+
+    // Bundled output in well-known output directories.
+    // Check both "/dir/" (nested) and "dir/" (root-relative) patterns.
+    let path_lower = path.to_lowercase();
+    let in_output_dir = ["dist/", "public/", "build/", "out/"]
+        .iter()
+        .any(|dir| path_lower.starts_with(dir) || path_lower.contains(&format!("/{dir}")));
+    if in_output_dir && (name.ends_with(".js") || name.ends_with(".css") || name.ends_with(".map"))
+    {
+        return true;
+    }
+
+    false
 }
+
+/// Line-count threshold for the diff above which CRDT tokenization is
+/// skipped in favor of line-level-only graph ops.  This measures the total
+/// number of *changed* lines (inserted + deleted + replaced), not the file
+/// size.  A large file with a 5-line edit stays under the threshold; a
+/// bundle rebuild that rewrites 2000 lines exceeds it.
+pub const CRDT_DIFF_LINE_THRESHOLD: usize = 500;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Public entry point

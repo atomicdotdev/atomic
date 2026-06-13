@@ -504,7 +504,7 @@ where
 }
 
 fn import_direct_write_insertion(
-    batch: &mut atomic_core::apply::GraphWriteBatch<'_>,
+    batch: &mut atomic_core::apply::CachedWriteGraphTxn<'_, '_>,
     change_id: NodeId,
     insertion: &Insertion<Option<Hash>>,
     by_end: &mut HashMap<ChangePosition, GraphNode<NodeId>>,
@@ -1335,7 +1335,7 @@ impl Repository {
         }
 
         {
-            let mut graph_batch = atomic_core::apply::GraphWriteBatch::new(&*txn)
+            let mut graph_batch = atomic_core::apply::CachedWriteGraphTxn::new(&*txn)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             for (inode, flag, source, target) in pending_edges {
                 graph_batch
@@ -1416,7 +1416,7 @@ impl Repository {
 
         let graph_start = std::time::Instant::now();
         {
-            let mut batch = atomic_core::apply::GraphWriteBatch::new(&*txn)
+            let mut batch = atomic_core::apply::CachedWriteGraphTxn::new(&*txn)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let mut inode_sources: HashSet<(u64, GraphNode<NodeId>)> = HashSet::new();
             let mut inode_terminal_candidates: Vec<(
@@ -1983,11 +1983,19 @@ impl Repository {
     pub fn write_recorded(
         &self,
         outcome: &RecordOutcome,
-        options: InsertOptions,
+        mut options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
         let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some();
         let change = outcome.change();
         let hash = outcome.hash();
+
+        // A freshly-recorded change is applied to the view it was recorded on.
+        // Its dependency closure is complete by construction, so it cannot
+        // produce zombie or missing-context conflicts. Disable conflict
+        // detection to skip the per-hunk zombie/deleted-context graph scans
+        // (the dominant apply cost on large changes); the graph written is
+        // identical, only the (empty) conflict report is skipped.
+        options.track_conflicts = false;
 
         // Get write transaction
         let mut txn = self
@@ -2564,5 +2572,95 @@ impl Repository {
             .with_dependencies(true);
 
         self.insert_from_view(options)
+    }
+
+    /// Record a Git SHA → Atomic change mapping in the GIT_SHA_INDEX.
+    ///
+    /// Called after each commit is imported to enable O(1) incremental lookups.
+    /// The `change_hash` is the Atomic Blake3 hash returned by write_import_*.
+    pub fn index_git_sha(&self, git_sha: &str, change_hash: &Hash) -> Result<(), RepositoryError> {
+        use atomic_core::pristine::GitShaIndexMutTxnT;
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Get the entity_id for this change hash
+        let entity_id = txn
+            .get_internal(change_hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| {
+                RepositoryError::Database(format!(
+                    "Change hash not found in INTERNAL: {}",
+                    change_hash.to_base32()
+                ))
+            })?;
+
+        txn.put_git_sha(git_sha, entity_id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Check if a Git SHA has been indexed.
+    pub fn has_git_sha(&self, git_sha: &str) -> Result<bool, RepositoryError> {
+        use atomic_core::pristine::GitShaIndexTxnT;
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        txn.has_git_sha(git_sha)
+            .map_err(|e| RepositoryError::Database(e.to_string()))
+    }
+
+    /// Backfill the GIT_SHA_INDEX from existing imported changes.
+    ///
+    /// Scans all changes on the current view, looks for `unhashed.git.sha`,
+    /// and populates the index. Idempotent — skips already-indexed SHAs.
+    pub fn backfill_git_sha_index(&self) -> Result<usize, RepositoryError> {
+        use crate::HistoryOptions;
+        use atomic_core::pristine::GitShaIndexTxnT;
+
+        let entries = self.log(HistoryOptions::default())?;
+        let mut count = 0;
+
+        for entry in &entries {
+            if let Ok(change) = self.load_change(&entry.hash) {
+                if let Some(ref unhashed) = change.unhashed {
+                    if let Some(git) = unhashed.get("git") {
+                        if let Some(sha) = git.get("sha").and_then(|v| v.as_str()) {
+                            // Check if already indexed
+                            {
+                                let txn = self
+                                    .pristine
+                                    .read_txn()
+                                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                                if txn.has_git_sha(sha).unwrap_or(false) {
+                                    continue;
+                                }
+                            }
+                            // Index it
+                            if let Err(e) = self.index_git_sha(sha, &entry.hash) {
+                                log::warn!(
+                                    "Failed to index git SHA {}: {}",
+                                    &sha[..8.min(sha.len())],
+                                    e
+                                );
+                            } else {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(count)
     }
 }

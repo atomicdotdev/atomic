@@ -99,6 +99,7 @@ impl Command for Show {
                     emphasis("Created"),
                     tag.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
                 );
+                println!("{}: {}", emphasis("Kind"), tag.kind);
                 println!(
                     "{}: {}",
                     emphasis("Type"),
@@ -109,16 +110,20 @@ impl Command for Show {
                     }
                 );
 
-                if let Some(message) = tag.message() {
+                if let Some(ref message) = tag.message {
                     println!("{}: {}", emphasis("Message"), message);
                 }
 
-                if let Some(author) = tag.author() {
+                if let Some(ref author) = tag.author {
                     let author_str = match &author.email {
                         Some(email) => format!("{} <{}>", author.name, email),
                         None => author.name.clone(),
                     };
                     println!("{}: {}", emphasis("Author"), author_str);
+                }
+
+                if let Some(ref metadata) = tag.metadata {
+                    println!("{}: {}", emphasis("Metadata"), metadata);
                 }
 
                 Ok(())
@@ -142,7 +147,7 @@ impl Command for Show {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomic_repository::TagOptions;
+    use atomic_repository::TagKind;
     use serial_test::serial;
 
     // -------------------------------------------------------------------------
@@ -216,7 +221,7 @@ mod tests {
         // Initialize a repository and create a tag
         {
             let repo = Repository::init(repo_path).unwrap();
-            repo.create_tag("v1.0.0", TagOptions::default()).unwrap();
+            repo.create_tag("v1.0.0", None, TagKind::Release).unwrap();
         }
 
         // Change to the repo directory
@@ -240,10 +245,8 @@ mod tests {
         // Initialize a repository and create an annotated tag
         {
             let repo = Repository::init(repo_path).unwrap();
-            let options = TagOptions::default()
-                .message("Release version 1.0.0")
-                .author("Alice", Some("alice@example.com"));
-            repo.create_tag("v1.0.0", options).unwrap();
+            repo.create_tag("v1.0.0", Some("Release version 1.0.0"), TagKind::Release)
+                .unwrap();
         }
 
         // Change to the repo directory

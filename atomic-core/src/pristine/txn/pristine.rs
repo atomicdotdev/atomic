@@ -112,7 +112,14 @@ impl Pristine {
 
             // State tables
             write_txn.open_table(STATES)?;
-            write_txn.open_table(TAGS)?;
+            write_txn.open_table(MERKLE_CHAIN)?;
+
+            // Tag record tables
+            write_txn.open_table(TAG_RECORDS)?;
+            write_txn.open_table(TAG_NAME_INDEX)?;
+
+            // Git SHA index (git commit SHA → entity_id)
+            write_txn.open_table(GIT_SHA_INDEX)?;
 
             // Session tables (Sherpa-enriched provenance data)
             write_txn.open_table(SESSION_EVENTS)?;

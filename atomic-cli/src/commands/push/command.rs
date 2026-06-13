@@ -658,6 +658,44 @@ impl Push {
             }
         }
 
+        // Upload tags for the pushed view.
+        let mut tag_count = 0;
+        {
+            let tags = repo.list_tags_for_view(&remote_view).unwrap_or_default();
+
+            for tag in &tags {
+                let tag_hash = tag.content_hash();
+                let tag_hash_str = tag_hash.to_base32();
+
+                let tag_bytes = match atomic_repository::serialize_tag(tag) {
+                    Ok(bytes) => Bytes::from(bytes),
+                    Err(e) => {
+                        print_warning(&format!("Failed to serialize tag '{}': {}", tag.name, e));
+                        continue;
+                    }
+                };
+
+                match remote
+                    .upload_tag(&tag_hash_str, &remote_view, tag_bytes)
+                    .await
+                {
+                    Ok(()) => {
+                        tag_count += 1;
+                        println!(
+                            "  {} {} tag '{}' ({})",
+                            success("\u{2713}"),
+                            style_hash(&tag_hash_str[..12]),
+                            tag.name,
+                            tag.kind,
+                        );
+                    }
+                    Err(e) => {
+                        print_warning(&format!("Failed to upload tag '{}': {}", tag.name, e));
+                    }
+                }
+            }
+        }
+
         // Summary
         print_blank();
         let mut summary = format!(
@@ -683,6 +721,9 @@ impl Push {
                 ", {} synced",
                 format_count(provenance_count, "provenance graph")
             ));
+        }
+        if tag_count > 0 {
+            summary.push_str(&format!(", {} synced", format_count(tag_count, "tag")));
         }
         print_success(&summary);
 

@@ -38,7 +38,7 @@
 use clap::Parser;
 
 use atomic_core::types::Base32;
-use atomic_repository::{Repository, TagFilter};
+use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
@@ -130,25 +130,24 @@ impl Command for List {
             other => CliError::Repository(other),
         })?;
 
-        // Build filter
-        let mut filter = TagFilter::new();
+        // Get tags — filter by view or list all
+        let mut tags = if let Some(view) = &self.view {
+            repo.list_tags_for_view(view)
+                .map_err(CliError::Repository)?
+        } else {
+            repo.list_all_tags().map_err(CliError::Repository)?
+        };
 
-        if let Some(view) = &self.view {
-            filter = filter.view(view);
-        }
-
+        // Apply name pattern filter (glob-style)
         if let Some(pattern) = &self.pattern {
-            filter = filter.pattern(pattern);
+            let pat = pattern.replace('*', "");
+            tags.retain(|t| t.name.contains(&pat));
         }
 
+        // Apply annotated-only filter
         if self.annotated_only {
-            filter = filter.annotated_only();
+            tags.retain(|t| t.is_annotated());
         }
-
-        // Get tags
-        let tags = repo
-            .list_tags_filtered(&filter)
-            .map_err(CliError::Repository)?;
 
         if tags.is_empty() {
             println!(
@@ -198,7 +197,7 @@ impl Command for List {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomic_repository::TagOptions;
+    use atomic_repository::TagKind;
     use serial_test::serial;
 
     // -------------------------------------------------------------------------
@@ -305,8 +304,8 @@ mod tests {
         // Initialize a repository and create some tags
         {
             let repo = Repository::init(repo_path).unwrap();
-            repo.create_tag("v1.0.0", TagOptions::default()).unwrap();
-            repo.create_tag("v2.0.0", TagOptions::default()).unwrap();
+            repo.create_tag("v1.0.0", None, TagKind::Release).unwrap();
+            repo.create_tag("v2.0.0", None, TagKind::Release).unwrap();
         }
 
         // Change to the repo directory
@@ -330,7 +329,7 @@ mod tests {
         // Initialize a repository and create a tag
         {
             let repo = Repository::init(repo_path).unwrap();
-            repo.create_tag("v1.0.0", TagOptions::default()).unwrap();
+            repo.create_tag("v1.0.0", None, TagKind::Release).unwrap();
         }
 
         // Change to the repo directory
@@ -354,8 +353,8 @@ mod tests {
         // Initialize a repository and create tags
         {
             let repo = Repository::init(repo_path).unwrap();
-            repo.create_tag("v1.0.0", TagOptions::default()).unwrap();
-            repo.create_tag("v2.0.0", TagOptions::default().message("Annotated"))
+            repo.create_tag("v1.0.0", None, TagKind::Release).unwrap();
+            repo.create_tag("v2.0.0", Some("Annotated"), TagKind::Release)
                 .unwrap();
         }
 
