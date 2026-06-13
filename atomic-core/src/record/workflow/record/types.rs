@@ -180,6 +180,12 @@ pub struct RecordedFile {
     /// Used by import paths for lockfiles/checksums where full line-level
     /// graph and CRDT detail is not worth the cost.
     opaque_generated: bool,
+
+    /// Pre-globalized graph operations.  When set, `assemble_change` uses
+    /// these directly instead of calling `globalize_recorded_file`, which
+    /// avoids re-walking the graph.  Produced by the record path when it
+    /// has a vertex map from content retrieval.
+    pre_globalized: Option<Vec<crate::change::GraphOp<Option<crate::types::Hash>>>>,
 }
 
 impl RecordedFile {
@@ -212,6 +218,7 @@ impl RecordedFile {
             crdt_ops: None,
             crdt_stats: None,
             opaque_generated: false,
+            pre_globalized: None,
         }
     }
 
@@ -416,6 +423,28 @@ impl RecordedFile {
     #[must_use]
     pub fn opaque_generated(&self) -> bool {
         self.opaque_generated
+    }
+
+    /// Set pre-globalized graph operations.
+    pub fn set_pre_globalized(
+        &mut self,
+        ops: Vec<crate::change::GraphOp<Option<crate::types::Hash>>>,
+    ) {
+        self.pre_globalized = Some(ops);
+    }
+
+    /// Get pre-globalized graph operations.
+    #[must_use]
+    pub fn pre_globalized(&self) -> Option<&[crate::change::GraphOp<Option<crate::types::Hash>>]> {
+        self.pre_globalized.as_deref()
+    }
+
+    /// Take ownership of pre-globalized graph operations.
+    #[must_use]
+    pub fn take_pre_globalized(
+        &mut self,
+    ) -> Option<Vec<crate::change::GraphOp<Option<crate::types::Hash>>>> {
+        self.pre_globalized.take()
     }
 
     /// Check if this file has CRDT operations.

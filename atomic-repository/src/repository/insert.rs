@@ -504,7 +504,7 @@ where
 }
 
 fn import_direct_write_insertion(
-    batch: &mut atomic_core::apply::GraphWriteBatch<'_>,
+    batch: &mut atomic_core::apply::CachedWriteGraphTxn<'_, '_>,
     change_id: NodeId,
     insertion: &Insertion<Option<Hash>>,
     by_end: &mut HashMap<ChangePosition, GraphNode<NodeId>>,
@@ -1335,7 +1335,7 @@ impl Repository {
         }
 
         {
-            let mut graph_batch = atomic_core::apply::GraphWriteBatch::new(&*txn)
+            let mut graph_batch = atomic_core::apply::CachedWriteGraphTxn::new(&*txn)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             for (inode, flag, source, target) in pending_edges {
                 graph_batch
@@ -1416,7 +1416,7 @@ impl Repository {
 
         let graph_start = std::time::Instant::now();
         {
-            let mut batch = atomic_core::apply::GraphWriteBatch::new(&*txn)
+            let mut batch = atomic_core::apply::CachedWriteGraphTxn::new(&*txn)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let mut inode_sources: HashSet<(u64, GraphNode<NodeId>)> = HashSet::new();
             let mut inode_terminal_candidates: Vec<(
@@ -1983,11 +1983,19 @@ impl Repository {
     pub fn write_recorded(
         &self,
         outcome: &RecordOutcome,
-        options: InsertOptions,
+        mut options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
         let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some();
         let change = outcome.change();
         let hash = outcome.hash();
+
+        // A freshly-recorded change is applied to the view it was recorded on.
+        // Its dependency closure is complete by construction, so it cannot
+        // produce zombie or missing-context conflicts. Disable conflict
+        // detection to skip the per-hunk zombie/deleted-context graph scans
+        // (the dominant apply cost on large changes); the graph written is
+        // identical, only the (empty) conflict report is skipped.
+        options.track_conflicts = false;
 
         // Get write transaction
         let mut txn = self

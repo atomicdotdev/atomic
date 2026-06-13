@@ -56,6 +56,31 @@ use crate::types::Hash;
 use super::globalize::{globalize_recorded_file, GlobalizeContext};
 use super::record::RecordedFile;
 
+/// Shift the content offsets of a pre-globalized op's inserted span(s) by
+/// `shift`, mapping the file-local blob offsets to the change-global blob.
+///
+/// Only the Insertion `start`/`end` (the new content this change introduces)
+/// are shifted; predecessor/successor positions reference existing graph
+/// vertices in other changes and must not move.
+fn shift_graph_op_content(op: &mut GraphOp<Option<Hash>>, shift: u64) {
+    use crate::change::{Atom, Insertion};
+    use crate::types::ChangePosition;
+
+    fn shift_insertion(ins: &mut Insertion<Option<Hash>>, shift: u64) {
+        ins.start = ChangePosition::new(ins.start.get() + shift);
+        ins.end = ChangePosition::new(ins.end.get() + shift);
+    }
+
+    match op {
+        GraphOp::Edit {
+            change: Atom::Insertion(ins),
+            ..
+        } => shift_insertion(ins, shift),
+        GraphOp::Replacement { replacement, .. } => shift_insertion(replacement, shift),
+        _ => {}
+    }
+}
+
 // ============================================================================
 // ASSEMBLY CONTEXT
 // ============================================================================
@@ -394,6 +419,39 @@ where
         );
         let glob_start = Instant::now();
 
+        // Fast path: if the file has pre-globalized ops (vertex map was
+        // available during content retrieval), skip globalization entirely.
+        if let Some(pre_ops) = file.pre_globalized() {
+            // The pre-globalized Insertion offsets index into this file's own
+            // inserted-span blob (base 0). Append that blob to the shared
+            // change content and shift the offsets to their global position so
+            // content retrieval can resolve each span.
+            let (base, _) = glob_ctx.append_content(file.content());
+            let shift = base.get();
+            for op in pre_ops {
+                let mut op = op.clone();
+                shift_graph_op_content(&mut op, shift);
+                ctx.add_hunk(op);
+            }
+            // Collect CRDT ops if present
+            if !file.opaque_generated() {
+                if let Some(crdt_ops) = file.crdt_ops() {
+                    ctx.add_file_ops(crdt_ops.clone());
+                }
+            }
+            let glob_ms = glob_start.elapsed().as_millis();
+            if glob_ms > 100 {
+                eprintln!(
+                    "[assemble] pre-globalized '{}' {}ms ({} hunks)",
+                    file.path(),
+                    glob_ms,
+                    pre_ops.len(),
+                );
+            }
+            stats.record_file();
+            continue;
+        }
+
         match globalize_recorded_file(&mut glob_ctx, file, options.get_globalize_options()) {
             Ok(globalized) => {
                 let glob_ms = glob_start.elapsed().as_millis();
@@ -438,6 +496,12 @@ where
                 }
 
                 if glob_ms > 100 {
+                    eprintln!(
+                        "[assemble] SLOW '{}' {}ms ({} hunks)",
+                        file.path(),
+                        glob_ms,
+                        hunk_count,
+                    );
                     log::warn!(
                         "assemble_change: SLOW file {}/{} '{}' took {}ms ({} hunks, {} bytes added)",
                         file_idx + 1,

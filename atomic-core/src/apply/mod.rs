@@ -156,12 +156,12 @@
 //! ```rust,ignore
 //! use atomic_core::apply::{
 //!     verify_dependencies, validate_can_apply, compute_new_state,
-//!     write_new_vertex, write_edge_map, Workspace, ApplyError,
+//!     write_new_vertex, write_edge_map, CachedWriteGraphTxn, Workspace, ApplyError,
 //! };
 //! use atomic_core::change::{Change, Atom};
 //!
 //! fn apply_to_view(
-//!     txn: &mut impl MutTxnT,
+//!     txn: &mut WriteTxn,
 //!     view: &mut ViewState,
 //!     change: &Change,
 //!     change_hash: &Hash,
@@ -175,15 +175,20 @@
 //!     // Create workspace for tracking state
 //!     let mut workspace = Workspace::new();
 //!
-//!     // Apply each graph_op's atoms
-//!     for graph_op in change.hunks() {
-//!         for atom in graph_op.atoms() {
-//!             match atom {
-//!                 Atom::Insertion(nv) => {
-//!                     write_new_vertex(txn, &mut workspace, change_id, nv, change)?;
-//!                 }
-//!                 Atom::EdgeUpdate(em) => {
-//!                     write_edge_map(txn, &mut workspace, change_id, em, change)?;
+//!     // Open GRAPH + INODE_GRAPH once for the whole hunk pass. The cached
+//!     // writer serves both graph reads and writes, so the tables are not
+//!     // reopened per edge. Drop it before mutating `txn` again.
+//!     {
+//!         let mut cached = CachedWriteGraphTxn::new(&*txn)?;
+//!         for graph_op in change.hunks() {
+//!             for atom in graph_op.atoms() {
+//!                 match atom {
+//!                     Atom::Insertion(nv) => {
+//!                         write_new_vertex(&mut cached, &mut workspace, change_id, nv, change)?;
+//!                     }
+//!                     Atom::EdgeUpdate(em) => {
+//!                         write_edge_map(&mut cached, &mut workspace, change_id, em, change)?;
+//!                     }
 //!                 }
 //!             }
 //!         }
@@ -248,8 +253,8 @@ pub use position::{
 };
 
 // Re-export atom application functions
-pub use edge::{find_source_vertex, find_target_vertex, write_edge_map, write_edge_map_batched};
-pub use insertion::{add_edge_with_reverse, write_new_vertex, write_new_vertex_batched};
+pub use edge::{find_source_vertex, find_target_vertex, write_edge_map};
+pub use insertion::write_new_vertex;
 
 // Re-export conflict tracking types
 pub use conflict::{
@@ -260,4 +265,4 @@ pub use conflict::{
 pub use file_ops::{
     apply_file_ops, apply_file_ops_batched, apply_file_ops_batched_groups, ApplyFileOpsStats,
 };
-pub use graph_batch::GraphWriteBatch;
+pub use graph_batch::CachedWriteGraphTxn;

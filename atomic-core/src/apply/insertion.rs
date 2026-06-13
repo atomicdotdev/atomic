@@ -44,12 +44,12 @@
 //! resolution during output.
 
 use crate::change::{Change, Insertion};
-use crate::pristine::{GraphTxnT, MutTxnT, TreeTxnT};
+use crate::pristine::GraphTxnT;
 #[allow(unused_imports)]
 use crate::types::{EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge};
 
 use super::error::LocalApplyError;
-use super::graph_batch::GraphWriteBatch;
+use super::graph_batch::{add_edge_with_reverse, CachedWriteGraphTxn};
 use super::position::{resolve_context_vertex, resolve_inode, resolve_position};
 use super::workspace::Workspace;
 
@@ -83,12 +83,13 @@ use super::workspace::Workspace;
 /// - `DependencyMissing`: Referenced change not found
 /// - `BlockNotFound`: Context position not found
 /// - `Internal`: Database error
-pub fn write_new_vertex<T: MutTxnT>(
-    txn: &mut T,
+pub fn write_new_vertex(
+    txn: &mut CachedWriteGraphTxn<'_, '_>,
     workspace: &mut Workspace,
     change_id: NodeId,
     insertion: &Insertion<Option<Hash>>,
     change: &Change,
+    detect_conflicts: bool,
 ) -> Result<(), LocalApplyError> {
     // Create the new span
     let node = GraphNode {
@@ -130,7 +131,9 @@ pub fn write_new_vertex<T: MutTxnT>(
         workspace.add_up_context_vertex(up_vertex);
 
         // Check if predecessors was deleted by an unknown change
-        check_deleted_context(txn, workspace, change, up_vertex)?;
+        if detect_conflicts {
+            check_deleted_context(txn, workspace, change, up_vertex)?;
+        }
     }
 
     let exact_inode_successor = resolve_position(txn, &insertion.inode, change_id).ok();
@@ -175,7 +178,9 @@ pub fn write_new_vertex<T: MutTxnT>(
         workspace.add_down_context_vertex(down_vertex);
 
         // Check if successors was deleted by an unknown change
-        check_deleted_context(txn, workspace, change, down_vertex)?;
+        if detect_conflicts {
+            check_deleted_context(txn, workspace, change, down_vertex)?;
+        }
     }
 
     // Resolve inode for inode_graph indexing
@@ -214,211 +219,6 @@ pub fn write_new_vertex<T: MutTxnT>(
     workspace.register_current_vertex(node);
 
     Ok(())
-}
-
-/// Batched variant of [`write_new_vertex`] that keeps graph tables open across
-/// the full hunk pass.
-pub fn write_new_vertex_batched<T: GraphTxnT + TreeTxnT>(
-    txn: &T,
-    graph_batch: &mut GraphWriteBatch<'_>,
-    workspace: &mut Workspace,
-    change_id: NodeId,
-    insertion: &Insertion<Option<Hash>>,
-    change: &Change,
-) -> Result<(), LocalApplyError> {
-    let node = GraphNode {
-        change: change_id,
-        start: insertion.start,
-        end: insertion.end,
-    };
-
-    workspace.clear_context();
-
-    if insertion.successors.is_empty() && insertion.predecessors.len() == 1 {
-        let internal_pos = resolve_position(txn, &insertion.predecessors[0], change_id)?;
-        if let Some(up_vertex) = workspace.get_current_vertex(internal_pos, true) {
-            let resolved_inode = resolve_inode(txn, &insertion.inode, change_id)?;
-            let up_flag = insertion.flag | EdgeFlags::BLOCK;
-            add_edge_with_reverse_batched(
-                graph_batch,
-                resolved_inode,
-                up_flag,
-                up_vertex,
-                node,
-                change_id,
-            )?;
-            workspace.add_up_context(up_vertex.end_pos());
-            workspace.add_up_context_vertex(up_vertex);
-            workspace.register_current_vertex(node);
-            return Ok(());
-        }
-    }
-
-    for up_pos in &insertion.predecessors {
-        let internal_pos = resolve_position(txn, up_pos, change_id)?;
-        let up_vertex = workspace
-            .get_current_vertex(internal_pos, true)
-            .unwrap_or(resolve_context_vertex(txn, internal_pos, true)?);
-        workspace.add_up_context(up_vertex.end_pos());
-        workspace.add_up_context_vertex(up_vertex);
-        check_deleted_context(txn, workspace, change, up_vertex)?;
-    }
-
-    let exact_inode_successor = resolve_position(txn, &insertion.inode, change_id).ok();
-
-    for down_pos in &insertion.successors {
-        let internal_pos = resolve_position(txn, down_pos, change_id)?;
-        if internal_pos.change == change_id {
-            return Err(LocalApplyError::CyclicDependency {
-                message: "Down context cannot reference the change being applied".to_string(),
-            });
-        }
-
-        let used_exact_inode_anchor = exact_inode_successor == Some(internal_pos);
-        let down_vertex = if used_exact_inode_anchor {
-            let inode_anchor = GraphNode {
-                change: internal_pos.change,
-                start: internal_pos.pos,
-                end: internal_pos.pos,
-            };
-            if graph_batch.has_graph_vertex(inode_anchor).map_err(|e| {
-                LocalApplyError::Internal {
-                    message: format!("Failed to check inode anchor vertex: {}", e),
-                }
-            })? {
-                inode_anchor
-            } else {
-                workspace
-                    .get_current_vertex(internal_pos, false)
-                    .unwrap_or(resolve_context_vertex(txn, internal_pos, false)?)
-            }
-        } else {
-            workspace
-                .get_current_vertex(internal_pos, false)
-                .unwrap_or(resolve_context_vertex(txn, internal_pos, false)?)
-        };
-        workspace.add_down_context(down_vertex.start_pos());
-        workspace.add_down_context_vertex(down_vertex);
-        if !used_exact_inode_anchor {
-            check_deleted_context(txn, workspace, change, down_vertex)?;
-        }
-    }
-
-    let resolved_inode = resolve_inode(txn, &insertion.inode, change_id)?;
-
-    let up_flag = insertion.flag | EdgeFlags::BLOCK;
-    for up_vertex in workspace.predecessor_vertices().to_vec() {
-        add_edge_with_reverse_batched(
-            graph_batch,
-            resolved_inode,
-            up_flag,
-            up_vertex,
-            node,
-            change_id,
-        )?;
-    }
-
-    let down_flag = insertion.flag | EdgeFlags::BLOCK;
-    for down_vertex in workspace.successor_vertices().to_vec() {
-        add_edge_with_reverse_batched(
-            graph_batch,
-            resolved_inode,
-            down_flag,
-            node,
-            down_vertex,
-            change_id,
-        )?;
-
-        if insertion.flag.is_folder() {
-            workspace.mark_rooted(down_vertex.start_pos());
-        }
-    }
-
-    workspace.register_current_vertex(node);
-
-    Ok(())
-}
-
-// Edge Operations
-
-/// Add an edge and its reverse to the graph.
-///
-/// In the Atomic graph model, edges come in pairs:
-/// - Forward edge: `source → target` with base flags
-/// - Reverse edge: `target → source` with PARENT flag added
-///
-/// This maintains bidirectional traversal capability.
-///
-/// # Graph Structure
-///
-/// ```text
-/// [source] ────flag────> [target]
-/// [target] ──flag|PARENT──> [source]
-/// ```
-///
-/// # Arguments
-///
-/// * `txn` - Write transaction
-/// * `inode` - Optional inode for inode_graph indexing
-/// * `flag` - Edge flags for the forward edge
-/// * `source` - Source span
-/// * `target` - Target span
-/// * `introduced_by` - Change that introduced this edge
-pub fn add_edge_with_reverse<T: MutTxnT>(
-    txn: &mut T,
-    inode: Option<Inode>,
-    flag: EdgeFlags,
-    source: GraphNode<NodeId>,
-    dest: GraphNode<NodeId>,
-    introduced_by: NodeId,
-) -> Result<(), LocalApplyError> {
-    // Create forward edge
-    let forward_edge = SerializedGraphEdge::new(flag, dest.start_pos(), introduced_by);
-
-    // Create reverse edge (with PARENT flag)
-    let reverse_flag = flag | EdgeFlags::PARENT;
-    let reverse_edge = SerializedGraphEdge::new(reverse_flag, source.end_pos(), introduced_by);
-
-    // Write to global GRAPH
-    txn.put_graph(source, forward_edge)
-        .map_err(|e| LocalApplyError::Internal {
-            message: format!("Failed to add forward edge: {}", e),
-        })?;
-
-    txn.put_graph(dest, reverse_edge)
-        .map_err(|e| LocalApplyError::Internal {
-            message: format!("Failed to add reverse edge: {}", e),
-        })?;
-
-    // Write to INODE_GRAPH secondary index
-    if let Some(inode_val) = inode {
-        txn.put_inode_graph(inode_val, source, forward_edge)
-            .map_err(|e| LocalApplyError::Internal {
-                message: format!("Failed to add forward inode edge: {}", e),
-            })?;
-
-        txn.put_inode_graph(inode_val, dest, reverse_edge)
-            .map_err(|e| LocalApplyError::Internal {
-                message: format!("Failed to add reverse inode edge: {}", e),
-            })?;
-    }
-
-    Ok(())
-}
-
-fn add_edge_with_reverse_batched(
-    graph_batch: &mut GraphWriteBatch<'_>,
-    inode: Option<Inode>,
-    flag: EdgeFlags,
-    source: GraphNode<NodeId>,
-    dest: GraphNode<NodeId>,
-    introduced_by: NodeId,
-) -> Result<(), LocalApplyError> {
-    graph_batch
-        .add_edge_with_reverse(inode, flag, source, dest, introduced_by)
-        .map_err(|e| LocalApplyError::Internal {
-            message: format!("Failed to add edge pair: {}", e),
-        })
 }
 
 // Conflict Detection
