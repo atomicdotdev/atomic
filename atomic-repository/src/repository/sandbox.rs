@@ -377,17 +377,30 @@ fn provision_working_tree(src: &Path, dest: &Path) -> Result<usize, RepositoryEr
             reflink_copy::reflink_or_copy(entry.path(), &target)?;
             count += 1;
         } else if ft.is_symlink() {
-            // Recreate symlinks rather than following them.
-            if let Ok(link_target) = std::fs::read_link(entry.path()) {
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let _ = std::os::unix::fs::symlink(link_target, &target);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
             }
+            let _ = recreate_symlink(entry.path(), &target);
         }
     }
 
     Ok(count)
+}
+
+/// Recreate a symlink found at `src` into `dest`, preserving its target.
+///
+/// Unix has a dedicated definition; everything else falls back below.
+#[cfg(unix)]
+fn recreate_symlink(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let link_target = std::fs::read_link(src)?;
+    std::os::unix::fs::symlink(link_target, dest)
+}
+
+/// Non-Unix fallback: symlink creation needs special privileges, so copy the
+/// file the link resolves to (correct content-wise).
+#[cfg(not(unix))]
+fn recreate_symlink(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::copy(src, dest).map(|_| ())
 }
 
 #[cfg(test)]
