@@ -59,7 +59,7 @@
 use std::path::{Path, PathBuf};
 
 use atomic_core::types::{Base32, Hash};
-use atomic_repository::Repository;
+use atomic_repository::{Repository, SANDBOX_POINTER};
 use chrono::{DateTime, Local, Utc};
 
 use crate::error::{CliError, CliResult};
@@ -79,6 +79,7 @@ pub mod record;
 pub mod remove;
 pub mod restore;
 pub mod revise;
+pub mod sandbox;
 pub mod split;
 pub mod stash;
 pub mod status;
@@ -140,6 +141,7 @@ pub use remote::Remote;
 pub use remove::Remove;
 pub use restore::Restore;
 pub use revise::Revise;
+pub use sandbox::Sandbox;
 pub use split::Split;
 pub use stash::Stash;
 pub use status::Status;
@@ -272,6 +274,13 @@ pub fn find_repository_root_from(start_path: &Path) -> CliResult<PathBuf> {
     loop {
         let dot_dir = current.join(DOT_DIR);
         if dot_dir.is_dir() {
+            return Ok(current);
+        }
+
+        // A sandbox working tree has no `.atomic/` of its own — it carries a
+        // pointer to the canonical graph. Treat the sandbox root as a valid
+        // repository root; `Repository::open*` resolves the pointer.
+        if current.join(SANDBOX_POINTER).is_file() {
             return Ok(current);
         }
 

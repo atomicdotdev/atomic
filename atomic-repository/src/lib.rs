@@ -119,6 +119,9 @@ pub mod ai;
 // Content search powered by syntext
 pub mod content_search;
 
+// OCI image layout production (sandbox stage/seal)
+pub mod oci;
+
 // Query plan schema and executor
 pub mod query_plan;
 
