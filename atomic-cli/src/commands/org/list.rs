@@ -71,7 +71,7 @@ impl Command for OrgList {
 
 impl OrgList {
     async fn execute(&self) -> CliResult<()> {
-        let client = build_client(self.org.as_deref())?;
+        let client = build_client(self.org.as_deref()).await?;
         let slug = client.org_slug().to_string();
 
         let info = atomic_teams::org::get_org(&client, &slug)

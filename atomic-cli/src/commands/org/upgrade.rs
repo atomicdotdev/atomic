@@ -84,7 +84,7 @@ impl Command for OrgUpgrade {
 
 impl OrgUpgrade {
     async fn execute(&self) -> CliResult<()> {
-        let client = build_client(self.org.as_deref())?;
+        let client = build_client(self.org.as_deref()).await?;
 
         // Determine which slug to upgrade: explicit arg > client's org slug.
         let slug = self.slug.as_deref().unwrap_or_else(|| client.org_slug());

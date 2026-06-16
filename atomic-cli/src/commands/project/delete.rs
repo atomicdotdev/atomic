@@ -88,7 +88,7 @@ impl Command for ProjectDelete {
                 }
             }
 
-            let client = build_client(self.org.as_deref())?;
+            let client = build_client(self.org.as_deref()).await?;
 
             client
                 .delete_project(ws_slug, proj_slug)

@@ -114,7 +114,7 @@ impl ProjectInit {
         })?;
 
         // 2. Build the storage client and resolve the workspace.
-        let (client, org_slug) = build_client_with_org(self.org.as_deref())?;
+        let (client, org_slug) = build_client_with_org(self.org.as_deref()).await?;
         let workspace = resolve_workspace(&org_slug, self.workspace.as_deref())?;
 
         // 3. Ensure the workspace exists — create it if necessary.

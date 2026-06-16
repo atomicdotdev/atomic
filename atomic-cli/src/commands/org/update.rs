@@ -98,7 +98,7 @@ impl OrgUpdate {
             });
         }
 
-        let client = build_client(self.org.as_deref())?;
+        let client = build_client(self.org.as_deref()).await?;
 
         // Determine which slug to update: explicit arg > client's org slug.
         let slug = self.slug.as_deref().unwrap_or_else(|| client.org_slug());

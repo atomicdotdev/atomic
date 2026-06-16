@@ -79,7 +79,7 @@ impl Command for WorkspaceList {
         })?;
 
         rt.block_on(async {
-            let client = build_client(self.org.as_deref())?;
+            let client = build_client(self.org.as_deref()).await?;
             let workspaces = client.list_workspaces().await.map_err(remote_err)?;
 
             if self.format == "json" {
