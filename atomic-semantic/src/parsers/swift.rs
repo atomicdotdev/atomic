@@ -32,7 +32,7 @@
 //! | `private` / `fileprivate` | `false` |
 
 use super::{Language, LanguageParser};
-use crate::entity::{Entity, EntityKind};
+use crate::entity::{Confidence, Entity, EntityKind, Reference};
 use tree_sitter::{Node, Parser};
 
 /// Swift AST entity extractor using tree-sitter.
@@ -563,6 +563,71 @@ impl SwiftParser {
             String::new()
         }
     }
+
+    fn walk_tree_for_calls(
+        &self,
+        node: &Node,
+        source: &str,
+        file_path: &str,
+        refs: &mut Vec<Reference>,
+    ) {
+        if node.kind() == "call_expression" {
+            // In tree-sitter-swift the callee is the first child (no named field)
+            if let Some(func_node) = node.child(0) {
+                if let Some(name) = self.extract_call_name(&func_node, source) {
+                    if !name.is_empty() {
+                        refs.push(Reference {
+                            symbol: name,
+                            file: file_path.to_string(),
+                            line: (node.start_position().row as u32) + 1,
+                            column: Some(node.start_position().column as u32),
+                            context: None,
+                            confidence: Confidence::High,
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.walk_tree_for_calls(&child, source, file_path, refs);
+        }
+    }
+
+    fn extract_call_name(&self, func_node: &Node, source: &str) -> Option<String> {
+        match func_node.kind() {
+            "simple_identifier" => {
+                let name = self.node_text(func_node, source);
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(name)
+                }
+            }
+            "navigation_expression" => {
+                // obj.method() — find the last navigation_suffix to get the method name
+                for i in (0..func_node.child_count()).rev() {
+                    if let Some(suffix) = func_node.child(i) {
+                        if suffix.kind() == "navigation_suffix" {
+                            for j in 0..suffix.child_count() {
+                                if let Some(name_node) = suffix.child(j) {
+                                    if name_node.kind() == "simple_identifier" {
+                                        let name = self.node_text(&name_node, source);
+                                        if !name.is_empty() {
+                                            return Some(name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Default for SwiftParser {
@@ -585,6 +650,16 @@ impl LanguageParser for SwiftParser {
         let mut entities = Vec::new();
         self.walk_tree(&tree.root_node(), source, file_path, &mut entities, None);
         entities
+    }
+
+    fn extract_references(&mut self, source: &str, file_path: &str) -> Vec<Reference> {
+        let tree = match self.parser.parse(source, None) {
+            Some(t) => t,
+            None => return vec![],
+        };
+        let mut refs = Vec::new();
+        self.walk_tree_for_calls(&tree.root_node(), source, file_path, &mut refs);
+        refs
     }
 }
 

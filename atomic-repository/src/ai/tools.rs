@@ -816,7 +816,6 @@ impl<'a> ToolExecutor for RepoToolExecutor<'a> {
             },
         ];
 
-        #[cfg(feature = "ast")]
         defs.push(ToolDefinition {
             name: "list_entities".into(),
             description: "List code entities (functions, classes, types, etc.) in a file \
@@ -844,7 +843,6 @@ impl<'a> ToolExecutor for RepoToolExecutor<'a> {
             "read_file" => self.exec_read_file(&call.arguments),
             "code_search" => self.exec_code_search(&call.arguments),
             "vault_read" => self.exec_vault_read(&call.arguments),
-            #[cfg(feature = "ast")]
             "list_entities" => self.exec_list_entities(&call.arguments),
             other => Err(format!("unknown tool: {other}")),
         }
@@ -998,7 +996,6 @@ impl<'a> RepoToolExecutor<'a> {
         }
     }
 
-    #[cfg(feature = "ast")]
     fn exec_list_entities(&self, args: &serde_json::Value) -> Result<String, String> {
         let path_str = args["path"]
             .as_str()

@@ -23,7 +23,7 @@
 //! | `use std::io` | Import | Use statement |
 
 use super::{Language, LanguageParser};
-use crate::entity::{Entity, EntityKind};
+use crate::entity::{Confidence, Entity, EntityKind, Reference};
 use tree_sitter::{Node, Parser};
 
 /// Rust AST entity extractor using tree-sitter.
@@ -502,6 +502,78 @@ impl RustParser {
         let first = text.lines().next()?;
         Some(first.trim_end_matches('{').trim().to_string())
     }
+
+    /// Walk the AST collecting function call sites.
+    ///
+    /// Visits every `call_expression` node and extracts the simple callee name.
+    /// Recurses into all children including function bodies.
+    fn walk_tree_for_calls(
+        &self,
+        node: &Node,
+        source: &str,
+        file_path: &str,
+        refs: &mut Vec<Reference>,
+    ) {
+        if node.kind() == "call_expression" {
+            if let Some(func_node) = node.child_by_field_name("function") {
+                if let Some(name) = self.extract_call_name(&func_node, source) {
+                    if !name.is_empty() {
+                        refs.push(Reference {
+                            symbol: name,
+                            file: file_path.to_string(),
+                            line: (node.start_position().row as u32) + 1,
+                            column: Some(node.start_position().column as u32),
+                            context: None,
+                            confidence: Confidence::High,
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.walk_tree_for_calls(&child, source, file_path, refs);
+        }
+    }
+
+    /// Extract the simple function name from the callee sub-node of a `call_expression`.
+    ///
+    /// Returns `None` for call targets we cannot name simply (closures, raw pointers, etc.).
+    fn extract_call_name(&self, func_node: &Node, source: &str) -> Option<String> {
+        match func_node.kind() {
+            "identifier" => {
+                let name = self.node_text(func_node, source);
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(name)
+                }
+            }
+            "field_expression" => {
+                // self.method() or obj.method() — extract just "method"
+                func_node
+                    .child_by_field_name("field")
+                    .map(|f| self.node_text(&f, source))
+                    .filter(|s| !s.is_empty())
+            }
+            "scoped_identifier" => {
+                // Module::func() — extract just "func"
+                func_node
+                    .child_by_field_name("name")
+                    .map(|n| self.node_text(&n, source))
+                    .filter(|s| !s.is_empty())
+            }
+            "generic_function" => {
+                // func::<T>() — recurse into the inner function node
+                func_node
+                    .child_by_field_name("function")
+                    .as_ref()
+                    .and_then(|f| self.extract_call_name(f, source))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Default for RustParser {
@@ -524,6 +596,23 @@ impl LanguageParser for RustParser {
         let mut entities = Vec::new();
         self.walk_tree(&tree.root_node(), source, file_path, &mut entities, None);
         entities
+    }
+
+    /// Extract all function call sites from a Rust source file.
+    ///
+    /// Each `Reference` has:
+    /// - `symbol`  — the simple callee name (e.g., `"authenticate"`, not `"auth::authenticate"`)
+    /// - `file`    — the caller file path
+    /// - `line`    — 1-based line of the call expression
+    /// - `confidence` — always `High` (tree-sitter parse is exact)
+    fn extract_references(&mut self, source: &str, file_path: &str) -> Vec<Reference> {
+        let tree = match self.parser.parse(source, None) {
+            Some(t) => t,
+            None => return vec![],
+        };
+        let mut refs = Vec::new();
+        self.walk_tree_for_calls(&tree.root_node(), source, file_path, &mut refs);
+        refs
     }
 }
 

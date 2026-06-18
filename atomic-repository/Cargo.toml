@@ -12,7 +12,7 @@ rust-version.workspace = true
 atomic-core = { workspace = true }
 atomic-config = { workspace = true }
 atomic-identity = { workspace = true }
-atomic-semantic = { workspace = true, optional = true }
+atomic-semantic = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -33,10 +33,6 @@ chrono = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 tokio = { workspace = true }
-
-[features]
-default = ["ast"]
-ast = ["atomic-semantic"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
