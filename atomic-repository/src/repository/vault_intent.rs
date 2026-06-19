@@ -60,6 +60,9 @@ pub struct IntentDeleteResult {
 }
 
 /// Options for updating an intent.
+///
+/// `content` replaces the intent's Markdown body. When it is `None`, the
+/// existing body is preserved unchanged.
 #[derive(Debug, Clone, Default)]
 pub struct IntentUpdateOptions {
     /// New status (backlog, planned, in-progress, review, done).
@@ -70,6 +73,8 @@ pub struct IntentUpdateOptions {
     pub priority: Option<String>,
     /// New title.
     pub title: Option<String>,
+    /// New Markdown body content. When `None`, the existing body is kept.
+    pub content: Option<String>,
 }
 
 /// Info for listing intents.
@@ -454,13 +459,12 @@ impl Repository {
         }
         let new_fm = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
 
-        // Re-store with updated frontmatter
-        self.vault_store(
-            &intent_file,
-            VaultEntryType::Intent,
-            entry.content_bytes.clone(),
-            new_fm,
-        )?;
+        let new_content = match options.content {
+            Some(ref body) => body.clone().into_bytes(),
+            None => entry.content_bytes.clone(),
+        };
+
+        self.vault_store(&intent_file, VaultEntryType::Intent, new_content, new_fm)?;
 
         // Update manifest
         {
@@ -902,6 +906,79 @@ mod tests {
         // Manifest should reflect update
         let manifest = repo.vault_manifest().unwrap();
         assert_eq!(manifest.intents[&result.id].status, "in-progress");
+    }
+
+    #[test]
+    fn test_intent_update_body_content() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo.vault_intent_create(create_opts("Body edit")).unwrap();
+        let new_body = "# Body edit\n\n## Problem\n\nThe widget leaks memory.\n";
+
+        repo.vault_intent_update(
+            &result.id,
+            IntentUpdateOptions {
+                content: Some(new_body.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let after = repo.vault_intent_show(&result.id).unwrap();
+        assert_eq!(String::from_utf8_lossy(&after.content_bytes), new_body);
+    }
+
+    #[test]
+    fn test_intent_update_without_content_preserves_body() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo.vault_intent_create(create_opts("Keep body")).unwrap();
+        let original_body = repo.vault_intent_show(&result.id).unwrap().content_bytes;
+
+        repo.vault_intent_update(
+            &result.id,
+            IntentUpdateOptions {
+                priority: Some("high".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            repo.vault_intent_show(&result.id).unwrap().content_bytes,
+            original_body
+        );
+    }
+
+    #[test]
+    fn test_intent_update_body_and_frontmatter_together() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo.vault_intent_create(create_opts("Combined")).unwrap();
+        let new_body = "# Combined\n\nFully rewritten.\n";
+        let updated = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    status: Some("review".to_string()),
+                    priority: Some("high".to_string()),
+                    content: Some(new_body.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated.status, "review");
+        assert_eq!(updated.priority, "high");
+        assert_eq!(
+            String::from_utf8_lossy(
+                &repo.vault_intent_show(&result.id).unwrap().content_bytes
+            ),
+            new_body
+        );
     }
 
     #[test]
