@@ -126,7 +126,9 @@ pub use vault_goal::{
     GoalInfo, GoalStartOptions, GoalStartResult, GoalStopOptions, GoalStopResult,
 };
 pub use vault_identity::VaultIdentity;
-pub use vault_intent::{IntentCreateOptions, IntentCreateResult, IntentInfo, IntentUpdateOptions};
+pub use vault_intent::{
+    IntentCreateOptions, IntentCreateResult, IntentDeleteResult, IntentInfo, IntentUpdateOptions,
+};
 pub use vault_kg_enrich::KgEnrichStats;
 pub use vault_names::{derive_intent_prefix, generate_goal_name};
 

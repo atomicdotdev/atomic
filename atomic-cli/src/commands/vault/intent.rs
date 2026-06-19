@@ -13,6 +13,7 @@
 //!   list    List intents
 //!   show    Show an intent's content
 //!   update  Update an intent's fields
+//!   delete  Delete an unstarted backlog intent
 //!   link    Link a goal to an intent
 //! ```
 //!
@@ -36,6 +37,9 @@
 //!
 //! # Update intent status
 //! atomic vault intent update PIMO-1 --status in-progress
+//!
+//! # Delete an accidental draft intent
+//! atomic vault intent delete PIMO-1
 //!
 //! # Link a goal to an intent
 //! atomic vault intent link PIMO-1 --goal swift-meadow-a3f2
@@ -119,6 +123,18 @@ pub enum IntentCommands {
     /// ```
     Update(IntentUpdate),
 
+    /// Delete an unstarted backlog intent.
+    ///
+    /// Removes an accidental draft intent from the vault. Only backlog
+    /// intents with no linked goals can be deleted.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic vault intent delete PIMO-1
+    /// ```
+    Delete(IntentDelete),
+
     /// Link a goal to an intent.
     ///
     /// Associates a goal with an intent so that the work done in the goal
@@ -152,6 +168,7 @@ impl Command for Intent {
             IntentCommands::List(cmd) => cmd.run(),
             IntentCommands::Show(cmd) => cmd.run(),
             IntentCommands::Update(cmd) => cmd.run(),
+            IntentCommands::Delete(cmd) => cmd.run(),
             IntentCommands::Link(cmd) => cmd.run(),
         }
     }
@@ -374,6 +391,49 @@ impl Command for IntentUpdate {
         println!("  priority: {}", info.priority);
         if let Some(ref assignee) = info.assignee {
             println!("  assignee: {}", assignee);
+        }
+
+        Ok(())
+    }
+}
+
+// Delete Subcommand
+
+/// Delete an unstarted backlog intent.
+///
+/// Removes an intent that has not left backlog and has no linked goals. Use this
+/// for accidental drafts only; started work should be closed or superseded
+/// instead of deleted.
+#[derive(Parser, Debug)]
+#[command(name = "delete")]
+pub struct IntentDelete {
+    /// Intent ID.
+    pub id: String,
+
+    /// Output as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl Command for IntentDelete {
+    fn run(&self) -> CliResult<()> {
+        let root = find_repository_root()?;
+        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+
+        let result = repo
+            .vault_intent_delete(&self.id)
+            .map_err(CliError::Repository)?;
+
+        if self.json {
+            let json = serde_json::json!({
+                "id": result.id,
+                "intent_file": result.intent_file,
+                "deleted": true,
+            });
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        } else {
+            println!("Deleted intent: {}", result.id);
+            println!("  file: .vault/{}", result.intent_file);
         }
 
         Ok(())
