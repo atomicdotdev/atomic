@@ -18,6 +18,7 @@ const INTENT_TEMPLATE: &str = include_str!("../../vault/templates/intent.md");
 use super::*;
 use atomic_core::pristine::vault::{IntentSummary, VaultEntry, VaultEntryType, VaultManifest};
 use atomic_core::pristine::{VaultMutTxnT, VaultTxnT};
+use std::fs;
 
 /// Options for creating a new intent.
 #[derive(Debug, Clone)]
@@ -47,6 +48,15 @@ pub struct IntentCreateResult {
     pub intent_file: String,
     /// The view the intent was created on.
     pub view_name: String,
+}
+
+/// Result of deleting an intent.
+#[derive(Debug, Clone)]
+pub struct IntentDeleteResult {
+    /// The normalized intent ID that was deleted.
+    pub id: String,
+    /// Vault-relative path to the removed intent.md file.
+    pub intent_file: String,
 }
 
 /// Options for updating an intent.
@@ -300,6 +310,88 @@ impl Repository {
             .ok_or_else(|| RepositoryError::InvalidOperation {
                 message: format!("Intent '{}' not found", full_id),
             })
+    }
+
+    /// Delete an unstarted backlog intent.
+    ///
+    /// This is intentionally conservative: only backlog intents with no linked
+    /// goals can be deleted. Started work should be closed or superseded
+    /// instead of removed from the vault.
+    pub fn vault_intent_delete(
+        &self,
+        intent_id: &str,
+    ) -> Result<IntentDeleteResult, RepositoryError> {
+        let full_id = self.normalize_intent_id(intent_id)?;
+        let intent_file =
+            self.find_intent_path(&full_id)?
+                .ok_or_else(|| RepositoryError::InvalidOperation {
+                    message: format!("Intent '{}' not found", full_id),
+                })?;
+
+        let manifest = self.vault_manifest()?;
+        let summary =
+            manifest
+                .intents
+                .get(&full_id)
+                .ok_or_else(|| RepositoryError::InvalidOperation {
+                    message: format!("Intent '{}' not found", full_id),
+                })?;
+
+        if summary.status != "backlog" {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "Intent '{}' has status '{}'; only backlog intents can be deleted",
+                    full_id, summary.status
+                ),
+            });
+        }
+
+        if summary.goals > 0 {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "Intent '{}' is linked to {} goal(s); unlink or close the work instead",
+                    full_id, summary.goals
+                ),
+            });
+        }
+
+        let deleted = self.vault_delete(&intent_file)?;
+        if !deleted {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("Intent '{}' not found", full_id),
+            });
+        }
+
+        {
+            let mut txn = self
+                .pristine
+                .write_txn()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let mut manifest = txn
+                .get_vault_manifest()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            manifest.intents.remove(&full_id);
+            txn.put_vault_manifest(&manifest)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            txn.commit()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
+
+        let materialized = self.vault_dir().join(&intent_file);
+        match fs::remove_file(&materialized) {
+            Ok(()) => {
+                if let Some(parent) = materialized.parent() {
+                    let _ = remove_empty_dirs_up_to(parent, &self.vault_dir().join("intents"));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(RepositoryError::Io(e)),
+        }
+
+        Ok(IntentDeleteResult {
+            id: full_id,
+            intent_file,
+        })
     }
 
     /// Update an intent's fields.
@@ -576,6 +668,33 @@ impl Repository {
     }
 }
 
+fn remove_empty_dirs_up_to(
+    mut dir: &std::path::Path,
+    stop_at: &std::path::Path,
+) -> Result<(), std::io::Error> {
+    while dir.starts_with(stop_at) && dir != stop_at {
+        match fs::remove_dir(dir) {
+            Ok(()) => {
+                if let Some(parent) = dir.parent() {
+                    dir = parent;
+                } else {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = dir.parent() {
+                    dir = parent;
+                } else {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,6 +891,67 @@ mod tests {
         // Manifest should reflect update
         let manifest = repo.vault_manifest().unwrap();
         assert_eq!(manifest.intents[&result.id].status, "in-progress");
+    }
+
+    #[test]
+    fn test_intent_delete_backlog_removes_manifest_entry_and_file() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo.vault_intent_create(create_opts("Delete me")).unwrap();
+        let materialized = repo.vault_dir().join(&result.intent_file);
+        assert!(materialized.exists());
+
+        let deleted = repo.vault_intent_delete(&result.id).unwrap();
+        assert_eq!(deleted.id, result.id);
+        assert_eq!(deleted.intent_file, result.intent_file);
+
+        let manifest = repo.vault_manifest().unwrap();
+        assert!(!manifest.intents.contains_key(&result.id));
+        assert!(repo.vault_retrieve(&result.intent_file).unwrap().is_none());
+        assert!(!materialized.exists());
+    }
+
+    #[test]
+    fn test_intent_delete_rejects_non_backlog_intent() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo.vault_intent_create(create_opts("Started")).unwrap();
+        repo.vault_intent_update(
+            &result.id,
+            IntentUpdateOptions {
+                status: Some("in-progress".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let err = repo.vault_intent_delete(&result.id).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("only backlog intents can be deleted"));
+        assert!(repo.vault_retrieve(&result.intent_file).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_intent_delete_rejects_linked_goal() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let intent = repo.vault_intent_create(create_opts("Linked")).unwrap();
+        repo.vault_store(
+            "goals/test-goal/_goal.md",
+            VaultEntryType::Session,
+            b"# Goal".to_vec(),
+            r#"{"goal_id":"test-goal","status":"active"}"#.to_string(),
+        )
+        .unwrap();
+        repo.vault_intent_link(&intent.id, "test-goal").unwrap();
+
+        let err = repo.vault_intent_delete(&intent.id).unwrap_err();
+        assert!(err.to_string().contains("linked to 1 goal"));
+        assert!(repo.vault_retrieve(&intent.intent_file).unwrap().is_some());
     }
 
     #[test]
