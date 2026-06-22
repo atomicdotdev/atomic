@@ -346,11 +346,22 @@ impl Repository {
             });
         }
 
-        if summary.goals > 0 {
+        let referenced_goals = manifest
+            .goals
+            .values()
+            .filter(|goal| {
+                goal.intent
+                    .as_deref()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(&full_id))
+            })
+            .count() as u32;
+        let linked_goals = summary.goals.max(referenced_goals);
+
+        if linked_goals > 0 {
             return Err(RepositoryError::InvalidOperation {
                 message: format!(
                     "Intent '{}' is linked to {} goal(s); unlink or close the work instead",
-                    full_id, summary.goals
+                    full_id, linked_goals
                 ),
             });
         }
@@ -948,6 +959,35 @@ mod tests {
         )
         .unwrap();
         repo.vault_intent_link(&intent.id, "test-goal").unwrap();
+
+        let err = repo.vault_intent_delete(&intent.id).unwrap_err();
+        assert!(err.to_string().contains("linked to 1 goal"));
+        assert!(repo.vault_retrieve(&intent.intent_file).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_intent_delete_rejects_goal_started_with_intent() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let intent = repo
+            .vault_intent_create(create_opts("Started from goal"))
+            .unwrap();
+        repo.vault_goal_start(GoalStartOptions {
+            name: Some("test-goal".to_string()),
+            intent: Some(intent.id.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Goal start stores the canonical relationship on the goal summary.
+        // Deletion must not rely only on the intent's cached goal count.
+        let manifest = repo.vault_manifest().unwrap();
+        assert_eq!(manifest.intents[&intent.id].goals, 0);
+        assert_eq!(
+            manifest.goals["test-goal"].intent.as_deref(),
+            Some(intent.id.as_str())
+        );
 
         let err = repo.vault_intent_delete(&intent.id).unwrap_err();
         assert!(err.to_string().contains("linked to 1 goal"));
