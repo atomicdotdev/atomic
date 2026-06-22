@@ -45,7 +45,7 @@ pub fn check_min_version_header(headers: &HeaderMap) {
             if needs_upgrade(current, min_ver) {
                 eprintln!(
                     "warning: this server requires Atomic CLI >= {} (you have {}). \
-                     Please upgrade: https://atomic.dev/install",
+                     Run 'atomic update' to upgrade.",
                     min_ver, current
                 );
             }
