@@ -36,8 +36,7 @@ pub fn needs_upgrade(current: &str, required: &str) -> bool {
 /// Prints a warning to stderr when an upgrade is needed. Silently does
 /// nothing if the header is absent, unparseable, or already satisfied.
 pub fn check_min_version_header(headers: &HeaderMap) {
-    let header_name =
-        reqwest::header::HeaderName::from_static("x-atomic-min-version");
+    let header_name = reqwest::header::HeaderName::from_static("x-atomic-min-version");
 
     if let Some(val) = headers.get(&header_name) {
         if let Ok(min_ver) = val.to_str() {
