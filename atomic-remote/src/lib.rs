@@ -128,8 +128,12 @@ pub mod storage_types;
 pub mod streaming;
 pub mod sync;
 pub mod types;
+pub mod version;
 
 // Re-exports
+
+// Version checking
+pub use version::{check_min_version_header, needs_upgrade};
 
 // Error types
 pub use error::{RemoteError, RemoteResult};

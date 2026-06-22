@@ -37,6 +37,7 @@ impl HttpRemote {
             .await
             .map_err(|e| RemoteError::connection_failed(&url, e))?;
 
+        crate::check_min_version_header(response.headers());
         let status = response.status();
         trace!("GET state response status: {}", status);
 
@@ -90,6 +91,7 @@ impl HttpRemote {
             .await
             .map_err(|e| RemoteError::connection_failed(&url, e))?;
 
+        crate::check_min_version_header(response.headers());
         let status = response.status();
         trace!("GET changelist response status: {}", status);
 
@@ -136,6 +138,7 @@ impl HttpRemote {
             .await
             .map_err(|e| RemoteError::connection_failed(&url, e))?;
 
+        crate::check_min_version_header(response.headers());
         let status = response.status();
 
         match status {
@@ -179,6 +182,7 @@ impl HttpRemote {
             .await
             .map_err(|e| RemoteError::connection_failed(&url, e))?;
 
+        crate::check_min_version_header(response.headers());
         let status = response.status();
 
         match status {
@@ -223,6 +227,7 @@ impl HttpRemote {
             .await
             .map_err(|e| RemoteError::connection_failed(&url, e))?;
 
+        crate::check_min_version_header(response.headers());
         let status = response.status();
 
         match status {
@@ -283,6 +288,7 @@ impl HttpRemote {
             .await
             .map_err(|e| RemoteError::connection_failed(&url, e))?;
 
+        crate::check_min_version_header(response.headers());
         let status = response.status();
 
         match status {
@@ -342,6 +348,7 @@ impl HttpRemote {
             .await
             .map_err(|e| RemoteError::connection_failed(&url, e))?;
 
+        crate::check_min_version_header(response.headers());
         let status = response.status();
 
         match status {
@@ -388,6 +395,7 @@ impl HttpRemote {
             .await
             .map_err(|e| RemoteError::connection_failed(&url, e))?;
 
+        crate::check_min_version_header(response.headers());
         let status = response.status();
 
         match status {
