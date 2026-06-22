@@ -75,6 +75,8 @@ pub struct IntentUpdateOptions {
     pub title: Option<String>,
     /// New Markdown body content. When `None`, the existing body is kept.
     pub content: Option<String>,
+    /// Allow rewriting the body after the intent has started or been linked.
+    pub force: bool,
 }
 
 /// Info for listing intents.
@@ -432,6 +434,31 @@ impl Repository {
         // Update frontmatter
         let mut fm: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(&entry.frontmatter_json).unwrap_or_default();
+
+        if options.content.is_some() && !options.force {
+            let manifest = self.vault_manifest()?;
+            let summary = manifest.intents.get(&full_id);
+            let current_status = summary
+                .map(|intent| intent.status.as_str())
+                .or_else(|| fm.get("status").and_then(|value| value.as_str()))
+                .unwrap_or("unknown");
+            let has_linked_goal = summary.is_some_and(|intent| intent.goals > 0)
+                || manifest.goals.values().any(|goal| {
+                    goal.intent
+                        .as_deref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(&full_id))
+                });
+
+            if current_status != "backlog" || has_linked_goal {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "Intent '{}' has started or is linked to a goal; rewriting its body would \
+                         change the execution context. Retry with force enabled.",
+                        full_id
+                    ),
+                });
+            }
+        }
 
         if let Some(ref status) = options.status {
             fm.insert(
@@ -1069,6 +1096,97 @@ mod tests {
         let err = repo.vault_intent_delete(&intent.id).unwrap_err();
         assert!(err.to_string().contains("linked to 1 goal"));
         assert!(repo.vault_retrieve(&intent.intent_file).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_intent_update_body_rejects_started_intent_without_force() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo.vault_intent_create(create_opts("Started")).unwrap();
+        repo.vault_intent_update(
+            &result.id,
+            IntentUpdateOptions {
+                status: Some("in-progress".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let before = repo.vault_intent_show(&result.id).unwrap().content_bytes;
+        let err = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    content: Some("# Rewritten".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Retry with force enabled"));
+        assert_eq!(
+            repo.vault_intent_show(&result.id).unwrap().content_bytes,
+            before
+        );
+    }
+
+    #[test]
+    fn test_intent_update_body_rejects_goal_reference_without_force() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let intent = repo.vault_intent_create(create_opts("Linked")).unwrap();
+        repo.vault_goal_start(GoalStartOptions {
+            name: Some("test-goal".to_string()),
+            intent: Some(intent.id.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let err = repo
+            .vault_intent_update(
+                &intent.id,
+                IntentUpdateOptions {
+                    content: Some("# Rewritten".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Retry with force enabled"));
+    }
+
+    #[test]
+    fn test_intent_update_body_force_allows_started_intent() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo.vault_intent_create(create_opts("Started")).unwrap();
+        repo.vault_intent_update(
+            &result.id,
+            IntentUpdateOptions {
+                status: Some("in-progress".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let new_body = "# Rewritten with explicit force\n";
+        repo.vault_intent_update(
+            &result.id,
+            IntentUpdateOptions {
+                content: Some(new_body.to_string()),
+                force: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&repo.vault_intent_show(&result.id).unwrap().content_bytes),
+            new_body
+        );
     }
 
     #[test]

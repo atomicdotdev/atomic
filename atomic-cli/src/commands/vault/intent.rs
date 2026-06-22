@@ -388,6 +388,10 @@ pub struct IntentUpdate {
     /// Read the new Markdown body content from standard input.
     #[arg(long)]
     pub body_stdin: bool,
+
+    /// Rewrite the body even if the intent has started or is linked to a goal.
+    #[arg(long, short = 'f')]
+    pub force: bool,
 }
 
 impl IntentUpdate {
@@ -437,6 +441,7 @@ impl Command for IntentUpdate {
                     priority: self.priority.clone(),
                     title: self.title.clone(),
                     content,
+                    force: self.force,
                 },
             )
             .map_err(CliError::Repository)?;
