@@ -1001,9 +1001,7 @@ mod tests {
         assert_eq!(updated.status, "review");
         assert_eq!(updated.priority, "high");
         assert_eq!(
-            String::from_utf8_lossy(
-                &repo.vault_intent_show(&result.id).unwrap().content_bytes
-            ),
+            String::from_utf8_lossy(&repo.vault_intent_show(&result.id).unwrap().content_bytes),
             new_body
         );
     }
