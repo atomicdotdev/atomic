@@ -149,7 +149,9 @@ pub use repository::{
 };
 
 // Vault intent exports
-pub use repository::{IntentCreateOptions, IntentCreateResult, IntentInfo, IntentUpdateOptions};
+pub use repository::{
+    IntentCreateOptions, IntentCreateResult, IntentDeleteResult, IntentInfo, IntentUpdateOptions,
+};
 
 // Vault embedding exports
 pub use repository::{hash_embed, EmbedConfig, TextChunk};
