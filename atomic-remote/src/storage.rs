@@ -171,6 +171,7 @@ impl StorageClient {
             .await
             .map_err(|e| RemoteError::other(format!("request failed: {}", e)))?;
 
+        crate::check_min_version_header(resp.headers());
         let status = resp.status();
         if status.is_success() {
             Ok(())
@@ -185,6 +186,7 @@ impl StorageClient {
         &self,
         resp: reqwest::Response,
     ) -> Result<T, RemoteError> {
+        crate::check_min_version_header(resp.headers());
         let status = resp.status();
         let body = resp
             .text()
