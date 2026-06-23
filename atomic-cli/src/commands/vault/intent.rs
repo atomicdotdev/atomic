@@ -38,6 +38,12 @@
 //! # Update intent status
 //! atomic vault intent update PIMO-1 --status in-progress
 //!
+//! # Replace the intent body inline
+//! atomic vault intent update PIMO-1 --body "# Title\n\n## Problem\n..."
+//!
+//! # Replace the intent body from a file
+//! cat plan.md | atomic vault intent update PIMO-1 --body-stdin
+//!
 //! # Delete an accidental draft intent
 //! atomic vault intent delete PIMO-1
 //! atomic vault intent delete PIMO-1 --force
@@ -114,13 +120,17 @@ pub enum IntentCommands {
 
     /// Update an intent's fields.
     ///
-    /// Modifies the status, assignee, priority, or title of an existing intent.
+    /// Modifies the status, assignee, priority, title, or Markdown body
+    /// of an existing intent. The body can be set inline with `--body`
+    /// or piped via `--body-stdin`.
     ///
     /// # Examples
     ///
     /// ```text
     /// atomic vault intent update PIMO-1 --status in-progress
     /// atomic vault intent update PIMO-1 --assignee bob --priority critical
+    /// atomic vault intent update PIMO-1 --body "# Fix auth\n\n## Problem\n..."
+    /// cat plan.md | atomic vault intent update PIMO-1 --body-stdin
     /// ```
     Update(IntentUpdate),
 
@@ -370,6 +380,35 @@ pub struct IntentUpdate {
     /// New title.
     #[arg(long)]
     pub title: Option<String>,
+
+    /// New Markdown body content, provided inline.
+    #[arg(long, conflicts_with = "body_stdin")]
+    pub body: Option<String>,
+
+    /// Read the new Markdown body content from standard input.
+    #[arg(long)]
+    pub body_stdin: bool,
+
+    /// Rewrite the body even if the intent has started or is linked to a goal.
+    #[arg(long, short = 'f')]
+    pub force: bool,
+}
+
+impl IntentUpdate {
+    fn resolve_body(&self) -> CliResult<Option<String>> {
+        if let Some(ref body) = self.body {
+            return Ok(Some(body.clone()));
+        }
+        if self.body_stdin {
+            use std::io::Read;
+            let mut content = String::new();
+            std::io::stdin()
+                .read_to_string(&mut content)
+                .map_err(CliError::Io)?;
+            return Ok(Some(content));
+        }
+        Ok(None)
+    }
 }
 
 impl Command for IntentUpdate {
@@ -377,6 +416,22 @@ impl Command for IntentUpdate {
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
+        let content = self.resolve_body()?;
+        if self.status.is_none()
+            && self.assignee.is_none()
+            && self.priority.is_none()
+            && self.title.is_none()
+            && content.is_none()
+        {
+            return Err(CliError::InvalidArgument {
+                message: "Nothing to update. Provide at least one of \
+                    --status, --assignee, --priority, --title, --body, \
+                    or --body-stdin."
+                    .to_string(),
+            });
+        }
+
+        let body_updated = content.is_some();
         let info = repo
             .vault_intent_update(
                 &self.id,
@@ -385,6 +440,8 @@ impl Command for IntentUpdate {
                     assignee: self.assignee.clone(),
                     priority: self.priority.clone(),
                     title: self.title.clone(),
+                    content,
+                    force: self.force,
                 },
             )
             .map_err(CliError::Repository)?;
@@ -394,6 +451,9 @@ impl Command for IntentUpdate {
         println!("  priority: {}", info.priority);
         if let Some(ref assignee) = info.assignee {
             println!("  assignee: {}", assignee);
+        }
+        if body_updated {
+            println!("  body: updated");
         }
 
         Ok(())
