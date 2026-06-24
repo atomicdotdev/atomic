@@ -79,7 +79,7 @@ impl Command for WorkspaceUpdate {
         })?;
 
         rt.block_on(async {
-            let client = build_client(self.org.as_deref()).await?;
+            let client = build_client(self.org.as_deref(), None).await?;
 
             let req = UpdateWorkspaceRequest {
                 name: self.name.clone(),

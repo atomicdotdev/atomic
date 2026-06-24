@@ -101,6 +101,13 @@ pub struct ProjectCreate {
     /// If not specified, uses the default org from global config.
     #[arg(long)]
     pub org: Option<String>,
+
+    /// Server profile to use (e.g. "staging", "prod").
+    ///
+    /// Overrides `default_server` from `~/.atomic/config.toml`.
+    /// Use `atomic server list` to see available profiles.
+    #[arg(long)]
+    pub server: Option<String>,
 }
 
 impl ProjectCreate {
@@ -124,7 +131,8 @@ impl Command for ProjectCreate {
         })?;
 
         rt.block_on(async {
-            let (client, org_slug) = build_client_with_org(self.org.as_deref()).await?;
+            let (client, org_slug) =
+                build_client_with_org(self.org.as_deref(), self.server.as_deref()).await?;
             let workspace = resolve_workspace(&org_slug, self.workspace.as_deref())?;
             let visibility = self.parse_visibility()?;
 
@@ -208,6 +216,7 @@ mod tests {
             default_view: "main".to_string(),
             visibility: "public".to_string(),
             org: Some("acme".to_string()),
+            server: None,
         };
         assert_eq!(cmd.name, "svc");
         assert_eq!(cmd.workspace.as_deref(), Some("backend"));

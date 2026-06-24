@@ -103,7 +103,7 @@ impl OrgDelete {
             }
         }
 
-        let client = build_client(self.org.as_deref()).await?;
+        let client = build_client(self.org.as_deref(), None).await?;
 
         atomic_teams::org::delete_org(&client, &self.slug)
             .await

@@ -44,6 +44,13 @@ pub struct WorkspaceList {
     #[arg(long)]
     pub org: Option<String>,
 
+    /// Server profile to use (e.g. "staging", "prod").
+    ///
+    /// Overrides `default_server` from `~/.atomic/config.toml`.
+    /// Use `atomic server list` to see available profiles.
+    #[arg(long)]
+    pub server: Option<String>,
+
     /// Output format (`table` or `json`).
     #[arg(long, default_value = "table")]
     pub format: String,
@@ -53,6 +60,7 @@ impl Default for WorkspaceList {
     fn default() -> Self {
         Self {
             org: None,
+            server: None,
             format: "table".to_string(),
         }
     }
@@ -79,7 +87,7 @@ impl Command for WorkspaceList {
         })?;
 
         rt.block_on(async {
-            let client = build_client(self.org.as_deref()).await?;
+            let client = build_client(self.org.as_deref(), self.server.as_deref()).await?;
             let workspaces = client.list_workspaces().await.map_err(remote_err)?;
 
             if self.format == "json" {

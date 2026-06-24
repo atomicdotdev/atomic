@@ -158,6 +158,7 @@ impl Command for New {
             store.set_default(&identity.id).map_err(|e| {
                 CliError::Internal(anyhow::anyhow!("Failed to set as default: {}", e))
             })?;
+            super::activate_server_for_identity(&identity.name);
         }
 
         if self.set_default_for_usage {
@@ -166,6 +167,7 @@ impl Command for New {
                 .map_err(|e| {
                     CliError::Internal(anyhow::anyhow!("Failed to set as default for usage: {}", e))
                 })?;
+            super::activate_server_for_identity(&identity.name);
         }
 
         // Print success message

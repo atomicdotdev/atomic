@@ -228,6 +228,7 @@ mod tests {
         let list = list::ProjectList {
             workspace: Some("ws".to_string()),
             org: None,
+            server: None,
             format: "table".to_string(),
         };
         assert_eq!(check_variant(&ProjectCommands::List(list)), "list");
@@ -240,6 +241,7 @@ mod tests {
             default_view: "dev".to_string(),
             visibility: "private".to_string(),
             org: None,
+            server: None,
         };
         assert_eq!(check_variant(&ProjectCommands::Create(create)), "create");
     }

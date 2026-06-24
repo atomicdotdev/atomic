@@ -1,16 +1,18 @@
 //! Shared authentication helpers for remote commands.
 //!
-//! Resolves the caller's identity from the remote URL, mints a short-lived
-//! self-signed EdDSA JWT for that identity, and attaches it as the
-//! `Authorization: Bearer` header.
+//! Resolves the caller's identity from the remote URL (or an explicit
+//! override), mints a short-lived self-signed EdDSA JWT for that identity,
+//! and attaches it as the `Authorization: Bearer` header.
 //!
 //! A raw public key is NOT a credential — the JWT (signed with the identity's
 //! private key) proves possession of that key. See [`crate::commands::token`]
 //! for the minting mechanics.
 //!
 //! Identity resolution order:
-//! 1. URL userinfo — `http://bob@alice.localhost:8080/...` → identity "bob"
-//! 2. Subdomain — `http://alice.localhost:8080/...` → identity "alice"
+//! 1. Explicit override — `identity_override` from `--identity` flag or
+//!    `RemoteEntry.identity` config field.
+//! 2. URL userinfo — `http://bob@alice.localhost:8080/...` → identity "bob"
+//! 3. Subdomain — `http://alice.localhost:8080/...` → identity "alice"
 
 use atomic_identity::IdentityStore;
 use atomic_remote::HttpRemoteConfig;
@@ -18,19 +20,33 @@ use url::Url;
 
 use crate::error::{CliError, CliResult};
 
-/// Attach a Bearer JWT auth header to the remote config by resolving the
-/// identity from the URL and logging in for a token.
+/// Attach a Bearer JWT auth header to the remote config.
 ///
-/// If the identity cannot be resolved (no userinfo, no subdomain, or identity
-/// not found in the store) or login fails, the config is returned unmodified
-/// and a debug log is emitted. This keeps push/pull/clone working against
-/// servers that don't require auth (e.g. public reads).
-pub async fn attach_identity(config: HttpRemoteConfig, remote_url: &str) -> HttpRemoteConfig {
-    let identity_name = match resolve_identity_name(remote_url) {
-        Some(name) => name,
-        None => {
-            log::debug!("No identity resolvable from URL: {}", remote_url);
-            return config;
+/// `identity_override` — if provided, this identity name is used directly,
+/// bypassing URL-based inference. Set from `RemoteEntry.identity` or the
+/// `--identity` CLI flag.
+///
+/// If the identity cannot be resolved (no override, no userinfo, no subdomain,
+/// or identity not found in the store) or login fails, the config is returned
+/// unmodified and a debug log is emitted. This keeps push/pull/clone working
+/// against servers that don't require auth (e.g. public reads).
+pub async fn attach_identity(
+    config: HttpRemoteConfig,
+    remote_url: &str,
+    identity_override: Option<&str>,
+) -> HttpRemoteConfig {
+    // Priority 1: explicit override (from --identity or RemoteEntry.identity)
+    let identity_name = if let Some(name) = identity_override {
+        log::debug!("Using explicit identity override: {}", name);
+        name.to_string()
+    } else {
+        // Priority 2/3: infer from URL userinfo or subdomain
+        match resolve_identity_name(remote_url) {
+            Some(name) => name,
+            None => {
+                log::debug!("No identity resolvable from URL: {}", remote_url);
+                return config;
+            }
         }
     };
 

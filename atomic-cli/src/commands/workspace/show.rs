@@ -68,7 +68,7 @@ impl Command for WorkspaceShow {
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
 
         rt.block_on(async {
-            let client = build_client(self.org.as_deref()).await?;
+            let client = build_client(self.org.as_deref(), None).await?;
             let ws = client.get_workspace(&self.slug).await.map_err(remote_err)?;
 
             if self.format == "json" {

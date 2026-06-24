@@ -81,7 +81,7 @@ impl Command for WorkspaceCreate {
         })?;
 
         rt.block_on(async {
-            let client = build_client(self.org.as_deref()).await?;
+            let client = build_client(self.org.as_deref(), None).await?;
 
             let visibility = self.parse_visibility()?;
 

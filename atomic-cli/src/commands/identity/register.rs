@@ -61,6 +61,12 @@ const SIGNING_DOMAIN: &str = "atomic-storage:register";
 /// Pushes the local identity to the server, which creates a tenant
 /// whose slug is derived from the identity's username. Authentication
 /// is Ed25519 signature-based — no passwords required.
+///
+/// When `--identity` is specified, a named server profile is automatically
+/// created in `~/.atomic/config.toml` so that commands targeting this
+/// server use that identity automatically. The profile name is derived
+/// from the server hostname (e.g. `staging.atomic.storage` → `staging`).
+/// Use `--server-name <name>` to choose a custom profile name.
 #[derive(Debug, Parser)]
 pub struct Register {
     /// URL of the atomic-storage server.
@@ -76,9 +82,19 @@ pub struct Register {
 
     /// Name of the identity to register.
     ///
-    /// If not specified, the current default identity is used.
+    /// If not specified, the current default identity is used. When
+    /// specified, the server URL and identity are automatically saved as
+    /// a named server profile (see `--server-name`).
     #[arg(short, long)]
     pub identity: Option<String>,
+
+    /// Custom name for the auto-created server profile.
+    ///
+    /// Only used when `--identity` is given. Defaults to the first
+    /// hostname label of the server URL (e.g. `staging` from
+    /// `staging.atomic.storage`).
+    #[arg(long)]
+    pub server_name: Option<String>,
 }
 
 impl Command for Register {
@@ -188,11 +204,52 @@ impl Register {
                 .and_then(|v| v.as_str())
                 .unwrap_or("(unknown)");
 
+            let clean_server_url = self.server_url.trim_end_matches('/').to_string();
             let mut config = GlobalConfig::load().map_err(|e| {
                 CliError::Internal(anyhow::anyhow!("Failed to load global config: {e}"))
             })?;
-            config.server.url = Some(self.server_url.trim_end_matches('/').to_string());
-            config.server.default_org = Some(slug.to_string());
+
+            // When --identity is specified, register as a named server profile
+            // so the URL+identity combo is remembered automatically.
+            if self.identity.is_some() {
+                let profile_name = self
+                    .server_name
+                    .clone()
+                    .or_else(|| derive_profile_name(&clean_server_url))
+                    .unwrap_or_else(|| slug.to_string());
+
+                let profile = atomic_config::ServerConfig {
+                    url: Some(clean_server_url.clone()),
+                    default_org: Some(slug.to_string()),
+                    default_workspaces: std::collections::BTreeMap::new(),
+                    identity: Some(identity.name.clone()),
+                };
+
+                config.servers.insert(profile_name.clone(), profile);
+
+                // If there's no active named server yet, make this one active.
+                if config.default_server.is_none() && config.server.is_configured() {
+                    // Legacy [server] is already set — don't override it silently.
+                    // Just register the profile; user can activate with `atomic server set`.
+                    println!(
+                        "  Profile:   '{}' added (activate with: atomic server set {})",
+                        profile_name, profile_name
+                    );
+                } else if config.default_server.is_none() {
+                    config.default_server = Some(profile_name.clone());
+                    println!("  Profile:   '{}' (now active)", profile_name);
+                } else {
+                    println!(
+                        "  Profile:   '{}' added (activate with: atomic server set {})",
+                        profile_name, profile_name
+                    );
+                }
+            } else {
+                // Default path: update the legacy [server] block.
+                config.server.url = Some(clean_server_url.clone());
+                config.server.default_org = Some(slug.to_string());
+            }
+
             config.save().map_err(|e| {
                 CliError::Internal(anyhow::anyhow!("Failed to save global config: {e}"))
             })?;
@@ -271,6 +328,34 @@ impl Register {
     }
 }
 
+/// Derive a short profile name from a server URL.
+///
+/// `https://staging.atomic.storage` → `"staging"`
+/// `https://atomic.storage`         → `"atomic-storage"` (no subdomain)
+/// `http://localhost:8080`           → `"localhost"`
+fn derive_profile_name(server_url: &str) -> Option<String> {
+    let url = url::Url::parse(server_url).ok()?;
+    let host = url.host_str()?;
+
+    // If the host has a subdomain, use that as the profile name.
+    if let Some(dot) = host.find('.') {
+        let label = &host[..dot];
+        if !label.is_empty() && label != "www" {
+            return Some(label.to_string());
+        }
+        // No useful subdomain — fall through to full host slug.
+    }
+
+    // Slug the host: replace dots and colons with hyphens, strip port.
+    let host_no_port = host.split(':').next().unwrap_or(host);
+    let slug = host_no_port.replace('.', "-");
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +390,7 @@ mod tests {
         let cmd = Register {
             server_url: "http://localhost:8080".to_string(),
             identity: Some("alice".to_string()),
+            server_name: None,
         };
 
         assert_eq!(cmd.server_url, "http://localhost:8080");
@@ -316,8 +402,35 @@ mod tests {
         let cmd = Register {
             server_url: "http://localhost:8080".to_string(),
             identity: None,
+            server_name: None,
         };
 
         assert!(cmd.identity.is_none());
+    }
+
+    #[test]
+    fn derive_profile_name_subdomain() {
+        assert_eq!(
+            derive_profile_name("https://staging.atomic.storage"),
+            Some("staging".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_profile_name_no_subdomain() {
+        // "atomic.storage" — "atomic" is the first label (subdomain of "storage")
+        // so it's used as the profile name.
+        assert_eq!(
+            derive_profile_name("https://atomic.storage"),
+            Some("atomic".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_profile_name_localhost() {
+        assert_eq!(
+            derive_profile_name("http://localhost:8080"),
+            Some("localhost".to_string())
+        );
     }
 }

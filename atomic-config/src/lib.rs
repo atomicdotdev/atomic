@@ -98,6 +98,16 @@ pub struct ServerConfig {
     /// and produces stable diffs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub default_workspaces: BTreeMap<String, String>,
+
+    /// Identity name to use when authenticating to this server.
+    ///
+    /// If set, management commands targeting this server use this identity
+    /// instead of the global default. Set automatically during
+    /// `atomic identity register` when `--identity` is specified.
+    ///
+    /// Example: `identity = "alice-staging"`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
 }
 
 impl ServerConfig {
@@ -164,9 +174,41 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub workspace: WorkspaceConfig,
 
-    /// Remote server configuration for atomic-storage.
+    /// Default remote server configuration for atomic-storage.
+    ///
+    /// This is the server used when no `--server` flag is given and no
+    /// `default_server` points to a named server in `servers`.
     #[serde(default)]
     pub server: ServerConfig,
+
+    /// Named server profiles (e.g. "staging", "prod").
+    ///
+    /// Each entry is a full `ServerConfig` with its own URL, default org,
+    /// workspaces, and optional identity override.
+    ///
+    /// ```toml
+    /// [servers.staging]
+    /// url = "https://staging.atomic.storage"
+    /// default_org = "alice"
+    /// identity = "alice-staging"
+    ///
+    /// [servers.prod]
+    /// url = "https://atomic.storage"
+    /// default_org = "alice"
+    /// identity = "alice-prod"
+    /// ```
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub servers: BTreeMap<String, ServerConfig>,
+
+    /// Name of the active server profile from `servers`.
+    ///
+    /// When set, management commands use `servers[default_server]` instead
+    /// of `server`. Switch with `atomic server set <name>` or pass
+    /// `--server <name>` per-command.
+    ///
+    /// When `None`, the legacy `[server]` block is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_server: Option<String>,
 }
 
 fn default_channel_name() -> String {
@@ -182,7 +224,59 @@ impl Default for GlobalConfig {
             pager: None,
             workspace: WorkspaceConfig::default(),
             server: ServerConfig::default(),
+            servers: BTreeMap::new(),
+            default_server: None,
         }
+    }
+}
+
+impl GlobalConfig {
+    /// Resolve the effective server config, honouring the optional name override.
+    ///
+    /// Resolution order:
+    /// 1. `server_override` (from `--server <name>` CLI flag)
+    /// 2. `default_server` (from `~/.atomic/config.toml`)
+    /// 3. Legacy `server` block
+    ///
+    /// Returns `(server_config, Option<name>)` — the name is `Some` when a
+    /// named profile was resolved, `None` for the legacy block.
+    pub fn resolve_server<'a>(
+        &'a self,
+        server_override: Option<&'a str>,
+    ) -> Result<(&'a ServerConfig, Option<&'a str>), String> {
+        // 1. Explicit --server flag
+        if let Some(name) = server_override {
+            return self
+                .servers
+                .get(name)
+                .map(|s| (s, Some(name)))
+                .ok_or_else(|| {
+                    format!(
+                        "Server profile '{}' not found. \
+                         Use 'atomic server list' to see available profiles, \
+                         or 'atomic server add {0} <url>' to create it.",
+                        name
+                    )
+                });
+        }
+
+        // 2. Configured default server name
+        if let Some(ref name) = self.default_server {
+            return self
+                .servers
+                .get(name.as_str())
+                .map(|s| (s, Some(name.as_str())))
+                .ok_or_else(|| {
+                    format!(
+                        "Default server profile '{}' not found in servers map. \
+                         Run 'atomic server set <name>' to fix.",
+                        name
+                    )
+                });
+        }
+
+        // 3. Legacy [server] block
+        Ok((&self.server, None))
     }
 }
 
@@ -370,6 +464,7 @@ mod tests {
             url: Some("https://atomic.storage".to_string()),
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
+            identity: None,
         };
         assert!(config.is_configured());
 
@@ -378,6 +473,7 @@ mod tests {
             url: Some("https://atomic.storage".to_string()),
             default_org: None,
             default_workspaces: BTreeMap::new(),
+            identity: None,
         };
         assert!(!partial.is_configured());
 
@@ -386,6 +482,7 @@ mod tests {
             url: None,
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
+            identity: None,
         };
         assert!(!partial.is_configured());
     }
@@ -396,6 +493,7 @@ mod tests {
             url: Some("https://atomic.storage".to_string()),
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
+            identity: None,
         };
         assert_eq!(
             config.org_base_url("alice"),
@@ -413,6 +511,7 @@ mod tests {
             url: Some("http://localhost:8080".to_string()),
             default_org: None,
             default_workspaces: BTreeMap::new(),
+            identity: None,
         };
         assert_eq!(
             config.org_base_url("alice"),
@@ -426,6 +525,7 @@ mod tests {
             url: Some("https://atomic.storage".to_string()),
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
+            identity: None,
         };
         assert_eq!(
             config.default_org_base_url(),
@@ -437,6 +537,7 @@ mod tests {
             url: Some("https://atomic.storage".to_string()),
             default_org: None,
             default_workspaces: BTreeMap::new(),
+            identity: None,
         };
         assert!(config.default_org_base_url().is_none());
     }
@@ -447,6 +548,7 @@ mod tests {
             url: Some("https://atomic.storage".to_string()),
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
+            identity: None,
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -470,6 +572,7 @@ mod tests {
                 url: Some("https://atomic.storage".to_string()),
                 default_org: Some("alice".to_string()),
                 default_workspaces: BTreeMap::new(),
+                identity: None,
             },
             ..GlobalConfig::default()
         };
@@ -493,6 +596,7 @@ mod tests {
             url: Some("https://atomic.storage".to_string()),
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
+            identity: None,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         assert!(!toml_str.contains("default_workspaces"));
@@ -508,6 +612,7 @@ mod tests {
             url: Some("https://atomic.storage".to_string()),
             default_org: Some("alice".to_string()),
             default_workspaces: workspaces,
+            identity: None,
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
