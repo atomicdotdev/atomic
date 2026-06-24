@@ -25,6 +25,7 @@ redb = { workspace = true }
 zstd = { workspace = true }
 dirs = "5.0"
 walkdir = { workspace = true }
+reflink-copy = "0.1"
 ignore = { workspace = true }
 syntext = { workspace = true }
 tempfile = { workspace = true }
@@ -33,6 +34,9 @@ chrono = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 tokio = { workspace = true }
+tar = "0.4"
+flate2 = "1.0"
+sha2 = "0.10"
 
 [features]
 default = ["ast"]

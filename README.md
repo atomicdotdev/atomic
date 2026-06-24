@@ -406,6 +406,57 @@ atomic/
 | **atomic-remote-client** | `atomic-enterprise/atomic-remote` | HTTP client library for push/pull/clone |
 | **atomic-docs** | `atomic-docs/` | Documentation site ([docs.atomic.dev](https://docs.atomic.dev/)) |
 
+## Atomic + smolvm: Concurrent Agent Sandboxes
+
+When several agents work a repository at once, each needs an isolated build
+surface (no `node_modules` / `target` collisions) while still sharing one
+history. Atomic does this with **copy-on-write working trees over a single
+canonical graph** — no per-agent forks, no virtualized I/O.
+
+- **The working tree is cloned; the graph is not.** A sandbox is a reflink
+  (copy-on-write) clone of the working tree — APFS `clonefile`, Btrfs/XFS
+  `FICLONE`, ReFS block-clone — done in-process via the `reflink-copy` crate.
+  Five agents off a 200 MB base cost a few MB and run at bare-metal filesystem
+  speed. There is exactly **one** pristine; a sandbox carries a small
+  `.atomic-sandbox` pointer, so `status`, `record`, `diff`, and `vault query`
+  all work inside it and land in the canonical graph.
+- **No FUSE, no virtio, no VM in the hot path.** Filesystem-protocol
+  virtualization (virtio-fs) is fatal for the metadata-heavy workloads agents
+  run (git, cargo, npm). Copy-on-write on the real filesystem needs none of it.
+
+```bash
+# Give each agent a private, copy-on-write working tree
+atomic sandbox create agent-1 --from dev      # forks a per-agent draft view
+atomic sandbox create agent-2 --from dev      # isolated artifacts, shared graph
+```
+
+### Shipping a sandbox: `stage` and `seal`
+
+A sandbox can be packaged as a **standard OCI image** (consumable by smolvm,
+podman, containerd — built in-process, no shelling out) for two purposes:
+
+| Command | Shape | Purpose |
+|---------|-------|---------|
+| `atomic sandbox stage` | layered: shared base + thin delta | inner-loop CI / circuit-breaker runs — base is pulled once and cached, only the delta ships each iteration |
+| `atomic sandbox seal` | flattened, single self-contained layer | a deployable runtime — "run this exact version" anywhere |
+
+```bash
+# Inner-loop CI artifact: base layer (dev) + delta layer (only what changed)
+atomic sandbox stage agent-1 --base dev -o ./ci-image
+
+# Deployable runtime image of the full merged state
+atomic sandbox seal dev -o ./runtime --entrypoint /app/run --env PORT=8080
+```
+
+Both embed provenance (the view names and Merkle states) in the image
+annotations, so a shipped image traces back to exact graph state. The runtime
+is [smolvm](https://github.com/binsquare/smolvm) — lightweight microVMs that
+boot OCI images in under 200 ms — making these images the unit of work for
+shared-infrastructure CI and circuit-breaker workflows.
+
+See [docs/CONCURRENT-AGENT-SANDBOXES.md](docs/CONCURRENT-AGENT-SANDBOXES.md) for
+the full design.
+
 ## Design Principles
 
 1. **Mathematical Soundness** — Operations are well-defined transformations with provable properties
