@@ -86,7 +86,7 @@ impl Command for TeamShow {
 
 impl TeamShow {
     async fn execute(&self) -> CliResult<()> {
-        let client = build_client(self.org.as_deref())?;
+        let client = build_client(self.org.as_deref()).await?;
         let org_slug = client.org_slug().to_string();
 
         let info = atomic_teams::team::get_team(&client, &org_slug, &self.slug)

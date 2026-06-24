@@ -110,6 +110,7 @@ pub mod query;
 // Storage management commands (always available)
 pub mod client;
 pub mod project;
+pub mod token;
 pub mod workspace;
 
 // Team collaboration commands (feature-gated)

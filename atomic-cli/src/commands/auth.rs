@@ -1,7 +1,12 @@
 //! Shared authentication helpers for remote commands.
 //!
-//! Resolves the caller's identity from the remote URL and builds
-//! the `Authorization: Bearer` header for authenticated requests.
+//! Resolves the caller's identity from the remote URL, mints a short-lived
+//! self-signed EdDSA JWT for that identity, and attaches it as the
+//! `Authorization: Bearer` header.
+//!
+//! A raw public key is NOT a credential — the JWT (signed with the identity's
+//! private key) proves possession of that key. See [`crate::commands::token`]
+//! for the minting mechanics.
 //!
 //! Identity resolution order:
 //! 1. URL userinfo — `http://bob@alice.localhost:8080/...` → identity "bob"
@@ -11,14 +16,14 @@ use atomic_identity::IdentityStore;
 use atomic_remote::HttpRemoteConfig;
 use url::Url;
 
-/// Attach a Bearer auth header to the remote config by resolving the
-/// identity from the URL.
+/// Attach a Bearer JWT auth header to the remote config by resolving the
+/// identity from the URL and logging in for a token.
 ///
-/// If the identity cannot be resolved (no userinfo, no subdomain, or
-/// identity not found in the store), the config is returned unmodified
-/// and a debug log is emitted. This keeps push/pull/clone working
-/// against servers that don't require auth.
-pub fn attach_identity(config: HttpRemoteConfig, remote_url: &str) -> HttpRemoteConfig {
+/// If the identity cannot be resolved (no userinfo, no subdomain, or identity
+/// not found in the store) or login fails, the config is returned unmodified
+/// and a debug log is emitted. This keeps push/pull/clone working against
+/// servers that don't require auth (e.g. public reads).
+pub async fn attach_identity(config: HttpRemoteConfig, remote_url: &str) -> HttpRemoteConfig {
     let identity_name = match resolve_identity_name(remote_url) {
         Some(name) => name,
         None => {
@@ -45,10 +50,54 @@ pub fn attach_identity(config: HttpRemoteConfig, remote_url: &str) -> HttpRemote
         }
     };
 
-    let public_key_b32 = identity.public_key_base32();
-    log::debug!("Attaching Bearer auth for identity '{}'", identity_name);
+    // Tokens are keyed to the apex server (where the identity registered), not
+    // the tenant subdomain — strip the leading subdomain label from the host.
+    let server = match apex_server_url(remote_url) {
+        Some(s) => s,
+        None => {
+            log::debug!("Could not derive apex server URL from: {}", remote_url);
+            return config;
+        }
+    };
 
-    config.with_header("Authorization", format!("Bearer {}", public_key_b32))
+    match crate::commands::token::get_token(&server, &identity).await {
+        Ok(jwt) => {
+            log::debug!("Attaching Bearer JWT for identity '{}'", identity_name);
+            config.with_header("Authorization", format!("Bearer {}", jwt))
+        }
+        Err(e) => {
+            // Non-fatal: a server that doesn't require auth still works for
+            // public reads. Auth-required operations will then fail with a
+            // clear 401 from the server.
+            log::debug!("Could not obtain JWT for '{}': {}", identity_name, e);
+            config
+        }
+    }
+}
+
+/// Derive the apex server URL (scheme + host without the leading subdomain
+/// label + port) from a tenant-scoped remote URL.
+///
+/// `http://alice.localhost:8080/workspaces/w/projects/p/code`
+///   → `http://localhost:8080`
+/// `https://alice.atomic.storage/...` → `https://atomic.storage`
+/// `http://localhost:8080/...` (no subdomain) → `http://localhost:8080`
+fn apex_server_url(remote_url: &str) -> Option<String> {
+    let url = Url::parse(remote_url).ok()?;
+    let scheme = url.scheme();
+    let host = url.host_str()?;
+
+    // Strip the first label if there is a subdomain; leave a bare host
+    // (e.g. "localhost") untouched.
+    let apex_host = match host.find('.') {
+        Some(dot) => &host[dot + 1..],
+        None => host,
+    };
+
+    match url.port() {
+        Some(port) => Some(format!("{scheme}://{apex_host}:{port}")),
+        None => Some(format!("{scheme}://{apex_host}")),
+    }
 }
 
 /// Extract the identity name from a remote URL.
@@ -89,6 +138,35 @@ fn extract_subdomain(host: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apex_strips_subdomain_with_port() {
+        assert_eq!(
+            apex_server_url("http://alice.localhost:8080/workspaces/w/projects/p/code").as_deref(),
+            Some("http://localhost:8080")
+        );
+    }
+
+    #[test]
+    fn apex_strips_subdomain_full_domain() {
+        assert_eq!(
+            apex_server_url("https://alice.atomic.storage/workspaces/w/projects/p/code").as_deref(),
+            Some("https://atomic.storage")
+        );
+    }
+
+    #[test]
+    fn apex_bare_host_unchanged() {
+        assert_eq!(
+            apex_server_url("http://localhost:8080/workspaces/w/projects/p/code").as_deref(),
+            Some("http://localhost:8080")
+        );
+    }
+
+    #[test]
+    fn apex_invalid_url_is_none() {
+        assert_eq!(apex_server_url("not a url"), None);
+    }
 
     #[test]
     fn userinfo_takes_priority() {

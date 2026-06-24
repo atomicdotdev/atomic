@@ -90,7 +90,7 @@ impl Command for WorkspaceDelete {
                 }
             }
 
-            let (client, org_slug) = build_client_with_org(self.org.as_deref())?;
+            let (client, org_slug) = build_client_with_org(self.org.as_deref()).await?;
 
             client
                 .delete_workspace(&self.slug)

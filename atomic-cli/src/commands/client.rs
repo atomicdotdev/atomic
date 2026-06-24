@@ -11,8 +11,9 @@
 //!    `atomic identity register`).
 //! 2. **Org override** — an explicit `--org` flag takes precedence over the
 //!    configured default org.
-//! 3. **Bearer token** — the base32-encoded Ed25519 public key of the
-//!    default identity.
+//! 3. **Bearer token** — a short-lived, client-self-signed EdDSA JWT minted
+//!    for the default identity (see [`crate::commands::token`]). The raw
+//!    public key is never sent as a credential.
 //!
 //! # Identity resolution
 //!
@@ -44,8 +45,8 @@ use crate::error::{CliError, CliResult};
 /// - No org slug available (neither override nor default).
 /// - Identity store cannot be opened or no default identity set.
 /// - HTTP client construction failure.
-pub fn build_client(org_override: Option<&str>) -> CliResult<StorageClient> {
-    let (client, _org_slug) = build_client_with_org(org_override)?;
+pub async fn build_client(org_override: Option<&str>) -> CliResult<StorageClient> {
+    let (client, _org_slug) = build_client_with_org(org_override).await?;
     Ok(client)
 }
 
@@ -53,16 +54,18 @@ pub fn build_client(org_override: Option<&str>) -> CliResult<StorageClient> {
 ///
 /// Useful for commands that also need to resolve org-scoped state (e.g.
 /// per-org default workspace lookup). Avoids resolving the org twice.
-pub fn build_client_with_org(org_override: Option<&str>) -> CliResult<(StorageClient, String)> {
+pub async fn build_client_with_org(
+    org_override: Option<&str>,
+) -> CliResult<(StorageClient, String)> {
     let config = GlobalConfig::load()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
 
     let server = &config.server;
-    if server.url.is_none() {
-        return Err(CliError::Internal(anyhow::anyhow!(
+    let server_url = server.url.clone().ok_or_else(|| {
+        CliError::Internal(anyhow::anyhow!(
             "Server not configured. Run 'atomic identity register <server-url>' first."
-        )));
-    }
+        ))
+    })?;
 
     let org_slug = resolve_org(org_override)?;
 
@@ -72,7 +75,9 @@ pub fn build_client_with_org(org_override: Option<&str>) -> CliResult<(StorageCl
         ))
     })?;
 
-    // Load default identity for bearer token.
+    // Load default identity — we authenticate with a short-lived JWT obtained
+    // by signing a challenge with this identity's private key, never with the
+    // raw public key.
     let store = IdentityStore::open_default()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to open identity store: {}", e)))?;
 
@@ -86,7 +91,8 @@ pub fn build_client_with_org(org_override: Option<&str>) -> CliResult<(StorageCl
             ))
         })?;
 
-    let bearer_token = identity.public_key_base32();
+    // Log in against the server apex for a JWT bearer token.
+    let bearer_token = crate::commands::token::get_token(&server_url, &identity).await?;
 
     let client = StorageClient::new(&base_url, &org_slug, &bearer_token).map_err(|e| {
         CliError::Internal(anyhow::anyhow!("Failed to create storage client: {}", e))
