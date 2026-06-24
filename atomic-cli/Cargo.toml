@@ -1,7 +1,6 @@
 [features]
-default = ["ast", "teams"]
+default = ["teams"]
 remote = []
-ast = ["atomic-semantic", "atomic-repository/ast"]
 teams = ["atomic-teams"]
 
 [package]
@@ -29,7 +28,7 @@ atomic-config = { workspace = true }
 atomic-identity = { workspace = true }
 atomic-remote = { workspace = true }
 atomic-repository = { workspace = true }
-atomic-semantic = { workspace = true, optional = true }
+atomic-semantic = { workspace = true }
 atomic-teams = { workspace = true, optional = true }
 
 # CLI

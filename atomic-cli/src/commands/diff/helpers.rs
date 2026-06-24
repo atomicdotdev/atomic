@@ -492,10 +492,21 @@ impl Diff {
             if matched_rm.contains(ri) || matched_add.contains(ai) {
                 continue;
             }
-            matched_rm.insert(*ri);
-            matched_add.insert(*ai);
             let rm_orig_idx = rm_entries[*ri].0;
             let add_orig_idx = add_entries[*ai].0;
+
+            // Only pull an add forward if there are no other Added lines
+            // between the remove and the matched add in the original order.
+            // Intervening Added lines represent genuinely new content that
+            // belongs before the matched line in the new file — moving the
+            // matched add past them would put it in the wrong position.
+            let has_intervening_adds = (rm_orig_idx + 1..add_orig_idx).any(|i| lines[i].is_added());
+            if has_intervening_adds {
+                continue;
+            }
+
+            matched_rm.insert(*ri);
+            matched_add.insert(*ai);
             rm_to_add.insert(rm_orig_idx, add_orig_idx);
             paired_add_indices.insert(add_orig_idx);
         }
