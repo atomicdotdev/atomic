@@ -42,6 +42,23 @@ pub enum QueryCommands {
     /// ```
     Neighbors(QueryNeighbors),
 
+    /// Find all functions that call a given entity.
+    ///
+    /// Queries the knowledge graph for CALLS edges whose destination is the
+    /// specified entity node. Useful for blast-radius analysis: see every
+    /// function that breaks if this function's signature changes.
+    ///
+    /// Run `atomic vault query enrich` first to populate CALLS edges.
+    /// Run `atomic vault query entities <file>` to discover entity IDs.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic vault query callers entity:src/auth.rs:verify:42
+    /// atomic vault query callers entity:src/auth.rs:verify:42 --json
+    /// ```
+    Callers(QueryCallers),
+
     /// List tree-sitter entities (functions, classes, types) in a file.
     ///
     /// Parses the file with tree-sitter and prints all extracted entities.
@@ -187,6 +204,7 @@ impl Command for Query {
         match &self.command {
             QueryCommands::Search(cmd) => cmd.run(),
             QueryCommands::Neighbors(cmd) => cmd.run(),
+            QueryCommands::Callers(cmd) => cmd.run(),
             QueryCommands::Entities(cmd) => cmd.run(),
             QueryCommands::Index(cmd) => cmd.run(),
             QueryCommands::Code(cmd) => cmd.run(),
@@ -1152,6 +1170,95 @@ impl Command for QueryNeighbors {
 }
 
 // ---------------------------------------------------------------------------
+// QueryCallers — find all functions that call a given entity
+// ---------------------------------------------------------------------------
+
+/// Find all functions that call a given entity node.
+#[derive(Parser, Debug)]
+pub struct QueryCallers {
+    /// Full entity node ID, e.g. `entity:src/auth.rs:verify:42`.
+    ///
+    /// Use `atomic vault query entities <file>` to list entity IDs for a file,
+    /// then pass one here.
+    pub entity_id: String,
+
+    /// Output as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl Command for QueryCallers {
+    fn run(&self) -> CliResult<()> {
+        let root = find_repository_root()?;
+        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+
+        let subgraph = repo
+            .vault_kg_neighbors(&self.entity_id, 1)
+            .map_err(CliError::Repository)?;
+
+        // Incoming CALLS edges: from_id is the caller, to_id is our entity.
+        let caller_edges: Vec<&KgEdge> = subgraph
+            .edges
+            .iter()
+            .filter(|e| e.kind.to_uppercase() == "CALLS" && e.to_id == self.entity_id)
+            .collect();
+
+        if self.json {
+            let out: Vec<serde_json::Value> = caller_edges
+                .iter()
+                .map(|e| {
+                    let node = subgraph.nodes.iter().find(|n| n.id == e.from_id);
+                    serde_json::json!({
+                        "caller_id": e.from_id,
+                        "summary": node.and_then(|n| n.summary.as_deref()),
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            return Ok(());
+        }
+
+        if caller_edges.is_empty() {
+            println!("No callers found for '{}'.", self.entity_id);
+            // Distinguish "no callers" from "CALLS edges not yet enriched"
+            let has_any_calls = subgraph
+                .edges
+                .iter()
+                .any(|e| e.kind.to_uppercase() == "CALLS");
+            if !has_any_calls {
+                println!(
+                    "Hint: run `atomic vault query enrich` to populate CALLS edges, \
+                    then retry."
+                );
+            } else {
+                println!("This function is an entry point — nothing in the repo calls it.");
+            }
+        } else {
+            println!("{} caller(s) of {}:\n", caller_edges.len(), self.entity_id);
+            for edge in &caller_edges {
+                // Parse entity:{file}:{name}:{line} for a readable display
+                let display = if let Some(rest) = edge.from_id.strip_prefix("entity:") {
+                    let last = rest.rfind(':').unwrap_or(rest.len());
+                    let inner = &rest[..last]; // {file}:{name}
+                    let sig = subgraph
+                        .nodes
+                        .iter()
+                        .find(|n| n.id == edge.from_id)
+                        .and_then(|n| n.summary.as_deref())
+                        .map(|s| format!("  [{}]", s.lines().next().unwrap_or(s)));
+                    format!("  {}{}", inner, sig.unwrap_or_default())
+                } else {
+                    format!("  {}", edge.from_id)
+                };
+                println!("{display}");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // QueryEntities — list tree-sitter entities in a file
 // ---------------------------------------------------------------------------
 
@@ -1166,7 +1273,6 @@ pub struct QueryEntities {
     pub json: bool,
 }
 
-#[cfg(feature = "ast")]
 impl Command for QueryEntities {
     fn run(&self) -> CliResult<()> {
         let root = find_repository_root()?;
@@ -1208,14 +1314,6 @@ impl Command for QueryEntities {
             println!("\n{} entity(ies) in {}", entities.len(), self.path);
         }
 
-        Ok(())
-    }
-}
-
-#[cfg(not(feature = "ast"))]
-impl Command for QueryEntities {
-    fn run(&self) -> CliResult<()> {
-        println!("Tree-sitter support not enabled. Rebuild with --features ast.");
         Ok(())
     }
 }
@@ -1420,32 +1518,36 @@ impl Command for QueryEnrich {
         }
 
         // Phase 5: AST entities
-        #[cfg(feature = "ast")]
-        {
-            let spinner = create_spinner("Extracting entities (tree-sitter)...");
-            match repo.kg_enrich_entities() {
-                Ok(n) => {
-                    total.entities = n;
-                    finish_success(&spinner, &format!("{} entit(ies)", n));
-                }
-                Err(e) => finish_error(&spinner, &format!("entities failed: {}", e)),
+        let spinner = create_spinner("Extracting entities (tree-sitter)...");
+        match repo.kg_enrich_entities() {
+            Ok(n) => {
+                total.entities = n;
+                finish_success(&spinner, &format!("{} entit(ies)", n));
             }
+            Err(e) => finish_error(&spinner, &format!("entities failed: {}", e)),
         }
 
         // Phase 6: INCLUDES edges
-        #[cfg(feature = "ast")]
-        {
-            let spinner = create_spinner("Resolving includes...");
-            match repo.kg_enrich_includes() {
-                Ok(n) => {
-                    total.includes = n;
-                    finish_success(&spinner, &format!("{} include(s)", n));
-                }
-                Err(e) => finish_error(&spinner, &format!("includes failed: {}", e)),
+        let spinner = create_spinner("Resolving includes...");
+        match repo.kg_enrich_includes() {
+            Ok(n) => {
+                total.includes = n;
+                finish_success(&spinner, &format!("{} include(s)", n));
             }
+            Err(e) => finish_error(&spinner, &format!("includes failed: {}", e)),
         }
 
-        // Phase 7: Content search index (syntext)
+        // Phase 7: CALLS edges (caller entity → callee entity)
+        let spinner = create_spinner("Resolving call sites...");
+        match repo.kg_enrich_calls() {
+            Ok(n) => {
+                total.calls = n;
+                finish_success(&spinner, &format!("{} call(s)", n));
+            }
+            Err(e) => finish_error(&spinner, &format!("calls failed: {}", e)),
+        }
+
+        // Phase 8: Content search index (syntext)
         let spinner = create_spinner("Building content index...");
         match atomic_repository::build_content_index(&root) {
             Ok(()) => {

@@ -481,7 +481,7 @@ fn summarize_exploration(tool_name: &str, tool_input: Option<&serde_json::Value>
         (None, Some(target), _) => {
             format!("Examine {}", target)
         }
-        (None, None, Some(desc)) => truncate_for_summary(desc, 80),
+        (None, None, Some(desc)) => truncate_for_summary(desc, 500),
         (None, None, None) => {
             let verb = match tool_name.to_lowercase().as_str() {
                 "grep" | "rg" | "ripgrep" | "search" => "Search codebase",
@@ -544,7 +544,7 @@ fn summarize_commitment(tool_name: &str, tool_input: Option<&serde_json::Value>)
     };
 
     match path {
-        Some(p) => format!("{} {}", verb, truncate_for_summary(p, 80)),
+        Some(p) => format!("{} {}", verb, p),
         None => format!("{} file", verb),
     }
 }
@@ -584,7 +584,7 @@ fn summarize_verification(
     if cmd.is_empty() {
         format!("Run verification{}", result_suffix)
     } else {
-        format!("{}{}", truncate_for_summary(cmd, 80), result_suffix)
+        format!("{}{}", truncate_for_summary(cmd, 300), result_suffix)
     }
 }
 
@@ -598,7 +598,7 @@ fn summarize_execution(tool_name: &str, tool_input: Option<&serde_json::Value>) 
         let cmd = extract_command(tool_input);
         let cmd = cmd.trim();
         if !cmd.is_empty() {
-            return truncate_for_summary(cmd, 100);
+            return truncate_for_summary(cmd, 300);
         }
     }
 

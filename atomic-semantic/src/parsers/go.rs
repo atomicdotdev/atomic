@@ -17,7 +17,7 @@
 //! | `import "fmt"` | Import | Import declaration |
 
 use super::{Language, LanguageParser};
-use crate::entity::{Entity, EntityKind};
+use crate::entity::{Confidence, Entity, EntityKind, Reference};
 use tree_sitter::{Node, Parser};
 
 /// Go AST entity extractor using tree-sitter.
@@ -327,6 +327,57 @@ impl GoParser {
             String::new()
         }
     }
+
+    fn walk_tree_for_calls(
+        &self,
+        node: &Node,
+        source: &str,
+        file_path: &str,
+        refs: &mut Vec<Reference>,
+    ) {
+        if node.kind() == "call_expression" {
+            if let Some(func_node) = node.child_by_field_name("function") {
+                if let Some(name) = self.extract_call_name(&func_node, source) {
+                    if !name.is_empty() {
+                        refs.push(Reference {
+                            symbol: name,
+                            file: file_path.to_string(),
+                            line: (node.start_position().row as u32) + 1,
+                            column: Some(node.start_position().column as u32),
+                            context: None,
+                            confidence: Confidence::High,
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.walk_tree_for_calls(&child, source, file_path, refs);
+        }
+    }
+
+    fn extract_call_name(&self, func_node: &Node, source: &str) -> Option<String> {
+        match func_node.kind() {
+            "identifier" => {
+                let name = self.node_text(func_node, source);
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(name)
+                }
+            }
+            "selector_expression" => {
+                // pkg.Func() or receiver.Method() — extract just the function/method name
+                func_node
+                    .child_by_field_name("field")
+                    .map(|f| self.node_text(&f, source))
+                    .filter(|s| !s.is_empty())
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Default for GoParser {
@@ -349,6 +400,16 @@ impl LanguageParser for GoParser {
         let mut entities = Vec::new();
         self.walk_tree(&tree.root_node(), source, file_path, &mut entities);
         entities
+    }
+
+    fn extract_references(&mut self, source: &str, file_path: &str) -> Vec<Reference> {
+        let tree = match self.parser.parse(source, None) {
+            Some(t) => t,
+            None => return vec![],
+        };
+        let mut refs = Vec::new();
+        self.walk_tree_for_calls(&tree.root_node(), source, file_path, &mut refs);
+        refs
     }
 }
 

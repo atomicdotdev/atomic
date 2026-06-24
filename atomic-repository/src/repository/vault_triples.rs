@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::content_search::{has_content_index, search_content, ContentSearchOptions};
-use atomic_core::pristine::ontology::edge_kind;
+use atomic_core::pristine::ontology::{edge_kind, predicate};
 use atomic_core::pristine::vault::{KgEdge, KgNode, KgSubgraph, VaultEntry, VaultEntryType};
 use atomic_core::pristine::{KgMutTxnT, KgTxnT};
 
@@ -56,12 +56,19 @@ impl Repository {
         if let Ok(fm) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
             &entry.frontmatter_json,
         ) {
-            extract_frontmatter_kg(&subject, entry.entry_type, &fm, &mut node, &mut edges);
+            extract_frontmatter_kg(
+                &subject,
+                entry.entry_type,
+                &fm,
+                &mut node,
+                &mut nodes,
+                &mut edges,
+            );
         }
 
         // Extract from content
         let content = String::from_utf8_lossy(&entry.content_bytes);
-        extract_content_edges(&subject, &content, &mut edges);
+        extract_content_edges(&subject, entry.entry_type, &content, &mut edges);
 
         nodes.push(node);
         Ok((nodes, edges))
@@ -574,6 +581,7 @@ fn extract_frontmatter_kg(
     entry_type: VaultEntryType,
     fm: &serde_json::Map<String, serde_json::Value>,
     node: &mut KgNode,
+    nodes: &mut Vec<KgNode>,
     edges: &mut Vec<KgEdge>,
 ) {
     // Common fields → edges
@@ -636,7 +644,7 @@ fn extract_frontmatter_kg(
                     obj.insert("priority".to_string(), serde_json::json!(s));
                 }
             }
-            // blocked_by array
+            // blocked_by array — write both directions for symmetric traversal
             if let Some(arr) = fm.get("blocked_by").and_then(|v| v.as_array()) {
                 for item in arr {
                     if let Some(s) = item.as_str() {
@@ -645,10 +653,16 @@ fn extract_frontmatter_kg(
                             format!("intent:{}", s),
                             edge_kind::BLOCKED_BY,
                         ));
+                        // Symmetric: the blocker also BLOCKS this intent
+                        edges.push(KgEdge::new(
+                            format!("intent:{}", s),
+                            subject,
+                            edge_kind::BLOCKS,
+                        ));
                     }
                 }
             }
-            // labels array -> HAS_LABEL edges
+            // labels array -> HAS_LABEL edges + concept nodes
             if let Some(arr) = fm.get("labels").and_then(|v| v.as_array()) {
                 for item in arr {
                     if let Some(s) = item.as_str() {
@@ -657,6 +671,8 @@ fn extract_frontmatter_kg(
                             format!("concept:{}", s),
                             edge_kind::HAS_LABEL,
                         ));
+                        // Ensure the concept node exists so it is searchable
+                        nodes.push(KgNode::new(format!("concept:{}", s), "concept", s, "vault"));
                     }
                 }
             }
@@ -687,13 +703,31 @@ fn extract_frontmatter_kg(
                 }
             }
         }
+        VaultEntryType::ToolResult => {
+            // ToolResult files always live at goals/{goal-name}/toolu_*.md.
+            // Derive the parent goal from the subject: "tool:goals:{goal}:{file}"
+            if let Some(rest) = subject.strip_prefix("tool:goals:") {
+                if let Some((goal_name, _)) = rest.split_once(':') {
+                    edges.push(KgEdge::new(
+                        subject,
+                        format!("goal:{}", goal_name),
+                        predicate::WAS_ASSOCIATED_WITH,
+                    ));
+                }
+            }
+        }
         _ => {}
     }
 }
 
 /// Extract edges from content text (wiki-links, file paths).
-fn extract_content_edges(subject: &str, content: &str, edges: &mut Vec<KgEdge>) {
-    // Extract [[wiki-links]]
+fn extract_content_edges(
+    subject: &str,
+    entry_type: VaultEntryType,
+    content: &str,
+    edges: &mut Vec<KgEdge>,
+) {
+    // Extract [[wiki-links]] — always REFERENCES regardless of entry type
     let mut pos = 0;
     while let Some(start) = content[pos..].find("[[") {
         let abs_start = pos + start + 2;
@@ -712,7 +746,14 @@ fn extract_content_edges(subject: &str, content: &str, edges: &mut Vec<KgEdge>) 
         }
     }
 
-    // Extract file paths (simple heuristic: paths with extensions)
+    // File paths: ToolResult content represents files the agent actually read/used,
+    // so emit USED edges.  All other entry types emit REFERENCES edges.
+    let file_edge_kind = if entry_type == VaultEntryType::ToolResult {
+        predicate::USED
+    } else {
+        edge_kind::REFERENCES
+    };
+
     for word in content.split_whitespace() {
         let clean = word.trim_matches(|c: char| {
             c == '`' || c == '"' || c == '\'' || c == '(' || c == ')' || c == ','
@@ -721,7 +762,7 @@ fn extract_content_edges(subject: &str, content: &str, edges: &mut Vec<KgEdge>) 
             edges.push(KgEdge::new(
                 subject,
                 format!("file:{}", clean),
-                edge_kind::REFERENCES,
+                file_edge_kind,
             ));
         }
     }
@@ -810,10 +851,17 @@ mod tests {
             .vault_extract_kg("intents/pimo-1/intent.md", &entry)
             .unwrap();
 
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].kind, "intent");
-        assert_eq!(nodes[0].id, "intent:PIMO-1");
-        assert_eq!(nodes[0].summary.as_deref(), Some("Fix auth"));
+        // 1 intent node + 1 concept node per label ("auth", "security")
+        assert_eq!(nodes.len(), 3);
+        let intent_node = nodes.iter().find(|n| n.kind == "intent").unwrap();
+        assert_eq!(intent_node.id, "intent:PIMO-1");
+        assert_eq!(intent_node.summary.as_deref(), Some("Fix auth"));
+        assert!(nodes
+            .iter()
+            .any(|n| n.kind == "concept" && n.id == "concept:auth"));
+        assert!(nodes
+            .iter()
+            .any(|n| n.kind == "concept" && n.id == "concept:security"));
 
         assert!(
             edges
@@ -985,6 +1033,7 @@ mod tests {
         let mut edges = Vec::new();
         extract_content_edges(
             "goal:test",
+            VaultEntryType::Session,
             "Check [[architecture]] and [[auth-design]] for details.",
             &mut edges,
         );
@@ -1007,6 +1056,7 @@ mod tests {
         let mut edges = Vec::new();
         extract_content_edges(
             "goal:test",
+            VaultEntryType::Session,
             "Modified `src/main.rs` and crates/core/src/lib.rs today.",
             &mut edges,
         );
@@ -1051,11 +1101,13 @@ mod tests {
             "blocked_by".to_string(),
             serde_json::json!(["PIMO-2", "PIMO-3"]),
         );
+        let mut nodes = Vec::new();
         extract_frontmatter_kg(
             "intent:PIMO-1",
             VaultEntryType::Intent,
             &fm,
             &mut node,
+            &mut nodes,
             &mut edges,
         );
         assert!(
@@ -1070,6 +1122,13 @@ mod tests {
                 .any(|e| e.kind == edge_kind::BLOCKED_BY && e.to_id == "intent:PIMO-3"),
             "Missing BLOCKED_BY edge for PIMO-3"
         );
+        // Reverse BLOCKS edges should also be present
+        assert!(
+            edges.iter().any(|e| e.kind == edge_kind::BLOCKS
+                && e.from_id == "intent:PIMO-2"
+                && e.to_id == "intent:PIMO-1"),
+            "Missing reverse BLOCKS edge from PIMO-2"
+        );
     }
 
     #[test]
@@ -1081,11 +1140,13 @@ mod tests {
             "goals".to_string(),
             serde_json::json!(["swift-meadow-a3f2"]),
         );
+        let mut nodes = Vec::new();
         extract_frontmatter_kg(
             "intent:PIMO-1",
             VaultEntryType::Intent,
             &fm,
             &mut node,
+            &mut nodes,
             &mut edges,
         );
         assert!(
@@ -1099,7 +1160,12 @@ mod tests {
     #[test]
     fn test_wiki_link_with_newline_ignored() {
         let mut edges = Vec::new();
-        extract_content_edges("goal:test", "See [[bad\nlink]] here.", &mut edges);
+        extract_content_edges(
+            "goal:test",
+            VaultEntryType::Session,
+            "See [[bad\nlink]] here.",
+            &mut edges,
+        );
         assert!(
             edges.iter().all(|e| e.kind != edge_kind::REFERENCES),
             "Should not extract wiki-link with newline"
@@ -1109,7 +1175,12 @@ mod tests {
     #[test]
     fn test_unclosed_wiki_link_ignored() {
         let mut edges = Vec::new();
-        extract_content_edges("goal:test", "See [[unclosed link here.", &mut edges);
+        extract_content_edges(
+            "goal:test",
+            VaultEntryType::Session,
+            "See [[unclosed link here.",
+            &mut edges,
+        );
         assert!(
             edges.iter().all(|e| e.kind != edge_kind::REFERENCES),
             "Should not extract unclosed wiki-link"

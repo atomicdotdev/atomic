@@ -45,16 +45,13 @@ impl Repository {
         };
 
         // Phase 4: AST entities → nodes + DEFINES edges
-        #[cfg(feature = "ast")]
-        {
-            stats.entities = self.kg_enrich_entities()?;
-        }
+        stats.entities = self.kg_enrich_entities()?;
 
         // Phase 4b: INCLUDES edges (from import entities)
-        #[cfg(feature = "ast")]
-        {
-            stats.includes = self.kg_enrich_includes()?;
-        }
+        stats.includes = self.kg_enrich_includes()?;
+
+        // Phase 4c: CALLS edges (caller entity → callee entity)
+        stats.calls = self.kg_enrich_calls()?;
 
         Ok(stats)
     }
@@ -463,7 +460,6 @@ impl Repository {
         }
 
         // AST entity extraction for changed files
-        #[cfg(feature = "ast")]
         {
             let mut parser_registry = atomic_semantic::ParserRegistry::new();
 
@@ -514,6 +510,16 @@ impl Repository {
                     ))
                     .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+                    // EXPORTS edge: only for publicly visible entities
+                    if entity.exported {
+                        txn.upsert_kg_edge(&KgEdge::new(
+                            format!("file:{}", entity.file),
+                            &entity_id,
+                            edge_kind::EXPORTS,
+                        ))
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    }
+
                     // Change MODIFIES entity (more precise than file-level)
                     txn.upsert_kg_edge(&KgEdge::new(
                         format!("change:{}", short_hash),
@@ -538,7 +544,6 @@ impl Repository {
     /// resolve each import path to an existing `file:{path}` node in the KG.
     /// If a match is found, creates an `INCLUDES` edge from the source file
     /// to the included file. Best-effort — unresolvable imports are skipped.
-    #[cfg(feature = "ast")]
     pub fn kg_enrich_includes(&self) -> Result<usize, RepositoryError> {
         let files = self
             .list_tracked_files()
@@ -657,11 +662,153 @@ impl Repository {
         Ok(count)
     }
 
+    /// Parses all tracked source files and writes `CALLS` edges between entity nodes.
+    ///
+    /// For every tracked file, this function:
+    /// 1. Extracts function/method entities (to build a name → entity-ID index).
+    /// 2. Extracts call sites via tree-sitter reference extraction.
+    /// 3. For each call site, finds the innermost enclosing function (the caller entity)
+    ///    and resolves the callee name to known entity nodes in the graph.
+    /// 4. Writes `KgEdge { from: caller_entity, to: callee_entity, kind: CALLS }`.
+    ///
+    /// Callee resolution is name-based: a call to `foo()` matches any entity named `foo`
+    /// across all tracked files. Calls to external crates / stdlib are silently skipped.
+    pub fn kg_enrich_calls(&self) -> Result<usize, RepositoryError> {
+        let files = self
+            .list_tracked_files()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut parser_registry = atomic_semantic::ParserRegistry::new();
+
+        // ── Pass 1: Parse every file to build the name → entity-ID index.
+        struct FileData {
+            path: String,
+            source: String,
+            entities: Vec<atomic_semantic::Entity>,
+        }
+
+        let mut all_file_data: Vec<FileData> = Vec::new();
+        // function/method name → list of entity IDs (names can appear in multiple files)
+        let mut name_to_entity_ids: HashMap<String, Vec<String>> = HashMap::new();
+
+        for file in &files {
+            if file.is_directory {
+                continue;
+            }
+            let path_str = file.path.to_string_lossy().to_string();
+            if !atomic_semantic::is_supported(&path_str) {
+                continue;
+            }
+            let abs_path = self.root().join(&file.path);
+            let source = match std::fs::read_to_string(&abs_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            let entities = parser_registry.extract(&path_str, &source);
+
+            for entity in &entities {
+                match entity.kind {
+                    atomic_semantic::EntityKind::Function | atomic_semantic::EntityKind::Method => {
+                        let entity_id =
+                            format!("entity:{}:{}:{}", entity.file, entity.name, entity.line);
+                        name_to_entity_ids
+                            .entry(entity.name.clone())
+                            .or_default()
+                            .push(entity_id);
+                    }
+                    _ => {}
+                }
+            }
+
+            all_file_data.push(FileData {
+                path: path_str,
+                source,
+                entities,
+            });
+        }
+
+        // ── Pass 2: Extract call sites and write CALLS edges.
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut count = 0;
+
+        for file_data in &all_file_data {
+            let refs = parser_registry.extract_references(&file_data.path, &file_data.source);
+            if refs.is_empty() {
+                continue;
+            }
+
+            // Build a (start_line, end_line, entity_id) list for this file's callable
+            // entities so we can find which function encloses each call site by line.
+            let mut callable_entities: Vec<(u32, u32, String)> = file_data
+                .entities
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.kind,
+                        atomic_semantic::EntityKind::Function | atomic_semantic::EntityKind::Method
+                    )
+                })
+                .map(|e| {
+                    (
+                        e.line,
+                        e.end_line,
+                        format!("entity:{}:{}:{}", e.file, e.name, e.line),
+                    )
+                })
+                .collect();
+            callable_entities.sort_by_key(|(start, _, _)| *start);
+
+            for r in &refs {
+                // Find the innermost (smallest range) enclosing function.
+                let caller_id = callable_entities
+                    .iter()
+                    .filter(|(start, end, _)| r.line >= *start && r.line <= *end)
+                    .min_by_key(|(start, end, _)| end - start)
+                    .map(|(_, _, id)| id.as_str());
+
+                let caller_id = match caller_id {
+                    Some(id) => id,
+                    None => continue, // call outside any function (top-level, macro, etc.)
+                };
+
+                // Skip names that resolve to too many definitions — they are almost
+                // certainly common trait-method names (new, clone, fmt, from, into,
+                // push, len, …) where name-only matching produces pure noise.
+                // A call to `Vec::new()` should not write edges to every `fn new()`
+                // across all 600+ files.
+                const MAX_CALLEE_FANOUT: usize = 10;
+
+                let callee_ids = match name_to_entity_ids.get(&r.symbol) {
+                    Some(ids) if ids.len() <= MAX_CALLEE_FANOUT => ids,
+                    Some(_) => continue, // too ambiguous — common trait method, skip
+                    None => continue,    // callee not in repo (stdlib / external dep)
+                };
+
+                for callee_id in callee_ids {
+                    if callee_id == caller_id {
+                        continue; // skip direct recursion
+                    }
+                    txn.upsert_kg_edge(&KgEdge::new(caller_id, callee_id, edge_kind::CALLS))
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    count += 1;
+                }
+            }
+        }
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(count)
+    }
+
     /// Parses all supported source files in the working copy and creates
     /// `entity:{file}:{name}:{line}` nodes with `DEFINES` edges from
     /// the corresponding file nodes. Runs during bulk enrichment
     /// (`atomic vault query enrich`, `atomic git import`).
-    #[cfg(feature = "ast")]
     pub fn kg_enrich_entities(&self) -> Result<usize, RepositoryError> {
         let files = self
             .list_tracked_files()
@@ -720,6 +867,16 @@ impl Repository {
                 ))
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+                // EXPORTS edge: only for publicly visible entities
+                if entity.exported {
+                    txn.upsert_kg_edge(&KgEdge::new(
+                        format!("file:{}", entity.file),
+                        &entity_id,
+                        edge_kind::EXPORTS,
+                    ))
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                }
+
                 count += 1;
             }
         }
@@ -745,12 +902,20 @@ pub struct KgEnrichStats {
     pub entities: usize,
     /// Number of INCLUDES edges created.
     pub includes: usize,
+    /// Number of CALLS edges created.
+    pub calls: usize,
 }
 
 impl KgEnrichStats {
     /// Total number of nodes created across all phases.
     pub fn total(&self) -> usize {
-        self.views + self.files + self.modules + self.changes + self.entities + self.includes
+        self.views
+            + self.files
+            + self.modules
+            + self.changes
+            + self.entities
+            + self.includes
+            + self.calls
     }
 }
 
@@ -758,8 +923,14 @@ impl std::fmt::Display for KgEnrichStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} views, {} files, {} modules, {} changes, {} entities, {} includes",
-            self.views, self.files, self.modules, self.changes, self.entities, self.includes
+            "{} views, {} files, {} modules, {} changes, {} entities, {} includes, {} calls",
+            self.views,
+            self.files,
+            self.modules,
+            self.changes,
+            self.entities,
+            self.includes,
+            self.calls
         )
     }
 }
@@ -786,10 +957,11 @@ mod tests {
             changes: 5,
             entities: 8,
             includes: 4,
+            calls: 0,
         };
         assert_eq!(
             stats.to_string(),
-            "3 views, 10 files, 2 modules, 5 changes, 8 entities, 4 includes"
+            "3 views, 10 files, 2 modules, 5 changes, 8 entities, 4 includes, 0 calls"
         );
     }
 
@@ -802,8 +974,9 @@ mod tests {
             changes: 3,
             entities: 4,
             includes: 1,
+            calls: 5,
         };
-        assert_eq!(stats.total(), 20);
+        assert_eq!(stats.total(), 25);
     }
 
     #[test]
@@ -815,10 +988,11 @@ mod tests {
         assert_eq!(stats.changes, 0);
         assert_eq!(stats.entities, 0);
         assert_eq!(stats.includes, 0);
+        assert_eq!(stats.calls, 0);
         assert_eq!(stats.total(), 0);
         assert_eq!(
             stats.to_string(),
-            "0 views, 0 files, 0 modules, 0 changes, 0 entities, 0 includes"
+            "0 views, 0 files, 0 modules, 0 changes, 0 entities, 0 includes, 0 calls"
         );
     }
 

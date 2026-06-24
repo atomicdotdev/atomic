@@ -17,7 +17,7 @@
 //! | `from x import y` | Import | From-import statement |
 
 use super::{Language, LanguageParser};
-use crate::entity::{Entity, EntityKind};
+use crate::entity::{Confidence, Entity, EntityKind, Reference};
 use tree_sitter::{Node, Parser};
 
 /// Python AST entity extractor using tree-sitter.
@@ -352,6 +352,57 @@ impl PythonParser {
             String::new()
         }
     }
+
+    fn walk_tree_for_calls(
+        &self,
+        node: &Node,
+        source: &str,
+        file_path: &str,
+        refs: &mut Vec<Reference>,
+    ) {
+        if node.kind() == "call" {
+            if let Some(func_node) = node.child_by_field_name("function") {
+                if let Some(name) = self.extract_call_name(&func_node, source) {
+                    if !name.is_empty() {
+                        refs.push(Reference {
+                            symbol: name,
+                            file: file_path.to_string(),
+                            line: (node.start_position().row as u32) + 1,
+                            column: Some(node.start_position().column as u32),
+                            context: None,
+                            confidence: Confidence::High,
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.walk_tree_for_calls(&child, source, file_path, refs);
+        }
+    }
+
+    fn extract_call_name(&self, func_node: &Node, source: &str) -> Option<String> {
+        match func_node.kind() {
+            "identifier" => {
+                let name = self.node_text(func_node, source);
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(name)
+                }
+            }
+            "attribute" => {
+                // obj.method() — extract just "method"
+                func_node
+                    .child_by_field_name("attribute")
+                    .map(|f| self.node_text(&f, source))
+                    .filter(|s| !s.is_empty())
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Default for PythonParser {
@@ -374,6 +425,16 @@ impl LanguageParser for PythonParser {
         let mut entities = Vec::new();
         self.walk_tree(&tree.root_node(), source, file_path, &mut entities, None);
         entities
+    }
+
+    fn extract_references(&mut self, source: &str, file_path: &str) -> Vec<Reference> {
+        let tree = match self.parser.parse(source, None) {
+            Some(t) => t,
+            None => return vec![],
+        };
+        let mut refs = Vec::new();
+        self.walk_tree_for_calls(&tree.root_node(), source, file_path, &mut refs);
+        refs
     }
 }
 
