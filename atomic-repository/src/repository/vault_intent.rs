@@ -1064,8 +1064,7 @@ The authentication module has no rate limiting.
         // Read the original content from disk (since update without content reads from disk)
         let intent_path = repo.vault_dir().join(&result.intent_file);
         let disk_content = std::fs::read_to_string(&intent_path).unwrap();
-        let (_, original_body) =
-            crate::repository::vault::parse_vault_frontmatter(&disk_content);
+        let (_, original_body) = crate::repository::vault::parse_vault_frontmatter(&disk_content);
 
         repo.vault_intent_update(
             &result.id,
