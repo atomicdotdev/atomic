@@ -148,23 +148,9 @@ pub fn record_turn(
         }
     })?;
 
-    // Align change detection with the view we will record onto, BEFORE the first
-    // status() — in memory only, so the read-only no-lock fast path is preserved.
-    //
-    // `record()` applies/filters against `session.view_name`, but `status()`
-    // reads `self.current_view`. The real hook flow switches `current_view` at
-    // session start; direct callers (the noname ACP→TurnOrchestrator bridge,
-    // tests) do not, leaving detection on `dev`. The dangerous case is a turn
-    // whose net effect is invisible from `dev` — e.g. deleting the last file
-    // that lived on the session view: the first status() would see a clean tree
-    // and the early `EmptyTurn` check below would fire, silently dropping the
-    // turn, before any later (write-handle) view switch could correct it.
-    //
-    // `set_current_view_in_memory` only assigns the field — no txn, no lock, no
-    // disk write — so the anti-hang design (record/mod.rs reopen-for-write) is
-    // untouched. If the session view does not exist yet (pure first turn),
-    // `status()`'s filter falls back to "show everything", so untracked
-    // detection still works. See `docs/atomic-record-view-mismatch.md`.
+    // `status()` reads current_view, while `record()` writes to session.view_name.
+    // Align the read-only handle before the first status check; this keeps the
+    // no-lock fast path and prevents direct callers from seeing false EmptyTurn.
     repo.set_current_view_in_memory(&options.session.view_name);
 
     // Step 2: Status — find out what the agent changed.
@@ -221,15 +207,9 @@ pub fn record_turn(
         }
     })?;
 
-    // Persist the view alignment on the write handle so the post-add status
-    // refresh and `record()` apply agree with the in-memory alignment done on
-    // the read-only handle above.
-    //
-    // A `ViewNotFound` is the legitimate first-turn case — the session view does
-    // not exist yet; `record()`'s apply creates it, and detection was already
-    // aligned in memory. Any other error (DB / failed `.atomic/current_view`
-    // write) must NOT be swallowed: continuing would leave detection and apply
-    // reading different views again, so surface it as `RecordFailed`.
+    // Keep the write handle on the same view for post-add status and record.
+    // First turns may target a view that record/apply will create; other failures
+    // mean we cannot trust the detection/apply alignment.
     match repo.set_current_view(&options.session.view_name) {
         Ok(()) => {}
         Err(atomic_repository::RepositoryError::ViewNotFound { .. }) => {
