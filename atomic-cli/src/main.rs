@@ -78,6 +78,7 @@ use commands::{
     Restore,
     Revise,
     Sandbox,
+    ServerCmd,
     Split,
     Stash,
     Status,
@@ -484,6 +485,32 @@ enum Commands {
     /// ```
     Remote(Remote),
 
+    /// Manage server profiles (staging, production, etc.).
+    ///
+    /// Server profiles let you store multiple atomic-storage server
+    /// configurations and switch between them easily. Each profile
+    /// can have its own URL, default org, and identity.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # List configured profiles
+    /// atomic server
+    ///
+    /// # Add a staging profile
+    /// atomic server add staging https://staging.atomic.storage --identity alice-staging
+    ///
+    /// # Switch to staging
+    /// atomic server set staging
+    ///
+    /// # Show active profile
+    /// atomic server show
+    ///
+    /// # Bind an identity to a profile
+    /// atomic server set-identity prod alice-prod
+    /// ```
+    Server(ServerCmd),
+
     /// Manage remote workspaces.
     ///
     /// Workspaces are organizational containers for projects on a remote
@@ -766,6 +793,8 @@ fn main() {
         Commands::Identity(identity) => identity.run(),
 
         Commands::Remote(remote) => remote.run(),
+
+        Commands::Server(server) => server.run(),
 
         Commands::Workspace(workspace) => workspace.run(),
 

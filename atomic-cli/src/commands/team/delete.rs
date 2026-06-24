@@ -105,7 +105,7 @@ impl TeamDelete {
             }
         }
 
-        let client = build_client(self.org.as_deref()).await?;
+        let client = build_client(self.org.as_deref(), None).await?;
         let org_slug = client.org_slug().to_string();
 
         atomic_teams::team::delete_team(&client, &org_slug, &self.slug)

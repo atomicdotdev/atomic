@@ -121,6 +121,16 @@ pub struct Push {
     /// Request timeout in seconds.
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
     pub timeout: u64,
+
+    /// Identity to use for authentication.
+    ///
+    /// Overrides the identity inferred from the remote URL subdomain and
+    /// the `identity` field in the remote's config entry.  Must match a
+    /// locally stored identity name (see `atomic identity list`).
+    ///
+    /// Example: `atomic push --identity alice-staging`
+    #[arg(long)]
+    pub identity: Option<String>,
 }
 
 impl Push {
@@ -145,6 +155,7 @@ impl Push {
             all: false,
             insecure: false,
             timeout: DEFAULT_TIMEOUT_SECS,
+            identity: None,
         }
     }
 
@@ -196,31 +207,26 @@ impl Push {
         self
     }
 
-    /// Resolve the remote URL.
+    /// Builder: set an explicit identity name override.
+    pub fn with_identity(mut self, identity: impl Into<String>) -> Self {
+        self.identity = Some(identity.into());
+        self
+    }
+
+    /// Resolve the remote URL and any identity hint from the `--identity` flag.
     ///
-    /// If the remote is a URL (contains "://"), returns it directly.
-    /// Otherwise, looks up the named remote in the repository configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `repo` - The repository to look up configuration from
-    ///
-    /// # Returns
-    ///
-    /// The resolved remote URL.
-    ///
-    /// # Errors
-    ///
-    /// Returns `CliError::RemoteNotFound` if the named remote doesn't exist.
-    fn resolve_remote_url(&self, repo: &Repository) -> CliResult<String> {
+    /// Returns `(url, identity_hint)` where `identity_hint` comes solely from
+    /// the `--identity` CLI flag. If absent, `attach_identity` falls back to
+    /// URL-subdomain inference.
+    fn resolve_remote_url(&self, repo: &Repository) -> CliResult<(String, Option<String>)> {
         // If it looks like a URL, use it directly
         if self.remote.contains("://") {
-            return Ok(self.remote.clone());
+            return Ok((self.remote.clone(), self.identity.clone()));
         }
 
         // Look up named remote in repository configuration
         match repo.get_remote(&self.remote) {
-            Ok(entry) => Ok(entry.url),
+            Ok(entry) => Ok((entry.url, self.identity.clone())),
             Err(atomic_repository::RepositoryError::RemoteNotFound { .. }) => {
                 Err(CliError::RemoteNotFound {
                     name: self.remote.clone(),
@@ -249,12 +255,19 @@ impl Push {
     }
 
     /// Build the HTTP remote configuration.
-    async fn build_remote_config(&self, remote_url: &str) -> HttpRemoteConfig {
+    ///
+    /// `identity_hint` — explicit identity name to use (from `--identity` or
+    /// `RemoteEntry.identity`). When `None`, falls back to URL-based inference.
+    async fn build_remote_config(
+        &self,
+        remote_url: &str,
+        identity_hint: Option<&str>,
+    ) -> HttpRemoteConfig {
         let config = HttpRemoteConfig::new()
             .with_timeout(Duration::from_secs(self.timeout))
             .danger_accept_invalid_certs(self.insecure);
 
-        crate::commands::auth::attach_identity(config, remote_url).await
+        crate::commands::auth::attach_identity(config, remote_url, identity_hint).await
     }
 
     /// Display the dry run preview.
@@ -295,8 +308,8 @@ impl Push {
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
 
-        // Resolve remote URL
-        let remote_url = self.resolve_remote_url(&repo)?;
+        // Resolve remote URL and identity hint
+        let (remote_url, identity_hint) = self.resolve_remote_url(&repo)?;
 
         // Determine views
         let local_view = self.get_local_view(&repo);
@@ -320,7 +333,9 @@ impl Push {
 
         // Connect to remote
         let spinner = create_spinner("Connecting to remote...");
-        let config = self.build_remote_config(&remote_url).await;
+        let config = self
+            .build_remote_config(&remote_url, identity_hint.as_deref())
+            .await;
         let remote = HttpRemote::with_config(&remote_url, config).map_err(|e| {
             finish_error(&spinner, "Failed to connect");
             convert_remote_error(e, &remote_url)
@@ -923,7 +938,7 @@ mod tests {
     async fn test_build_remote_config_default() {
         let push = Push::new();
         let config = push
-            .build_remote_config("http://test.localhost:8080/code")
+            .build_remote_config("http://test.localhost:8080/code", None)
             .await;
 
         assert_eq!(config.timeout, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
@@ -934,7 +949,7 @@ mod tests {
     async fn test_build_remote_config_custom_timeout() {
         let push = Push::new().with_timeout(120);
         let config = push
-            .build_remote_config("http://test.localhost:8080/code")
+            .build_remote_config("http://test.localhost:8080/code", None)
             .await;
 
         assert_eq!(config.timeout, Duration::from_secs(120));
@@ -944,7 +959,7 @@ mod tests {
     async fn test_build_remote_config_insecure() {
         let push = Push::new().with_insecure(true);
         let config = push
-            .build_remote_config("http://test.localhost:8080/code")
+            .build_remote_config("http://test.localhost:8080/code", None)
             .await;
 
         assert!(config.danger_accept_invalid_certs);

@@ -73,7 +73,7 @@ impl Command for TeamList {
 
 impl TeamList {
     async fn execute(&self) -> CliResult<()> {
-        let client = build_client(self.org.as_deref()).await?;
+        let client = build_client(self.org.as_deref(), None).await?;
         let slug = client.org_slug().to_string();
 
         let teams = atomic_teams::team::list_teams(&client, &slug)

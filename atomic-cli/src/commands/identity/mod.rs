@@ -59,6 +59,8 @@ pub use whoami::WhoAmI;
 
 use clap::Subcommand;
 
+use atomic_config::GlobalConfig;
+
 use crate::commands::Command;
 use crate::error::CliResult;
 
@@ -325,6 +327,7 @@ impl Command for Default {
                     "Set '{}' as default identity for {} usage",
                     name, usage
                 ));
+                activate_server_for_identity(name);
             } else {
                 store.set_default(&identity.id).map_err(|e| {
                     crate::error::CliError::Internal(anyhow::anyhow!(
@@ -333,6 +336,7 @@ impl Command for Default {
                     ))
                 })?;
                 print_success(&format!("Set '{}' as default identity", name));
+                activate_server_for_identity(name);
             }
         }
 
@@ -341,6 +345,49 @@ impl Command for Default {
 }
 
 // Helper Functions
+
+/// When an identity becomes the active default, automatically activate the
+/// server profile bound to it (if any).
+///
+/// Looks for a named profile in `~/.atomic/config.toml` whose `identity`
+/// field matches `identity_name`. If found, sets `default_server` to that
+/// profile name and saves the config. Emits a hint so the user knows the
+/// server switched alongside the identity.
+///
+/// This is intentionally non-fatal: if the config can't be loaded/saved,
+/// a debug log is emitted and the command still succeeds — the identity
+/// switch itself is the important operation.
+pub fn activate_server_for_identity(identity_name: &str) {
+    let mut config = match GlobalConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            log::debug!("Could not load config for server auto-activation: {}", e);
+            return;
+        }
+    };
+
+    // Find a named server profile whose identity binding matches.
+    let matching_profile = config
+        .servers
+        .iter()
+        .find(|(_, srv)| srv.identity.as_deref() == Some(identity_name))
+        .map(|(name, _)| name.clone());
+
+    if let Some(profile_name) = matching_profile {
+        // Only update + print if it's actually changing.
+        if config.default_server.as_deref() != Some(&profile_name) {
+            config.default_server = Some(profile_name.clone());
+            if let Err(e) = config.save() {
+                log::debug!("Could not save config for server auto-activation: {}", e);
+                return;
+            }
+            crate::output::print_hint(&format!(
+                "Server profile '{}' activated (bound to identity '{}')",
+                profile_name, identity_name
+            ));
+        }
+    }
+}
 
 /// Format an identity type for display.
 pub fn format_identity_type(identity_type: &atomic_identity::IdentityType) -> &'static str {

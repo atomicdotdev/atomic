@@ -79,7 +79,7 @@ impl Command for ProjectShow {
 
         rt.block_on(async {
             let (ws_slug, proj_slug) = parse_project_path(&self.slug)?;
-            let client = build_client(self.org.as_deref()).await?;
+            let client = build_client(self.org.as_deref(), None).await?;
 
             let project = client
                 .get_project(ws_slug, proj_slug)
