@@ -273,9 +273,16 @@ impl Disable {
                         }
                     }
                 }
+                "kiro" => {
+                    print_success("Kiro hooks are configured through the IDE panel.");
+                    println!(
+                        "  Remove hooks manually in Kiro IDE \u{2192} Agent Steering & Skills."
+                    );
+                    println!("  Uninstall skills/steering: npx atomic-kiro --uninstall");
+                }
                 other => {
                     print_warning(&format!(
-                        "Global disable is not supported for '{}'. Supported agents: claude-code, gemini-cli",
+                        "Global disable is not supported for '{}'. Supported agents: claude-code, gemini-cli, kiro",
                         other
                     ));
                 }

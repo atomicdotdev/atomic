@@ -302,9 +302,15 @@ atomic agent hooks <agent> <verb>              # internal, called by agent hooks
 | Agent | Status | Hook Format |
 |---|---|---|
 | **Claude Code** | ✅ Implemented | `.claude/settings.json`, 7 hooks |
-| **Gemini CLI** | 📋 Planned | `.gemini/settings.json` |
-| **Codex** | 📋 Planned | TBD |
-| **OpenCode** | 📋 Planned | TBD |
+| **Cline** | ✅ Implemented | `.cline/settings.json` |
+| **Codex** | ✅ Implemented | `.codex/hooks.json` |
+| **Copilot** | ✅ Implemented | `.github/copilot-hooks.yml` |
+| **Cursor** | ✅ Implemented | `.cursor/hooks.json` |
+| **Gemini CLI** | ✅ Implemented | `.gemini/settings.json` |
+| **Kiro** | ✅ Implemented | IDE panel + shell scripts (via `atomic-kiro` package) |
+| **OpenCode** | ✅ Implemented | `.opencode/hooks.json` |
+| **Pi** | ✅ Implemented | Extension-based (`atomic-pi` package) |
+| **Sherpa** | ✅ Implemented | Self-managed by TUI |
 
 Adding a new agent requires implementing the `AgentHook` trait (~150 lines) and registering it in `AgentRegistry::with_defaults()`.
 

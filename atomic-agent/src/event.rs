@@ -148,6 +148,10 @@ impl HookType {
     /// // OpenCode verbs
     /// assert_eq!(HookType::from_verb("user-prompt"), Some(HookType::TurnStart));
     ///
+    /// // Kiro IDE verbs
+    /// assert_eq!(HookType::from_verb("prompt-submit"), Some(HookType::TurnStart));
+    /// assert_eq!(HookType::from_verb("agent-stop"), Some(HookType::TurnEnd));
+    ///
     /// // Hermes Agent verbs
     /// assert_eq!(HookType::from_verb("pre_llm_call"), Some(HookType::TurnStart));
     /// assert_eq!(HookType::from_verb("post_tool_call"), Some(HookType::PostToolUse));
@@ -208,6 +212,13 @@ impl HookType {
             "before-tool" => Some(HookType::PreToolUse),
             "after-tool" | "post_tool_call" => Some(HookType::PostToolUse),
 
+            // Kiro IDE turn boundaries
+            // ("prompt-submit" already matched above for Devin — same mapping)
+            "agent-stop" => Some(HookType::TurnEnd),
+            // Kiro tool use
+            "pre-tool-use" => Some(HookType::PreToolUse),
+            "post-tool-use" => Some(HookType::PostToolUse),
+            // Kiro post-task is already handled above ("post-task" → PostToolUse)
             _ => None,
         }
     }

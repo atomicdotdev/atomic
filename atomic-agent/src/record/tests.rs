@@ -585,6 +585,11 @@ fn test_vendor_from_agent_name_codex() {
 }
 
 #[test]
+fn test_vendor_from_agent_name_kiro() {
+    assert_eq!(vendor_from_agent_name("kiro"), AIVendor::AmazonBedrock);
+}
+
+#[test]
 fn test_vendor_from_agent_name_unknown() {
     match vendor_from_agent_name("my-custom-agent") {
         AIVendor::Other(name) => assert_eq!(name, "my-custom-agent"),

@@ -64,6 +64,7 @@ pub mod cursor;
 pub mod devin;
 pub mod gemini_cli;
 pub mod hermes;
+pub mod kiro;
 pub mod manifest;
 pub mod opencode;
 pub mod pi;
@@ -252,6 +253,7 @@ impl AgentRegistry {
     /// - Devin Desktop (`devin`)
     /// - Gemini CLI (`gemini-cli`)
     /// - Hermes Agent (`hermes`)
+    /// - Kiro (`kiro`)
     /// - OpenCode (`opencode`)
     /// - Pi (`pi`)
     /// - Sherpa (`sherpa`)
@@ -265,6 +267,7 @@ impl AgentRegistry {
         registry.register(Box::new(devin::DevinHook::new()));
         registry.register(Box::new(gemini_cli::GeminiCliHook::new()));
         registry.register(Box::new(hermes::HermesHook::new()));
+        registry.register(Box::new(kiro::KiroHook::new()));
         registry.register(Box::new(opencode::OpenCodeHook::new()));
         registry.register(Box::new(pi::PiHook::new()));
         registry.register(Box::new(sherpa::SherpaHook::new()));
