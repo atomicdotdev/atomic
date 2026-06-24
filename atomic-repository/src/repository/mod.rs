@@ -577,6 +577,21 @@ default = "{}"
         Ok(())
     }
 
+    /// Set the current view in memory only — no disk write, no transaction, no lock.
+    ///
+    /// Unlike [`set_current_view`](Self::set_current_view), this does not verify
+    /// that the view exists and does not persist `.atomic/current_view`. It only
+    /// assigns `self.current_view`, which governs which view `status()` reads.
+    ///
+    /// Use this to align change *detection* with the intended *apply* view on a
+    /// read-only repository handle, where taking a write lock would defeat the
+    /// no-lock fast path. If the view does not exist yet, `status()`'s view
+    /// filter falls back to "show everything", so detection still works.
+    #[inline]
+    pub fn set_current_view_in_memory(&mut self, view: &str) {
+        self.current_view = view.to_string();
+    }
+
     // ── Internal helpers ────────────────────────────────────────────────
 
     /// Get a reference to the pristine database.

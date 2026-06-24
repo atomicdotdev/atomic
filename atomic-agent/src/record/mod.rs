@@ -140,13 +140,32 @@ pub fn record_turn(
     // Step 1: Open the repository read-only for the initial status check.
     // This avoids blocking on the redb write lock — we only need read access
     // to decide whether there's work to do and which files are untracked.
-    let repo = atomic_repository::Repository::open_readonly(repo_root).map_err(|e| {
+    let mut repo = atomic_repository::Repository::open_readonly(repo_root).map_err(|e| {
         AgentError::RecordFailed {
             session_id: options.session.session_id.clone(),
             turn_number: options.turn_number,
             reason: format!("Failed to open repository (readonly): {}", e),
         }
     })?;
+
+    // Align change detection with the view we will record onto, BEFORE the first
+    // status() — in memory only, so the read-only no-lock fast path is preserved.
+    //
+    // `record()` applies/filters against `session.view_name`, but `status()`
+    // reads `self.current_view`. The real hook flow switches `current_view` at
+    // session start; direct callers (the noname ACP→TurnOrchestrator bridge,
+    // tests) do not, leaving detection on `dev`. The dangerous case is a turn
+    // whose net effect is invisible from `dev` — e.g. deleting the last file
+    // that lived on the session view: the first status() would see a clean tree
+    // and the early `EmptyTurn` check below would fire, silently dropping the
+    // turn, before any later (write-handle) view switch could correct it.
+    //
+    // `set_current_view_in_memory` only assigns the field — no txn, no lock, no
+    // disk write — so the anti-hang design (record/mod.rs reopen-for-write) is
+    // untouched. If the session view does not exist yet (pure first turn),
+    // `status()`'s filter falls back to "show everything", so untracked
+    // detection still works. See `docs/atomic-record-view-mismatch.md`.
+    repo.set_current_view_in_memory(&options.session.view_name);
 
     // Step 2: Status — find out what the agent changed.
     // Include untracked files because agent turns commonly create new source,
@@ -194,13 +213,39 @@ pub fn record_turn(
     // skips the table-init `begin_write()` that `open()` does — the tables
     // already exist and that write lock is the primary cause of hook hangs
     // when another process holds a transaction.
-    let repo = atomic_repository::Repository::open_existing(repo_root).map_err(|e| {
+    let mut repo = atomic_repository::Repository::open_existing(repo_root).map_err(|e| {
         AgentError::RecordFailed {
             session_id: options.session.session_id.clone(),
             turn_number: options.turn_number,
             reason: format!("Failed to open repository for recording: {}", e),
         }
     })?;
+
+    // Persist the view alignment on the write handle so the post-add status
+    // refresh and `record()` apply agree with the in-memory alignment done on
+    // the read-only handle above.
+    //
+    // A `ViewNotFound` is the legitimate first-turn case — the session view does
+    // not exist yet; `record()`'s apply creates it, and detection was already
+    // aligned in memory. Any other error (DB / failed `.atomic/current_view`
+    // write) must NOT be swallowed: continuing would leave detection and apply
+    // reading different views again, so surface it as `RecordFailed`.
+    match repo.set_current_view(&options.session.view_name) {
+        Ok(()) => {}
+        Err(atomic_repository::RepositoryError::ViewNotFound { .. }) => {
+            log::debug!(
+                "session view '{}' not yet created; first-turn apply will create it",
+                options.session.view_name
+            );
+        }
+        Err(e) => {
+            return Err(AgentError::RecordFailed {
+                session_id: options.session.session_id.clone(),
+                turn_number: options.turn_number,
+                reason: format!("Failed to align current view before record: {}", e),
+            });
+        }
+    }
 
     if !untracked_paths.is_empty() {
         log::info!(
