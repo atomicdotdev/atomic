@@ -310,6 +310,14 @@ impl Push {
             hint(&remote_url)
         );
 
+        // Fail fast if we have no usable credentials for this remote. A push is
+        // a write that always requires auth; without a credential the server's
+        // negotiation endpoints return an ambiguous 404 (private projects are
+        // deliberately masked), which surfaces as a misleading "view not found".
+        // Catching the missing credential here gives the user an accurate,
+        // actionable error instead.
+        crate::commands::auth::check_push_credentials(&remote_url)?;
+
         // Connect to remote
         let spinner = create_spinner("Connecting to remote...");
         let config = self.build_remote_config(&remote_url).await;
