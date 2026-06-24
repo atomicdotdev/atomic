@@ -138,7 +138,7 @@ fn verify_org_exists(slug: &str) -> CliResult<()> {
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {e}")))?;
 
     rt.block_on(async {
-        let (client, _resolved) = build_client_with_org(Some(slug))?;
+        let (client, _resolved) = build_client_with_org(Some(slug)).await?;
         match atomic_teams::org::get_org(&client, slug).await {
             Ok(_) => Ok(()),
             Err(e) if is_org_not_found(&e) => Err(CliError::InvalidArgument {

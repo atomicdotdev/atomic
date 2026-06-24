@@ -85,7 +85,7 @@ impl Command for OrgShow {
 
 impl OrgShow {
     async fn execute(&self) -> CliResult<()> {
-        let client = build_client(self.org.as_deref())?;
+        let client = build_client(self.org.as_deref()).await?;
 
         // Determine which slug to look up: explicit arg > client's org slug
         let slug = self.slug.as_deref().unwrap_or_else(|| client.org_slug());
