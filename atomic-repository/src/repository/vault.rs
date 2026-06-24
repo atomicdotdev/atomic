@@ -791,6 +791,12 @@ pub struct VaultFileChange {
 /// after the closing `---`.
 ///
 /// If there's no frontmatter, returns `("{}", full_content)`.
+/// Parse vault markdown frontmatter. Public within the crate so that
+/// `vault_intent_update` can read disk content before storing.
+pub(crate) fn parse_vault_frontmatter(content: &str) -> (String, String) {
+    parse_markdown_frontmatter(content)
+}
+
 fn parse_markdown_frontmatter(content: &str) -> (String, String) {
     // Check for frontmatter delimiter
     if !content.starts_with("---\n") && !content.starts_with("---\r\n") {
@@ -906,7 +912,10 @@ fn parse_yaml_value(s: &str) -> serde_json::Value {
 
     // Try as array [a, b, c]
     if s.starts_with('[') && s.ends_with(']') {
-        let inner = &s[1..s.len() - 1];
+        let inner = s[1..s.len() - 1].trim();
+        if inner.is_empty() {
+            return serde_json::Value::Array(Vec::new());
+        }
         let items: Vec<serde_json::Value> = inner
             .split(',')
             .map(|item| parse_yaml_value(item.trim()))
