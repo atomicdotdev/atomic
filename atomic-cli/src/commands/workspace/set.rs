@@ -186,7 +186,7 @@ fn verify_workspace_exists(org_slug: &str, workspace_slug: &str) -> CliResult<()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {e}")))?;
 
     rt.block_on(async {
-        let (client, _resolved) = build_client_with_org(Some(org_slug)).await?;
+        let (client, _resolved) = build_client_with_org(Some(org_slug), None).await?;
         match client.get_workspace(workspace_slug).await {
             Ok(_) => Ok(()),
             Err(e) if e.is_not_found() => Err(CliError::InvalidArgument {

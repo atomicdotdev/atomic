@@ -98,6 +98,7 @@ pub mod clone;
 pub mod pull;
 pub mod push;
 pub mod remote;
+pub mod server;
 
 // Phase 4: Identity Management
 pub mod identity;
@@ -143,6 +144,7 @@ pub use remove::Remove;
 pub use restore::Restore;
 pub use revise::Revise;
 pub use sandbox::Sandbox;
+pub use server::ServerCmd;
 pub use split::Split;
 pub use stash::Stash;
 pub use status::Status;

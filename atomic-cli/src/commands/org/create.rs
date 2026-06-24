@@ -81,7 +81,7 @@ impl OrgCreate {
     async fn execute(&self) -> CliResult<()> {
         // Build client using current default org (doesn't matter which org
         // we're scoped to — the server creates a new org regardless).
-        let client = build_client(None).await?;
+        let client = build_client(None, None).await?;
 
         let info = atomic_teams::org::create_org(&client, &self.name, self.email.as_deref())
             .await

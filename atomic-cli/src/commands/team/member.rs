@@ -168,7 +168,7 @@ impl Command for TeamMemberList {
 
 impl TeamMemberList {
     async fn execute(&self) -> CliResult<()> {
-        let client = build_client(self.org.as_deref()).await?;
+        let client = build_client(self.org.as_deref(), None).await?;
         let org_slug = client.org_slug().to_string();
 
         let members =
@@ -282,7 +282,7 @@ impl TeamMemberAdd {
             ),
         })?;
 
-        let client = build_client(self.org.as_deref()).await?;
+        let client = build_client(self.org.as_deref(), None).await?;
         let org_slug = client.org_slug().to_string();
 
         let identity_id =
@@ -372,7 +372,7 @@ impl TeamMemberUpdate {
             ),
         })?;
 
-        let client = build_client(self.org.as_deref()).await?;
+        let client = build_client(self.org.as_deref(), None).await?;
         let org_slug = client.org_slug().to_string();
 
         let identity_id =
@@ -475,7 +475,7 @@ impl TeamMemberRemove {
             }
         }
 
-        let client = build_client(self.org.as_deref()).await?;
+        let client = build_client(self.org.as_deref(), None).await?;
         let org_slug = client.org_slug().to_string();
 
         let identity_id =

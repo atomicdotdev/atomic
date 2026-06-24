@@ -94,7 +94,7 @@ impl Command for ProjectUpdate {
         })?;
 
         rt.block_on(async {
-            let client = build_client(self.org.as_deref()).await?;
+            let client = build_client(self.org.as_deref(), None).await?;
 
             let req = UpdateProjectRequest {
                 name: self.name.clone(),

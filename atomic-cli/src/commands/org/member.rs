@@ -161,7 +161,7 @@ impl Command for MemberList {
 
 impl MemberList {
     async fn execute(&self) -> CliResult<()> {
-        let client = build_client(self.org.as_deref()).await?;
+        let client = build_client(self.org.as_deref(), None).await?;
         let slug = client.org_slug().to_string();
 
         let members = atomic_teams::member::list_members(&client, &slug)
@@ -261,7 +261,7 @@ impl MemberAdd {
             ),
         })?;
 
-        let client = build_client(self.org.as_deref()).await?;
+        let client = build_client(self.org.as_deref(), None).await?;
         let slug = client.org_slug().to_string();
 
         let identity_id =
@@ -338,7 +338,7 @@ impl MemberUpdate {
             ),
         })?;
 
-        let client = build_client(self.org.as_deref()).await?;
+        let client = build_client(self.org.as_deref(), None).await?;
         let slug = client.org_slug().to_string();
 
         let identity_id =
@@ -409,7 +409,7 @@ impl Command for MemberRemove {
 
 impl MemberRemove {
     async fn execute(&self) -> CliResult<()> {
-        let client = build_client(self.org.as_deref()).await?;
+        let client = build_client(self.org.as_deref(), None).await?;
         let slug = client.org_slug().to_string();
 
         let identity_id =

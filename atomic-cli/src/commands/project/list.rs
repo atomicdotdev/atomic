@@ -55,6 +55,13 @@ pub struct ProjectList {
     #[arg(long)]
     pub org: Option<String>,
 
+    /// Server profile to use (e.g. "staging", "prod").
+    ///
+    /// Overrides `default_server` from `~/.atomic/config.toml`.
+    /// Use `atomic server list` to see available profiles.
+    #[arg(long)]
+    pub server: Option<String>,
+
     /// Output format: `table` or `json`.
     #[arg(long, default_value = "table")]
     pub format: String,
@@ -67,7 +74,8 @@ impl Command for ProjectList {
         })?;
 
         rt.block_on(async {
-            let (client, org_slug) = build_client_with_org(self.org.as_deref()).await?;
+            let (client, org_slug) =
+                build_client_with_org(self.org.as_deref(), self.server.as_deref()).await?;
             let workspace = resolve_workspace(&org_slug, self.workspace.as_deref())?;
 
             let projects = client.list_projects(&workspace).await.map_err(remote_err)?;
@@ -132,6 +140,7 @@ mod tests {
         let cmd = ProjectList {
             workspace: Some("ws".to_string()),
             org: None,
+            server: None,
             format: "table".to_string(),
         };
         assert_eq!(cmd.format, "table");
@@ -142,6 +151,7 @@ mod tests {
         let cmd = ProjectList {
             workspace: Some("my-workspace".to_string()),
             org: Some("acme".to_string()),
+            server: None,
             format: "json".to_string(),
         };
         assert_eq!(cmd.workspace.as_deref(), Some("my-workspace"));
@@ -154,6 +164,7 @@ mod tests {
         let cmd = ProjectList {
             workspace: None,
             org: None,
+            server: None,
             format: "table".to_string(),
         };
         assert!(cmd.workspace.is_none());

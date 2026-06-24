@@ -205,7 +205,8 @@ impl Clone {
             .with_timeout(Duration::from_secs(self.timeout))
             .danger_accept_invalid_certs(self.insecure);
 
-        crate::commands::auth::attach_identity(config, &self.url).await
+        // Clone uses the URL directly — identity inferred from subdomain only.
+        crate::commands::auth::attach_identity(config, &self.url, None).await
     }
 
     /// Get the display name for the repository.
