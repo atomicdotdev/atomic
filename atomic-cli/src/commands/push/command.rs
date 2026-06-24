@@ -249,12 +249,12 @@ impl Push {
     }
 
     /// Build the HTTP remote configuration.
-    fn build_remote_config(&self, remote_url: &str) -> HttpRemoteConfig {
+    async fn build_remote_config(&self, remote_url: &str) -> HttpRemoteConfig {
         let config = HttpRemoteConfig::new()
             .with_timeout(Duration::from_secs(self.timeout))
             .danger_accept_invalid_certs(self.insecure);
 
-        crate::commands::auth::attach_identity(config, remote_url)
+        crate::commands::auth::attach_identity(config, remote_url).await
     }
 
     /// Display the dry run preview.
@@ -310,9 +310,17 @@ impl Push {
             hint(&remote_url)
         );
 
+        // Fail fast if we have no usable credentials for this remote. A push is
+        // a write that always requires auth; without a credential the server's
+        // negotiation endpoints return an ambiguous 404 (private projects are
+        // deliberately masked), which surfaces as a misleading "view not found".
+        // Catching the missing credential here gives the user an accurate,
+        // actionable error instead.
+        crate::commands::auth::check_push_credentials(&remote_url)?;
+
         // Connect to remote
         let spinner = create_spinner("Connecting to remote...");
-        let config = self.build_remote_config(&remote_url);
+        let config = self.build_remote_config(&remote_url).await;
         let remote = HttpRemote::with_config(&remote_url, config).map_err(|e| {
             finish_error(&spinner, "Failed to connect");
             convert_remote_error(e, &remote_url)
@@ -911,27 +919,33 @@ mod tests {
 
     // Remote Config Tests
 
-    #[test]
-    fn test_build_remote_config_default() {
+    #[tokio::test]
+    async fn test_build_remote_config_default() {
         let push = Push::new();
-        let config = push.build_remote_config("http://test.localhost:8080/code");
+        let config = push
+            .build_remote_config("http://test.localhost:8080/code")
+            .await;
 
         assert_eq!(config.timeout, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
         assert!(!config.danger_accept_invalid_certs);
     }
 
-    #[test]
-    fn test_build_remote_config_custom_timeout() {
+    #[tokio::test]
+    async fn test_build_remote_config_custom_timeout() {
         let push = Push::new().with_timeout(120);
-        let config = push.build_remote_config("http://test.localhost:8080/code");
+        let config = push
+            .build_remote_config("http://test.localhost:8080/code")
+            .await;
 
         assert_eq!(config.timeout, Duration::from_secs(120));
     }
 
-    #[test]
-    fn test_build_remote_config_insecure() {
+    #[tokio::test]
+    async fn test_build_remote_config_insecure() {
         let push = Push::new().with_insecure(true);
-        let config = push.build_remote_config("http://test.localhost:8080/code");
+        let config = push
+            .build_remote_config("http://test.localhost:8080/code")
+            .await;
 
         assert!(config.danger_accept_invalid_certs);
     }

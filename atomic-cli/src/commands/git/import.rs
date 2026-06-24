@@ -29,6 +29,7 @@
 //!   it for token-level blame and word-diff.
 
 use std::collections::HashSet;
+use std::io::ErrorKind;
 use std::path::Path;
 
 use clap::Parser;
@@ -155,6 +156,45 @@ fn current_git_branch(git_repo: &GitRepository) -> Option<String> {
         return None;
     }
     head.shorthand().map(ToOwned::to_owned)
+}
+
+const GIT_SHADOW_EXCLUDE_PATTERNS: &[&str] = &["/.atomic/", "/.vault/", "/.atomicignore"];
+
+fn ensure_git_shadow_excludes(git_dir: &Path) -> CliResult<bool> {
+    let info_dir = git_dir.join("info");
+    std::fs::create_dir_all(&info_dir)?;
+
+    let exclude_path = info_dir.join("exclude");
+    let mut content = match std::fs::read_to_string(&exclude_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+
+    let missing: Vec<&str> = GIT_SHADOW_EXCLUDE_PATTERNS
+        .iter()
+        .copied()
+        .filter(|pattern| !content.lines().any(|line| line.trim() == *pattern))
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(false);
+    }
+
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if !content.is_empty() {
+        content.push('\n');
+    }
+    content.push_str("# Atomic local state (managed by atomic git import)\n");
+    for pattern in missing {
+        content.push_str(pattern);
+        content.push('\n');
+    }
+
+    std::fs::write(exclude_path, content)?;
+    Ok(true)
 }
 
 impl Import {
@@ -375,6 +415,10 @@ impl Command for Import {
             }
 
             return Ok(());
+        }
+
+        if ensure_git_shadow_excludes(git_repo.path())? {
+            print_info("Configured Git to ignore Atomic local state.");
         }
 
         // Check if Atomic repository exists in THIS directory (not parent dirs).
@@ -714,5 +758,20 @@ mod tests {
         assert!(patterns.iter().any(|p| p == "node_modules/"));
         assert!(patterns.iter().any(|p| p == ".yarn/cache/"));
         assert!(patterns.iter().any(|p| p == "vendor/"));
+    }
+
+    #[test]
+    fn test_git_shadow_excludes_are_added_to_git_info_exclude() {
+        let temp = tempfile::tempdir().unwrap();
+        let git_dir = temp.path().join(".git");
+
+        assert!(ensure_git_shadow_excludes(&git_dir).unwrap());
+
+        let exclude = std::fs::read_to_string(git_dir.join("info").join("exclude")).unwrap();
+        assert!(exclude.contains("/.atomic/"));
+        assert!(exclude.contains("/.vault/"));
+        assert!(exclude.contains("/.atomicignore"));
+
+        assert!(!ensure_git_shadow_excludes(&git_dir).unwrap());
     }
 }

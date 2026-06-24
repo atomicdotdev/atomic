@@ -131,7 +131,7 @@ impl TeamUpdate {
             })
             .transpose()?;
 
-        let client = build_client(self.org.as_deref())?;
+        let client = build_client(self.org.as_deref()).await?;
         let org_slug = client.org_slug().to_string();
 
         let info = atomic_teams::team::update_team(

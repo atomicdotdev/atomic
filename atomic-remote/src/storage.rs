@@ -2,8 +2,8 @@
 //!
 //! `StorageClient` provides typed access to CRUD operations on workspaces,
 //! projects, and other management endpoints. It handles authentication
-//! (Ed25519 public key as Bearer token), JSON serialization, and
-//! response envelope unwrapping.
+//! (short-lived JWT bearer token), JSON serialization, and response envelope
+//! unwrapping.
 //!
 //! The VCS protocol (push/pull/clone) uses `HttpRemote` instead.
 
@@ -30,7 +30,7 @@ use crate::storage_types::{
 /// let client = StorageClient::new(
 ///     "https://alice.atomic.storage",
 ///     "alice",
-///     "EDPK_BASE32_TOKEN",
+///     "eyJhbG...self_signed_eddsa_jwt",
 /// )?;
 ///
 /// let ws = client.create_workspace(&CreateWorkspaceRequest {
@@ -49,8 +49,8 @@ impl StorageClient {
     /// Create a new client targeting a specific org.
     ///
     /// The `base_url` should be the full org-scoped URL, e.g.,
-    /// `https://alice.atomic.storage`. The `bearer_token` is the
-    /// base32-encoded Ed25519 public key.
+    /// `https://alice.atomic.storage`. The `bearer_token` is a short-lived,
+    /// client-self-signed EdDSA JWT (see `atomic-cli`'s `commands::token`).
     pub fn new(base_url: &str, org_slug: &str, bearer_token: &str) -> Result<Self, RemoteError> {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -171,6 +171,7 @@ impl StorageClient {
             .await
             .map_err(|e| RemoteError::other(format!("request failed: {}", e)))?;
 
+        crate::check_min_version_header(resp.headers());
         let status = resp.status();
         if status.is_success() {
             Ok(())
@@ -185,6 +186,7 @@ impl StorageClient {
         &self,
         resp: reqwest::Response,
     ) -> Result<T, RemoteError> {
+        crate::check_min_version_header(resp.headers());
         let status = resp.status();
         let body = resp
             .text()

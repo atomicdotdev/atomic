@@ -77,6 +77,7 @@ use crate::RepositoryError;
 
 mod filter;
 mod materialize;
+mod sandbox;
 mod semantic_materialize;
 mod switch;
 mod views;
@@ -87,6 +88,7 @@ pub use filter::{
     collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,
     expand_indexed_dependency_closure,
 };
+pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
 pub use views::ViewInfo;
 
 // Re-import workspace helpers from `switch` so they are available to
@@ -126,7 +128,9 @@ pub use vault_goal::{
     GoalInfo, GoalStartOptions, GoalStartResult, GoalStopOptions, GoalStopResult,
 };
 pub use vault_identity::VaultIdentity;
-pub use vault_intent::{IntentCreateOptions, IntentCreateResult, IntentInfo, IntentUpdateOptions};
+pub use vault_intent::{
+    IntentCreateOptions, IntentCreateResult, IntentDeleteResult, IntentInfo, IntentUpdateOptions,
+};
 pub use vault_kg_enrich::KgEnrichStats;
 pub use vault_names::{derive_intent_prefix, generate_goal_name};
 
@@ -297,6 +301,9 @@ default = "{}"
     ///
     /// Returns an error if no repository is found.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
+        if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path.as_ref()) {
+            return Self::open_sandbox(working_root, canonical, &view);
+        }
         let root = Self::find_root(path.as_ref())?;
         let dot_dir = root.join(DOT_DIR);
 
@@ -333,6 +340,9 @@ default = "{}"
     /// Use this for short-lived processes (agent hooks, background jobs)
     /// where blocking on the init write lock would hang the process.
     pub fn open_existing<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
+        if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path.as_ref()) {
+            return Self::open_sandbox(working_root, canonical, &view);
+        }
         let root = Self::find_root(path.as_ref())?;
         let dot_dir = root.join(DOT_DIR);
 
@@ -387,6 +397,9 @@ default = "{}"
     /// let status = repo.status(StatusOptions::default())?;
     /// ```
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
+        if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path.as_ref()) {
+            return Self::open_sandbox(working_root, canonical, &view);
+        }
         let root = Self::find_root(path.as_ref())?;
         let dot_dir = root.join(DOT_DIR);
 

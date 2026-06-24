@@ -88,6 +88,13 @@ echo "  Found $expected_commits first-parent commits on branch '$default_branch'
 # Initialize atomic and import
 assert_success "atomic git import succeeds" atomic git import
 
+git_status_after_import="$(git status --short)"
+if [[ -z "$git_status_after_import" ]]; then
+    _pass "git status stays clean after import"
+else
+    _fail "git status dirty after import" "$git_status_after_import"
+fi
+
 # Verify view created (should use default branch name)
 assert_view_exists "view '$default_branch' created" "$default_branch"
 
@@ -564,6 +571,13 @@ if [[ "$_status_lines" -eq 0 ]]; then
 else
     _dirty=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | head -10)
     _fail "status not clean after import" "$_status_lines dirty entries: $_dirty"
+fi
+
+_git_status_lines=$(cd "$GIT_REPO" && git status --short)
+if [[ -z "$_git_status_lines" ]]; then
+    _pass "git status is clean after import"
+else
+    _fail "git status dirty after import" "$_git_status_lines"
 fi
 
 # 7. Change count matches git commit count

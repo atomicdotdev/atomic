@@ -361,6 +361,27 @@ fn format_bytes(bytes: u64) -> String {
 
 // Error Conversion
 
+/// Build the user-facing message for a "not found" (HTTP 404) response during
+/// a push.
+///
+/// The server deliberately masks private projects: it returns 404 to callers
+/// who are not authenticated/authorized rather than revealing that the project
+/// exists. Because a push is a write that always requires auth, a 404 almost
+/// always means the caller's credentials are missing/expired or they lack push
+/// access — not that the project/view is genuinely absent. The message spells
+/// out both possibilities and points at the remedy.
+///
+/// `target` describes what was not found, e.g. `"project/view 'dev'"` or
+/// `"the project"`.
+fn not_found_push_message(target: &str) -> String {
+    format!(
+        "Remote returned 'not found' for {target}. This means either it \
+         doesn't exist, or you're not authenticated/authorized to push to it. \
+         Make sure your identity is registered with the server \
+         (`atomic identity register <server-url>`) and that you have push access."
+    )
+}
+
 /// Convert a remote error to a CLI error.
 ///
 /// Maps the various remote error types to appropriate CLI error types
@@ -383,12 +404,19 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
         RemoteError::AuthenticationFailed { .. } => CliError::AuthenticationFailed {
             remote: url.to_string(),
         },
+        // A 404 on a push is ambiguous. Private projects are deliberately
+        // masked: the server returns "not found" to anyone who isn't
+        // authenticated/authorized, so a missing project and a private one we
+        // can't see are indistinguishable on the wire. A push is a *write* that
+        // always requires auth, so the most likely cause is missing/expired
+        // credentials — not a genuinely-absent project/view. Say so, and point
+        // at the remedy, instead of the misleading "view not found".
         RemoteError::RepositoryNotFound { .. } => CliError::RemoteError {
-            message: "Repository not found on remote".to_string(),
+            message: not_found_push_message("the project"),
             url: Some(url.to_string()),
         },
         RemoteError::ViewNotFound { view } => CliError::RemoteError {
-            message: format!("View '{}' not found on remote", view),
+            message: not_found_push_message(&format!("project/view '{}'", view)),
             url: Some(url.to_string()),
         },
         RemoteError::ChangeNotFound { hash } => CliError::ChangeNotFound { hash },
@@ -598,12 +626,20 @@ mod tests {
 
     #[test]
     fn test_convert_repo_not_found() {
+        // A 404 for the repository/project on a push is ambiguous (the server
+        // masks private projects), so the message must point at auth rather
+        // than implying the project is simply absent.
         let err = RemoteError::repo_not_found("http://example.com/repo");
         let cli_err = convert_remote_error(err, "http://example.com/repo");
 
         match cli_err {
             CliError::RemoteError { message, .. } => {
+                let lower = message.to_lowercase();
                 assert!(message.contains("not found"));
+                // Mentions the authentication/authorization possibility.
+                assert!(lower.contains("authenticated") || lower.contains("authorized"));
+                // Points at the remedy.
+                assert!(message.contains("atomic identity register"));
             }
             _ => panic!("Expected RemoteError"),
         }
@@ -611,13 +647,21 @@ mod tests {
 
     #[test]
     fn test_convert_view_not_found() {
+        // The server returns 404 both for a genuinely-missing view and for a
+        // private one the caller can't see. On a push (a write that needs
+        // auth) the message must name the view *and* explain that this may be
+        // an auth/authorization problem, with the remedy to run identity
+        // register — not the misleading "view not found".
         let err = RemoteError::view_not_found("main");
         let cli_err = convert_remote_error(err, "http://example.com");
 
         match cli_err {
             CliError::RemoteError { message, .. } => {
+                let lower = message.to_lowercase();
                 assert!(message.contains("main"));
                 assert!(message.contains("not found"));
+                assert!(lower.contains("authenticated") || lower.contains("authorized"));
+                assert!(message.contains("atomic identity register"));
             }
             _ => panic!("Expected RemoteError"),
         }

@@ -77,6 +77,7 @@ use commands::{
     Remove,
     Restore,
     Revise,
+    Sandbox,
     Split,
     Stash,
     Status,
@@ -237,6 +238,20 @@ enum Commands {
     /// ```
     #[command(alias = "reset")]
     Restore(Restore),
+
+    /// Provision concurrent agent sandboxes (copy-on-write working trees).
+    ///
+    /// Each sandbox is a private, copy-on-write clone of the working tree so
+    /// multiple agents can work at once with isolated build artifacts while
+    /// sharing the single canonical graph.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic sandbox create agent-1
+    /// atomic sandbox create agent-2 --dest /tmp/agent-2
+    /// ```
+    Sandbox(Sandbox),
 
     /// Split a view (create a new view from an existing one).
     ///
@@ -717,6 +732,8 @@ fn main() {
         Commands::Move(mv) => mv.run(),
 
         Commands::Restore(restore) => restore.run(),
+
+        Commands::Sandbox(sandbox) => sandbox.run(),
 
         Commands::Split(split) => split.run(),
 

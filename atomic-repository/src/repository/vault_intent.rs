@@ -18,6 +18,7 @@ const INTENT_TEMPLATE: &str = include_str!("../../vault/templates/intent.md");
 use super::*;
 use atomic_core::pristine::vault::{IntentSummary, VaultEntry, VaultEntryType, VaultManifest};
 use atomic_core::pristine::{VaultMutTxnT, VaultTxnT};
+use std::fs;
 
 /// Options for creating a new intent.
 #[derive(Debug, Clone)]
@@ -49,7 +50,19 @@ pub struct IntentCreateResult {
     pub view_name: String,
 }
 
+/// Result of deleting an intent.
+#[derive(Debug, Clone)]
+pub struct IntentDeleteResult {
+    /// The normalized intent ID that was deleted.
+    pub id: String,
+    /// Vault-relative path to the removed intent.md file.
+    pub intent_file: String,
+}
+
 /// Options for updating an intent.
+///
+/// `content` replaces the intent's Markdown body. When it is `None`, the
+/// existing body is preserved unchanged.
 #[derive(Debug, Clone, Default)]
 pub struct IntentUpdateOptions {
     /// New status (backlog, planned, in-progress, review, done).
@@ -60,6 +73,10 @@ pub struct IntentUpdateOptions {
     pub priority: Option<String>,
     /// New title.
     pub title: Option<String>,
+    /// New Markdown body content. When `None`, the existing body is kept.
+    pub content: Option<String>,
+    /// Allow rewriting the body after the intent has started or been linked.
+    pub force: bool,
 }
 
 /// Info for listing intents.
@@ -302,6 +319,99 @@ impl Repository {
             })
     }
 
+    /// Delete an unstarted backlog intent.
+    ///
+    /// This is intentionally conservative: only backlog intents with no linked
+    /// goals can be deleted. Started work should be closed or superseded
+    /// instead of removed from the vault.
+    pub fn vault_intent_delete(
+        &self,
+        intent_id: &str,
+    ) -> Result<IntentDeleteResult, RepositoryError> {
+        let full_id = self.normalize_intent_id(intent_id)?;
+        let intent_file =
+            self.find_intent_path(&full_id)?
+                .ok_or_else(|| RepositoryError::InvalidOperation {
+                    message: format!("Intent '{}' not found", full_id),
+                })?;
+
+        let manifest = self.vault_manifest()?;
+        let summary =
+            manifest
+                .intents
+                .get(&full_id)
+                .ok_or_else(|| RepositoryError::InvalidOperation {
+                    message: format!("Intent '{}' not found", full_id),
+                })?;
+
+        if summary.status != "backlog" {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "Intent '{}' has status '{}'; only backlog intents can be deleted",
+                    full_id, summary.status
+                ),
+            });
+        }
+
+        let referenced_goals = manifest
+            .goals
+            .values()
+            .filter(|goal| {
+                goal.intent
+                    .as_deref()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(&full_id))
+            })
+            .count() as u32;
+        let linked_goals = summary.goals.max(referenced_goals);
+
+        if linked_goals > 0 {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "Intent '{}' is linked to {} goal(s); unlink or close the work instead",
+                    full_id, linked_goals
+                ),
+            });
+        }
+
+        let deleted = self.vault_delete(&intent_file)?;
+        if !deleted {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("Intent '{}' not found", full_id),
+            });
+        }
+
+        {
+            let mut txn = self
+                .pristine
+                .write_txn()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let mut manifest = txn
+                .get_vault_manifest()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            manifest.intents.remove(&full_id);
+            txn.put_vault_manifest(&manifest)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            txn.commit()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
+
+        let materialized = self.vault_dir().join(&intent_file);
+        match fs::remove_file(&materialized) {
+            Ok(()) => {
+                if let Some(parent) = materialized.parent() {
+                    let _ = remove_empty_dirs_up_to(parent, &self.vault_dir().join("intents"));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(RepositoryError::Io(e)),
+        }
+
+        Ok(IntentDeleteResult {
+            id: full_id,
+            intent_file,
+        })
+    }
+
     /// Update an intent's fields.
     pub fn vault_intent_update(
         &self,
@@ -336,6 +446,31 @@ impl Repository {
         let mut fm: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(&frontmatter_json).unwrap_or_default();
 
+        if options.content.is_some() && !options.force {
+            let manifest = self.vault_manifest()?;
+            let summary = manifest.intents.get(&full_id);
+            let current_status = summary
+                .map(|intent| intent.status.as_str())
+                .or_else(|| fm.get("status").and_then(|value| value.as_str()))
+                .unwrap_or("unknown");
+            let has_linked_goal = summary.is_some_and(|intent| intent.goals > 0)
+                || manifest.goals.values().any(|goal| {
+                    goal.intent
+                        .as_deref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(&full_id))
+                });
+
+            if current_status != "backlog" || has_linked_goal {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "Intent '{}' has started or is linked to a goal; rewriting its body would \
+                         change the execution context. Retry with force enabled.",
+                        full_id
+                    ),
+                });
+            }
+        }
+
         if let Some(ref status) = options.status {
             fm.insert(
                 "status".to_string(),
@@ -362,8 +497,12 @@ impl Repository {
         }
         let new_fm = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
 
-        // Re-store with updated frontmatter and current content from disk
-        self.vault_store(&intent_file, VaultEntryType::Intent, content_bytes, new_fm)?;
+        let new_content = match options.content {
+            Some(ref body) => body.clone().into_bytes(),
+            None => content_bytes,
+        };
+
+        self.vault_store(&intent_file, VaultEntryType::Intent, new_content, new_fm)?;
 
         // Update manifest
         {
@@ -585,6 +724,33 @@ impl Repository {
             ),
         })
     }
+}
+
+fn remove_empty_dirs_up_to(
+    mut dir: &std::path::Path,
+    stop_at: &std::path::Path,
+) -> Result<(), std::io::Error> {
+    while dir.starts_with(stop_at) && dir != stop_at {
+        match fs::remove_dir(dir) {
+            Ok(()) => {
+                if let Some(parent) = dir.parent() {
+                    dir = parent;
+                } else {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = dir.parent() {
+                    dir = parent;
+                } else {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -865,6 +1031,264 @@ The authentication module has no rate limiting.
             stored_body.contains("rate limiting"),
             "redb body should have disk edits. Got:\n{}",
             stored_body
+        );
+    }
+
+    #[test]
+    fn test_intent_update_body_content() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo.vault_intent_create(create_opts("Body edit")).unwrap();
+        let new_body = "# Body edit\n\n## Problem\n\nThe widget leaks memory.\n";
+
+        repo.vault_intent_update(
+            &result.id,
+            IntentUpdateOptions {
+                content: Some(new_body.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let after = repo.vault_intent_show(&result.id).unwrap();
+        assert_eq!(String::from_utf8_lossy(&after.content_bytes), new_body);
+    }
+
+    #[test]
+    fn test_intent_update_without_content_preserves_body() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo.vault_intent_create(create_opts("Keep body")).unwrap();
+        // Read the original content from disk (since update without content reads from disk)
+        let intent_path = repo.vault_dir().join(&result.intent_file);
+        let disk_content = std::fs::read_to_string(&intent_path).unwrap();
+        let (_, original_body) =
+            crate::repository::vault::parse_vault_frontmatter(&disk_content);
+
+        repo.vault_intent_update(
+            &result.id,
+            IntentUpdateOptions {
+                priority: Some("high".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let after = repo.vault_intent_show(&result.id).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&after.content_bytes),
+            original_body,
+            "body should be unchanged after frontmatter-only update"
+        );
+    }
+
+    #[test]
+    fn test_intent_update_body_and_frontmatter_together() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo.vault_intent_create(create_opts("Combined")).unwrap();
+        let new_body = "# Combined\n\nFully rewritten.\n";
+        let updated = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    status: Some("review".to_string()),
+                    priority: Some("high".to_string()),
+                    content: Some(new_body.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated.status, "review");
+        assert_eq!(updated.priority, "high");
+        assert_eq!(
+            String::from_utf8_lossy(&repo.vault_intent_show(&result.id).unwrap().content_bytes),
+            new_body
+        );
+    }
+
+    #[test]
+    fn test_intent_delete_backlog_removes_manifest_entry_and_file() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo.vault_intent_create(create_opts("Delete me")).unwrap();
+        let materialized = repo.vault_dir().join(&result.intent_file);
+        assert!(materialized.exists());
+
+        let deleted = repo.vault_intent_delete(&result.id).unwrap();
+        assert_eq!(deleted.id, result.id);
+        assert_eq!(deleted.intent_file, result.intent_file);
+
+        let manifest = repo.vault_manifest().unwrap();
+        assert!(!manifest.intents.contains_key(&result.id));
+        assert!(repo.vault_retrieve(&result.intent_file).unwrap().is_none());
+        assert!(!materialized.exists());
+    }
+
+    #[test]
+    fn test_intent_delete_rejects_non_backlog_intent() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo.vault_intent_create(create_opts("Started")).unwrap();
+        repo.vault_intent_update(
+            &result.id,
+            IntentUpdateOptions {
+                status: Some("in-progress".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let err = repo.vault_intent_delete(&result.id).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("only backlog intents can be deleted"));
+        assert!(repo.vault_retrieve(&result.intent_file).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_intent_delete_rejects_linked_goal() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let intent = repo.vault_intent_create(create_opts("Linked")).unwrap();
+        repo.vault_store(
+            "goals/test-goal/_goal.md",
+            VaultEntryType::Session,
+            b"# Goal".to_vec(),
+            r#"{"goal_id":"test-goal","status":"active"}"#.to_string(),
+        )
+        .unwrap();
+        repo.vault_intent_link(&intent.id, "test-goal").unwrap();
+
+        let err = repo.vault_intent_delete(&intent.id).unwrap_err();
+        assert!(err.to_string().contains("linked to 1 goal"));
+        assert!(repo.vault_retrieve(&intent.intent_file).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_intent_delete_rejects_goal_started_with_intent() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let intent = repo
+            .vault_intent_create(create_opts("Started from goal"))
+            .unwrap();
+        repo.vault_goal_start(GoalStartOptions {
+            name: Some("test-goal".to_string()),
+            intent: Some(intent.id.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Goal start stores the canonical relationship on the goal summary.
+        // Deletion must not rely only on the intent's cached goal count.
+        let manifest = repo.vault_manifest().unwrap();
+        assert_eq!(manifest.intents[&intent.id].goals, 0);
+        assert_eq!(
+            manifest.goals["test-goal"].intent.as_deref(),
+            Some(intent.id.as_str())
+        );
+
+        let err = repo.vault_intent_delete(&intent.id).unwrap_err();
+        assert!(err.to_string().contains("linked to 1 goal"));
+        assert!(repo.vault_retrieve(&intent.intent_file).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_intent_update_body_rejects_started_intent_without_force() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo.vault_intent_create(create_opts("Started")).unwrap();
+        repo.vault_intent_update(
+            &result.id,
+            IntentUpdateOptions {
+                status: Some("in-progress".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let before = repo.vault_intent_show(&result.id).unwrap().content_bytes;
+        let err = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    content: Some("# Rewritten".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Retry with force enabled"));
+        assert_eq!(
+            repo.vault_intent_show(&result.id).unwrap().content_bytes,
+            before
+        );
+    }
+
+    #[test]
+    fn test_intent_update_body_rejects_goal_reference_without_force() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let intent = repo.vault_intent_create(create_opts("Linked")).unwrap();
+        repo.vault_goal_start(GoalStartOptions {
+            name: Some("test-goal".to_string()),
+            intent: Some(intent.id.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let err = repo
+            .vault_intent_update(
+                &intent.id,
+                IntentUpdateOptions {
+                    content: Some("# Rewritten".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Retry with force enabled"));
+    }
+
+    #[test]
+    fn test_intent_update_body_force_allows_started_intent() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        let result = repo.vault_intent_create(create_opts("Started")).unwrap();
+        repo.vault_intent_update(
+            &result.id,
+            IntentUpdateOptions {
+                status: Some("in-progress".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let new_body = "# Rewritten with explicit force\n";
+        repo.vault_intent_update(
+            &result.id,
+            IntentUpdateOptions {
+                content: Some(new_body.to_string()),
+                force: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&repo.vault_intent_show(&result.id).unwrap().content_bytes),
+            new_body
         );
     }
 

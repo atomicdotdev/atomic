@@ -184,6 +184,9 @@ impl HookType {
             "before-agent" => Some(HookType::TurnStart),
             "after-agent" => Some(HookType::TurnEnd),
 
+            // Devin Desktop turn boundaries
+            "prompt-submit" => Some(HookType::TurnStart),
+
             // Copilot + OpenCode + Pi turn boundaries
             "user-prompt" => Some(HookType::TurnStart),
             // OpenCode + Pi also use "stop" for TurnEnd (handled above)
@@ -666,6 +669,27 @@ mod tests {
             HookType::from_verb("post-todo"),
             Some(HookType::PostToolUse)
         );
+        assert_eq!(
+            HookType::from_verb("post-tool"),
+            Some(HookType::PostToolUse)
+        );
+    }
+
+    #[test]
+    fn test_hook_type_from_verb_devin() {
+        assert_eq!(
+            HookType::from_verb("session-start"),
+            Some(HookType::SessionStart)
+        );
+        assert_eq!(
+            HookType::from_verb("session-end"),
+            Some(HookType::SessionEnd)
+        );
+        assert_eq!(
+            HookType::from_verb("prompt-submit"),
+            Some(HookType::TurnStart)
+        );
+        assert_eq!(HookType::from_verb("stop"), Some(HookType::TurnEnd));
         assert_eq!(
             HookType::from_verb("post-tool"),
             Some(HookType::PostToolUse)

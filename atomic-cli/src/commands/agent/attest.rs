@@ -614,6 +614,7 @@ fn pretty_tool(description: &str) -> String {
         "codex" => "Codex",
         "gemini-cli" => "Gemini CLI",
         "cursor" => "Cursor",
+        "devin" => "Devin Desktop",
         "cline" => "Cline",
         "opencode" => "OpenCode",
         "copilot" => "Copilot",

@@ -200,12 +200,12 @@ impl Clone {
     ///
     /// Creates an `HttpRemoteConfig` with the timeout and security settings
     /// specified by the user.
-    fn build_remote_config(&self) -> HttpRemoteConfig {
+    async fn build_remote_config(&self) -> HttpRemoteConfig {
         let config = HttpRemoteConfig::new()
             .with_timeout(Duration::from_secs(self.timeout))
             .danger_accept_invalid_certs(self.insecure);
 
-        crate::commands::auth::attach_identity(config, &self.url)
+        crate::commands::auth::attach_identity(config, &self.url).await
     }
 
     /// Get the display name for the repository.
@@ -257,7 +257,7 @@ impl Clone {
 
         // Connect to remote
         let spinner = create_spinner("Connecting to remote...");
-        let config = self.build_remote_config();
+        let config = self.build_remote_config().await;
         let remote = HttpRemote::with_config(&self.url, config).map_err(|e| {
             finish_error(&spinner, "Failed to connect");
             convert_remote_error(e, &self.url)
@@ -742,10 +742,10 @@ mod tests {
     // Internal Method Tests
 
     /// Test build_remote_config with default settings.
-    #[test]
-    fn test_build_remote_config_default() {
+    #[tokio::test]
+    async fn test_build_remote_config_default() {
         let clone = Clone::new("https://example.com/repo".to_string());
-        let config = clone.build_remote_config();
+        let config = clone.build_remote_config().await;
 
         // HttpRemoteConfig doesn't expose fields directly, so we just verify
         // it doesn't panic and returns something
@@ -753,18 +753,18 @@ mod tests {
     }
 
     /// Test build_remote_config with custom timeout.
-    #[test]
-    fn test_build_remote_config_custom_timeout() {
+    #[tokio::test]
+    async fn test_build_remote_config_custom_timeout() {
         let clone = Clone::new("https://example.com/repo".to_string()).with_timeout(120);
-        let config = clone.build_remote_config();
+        let config = clone.build_remote_config().await;
         assert!(std::mem::size_of_val(&config) > 0);
     }
 
     /// Test build_remote_config with insecure flag.
-    #[test]
-    fn test_build_remote_config_insecure() {
+    #[tokio::test]
+    async fn test_build_remote_config_insecure() {
         let clone = Clone::new("https://example.com/repo".to_string()).with_insecure(true);
-        let config = clone.build_remote_config();
+        let config = clone.build_remote_config().await;
         assert!(std::mem::size_of_val(&config) > 0);
     }
 

@@ -119,6 +119,9 @@ pub mod ai;
 // Content search powered by syntext
 pub mod content_search;
 
+// OCI image layout production (sandbox stage/seal)
+pub mod oci;
+
 // Query plan schema and executor
 pub mod query_plan;
 
@@ -149,7 +152,9 @@ pub use repository::{
 };
 
 // Vault intent exports
-pub use repository::{IntentCreateOptions, IntentCreateResult, IntentInfo, IntentUpdateOptions};
+pub use repository::{
+    IntentCreateOptions, IntentCreateResult, IntentDeleteResult, IntentInfo, IntentUpdateOptions,
+};
 
 // Vault embedding exports
 pub use repository::{hash_embed, EmbedConfig, TextChunk};
