@@ -57,6 +57,7 @@ use clap::Args;
 
 use atomic_agent::event::HookType;
 use atomic_agent::hooks::AgentRegistry;
+use atomic_core::types::Base32;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
@@ -87,6 +88,33 @@ pub struct Hooks {
     /// Run the hook body in this process.
     #[arg(long, hide = true)]
     foreground: bool,
+
+    /// Emit a machine-readable JSON result on stdout describing what the hook
+    /// recorded (session id, whether a change was recorded, the change hash,
+    /// and the files in that change).
+    ///
+    /// Off by default so existing agent integrations (Claude Code reads its own
+    /// JSON response from stdout; the OpenCode plugin treats stdout as TUI
+    /// noise) are unaffected. Callers that need the recorded change hash — e.g.
+    /// the Sherpa UI bridging an ACP run into Atomic — pass `--json`.
+    #[arg(long, hide = true)]
+    json: bool,
+}
+
+/// Machine-readable result of a hook invocation, emitted on stdout when
+/// `--json` is passed. Lets a coordinator (e.g. the Sherpa UI) link the ACP
+/// turn to the Atomic change it produced.
+#[derive(Debug, serde::Serialize)]
+struct HookJsonResult {
+    /// The agent session id the hook ran under.
+    session_id: String,
+    /// Whether this hook recorded an Atomic change.
+    recorded: bool,
+    /// The recorded change hash (base32), if a change was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    change_hash: Option<String>,
+    /// The files in the recorded change (empty when nothing was recorded).
+    files: Vec<String>,
 }
 
 impl Command for Hooks {
@@ -209,6 +237,33 @@ impl Command for Hooks {
             log::debug!("Hook response: {}", message);
         }
 
+        // When explicitly requested (`--json`), emit a machine-readable result
+        // on stdout for coordinators that need the recorded change hash. This is
+        // opt-in so the default quiet behavior above is preserved for the agents
+        // that read or ignore stdout themselves.
+        if self.json {
+            let json = match &result.change_recorded {
+                Some(outcome) => HookJsonResult {
+                    session_id: result.session_id.clone(),
+                    recorded: true,
+                    change_hash: Some(outcome.hash.to_base32()),
+                    files: outcome.recorded_file_list().to_vec(),
+                },
+                None => HookJsonResult {
+                    session_id: result.session_id.clone(),
+                    recorded: false,
+                    change_hash: None,
+                    files: Vec::new(),
+                },
+            };
+            // Serialize defensively: a serialization failure must not turn a
+            // successful hook into an error.
+            match serde_json::to_string(&json) {
+                Ok(s) => println!("{}", s),
+                Err(e) => log::warn!("Failed to serialize hook JSON result: {}", e),
+            }
+        }
+
         Ok(())
     }
 }
@@ -268,6 +323,7 @@ mod tests {
             agent_name: "claude-code".to_string(),
             verb: "stop".to_string(),
             foreground: false,
+            json: false,
         };
         assert_eq!(hooks.agent_name, "claude-code");
         assert_eq!(hooks.verb, "stop");
@@ -376,6 +432,7 @@ mod tests {
             agent_name: "claude-code".to_string(),
             verb: "session-start".to_string(),
             foreground: false,
+            json: false,
         };
         let debug = format!("{:?}", hooks);
         assert!(debug.contains("claude-code"));
@@ -388,6 +445,7 @@ mod tests {
             agent_name: "codex".to_string(),
             verb: "stop".to_string(),
             foreground: false,
+            json: false,
         };
 
         assert!(hooks.should_handoff_codex_stop());
@@ -399,6 +457,7 @@ mod tests {
             agent_name: "codex".to_string(),
             verb: "stop".to_string(),
             foreground: true,
+            json: false,
         };
 
         assert!(!hooks.should_handoff_codex_stop());
@@ -410,8 +469,51 @@ mod tests {
             agent_name: "claude-code".to_string(),
             verb: "stop".to_string(),
             foreground: false,
+            json: false,
         };
 
         assert!(!hooks.should_handoff_codex_stop());
+    }
+
+    #[test]
+    fn test_hook_json_result_recorded() {
+        // The shape a coordinator (Sherpa UI) parses to link an ACP turn to its
+        // Atomic change.
+        let result = HookJsonResult {
+            session_id: "sess-abc".to_string(),
+            recorded: true,
+            change_hash: Some("ABC123".to_string()),
+            files: vec!["src/main.rs".to_string(), "src/lib.rs".to_string()],
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+
+        assert_eq!(parsed["session_id"], "sess-abc");
+        assert_eq!(parsed["recorded"], true);
+        assert_eq!(parsed["change_hash"], "ABC123");
+        assert_eq!(parsed["files"][0], "src/main.rs");
+        assert_eq!(parsed["files"][1], "src/lib.rs");
+    }
+
+    #[test]
+    fn test_hook_json_result_not_recorded_omits_hash() {
+        // When nothing was recorded, `change_hash` is omitted (not null) and
+        // `files` is empty.
+        let result = HookJsonResult {
+            session_id: "sess-xyz".to_string(),
+            recorded: false,
+            change_hash: None,
+            files: Vec::new(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["recorded"], false);
+        assert!(
+            !json.contains("change_hash"),
+            "change_hash must be omitted when None, got: {}",
+            json
+        );
+        assert_eq!(parsed["files"].as_array().unwrap().len(), 0);
     }
 }
