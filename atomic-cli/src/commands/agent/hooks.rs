@@ -270,7 +270,11 @@ impl Command for Hooks {
 
 impl Hooks {
     fn should_handoff_codex_stop(&self) -> bool {
-        !self.foreground && self.agent_name == "codex" && self.verb == "stop"
+        // `--json` callers (e.g. the Sherpa UI bridge) need the recorded change
+        // hash on stdout synchronously. The background handoff detaches into a
+        // child whose stdout is null, so it can never return JSON — run the hook
+        // in-process instead when JSON output is requested.
+        !self.foreground && !self.json && self.agent_name == "codex" && self.verb == "stop"
     }
 
     fn handoff_codex_stop(&self, input: &[u8]) -> CliResult<()> {
@@ -449,6 +453,20 @@ mod tests {
         };
 
         assert!(hooks.should_handoff_codex_stop());
+    }
+
+    #[test]
+    fn test_codex_stop_json_disables_handoff() {
+        // `--json` must run in-process so the caller gets the change hash on
+        // stdout; the background handoff nulls stdout and could never return it.
+        let hooks = Hooks {
+            agent_name: "codex".to_string(),
+            verb: "stop".to_string(),
+            foreground: false,
+            json: true,
+        };
+
+        assert!(!hooks.should_handoff_codex_stop());
     }
 
     #[test]
