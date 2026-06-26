@@ -89,31 +89,18 @@ pub struct Hooks {
     #[arg(long, hide = true)]
     foreground: bool,
 
-    /// Emit a machine-readable JSON result on stdout describing what the hook
-    /// recorded (session id, whether a change was recorded, the change hash,
-    /// and the files in that change).
-    ///
-    /// Off by default so existing agent integrations (Claude Code reads its own
-    /// JSON response from stdout; the OpenCode plugin treats stdout as TUI
-    /// noise) are unaffected. Callers that need the recorded change hash — e.g.
-    /// the Sherpa UI bridging an ACP run into Atomic — pass `--json`.
+    /// Print one JSON result line for callers that need the recorded change hash.
     #[arg(long, hide = true)]
     json: bool,
 }
 
-/// Machine-readable result of a hook invocation, emitted on stdout when
-/// `--json` is passed. Lets a coordinator (e.g. the Sherpa UI) link the ACP
-/// turn to the Atomic change it produced.
+/// JSON emitted by `--json`.
 #[derive(Debug, serde::Serialize)]
 struct HookJsonResult {
-    /// The agent session id the hook ran under.
     session_id: String,
-    /// Whether this hook recorded an Atomic change.
     recorded: bool,
-    /// The recorded change hash (base32), if a change was recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     change_hash: Option<String>,
-    /// The files in the recorded change (empty when nothing was recorded).
     files: Vec<String>,
 }
 
@@ -229,18 +216,12 @@ impl Command for Hooks {
             log::debug!("{}", outcome);
         }
 
-        // Log the system message instead of printing to stdout.
-        // Claude Code expects JSON on stdout, but OpenCode's plugin $
-        // captures stdout and displays it in the TUI as noise.
-        // Use log::debug so it's available in RUST_LOG but silent otherwise.
+        // Keep hook stdout quiet by default; some agent TUIs display it directly.
         if let Some(ref message) = result.message {
             log::debug!("Hook response: {}", message);
         }
 
-        // When explicitly requested (`--json`), emit a machine-readable result
-        // on stdout for coordinators that need the recorded change hash. This is
-        // opt-in so the default quiet behavior above is preserved for the agents
-        // that read or ignore stdout themselves.
+        // Emit the recorded change hash for UI/bridge callers.
         if self.json {
             let json = match &result.change_recorded {
                 Some(outcome) => HookJsonResult {
@@ -256,8 +237,6 @@ impl Command for Hooks {
                     files: Vec::new(),
                 },
             };
-            // Serialize defensively: a serialization failure must not turn a
-            // successful hook into an error.
             match serde_json::to_string(&json) {
                 Ok(s) => println!("{}", s),
                 Err(e) => log::warn!("Failed to serialize hook JSON result: {}", e),
@@ -270,10 +249,7 @@ impl Command for Hooks {
 
 impl Hooks {
     fn should_handoff_codex_stop(&self) -> bool {
-        // `--json` callers (e.g. the Sherpa UI bridge) need the recorded change
-        // hash on stdout synchronously. The background handoff detaches into a
-        // child whose stdout is null, so it can never return JSON — run the hook
-        // in-process instead when JSON output is requested.
+        // Codex stop handoff drops stdout, so `--json` must stay in-process.
         !self.foreground && !self.json && self.agent_name == "codex" && self.verb == "stop"
     }
 
@@ -457,8 +433,6 @@ mod tests {
 
     #[test]
     fn test_codex_stop_json_disables_handoff() {
-        // `--json` must run in-process so the caller gets the change hash on
-        // stdout; the background handoff nulls stdout and could never return it.
         let hooks = Hooks {
             agent_name: "codex".to_string(),
             verb: "stop".to_string(),
@@ -495,8 +469,6 @@ mod tests {
 
     #[test]
     fn test_hook_json_result_recorded() {
-        // The shape a coordinator (Sherpa UI) parses to link an ACP turn to its
-        // Atomic change.
         let result = HookJsonResult {
             session_id: "sess-abc".to_string(),
             recorded: true,
@@ -515,8 +487,6 @@ mod tests {
 
     #[test]
     fn test_hook_json_result_not_recorded_omits_hash() {
-        // When nothing was recorded, `change_hash` is omitted (not null) and
-        // `files` is empty.
         let result = HookJsonResult {
             session_id: "sess-xyz".to_string(),
             recorded: false,
