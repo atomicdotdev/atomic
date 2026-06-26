@@ -97,6 +97,13 @@ pub struct DispatchResult {
     /// If a turn was recorded, contains the outcome.
     pub change_recorded: Option<TurnRecordOutcome>,
 
+    /// The Atomic view the session records onto (the per-session agent view).
+    ///
+    /// Set on turn events so a caller can locate the recorded change, which
+    /// lives on this view rather than the default/shared view. `None` when the
+    /// session view is not known for this event.
+    pub view: Option<String>,
+
     /// User-facing message to return to the agent (via hook stdout).
     ///
     /// For `SessionStart`, this is the "Atomic is tracking" message.
@@ -117,6 +124,7 @@ impl DispatchResult {
             session_id: session_id.into(),
             new_phase: phase,
             change_recorded: None,
+            view: None,
             message: None,
             warnings: Vec::new(),
         }
@@ -125,6 +133,12 @@ impl DispatchResult {
     /// Set the recorded change outcome.
     pub(crate) fn with_change(mut self, outcome: TurnRecordOutcome) -> Self {
         self.change_recorded = Some(outcome);
+        self
+    }
+
+    /// Set the session's record view.
+    pub(crate) fn with_view(mut self, view: impl Into<String>) -> Self {
+        self.view = Some(view.into());
         self
     }
 

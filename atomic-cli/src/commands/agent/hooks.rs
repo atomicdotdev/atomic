@@ -101,6 +101,10 @@ struct HookJsonResult {
     recorded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     change_hash: Option<String>,
+    /// The view the change was recorded onto (the per-session agent view), so a
+    /// caller can locate it — the change lives here, not on the default view.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    view: Option<String>,
     files: Vec<String>,
 }
 
@@ -228,12 +232,14 @@ impl Command for Hooks {
                     session_id: result.session_id.clone(),
                     recorded: true,
                     change_hash: Some(outcome.hash.to_base32()),
+                    view: result.view.clone(),
                     files: outcome.recorded_file_list().to_vec(),
                 },
                 None => HookJsonResult {
                     session_id: result.session_id.clone(),
                     recorded: false,
                     change_hash: None,
+                    view: result.view.clone(),
                     files: Vec::new(),
                 },
             };
@@ -473,6 +479,7 @@ mod tests {
             session_id: "sess-abc".to_string(),
             recorded: true,
             change_hash: Some("ABC123".to_string()),
+            view: Some("bold-creek-a3f2".to_string()),
             files: vec!["src/main.rs".to_string(), "src/lib.rs".to_string()],
         };
         let parsed: serde_json::Value =
@@ -481,6 +488,7 @@ mod tests {
         assert_eq!(parsed["session_id"], "sess-abc");
         assert_eq!(parsed["recorded"], true);
         assert_eq!(parsed["change_hash"], "ABC123");
+        assert_eq!(parsed["view"], "bold-creek-a3f2");
         assert_eq!(parsed["files"][0], "src/main.rs");
         assert_eq!(parsed["files"][1], "src/lib.rs");
     }
@@ -491,6 +499,7 @@ mod tests {
             session_id: "sess-xyz".to_string(),
             recorded: false,
             change_hash: None,
+            view: None,
             files: Vec::new(),
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -500,6 +509,11 @@ mod tests {
         assert!(
             !json.contains("change_hash"),
             "change_hash must be omitted when None, got: {}",
+            json
+        );
+        assert!(
+            !json.contains("view"),
+            "view must be omitted when None, got: {}",
             json
         );
         assert_eq!(parsed["files"].as_array().unwrap().len(), 0);

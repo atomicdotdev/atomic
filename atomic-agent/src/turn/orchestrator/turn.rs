@@ -215,8 +215,11 @@ impl TurnOrchestrator {
         );
         let remaining = phase::apply_common_actions(&mut session, &result);
 
-        // Execute strategy-specific actions
-        let mut dispatch = DispatchResult::new(session_id, session.phase);
+        // Execute strategy-specific actions. Record the session's view so the
+        // caller can locate the change, which lands on the agent view rather
+        // than the default view.
+        let mut dispatch =
+            DispatchResult::new(session_id, session.phase).with_view(&session.view_name);
 
         for action in &remaining {
             match action {
