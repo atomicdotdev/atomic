@@ -531,7 +531,7 @@ default = "{}"
     /// repository root. Returns `<canonical_root>/.atomic`.
     ///
     /// Use this for lock-free filesystem access to the canonical graph — e.g.
-    /// writing a provenance graph through [`ChangeStore`](crate::ChangeStore) —
+    /// writing a provenance graph through [`ChangeStore`] —
     /// where opening a full [`Repository`] would take the redb lock. In a
     /// sandbox `path/.atomic` is a throwaway local dir (or absent), so joining
     /// `.atomic` onto the working root would miss the real graph entirely.
