@@ -57,6 +57,7 @@ use clap::Args;
 
 use atomic_agent::event::HookType;
 use atomic_agent::hooks::AgentRegistry;
+use atomic_core::types::Base32;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
@@ -87,6 +88,24 @@ pub struct Hooks {
     /// Run the hook body in this process.
     #[arg(long, hide = true)]
     foreground: bool,
+
+    /// Print one JSON result line for callers that need the recorded change hash.
+    #[arg(long, hide = true)]
+    json: bool,
+}
+
+/// JSON emitted by `--json`.
+#[derive(Debug, serde::Serialize)]
+struct HookJsonResult {
+    session_id: String,
+    recorded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    change_hash: Option<String>,
+    /// The view the change was recorded onto (the per-session agent view), so a
+    /// caller can locate it — the change lives here, not on the default view.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    view: Option<String>,
+    files: Vec<String>,
 }
 
 impl Command for Hooks {
@@ -201,12 +220,33 @@ impl Command for Hooks {
             log::debug!("{}", outcome);
         }
 
-        // Log the system message instead of printing to stdout.
-        // Claude Code expects JSON on stdout, but OpenCode's plugin $
-        // captures stdout and displays it in the TUI as noise.
-        // Use log::debug so it's available in RUST_LOG but silent otherwise.
+        // Keep hook stdout quiet by default; some agent TUIs display it directly.
         if let Some(ref message) = result.message {
             log::debug!("Hook response: {}", message);
+        }
+
+        // Emit the recorded change hash for UI/bridge callers.
+        if self.json {
+            let json = match &result.change_recorded {
+                Some(outcome) => HookJsonResult {
+                    session_id: result.session_id.clone(),
+                    recorded: true,
+                    change_hash: Some(outcome.hash.to_base32()),
+                    view: result.view.clone(),
+                    files: outcome.recorded_file_list().to_vec(),
+                },
+                None => HookJsonResult {
+                    session_id: result.session_id.clone(),
+                    recorded: false,
+                    change_hash: None,
+                    view: result.view.clone(),
+                    files: Vec::new(),
+                },
+            };
+            match serde_json::to_string(&json) {
+                Ok(s) => println!("{}", s),
+                Err(e) => log::warn!("Failed to serialize hook JSON result: {}", e),
+            }
         }
 
         Ok(())
@@ -215,7 +255,8 @@ impl Command for Hooks {
 
 impl Hooks {
     fn should_handoff_codex_stop(&self) -> bool {
-        !self.foreground && self.agent_name == "codex" && self.verb == "stop"
+        // Codex stop handoff drops stdout, so `--json` must stay in-process.
+        !self.foreground && !self.json && self.agent_name == "codex" && self.verb == "stop"
     }
 
     fn handoff_codex_stop(&self, input: &[u8]) -> CliResult<()> {
@@ -268,6 +309,7 @@ mod tests {
             agent_name: "claude-code".to_string(),
             verb: "stop".to_string(),
             foreground: false,
+            json: false,
         };
         assert_eq!(hooks.agent_name, "claude-code");
         assert_eq!(hooks.verb, "stop");
@@ -376,6 +418,7 @@ mod tests {
             agent_name: "claude-code".to_string(),
             verb: "session-start".to_string(),
             foreground: false,
+            json: false,
         };
         let debug = format!("{:?}", hooks);
         assert!(debug.contains("claude-code"));
@@ -388,9 +431,22 @@ mod tests {
             agent_name: "codex".to_string(),
             verb: "stop".to_string(),
             foreground: false,
+            json: false,
         };
 
         assert!(hooks.should_handoff_codex_stop());
+    }
+
+    #[test]
+    fn test_codex_stop_json_disables_handoff() {
+        let hooks = Hooks {
+            agent_name: "codex".to_string(),
+            verb: "stop".to_string(),
+            foreground: false,
+            json: true,
+        };
+
+        assert!(!hooks.should_handoff_codex_stop());
     }
 
     #[test]
@@ -399,6 +455,7 @@ mod tests {
             agent_name: "codex".to_string(),
             verb: "stop".to_string(),
             foreground: true,
+            json: false,
         };
 
         assert!(!hooks.should_handoff_codex_stop());
@@ -410,8 +467,55 @@ mod tests {
             agent_name: "claude-code".to_string(),
             verb: "stop".to_string(),
             foreground: false,
+            json: false,
         };
 
         assert!(!hooks.should_handoff_codex_stop());
+    }
+
+    #[test]
+    fn test_hook_json_result_recorded() {
+        let result = HookJsonResult {
+            session_id: "sess-abc".to_string(),
+            recorded: true,
+            change_hash: Some("ABC123".to_string()),
+            view: Some("bold-creek-a3f2".to_string()),
+            files: vec!["src/main.rs".to_string(), "src/lib.rs".to_string()],
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+
+        assert_eq!(parsed["session_id"], "sess-abc");
+        assert_eq!(parsed["recorded"], true);
+        assert_eq!(parsed["change_hash"], "ABC123");
+        assert_eq!(parsed["view"], "bold-creek-a3f2");
+        assert_eq!(parsed["files"][0], "src/main.rs");
+        assert_eq!(parsed["files"][1], "src/lib.rs");
+    }
+
+    #[test]
+    fn test_hook_json_result_not_recorded_omits_hash() {
+        let result = HookJsonResult {
+            session_id: "sess-xyz".to_string(),
+            recorded: false,
+            change_hash: None,
+            view: None,
+            files: Vec::new(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["recorded"], false);
+        assert!(
+            !json.contains("change_hash"),
+            "change_hash must be omitted when None, got: {}",
+            json
+        );
+        assert!(
+            !json.contains("view"),
+            "view must be omitted when None, got: {}",
+            json
+        );
+        assert_eq!(parsed["files"].as_array().unwrap().len(), 0);
     }
 }
