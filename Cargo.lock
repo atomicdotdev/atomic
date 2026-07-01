@@ -160,6 +160,7 @@ version = "0.9.1"
 dependencies = [
  "anyhow",
  "atomic-agent",
+ "atomic-canonical",
  "atomic-config",
  "atomic-core",
  "atomic-identity",
@@ -167,6 +168,7 @@ dependencies = [
  "atomic-repository",
  "atomic-semantic",
  "atomic-teams",
+ "blake3",
  "bytes",
  "chrono",
  "clap",
