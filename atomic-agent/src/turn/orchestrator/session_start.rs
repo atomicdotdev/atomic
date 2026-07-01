@@ -159,6 +159,25 @@ impl TurnOrchestrator {
         // still work, it just won't have the parent's history.
         if session.parent_view.is_none() {
             match atomic_repository::Repository::open_existing(&self.repo_root) {
+                Ok(repo) if repo.is_sandbox() => {
+                    // A sandbox is a materialized copy of the project; `record`
+                    // writes to the *canonical* graph (shared pristine +
+                    // changes), on the view named in the `.atomic-sandbox`
+                    // pointer. The agent is already on that view, so adopt it
+                    // for recording and do NOT fork or switch:
+                    //   * create_view_from would inject a spurious view into
+                    //     the canonical graph, and
+                    //   * set_current_view writes the *canonical*
+                    //     .atomic/current_view, clobbering the real user's
+                    //     current view.
+                    let current = repo.current_view().to_string();
+                    log::info!(
+                        "Sandbox session {}: recording on provisioned view '{}' (no fork/switch)",
+                        session_id,
+                        current,
+                    );
+                    session.view_name = current;
+                }
                 Ok(mut repo) => {
                     let current = repo.current_view().to_string();
                     session.set_parent_view(&current);
@@ -267,7 +286,19 @@ impl TurnOrchestrator {
                 {
                     let current = repo.current_view().to_string();
 
-                    if current != "dev" && current != "main" && current != "release" {
+                    if repo.is_sandbox() {
+                        // Sandboxes already operate on the view named in their
+                        // pointer file and record into the canonical graph.
+                        // Adopt that view verbatim; never fork or switch
+                        // (set_current_view writes the canonical
+                        // .atomic/current_view the sandbox shares).
+                        log::info!(
+                            "Fallback sandbox session {} adopting provisioned view '{}'",
+                            session_id,
+                            current,
+                        );
+                        session.view_name = current;
+                    } else if current != "dev" && current != "main" && current != "release" {
                         // Adopt the existing agent view (session-start
                         // likely created it before this fallback ran).
                         log::info!(

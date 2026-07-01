@@ -161,6 +161,7 @@ impl Repository {
             current_view: view.to_string(),
             pristine,
             change_store,
+            is_sandbox: true,
         })
     }
 
