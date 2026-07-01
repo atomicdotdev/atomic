@@ -132,6 +132,57 @@ async fn test_session_start_resumes_ended_session() {
     assert_eq!(session.turn_count, 3); // preserved
 }
 
+#[tokio::test]
+async fn test_session_start_in_sandbox_adopts_view_without_forking() {
+    // Canonical repository with a distinct view the sandbox operates on.
+    let canonical = TempDir::new().unwrap();
+    let mut repo = Repository::init(canonical.path()).unwrap();
+    let user_view = repo.current_view().to_string(); // "dev"
+    repo.create_view_from("agent-sbx", &user_view).unwrap();
+
+    // Provision a sandbox working tree bound to the agent view.
+    let sandbox_dir = TempDir::new().unwrap();
+    repo.provision_sandbox(sandbox_dir.path(), "agent-sbx")
+        .unwrap();
+    drop(repo); // release the canonical pristine lock before reopening
+
+    // Sanity: the sandbox opens on its provisioned view.
+    let sbx = Repository::open_existing(sandbox_dir.path()).unwrap();
+    assert!(sbx.is_sandbox());
+    assert_eq!(sbx.current_view(), "agent-sbx");
+    drop(sbx);
+
+    // Orchestrator rooted at the sandbox working tree (mirrors the hook path).
+    let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
+    let watcher = FallbackWatcher::new(WatcherConfig::new(sandbox_dir.path()));
+    let mut orch =
+        TurnOrchestrator::with_watcher(sandbox_dir.path(), session_store, Box::new(watcher));
+
+    orch.dispatch(session_start_event("sess-sbx"))
+        .await
+        .unwrap();
+
+    // The session records on the sandbox's own view — not a freshly forked one.
+    let session = orch.session_store.load("sess-sbx").unwrap().unwrap();
+    assert_eq!(session.view_name, "agent-sbx");
+    assert!(
+        session.parent_view.is_none(),
+        "sandbox session must not fork a child view"
+    );
+
+    // The canonical graph is untouched: no spurious agent view was forked and
+    // the current view was not repointed.
+    let canonical_after = Repository::open_existing(canonical.path()).unwrap();
+    let mut views = canonical_after.list_views().unwrap();
+    views.sort();
+    assert_eq!(
+        views,
+        vec!["agent-sbx".to_string(), user_view.clone()],
+        "sandbox session must not fork a new view into the canonical graph"
+    );
+    assert_eq!(canonical_after.current_view(), user_view);
+}
+
 // TurnStart tests
 
 #[tokio::test]
