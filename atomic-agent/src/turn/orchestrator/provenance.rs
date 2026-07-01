@@ -438,8 +438,27 @@ impl TurnOrchestrator {
             // Failure is still treated as non-fatal; the provenance chain
             // remains intact and the DB metadata can be rebuilt later.
 
-            let dot_dir = self.repo_root.join(atomic_repository::DOT_DIR);
-            let changes_dir = dot_dir.join("changes");
+            // Resolve the *canonical* changes dir. In a sandbox `repo_root`
+            // has no graph of its own — the pointer file names the canonical
+            // repository. Joining `.atomic` onto `repo_root` would write the
+            // graph into a throwaway dir inside the sandbox, so it would be
+            // absent from the real graph whenever the best-effort Phase 2
+            // below loses the redb write-lock race with a concurrent agent.
+            // `canonical_dot_dir` follows the pointer without opening redb, so
+            // Phase 1 stays lock-free.
+            let changes_dir =
+                match atomic_repository::Repository::canonical_dot_dir(&self.repo_root) {
+                    Ok(dot_dir) => dot_dir.join("changes"),
+                    Err(e) => {
+                        log::warn!(
+                            "Could not resolve canonical changes dir to save \
+                             provenance graph for session {}: {}",
+                            session_id,
+                            e,
+                        );
+                        return true;
+                    }
+                };
 
             // Phase 1: Filesystem write — never blocks on redb.
             let hash = match atomic_repository::ChangeStore::new(

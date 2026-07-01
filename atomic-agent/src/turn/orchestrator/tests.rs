@@ -183,6 +183,90 @@ async fn test_session_start_in_sandbox_adopts_view_without_forking() {
     assert_eq!(canonical_after.current_view(), user_view);
 }
 
+#[tokio::test]
+async fn test_full_turn_in_sandbox_records_provenance_into_canonical_graph() {
+    // Canonical repo with a distinct view the sandbox operates on.
+    let canonical = TempDir::new().unwrap();
+    let repo = Repository::init(canonical.path()).unwrap();
+    // Default `atomic sandbox create` (no --from/--view) binds to the current
+    // shared view. Exercise that exact case.
+    let user_view = repo.current_view().to_string();
+
+    let sandbox_dir = TempDir::new().unwrap();
+    repo.provision_sandbox(sandbox_dir.path(), &user_view)
+        .unwrap();
+    drop(repo);
+
+    // Orchestrator rooted at the sandbox working tree (mirrors the hook path).
+    let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
+    let watcher = FallbackWatcher::new(WatcherConfig::new(sandbox_dir.path()));
+    let mut orch =
+        TurnOrchestrator::with_watcher(sandbox_dir.path(), session_store, Box::new(watcher));
+    orch.set_agent("claude-code", "Claude Code");
+
+    orch.dispatch(session_start_event("sess-sbx-prov"))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event("sess-sbx-prov", "Create agent.txt"))
+        .await
+        .unwrap();
+
+    // Agent writes a file into its sandbox working tree.
+    fs::write(sandbox_dir.path().join("agent.txt"), "agent work\n").unwrap();
+
+    let result = orch
+        .dispatch(turn_end_event("sess-sbx-prov"))
+        .await
+        .unwrap();
+
+    assert!(
+        result.was_recorded(),
+        "a turn that created a file in the sandbox must record a change"
+    );
+    let change_hash = result.change_recorded.as_ref().unwrap().hash;
+
+    // The provenance graph file must be written into the CANONICAL change
+    // store (not a throwaway `.atomic/changes` inside the sandbox). Phase 1 of
+    // the save is the lock-free durability guarantee; if it targets the
+    // sandbox's local dir, provenance is lost whenever the best-effort Phase 2
+    // (which takes the redb write lock) loses a race with a concurrent agent.
+    let canonical_changes = atomic_repository::ChangeStore::new(
+        canonical.path().join(".atomic").join("changes"),
+        atomic_repository::DEFAULT_CACHE_CAPACITY,
+    )
+    .unwrap();
+    assert!(
+        canonical_changes.count_provenance_graphs().unwrap() >= 1,
+        "provenance graph must be written to the canonical change store"
+    );
+
+    // Nothing should be written into a sandbox-local change store.
+    let sandbox_changes = sandbox_dir.path().join(".atomic").join("changes");
+    if sandbox_changes.is_dir() {
+        let local = atomic_repository::ChangeStore::new(
+            sandbox_changes,
+            atomic_repository::DEFAULT_CACHE_CAPACITY,
+        )
+        .unwrap();
+        assert_eq!(
+            local.count_provenance_graphs().unwrap(),
+            0,
+            "provenance must not be written to a throwaway change store inside the sandbox"
+        );
+    }
+
+    // End-to-end: the change and its provenance are both registered in the
+    // canonical graph.
+    let canonical_repo = Repository::open(canonical.path()).unwrap();
+    let provenance = canonical_repo
+        .find_provenance_for_change(&change_hash)
+        .unwrap();
+    assert!(
+        !provenance.is_empty(),
+        "provenance graph for the sandbox turn must be registered in the canonical graph"
+    );
+}
+
 // TurnStart tests
 
 #[tokio::test]
