@@ -35,15 +35,19 @@ pub mod gate;
 pub mod hash;
 pub mod jcs;
 pub mod lift;
+pub mod memory;
 pub mod node;
 pub mod proof;
 pub mod render;
 pub mod vocab;
 
 pub use error::{CanonicalError, Result};
-pub use gate::{validate_intent, ValidationReport, Violation};
-pub use node::{AcceptanceCriterion, CanonicalNode, Proof, Task};
-pub use render::{render, Target};
+pub use gate::{validate_intent, validate_memory, ValidationReport, Violation};
+pub use memory::MemoryNode;
+pub use node::{
+    AcceptanceCriterion, CanonicalNode, Constraint, Proof, Ref, ScopeItem, Task,
+};
+pub use render::{render, render_memory, Target};
 
 use atomic_identity::identity::Identity;
 use atomic_identity::keypair::KeyPair;
@@ -65,4 +69,26 @@ pub fn lift_and_attest(
 /// Verify an attested node's content hash and signature against a public key.
 pub fn verify(node: &CanonicalNode, public_key: &atomic_identity::keypair::PublicKey) -> Result<()> {
     proof::verify(node, public_key)
+}
+
+/// Lift an authored memory (frontmatter + body) into a canonical node, attest
+/// it (hash + sign) with the given identity, and return the node. Mirrors
+/// [`lift_and_attest`] and signs through the same single path. The node is
+/// *not* gated here — call [`validate_memory`] to gate it.
+pub fn lift_and_attest_memory(
+    frontmatter: &Map<String, Value>,
+    body: &str,
+    identity: &Identity,
+    keypair: &KeyPair,
+) -> Result<MemoryNode> {
+    let node = memory::lift_memory(frontmatter, body)?;
+    Ok(proof::attest_memory(node, identity, keypair))
+}
+
+/// Verify an attested memory's content hash and signature against a public key.
+pub fn verify_memory(
+    node: &MemoryNode,
+    public_key: &atomic_identity::keypair::PublicKey,
+) -> Result<()> {
+    proof::verify_memory(node, public_key)
 }

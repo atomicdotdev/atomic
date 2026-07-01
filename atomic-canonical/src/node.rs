@@ -17,6 +17,7 @@ pub const CONTEXT_URL: &str = "https://atomic.dev/ns/ctx.jsonld";
 
 /// A single acceptance criterion, lifted from a `:::acceptance-criterion` directive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcceptanceCriterion {
     #[serde(rename = "@type")]
     pub type_: String,
@@ -25,14 +26,54 @@ pub struct AcceptanceCriterion {
     pub text: String,
     #[serde(rename = "acStatus")]
     pub ac_status: String,
-    #[serde(rename = "verifiedBy", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "verifiedBy", default, skip_serializing_if = "Option::is_none")]
     pub verified_by: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+}
+
+/// A scope boundary item, lifted from a `:::scope-in` / `:::scope-out`
+/// directive. The prose is the unconstrained narrative; the gate enforces
+/// presence, never content.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeItem {
+    #[serde(rename = "@type")]
+    pub type_: String,
+    #[serde(rename = "@id")]
+    pub id: String,
+    pub text: String,
+}
+
+/// A constraint the implementation must respect, lifted from a `:::constraint`
+/// directive. Prose body; typed so the graph knows how many there are.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Constraint {
+    #[serde(rename = "@type")]
+    pub type_: String,
+    #[serde(rename = "@id")]
+    pub id: String,
+    pub text: String,
+}
+
+/// A typed dependency edge leaf, lifted from a `:::ref{to= edge=}` directive.
+/// `@type`/`@id` are omitted when absent (the doc's `:::ref` carries only
+/// `to`/`edge`), so no empty JSON-LD keys leak into the hash.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ref {
+    #[serde(rename = "@type", default, skip_serializing_if = "Option::is_none")]
+    pub type_: Option<String>,
+    #[serde(rename = "@id", default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub to: String,
+    pub edge: String,
 }
 
 /// A decomposed task, lifted from a `:::task` directive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Task {
     #[serde(rename = "@type")]
     pub type_: String,
@@ -41,14 +82,15 @@ pub struct Task {
     pub text: String,
     #[serde(rename = "taskStatus")]
     pub task_status: String,
-    #[serde(rename = "touchesFile", skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "touchesFile", default, skip_serializing_if = "Vec::is_empty")]
     pub touches_file: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub satisfies: Option<String>,
 }
 
 /// A Data Integrity proof (`eddsa-jcs-2022`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Proof {
     #[serde(rename = "@type")]
     pub type_: String,
@@ -63,6 +105,7 @@ pub struct Proof {
 
 /// The canonical Intent node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalNode {
     #[serde(rename = "@context")]
     pub context: String,
@@ -76,33 +119,52 @@ pub struct CanonicalNode {
     pub human_key: String,
     pub title: String,
     pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // Every field that is omitted when empty carries `default` so the
+    // serde round trip (`to_value` → `from_value`) the typed attest/verify
+    // wrappers rely on is symmetric: an omitted key deserializes back to its
+    // empty value rather than erroring on a "missing field".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<String>,
 
-    #[serde(rename = "motivatedBy", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "motivatedBy", default, skip_serializing_if = "Option::is_none")]
     pub motivated_by: Option<String>,
-    #[serde(rename = "informedBy", skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "informedBy", default, skip_serializing_if = "Vec::is_empty")]
     pub informed_by: Vec<String>,
 
-    #[serde(rename = "hasAcceptanceCriterion", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "hasAcceptanceCriterion",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub has_acceptance_criterion: Vec<AcceptanceCriterion>,
-    #[serde(rename = "hasTask", skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "hasTask", default, skip_serializing_if = "Vec::is_empty")]
     pub has_task: Vec<Task>,
 
+    // Collection sub-nodes. Empty collections are omitted (skip_serializing_if),
+    // so adding these fields does NOT change the hash of existing fixtures.
+    #[serde(rename = "hasScopeIn", default, skip_serializing_if = "Vec::is_empty")]
+    pub has_scope_in: Vec<ScopeItem>,
+    #[serde(rename = "hasScopeOut", default, skip_serializing_if = "Vec::is_empty")]
+    pub has_scope_out: Vec<ScopeItem>,
+    #[serde(rename = "hasConstraint", default, skip_serializing_if = "Vec::is_empty")]
+    pub has_constraint: Vec<Constraint>,
+    #[serde(rename = "dependsOn", default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<Ref>,
+
     /// The unconstrained reason. Presence enforced by the gate; content honest.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
 
-    #[serde(rename = "contentHash", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "contentHash", default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
-    #[serde(rename = "attributedTo", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "attributedTo", default, skip_serializing_if = "Option::is_none")]
     pub attributed_to: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<Proof>,
 }
 
@@ -112,25 +174,17 @@ impl CanonicalNode {
         serde_json::to_value(self).expect("canonical node serialization is infallible")
     }
 
-    /// The value used for signing: everything except the `proof` (a Data
-    /// Integrity signature covers the document minus the proof). `contentHash`
-    /// is included so the signature also commits to the hash.
+    /// The value used for signing: everything except the `proof`. Delegates to
+    /// [`crate::proof::signing_view`] so the excluded key-set is defined once,
+    /// at the Value level, shared by every node type.
     pub fn signing_value(&self) -> serde_json::Value {
-        let mut value = self.to_value();
-        if let Some(obj) = value.as_object_mut() {
-            obj.remove("proof");
-        }
-        value
+        crate::proof::signing_view(&self.to_value())
     }
 
     /// The value used for the content hash: excludes both `proof` and
-    /// `contentHash` (you cannot hash the hash).
+    /// `contentHash`. Delegates to [`crate::proof::hashing_view`].
     pub fn hashing_value(&self) -> serde_json::Value {
-        let mut value = self.signing_value();
-        if let Some(obj) = value.as_object_mut() {
-            obj.remove("contentHash");
-        }
-        value
+        crate::proof::hashing_view(&self.to_value())
     }
 
     /// Canonical bytes for signing (JCS of `signing_value`).
