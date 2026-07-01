@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "atomic-agent",
+    "atomic-canonical",
     "atomic-cli",
     "atomic-core",
     "atomic-config",
@@ -24,6 +25,7 @@ rust-version = "1.90"
 [workspace.dependencies]
 # Core
 atomic-agent = { path = "atomic-agent" }
+atomic-canonical = { path = "atomic-canonical" }
 atomic-core = { path = "atomic-core" }
 atomic-config = { path = "atomic-config" }
 atomic-identity = { path = "atomic-identity" }

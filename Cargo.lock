@@ -142,6 +142,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomic-canonical"
+version = "0.8.0"
+dependencies = [
+ "atomic-identity",
+ "blake3",
+ "chrono",
+ "data-encoding",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "atomic-cli"
 version = "0.9.1"
 dependencies = [
