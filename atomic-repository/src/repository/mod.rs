@@ -630,6 +630,15 @@ default = "{}"
         Ok(())
     }
 
+    /// Set the current view on this handle only.
+    ///
+    /// This does not validate the view or persist `.atomic/current_view`. It is
+    /// intended for read-only handles that need `status()` to read another view.
+    #[inline]
+    pub fn set_current_view_in_memory(&mut self, view: &str) {
+        self.current_view = view.to_string();
+    }
+
     // ── Internal helpers ────────────────────────────────────────────────
 
     /// Get a reference to the pristine database.
