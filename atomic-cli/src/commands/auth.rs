@@ -67,7 +67,10 @@ fn configured_server_identities() -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     let mut consider = |server: &atomic_config::ServerConfig| {
         if let (Some(url), Some(identity)) = (server.url.as_ref(), server.identity.as_ref()) {
-            if let Some(host) = Url::parse(url).ok().and_then(|u| u.host_str().map(String::from)) {
+            if let Some(host) = Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(String::from))
+            {
                 pairs.push((host, identity.clone()));
             }
         }
@@ -623,7 +626,10 @@ mod tests {
     fn servers() -> Vec<(String, String)> {
         vec![
             ("atomic.storage".to_string(), "Aaron".to_string()),
-            ("staging.atomic.storage".to_string(), "aaron-staging".to_string()),
+            (
+                "staging.atomic.storage".to_string(),
+                "aaron-staging".to_string(),
+            ),
         ]
     }
 
