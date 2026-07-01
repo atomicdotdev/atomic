@@ -14,8 +14,26 @@ use serde_json::{Map, Value};
 
 use crate::directive::{self, Directive};
 use crate::error::{CanonicalError, Result};
-use crate::node::{AcceptanceCriterion, CanonicalNode, Task, CONTEXT_URL};
-use crate::vocab::NodeType;
+use crate::node::{
+    AcceptanceCriterion, CanonicalNode, Constraint, Ref, ScopeItem, Task, CONTEXT_URL,
+};
+use crate::vocab::{self, NodeType};
+
+/// The exact set of directive names `lift_intent` branches on. The match and
+/// the closed-vocabulary test both read this const so the test cannot rot when
+/// the lift gains or loses a branch (bidirectional closure). Every name here
+/// must be a member of [`vocab::DIRECTIVE_NAMES`]; nothing in the registry may
+/// be a name the lift cannot handle.
+pub(crate) const LIFTED_INTENT_DIRECTIVES: &[&str] = &[
+    "why",
+    "acceptance-criterion",
+    "task",
+    "scope-in",
+    "scope-out",
+    "constraint",
+    "ref",
+    "file-ref",
+];
 
 /// Lift an intent from its frontmatter spine and markdown body.
 pub fn lift_intent(frontmatter: &Map<String, Value>, body: &str) -> Result<CanonicalNode> {
@@ -28,8 +46,15 @@ pub fn lift_intent(frontmatter: &Map<String, Value>, body: &str) -> Result<Canon
     let mut why = None;
     let mut acs = Vec::new();
     let mut tasks = Vec::new();
+    let mut scope_in = Vec::new();
+    let mut scope_out = Vec::new();
+    let mut constraints = Vec::new();
+    let mut deps = Vec::new();
     let mut ac_n = 0usize;
     let mut task_n = 0usize;
+    let mut scope_in_n = 0usize;
+    let mut scope_out_n = 0usize;
+    let mut constraint_n = 0usize;
 
     for d in &directives {
         match d.name.as_str() {
@@ -48,12 +73,33 @@ pub fn lift_intent(frontmatter: &Map<String, Value>, body: &str) -> Result<Canon
                 task_n += 1;
                 tasks.push(lift_task(d, &human_key, task_n));
             }
-            // Recognized but not lifted in M0.
-            "scope-in" | "scope-out" | "constraint" | "ref" | "file-ref" => {}
+            "scope-in" => {
+                scope_in_n += 1;
+                scope_in.push(lift_scope(d, &human_key, "scope-in", scope_in_n));
+            }
+            "scope-out" => {
+                scope_out_n += 1;
+                scope_out.push(lift_scope(d, &human_key, "scope-out", scope_out_n));
+            }
+            "constraint" => {
+                constraint_n += 1;
+                constraints.push(lift_constraint(d, &human_key, constraint_n));
+            }
+            "ref" => {
+                deps.push(lift_ref(d)?);
+            }
+            // `file-ref` is nested-only (consumed inside `task`); at top level
+            // it carries no meaning, so it is a recognized no-op.
+            "file-ref" => {}
             other => {
+                debug_assert!(
+                    !LIFTED_INTENT_DIRECTIVES.contains(&other),
+                    "'{other}' is in LIFTED_INTENT_DIRECTIVES but has no match arm"
+                );
                 return Err(CanonicalError::Lift(format!(
-                    "directive ':{other}' has no lift rule"
-                )))
+                    "directive ':{other}' has no lift rule (lift handles: {})",
+                    LIFTED_INTENT_DIRECTIVES.join(", ")
+                )));
             }
         }
     }
@@ -71,6 +117,10 @@ pub fn lift_intent(frontmatter: &Map<String, Value>, body: &str) -> Result<Canon
         informed_by: str_array(frontmatter, "informedBy"),
         has_acceptance_criterion: acs,
         has_task: tasks,
+        has_scope_in: scope_in,
+        has_scope_out: scope_out,
+        has_constraint: constraints,
+        depends_on: deps,
         why,
         content_hash: None,
         attributed_to: opt_str(frontmatter, "attributedTo"),
@@ -124,6 +174,62 @@ fn lift_task(d: &Directive, human_key: &str, n: usize) -> Task {
     }
 }
 
+/// Lift a `:::scope-in` / `:::scope-out` container into a `ScopeItem`.
+/// `kind` is "scope-in" or "scope-out" and drives the generated id slug.
+/// Prose body is the unconstrained narrative (never graded).
+fn lift_scope(d: &Directive, human_key: &str, kind: &str, n: usize) -> ScopeItem {
+    let local = d
+        .id
+        .clone()
+        .unwrap_or_else(|| format!("{}-{kind}-{n}", slug(human_key)));
+    ScopeItem {
+        type_: NodeType::ScopeItem.as_str().to_string(),
+        id: as_urn("scope", &local),
+        text: d.body.clone(),
+    }
+}
+
+/// Lift a `:::constraint` container into a `Constraint`.
+fn lift_constraint(d: &Directive, human_key: &str, n: usize) -> Constraint {
+    let local = d
+        .id
+        .clone()
+        .unwrap_or_else(|| format!("{}-constraint-{n}", slug(human_key)));
+    Constraint {
+        type_: NodeType::Constraint.as_str().to_string(),
+        id: as_urn("constraint", &local),
+        text: d.body.clone(),
+    }
+}
+
+/// Lift a `:::ref{to= edge=}` leaf into a typed dependency edge. Both `to` and
+/// `edge` are required (a dependency with no target or no edge type is a lift
+/// error), and `edge` must be a known *dependency* edge — a `:::ref` sits on the
+/// dependency chain, so edges like `verifiedBy`/`about` are rejected even though
+/// they are valid edges elsewhere.
+fn lift_ref(d: &Directive) -> Result<Ref> {
+    let to = d
+        .attr("to")
+        .ok_or_else(|| CanonicalError::Lift("':::ref' is missing required 'to'".into()))?
+        .to_string();
+    let edge = d
+        .attr("edge")
+        .ok_or_else(|| CanonicalError::Lift("':::ref' is missing required 'edge'".into()))?
+        .to_string();
+    if !vocab::is_known_dependency_edge(&edge) {
+        return Err(CanonicalError::Lift(format!(
+            "':::ref' edge '{edge}' is not a dependency edge {:?}",
+            vocab::DEPENDENCY_EDGES
+        )));
+    }
+    Ok(Ref {
+        type_: d.id.as_ref().map(|_| NodeType::Ref.as_str().to_string()),
+        id: d.id.as_ref().map(|id| as_urn("ref", id)),
+        to,
+        edge,
+    })
+}
+
 /// Wrap a local id into `urn:atomic:<kind>:<local>` unless already a urn.
 fn as_urn(kind: &str, local: &str) -> String {
     if local.starts_with("urn:atomic:") {
@@ -166,7 +272,11 @@ fn str_array(fm: &Map<String, Value>, key: &str) -> Vec<String> {
 /// `---\n<key: value lines>\n---\n<body>`. Enough for templates and the CLI;
 /// values may be quoted strings or `[a, b]` arrays. Not a full YAML parser.
 pub fn parse_markdown(doc: &str) -> Result<(Map<String, Value>, String)> {
-    let doc = doc.strip_prefix('\u{feff}').unwrap_or(doc);
+    // Normalize CRLF so a Windows-authored file parses identically to LF —
+    // otherwise the "---\n" prefix match fails and the whole doc is silently
+    // treated as body with empty frontmatter.
+    let normalized = doc.strip_prefix('\u{feff}').unwrap_or(doc).replace("\r\n", "\n");
+    let doc = normalized.as_str();
     let rest = match doc.strip_prefix("---\n") {
         Some(r) => r,
         None => return Ok((Map::new(), doc.to_string())),
@@ -210,4 +320,118 @@ fn parse_scalar(raw: &str) -> Value {
     }
     let unquoted = raw.trim_matches(['"', '\'']);
     Value::String(unquoted.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fm() -> Map<String, Value> {
+        json!({ "id": "WORD-5", "title": "t", "status": "todo" })
+            .as_object()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn lifts_scope_in_out_and_constraints() {
+        let body = "\
+:::scope-in
+`src/App.tsx` state and markup.
+:::
+
+:::scope-out
+Persisting the name across reloads.
+:::
+
+:::constraint
+Keep it local to the existing app.
+:::
+
+:::constraint
+Do not touch the global keyboard handler.
+:::";
+        let node = lift_intent(&fm(), body).unwrap();
+        assert_eq!(node.has_scope_in.len(), 1);
+        assert_eq!(node.has_scope_out.len(), 1);
+        assert_eq!(node.has_constraint.len(), 2);
+
+        // Ids are well-formed urns generated from the slug + ordinal.
+        assert_eq!(node.has_scope_in[0].id, "urn:atomic:scope:word-5-scope-in-1");
+        assert_eq!(node.has_scope_out[0].id, "urn:atomic:scope:word-5-scope-out-1");
+        assert_eq!(node.has_constraint[0].id, "urn:atomic:constraint:word-5-constraint-1");
+        assert_eq!(node.has_constraint[1].id, "urn:atomic:constraint:word-5-constraint-2");
+        assert!(node.has_scope_in[0].text.contains("src/App.tsx"));
+    }
+
+    #[test]
+    fn lifts_ref_dependency() {
+        let body = ":::ref{to=urn:atomic:intent:xyz edge=blockedBy}\n:::";
+        let node = lift_intent(&fm(), body).unwrap();
+        assert_eq!(node.depends_on.len(), 1);
+        assert_eq!(node.depends_on[0].to, "urn:atomic:intent:xyz");
+        assert_eq!(node.depends_on[0].edge, "blockedBy");
+        // No @type/@id emitted when the directive carries no #id.
+        assert!(node.depends_on[0].type_.is_none());
+        assert!(node.depends_on[0].id.is_none());
+    }
+
+    #[test]
+    fn ref_with_unknown_edge_is_error() {
+        let body = ":::ref{to=urn:atomic:intent:xyz edge=wat}\n:::";
+        assert!(lift_intent(&fm(), body).is_err());
+    }
+
+    #[test]
+    fn ref_missing_to_is_error() {
+        let body = ":::ref{edge=blockedBy}\n:::";
+        assert!(lift_intent(&fm(), body).is_err());
+    }
+
+    #[test]
+    fn ref_missing_edge_is_error() {
+        let body = ":::ref{to=urn:atomic:intent:xyz}\n:::";
+        assert!(lift_intent(&fm(), body).is_err());
+    }
+
+    /// Bidirectional closure over the whole directive registry: every name a
+    /// lift branches on is a known directive, and every registry directive is
+    /// handled by exactly one lift (the intent lift or the memory lift). This
+    /// keeps the closed vocabulary and the lifts from diverging — a new
+    /// directive with no lift, or a lift branch outside the registry, fails.
+    #[test]
+    fn every_lifted_directive_is_known() {
+        use crate::memory::LIFTED_MEMORY_DIRECTIVES;
+
+        for name in LIFTED_INTENT_DIRECTIVES {
+            assert!(
+                vocab::is_known_directive(name),
+                "intent lift branches on '{name}' but it is not in the closed registry"
+            );
+        }
+        for name in LIFTED_MEMORY_DIRECTIVES {
+            assert!(
+                vocab::is_known_directive(name),
+                "memory lift branches on '{name}' but it is not in the closed registry"
+            );
+        }
+        // The two lift sets are disjoint (a directive belongs to one node type).
+        for name in LIFTED_MEMORY_DIRECTIVES {
+            assert!(
+                !LIFTED_INTENT_DIRECTIVES.contains(name),
+                "'{name}' is claimed by both the intent lift and the memory lift"
+            );
+        }
+        // Every registry directive is handled by exactly one lift.
+        for name in vocab::DIRECTIVE_NAMES {
+            let intent = LIFTED_INTENT_DIRECTIVES.contains(name);
+            let memory = LIFTED_MEMORY_DIRECTIVES.contains(name);
+            assert!(
+                intent ^ memory,
+                "registry lists '{name}' but it is handled by {} lift(s), not exactly one",
+                intent as u8 + memory as u8
+            );
+        }
+    }
 }
