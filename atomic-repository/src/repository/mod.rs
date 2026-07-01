@@ -193,6 +193,12 @@ pub struct Repository {
     pristine: Arc<Pristine>,
     /// The change store for persisting changes
     change_store: ChangeStore,
+    /// Whether this handle was opened for an agent sandbox (via
+    /// [`Repository::open_sandbox`]). A sandbox's `dot_dir`/`pristine`/
+    /// `change_store` point at the canonical repository while `current_view`
+    /// holds the sandbox's view (from its pointer file); it must not repoint
+    /// the canonical `current_view` on disk.
+    is_sandbox: bool,
 }
 
 impl std::fmt::Debug for Repository {
@@ -203,6 +209,7 @@ impl std::fmt::Debug for Repository {
             .field("current_view", &self.current_view)
             .field("pristine", &"<Pristine>")
             .field("change_store", &self.change_store)
+            .field("is_sandbox", &self.is_sandbox)
             .finish()
     }
 }
@@ -285,6 +292,7 @@ default = "{}"
             current_view: DEFAULT_VIEW.to_string(),
             pristine,
             change_store,
+            is_sandbox: false,
         })
     }
 
@@ -327,6 +335,7 @@ default = "{}"
             current_view,
             pristine,
             change_store,
+            is_sandbox: false,
         })
     }
 
@@ -363,6 +372,7 @@ default = "{}"
             current_view,
             pristine,
             change_store,
+            is_sandbox: false,
         })
     }
 
@@ -423,6 +433,7 @@ default = "{}"
             current_view,
             pristine,
             change_store,
+            is_sandbox: false,
         })
     }
 
@@ -460,6 +471,7 @@ default = "{}"
             current_view,
             pristine,
             change_store,
+            is_sandbox: false,
         })
     }
 
@@ -539,6 +551,17 @@ default = "{}"
     #[inline]
     pub fn current_view(&self) -> &str {
         &self.current_view
+    }
+
+    /// Whether this handle was opened for an agent sandbox.
+    ///
+    /// A sandbox records into the canonical graph on the view named in its
+    /// pointer file (held in `current_view`, never written back to the
+    /// canonical `current_view` on disk), so callers must not fork a new view
+    /// or repoint the current view for it.
+    #[inline]
+    pub fn is_sandbox(&self) -> bool {
+        self.is_sandbox
     }
 
     /// Get the config file path.
