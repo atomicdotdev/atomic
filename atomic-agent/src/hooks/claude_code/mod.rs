@@ -330,7 +330,8 @@ const HOOK_DEFS: &[(&str, &str, &str)] = &[
 fn install_hooks_into(hooks: &mut ClaudeHooks, _settings_path: &Path) -> AgentResult<usize> {
     let mut count = 0;
     for (_label, matcher, verb) in HOOK_DEFS {
-        let command = format!("test -d .atomic && {} {} || true", ATOMIC_HOOK_PREFIX, verb);
+        let command =
+            crate::hooks::guarded_hook_command(&format!("{} {}", ATOMIC_HOOK_PREFIX, verb));
 
         let matchers = match *verb {
             "session-start" => &mut hooks.session_start,
