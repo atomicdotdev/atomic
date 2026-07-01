@@ -523,6 +523,25 @@ default = "{}"
         Self::find_root(path.as_ref()).is_ok()
     }
 
+    /// Resolve the **canonical** `.atomic` directory for a working path
+    /// *without* opening the database.
+    ///
+    /// If `path` is inside an agent sandbox, follows the `.atomic-sandbox`
+    /// pointer to the canonical repository; otherwise finds the enclosing
+    /// repository root. Returns `<canonical_root>/.atomic`.
+    ///
+    /// Use this for lock-free filesystem access to the canonical graph — e.g.
+    /// writing a provenance graph through [`ChangeStore`](crate::ChangeStore) —
+    /// where opening a full [`Repository`] would take the redb lock. In a
+    /// sandbox `path/.atomic` is a throwaway local dir (or absent), so joining
+    /// `.atomic` onto the working root would miss the real graph entirely.
+    pub fn canonical_dot_dir<P: AsRef<Path>>(path: P) -> Result<PathBuf, RepositoryError> {
+        if let Some((_working, canonical, _view)) = sandbox::detect_sandbox(path.as_ref()) {
+            return Ok(Self::find_root(&canonical)?.join(DOT_DIR));
+        }
+        Ok(Self::find_root(path.as_ref())?.join(DOT_DIR))
+    }
+
     /// Get the repository root path.
     #[inline]
     pub fn root(&self) -> &Path {
