@@ -21,10 +21,10 @@
 //!   "command_prefix": "atomic agent hooks codex",
 //!   "hooks": {
 //!     "SessionStart": [
-//!       { "hooks": [ { "type": "command", "command": "test -d .atomic && atomic agent hooks codex session-start || true", "statusMessage": "Atomic: tracking session" } ] }
+//!       { "hooks": [ { "type": "command", "command": "test -d .atomic || test -f .atomic-sandbox && atomic agent hooks codex session-start || true", "statusMessage": "Atomic: tracking session" } ] }
 //!     ],
 //!     "Stop": [
-//!       { "hooks": [ { "type": "command", "command": "test -d .atomic && atomic agent hooks codex stop || true" } ] }
+//!       { "hooks": [ { "type": "command", "command": "test -d .atomic || test -f .atomic-sandbox && atomic agent hooks codex stop || true" } ] }
 //!     ]
 //!   }
 //! }

@@ -271,12 +271,16 @@ mod tests {
         assert!(is_atomic_hook(
             "atomic agent hooks claude-code user-prompt-submit"
         ));
-        // Guarded format (current)
+        // Guarded format (legacy, `.atomic`-only)
         assert!(is_atomic_hook(
             "test -d .atomic && atomic agent hooks claude-code stop || true"
         ));
         assert!(is_atomic_hook(
             "test -d .atomic && atomic agent hooks claude-code user-prompt-submit || true"
+        ));
+        // Sandbox-aware guarded format (current)
+        assert!(is_atomic_hook(
+            "test -d .atomic || test -f .atomic-sandbox && atomic agent hooks claude-code stop || true"
         ));
         // Non-atomic commands
         assert!(!is_atomic_hook("entire hooks claude-code stop"));
