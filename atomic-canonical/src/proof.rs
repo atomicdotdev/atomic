@@ -5,10 +5,8 @@
 //! and sign over the same canonical bytes the content hash uses, via the one
 //! `jcs` entry point — so hash and signature can never disagree.
 //!
-//! `proofValue` is a multibase string. We use base32-upper (`B`) via
-//! `data-encoding` (already in-tree) rather than base58btc (`z`) to avoid an
-//! extra dependency; it is a valid multibase encoding and the prefix is
-//! swappable when a base58 dependency is admitted.
+//! `proofValue` is a multibase string in base58btc (`z`), as the
+//! `eddsa-jcs-2022` cryptosuite specifies.
 
 use atomic_identity::identity::Identity;
 use atomic_identity::keypair::{KeyPair, PublicKey};
@@ -25,8 +23,8 @@ use crate::node::{CanonicalNode, Proof};
 pub const CRYPTOSUITE: &str = "eddsa-jcs-2022";
 pub const PROOF_TYPE: &str = "DataIntegrityProof";
 pub const PROOF_PURPOSE: &str = "assertionMethod";
-/// Multibase prefix for base32-upper, no padding.
-const MULTIBASE_BASE32_UPPER: char = 'B';
+/// Multibase prefix for base58btc — the encoding `eddsa-jcs-2022` specifies.
+const MULTIBASE_BASE58_BTC: char = 'z';
 
 /// Canonical property names. Hardcoded because the closed vocabulary
 /// standardizes them across *all* node types (Intent, Memory, and any future
@@ -188,25 +186,25 @@ pub fn verify_memory(node: &MemoryNode, public_key: &PublicKey) -> Result<()> {
 
 fn encode_proof_value(signature: &Signature) -> String {
     let mut s = String::new();
-    s.push(MULTIBASE_BASE32_UPPER);
-    s.push_str(&data_encoding::BASE32_NOPAD.encode(signature.as_bytes()));
+    s.push(MULTIBASE_BASE58_BTC);
+    s.push_str(&bs58::encode(signature.as_bytes()).into_string());
     s
 }
 
 fn decode_proof_value(value: &str) -> Result<Signature> {
     let mut chars = value.chars();
     match chars.next() {
-        Some(MULTIBASE_BASE32_UPPER) => {}
+        Some(MULTIBASE_BASE58_BTC) => {}
         _ => {
             return Err(CanonicalError::Proof(format!(
                 "unsupported multibase prefix in proofValue: {value:.4}…"
             )))
         }
     }
-    let body = &value[MULTIBASE_BASE32_UPPER.len_utf8()..];
-    let bytes = data_encoding::BASE32_NOPAD
-        .decode(body.as_bytes())
-        .map_err(|e| CanonicalError::Proof(format!("bad base32 proofValue: {e}")))?;
+    let body = &value[MULTIBASE_BASE58_BTC.len_utf8()..];
+    let bytes = bs58::decode(body)
+        .into_vec()
+        .map_err(|e| CanonicalError::Proof(format!("bad base58btc proofValue: {e}")))?;
     Signature::from_slice(&bytes).map_err(|e| CanonicalError::Proof(e.to_string()))
 }
 

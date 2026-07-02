@@ -9,12 +9,14 @@
 //! hash (`hash.rs`) and the Data Integrity proof (`proof.rs`) go through
 //! `canonicalize`, so the two can never drift.
 //!
-//! Scope note (M0): object-key sorting is by UTF-8 byte order. RFC 8785
-//! specifies sorting by UTF-16 code units; for the ASCII property names in
-//! our vocabulary the two orderings are identical. Numbers are emitted via
-//! `serde_json`'s formatter, which is exact for the integer/simple values we
-//! use. Both are revisited if the vocabulary ever admits non-ASCII keys or
-//! floating-point payloads.
+//! Object keys are sorted by UTF-16 code units as RFC 8785 §3.2.3 specifies
+//! (not by UTF-8 bytes — the two differ once keys leave the BMP, e.g. an
+//! emoji key sorts after `\u{ff61}` in UTF-8 but before it in UTF-16).
+//!
+//! Scope note: numbers are emitted via `serde_json`'s formatter, which
+//! matches RFC 8785 for the integer values our vocabulary admits; the full
+//! ECMAScript number-to-string algorithm is only needed if floating-point
+//! payloads are ever admitted.
 
 use serde_json::Value;
 
@@ -44,7 +46,7 @@ fn write_value(out: &mut String, value: &Value) {
         }
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            keys.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
             out.push('{');
             for (i, key) in keys.iter().enumerate() {
                 if i > 0 {
@@ -94,5 +96,18 @@ mod tests {
     fn escapes_strings() {
         let v = json!({ "k": "a\"b\nc" });
         assert_eq!(canonicalize(&v), r#"{"k":"a\"b\nc"}"#);
+    }
+
+    /// RFC 8785 §3.2.3: keys sort by UTF-16 code units. A supplementary-plane
+    /// key (😀, surrogate pair D83D DE00) must sort BEFORE U+FF61 (｡) — the
+    /// opposite of UTF-8 byte order, where 😀 (F0 9F …) follows ｡ (EF BD A1).
+    #[test]
+    fn keys_sort_by_utf16_code_units_not_utf8_bytes() {
+        let v = json!({ "\u{ff61}": 1, "😀": 2 });
+        assert_eq!(
+            canonicalize(&v),
+            "{\"😀\":2,\"\u{ff61}\":1}",
+            "supplementary-plane keys must sort by UTF-16 code units"
+        );
     }
 }

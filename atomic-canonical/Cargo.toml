@@ -12,6 +12,7 @@ rust-version.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
+bs58 = { workspace = true }
 chrono = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
