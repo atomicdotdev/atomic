@@ -69,6 +69,12 @@ atom:IntentShape
     sh:property [
         sh:path atom:hasAcceptanceCriterion ;
         sh:node atom:AcceptanceCriterionShape ;
+    ] ;
+
+    # every task must itself satisfy its shape.
+    sh:property [
+        sh:path atom:hasTask ;
+        sh:node atom:TaskShape ;
     ] .
 
 #####################################################################
@@ -101,6 +107,26 @@ atom:AcceptanceCriterionShape
                 }
             }
         """ ;
+    ] .
+
+#####################################################################
+# TaskShape — a decomposed work item carries exactly one status
+#####################################################################
+# The task-status value set is not yet a closed vocabulary (the doc
+# does not enumerate it), so this shape checks cardinality only — a
+# sh:in lands together with the vocab registry entry. `satisfies` is
+# not shape-checked here: the @context coerces it to an IRI, so a
+# nodeKind constraint cannot fire; resolution ("does the criterion
+# exist?") is a graph-join check for the store-backed milestone.
+atom:TaskShape
+    a sh:NodeShape ;
+    sh:targetClass atom:Task ;
+
+    sh:property [
+        sh:path atom:taskStatus ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:message "a task carries exactly one status" ;
     ] .
 
 #####################################################################

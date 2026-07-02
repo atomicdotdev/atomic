@@ -188,6 +188,39 @@ mod tests {
     }
 
     #[test]
+    fn task_without_status_fails_task_shape() {
+        if !engine() {
+            return;
+        }
+        let md = "---\nid: WORD-5\ntitle: t\nstatus: done\ncreated_at: 2026-06-25T11:24:25Z\n---\n\n:::why\na reason\n:::\n\n:::task{#WORD-5-1 status=done}\nAdd modal.\n:::\n";
+        let (fm, body) = crate::lift::parse_markdown(md).unwrap();
+        let node = crate::lift::lift_intent(&fm, &body).unwrap();
+        let kp = KeyPair::generate();
+        let id = Identity::new("lee", &kp);
+        let mut value = crate::proof::attest(node, &id, &kp).to_value();
+
+        let report = validate_value(&value).unwrap();
+        assert!(
+            report.conforms,
+            "task with status conforms:\n{}",
+            report.report
+        );
+
+        // Strip the task's status: TaskShape's cardinality must reject it.
+        value["hasTask"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("taskStatus");
+        let report = validate_value(&value).unwrap();
+        assert!(!report.conforms, "a task without a status must not conform");
+        assert!(
+            report.report.contains("exactly one status"),
+            "violation must come from TaskShape:\n{}",
+            report.report
+        );
+    }
+
+    #[test]
     fn memory_with_unknown_kind_fails() {
         if !engine() {
             return;
