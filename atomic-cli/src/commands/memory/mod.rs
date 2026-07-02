@@ -104,9 +104,10 @@ pub enum MemoryCommands {
     /// Gates the memory first (refusing to sign a node that fails for a reason
     /// signing cannot fix), fills `attributedTo` from the signing identity,
     /// signs the canonical node, re-gates the attested result, and writes the
-    /// node (with embedded contentHash + proof) to a tracked vault entry
-    /// (dual-written to a legacy sidecar). No memory entry, `content_hash`, or
-    /// merkle is touched.
+    /// node (with embedded contentHash + proof) to a tracked vault entry at
+    /// `attestations/memory/<id>/attested.md` (dual-written to a legacy sidecar).
+    /// The source memory is unchanged and the vault's hashing scheme is
+    /// untouched — a new attestation entry is simply added.
     ///
     /// # Examples
     ///

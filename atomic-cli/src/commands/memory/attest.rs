@@ -74,11 +74,10 @@ impl Command for MemoryAttest {
                 .map_err(|e| {
                     CliError::Internal(anyhow::anyhow!("Failed to load default identity: {}", e))
                 })?
-                .ok_or_else(|| {
-                    CliError::Internal(anyhow::anyhow!(
-                        "No default identity set. Create one first:\n  \
-                         atomic identity new <name> --email <email> --set-default"
-                    ))
+                .ok_or_else(|| CliError::InvalidArgument {
+                    message: "No default identity set. Create one first:\n  \
+                              atomic identity new <name> --email <email> --set-default"
+                        .to_string(),
                 })?
         };
         let keypair = store.load_keypair(&identity.id, None).map_err(|e| {
@@ -164,6 +163,11 @@ impl Command for MemoryAttest {
             frontmatter_json,
         )
         .map_err(CliError::Repository)?;
+        // Materialize the tracked attestation into the .vault/ working tree so it
+        // exists on disk (matching the printed path) and is captured by a later
+        // `atomic record` — i.e. it travels via the change graph like any entry.
+        repo.vault_materialize(&vault_path)
+            .map_err(CliError::Repository)?;
 
         let did = node.attributed_to.as_deref().unwrap_or("(unknown)");
         let proof_prefix = node

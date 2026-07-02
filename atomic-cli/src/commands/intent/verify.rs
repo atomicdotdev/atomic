@@ -72,11 +72,10 @@ impl Command for IntentVerify {
                 .map_err(|e| {
                     CliError::Internal(anyhow::anyhow!("Failed to load default identity: {}", e))
                 })?
-                .ok_or_else(|| {
-                    CliError::Internal(anyhow::anyhow!(
-                        "No default identity set. Create one first:\n  \
-                         atomic identity new <name> --email <email> --set-default"
-                    ))
+                .ok_or_else(|| CliError::InvalidArgument {
+                    message: "No default identity set. Create one first:\n  \
+                              atomic identity new <name> --email <email> --set-default"
+                        .to_string(),
                 })?
         };
 

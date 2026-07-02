@@ -489,6 +489,10 @@ atomic intent validate WORD-5
 
 Runs the SHACL gate against the lifted node and prints the report. On failure you get the failing node, the shape it broke, and the message. The same check runs automatically at the transition to `done`, so validate-by-hand is for authoring. The gate is for the system.
 
+> **Editing note — sync after you edit, and edit the body.** The id-based verbs (`validate`/`show`/`attest`/`verify <id>`) read the *recorded* entry from the vault DB, not the raw `.vault/…/*.md` file on disk. If you hand-edit an entry's markdown, run `atomic vault sync` first (or those commands will silently act on the pre-edit state). To gate an unrecorded file directly, `atomic intent validate ./path.md` reads the file itself and skips the DB.
+>
+> Caveat: `vault sync` detects changes by the entry **body** (the vault's storage hash is `blake3(body)`, frontmatter excluded), so a *frontmatter-only* hand-edit — e.g. flipping `status` — may not be picked up ("Vault is up to date"). Change status/metadata through the workflow (the gate grants `status` on transition) rather than by hand-editing frontmatter.
+
 **Show the flywheel chain for a change:**
 
 ```

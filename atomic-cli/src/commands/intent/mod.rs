@@ -13,7 +13,7 @@
 //! atomic intent validate <ID|path>   Gate an intent against the canonical shapes
 //! atomic intent show <ID>            Render an intent as a read-time projection
 //! atomic intent new <TITLE>          Scaffold a directive-based intent
-//! atomic intent attest <ID>          Sign an intent into a canonical sidecar
+//! atomic intent attest <ID>          Sign an intent into a tracked attestation entry
 //! atomic intent verify <ID>          Verify a signed intent's attestation
 //! ```
 //!
@@ -94,13 +94,16 @@ pub enum IntentCommands {
     /// ```
     New(IntentNew),
 
-    /// Attest an intent: sign it into a canonical sidecar.
+    /// Attest an intent: sign it into a tracked attestation entry.
     ///
     /// Gates the intent first (refusing to sign a non-conforming node),
     /// fills `attributedTo` from the signing identity's `did:atomic`, signs
     /// the canonical node, re-gates the attested result, and writes the node
-    /// (with embedded contentHash + proof) to a sidecar under `.atomic/`.
-    /// No `VaultEntry`, `content_hash`, or merkle is touched.
+    /// (with embedded contentHash + proof) as a tracked vault entry at
+    /// `attestations/<id>/attested.md` (dual-written to a legacy `.atomic/`
+    /// sidecar during transition). The attestation entry uses the vault's
+    /// existing `blake3(body)` storage hash; the intent's own `content_hash`
+    /// is never redefined.
     ///
     /// # Examples
     ///
