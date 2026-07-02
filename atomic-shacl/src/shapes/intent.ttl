@@ -1,0 +1,88 @@
+# IntentShape — the SHACL rendering of the hand-coded gate's `validate_intent`.
+#
+# This is the team-editable, standard-SHACL source of truth for intent policy.
+# It is compiled into the binary via include_str! (the compiled bytes are the
+# trusted artifact) but stays valid Turtle that any real SHACL validator can load.
+#
+# Trim semantics (load-bearing): the hand-coded gate rejects a WHITESPACE-ONLY
+# `why` (it uses .trim()) but accepts a whitespace-only `attributedTo` (no trim).
+# The shim reproduces this by emitting the a:why triple ONLY when the trimmed
+# value is non-empty, and the a:attributedTo triple whenever the raw value is
+# non-empty. So both rules below are plain sh:minCount 1 — the asymmetry lives in
+# the shim (and is pinned by the differential corpus), not in these shapes.
+
+@prefix sh:  <http://www.w3.org/ns/shacl#> .
+@prefix a:   <https://atomic.dev/ns#> .
+
+a:IntentShape a sh:NodeShape ;
+    sh:targetClass a:Intent ;
+
+    # status ∈ closed set (single field ⇒ exactly one).
+    sh:property [
+        sh:path a:status ;
+        sh:minCount 1 ;
+        sh:in ( "backlog" "todo" "in_progress" "done" ) ;
+        sh:message "status is not one of backlog/todo/in_progress/done" ;
+    ] ;
+
+    # author present (shim emits iff raw value non-empty — untrimmed, matching the gate).
+    sh:property [
+        sh:path a:attributedTo ;
+        sh:minCount 1 ;
+        sh:message "author (attributedTo) must be present as a DID" ;
+    ] ;
+
+    # Data Integrity proof present.
+    sh:property [
+        sh:path a:proof ;
+        sh:minCount 1 ;
+        sh:message "intent must carry a Data Integrity proof" ;
+    ] ;
+
+    # reason present (shim emits iff trimmed value non-empty — content never graded).
+    sh:property [
+        sh:path a:why ;
+        sh:minCount 1 ;
+        sh:message "a reason (why) must be present — its content is not graded" ;
+    ] ;
+
+    # each acceptance criterion must satisfy AcceptanceCriterionShape.
+    sh:property [
+        sh:path a:hasAcceptanceCriterion ;
+        sh:node a:AcceptanceCriterionShape ;
+    ] ;
+
+    # INTENT-5 (conditional, SHACL-SPARQL): if scope-in is declared, scope-out must be too.
+    sh:sparql [
+        a sh:SPARQLConstraint ;
+        sh:message "a scope declaration must state what is out of scope (the boundaries the agent must respect)" ;
+        sh:select """
+            SELECT $this WHERE {
+                $this <https://atomic.dev/ns#hasScopeIn> ?in .
+                FILTER NOT EXISTS { $this <https://atomic.dev/ns#hasScopeOut> ?out . }
+            }
+        """ ;
+    ] .
+
+a:AcceptanceCriterionShape a sh:NodeShape ;
+
+    # acStatus ∈ closed set.
+    sh:property [
+        sh:path a:acStatus ;
+        sh:minCount 1 ;
+        sh:in ( "open" "met" ) ;
+        sh:message "acStatus is not one of open/met" ;
+    ] ;
+
+    # INTENT-7 (conditional, SHACL-SPARQL): a met criterion must carry verifiedBy AND evidence.
+    sh:sparql [
+        a sh:SPARQLConstraint ;
+        sh:message "a met acceptance criterion must carry verifiedBy and evidence" ;
+        sh:select """
+            SELECT $this WHERE {
+                $this <https://atomic.dev/ns#acStatus> "met" .
+                FILTER ( NOT EXISTS { $this <https://atomic.dev/ns#verifiedBy> ?v } ||
+                         NOT EXISTS { $this <https://atomic.dev/ns#evidence> ?e } )
+            }
+        """ ;
+    ] .

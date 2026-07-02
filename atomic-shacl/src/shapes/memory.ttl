@@ -1,0 +1,56 @@
+# MemoryShape — the SHACL rendering of the hand-coded gate's `validate_memory`.
+#
+# Standard SHACL; compiled in via include_str! but loadable by any real validator.
+#
+# Directionality (load-bearing ABSENCE): there is deliberately NO forward-edge
+# rule (no "status = superseded ⇒ supersedes present"). supersedes/previousRevision
+# are BACKWARD edges only; a retired memory gains no new edge. Adding a forward-edge
+# property shape here would re-introduce the "references its future uses" anti-pattern
+# and MUST fail the differential corpus's superseded-no-forward-edge anti-fixture.
+#
+# Trim semantics: `text` presence is enforced by the shim emitting the a:text triple
+# ONLY when the trimmed value is non-empty (matching the gate's .trim()); the rule
+# below is therefore plain sh:minCount 1.
+
+@prefix sh:  <http://www.w3.org/ns/shacl#> .
+@prefix a:   <https://atomic.dev/ns#> .
+
+a:MemoryShape a sh:NodeShape ;
+    sh:targetClass a:Memory ;
+
+    # memoryKind ∈ closed set (single field ⇒ exactly one).
+    sh:property [
+        sh:path a:memoryKind ;
+        sh:minCount 1 ;
+        sh:in ( "constraint" "preference" "lesson" "context" ) ;
+        sh:message "memoryKind is not one of constraint/preference/lesson/context" ;
+    ] ;
+
+    # status ∈ closed set.
+    sh:property [
+        sh:path a:status ;
+        sh:minCount 1 ;
+        sh:in ( "active" "superseded" "retracted" ) ;
+        sh:message "status is not one of active/superseded/retracted" ;
+    ] ;
+
+    # author present (shim emits iff raw value non-empty — untrimmed, matching the gate).
+    sh:property [
+        sh:path a:attributedTo ;
+        sh:minCount 1 ;
+        sh:message "author (attributedTo) must be present as a DID" ;
+    ] ;
+
+    # Data Integrity proof present.
+    sh:property [
+        sh:path a:proof ;
+        sh:minCount 1 ;
+        sh:message "memory must carry a Data Integrity proof" ;
+    ] ;
+
+    # text present (shim emits iff trimmed value non-empty — content never graded).
+    sh:property [
+        sh:path a:text ;
+        sh:minCount 1 ;
+        sh:message "a memory must carry text — its content is not graded" ;
+    ] .
