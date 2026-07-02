@@ -769,3 +769,78 @@ fn test_orchestrator_debug() {
     assert!(debug.contains("TurnOrchestrator"));
     assert!(debug.contains("repo_root"));
 }
+
+#[tokio::test]
+async fn test_file_recorded_on_another_view_records_again_on_new_view() {
+    // Regression (found doing real work in a real repo): the tracking TREE
+    // is global, but status's tree scan SKIPPED files whose creating change
+    // is not visible on the current view. A file recorded by an earlier
+    // session on ANOTHER view, then re-created on disk under a new view,
+    // fell into a permanent gap: status called it untracked-and-clean while
+    // `add` refused it (TREE already tracks it) — so `record` could never
+    // see it again (false EmptyTurn forever).
+    let dir = TempDir::new().unwrap();
+    Repository::init(dir.path()).unwrap();
+
+    // Session A records shared.rs on its own per-session view.
+    let store_a = SessionStore::for_repo(dir.path()).unwrap();
+    let watcher_a = FallbackWatcher::new(WatcherConfig::new(dir.path()));
+    let mut orch_a = TurnOrchestrator::with_watcher(dir.path(), store_a, Box::new(watcher_a));
+    orch_a.set_agent("claude-code", "Claude Code");
+    orch_a
+        .dispatch(session_start_event("sess-A"))
+        .await
+        .unwrap();
+    orch_a
+        .dispatch(turn_start_event("sess-A", "create shared"))
+        .await
+        .unwrap();
+    fs::write(dir.path().join("shared.rs"), "fn shared() {}\n").unwrap();
+    let ra = orch_a.dispatch(turn_end_event("sess-A")).await.unwrap();
+    assert!(ra.was_recorded(), "session A must record shared.rs");
+    orch_a.dispatch(session_end_event("sess-A")).await.unwrap();
+
+    // Session end re-materializes the parent view; shared.rs (recorded only
+    // on session A's view) leaves the working tree. Tolerate either.
+    let _ = fs::remove_file(dir.path().join("shared.rs"));
+
+    // Session B on a NEW view: turn 1 records something else (the view now
+    // exists), turn 2 re-creates the SAME file session A recorded.
+    let store_b = SessionStore::for_repo(dir.path()).unwrap();
+    let watcher_b = FallbackWatcher::new(WatcherConfig::new(dir.path()));
+    let mut orch_b = TurnOrchestrator::with_watcher(dir.path(), store_b, Box::new(watcher_b));
+    orch_b.set_agent("claude-code", "Claude Code");
+    orch_b
+        .dispatch(session_start_event("sess-B"))
+        .await
+        .unwrap();
+
+    orch_b
+        .dispatch(turn_start_event("sess-B", "unrelated work"))
+        .await
+        .unwrap();
+    fs::write(dir.path().join("other.rs"), "fn other() {}\n").unwrap();
+    let rb1 = orch_b.dispatch(turn_end_event("sess-B")).await.unwrap();
+    assert!(rb1.was_recorded(), "session B turn 1 must record");
+
+    orch_b
+        .dispatch(turn_start_event("sess-B", "recreate shared"))
+        .await
+        .unwrap();
+    fs::write(dir.path().join("shared.rs"), "fn shared_v2() {}\n").unwrap();
+    let rb2 = orch_b.dispatch(turn_end_event("sess-B")).await.unwrap();
+    assert!(
+        rb2.was_recorded(),
+        "re-creating a file another view already tracks must record — \
+         regression: add=already-tracked + status=untracked ⇒ false EmptyTurn"
+    );
+    let outcome = rb2.change_recorded.as_ref().unwrap();
+    assert!(
+        outcome
+            .recorded_file_list()
+            .iter()
+            .any(|f| f.contains("shared.rs")),
+        "the re-created file itself must be in the recorded change: {:?}",
+        outcome.recorded_file_list()
+    );
+}
