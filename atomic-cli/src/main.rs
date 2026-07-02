@@ -66,7 +66,9 @@ use commands::{
     Identity,
     Init,
     Insert,
+    Intent,
     Log,
+    Memory,
     Move,
     ProjectCmd,
     Pull,
@@ -694,6 +696,31 @@ enum Commands {
     /// ```
     Vault(Vault),
 
+    /// Author and validate canonical intents (markdown + typed directives).
+    ///
+    /// The Recording-the-Why authoring loop: scaffold from a template,
+    /// write the directive blocks, validate against the gate (tier-1 in
+    /// process, tier-2 SHACL with --shacl).
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic intent new WORD-5 --title "Add name prompt modal"
+    /// atomic intent validate WORD-5.md --shacl
+    /// atomic intent show WORD-5.md
+    /// ```
+    Intent(Intent),
+
+    /// Author and validate canonical memories (durable, reusable context).
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic memory new upload-assumptions --kind constraint --about storage
+    /// atomic memory validate upload-assumptions.md --shacl
+    /// ```
+    Memory(Memory),
+
     /// Remove the last change from the current view.
     ///
     /// The change is removed from the view's change log but NOT deleted
@@ -815,6 +842,8 @@ fn main() {
         Commands::Query(query) => query.run(),
 
         Commands::Vault(vault) => vault.run(),
+        Commands::Intent(cmd) => cmd.run(),
+        Commands::Memory(cmd) => cmd.run(),
     };
 
     // Handle errors with user-friendly output

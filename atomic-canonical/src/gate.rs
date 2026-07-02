@@ -20,7 +20,7 @@ use crate::node::CanonicalNode;
 use crate::vocab;
 
 /// A single shape violation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Violation {
     /// The `@id` of the focus node (or sub-node) that failed.
     pub focus_node: String,
@@ -33,7 +33,7 @@ pub struct Violation {
 }
 
 /// The result of validating a node.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ValidationReport {
     pub conforms: bool,
     pub results: Vec<Violation>,

@@ -68,6 +68,7 @@ use crate::error::{CliError, CliResult};
 
 // Phase 2: Core Local Commands
 pub mod add;
+pub mod canonical;
 pub mod change;
 pub mod diff;
 pub mod doctor;
@@ -124,6 +125,7 @@ pub mod team;
 // Re-export command structs for convenience
 pub use add::Add;
 pub use agent::Agent;
+pub use canonical::{Intent, Memory};
 pub use change::ChangeCmd;
 pub use clone::Clone;
 pub use diff::Diff;
