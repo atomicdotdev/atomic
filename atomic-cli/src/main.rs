@@ -71,6 +71,7 @@ use commands::{
     Memory,
     Move,
     ProjectCmd,
+    Provenance,
     Pull,
     Push,
     Query,
@@ -743,6 +744,25 @@ enum Commands {
     #[command(name = "memory")]
     Memory(Memory),
 
+    /// Project & trace W3C PROV over the provenance atomic already captures.
+    ///
+    /// Read-only, compute-on-demand: projects the per-turn `ProvenanceGraph`
+    /// into a signed W3C PROV JSON-LD named subgraph. The capture path is never
+    /// touched and nothing is written. The person's real `did:atomic` signs the
+    /// projection; the agent is a non-verifiable descriptive label.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Walk the flywheel chain for a change
+    /// atomic provenance trace <change>
+    ///
+    /// # Emit the signed PROV JSON-LD artifact
+    /// atomic provenance show <change>
+    /// ```
+    #[command(name = "provenance")]
+    Provenance(Provenance),
+
     /// Remove the last change from the current view.
     ///
     /// The change is removed from the view's change log but NOT deleted
@@ -868,6 +888,8 @@ fn main() {
         Commands::Intent(intent) => intent.run(),
 
         Commands::Memory(memory) => memory.run(),
+
+        Commands::Provenance(provenance) => provenance.run(),
     };
 
     // Handle errors with user-friendly output

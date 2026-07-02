@@ -319,7 +319,7 @@ The provenance for a change is a named subgraph keyed to the change id. Inside i
       "@id": "urn:atomic:activity:01J8ZD9X5K",
       "prov:startedAtTime": "2026-06-30T13:58:02Z",
       "prov:endedAtTime": "2026-06-30T14:02:09Z",
-      "associatedWith": "did:atomic:agent:claude",
+      "associatedWith": "urn:atomic:agent:claude",
       "actedOnBehalfOf": "did:atomic:lee",
       "used": [
         "urn:atomic:intent:019efe85-5650-7430-a794-5ab6ade7a4bc",
@@ -330,7 +330,8 @@ The provenance for a change is a named subgraph keyed to the change id. Inside i
     },
     {
       "@type": "prov:SoftwareAgent",
-      "@id": "did:atomic:agent:claude",
+      "@id": "urn:atomic:agent:claude",
+      "prov:label": "Claude Code",
       "actedOnBehalfOf": "did:atomic:lee"
     },
     {
@@ -340,6 +341,8 @@ The provenance for a change is a named subgraph keyed to the change id. Inside i
   ]
 }
 ```
+
+The `SoftwareAgent` `@id` is a **`urn:atomic:agent:<slug>` label, not a DID** — `did:atomic:<x>` is a key fingerprint (`base32(blake3(pubkey))`), so a name like `claude` cannot be a verifiable `did:atomic`. Only the **Person** is a real `did:atomic`, and the Person's key is what **signs** the graph; the SoftwareAgent is descriptive attribution with no key behind it (until agents are issued their own keypairs). The signed subgraph the projector emits also carries, at the top level (outside `@graph`), an `attributedTo` (= the signing Person's `did:atomic`), a `contentHash`, and an `eddsa-jcs-2022` `proof` — injected by the same Data-Integrity signing path Intent and Memory use.
 
 ---
 

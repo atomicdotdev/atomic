@@ -38,6 +38,7 @@ pub mod lift;
 pub mod memory;
 pub mod node;
 pub mod proof;
+pub mod prov;
 pub mod render;
 pub mod vocab;
 
@@ -47,6 +48,7 @@ pub use memory::MemoryNode;
 pub use node::{
     AcceptanceCriterion, CanonicalNode, Constraint, Proof, Ref, ScopeItem, Task,
 };
+pub use prov::{attest_prov, project, verify_prov, ProvActivityInput};
 pub use render::{render, render_memory, Target};
 
 use atomic_identity::identity::Identity;
