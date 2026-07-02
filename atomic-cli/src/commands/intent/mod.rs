@@ -31,12 +31,14 @@ use crate::error::CliResult;
 
 pub mod attest;
 pub mod bridge;
+pub mod list;
 pub mod new;
 pub mod show;
 pub mod validate;
 pub mod verify;
 
 pub use attest::IntentAttest;
+pub use list::IntentList;
 pub use new::IntentNew;
 pub use show::IntentShow;
 pub use validate::IntentValidate;
@@ -123,6 +125,24 @@ pub enum IntentCommands {
     /// atomic intent verify PIMO-1 --identity alice-work
     /// ```
     Verify(IntentVerify),
+
+    /// List the vault's intents, attestation-aware.
+    ///
+    /// The canonical-family analogue of `atomic vault intent list`: alongside the
+    /// human key and status it adds an `attested` column (fresh / stale / –) and
+    /// a `verifies` column (✓ / ✗ / –). `verifies` is `✓` only when a fresh
+    /// attestation signed by the resolving identity cryptographically checks out,
+    /// `✗` when a same-signer node fails its hash/signature, and `–` otherwise
+    /// (no attestation, stale, no resolvable identity, or a different signer).
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic intent list
+    /// atomic intent list --identity alice-work
+    /// atomic intent list --json
+    /// ```
+    List(IntentList),
 }
 
 /// Record the "why": lift, validate, attest, and render canonical intents.
@@ -145,6 +165,7 @@ impl Command for Intent {
             IntentCommands::New(cmd) => cmd.run(),
             IntentCommands::Attest(cmd) => cmd.run(),
             IntentCommands::Verify(cmd) => cmd.run(),
+            IntentCommands::List(cmd) => cmd.run(),
         }
     }
 }

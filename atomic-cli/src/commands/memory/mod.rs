@@ -36,12 +36,14 @@ use crate::error::CliResult;
 
 pub mod attest;
 pub mod bridge;
+pub mod list;
 pub mod new;
 pub mod show;
 pub mod validate;
 pub mod verify;
 
 pub use attest::MemoryAttest;
+pub use list::MemoryList;
 pub use new::MemoryNew;
 pub use show::MemoryShow;
 pub use validate::MemoryValidate;
@@ -128,6 +130,22 @@ pub enum MemoryCommands {
     /// atomic memory verify 01j8zc4r8t --identity alice-work
     /// ```
     Verify(MemoryVerify),
+
+    /// List the vault's memories, attestation-aware.
+    ///
+    /// The canonical-family analogue of `atomic vault memory list`: alongside the
+    /// id it adds the memory's kind/status/about-count (lifted, never graded), an
+    /// `attested` column (fresh / stale / –) and a `verifies` column (✓ / ✗ / –)
+    /// with the same DID-match-then-verify rule as `atomic intent list`.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic memory list
+    /// atomic memory list --identity alice-work
+    /// atomic memory list --json
+    /// ```
+    List(MemoryList),
 }
 
 /// Record the "why" for durable context: lift, validate, attest, and render
@@ -152,6 +170,7 @@ impl Command for Memory {
             MemoryCommands::Validate(cmd) => cmd.run(),
             MemoryCommands::Attest(cmd) => cmd.run(),
             MemoryCommands::Verify(cmd) => cmd.run(),
+            MemoryCommands::List(cmd) => cmd.run(),
         }
     }
 }
