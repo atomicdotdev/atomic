@@ -237,16 +237,29 @@ mod tests {
 
         // The generic path filled the excluded-later fields.
         let obj = attested.as_object().unwrap();
-        assert!(obj.get(PROP_CONTENT_HASH).unwrap().as_str().unwrap().starts_with("blake3:"));
+        assert!(obj
+            .get(PROP_CONTENT_HASH)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .starts_with("blake3:"));
         assert!(obj.get(PROP_PROOF).is_some());
-        assert!(obj.get(PROP_ATTRIBUTED_TO).unwrap().as_str().unwrap().starts_with("did:atomic:"));
+        assert!(obj
+            .get(PROP_ATTRIBUTED_TO)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .starts_with("did:atomic:"));
 
         // Verifies with the right key, independent of CanonicalNode.
         verify_value(&attested, &kp.public).expect("generic verify should succeed");
 
         // Tamper a signed field → the stored contentHash no longer matches.
         let mut tampered = attested.clone();
-        tampered.as_object_mut().unwrap().insert("status".into(), Value::String("done".into()));
+        tampered
+            .as_object_mut()
+            .unwrap()
+            .insert("status".into(), Value::String("done".into()));
         let err = verify_value(&tampered, &kp.public).unwrap_err();
         assert!(
             matches!(err, CanonicalError::HashMismatch { .. }),

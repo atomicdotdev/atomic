@@ -49,15 +49,15 @@ pub const AC_STATUS: &[&str] = &["open", "met"];
 /// NOTE: `lift.rs` must only branch on these names. A directive name not in
 /// this list is a parse/gate error, never a new type the lift absorbs.
 pub const DIRECTIVE_NAMES: &[&str] = &[
-    "why",                 // container: the unconstrained reason (presence enforced, content honest)
+    "why", // container: the unconstrained reason (presence enforced, content honest)
     "acceptance-criterion", // container
-    "task",                // container
-    "scope-in",            // container
-    "scope-out",           // container
-    "constraint",          // container
-    "ref",                 // leaf: a typed dependency edge
-    "file-ref",            // leaf: a file the task touches
-    "memory",              // container: carries a memory's body text
+    "task", // container
+    "scope-in", // container
+    "scope-out", // container
+    "constraint", // container
+    "ref", // leaf: a typed dependency edge
+    "file-ref", // leaf: a file the task touches
+    "memory", // container: carries a memory's body text
 ];
 
 /// Inline directive names (`:name[label]{attrs}` inside running prose).

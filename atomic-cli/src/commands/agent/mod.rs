@@ -42,6 +42,7 @@ mod disable;
 mod enable;
 mod explain;
 mod hooks;
+mod prov;
 mod status;
 
 use clap::{Args, Subcommand};
@@ -201,6 +202,19 @@ pub enum AgentCommands {
     /// invocation. It appears here for documentation purposes only.
     #[command(hide = true)]
     Hooks(hooks::Hooks),
+
+    /// Export a session's provenance as a W3C PROV-O JSON-LD graph.
+    ///
+    /// Projects a recorded session (and its managed-run stamp, when present)
+    /// into `prov:Activity` / `prov:SoftwareAgent` / `prov:actedOnBehalfOf`.
+    /// Use `--shacl` to run the tier-2 formal gate over the result.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic agent prov <session-id> --person did:atomic:lee --shacl
+    /// ```
+    Prov(prov::Prov),
 }
 
 impl Command for Agent {
@@ -212,6 +226,7 @@ impl Command for Agent {
             AgentCommands::Explain(cmd) => cmd.run(),
             AgentCommands::Attest(cmd) => cmd.run(),
             AgentCommands::Hooks(cmd) => cmd.run(),
+            AgentCommands::Prov(cmd) => cmd.run(),
         }
     }
 }

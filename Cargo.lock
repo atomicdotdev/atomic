@@ -162,6 +162,7 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "atomic-agent",
+ "atomic-canonical",
  "atomic-config",
  "atomic-core",
  "atomic-identity",

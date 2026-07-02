@@ -23,6 +23,7 @@ path = "src/main.rs"
 [dependencies]
 # Internal crates
 atomic-agent = { workspace = true }
+atomic-canonical = { workspace = true }
 atomic-core = { workspace = true }
 atomic-config = { workspace = true }
 atomic-identity = { workspace = true }

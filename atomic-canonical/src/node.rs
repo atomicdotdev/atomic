@@ -26,7 +26,11 @@ pub struct AcceptanceCriterion {
     pub text: String,
     #[serde(rename = "acStatus")]
     pub ac_status: String,
-    #[serde(rename = "verifiedBy", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "verifiedBy",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub verified_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
@@ -128,7 +132,11 @@ pub struct CanonicalNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<String>,
 
-    #[serde(rename = "motivatedBy", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "motivatedBy",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub motivated_by: Option<String>,
     #[serde(rename = "informedBy", default, skip_serializing_if = "Vec::is_empty")]
     pub informed_by: Vec<String>,
@@ -148,7 +156,11 @@ pub struct CanonicalNode {
     pub has_scope_in: Vec<ScopeItem>,
     #[serde(rename = "hasScopeOut", default, skip_serializing_if = "Vec::is_empty")]
     pub has_scope_out: Vec<ScopeItem>,
-    #[serde(rename = "hasConstraint", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "hasConstraint",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub has_constraint: Vec<Constraint>,
     #[serde(rename = "dependsOn", default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<Ref>,
@@ -157,9 +169,17 @@ pub struct CanonicalNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
 
-    #[serde(rename = "contentHash", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "contentHash",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub content_hash: Option<String>,
-    #[serde(rename = "attributedTo", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "attributedTo",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub attributed_to: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,

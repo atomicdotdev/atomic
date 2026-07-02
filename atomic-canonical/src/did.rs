@@ -90,7 +90,10 @@ mod tests {
         assert_eq!(did_key, did_key_for_public_key(&kp.public), "stable");
         // Either representation of the same key verifies.
         assert!(did_matches_public_key(&did_key, &kp.public));
-        assert!(did_matches_public_key(&did_for_public_key(&kp.public), &kp.public));
+        assert!(did_matches_public_key(
+            &did_for_public_key(&kp.public),
+            &kp.public
+        ));
 
         let other = KeyPair::generate();
         assert!(!did_matches_public_key(&did_key, &other.public));

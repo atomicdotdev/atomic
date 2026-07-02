@@ -57,8 +57,14 @@ fn full_round_trip_lifts_attests_gates_verifies_renders() {
     assert_eq!(node.human_key, "WORD-5");
     assert_eq!(node.has_acceptance_criterion.len(), 1);
     assert_eq!(node.has_task.len(), 1);
-    assert_eq!(node.has_acceptance_criterion[0].id, "urn:atomic:ac:WORD-5-ac-1");
-    assert_eq!(node.has_task[0].touches_file, vec!["src/App.tsx".to_string()]);
+    assert_eq!(
+        node.has_acceptance_criterion[0].id,
+        "urn:atomic:ac:WORD-5-ac-1"
+    );
+    assert_eq!(
+        node.has_task[0].touches_file,
+        vec!["src/App.tsx".to_string()]
+    );
     assert!(node.why.as_deref().unwrap().contains("local-only modal"));
 
     // Attested.
@@ -108,7 +114,10 @@ fn gate_requires_a_reason_to_be_present() {
     let node = lift_and_attest(&frontmatter(), body, &id, &kp).unwrap();
     let report = validate_intent(&node);
     assert!(!report.conforms);
-    assert!(report.results.iter().any(|v| v.path.as_deref() == Some("why")));
+    assert!(report
+        .results
+        .iter()
+        .any(|v| v.path.as_deref() == Some("why")));
 }
 
 #[test]
@@ -119,7 +128,10 @@ fn gate_rejects_unknown_status() {
     let node = lift_and_attest(&fm, ":::why{}\nr\n:::", &id, &kp).unwrap();
     let report = validate_intent(&node);
     assert!(!report.conforms);
-    assert!(report.results.iter().any(|v| v.path.as_deref() == Some("status")));
+    assert!(report
+        .results
+        .iter()
+        .any(|v| v.path.as_deref() == Some("status")));
 }
 
 #[test]
@@ -253,7 +265,11 @@ fn memory_lift_gate_attest_verify_render_end_to_end() {
     assert_eq!(node.proof.as_ref().unwrap().cryptosuite, "eddsa-jcs-2022");
 
     // Gate conforms.
-    assert!(validate_memory(&node).conforms, "gate:\n{}", validate_memory(&node));
+    assert!(
+        validate_memory(&node).conforms,
+        "gate:\n{}",
+        validate_memory(&node)
+    );
 
     // Verify.
     verify_memory(&node, &kp.public).expect("memory verification should succeed");
@@ -301,9 +317,7 @@ fn memory_falls_back_to_whole_body_without_container() {
 
 #[test]
 fn parse_markdown_then_lift() {
-    let doc = format!(
-        "---\nid: WORD-9\ntitle: \"Doc parse\"\nstatus: backlog\n---\n{BODY}"
-    );
+    let doc = format!("---\nid: WORD-9\ntitle: \"Doc parse\"\nstatus: backlog\n---\n{BODY}");
     let (fm, body) = parse_markdown(&doc).unwrap();
     assert_eq!(fm.get("id").unwrap().as_str(), Some("WORD-9"));
     let node = lift_intent(&fm, &body).unwrap();
@@ -322,9 +336,10 @@ fn injected_unknown_field_is_rejected_on_load_intent() {
     let (id, kp) = dev_identity();
     let node = lift_and_attest(&frontmatter(), BODY, &id, &kp).unwrap();
     let mut v = serde_json::to_value(&node).unwrap();
-    v.as_object_mut()
-        .unwrap()
-        .insert("actualStatus".into(), Value::String("done-but-forged".into()));
+    v.as_object_mut().unwrap().insert(
+        "actualStatus".into(),
+        Value::String("done-but-forged".into()),
+    );
     let reload: Result<atomic_canonical::CanonicalNode, _> = serde_json::from_value(v);
     assert!(reload.is_err(), "an unknown field must be rejected on load");
 }
@@ -365,16 +380,12 @@ fn tampered_proof_metadata_fails_verification() {
 fn ref_edge_is_restricted_to_dependency_subset() {
     // MINOR fix: a :::ref sits on the dependency chain, so a non-dependency edge
     // (e.g. verifiedBy) must be rejected even though it is a valid edge elsewhere.
-    let good = format!(
-        "{BODY}\n\n:::ref{{to=urn:atomic:intent:other edge=blockedBy}}\n:::"
-    );
+    let good = format!("{BODY}\n\n:::ref{{to=urn:atomic:intent:other edge=blockedBy}}\n:::");
     let node = lift_intent(&frontmatter(), &good).unwrap();
     assert_eq!(node.depends_on.len(), 1);
     assert_eq!(node.depends_on[0].edge, "blockedBy");
 
-    let bad = format!(
-        "{BODY}\n\n:::ref{{to=urn:atomic:intent:other edge=verifiedBy}}\n:::"
-    );
+    let bad = format!("{BODY}\n\n:::ref{{to=urn:atomic:intent:other edge=verifiedBy}}\n:::");
     assert!(
         lift_intent(&frontmatter(), &bad).is_err(),
         "verifiedBy is not a dependency edge"

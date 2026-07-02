@@ -103,8 +103,7 @@ mod tests {
         match value {
             Value::Object(map) => {
                 for (key, v) in map {
-                    if !key.starts_with('@') && !terms.contains_key(key) && !missing.contains(key)
-                    {
+                    if !key.starts_with('@') && !terms.contains_key(key) && !missing.contains(key) {
                         missing.push(key.clone());
                     }
                     collect_missing(v, terms, missing);

@@ -64,12 +64,24 @@ pub struct MemoryNode {
     // no empty JSON-LD keys leak into the hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<String>,
-    #[serde(rename = "previousRevision", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "previousRevision",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub previous_revision: Option<String>,
 
-    #[serde(rename = "contentHash", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "contentHash",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub content_hash: Option<String>,
-    #[serde(rename = "attributedTo", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "attributedTo",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub attributed_to: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
@@ -120,10 +132,9 @@ pub fn lift_memory(frontmatter: &Map<String, Value>, body: &str) -> Result<Memor
         .ok_or_else(|| CanonicalError::Lift("memory frontmatter missing 'uid' (or 'id')".into()))?;
     let node_id = as_memory_urn(&uid);
 
-    let memory_kind = require_str(frontmatter, "memoryKind")
-        .or_else(|_| require_str(frontmatter, "kind"))?;
-    let status =
-        opt_str(frontmatter, "status").unwrap_or_else(|| "active".to_string());
+    let memory_kind =
+        require_str(frontmatter, "memoryKind").or_else(|_| require_str(frontmatter, "kind"))?;
+    let status = opt_str(frontmatter, "status").unwrap_or_else(|| "active".to_string());
 
     // Single authoring site: the first `:::memory` container's body is
     // authoritative; the surrounding prose is ignored. Only when no container
@@ -209,7 +220,8 @@ fn as_memory_urn(local: &str) -> String {
 }
 
 fn require_str(fm: &Map<String, Value>, key: &str) -> Result<String> {
-    opt_str(fm, key).ok_or_else(|| CanonicalError::Lift(format!("memory frontmatter missing '{key}'")))
+    opt_str(fm, key)
+        .ok_or_else(|| CanonicalError::Lift(format!("memory frontmatter missing '{key}'")))
 }
 
 fn opt_str(fm: &Map<String, Value>, key: &str) -> Option<String> {

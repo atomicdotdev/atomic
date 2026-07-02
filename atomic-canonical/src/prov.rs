@@ -93,7 +93,10 @@ pub fn provenance_graph(input: &ProvenanceInput) -> Value {
     if let Some(ended) = &input.ended_at {
         activity.insert("endedAtTime".into(), json!(ended));
     }
-    activity.insert("wasAssociatedWith".into(), json!(agent_iri(&input.agent_name)));
+    activity.insert(
+        "wasAssociatedWith".into(),
+        json!(agent_iri(&input.agent_name)),
+    );
     if !input.used.is_empty() {
         activity.insert("used".into(), json!(input.used));
     }
@@ -217,7 +220,10 @@ mod tests {
 
         let activity = find(&g, "urn:atomic:activity:session:inner-1");
         assert_eq!(activity["@type"], "Activity");
-        assert_eq!(activity["wasAssociatedWith"], "urn:atomic:agent:claude-code");
+        assert_eq!(
+            activity["wasAssociatedWith"],
+            "urn:atomic:agent:claude-code"
+        );
         assert_eq!(activity["generated"][0], "urn:atomic:change:W5GSLAVO");
         assert_eq!(activity["used"][0], "urn:atomic:intent:019efe85");
         assert_eq!(activity["partOfRun"], "urn:atomic:run:run-1");
@@ -267,7 +273,11 @@ mod tests {
         // …but the orchestrator's person edge is absent, not invented.
         let orchestrator = find(&g, "urn:atomic:agent:sherpa");
         assert!(orchestrator.get("actedOnBehalfOf").is_none());
-        assert!(g["@graph"].as_array().unwrap().iter().all(|n| n["@type"] != "Person"));
+        assert!(g["@graph"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["@type"] != "Person"));
     }
 
     #[test]

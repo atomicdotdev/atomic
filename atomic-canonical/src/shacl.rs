@@ -123,9 +123,7 @@ mod tests {
         if is_available() {
             true
         } else {
-            eprintln!(
-                "shacl tests SKIPPED — no pyshacl (set ATOMIC_PYSHACL or install pyshacl)"
-            );
+            eprintln!("shacl tests SKIPPED — no pyshacl (set ATOMIC_PYSHACL or install pyshacl)");
             false
         }
     }
@@ -150,7 +148,11 @@ mod tests {
             "status=met verifiedBy=did:atomic:lee evidence=urn:atomic:change:01J8ZE",
         );
         let report = validate_value(&value).unwrap();
-        assert!(report.conforms, "expected conformance, got:\n{}", report.report);
+        assert!(
+            report.conforms,
+            "expected conformance, got:\n{}",
+            report.report
+        );
     }
 
     #[test]
@@ -162,7 +164,10 @@ mod tests {
         // a bare checked box cannot pass the gate.
         let value = attested_intent("status=met");
         let report = validate_value(&value).unwrap();
-        assert!(!report.conforms, "a met AC without evidence must not conform");
+        assert!(
+            !report.conforms,
+            "a met AC without evidence must not conform"
+        );
         assert!(
             report.report.contains("verifiedBy and evidence"),
             "violation must come from the met-needs-evidence constraint:\n{}",
@@ -195,7 +200,11 @@ mod tests {
         let mut value = crate::proof::attest_memory(node, &id, &kp).to_value();
 
         let report = validate_value(&value).unwrap();
-        assert!(report.conforms, "valid memory must conform:\n{}", report.report);
+        assert!(
+            report.conforms,
+            "valid memory must conform:\n{}",
+            report.report
+        );
 
         value["memoryKind"] = serde_json::json!("vibe");
         let report = validate_value(&value).unwrap();
@@ -229,7 +238,11 @@ mod tests {
             person: Some("did:atomic:lee".into()),
         });
         let report = validate_value(&g).unwrap();
-        assert!(report.conforms, "PROV graph must conform:\n{}", report.report);
+        assert!(
+            report.conforms,
+            "PROV graph must conform:\n{}",
+            report.report
+        );
     }
 
     #[test]
@@ -247,7 +260,14 @@ mod tests {
             }]
         });
         let report = validate_value(&g).unwrap();
-        assert!(!report.conforms, "an activity with no agent must not conform");
-        assert!(report.report.contains("associated with an agent"), "{}", report.report);
+        assert!(
+            !report.conforms,
+            "an activity with no agent must not conform"
+        );
+        assert!(
+            report.report.contains("associated with an agent"),
+            "{}",
+            report.report
+        );
     }
 }

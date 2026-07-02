@@ -56,7 +56,11 @@ impl std::fmt::Display for ValidationReport {
         writeln!(f, "conforms: no ({} violation(s))", self.results.len())?;
         for v in &self.results {
             let path = v.path.as_deref().unwrap_or("-");
-            writeln!(f, "  ✗ [{}] {} ({}): {}", v.shape, v.focus_node, path, v.message)?;
+            writeln!(
+                f,
+                "  ✗ [{}] {} ({}): {}",
+                v.shape, v.focus_node, path, v.message
+            )?;
         }
         Ok(())
     }
@@ -378,7 +382,10 @@ mod tests {
         assert!(!report.conforms);
         for path in ["proof", "attributedTo", "text"] {
             assert!(
-                report.results.iter().any(|v| v.path.as_deref() == Some(path)),
+                report
+                    .results
+                    .iter()
+                    .any(|v| v.path.as_deref() == Some(path)),
                 "expected a violation on {path}"
             );
         }
