@@ -114,9 +114,10 @@ atomic vault memory show architecture
 To save new knowledge, write a markdown file to `.vault/memory/` and
 then run `atomic vault sync` to persist it to the database.
 
-## Version Control
+## Version Control (Read-Only)
 
-The vault is tracked by the same Atomic VCS as the code:
+The vault is tracked by the same Atomic VCS as the code. You inspect state
+and history — you do **not** write to version control yourself:
 
 ```
 # Check repo status
@@ -128,6 +129,24 @@ atomic log
 # Show working copy diff
 atomic diff
 ```
+
+## Views and Recording Are Not Yours to Manage
+
+You do **not** create or switch views, and you do **not** run `atomic add`,
+`atomic record`, or `atomic insert` — the integration's hooks and the
+workflow orchestrator own all of that:
+
+- **Session start** puts you on the right view automatically (a forked
+  draft view, a provisioned sandbox view, or a managed run's declared
+  view — depending on how you were launched).
+- **Turn end** records automatically with full AI provenance (model,
+  session, decision graph).
+- **Session end** restores the original view.
+- **Merging into a shared view** (`atomic insert`) is a human/orchestrator
+  decision made at review time — never run it yourself.
+
+To review what the hooks recorded, use the read-only commands above
+(`atomic log`, `atomic diff`).
 
 ## Workflow
 
@@ -148,38 +167,28 @@ atomic diff
    atomic vault goal start --intent PROJ-1
    ```
 
-4. **Create a draft view** for isolated work:
-   ```
-   atomic view create <goal-name> --draft
-   atomic view switch <goal-name>
-   ```
-
-5. **Search and explore** using grep + knowledge graph together:
+4. **Search and explore** using grep + knowledge graph together:
    ```
    grep "worker_threads" --type rs
    atomic vault query search "worker_threads Builder"
    atomic vault query neighbors "entity:src/builder.rs:worker_threads:42"
    ```
 
-6. **Make changes** using read, edit, write tools
+5. **Make changes** using read, edit, write tools. Recording happens
+   automatically at turn end — do not run `atomic record`.
 
-7. **Record** your changes:
+6. **Sync vault edits** after changing any vault markdown file:
    ```
-   atomic record -m "Add max_worker_threads option to Builder"
+   atomic vault sync
    ```
 
-8. **Stop the goal** when done:
+7. **Stop the goal** when done:
    ```
    atomic vault goal stop --promote
    ```
 
-9. **Review**: The draft view stays alive for review.
+8. **Review** what was recorded (read-only):
    ```
-   atomic view switch <goal-name>
+   atomic log
    atomic diff
    ```
-
-10. **Merge** when approved:
-    ```
-    atomic insert from-view <goal-name> --to-view dev
-    ```
