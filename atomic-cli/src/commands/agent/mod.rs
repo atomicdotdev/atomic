@@ -42,6 +42,7 @@ mod disable;
 mod enable;
 mod explain;
 mod hooks;
+mod lifecycle;
 mod status;
 
 use clap::{Args, Subcommand};
@@ -53,6 +54,7 @@ pub use attest::Attest;
 pub use disable::Disable;
 pub use enable::Enable;
 pub use explain::Explain;
+pub use lifecycle::Lifecycle;
 pub use status::AgentStatus;
 
 // Agent Command
@@ -191,6 +193,14 @@ pub enum AgentCommands {
     /// ```
     Attest(Attest),
 
+    /// Declare managed runs for orchestrated agents.
+    ///
+    /// Used by outer orchestrators such as Sherpa/noname before launching an
+    /// ACP executor. While a run is active, participating hooks adopt the
+    /// run's declared view and stamp their sessions with the run context —
+    /// nothing is suppressed; `lifecycle end --json` returns the run summary.
+    Lifecycle(Lifecycle),
+
     /// Internal hook handlers (called by agent hooks).
     ///
     /// These commands are invoked by the hooks installed in agent
@@ -211,6 +221,7 @@ impl Command for Agent {
             AgentCommands::Status(cmd) => cmd.run(),
             AgentCommands::Explain(cmd) => cmd.run(),
             AgentCommands::Attest(cmd) => cmd.run(),
+            AgentCommands::Lifecycle(cmd) => cmd.run(),
             AgentCommands::Hooks(cmd) => cmd.run(),
         }
     }

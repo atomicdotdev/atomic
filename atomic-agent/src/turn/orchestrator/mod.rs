@@ -73,8 +73,40 @@ use crate::error::AgentResult;
 use crate::event::{HookType, TurnEvent};
 use crate::record::TurnRecordOutcome;
 use crate::turn::phase::Phase;
-use crate::turn::session::SessionStore;
+use crate::turn::session::{ManagedRunStamp, SessionStore};
 use crate::watcher::{self, FileWatcher, WatcherConfig};
+
+// ═══════════════════════════════════════════════════════════════════════
+// ManagedRunContext
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Context for a managed lifecycle run, injected by the CLI hook handler.
+///
+/// When an outer orchestrator (e.g. Sherpa/noname) has declared a managed
+/// run via `atomic agent lifecycle begin`, the hook handler resolves the
+/// governing lifecycle and passes its context here. The orchestrator then:
+///
+/// - stamps every session it CREATES with [`ManagedRunStamp`] (sessions
+///   that already existed are never re-attributed), and
+/// - if the run declares a `view`, new sessions ADOPT that view instead of
+///   forking a fresh haikunator view, so recorded changes land where the
+///   run owner expects them.
+///
+/// Hooks are never suppressed under a managed run — every participant
+/// records through the same pipeline, and correlation lives in the stamp.
+#[derive(Clone, Debug)]
+pub struct ManagedRunContext {
+    /// The correlation stamp written onto sessions born under this run.
+    pub stamp: ManagedRunStamp,
+
+    /// View declared by the run owner. New sessions adopt it (fork-from-
+    /// current mechanics with a deterministic name). `None` — sessions fork
+    /// their usual per-session view and are only stamped.
+    ///
+    /// Inside a sandbox the provisioned sandbox view always wins; a
+    /// conflicting declared view is logged and ignored.
+    pub view: Option<String>,
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // DispatchResult
@@ -209,6 +241,12 @@ pub struct TurnOrchestrator {
 
     /// Human-readable agent display name (e.g., "Claude Code").
     pub(crate) agent_display_name: String,
+
+    /// Managed-run context, when a governing lifecycle covers this hook.
+    ///
+    /// Set by the CLI hook handler via [`set_managed_run`](Self::set_managed_run).
+    /// `None` for direct agent usage — behavior is unchanged.
+    pub(crate) managed_run: Option<ManagedRunContext>,
 }
 
 impl TurnOrchestrator {
@@ -239,6 +277,7 @@ impl TurnOrchestrator {
             watcher,
             agent_name: "unknown".to_string(),
             agent_display_name: "Unknown Agent".to_string(),
+            managed_run: None,
         })
     }
 
@@ -257,6 +296,7 @@ impl TurnOrchestrator {
             watcher,
             agent_name: "unknown".to_string(),
             agent_display_name: "Unknown Agent".to_string(),
+            managed_run: None,
         }
     }
 
@@ -268,6 +308,26 @@ impl TurnOrchestrator {
     pub fn set_agent(&mut self, name: impl Into<String>, display_name: impl Into<String>) {
         self.agent_name = name.into();
         self.agent_display_name = display_name.into();
+    }
+
+    /// Attach the managed-run context for this hook invocation.
+    ///
+    /// Called by the CLI hook handler when a governing managed lifecycle
+    /// covers the hook's working directory. Sessions created during this
+    /// dispatch are stamped with the run context and, if the run declares a
+    /// view, adopt it instead of forking (see [`ManagedRunContext`]).
+    pub fn set_managed_run(&mut self, context: ManagedRunContext) {
+        self.managed_run = Some(context);
+    }
+
+    /// The view declared by the governing managed run, if any.
+    pub(crate) fn managed_view(&self) -> Option<&str> {
+        self.managed_run.as_ref().and_then(|m| m.view.as_deref())
+    }
+
+    /// The stamp to write onto sessions born under the managed run.
+    pub(crate) fn managed_stamp(&self) -> Option<ManagedRunStamp> {
+        self.managed_run.as_ref().map(|m| m.stamp.clone())
     }
 
     /// Returns the repository root path.
