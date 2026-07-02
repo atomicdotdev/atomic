@@ -57,6 +57,14 @@ pub fn lift_intent(frontmatter: &Map<String, Value>, body: &str) -> Result<Canon
     let mut constraint_n = 0usize;
 
     for d in &directives {
+        // Inline (and nested-leaf) `:ref` children of any container sit on the
+        // intent's dependency chain, same rules as a top-level `:::ref`. The
+        // container prose keeps the inline mention verbatim.
+        for child in &d.children {
+            if child.name == "ref" {
+                deps.push(lift_ref(child)?);
+            }
+        }
         match d.name.as_str() {
             "why" => {
                 // Single authoring site: first `:::why` wins; the reason is
@@ -375,6 +383,24 @@ Do not touch the global keyboard handler.
         // No @type/@id emitted when the directive carries no #id.
         assert!(node.depends_on[0].type_.is_none());
         assert!(node.depends_on[0].id.is_none());
+    }
+
+    #[test]
+    fn lifts_inline_ref_from_why_prose() {
+        let body = ":::why\nLocal-only per :ref[the storage constraint]{to=urn:atomic:memory:01J8ZC edge=depends}, not a profile system.\n:::";
+        let node = lift_intent(&fm(), body).unwrap();
+        // The reason keeps the inline mention verbatim…
+        assert!(node.why.as_deref().unwrap().contains(":ref[the storage constraint]"));
+        // …and the edge lands on the dependency chain, typed and validated.
+        assert_eq!(node.depends_on.len(), 1);
+        assert_eq!(node.depends_on[0].to, "urn:atomic:memory:01J8ZC");
+        assert_eq!(node.depends_on[0].edge, "depends");
+    }
+
+    #[test]
+    fn inline_ref_with_bad_edge_is_error() {
+        let body = ":::why\nsee :ref[x]{to=urn:atomic:memory:1 edge=verifiedBy}\n:::";
+        assert!(lift_intent(&fm(), body).is_err());
     }
 
     #[test]

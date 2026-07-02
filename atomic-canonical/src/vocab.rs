@@ -60,6 +60,21 @@ pub const DIRECTIVE_NAMES: &[&str] = &[
     "memory",              // container: carries a memory's body text
 ];
 
+/// Inline directive names (`:name[label]{attrs}` inside running prose).
+///
+/// Inline recognition is registry-gated the *other* way around from block
+/// directives: prose is the unconstrained slot, so a colon-pattern whose name
+/// is not registered here stays prose (never an error) — otherwise writing
+/// `did:atomic:lee[sic]` in a reason would be a parse failure. Only registered
+/// names lift; the closed-vocabulary property still holds for everything that
+/// reaches the graph.
+pub const INLINE_DIRECTIVE_NAMES: &[&str] = &["ref"];
+
+/// Is this an inline directive name the system lifts from prose?
+pub fn is_known_inline_directive(name: &str) -> bool {
+    INLINE_DIRECTIVE_NAMES.contains(&name)
+}
+
 /// Memory kinds (closed set; mirrors `MemoryShape` `sh:in`). Exactly one.
 pub const MEMORY_KIND: &[&str] = &["constraint", "preference", "lesson", "context"];
 
