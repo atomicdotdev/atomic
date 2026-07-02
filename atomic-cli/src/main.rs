@@ -68,6 +68,7 @@ use commands::{
     Insert,
     Intent,
     Log,
+    Memory,
     Move,
     ProjectCmd,
     Pull,
@@ -720,6 +721,28 @@ enum Commands {
     #[command(name = "intent")]
     Intent(Intent),
 
+    /// Record the "why" for durable context: lift, validate, attest, and render
+    /// canonical memories.
+    ///
+    /// A sibling of the raw `atomic vault memory` tree, driving the
+    /// `atomic-canonical` engine for MEMORIES. Attestations are persisted
+    /// additively as tracked vault entries.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Scaffold a directive-based memory
+    /// atomic memory new --kind constraint
+    ///
+    /// # Gate it against the canonical shapes
+    /// atomic memory validate 01j8zc4r8t
+    ///
+    /// # Sign it into a tracked attestation
+    /// atomic memory attest 01j8zc4r8t
+    /// ```
+    #[command(name = "memory")]
+    Memory(Memory),
+
     /// Remove the last change from the current view.
     ///
     /// The change is removed from the view's change log but NOT deleted
@@ -843,6 +866,8 @@ fn main() {
         Commands::Vault(vault) => vault.run(),
 
         Commands::Intent(intent) => intent.run(),
+
+        Commands::Memory(memory) => memory.run(),
     };
 
     // Handle errors with user-friendly output
