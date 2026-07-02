@@ -41,6 +41,7 @@ pub mod node;
 pub mod proof;
 pub mod prov;
 pub mod render;
+pub mod shacl;
 pub mod vocab;
 
 pub use error::{CanonicalError, Result};

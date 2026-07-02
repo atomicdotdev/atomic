@@ -13,6 +13,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 data-encoding = { workspace = true }
 atomic-identity = { workspace = true }

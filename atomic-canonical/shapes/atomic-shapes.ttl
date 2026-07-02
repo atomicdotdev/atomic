@@ -1,0 +1,191 @@
+# SHACL shapes for the Recording-the-Why canonical nodes — the formal gate.
+#
+# These are real SHACL (evaluated by pyshacl over the JSON-LD projection),
+# the tier-2 companion to the always-on Rust gate in `gate.rs`:
+#   tier 1 (gate.rs)  — fast, in-process, runs in the agent inner loop;
+#   tier 2 (this file) — authoritative W3C SHACL conformance, run at status
+#                        transitions / CI via `shacl.rs`.
+#
+# The two tiers enforce the same rules; this file is the portable,
+# regulator-readable statement of them. Presence is enforced, content is
+# left honest: nothing here grades the prose of a why or a memory.
+
+@prefix sh:   <http://www.w3.org/ns/shacl#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix atom: <https://atomic.dev/ns#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix sec:  <https://w3id.org/security#> .
+
+# Prefix declarations for SPARQL-based constraints.
+<https://atomic.dev/ns/shapes> a owl:Ontology ;
+    sh:declare [ sh:prefix "atom" ; sh:namespace "https://atomic.dev/ns#"^^xsd:anyURI ] ;
+    sh:declare [ sh:prefix "sec" ; sh:namespace "https://w3id.org/security#"^^xsd:anyURI ] .
+
+#####################################################################
+# IntentShape — the gate for atom:Intent
+#####################################################################
+atom:IntentShape
+    a sh:NodeShape ;
+    sh:targetClass atom:Intent ;
+
+    # status: closed vocabulary, exactly one. The ontology refusing any
+    # value it does not recognize.
+    sh:property [
+        sh:path atom:status ;
+        sh:in ( "backlog" "todo" "in_progress" "done" ) ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:message "status must be exactly one of the known states" ;
+    ] ;
+
+    # authorship must be an identity IRI (a DID), not free text. The
+    # stronger sh:class prov:Agent check needs the identity graph joined
+    # in — that lands with the store-backed resolver.
+    sh:property [
+        sh:path atom:attributedTo ;
+        sh:minCount 1 ;
+        sh:nodeKind sh:IRI ;
+        sh:message "attributedTo must be an identity IRI (did:...), not a string" ;
+    ] ;
+
+    # a cryptographic proof must be present.
+    sh:property [
+        sh:path sec:proof ;
+        sh:minCount 1 ;
+        sh:message "intent must carry a Data Integrity proof" ;
+    ] ;
+
+    # the why must exist. Presence enforced; content honest — no shape on
+    # the prose itself, ever.
+    sh:property [
+        sh:path atom:why ;
+        sh:minCount 1 ;
+        sh:minLength 1 ;
+        sh:message "the why must exist (an empty why we can see beats a fake why we trust)" ;
+    ] ;
+
+    # every acceptance criterion must itself satisfy its shape.
+    sh:property [
+        sh:path atom:hasAcceptanceCriterion ;
+        sh:node atom:AcceptanceCriterionShape ;
+    ] .
+
+#####################################################################
+# AcceptanceCriterionShape — a checked box must carry its evidence
+#####################################################################
+atom:AcceptanceCriterionShape
+    a sh:NodeShape ;
+    sh:targetClass atom:AcceptanceCriterion ;
+
+    sh:property [
+        sh:path atom:acStatus ;
+        sh:in ( "open" "met" ) ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:message "acStatus must be 'open' or 'met'" ;
+    ] ;
+
+    # The load-bearing rule (SHACL-SPARQL): if it is met, it must say who
+    # verified it and link the evidence. A bare checked box cannot pass.
+    sh:sparql [
+        a sh:SPARQLConstraint ;
+        sh:message "a met acceptance criterion must carry verifiedBy and evidence" ;
+        sh:prefixes <https://atomic.dev/ns/shapes> ;
+        sh:select """
+            SELECT $this WHERE {
+                $this atom:acStatus "met" .
+                FILTER NOT EXISTS {
+                    $this atom:verifiedBy ?who .
+                    $this atom:evidence   ?ev .
+                }
+            }
+        """ ;
+    ] .
+
+#####################################################################
+# MemoryShape — durable context with a typed kind and a revision chain
+#####################################################################
+atom:MemoryShape
+    a sh:NodeShape ;
+    sh:targetClass atom:Memory ;
+
+    sh:property [
+        sh:path atom:memoryKind ;
+        sh:in ( "constraint" "preference" "lesson" "context" ) ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:message "memory kind must be one of the known types" ;
+    ] ;
+
+    sh:property [
+        sh:path atom:status ;
+        sh:in ( "active" "superseded" "retracted" ) ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:message "memory status must be one of the known states" ;
+    ] ;
+
+    sh:property [
+        sh:path atom:text ;
+        sh:minCount 1 ;
+        sh:minLength 1 ;
+        sh:message "memory must carry its text (presence enforced; content honest)" ;
+    ] ;
+
+    sh:property [
+        sh:path atom:attributedTo ;
+        sh:minCount 1 ;
+        sh:nodeKind sh:IRI ;
+        sh:message "author must be an identity IRI" ;
+    ] ;
+
+    sh:property [
+        sh:path sec:proof ;
+        sh:minCount 1 ;
+        sh:message "memory must carry a Data Integrity proof" ;
+    ] .
+
+#####################################################################
+# PROV projection shapes — the provenance graph stays well-formed
+#####################################################################
+atom:ActivityShape
+    a sh:NodeShape ;
+    sh:targetClass prov:Activity ;
+
+    sh:property [
+        sh:path prov:wasAssociatedWith ;
+        sh:minCount 1 ;
+        sh:nodeKind sh:IRI ;
+        sh:message "every activity must be associated with an agent" ;
+    ] ;
+
+    sh:property [
+        sh:path prov:startedAtTime ;
+        sh:datatype xsd:dateTime ;
+        sh:maxCount 1 ;
+        sh:message "startedAtTime must be an xsd:dateTime" ;
+    ] ;
+
+    sh:property [
+        sh:path prov:endedAtTime ;
+        sh:datatype xsd:dateTime ;
+        sh:maxCount 1 ;
+        sh:message "endedAtTime must be an xsd:dateTime" ;
+    ] .
+
+atom:SoftwareAgentShape
+    a sh:NodeShape ;
+    sh:targetClass prov:SoftwareAgent ;
+
+    sh:property [
+        sh:path atom:agentName ;
+        sh:minCount 1 ;
+        sh:message "a software agent must carry its registry name" ;
+    ] ;
+
+    sh:property [
+        sh:path prov:actedOnBehalfOf ;
+        sh:nodeKind sh:IRI ;
+        sh:message "delegation must point at an agent/person IRI" ;
+    ] .

@@ -19,6 +19,9 @@ pub enum CanonicalError {
     #[error("signature verification failed: {0}")]
     Verification(String),
 
+    #[error("shacl validation error: {0}")]
+    Shacl(String),
+
     #[error("identity error: {0}")]
     Identity(#[from] atomic_identity::IdentityError),
 }
