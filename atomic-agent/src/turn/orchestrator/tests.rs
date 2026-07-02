@@ -954,3 +954,41 @@ async fn test_preexisting_session_is_not_restamped() {
         "pre-existing sessions keep their own view"
     );
 }
+
+#[tokio::test]
+async fn test_sandbox_session_files_land_in_canonical_store() {
+    // Regression: sessions written by the REAL constructor (the hooks path)
+    // must land in the canonical .atomic/sessions — not in a throwaway
+    // .atomic/ inside the sandbox working tree — or `lifecycle end`'s
+    // stamp harvest never sees sandbox sessions.
+    let canonical = TempDir::new().unwrap();
+    let mut repo = Repository::init(canonical.path()).unwrap();
+    let user_view = repo.current_view().to_string();
+    repo.create_view_from("agent-sbx2", &user_view).unwrap();
+
+    let sandbox_dir = TempDir::new().unwrap();
+    repo.provision_sandbox(sandbox_dir.path(), "agent-sbx2")
+        .unwrap();
+    drop(repo);
+
+    let mut orch = TurnOrchestrator::new(sandbox_dir.path()).await.unwrap();
+    orch.set_agent("codex", "Codex");
+    orch.dispatch(session_start_event("sess-canon"))
+        .await
+        .unwrap();
+
+    assert!(
+        canonical
+            .path()
+            .join(".atomic/sessions/sess-canon.json")
+            .is_file(),
+        "sandbox session must be stored in the canonical session store"
+    );
+    assert!(
+        !sandbox_dir
+            .path()
+            .join(".atomic/sessions/sess-canon.json")
+            .exists(),
+        "sandbox session must not be stranded in a sandbox-local .atomic"
+    );
+}

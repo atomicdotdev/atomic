@@ -266,7 +266,18 @@ impl TurnOrchestrator {
     pub async fn new(repo_root: impl Into<PathBuf>) -> AgentResult<Self> {
         let repo_root = repo_root.into();
 
-        let session_store = SessionStore::for_repo(&repo_root)?;
+        // Sessions are canonical metadata, not working-tree state. Inside a
+        // sandbox `repo_root` is the sandbox working tree, which has no graph
+        // of its own — writing session files under it strands them (and their
+        // attestations/run stamps) in a throwaway `.atomic/` that dies with
+        // the sandbox, and `lifecycle end`'s harvest (which scans the
+        // canonical session store for run stamps) never sees them. Resolve
+        // through the sandbox pointer; for a normal repository this is the
+        // same `.atomic`.
+        let session_store = match atomic_repository::Repository::canonical_dot_dir(&repo_root) {
+            Ok(dot_dir) => SessionStore::new(dot_dir.join("sessions"))?,
+            Err(_) => SessionStore::for_repo(&repo_root)?,
+        };
 
         let watcher_config = WatcherConfig::new(&repo_root);
         let watcher = watcher::create_watcher(watcher_config).await?;
