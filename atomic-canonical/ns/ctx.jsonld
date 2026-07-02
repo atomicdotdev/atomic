@@ -1,0 +1,82 @@
+{
+  "@context": {
+    "@version": 1.1,
+    "atom": "https://atomic.dev/ns#",
+    "prov": "http://www.w3.org/ns/prov#",
+    "sec": "https://w3id.org/security#",
+    "xsd": "http://www.w3.org/2001/XMLSchema#",
+
+    "Intent": "atom:Intent",
+    "AcceptanceCriterion": "atom:AcceptanceCriterion",
+    "Task": "atom:Task",
+    "ScopeItem": "atom:ScopeItem",
+    "Constraint": "atom:Constraint",
+    "Ref": "atom:Ref",
+    "Memory": "atom:Memory",
+
+    "humanKey": "atom:humanKey",
+    "title": "atom:title",
+    "status": "atom:status",
+    "priority": "atom:priority",
+    "view": "atom:view",
+    "why": "atom:why",
+    "text": "atom:text",
+    "contentHash": "atom:contentHash",
+    "createdAt": { "@id": "atom:createdAt", "@type": "xsd:dateTime" },
+    "attributedTo": { "@id": "atom:attributedTo", "@type": "@id" },
+
+    "motivatedBy": { "@id": "atom:motivatedBy", "@type": "@id" },
+    "informedBy": { "@id": "atom:informedBy", "@type": "@id" },
+    "hasAcceptanceCriterion": "atom:hasAcceptanceCriterion",
+    "hasTask": "atom:hasTask",
+    "hasScopeIn": "atom:hasScopeIn",
+    "hasScopeOut": "atom:hasScopeOut",
+    "hasConstraint": "atom:hasConstraint",
+    "dependsOn": "atom:dependsOn",
+
+    "acStatus": "atom:acStatus",
+    "verifiedBy": { "@id": "atom:verifiedBy", "@type": "@id" },
+    "evidence": { "@id": "atom:evidence", "@type": "@id" },
+
+    "taskStatus": "atom:taskStatus",
+    "touchesFile": "atom:touchesFile",
+    "satisfies": { "@id": "atom:satisfies", "@type": "@id" },
+
+    "to": { "@id": "atom:to", "@type": "@id" },
+    "edge": "atom:edge",
+
+    "memoryKind": "atom:memoryKind",
+    "about": { "@id": "atom:about", "@type": "@id" },
+    "supersedes": { "@id": "atom:supersedes", "@type": "@id" },
+    "previousRevision": { "@id": "atom:previousRevision", "@type": "@id" },
+
+    "proof": "sec:proof",
+    "DataIntegrityProof": "sec:DataIntegrityProof",
+    "cryptosuite": "sec:cryptosuite",
+    "verificationMethod": { "@id": "sec:verificationMethod", "@type": "@id" },
+    "proofPurpose": "sec:proofPurpose",
+    "proofValue": "sec:proofValue",
+
+    "Activity": "prov:Activity",
+    "SoftwareAgent": "prov:SoftwareAgent",
+    "Person": "prov:Person",
+    "wasAssociatedWith": { "@id": "prov:wasAssociatedWith", "@type": "@id" },
+    "actedOnBehalfOf": { "@id": "prov:actedOnBehalfOf", "@type": "@id" },
+    "used": { "@id": "prov:used", "@type": "@id" },
+    "generated": { "@id": "prov:generated", "@type": "@id" },
+    "startedAtTime": { "@id": "prov:startedAtTime", "@type": "xsd:dateTime" },
+    "endedAtTime": { "@id": "prov:endedAtTime", "@type": "xsd:dateTime" },
+
+    "sessionId": "atom:sessionId",
+    "runId": "atom:runId",
+    "agentName": "atom:agentName",
+    "agentDisplayName": "atom:agentDisplayName",
+    "model": "atom:model",
+    "vendor": "atom:vendor",
+    "turnCount": { "@id": "atom:turnCount", "@type": "xsd:integer" },
+    "turnParent": { "@id": "atom:turnParent", "@type": "@id" },
+    "partOfRun": { "@id": "atom:partOfRun", "@type": "@id" },
+    "ownerSessionId": "atom:ownerSessionId",
+    "workItem": { "@id": "atom:workItem", "@type": "@id" }
+  }
+}

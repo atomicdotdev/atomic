@@ -29,6 +29,7 @@
 //! any attested node is trusted in a real/shared setting.
 
 pub mod did;
+pub mod context;
 pub mod directive;
 pub mod error;
 pub mod gate;
@@ -38,6 +39,7 @@ pub mod lift;
 pub mod memory;
 pub mod node;
 pub mod proof;
+pub mod prov;
 pub mod render;
 pub mod vocab;
 
