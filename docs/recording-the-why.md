@@ -210,6 +210,12 @@ XML has the properties we need (draconian parsing, XSD schemas, C14N canonicaliz
 
 JSON-LD gives us `@type` for node types, `@id` for stable identity, typed references as first-class edges, JSON Schema for validation, and JCS (RFC 8785\) for deterministic bytes to hash. Agents emit JSON well under load. And because JSON-LD is RDF, we get the PROV vocabulary for provenance and the Data Integrity proof standard for signing, both of which are native to the linked-data ecosystem.
 
+### **Where an attestation lives**
+
+An attestation is now a first-class **tracked vault entry** (entry_type `attestation`) at `attestations/<intent-id>/attested.md`, not a loose sidecar. Its body is the signed JSON-LD node exactly as produced by the lift-and-sign step. The vault's storage hash over that entry stays `blake3(body)` — the same content-addressed primitive every other vault entry uses — and the node's own `contentHash` and `eddsa-jcs-2022` proof live *inside* that body, opaque to the storage hash. Two independent digests, two independent jobs: the storage hash tells the vault whether the bytes on disk match what was recorded, and the node's `contentHash` + proof tell a verifier whether the signed facts are intact and who signed them.
+
+Because it's a tracked entry, an attestation flows through the ordinary `atomic record` path and lands in the change graph like anything else — the patch graph stays canonical, and there is no triplestore. The triple view remains a projection we compute and discard. During the transition an attestation is dual-written to the legacy `.atomic/canonical/intents/<intent-id>/attested.jsonld` sidecar as well, and readers prefer the tracked entry, falling back to the sidecar so pre-upgrade attestations keep verifying.
+
 ### **The lift**
 
 The lift is a typed extractor that reads the authored markdown and produces canonical nodes. Frontmatter keys map to spine properties. Directive names map to node types. Directive attributes map to typed properties and edges. Prose inside directive fences becomes the unconstrained text slot. Everything the lift doesn't have a rule for stays in the body as unlifted narrative, and that's correct, because the moment you try to schematize the why you're back to the Copilot Summary failure.

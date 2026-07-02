@@ -2,7 +2,10 @@
 
 use clap::Parser;
 
+use serde_json::Value;
+
 use atomic_canonical::{lift_and_attest, validate_intent, verify};
+use atomic_core::pristine::VaultEntryType;
 use atomic_identity::IdentityStore;
 use atomic_repository::Repository;
 
@@ -109,10 +112,13 @@ impl Command for IntentAttest {
             message: format!("attested intent failed self-verification: {e}"),
         })?;
 
+        // --- Legacy sidecar dual-write (transition) ---------------------------
         // Persist the attested node as a sidecar under `.atomic/` — NOT into
         // redb, NOT into the .vault/ tree, NOT via any VaultEntry write. This
-        // never touches content_hash or the manifest merkle.
-        let sidecar_path = bridge::attested_sidecar_path(&repo, &self.id);
+        // never touches content_hash or the manifest merkle. Kept during the
+        // transition so pre-upgrade readers keep working; `load_attestation`
+        // prefers the tracked entry below and shadows this copy.
+        let sidecar_path = bridge::attested_sidecar_path(&repo, &self.id)?;
         if let Some(parent) = sidecar_path.parent() {
             std::fs::create_dir_all(parent).map_err(CliError::Io)?;
         }
@@ -137,6 +143,46 @@ impl Command for IntentAttest {
         )
         .map_err(CliError::Io)?;
 
+        // --- Tracked vault entry (new authoritative source) -------------------
+        // Store JUST the attested node (not the {node,source} wrapper) as the
+        // body, so it parses straight back to a CanonicalNode on read.
+        let mut body = serde_json::to_string_pretty(&node.to_value())
+            .expect("canonical node serialization is infallible");
+        // serde pretty JSON has NO trailing newline; render_entry_to_markdown
+        // appends one to any body not ending in '\n'. Pre-appending it here makes
+        // materialize a byte-identity transform on the body, so the first
+        // vault_scan sees Hash::of(body) == stored blake3(content) == Unchanged.
+        body.push('\n');
+        let content_bytes = body.into_bytes();
+
+        // Frontmatter anchors — FLAT SCALAR strings only, so they survive
+        // yaml_frontmatter_to_json (which only round-trips `key: scalar/array`
+        // lines; a nested object would be mangled). sourceContentHash/vaultPath
+        // contain ':' and '/' but no ": " (colon-space), so write_frontmatter_field
+        // emits them bare and they round-trip cleanly.
+        let mut fm = serde_json::Map::new();
+        fm.insert(
+            "intentId".into(),
+            Value::String(bridge::normalized_id(&repo, &self.id)?),
+        );
+        fm.insert(
+            "sourceContentHash".into(),
+            Value::String(bridge::source_content_hash(&inputs)),
+        );
+        if let Some(vp) = bridge::vault_path_for(&repo, &self.id)? {
+            fm.insert("vaultPath".into(), Value::String(vp));
+        }
+        let frontmatter_json = serde_json::to_string(&fm).unwrap();
+
+        let vault_path = bridge::attestation_vault_path(&repo, &self.id)?;
+        repo.vault_store(
+            &vault_path,
+            VaultEntryType::Attestation,
+            content_bytes,
+            frontmatter_json,
+        )
+        .map_err(CliError::Repository)?;
+
         let did = node
             .attributed_to
             .as_deref()
@@ -154,6 +200,7 @@ impl Command for IntentAttest {
             println!("{}", serde_json::to_string_pretty(&node.to_value()).unwrap());
         } else {
             println!("Attested intent: {}", self.id);
+            println!("  vault:     .vault/{vault_path}");
             println!("  sidecar:   {}", sidecar_path.display());
             println!("  author:    {did}");
             println!("  proof:     {proof_prefix}…");
