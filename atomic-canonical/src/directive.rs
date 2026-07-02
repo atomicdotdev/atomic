@@ -2,11 +2,17 @@
 //!
 //! The body's typed structure is explicit and local: the lift reads a node's
 //! type off the directive name, never off heading position (the fragile
-//! "positional lift" the doc rejects). M0 supports:
+//! "positional lift" the doc rejects). All three directive forms are supported:
 //!   - container: `:::name{#id key=value ...}` … prose … `:::`
 //!   - leaf:      `::name{key=value ...}`  (edges only, no body)
+//!   - inline:    `:name[label]{key=value ...}`  (names a node inside prose)
 //!
-//! Inline directives are deferred (not needed for the Intent slice).
+//! Inline directives are recognized *inside container prose* and surface as
+//! children of the container while the prose keeps them verbatim — the graph
+//! stores the edge, the render resolves it (reference, don't embed). Because
+//! prose is the unconstrained slot, an inline pattern whose name is not in
+//! [`vocab::INLINE_DIRECTIVE_NAMES`] stays prose instead of erroring (a reason
+//! mentioning `did:atomic:lee` or `foo:bar[0]` must never fail the lift).
 
 use std::collections::BTreeMap;
 
@@ -21,7 +27,9 @@ pub struct Directive {
     pub attrs: BTreeMap<String, String>,
     /// Prose inside a container directive (trimmed). Empty for leaf directives.
     pub body: String,
-    /// Leaf directives nested inside this container (e.g. `::file-ref`).
+    /// The `[label]` of an inline directive. `None` for container/leaf forms.
+    pub label: Option<String>,
+    /// Leaf and inline directives nested inside this container.
     pub children: Vec<Directive>,
 }
 
@@ -77,11 +85,16 @@ pub fn parse(body: &str) -> Result<Vec<Directive>> {
                     "unterminated container directive ':::{name}' (missing closing ':::')"
                 )));
             }
+            let body = body_lines.join("\n").trim().to_string();
+            // Inline directives inside the prose surface as children; the
+            // prose keeps them verbatim (store the edge, render resolves it).
+            children.extend(parse_inline(&body)?);
             out.push(Directive {
                 name,
                 id,
                 attrs,
-                body: body_lines.join("\n").trim().to_string(),
+                body,
+                label: None,
                 children,
             });
         } else if trimmed.starts_with("::") {
@@ -112,8 +125,85 @@ fn parse_leaf(line: &str) -> Result<Option<Directive>> {
         id,
         attrs,
         body: String::new(),
+        label: None,
         children: Vec::new(),
     }))
+}
+
+/// Extract inline directives (`:name[label]{attrs}`) from running prose.
+///
+/// Recognition rules keep prose safe:
+/// - the `:` must sit at a word boundary (start of text, or after a
+///   non-alphanumeric character) — so `did:atomic:lee` never matches;
+/// - the name must be immediately followed by `[label]` — a bare `:word`
+///   is prose;
+/// - the name must be in the inline registry — `:unknown[x]` stays prose,
+///   because prose is the unconstrained slot.
+pub fn parse_inline(text: &str) -> Result<Vec<Directive>> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b':' {
+            i += 1;
+            continue;
+        }
+        // Word boundary: previous byte must not be alphanumeric or ':' (which
+        // would make this the tail of a URN/DID or a block-directive marker).
+        if i > 0 {
+            let prev = bytes[i - 1] as char;
+            if prev.is_ascii_alphanumeric() || prev == ':' {
+                i += 1;
+                continue;
+            }
+        }
+        // Read the name: [a-z0-9-]+ immediately after ':'.
+        let name_start = i + 1;
+        let mut j = name_start;
+        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'-') {
+            j += 1;
+        }
+        if j == name_start || j >= bytes.len() || bytes[j] != b'[' {
+            i += 1;
+            continue;
+        }
+        let name = &text[name_start..j];
+        if !vocab::is_known_inline_directive(name) {
+            i += 1;
+            continue;
+        }
+        // Label: up to the matching ']' (no nesting in labels).
+        let label_start = j + 1;
+        let Some(label_len) = text[label_start..].find(']') else {
+            return Err(CanonicalError::Directive(format!(
+                "unterminated inline directive ':{name}[' (missing closing ']')"
+            )));
+        };
+        let label = text[label_start..label_start + label_len].to_string();
+        let mut end = label_start + label_len + 1;
+        // Optional immediate `{attrs}`.
+        let mut attrs_src = "";
+        if bytes.get(end) == Some(&b'{') {
+            let Some(close) = text[end + 1..].find('}') else {
+                return Err(CanonicalError::Directive(format!(
+                    "unterminated inline directive ':{name}[…]{{' (missing closing '}}')"
+                )));
+            };
+            attrs_src = &text[end + 1..end + 1 + close];
+            end = end + 1 + close + 1;
+        }
+        let (id, attrs) = parse_attrs(attrs_src)?;
+        out.push(Directive {
+            name: name.to_string(),
+            id,
+            attrs,
+            body: String::new(),
+            label: Some(label),
+            children: Vec::new(),
+        });
+        i = end;
+    }
+    Ok(out)
 }
 
 fn check_known(name: &str) -> Result<()> {
@@ -233,5 +323,56 @@ mod tests {
     fn unterminated_container_is_error() {
         let body = ":::why{}\nno close here";
         assert!(parse(body).is_err());
+    }
+
+    // Inline directives
+
+    #[test]
+    fn inline_ref_in_container_prose_becomes_child() {
+        let body = ":::why\nWe follow :ref[the storage decision]{to=urn:atomic:memory:01J edge=depends} here.\n:::";
+        let ds = parse(body).unwrap();
+        let why = &ds[0];
+        // Prose keeps the inline verbatim (reference, don't embed).
+        assert!(why.body.contains(":ref[the storage decision]"));
+        assert_eq!(why.children.len(), 1);
+        let r = &why.children[0];
+        assert_eq!(r.name, "ref");
+        assert_eq!(r.label.as_deref(), Some("the storage decision"));
+        assert_eq!(r.attr("to"), Some("urn:atomic:memory:01J"));
+        assert_eq!(r.attr("edge"), Some("depends"));
+    }
+
+    #[test]
+    fn inline_parse_extracts_multiple() {
+        let text = "see :ref[a]{to=urn:atomic:intent:1 edge=depends} and :ref[b]{to=urn:atomic:intent:2 edge=blockedBy}";
+        let ds = parse_inline(text).unwrap();
+        assert_eq!(ds.len(), 2);
+        assert_eq!(ds[0].label.as_deref(), Some("a"));
+        assert_eq!(ds[1].attr("edge"), Some("blockedBy"));
+    }
+
+    #[test]
+    fn dids_urns_and_unregistered_names_stay_prose() {
+        // Colons inside identifiers must never match (word boundary), and an
+        // unregistered inline name is prose, not an error.
+        let text = "did:atomic:lee wrote urn:atomic:intent:x; :unknown[thing]{a=b} and foo:bar[0] stay prose";
+        let ds = parse_inline(text).unwrap();
+        assert!(ds.is_empty(), "got {ds:?}");
+    }
+
+    #[test]
+    fn inline_without_label_bracket_is_prose() {
+        let ds = parse_inline("a plain :ref mention with no bracket").unwrap();
+        assert!(ds.is_empty());
+    }
+
+    #[test]
+    fn unterminated_inline_label_is_error() {
+        assert!(parse_inline("bad :ref[never closed").is_err());
+    }
+
+    #[test]
+    fn unterminated_inline_attrs_is_error() {
+        assert!(parse_inline("bad :ref[x]{to=urn:atomic:intent:1").is_err());
     }
 }
