@@ -122,11 +122,8 @@ impl TurnOrchestrator {
             }
         };
 
-        // Stamp sessions born under a managed lifecycle with the run context.
-        // The stamp is the correlation edge the run owner queries later
-        // (`atomic agent lifecycle end --json`). Only sessions CREATED here
-        // are stamped — the early return above keeps pre-existing sessions
-        // out of the run's attribution.
+        // Only sessions CREATED here get the run stamp — the early return
+        // above keeps pre-existing sessions out of the run's attribution.
         if let Some(stamp) = self.managed_stamp() {
             log::info!(
                 "Session {} runs under managed lifecycle {} (owner: {})",
@@ -207,12 +204,9 @@ impl TurnOrchestrator {
                     let current = repo.current_view().to_string();
                     session.set_parent_view(&current);
 
-                    // Under a managed lifecycle the run owner declares the
-                    // view for this run — adopt it instead of forking a fresh
-                    // per-session view, so recorded changes land where the
-                    // owner expects them. Same fork-from-current mechanics,
-                    // deterministic name (create below tolerates "already
-                    // exists" for the second session of the same run).
+                    // Adopt the run's declared view instead of forking a
+                    // per-session one. `create` below tolerates "already
+                    // exists" for the second session of the same run.
                     if let Some(declared) = self.managed_view() {
                         log::info!(
                             "Session {} adopting managed-run view '{}' (declared by lifecycle)",
@@ -310,9 +304,8 @@ impl TurnOrchestrator {
                 let vendor = vendor_from_agent_name(&self.agent_name);
                 session.agent_vendor = vendor.to_string();
 
-                // Fallback-created sessions under a managed lifecycle carry
-                // the same stamp as ones created by session-start (this is
-                // the path an owner's turn-end-only fallback recording uses).
+                // Fallback-created sessions carry the same run stamp as
+                // session-start-created ones.
                 if let Some(stamp) = self.managed_stamp() {
                     session.managed_run = Some(stamp);
                 }
@@ -346,9 +339,8 @@ impl TurnOrchestrator {
                         );
                         session.view_name = current;
                     } else if let Some(declared) = self.managed_view() {
-                        // The managed run declares the view — adopt it with
-                        // the same fork-from-current mechanics as
-                        // handle_session_start.
+                        // Adopt the run's declared view (same mechanics
+                        // as handle_session_start).
                         log::info!(
                             "Fallback session {} adopting managed-run view '{}'",
                             session_id,

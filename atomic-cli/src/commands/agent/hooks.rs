@@ -172,11 +172,8 @@ impl Command for Hooks {
             e
         })?;
 
-        // Resolve the managed run governing this hook, if any. Hooks are
-        // never suppressed: under a managed lifecycle the session ADOPTS the
-        // run's declared view and is STAMPED with the run context, so the
-        // owner can correlate recorded changes without stealing or dropping
-        // anyone's provenance.
+        // Resolve the managed run governing this hook, if any — hooks are
+        // never suppressed, sessions adopt the run's view + stamp.
         let managed = super::lifecycle::find_governing_lifecycle_for_hook(&self.agent_name);
         if let Some(lc) = &managed {
             log::info!(

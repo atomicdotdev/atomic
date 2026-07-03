@@ -1,36 +1,17 @@
 //! Managed lifecycle declarations for orchestrated agent runs.
 //!
-//! An outer orchestrator such as Sherpa/noname can wrap an ACP executor
-//! (codex-acp, claude-acp, …). `atomic agent lifecycle begin` declares that
-//! run: who owns it, which executor performs it, which view the work should
-//! land on, and which working directory it covers.
+//! `lifecycle begin` declares a run (owner, executor, view, workdir). Hooks
+//! are never suppressed: sessions created under a governing run **adopt**
+//! its declared view and are **stamped** with the run context; `lifecycle
+//! end --json` harvests the summary from those stamps.
 //!
-//! Hooks are **never suppressed** under a managed lifecycle. Instead, hooks
-//! whose working directory falls inside a declared run:
+//! Lifecycles are keyed by `run_id` (one JSON file each) so concurrent runs
+//! coexist; hooks resolve the governing run by longest-matching `workdir`.
+//! The store lives in the *canonical* `.atomic` (resolved through the
+//! sandbox pointer) so sandbox hooks see project-root lifecycles.
 //!
-//! - **adopt** the run's declared view for new sessions (instead of forking a
-//!   per-session view), and
-//! - **stamp** those sessions with the run context (`managed_run` on the
-//!   session file) — the PROV `actedOnBehalfOf` edge.
-//!
-//! Every participant records through the same pipeline; correlation lives in
-//! the data, not in a lock. `lifecycle end --json` harvests the run summary
-//! (sessions, views, recorded change hashes) from the stamps.
-//!
-//! # Concurrency
-//!
-//! Lifecycles are keyed by `run_id` — one JSON file per run under
-//! `<canonical .atomic>/agent-lifecycle/`. Concurrent runs (e.g. three
-//! sandboxed builds plus an in-repo research run) coexist; hooks resolve the
-//! governing run by longest-matching `workdir`. The store lives in the
-//! *canonical* `.atomic` (resolved through the sandbox pointer), so hooks
-//! firing inside a sandbox see lifecycles declared at the project root.
-//!
-//! # Leases
-//!
-//! `expires_at` is crash protection, not a session limit: an orchestrator
-//! that dies without calling `end` leaves a lease that expires on its own.
-//! Expired lifecycles are ignored and opportunistically cleaned up.
+//! `expires_at` is crash protection, not a session limit: a dead
+//! orchestrator's lease expires on its own and is cleaned up lazily.
 
 use std::fs;
 use std::path::{Path, PathBuf};

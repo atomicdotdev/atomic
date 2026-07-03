@@ -80,31 +80,19 @@ use crate::watcher::{self, FileWatcher, WatcherConfig};
 // ManagedRunContext
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Context for a managed lifecycle run, injected by the CLI hook handler.
+/// Context for a managed lifecycle run (`atomic agent lifecycle begin`),
+/// injected by the CLI hook handler.
 ///
-/// When an outer orchestrator (e.g. Sherpa/noname) has declared a managed
-/// run via `atomic agent lifecycle begin`, the hook handler resolves the
-/// governing lifecycle and passes its context here. The orchestrator then:
-///
-/// - stamps every session it CREATES with [`ManagedRunStamp`] (sessions
-///   that already existed are never re-attributed), and
-/// - if the run declares a `view`, new sessions ADOPT that view instead of
-///   forking a fresh haikunator view, so recorded changes land where the
-///   run owner expects them.
-///
-/// Hooks are never suppressed under a managed run — every participant
-/// records through the same pipeline, and correlation lives in the stamp.
+/// Sessions CREATED under the run are stamped with [`ManagedRunStamp`] and
+/// adopt the declared view; pre-existing sessions are never re-attributed.
 #[derive(Clone, Debug)]
 pub struct ManagedRunContext {
     /// The correlation stamp written onto sessions born under this run.
     pub stamp: ManagedRunStamp,
 
-    /// View declared by the run owner. New sessions adopt it (fork-from-
-    /// current mechanics with a deterministic name). `None` — sessions fork
-    /// their usual per-session view and are only stamped.
-    ///
-    /// Inside a sandbox the provisioned sandbox view always wins; a
-    /// conflicting declared view is logged and ignored.
+    /// View declared by the run owner; `None` = sessions fork their usual
+    /// per-session view. Inside a sandbox the provisioned sandbox view
+    /// always wins over a conflicting declared view.
     pub view: Option<String>,
 }
 
@@ -242,10 +230,8 @@ pub struct TurnOrchestrator {
     /// Human-readable agent display name (e.g., "Claude Code").
     pub(crate) agent_display_name: String,
 
-    /// Managed-run context, when a governing lifecycle covers this hook.
-    ///
-    /// Set by the CLI hook handler via [`set_managed_run`](Self::set_managed_run).
-    /// `None` for direct agent usage — behavior is unchanged.
+    /// Managed-run context when a governing lifecycle covers this hook;
+    /// `None` for direct agent usage (behavior unchanged).
     pub(crate) managed_run: Option<ManagedRunContext>,
 }
 
@@ -266,14 +252,9 @@ impl TurnOrchestrator {
     pub async fn new(repo_root: impl Into<PathBuf>) -> AgentResult<Self> {
         let repo_root = repo_root.into();
 
-        // Sessions are canonical metadata, not working-tree state. Inside a
-        // sandbox `repo_root` is the sandbox working tree, which has no graph
-        // of its own — writing session files under it strands them (and their
-        // attestations/run stamps) in a throwaway `.atomic/` that dies with
-        // the sandbox, and `lifecycle end`'s harvest (which scans the
-        // canonical session store for run stamps) never sees them. Resolve
-        // through the sandbox pointer; for a normal repository this is the
-        // same `.atomic`.
+        // Sessions must live in the canonical `.atomic`, not a sandbox's
+        // throwaway one — `lifecycle end` harvests run stamps from the
+        // canonical session store. Same directory for a normal repository.
         let session_store = match atomic_repository::Repository::canonical_dot_dir(&repo_root) {
             Ok(dot_dir) => SessionStore::new(dot_dir.join("sessions"))?,
             Err(_) => SessionStore::for_repo(&repo_root)?,
@@ -321,12 +302,8 @@ impl TurnOrchestrator {
         self.agent_display_name = display_name.into();
     }
 
-    /// Attach the managed-run context for this hook invocation.
-    ///
-    /// Called by the CLI hook handler when a governing managed lifecycle
-    /// covers the hook's working directory. Sessions created during this
-    /// dispatch are stamped with the run context and, if the run declares a
-    /// view, adopt it instead of forking (see [`ManagedRunContext`]).
+    /// Attach the managed-run context for this hook invocation
+    /// (see [`ManagedRunContext`]).
     pub fn set_managed_run(&mut self, context: ManagedRunContext) {
         self.managed_run = Some(context);
     }

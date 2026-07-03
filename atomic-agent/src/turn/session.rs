@@ -63,18 +63,10 @@ use crate::turn::phase::Phase;
 
 // ManagedRunStamp
 
-/// Correlation stamp for sessions born under a managed lifecycle.
-///
-/// When an outer orchestrator (e.g. Sherpa/noname) declares a run via
-/// `atomic agent lifecycle begin`, every session created inside that run's
-/// workdir is stamped with the run context. The stamp is the queryable edge
-/// between the orchestrator's run and the sessions/changes it produced —
-/// the PROV `actedOnBehalfOf` chain: this agent's activity was performed
-/// on behalf of `owner_agent`'s run `run_id`.
-///
-/// Sessions that already existed when the lifecycle began are NOT stamped —
-/// the stamp marks sessions born within the run, so a user's own concurrent
-/// direct session is never attributed to the orchestrator.
+/// Correlation stamp for sessions born under a managed lifecycle
+/// (`atomic agent lifecycle begin`) — the edge between the orchestrator's
+/// run and the sessions/changes it produced. Pre-existing sessions are
+/// never stamped, so a concurrent direct session is not attributed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedRunStamp {
     /// The managed run id (from `lifecycle begin`).
@@ -222,11 +214,8 @@ pub struct AgentSession {
     #[serde(default)]
     pub recorded_change_hashes: Vec<atomic_core::types::Hash>,
 
-    /// Managed-run stamp, set when this session was created under a managed
-    /// lifecycle (see [`ManagedRunStamp`]). `None` for direct agent sessions.
-    ///
-    /// `atomic agent lifecycle end --json` scans session files for this stamp
-    /// to build the run summary (sessions, views, recorded change hashes).
+    /// Managed-run stamp when created under a managed lifecycle; `None` for
+    /// direct sessions. `lifecycle end --json` harvests runs from this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_run: Option<ManagedRunStamp>,
 }
