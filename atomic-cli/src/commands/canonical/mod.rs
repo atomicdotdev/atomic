@@ -69,6 +69,50 @@ pub(crate) fn resolve_signing_identity(
     Ok((identity, keypair))
 }
 
+/// Resolve `urn:atomic:change:<hash>` evidence URNs against the change
+/// store at `repo_root`. Returns one violation per URN that does not
+/// resolve. With no repository (`None`) the check is skipped — the gate
+/// still enforces presence; resolution needs a change store.
+pub(crate) fn check_evidence_resolution(
+    evidence: &[(String, String)],
+    repo_root: Option<&std::path::Path>,
+) -> Vec<atomic_canonical::gate::Violation> {
+    use atomic_core::types::{Base32, Hash};
+
+    let mut violations = Vec::new();
+    if evidence.is_empty() {
+        return violations;
+    }
+    let Some(root) = repo_root else {
+        eprintln!("note: evidence resolution skipped — not inside an Atomic repository");
+        return violations;
+    };
+    let repo = match atomic_repository::Repository::open_readonly(root) {
+        Ok(repo) => repo,
+        Err(e) => {
+            eprintln!("note: evidence resolution skipped — cannot open repository: {e}");
+            return violations;
+        }
+    };
+    for (focus, urn) in evidence {
+        let Some(hash_str) = urn.strip_prefix("urn:atomic:change:") else {
+            continue; // non-change URNs are out of scope here
+        };
+        let resolved = Hash::from_base32(hash_str.as_bytes())
+            .map(|h| repo.has_change(&h))
+            .unwrap_or(false);
+        if !resolved {
+            violations.push(atomic_canonical::gate::Violation {
+                focus_node: focus.clone(),
+                shape: "EvidenceResolution".to_string(),
+                path: Some("evidence".to_string()),
+                message: format!("evidence {urn} does not resolve to a change in this repository"),
+            });
+        }
+    }
+    violations
+}
+
 /// Shared validate output: tier-1 (always) + tier-2 (when requested).
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct ValidateOutput {
@@ -186,4 +230,43 @@ pub(crate) fn write_new_file(path: &std::path::Path, content: &str) -> CliResult
 
 pub(crate) fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::check_evidence_resolution;
+
+    fn ev(urn: &str) -> Vec<(String, String)> {
+        vec![("urn:atomic:ac:x-ac-1".to_string(), urn.to_string())]
+    }
+
+    #[test]
+    fn no_repo_skips_without_violations() {
+        let v = check_evidence_resolution(&ev("urn:atomic:change:AAAA"), None);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn unresolvable_urn_in_repo_is_a_violation() {
+        let dir = tempfile::tempdir().unwrap();
+        atomic_repository::Repository::init(dir.path()).unwrap();
+        let v = check_evidence_resolution(
+            &ev("urn:atomic:change:XXX5YG4CV4XJL7JV3RRK6RHLJRTA4BW5ET4AACFDTKZQEMYJYGCQ"),
+            Some(dir.path()),
+        );
+        assert_eq!(v.len(), 1);
+        assert!(
+            v[0].message.contains("does not resolve"),
+            "{}",
+            v[0].message
+        );
+    }
+
+    #[test]
+    fn non_change_urns_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        atomic_repository::Repository::init(dir.path()).unwrap();
+        let v = check_evidence_resolution(&ev("urn:atomic:intent:abc"), Some(dir.path()));
+        assert!(v.is_empty());
+    }
 }

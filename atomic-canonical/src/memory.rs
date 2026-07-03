@@ -127,6 +127,7 @@ impl MemoryNode {
 /// container directive if present (single authoring site), else falls back to
 /// the whole trimmed body.
 pub fn lift_memory(frontmatter: &Map<String, Value>, body: &str) -> Result<MemoryNode> {
+    crate::directive::check_embedded_directives(body)?;
     let uid = opt_str(frontmatter, "uid")
         .or_else(|| opt_str(frontmatter, "id"))
         .ok_or_else(|| CanonicalError::Lift("memory frontmatter missing 'uid' (or 'id')".into()))?;

@@ -133,7 +133,21 @@ impl Validate {
         let (identity, keypair) =
             resolve_signing_identity(self.identity.as_deref(), self.password.as_deref())?;
         let attested = proof::attest(node, &identity, &keypair);
-        let report = gate::validate_intent(&attested);
+        let mut report = gate::validate_intent(&attested);
+
+        // Evidence URNs must resolve to real changes when a repository is
+        // reachable; presence alone is checked by the gate.
+        let evidence: Vec<(String, String)> = attested
+            .has_acceptance_criterion
+            .iter()
+            .filter_map(|ac| ac.evidence.clone().map(|e| (ac.id.clone(), e)))
+            .collect();
+        let repo_root = crate::commands::find_repository_root().ok();
+        let extra = super::check_evidence_resolution(&evidence, repo_root.as_deref());
+        if !extra.is_empty() {
+            report.conforms = false;
+            report.results.extend(extra);
+        }
         finish_validate(
             "intent",
             report,

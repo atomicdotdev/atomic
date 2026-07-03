@@ -17,7 +17,6 @@
 //! Engine resolution: `ATOMIC_PYSHACL` env var, else `pyshacl` on PATH.
 //! Callers use [`is_available`] to decide whether tier 2 can run here.
 
-use std::io::Write;
 use std::process::{Command, Stdio};
 
 use serde_json::Value;
