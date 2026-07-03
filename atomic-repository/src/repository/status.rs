@@ -88,20 +88,9 @@ impl Repository {
         for result in tree_iter {
             let (path, inode) = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-            // View filter: files whose creating change is not on the
-            // current view belong to other views. When such a file is
-            // absent from the working copy it is skipped entirely — it
-            // must not appear in this view's status (e.g. as Deleted).
-            //
-            // But when the working copy HAS the file (it was re-created
-            // on this view after a switch), it is new content FOR THIS
-            // VIEW and must classify as Added. Skipping it here opened a
-            // permanent gap: `add` refuses it (the TREE already tracks
-            // it) while status called it untracked-and-clean, so `record`
-            // could never see it again. Fall through with has_graph=false
-            // so the classifier reports Added. The extra disk stat only
-            // runs for cross-view files, which exist on disk only after a
-            // re-create — rare.
+            // Cross-view entries are hidden from this view unless the file
+            // exists on disk again. In that case it is new content for the
+            // current view and should classify as Added.
             let has_graph = if let Ok(Some(position)) = txn.inode_position(inode) {
                 if let Some(ref ids) = current_view_change_ids {
                     if !position.change.is_root() && !ids.contains(&position.change) {

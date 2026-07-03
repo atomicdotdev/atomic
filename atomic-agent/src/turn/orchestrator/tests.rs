@@ -772,13 +772,6 @@ fn test_orchestrator_debug() {
 
 #[tokio::test]
 async fn test_file_recorded_on_another_view_records_again_on_new_view() {
-    // Regression (found doing real work in a real repo): the tracking TREE
-    // is global, but status's tree scan SKIPPED files whose creating change
-    // is not visible on the current view. A file recorded by an earlier
-    // session on ANOTHER view, then re-created on disk under a new view,
-    // fell into a permanent gap: status called it untracked-and-clean while
-    // `add` refused it (TREE already tracks it) — so `record` could never
-    // see it again (false EmptyTurn forever).
     let dir = TempDir::new().unwrap();
     Repository::init(dir.path()).unwrap();
 
@@ -800,12 +793,10 @@ async fn test_file_recorded_on_another_view_records_again_on_new_view() {
     assert!(ra.was_recorded(), "session A must record shared.rs");
     orch_a.dispatch(session_end_event("sess-A")).await.unwrap();
 
-    // Session end re-materializes the parent view; shared.rs (recorded only
-    // on session A's view) leaves the working tree. Tolerate either.
+    // Session A's file should not be present on the parent view.
     let _ = fs::remove_file(dir.path().join("shared.rs"));
 
-    // Session B on a NEW view: turn 1 records something else (the view now
-    // exists), turn 2 re-creates the SAME file session A recorded.
+    // Session B re-creates the same path on a different view.
     let store_b = SessionStore::for_repo(dir.path()).unwrap();
     let watcher_b = FallbackWatcher::new(WatcherConfig::new(dir.path()));
     let mut orch_b = TurnOrchestrator::with_watcher(dir.path(), store_b, Box::new(watcher_b));
