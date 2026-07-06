@@ -59,6 +59,7 @@ rayon = "1.10"
 fastcdc = "3.1"
 
 # Hashing & Crypto
+bs58 = "0.5"
 blake3 = "1.5"
 ed25519-dalek = { version = "2.1", features = ["serde"] }
 rand = "0.8"
