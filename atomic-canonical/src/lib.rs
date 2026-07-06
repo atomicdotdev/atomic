@@ -28,6 +28,7 @@
 //! **non-production dev identities**. Key-at-rest encryption must land before
 //! any attested node is trusted in a real/shared setting.
 
+pub mod context;
 pub mod did;
 pub mod directive;
 pub mod error;

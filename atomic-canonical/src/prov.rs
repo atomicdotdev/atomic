@@ -1,12 +1,21 @@
-//! W3C PROV projection — a signed PROV JSON-LD named subgraph over one turn's
-//! provenance.
+//! W3C PROV projection — a PROV JSON-LD named subgraph over one turn's provenance.
 //!
 //! This is a **projection** of provenance atomic already captures (a per-turn
 //! `ProvenanceGraph`), NOT new capture. Given a plain input struct describing a
 //! turn's activity, [`project`] builds the named-subgraph JSON-LD described in
-//! `docs/recording-the-why.md` §"A provenance graph", and [`attest_prov`] /
-//! [`verify_prov`] sign and verify it through the *same* canonicalization/signing
-//! path every other node type uses ([`crate::proof::attest_value`]).
+//! the "Recording the Why" baseline §"A provenance graph".
+//!
+//! ## Unsigned by default; **signable** on demand
+//! Per the baseline, the provenance graph is "one addressable, **signable** unit
+//! you can hand to an auditor whole" — *signable*, not *signed*. It is a derived
+//! view whose `used`/`generated` edges point at already-signed primaries
+//! (intents, memories, changes), and its own chain integrity comes from
+//! `turnParent` hash-linking — so the default projection carries **no** proof
+//! envelope. [`attest_prov`] / [`verify_prov`] are the opt-in "signable" path:
+//! when you need a standalone, tamper-evident bundle, they sign/verify the graph
+//! through the *same* canonicalization/signing path every other node type uses
+//! ([`crate::proof::attest_value`]), which injects a top-level
+//! `attributedTo`/`contentHash`/`proof` bound to the signing Person.
 //!
 //! ## Layering
 //! This module — like the rest of `atomic-canonical` — is **`atomic-core`
@@ -15,29 +24,25 @@
 //! ProvActivityInput` mapping (and all base32/`Hash` handling) lives at the
 //! `atomic-cli` boundary. Do not add `use atomic_core::` here.
 //!
-//! ## Two deliberate divergences from the doc example
-//! 1. **Agent id is a URN, not a DID.** The doc example (recording-the-why.md
-//!    lines 322/333) shows `did:atomic:agent:claude`. That is illustrative and
-//!    *wrong* per the hard scope: `did:atomic:<..>` is a key **fingerprint**, not
-//!    a name (see [`crate::did`]). The `SoftwareAgent` here is a NON-VERIFIABLE
-//!    descriptive label, so its `@id` is `urn:atomic:agent:<slug>`. Only the
-//!    **person's** key signs the whole `@graph`; nothing about the agent is
-//!    signed-as-an-identity.
-//! 2. **A top-level `attributedTo` (+ `contentHash`/`proof`) envelope.** The
-//!    doc `@graph` has no top-level `attributedTo`; [`crate::proof::attest_value`]
-//!    injects one from the signer's `did:atomic` (the Person), and we ACCEPT it
-//!    rather than build a bespoke signing path that skips the injection. It is
-//!    semantically correct (that is who signed and on whose behalf the activity
-//!    ran), consistent with Intent/Memory nodes, and — being inside the
-//!    hashing/signing view — strengthens the artifact by binding the whole
-//!    subgraph to the signer. The signed artifact's top level therefore carries
-//!    `@context`, `@id`, `@graph`, `attributedTo`, `contentHash`, `proof`, with
-//!    the PROV nodes inside `@graph`.
+//! ## Agent id is a URN, not a DID (W3C DID-Core compliance)
+//! The baseline example writes the `SoftwareAgent` as `did:atomic:agent:claude`.
+//! We deliberately emit `urn:atomic:agent:<slug>` instead. A `did:` identifier
+//! must resolve to a DID Document with verification material (DID-Core); a
+//! keyless agent has none, so a `did:atomic:agent:<name>` would be a
+//! non-resolvable *fake* DID — and it is not even a valid `did:atomic`, which is
+//! a key fingerprint `base32(blake3(pubkey))` (see [`crate::did`]). PROV-O admits
+//! any IRI for an agent, so a `urn:` is the honest, spec-compliant choice for a
+//! non-verifiable descriptive label. When agents are issued their own keypairs,
+//! the correct `@id` becomes a real resolvable `did:key` — never
+//! `did:atomic:agent:`. Only the **Person's** key signs (in the signable path).
 //!
-//! ## The flywheel `used` edge is DEFERRED
-//! The activity's `used` edge (what the turn pulled from the vault) is emitted as
-//! an EMPTY array literal (`"used": []`). It is intentionally not populated in
-//! this slice and is not an input field.
+//! ## The flywheel `used` edge
+//! The activity's `used` edge (the intents/memories/vault state the turn pulled)
+//! is a first-class, populated field ([`ProvActivityInput::used`]). Following the
+//! baseline's "unknown links are omitted, never invented", it is emitted only
+//! when non-empty. Today the `atomic-core` capture records no structured inputs,
+//! so the mapping supplies an empty set until the capture records them (a
+//! separate capture-path change); the projection itself is ready.
 
 use atomic_identity::identity::Identity;
 use atomic_identity::keypair::{KeyPair, PublicKey};
@@ -75,10 +80,14 @@ pub struct ProvActivityInput {
     pub person_did: String,
     /// `urn:atomic:change:<base32>` for each explained change (PROV `generated`).
     pub generated: Vec<String>,
+    /// What the turn `used` — `urn:atomic:intent:<..>` / `urn:atomic:memory:<..>`
+    /// (and, eventually, vault-state refs) the activity pulled in. The flywheel
+    /// input edge. Emitted only when non-empty (unknown links are omitted, never
+    /// invented); empty until the capture records structured inputs.
+    pub used: Vec<String>,
     /// `urn:atomic:activity:<parent-activity-id>` (PROV `wasInformedBy` /
     /// `turnParent`), or `None` to omit the key entirely.
     pub turn_parent: Option<String>,
-    // `used: []` is DEFERRED — intentionally NOT a field.
 }
 
 /// `urn:atomic:change:<base32>` for a change hash's base32 form.
@@ -139,9 +148,12 @@ pub fn project(input: &ProvActivityInput) -> Value {
     activity.insert("associatedWith".into(), json!(agent_id));
     activity.insert("actedOnBehalfOf".into(), json!(input.person_did));
     activity.insert("generated".into(), json!(input.generated));
-    // Flywheel `used` edge DEFERRED — emit an explicit empty array literal.
-    activity.insert("used".into(), json!([]));
-    // wasInformedBy — omit the key entirely when there is no parent turn.
+    // Flywheel `used` edge — emitted only when non-empty (unknown omitted, never
+    // invented). Empty until the capture records structured inputs.
+    if !input.used.is_empty() {
+        activity.insert("used".into(), json!(input.used));
+    }
+    // turnParent — omit the key entirely when there is no parent turn.
     if let Some(parent) = &input.turn_parent {
         activity.insert("turnParent".into(), json!(parent));
     }
@@ -151,7 +163,9 @@ pub fn project(input: &ProvActivityInput) -> Value {
     agent.insert("@type".into(), json!("prov:SoftwareAgent"));
     agent.insert("@id".into(), json!(agent_id));
     agent.insert("actedOnBehalfOf".into(), json!(input.person_did));
-    agent.insert("prov:label".into(), json!(input.agent_display_name));
+    // Human label as rdfs:label (there is no prov:label in PROV-O); the ctx maps
+    // the `label` term to rdfs:label.
+    agent.insert("label".into(), json!(input.agent_display_name));
     if let Some(vendor) = &input.agent_vendor {
         agent.insert("vendor".into(), json!(vendor));
     }
@@ -214,6 +228,10 @@ mod tests {
             agent_vendor: Some("anthropic".into()),
             person_did: person_did.into(),
             generated: vec![change_urn("CHANGEBASE32")],
+            used: vec![
+                "urn:atomic:intent:019efe85".into(),
+                "urn:atomic:memory:01J8ZC4R8T".into(),
+            ],
             turn_parent: Some(activity_urn("session-000")),
         }
     }
@@ -267,10 +285,13 @@ mod tests {
             activity.get("generated"),
             Some(&json!(["urn:atomic:change:CHANGEBASE32"]))
         );
-        // `used` is present and an EMPTY array (flywheel deferred).
+        // `used` is populated (the flywheel input edge).
         assert_eq!(
-            activity.get("used").and_then(Value::as_array).map(Vec::len),
-            Some(0)
+            activity.get("used"),
+            Some(&json!([
+                "urn:atomic:intent:019efe85",
+                "urn:atomic:memory:01J8ZC4R8T"
+            ]))
         );
         assert_eq!(
             activity.get("turnParent").and_then(Value::as_str),
@@ -282,7 +303,7 @@ mod tests {
         let agent_id = agent.get("@id").and_then(Value::as_str).unwrap();
         assert!(agent_id.starts_with("urn:atomic:agent:"));
         assert!(!agent_id.starts_with("did:"));
-        assert_eq!(agent.get("prov:label").and_then(Value::as_str), Some("Claude Code"));
+        assert_eq!(agent.get("label").and_then(Value::as_str), Some("Claude Code"));
         assert_eq!(agent.get("vendor").and_then(Value::as_str), Some("anthropic"));
 
         // Person @id == the real did:atomic.
@@ -297,6 +318,7 @@ mod tests {
         input.agent_vendor = None;
         input.started_at = None;
         input.ended_at = None;
+        input.used = Vec::new();
 
         let value = project(&input);
         let activity = node_of_type(&value, "prov:Activity");
@@ -304,8 +326,8 @@ mod tests {
         assert!(activity.get("turnParent").is_none());
         assert!(activity.get("prov:startedAtTime").is_none());
         assert!(activity.get("prov:endedAtTime").is_none());
-        // But `used` is still present as an empty array.
-        assert!(activity.get("used").is_some());
+        // `used` is omitted when empty (unknown links omitted, never invented).
+        assert!(activity.get("used").is_none());
 
         let agent = node_of_type(&value, "prov:SoftwareAgent");
         assert!(agent.get("vendor").is_none());
@@ -364,5 +386,21 @@ mod tests {
         assert_eq!(normalize_agent_slug("Claude-Code"), "claude");
         assert_eq!(normalize_agent_slug("codex"), "codex");
         assert_eq!(normalize_agent_slug(""), "");
+    }
+
+    /// Every bare key the projection emits — including the signed envelope
+    /// (`attributedTo`/`contentHash`/`proof`/…) — must be defined in the shipped
+    /// `@context`, so the emitted JSON is real, resolvable RDF (the closed-registry
+    /// discipline applied to the PROV projection).
+    #[test]
+    fn every_projected_key_is_defined_in_the_context() {
+        let (id, kp) = dev_identity();
+        let person = crate::did::did_for_public_key(&id.public_key);
+        let signed = attest_prov(&sample_input(&person), &id, &kp);
+        let undefined = crate::context::undefined_terms(&signed);
+        assert!(
+            undefined.is_empty(),
+            "these projected keys have no @context term: {undefined:?}"
+        );
     }
 }

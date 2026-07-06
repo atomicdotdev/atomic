@@ -5,9 +5,10 @@
 //!
 //! These prove the PROJECTION path end-to-end:
 //!   1. a REAL `ProvenanceGraph` is persisted with `repo.save_provenance_graph`,
-//!   2. `atomic provenance show --json` projects + signs it on the fly,
-//!   3. the emitted PROV JSON-LD parses and its proof verifies via `verify_prov`
-//!      against the resolved identity's public key,
+//!   2. `atomic provenance show` projects it UNSIGNED on the fly (the baseline's
+//!      "signable, not signed" default),
+//!   3. `atomic provenance show --sign` emits the signable artifact, and its proof
+//!      verifies via `verify_prov` against the resolved identity's public key,
 //!   4. `atomic provenance trace` prints the human flywheel chain, and
 //!   5. compute-on-demand: no new files appear and the provenance-graph count is
 //!      unchanged after trace/show.
@@ -119,7 +120,7 @@ fn repo_with_internal_change(repo_dir: &Path, home_dir: &Path) -> Hash {
 }
 
 #[test]
-fn provenance_show_projects_signs_and_verifies_and_writes_nothing() {
+fn provenance_show_defaults_unsigned_and_sign_flag_verifies_and_writes_nothing() {
     let repo_tmp = TempDir::new().unwrap();
     let home_tmp = TempDir::new().unwrap();
     let repo_dir = repo_tmp.path();
@@ -182,11 +183,8 @@ fn provenance_show_projects_signs_and_verifies_and_writes_nothing() {
             change_hash.to_base32()
         )]))
     );
-    // used is present and EMPTY (flywheel deferred).
-    assert_eq!(
-        activity.get("used").and_then(Value::as_array).map(Vec::len),
-        Some(0)
-    );
+    // `used` is omitted when empty (unknown links omitted, never invented).
+    assert!(activity.get("used").is_none());
     let agent = graph_nodes
         .iter()
         .find(|n| n.get("@type").and_then(Value::as_str) == Some("prov:SoftwareAgent"))
@@ -195,17 +193,39 @@ fn provenance_show_projects_signs_and_verifies_and_writes_nothing() {
     assert_eq!(agent_id, "urn:atomic:agent:claude");
     assert!(!agent_id.starts_with("did:"), "agent id must NOT be a did");
     assert_eq!(
-        agent.get("prov:label").and_then(Value::as_str),
+        agent.get("label").and_then(Value::as_str),
         Some("Claude Code")
     );
 
-    // The proof verifies against the resolved identity's public key.
-    verify_prov(&value, &pubkey).expect("emitted PROV proof must verify");
-    // Top-level attributedTo == the signer's Person did (accepted injection).
+    // Default `show` is UNSIGNED — the baseline's "signable, not signed" unit.
+    assert!(value.get("proof").is_none(), "default show must be unsigned");
+    assert!(value.get("attributedTo").is_none());
+    assert!(value.get("contentHash").is_none());
+
+    // `show --sign` emits the SIGNABLE artifact: it verifies against the resolved
+    // key and carries the top-level attributedTo/contentHash/proof envelope.
+    let signed_out = atomic(
+        repo_dir,
+        home_dir,
+        &["provenance", "show", "--sign", &change_hash.to_base32()],
+    );
+    assert!(
+        signed_out.status.success(),
+        "provenance show --sign failed: {}",
+        String::from_utf8_lossy(&signed_out.stderr)
+    );
+    let signed: Value = serde_json::from_str(&String::from_utf8(signed_out.stdout).unwrap())
+        .expect("show --sign emits valid JSON-LD");
+    verify_prov(&signed, &pubkey).expect("signed PROV proof must verify");
     assert_eq!(
-        value.get("attributedTo").and_then(Value::as_str),
+        signed.get("attributedTo").and_then(Value::as_str),
         Some(did_for_public_key(&pubkey).as_str())
     );
+    assert!(signed.get("proof").is_some());
+    assert!(signed
+        .get("contentHash")
+        .and_then(Value::as_str)
+        .is_some_and(|h| h.starts_with("blake3:")));
 
     // `trace` — prints the human chain (change -> activity -> generated -> ...).
     let trace = atomic(

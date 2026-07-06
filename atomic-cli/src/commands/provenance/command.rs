@@ -1,10 +1,13 @@
 //! `atomic provenance {trace,show}` subcommand implementations.
 //!
 //! Both are READ-ONLY and COMPUTE-ON-DEMAND: they load the per-turn
-//! `ProvenanceGraph` atomic already captured, project it into a W3C PROV JSON-LD
-//! named subgraph, and (for `show`/`--json`) sign it on the fly with the person's
-//! identity. NOTHING is written — no vault entry, no sidecar, no
-//! `save_provenance_graph`, no content-hash/merkle touch.
+//! `ProvenanceGraph` atomic already captured and project it into a W3C PROV
+//! JSON-LD named subgraph. Per the baseline the graph is **signable, not signed**
+//! — the default JSON output is the unsigned projection; `--sign` produces the
+//! signable standalone artifact (a top-level `attributedTo`/`contentHash`/`proof`
+//! bound to the person's identity) for handing to an auditor. NOTHING is written
+//! either way — no vault entry, no sidecar, no `save_provenance_graph`, no
+//! content-hash/merkle touch.
 
 use clap::Parser;
 
@@ -24,46 +27,51 @@ use crate::output::{emphasis, hint, info};
 ///
 /// Walks the provenance graph for a change — the activity that generated it, the
 /// changes it generated, the agent and person involved, and the parent turn —
-/// and prints the human-readable chain. `--json` emits the signed PROV JSON-LD
-/// named subgraph instead (identical to `show --json`).
+/// and prints the human-readable chain. `--json` emits the PROV JSON-LD named
+/// subgraph instead (unsigned by default; add `--sign` for the signable artifact).
 #[derive(Parser, Debug)]
 #[command(name = "trace")]
 pub struct ProvenanceTrace {
     /// Change hash, hash prefix, or `urn:atomic:change:<base32>`.
     pub target: String,
 
-    /// Identity whose key signs the projection (for `--json`). Defaults to the
-    /// current default identity.
+    /// Identity whose key signs the projection (with `--json --sign`, and to
+    /// resolve the Person). Defaults to the current default identity.
     #[arg(long)]
     pub identity: Option<String>,
 
-    /// Emit the signed PROV JSON-LD `@graph` instead of the human chain.
+    /// Emit the PROV JSON-LD `@graph` instead of the human chain.
     #[arg(long)]
     pub json: bool,
+
+    /// With `--json`, emit the SIGNABLE artifact — sign the graph (top-level
+    /// `attributedTo`/`contentHash`/`proof`) instead of the plain projection.
+    #[arg(long)]
+    pub sign: bool,
 }
 
-/// Project (and sign) the PROV JSON-LD named subgraph for a change.
+/// Project the PROV JSON-LD named subgraph for a change.
 ///
-/// Default (and `--json`) prints the SIGNED PROV JSON-LD `@graph` — the
-/// verifiable artifact you hand an auditor. It carries a top-level
-/// `attributedTo`/`contentHash`/`proof` envelope injected by the shared signing
-/// path (the person's `did:atomic` signs the whole subgraph); this one-line
-/// divergence from the doc example is intentional and documented in
-/// `atomic-canonical`'s `prov` module.
+/// Prints the UNSIGNED projection by default — the baseline's "signable" unit,
+/// a derived view whose integrity comes from `turnParent` hash-linking and the
+/// already-signed primaries it references. `--sign` emits the SIGNABLE standalone
+/// artifact instead: a top-level `attributedTo`/`contentHash`/`proof` envelope
+/// injected by the shared signing path (the person's `did:atomic` signs the whole
+/// subgraph), for handing to an auditor as a self-verifying bundle.
 #[derive(Parser, Debug)]
 #[command(name = "show")]
 pub struct ProvenanceShow {
     /// Change hash, hash prefix, or `urn:atomic:change:<base32>`.
     pub target: String,
 
-    /// Identity whose key signs the projection. Defaults to the current default
-    /// identity.
+    /// Identity used to resolve the Person (and to sign with `--sign`). Defaults
+    /// to the current default identity.
     #[arg(long)]
     pub identity: Option<String>,
 
-    /// Emit the signed PROV JSON-LD `@graph` (the default for `show`).
+    /// Emit the SIGNABLE artifact — sign the graph instead of the plain projection.
     #[arg(long)]
-    pub json: bool,
+    pub sign: bool,
 }
 
 impl Command for ProvenanceTrace {
@@ -74,17 +82,22 @@ impl Command for ProvenanceTrace {
         let graphs = load_graphs(&repo, &change_hash)?;
 
         if self.json {
-            // Sign and emit, exactly like `show --json`.
+            // Emit the JSON-LD, exactly like `show` (unsigned by default; `--sign`
+            // for the signable artifact).
             let (identity, keypair) = resolve_person(self.identity.as_deref())?;
             let person_did = did_for_public_key(&identity.public_key);
-            let signed = graphs
+            let values = graphs
                 .iter()
                 .map(|(_, g)| {
                     let input = map_graph_to_input(&repo, g, &change_hash, &person_did);
-                    attest_prov(&input, &identity, &keypair)
+                    if self.sign {
+                        attest_prov(&input, &identity, &keypair)
+                    } else {
+                        project(&input)
+                    }
                 })
                 .collect::<Vec<_>>();
-            print_signed(&signed);
+            print_value(&values, self.sign);
             return Ok(());
         }
 
@@ -112,18 +125,19 @@ impl Command for ProvenanceShow {
         let (identity, keypair) = resolve_person(self.identity.as_deref())?;
         let person_did = did_for_public_key(&identity.public_key);
 
-        let signed = graphs
+        let values = graphs
             .iter()
             .map(|(_, g)| {
                 let input = map_graph_to_input(&repo, g, &change_hash, &person_did);
-                attest_prov(&input, &identity, &keypair)
+                if self.sign {
+                    attest_prov(&input, &identity, &keypair)
+                } else {
+                    project(&input)
+                }
             })
             .collect::<Vec<_>>();
 
-        // `show` always emits the signed JSON-LD artifact; `--json` is accepted
-        // as an explicit synonym so the two verbs share a flag.
-        let _ = self.json;
-        print_signed(&signed);
+        print_value(&values, self.sign);
         Ok(())
     }
 }
@@ -229,20 +243,23 @@ fn resolve_person(
     Ok((identity, keypair))
 }
 
-/// Print the signed PROV JSON-LD artifact(s) to stdout.
-fn print_signed(signed: &[serde_json::Value]) {
-    let out = if signed.len() == 1 {
-        serde_json::to_string_pretty(&signed[0])
+/// Print the PROV JSON-LD artifact(s) to stdout. When `signed`, add the
+/// dev-signature caveat (the signing path was used).
+fn print_value(values: &[serde_json::Value], signed: bool) {
+    let out = if values.len() == 1 {
+        serde_json::to_string_pretty(&values[0])
     } else {
-        serde_json::to_string_pretty(&signed)
+        serde_json::to_string_pretty(&values)
     }
-    .expect("signed PROV value serialization is infallible");
+    .expect("PROV value serialization is infallible");
     println!("{out}");
-    eprintln!(
-        "note: signing keys are stored unencrypted on disk; treat this \
-         projection as a non-production dev signature until key-at-rest \
-         encryption lands."
-    );
+    if signed {
+        eprintln!(
+            "note: signing keys are stored unencrypted on disk; treat this \
+             signed projection as a non-production dev signature until key-at-rest \
+             encryption lands."
+        );
+    }
 }
 
 /// Print the human-readable flywheel chain: change -> activity -> generated ->

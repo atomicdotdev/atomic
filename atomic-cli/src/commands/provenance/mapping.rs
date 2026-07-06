@@ -81,6 +81,12 @@ pub fn map_graph_to_input(
         agent_vendor,
         person_did: person_did.to_string(),
         generated,
+        // The flywheel `used` edge (intents/memories the turn pulled). The current
+        // `atomic_core::ProvenanceGraph` capture records no structured inputs —
+        // only `nodes`/`edges`/`changes_explained` — so we supply an empty set
+        // (the projection omits `used` rather than inventing edges). Populating it
+        // is gated on the capture recording inputs (a separate capture-path change).
+        used: Vec::new(),
         turn_parent,
     }
 }
