@@ -37,6 +37,7 @@ pub(crate) const LIFTED_INTENT_DIRECTIVES: &[&str] = &[
 
 /// Lift an intent from its frontmatter spine and markdown body.
 pub fn lift_intent(frontmatter: &Map<String, Value>, body: &str) -> Result<CanonicalNode> {
+    directive::check_embedded_directives(body)?;
     let human_key = require_str(frontmatter, "id")?;
     let uid = opt_str(frontmatter, "uid").unwrap_or_else(|| slug(&human_key));
     let node_id = format!("urn:atomic:intent:{uid}");

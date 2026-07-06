@@ -206,6 +206,84 @@ pub fn parse_inline(text: &str) -> Result<Vec<Directive>> {
     Ok(out)
 }
 
+/// Reject a REGISTERED directive name embedded mid-prose with an attrs
+/// brace (e.g. `… ::file-ref{path=x} …` inside a sentence). The block
+/// parser only reads directives at line start, so an embedded one would
+/// silently stay prose and its edge would be lost. Unregistered names stay
+/// prose (the inline rule); `std::fs` and `foo::ref{...}` never match — the
+/// colon run must not follow an identifier character.
+pub fn check_embedded_directives(text: &str) -> Result<()> {
+    let mut in_fence = false;
+    for raw_line in text.lines() {
+        let line = strip_html_comments(raw_line);
+        let t = line.trim_start();
+        if t.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        // Lines the block parser handles itself (directive opens/closes).
+        if in_fence || t.starts_with(':') {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b':' {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && bytes[i] == b':' {
+                i += 1;
+            }
+            let run = i - start;
+            if !(2..=3).contains(&run) {
+                continue;
+            }
+            if start > 0 {
+                let prev = bytes[start - 1];
+                if prev.is_ascii_alphanumeric() || prev == b'_' {
+                    continue;
+                }
+            }
+            let name_start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_lowercase() || bytes[i].is_ascii_digit() || bytes[i] == b'-')
+            {
+                i += 1;
+            }
+            if i == name_start || i >= bytes.len() || bytes[i] != b'{' {
+                continue;
+            }
+            let name = &line[name_start..i];
+            if vocab::is_known_directive(name) {
+                return Err(CanonicalError::Directive(format!(
+                    "directive '{}{name}' is embedded in prose — block \
+                     directives must start their own line",
+                    ":".repeat(run)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Drop `<!-- … -->` spans so template guidance comments never trip the
+/// embedded-directive check.
+fn strip_html_comments(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find("<!--") {
+        out.push_str(&rest[..open]);
+        match rest[open..].find("-->") {
+            Some(close) => rest = &rest[open + close + 3..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn check_known(name: &str) -> Result<()> {
     if !vocab::is_known_directive(name) {
         return Err(CanonicalError::Directive(format!(
@@ -374,5 +452,31 @@ mod tests {
     #[test]
     fn unterminated_inline_attrs_is_error() {
         assert!(parse_inline("bad :ref[x]{to=urn:atomic:intent:1").is_err());
+    }
+
+    #[test]
+    fn embedded_known_leaf_in_prose_is_error() {
+        let body = ":::task{#t1 status=open}\nUpdate ::file-ref{path=Cargo.toml} early.\n:::";
+        let err = check_embedded_directives(body).unwrap_err();
+        assert!(
+            err.to_string().contains("must start their own line"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rust_paths_and_suffixed_names_stay_prose() {
+        check_embedded_directives("use std::fs::read; also foo::ref{x} stays.").unwrap();
+    }
+
+    #[test]
+    fn unregistered_embedded_name_stays_prose() {
+        check_embedded_directives("try ::made-up{x=1} here").unwrap();
+    }
+
+    #[test]
+    fn template_comments_and_fences_are_exempt() {
+        check_embedded_directives("<!-- Name touched files with ::file-ref{path=...} -->").unwrap();
+        check_embedded_directives("```\n::file-ref{path=x}\n```").unwrap();
     }
 }
