@@ -1,5 +1,14 @@
 # SHACL engine spike — findings (oxirs-shacl 0.3.1)
 
+> **STATUS (2026-07-06): the `atomic-shacl` spike crate has been removed.**
+> Decision (Lee, owner): SHACL validation runs as a **Circuit Breaker (CB)
+> workflow**, not built into `atomic`. So no SHACL engine ships in the atomic
+> binary. This document is retained as the record of *why* oxirs (and, more
+> broadly, an in-atomic engine) was rejected: the ~432-crate footprint, the
+> silently-dropped `sh:node`/`sh:sparql`, and the pre-1.0 maturity. atomic keeps
+> the fast hand-coded tier-1 gate, emits canonical JSON-LD, and ships the shape
+> `.ttl` as data for CB to validate against.
+
 **Question:** can a real SHACL engine (`oxirs-shacl`) over real Turtle shapes
 reproduce the hand-coded gate (`atomic-canonical/src/gate.rs`), so intent/memory
 policy becomes team-editable data?

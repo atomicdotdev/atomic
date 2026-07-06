@@ -5,7 +5,6 @@ members = [
     "atomic-canonical",
     "atomic-cli",
     "atomic-core",
-    "atomic-shacl",
     "atomic-config",
     "atomic-identity",
     "atomic-remote",
@@ -34,17 +33,6 @@ atomic-remote = { path = "atomic-remote" }
 atomic-repository = { path = "atomic-repository" }
 atomic-semantic = { path = "atomic-semantic" }
 atomic-teams = { path = "atomic-teams" }
-
-# SHACL — Recording the Why. A real SHACL engine over Turtle shapes. This
-# pre-1.0 RDF/SHACL stack (oxirs) pulls a large transitive tree, so it is
-# ISOLATED to atomic-shacl only, gated behind that crate's off-by-default
-# `oxirs-engine` feature, and must never appear under atomic-canonical (enforced
-# by a purity check). Pinned exactly so an oxirs point release cannot silently
-# change validation semantics. oxirs-core provides both the RDF model and the
-# store, so oxrdf/oxttl are not needed as direct dependencies.
-atomic-shacl = { path = "atomic-shacl" }
-oxirs-shacl = "=0.3.1"
-oxirs-core = "=0.3.1"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
