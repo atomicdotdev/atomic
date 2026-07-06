@@ -645,7 +645,7 @@ default = "{}"
     /// Use this only when the caller will immediately populate the working
     /// copy itself (e.g. the agent record hook, which creates files and
     /// then records them).  For interactive view switches, use
-    /// [`switch_view`] instead — it materializes the working copy and
+    /// [`Repository::switch_view`] instead — it materializes the working copy and
     /// prevents desync between the pointer and disk state.
     ///
     /// `status()` handles the desynchronised state gracefully: files that
