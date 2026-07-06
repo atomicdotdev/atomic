@@ -522,7 +522,7 @@ impl Command for Init {
         // Create the initial view if it's different from the default
         if self.view != atomic_repository::DEFAULT_VIEW {
             repo.create_view(&self.view).map_err(CliError::Repository)?;
-            repo.set_current_view(&self.view)
+            repo.align_to_view(&self.view)
                 .map_err(CliError::Repository)?;
         }
 

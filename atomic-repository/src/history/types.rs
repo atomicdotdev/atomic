@@ -229,6 +229,14 @@ pub struct HistoryOptions {
 
     /// Only include tagged changes.
     pub tagged_only: bool,
+
+    /// Include inherited changes on draft views.
+    ///
+    /// By default (`false`), `log()` on a draft view only shows changes
+    /// that are new to that view — changes inherited from parent views
+    /// are filtered out.  Set to `true` to see the full change log
+    /// including inherited entries (equivalent to `--all` on the CLI).
+    pub include_inherited: bool,
 }
 
 impl HistoryOptions {
@@ -288,6 +296,15 @@ impl HistoryOptions {
     /// * `n` - Number of recent changes to retrieve
     pub fn last(n: usize) -> Self {
         Self::default().limit(n)
+    }
+
+    /// Include inherited changes on draft views.
+    ///
+    /// By default, draft views only show their own changes.
+    /// Call this to see the full log including parent changes.
+    pub fn include_inherited(mut self, include: bool) -> Self {
+        self.include_inherited = include;
+        self
     }
 
     /// Create options with headers loaded.

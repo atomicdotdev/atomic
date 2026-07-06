@@ -210,7 +210,7 @@ pub fn record_turn(
     // Keep the write handle on the same view for post-add status and record.
     // First turns may target a view that record/apply will create; other failures
     // mean we cannot trust the detection/apply alignment.
-    match repo.set_current_view(&options.session.view_name) {
+    match repo.align_to_view(&options.session.view_name) {
         Ok(()) => {}
         Err(atomic_repository::RepositoryError::ViewNotFound { .. }) => {
             log::debug!(

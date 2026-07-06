@@ -375,6 +375,190 @@ fn test_repo_status_ignores_node_modules_no_trailing_newline() {
 }
 
 #[test]
+fn test_status_no_untracked_for_files_tracked_on_other_view() {
+    // Reproduces the customer bug report:
+    //   "I run atomic status and it shows me tons of things that aren't
+    //    tracked, then I run atomic add and it says there's nothing to add."
+    //
+    // Root cause: status() filters TREE entries by the view's change filter
+    // (view-aware), excluding files whose introducing change isn't visible.
+    // Those files then appear as "Untracked" during the filesystem walk.
+    // But is_tracked() (used by add) checks the global TREE table without
+    // any view filter — so those same files are "already tracked."
+    //
+    // Scenario: agent hook creates a draft view, adds+records files on it,
+    // then the user checks status on the parent (dev) view while the files
+    // still exist on disk.
+    use crate::record::RecordOptions;
+    use crate::status::FileStatus;
+    use atomic_core::pristine::{MutTxnT, ViewScope, ViewTxnT};
+
+    let (temp_dir, mut repo) = create_temp_repo();
+
+    // Step 1: Record a base file on dev so the view isn't empty
+    std::fs::write(temp_dir.path().join("base.txt"), b"base content").unwrap();
+    repo.add("base.txt", TrackingOptions::default()).unwrap();
+    let header = ChangeHeader::new("Add base.txt");
+    repo.record(header, RecordOptions::new().with_all(true))
+        .expect("base record failed");
+
+    // Step 2: Create a draft child view (simulates agent session)
+    {
+        let mut txn = repo.pristine.write_txn().unwrap();
+        let dev = txn.get_view("dev").unwrap().unwrap();
+        txn.create_view("agent-draft", ViewScope::Draft, Some(dev.id))
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // Step 3: Switch to draft, add+record files, switch back
+    repo.set_current_view("agent-draft").unwrap();
+
+    std::fs::write(temp_dir.path().join("agent_file.txt"), b"created by agent").unwrap();
+    std::fs::create_dir_all(temp_dir.path().join("src")).unwrap();
+    std::fs::write(temp_dir.path().join("src/module.rs"), b"pub fn agent() {}").unwrap();
+
+    repo.add("agent_file.txt", TrackingOptions::default())
+        .unwrap();
+    repo.add("src/module.rs", TrackingOptions::default())
+        .unwrap();
+
+    let header = ChangeHeader::new("Agent adds files");
+    repo.record(header, RecordOptions::new().with_all(true))
+        .expect("agent record failed");
+
+    // Step 4: Switch back to dev (but leave files on disk — simulates
+    // agent creating files in the working copy without cleaning up)
+    repo.set_current_view("dev").unwrap();
+
+    // Files still exist on disk (agent created them, switch_view wasn't
+    // called so no materialization cleanup happened)
+    assert!(temp_dir.path().join("agent_file.txt").exists());
+    assert!(temp_dir.path().join("src/module.rs").exists());
+
+    // Step 5: Check status on dev — THE BUG
+    let status = repo
+        .status(StatusOptions::default())
+        .expect("status failed");
+
+    // These files should NOT appear as Untracked
+    let untracked_paths: Vec<String> = status
+        .entries()
+        .iter()
+        .filter(|e| e.status() == FileStatus::Untracked)
+        .map(|e| e.path().to_string_lossy().to_string())
+        .collect();
+
+    assert!(
+        !untracked_paths.iter().any(|p| p == "agent_file.txt"),
+        "agent_file.txt must NOT appear as Untracked on dev. \
+         It is in TREE (from draft view) and should be Added or hidden. \
+         Untracked entries: {:?}",
+        untracked_paths
+    );
+    assert!(
+        !untracked_paths.iter().any(|p| p == "src/module.rs"),
+        "src/module.rs must NOT appear as Untracked on dev. \
+         Untracked entries: {:?}",
+        untracked_paths
+    );
+
+    // Step 6: Verify the contradictory state doesn't exist
+    // is_tracked should return true (file is in global TREE)
+    assert!(
+        repo.is_tracked("agent_file.txt").unwrap(),
+        "agent_file.txt should be tracked (in global TREE)"
+    );
+
+    // If status says Untracked AND is_tracked says true, that's the bug
+    let is_untracked_in_status = untracked_paths.iter().any(|p| p == "agent_file.txt");
+    let is_tracked_globally = repo.is_tracked("agent_file.txt").unwrap();
+    assert!(
+        !(is_untracked_in_status && is_tracked_globally),
+        "CONTRADICTION: status says Untracked but is_tracked says true. \
+         This is the exact bug the customer reported."
+    );
+
+    // Step 7: The correct behavior — these files should show as Added
+    // (tracked in TREE, but not yet recorded on THIS view)
+    let added_paths: Vec<String> = status
+        .entries()
+        .iter()
+        .filter(|e| e.status() == FileStatus::Added)
+        .map(|e| e.path().to_string_lossy().to_string())
+        .collect();
+
+    assert!(
+        added_paths.iter().any(|p| p == "agent_file.txt"),
+        "agent_file.txt should appear as Added on dev (tracked but not \
+         recorded on this view). Added entries: {:?}, All entries: {:?}",
+        added_paths,
+        status
+            .entries()
+            .iter()
+            .map(|e| (e.path().to_string_lossy().to_string(), e.status()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_status_foreign_file_not_on_disk_is_invisible() {
+    // Complement to the test above: when a file is tracked on another view
+    // but does NOT exist on disk, it should not appear in status at all.
+    // It should not be Deleted (it was never on this view) or Untracked.
+    use crate::record::RecordOptions;
+    use crate::status::FileStatus;
+    use atomic_core::pristine::{MutTxnT, ViewScope, ViewTxnT};
+
+    let (temp_dir, mut repo) = create_temp_repo();
+
+    // Record base on dev
+    std::fs::write(temp_dir.path().join("base.txt"), b"base").unwrap();
+    repo.add("base.txt", TrackingOptions::default()).unwrap();
+    let header = ChangeHeader::new("Base commit");
+    repo.record(header, RecordOptions::new().with_all(true))
+        .unwrap();
+
+    // Create draft, record a file on it
+    {
+        let mut txn = repo.pristine.write_txn().unwrap();
+        let dev = txn.get_view("dev").unwrap().unwrap();
+        txn.create_view("draft", ViewScope::Draft, Some(dev.id))
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    repo.set_current_view("draft").unwrap();
+
+    std::fs::write(temp_dir.path().join("draft_only.txt"), b"draft content").unwrap();
+    repo.add("draft_only.txt", TrackingOptions::default())
+        .unwrap();
+    let header = ChangeHeader::new("Draft file");
+    repo.record(header, RecordOptions::new().with_all(true))
+        .unwrap();
+
+    // Switch back to dev AND remove the file from disk
+    repo.set_current_view("dev").unwrap();
+    std::fs::remove_file(temp_dir.path().join("draft_only.txt")).unwrap();
+
+    // Status on dev should NOT mention draft_only.txt at all
+    let status = repo
+        .status(StatusOptions::default())
+        .expect("status failed");
+    let all_paths: Vec<(String, FileStatus)> = status
+        .entries()
+        .iter()
+        .map(|e| (e.path().to_string_lossy().to_string(), e.status()))
+        .collect();
+
+    assert!(
+        !all_paths.iter().any(|(p, _)| p == "draft_only.txt"),
+        "draft_only.txt should not appear in status on dev at all \
+         (not on disk, belongs to another view). Entries: {:?}",
+        all_paths
+    );
+}
+
+#[test]
 fn test_status_detects_modification_when_file_index_missing() {
     // Repro for the silent-data-loss bug: when a tracked file has no
     // FILE_INDEX entry (e.g. after `atomic insert` / `atomic clone` /

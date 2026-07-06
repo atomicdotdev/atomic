@@ -354,6 +354,26 @@ impl OpenCodeHook {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("opencode-{}", uuid_short()))
     }
+
+    /// Path to the global OpenCode config directory (`~/.config/opencode/`).
+    ///
+    /// OpenCode uses the XDG-style `~/.config/opencode/` path on all
+    /// platforms (including macOS, where `dirs::config_dir()` returns
+    /// `~/Library/Application Support/`), so we construct it from the
+    /// home directory.
+    fn global_config_dir() -> Option<std::path::PathBuf> {
+        dirs::home_dir().map(|h| h.join(".config").join("opencode"))
+    }
+
+    /// Check whether the `atomic-opencode` plugin is installed globally.
+    ///
+    /// Returns `true` if `~/.config/opencode/plugins/atomic-hooks.ts` exists
+    /// (as a file or valid symlink).
+    fn is_plugin_installed() -> bool {
+        Self::global_config_dir()
+            .map(|d| d.join("plugins").join("atomic-hooks.ts").exists())
+            .unwrap_or(false)
+    }
 }
 
 impl Default for OpenCodeHook {
@@ -557,7 +577,14 @@ impl AgentHook for OpenCodeHook {
     }
 
     fn install(&self, _repo_root: &Path) -> AgentResult<usize> {
-        Ok(0) // Installation handled by atomic-opencode package
+        // OpenCode hooks are managed by the atomic-opencode package, not
+        // by writing files into the repo.  Report 1 if the plugin is
+        // already present so that `enable` shows a success message.
+        if Self::is_plugin_installed() {
+            Ok(1)
+        } else {
+            Ok(0)
+        }
     }
 
     fn uninstall(&self, _repo_root: &Path) -> AgentResult<()> {
@@ -565,7 +592,7 @@ impl AgentHook for OpenCodeHook {
     }
 
     fn is_installed(&self, _repo_root: &Path) -> bool {
-        false // Managed by atomic-opencode package
+        Self::is_plugin_installed()
     }
 
     fn supported_hooks(&self) -> Vec<HookType> {
@@ -580,8 +607,9 @@ impl AgentHook for OpenCodeHook {
     }
 
     fn detect_presence(&self, repo_root: &Path) -> bool {
-        // OpenCode is present if the .opencode directory exists
-        repo_root.join(OPENCODE_DIR).is_dir()
+        // OpenCode is present if the repo has a .opencode directory OR if
+        // the atomic-opencode plugin is installed globally.
+        repo_root.join(OPENCODE_DIR).is_dir() || Self::is_plugin_installed()
     }
 
     fn hook_verbs(&self) -> Vec<&str> {
@@ -914,7 +942,12 @@ mod tests {
     fn test_detect_presence_without_opencode_dir() {
         let tmp = TempDir::new().unwrap();
         let hook = make_hook();
-        assert!(!hook.detect_presence(tmp.path()));
+        // Without a repo-level .opencode dir, detection depends on the
+        // global plugin.  We only assert "no detection" when the plugin
+        // is also absent globally.
+        if !OpenCodeHook::is_plugin_installed() {
+            assert!(!hook.detect_presence(tmp.path()));
+        }
     }
 
     #[test]
@@ -922,15 +955,23 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(".opencode"), "not a dir").unwrap();
         let hook = make_hook();
-        assert!(!hook.detect_presence(tmp.path()));
+        // A regular file named .opencode is not a directory, so repo-local
+        // detection fails.  Overall result depends on global plugin state.
+        if !OpenCodeHook::is_plugin_installed() {
+            assert!(!hook.detect_presence(tmp.path()));
+        }
     }
 
     #[test]
-    fn test_install_is_noop() {
+    fn test_install_returns_count_based_on_plugin() {
         let tmp = TempDir::new().unwrap();
         let hook = make_hook();
         let count = hook.install(tmp.path()).unwrap();
-        assert_eq!(count, 0);
+        if OpenCodeHook::is_plugin_installed() {
+            assert_eq!(count, 1);
+        } else {
+            assert_eq!(count, 0);
+        }
     }
 
     #[test]
@@ -941,10 +982,13 @@ mod tests {
     }
 
     #[test]
-    fn test_is_installed_returns_false() {
+    fn test_is_installed_matches_plugin_state() {
         let tmp = TempDir::new().unwrap();
         let hook = make_hook();
-        assert!(!hook.is_installed(tmp.path()));
+        assert_eq!(
+            hook.is_installed(tmp.path()),
+            OpenCodeHook::is_plugin_installed()
+        );
     }
 
     // uuid_short tests

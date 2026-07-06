@@ -468,8 +468,8 @@ impl Command for Import {
                         .map_err(|e| CliError::Internal(e.into()))?;
                 }
 
-                // Switch to the view
-                repo.set_current_view(&branch_name)
+                // Align to the view (materialize happens after all branches imported)
+                repo.align_to_view(&branch_name)
                     .map_err(|e| CliError::Internal(e.into()))?;
 
                 // Import the branch
@@ -531,8 +531,8 @@ impl Command for Import {
                     .map_err(|e| CliError::Internal(e.into()))?;
             }
 
-            // Switch to the view
-            repo.set_current_view(&branch_name)
+            // Align to the view (materialize/reindex follows)
+            repo.align_to_view(&branch_name)
                 .map_err(|e| CliError::Internal(e.into()))?;
 
             // Import

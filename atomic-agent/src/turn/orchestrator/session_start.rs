@@ -208,14 +208,14 @@ impl TurnOrchestrator {
                     // while current_view points to the agent view. This ensures
                     // status/add/record see the right view. session-end will
                     // switch back to the user's view.
-                    if let Err(e) = repo.set_current_view(&session.view_name) {
+                    if let Err(e) = repo.align_to_view(&session.view_name) {
                         log::warn!(
-                            "Could not switch to agent view '{}': {} (non-fatal)",
+                            "Could not align to agent view '{}': {} (non-fatal)",
                             session.view_name,
                             e,
                         );
                     } else {
-                        log::info!("Switched to agent view '{}'", session.view_name,);
+                        log::info!("Aligned to agent view '{}'", session.view_name,);
                     }
                 }
                 Err(e) => {
@@ -334,9 +334,9 @@ impl TurnOrchestrator {
 
                         // Switch to the agent view so status/add/record
                         // target the right view.
-                        if let Err(e) = repo.set_current_view(&session.view_name) {
+                        if let Err(e) = repo.align_to_view(&session.view_name) {
                             log::warn!(
-                                "Fallback session {} could not switch to '{}': {} (non-fatal)",
+                                "Fallback session {} could not align to '{}': {} (non-fatal)",
                                 session_id,
                                 session.view_name,
                                 e,
