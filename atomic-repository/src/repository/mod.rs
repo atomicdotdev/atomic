@@ -593,20 +593,25 @@ default = "{}"
 
     /// Set the current view (internal, does not update working copy).
     ///
+    /// Update the view pointer on disk without materializing.
+    ///
     /// This updates both the in-memory state and persists the change to disk,
-    /// but does NOT update the working copy. Use `switch_view` instead for
-    /// the full switch operation that also updates the working copy.
+    /// but does **NOT** update the working copy.  The working copy may be
+    /// left inconsistent with the view pointer — `status()` handles this
+    /// gracefully (files tracked on other views show as `Added` rather than
+    /// `Untracked`), but callers should prefer `switch_view()` for any
+    /// user-facing view change.
     ///
-    /// # Arguments
-    ///
-    /// * `view` - The name of the view to switch to
+    /// This is `pub(crate)` to prevent external code from accidentally
+    /// desynchronising the view pointer and working copy.  Internal uses
+    /// (init, git import, agent record alignment) know they will
+    /// materialise or record immediately afterward.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The view does not exist in the pristine database
-    /// - The view file cannot be written
-    pub fn set_current_view(&mut self, view: &str) -> Result<(), RepositoryError> {
+    /// Returns an error if the view does not exist or the pointer file
+    /// cannot be written.
+    pub(crate) fn set_current_view(&mut self, view: &str) -> Result<(), RepositoryError> {
         // Verify the view exists in the pristine database
         {
             let txn = self
@@ -628,6 +633,33 @@ default = "{}"
         self.current_view = view.to_string();
         self.write_current_view(view)?;
         Ok(())
+    }
+
+    /// Align the view pointer without materializing the working copy.
+    ///
+    /// This persists the new view name to `.atomic/current_view` so that
+    /// subsequent `status()`, `add()`, and `record()` calls target the
+    /// correct view, but it does **not** add, remove, or update any files
+    /// on disk.
+    ///
+    /// Use this only when the caller will immediately populate the working
+    /// copy itself (e.g. the agent record hook, which creates files and
+    /// then records them).  For interactive view switches, use
+    /// [`Repository::switch_view`] instead — it materializes the working copy and
+    /// prevents desync between the pointer and disk state.
+    ///
+    /// `status()` handles the desynchronised state gracefully: files that
+    /// are tracked globally (in TREE) but whose introducing change belongs
+    /// to another view appear as `Added` (not `Untracked`), so there is
+    /// no contradictory "Untracked + already tracked" state even if the
+    /// caller forgets to materialise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the view does not exist or the pointer file
+    /// cannot be written.
+    pub fn align_to_view(&mut self, view: &str) -> Result<(), RepositoryError> {
+        self.set_current_view(view)
     }
 
     /// Set the current view on this handle only.

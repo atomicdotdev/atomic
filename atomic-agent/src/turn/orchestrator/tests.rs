@@ -484,7 +484,8 @@ async fn test_session_attestation_covers_only_agent_recorded_changes() {
         let agent_view_history = repo
             .log(
                 atomic_repository::history::HistoryOptions::default()
-                    .view(&session_after_turn.view_name),
+                    .view(&session_after_turn.view_name)
+                    .include_inherited(true),
             )
             .unwrap();
         let inherited_hashes: Vec<_> = agent_view_history.iter().map(|e| e.hash).collect();

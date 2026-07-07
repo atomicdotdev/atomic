@@ -316,7 +316,7 @@ mod tests {
         {
             let mut repo = Repository::init(repo_path).unwrap();
             repo.create_view("feature").unwrap();
-            repo.set_current_view("feature").unwrap();
+            repo.align_to_view("feature").unwrap();
         }
 
         // Change to the repo directory

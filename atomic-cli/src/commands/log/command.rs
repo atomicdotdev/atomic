@@ -206,6 +206,10 @@ impl Log {
             options = options.from_sequence(from);
         }
 
+        if self.all {
+            options = options.include_inherited(true);
+        }
+
         options
     }
 
@@ -525,14 +529,9 @@ impl Command for Log {
             );
         }
 
-        // Show all entries in VIEW_CHANGES for this view.
-        //
-        // Previous draft-view filtering used `parent_change_count` which
-        // reads the parent's *live* change_count.  That counter moves as
-        // the parent gains more changes, shifting the filter threshold
-        // and hiding entries that should be visible — including the
-        // draft view's own local changes.  Until a stable fork-point
-        // snapshot is stored at view-creation time, show everything.
+        // Draft views now filter inherited changes by default (the
+        // repository layer compares against ancestor VIEW_CHANGES).
+        // Use `--all` to see the full log including inherited entries.
         self.print_entries(&entries);
 
         Ok(())

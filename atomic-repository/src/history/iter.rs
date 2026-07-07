@@ -194,6 +194,7 @@ pub fn reverse_log<T: ViewTxnT>(
         load_headers: options.load_headers,
         view: options.view.clone(),
         tagged_only: options.tagged_only,
+        include_inherited: options.include_inherited,
     };
 
     let iter = log(txn, view, &forward_options)?;

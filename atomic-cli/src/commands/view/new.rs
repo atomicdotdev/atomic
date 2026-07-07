@@ -298,8 +298,12 @@ impl New {
     /// Optionally switch to the new view and print hint.
     fn maybe_switch(&self, name: &str, repo: &mut Repository) -> CliResult<()> {
         if self.switch {
-            repo.set_current_view(name).map_err(CliError::Repository)?;
-            print_success(&format!("Switched to view: {}", style_view(name)));
+            let result = repo.switch_view(name).map_err(CliError::Repository)?;
+            print_success(&format!(
+                "Switched to view: {} ({} files updated)",
+                style_view(name),
+                result.files_written,
+            ));
         } else {
             print_hint(&format!(
                 "Use 'atomic view switch {}' to switch to the new view",
