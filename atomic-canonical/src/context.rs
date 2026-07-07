@@ -58,7 +58,10 @@ mod tests {
 
     #[test]
     fn context_document_is_valid_and_nonempty() {
-        assert!(defined_terms().len() > 20, "context should define the vocabulary");
+        assert!(
+            defined_terms().len() > 20,
+            "context should define the vocabulary"
+        );
         assert!(defined_terms().contains("prov"));
         assert!(defined_terms().contains("used"));
         assert!(defined_terms().contains("associatedWith"));

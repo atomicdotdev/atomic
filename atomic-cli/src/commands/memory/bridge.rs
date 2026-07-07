@@ -87,8 +87,8 @@ pub fn memory_id(id_or_path: &str) -> String {
 /// (`serde_json::from_str` into a `Map`). A malformed frontmatter string is a
 /// clean argument error rather than an internal panic.
 pub fn inputs_from_entry(entry: &VaultEntry) -> CliResult<MemLiftInputs> {
-    let frontmatter: Map<String, Value> = serde_json::from_str(&entry.frontmatter_json)
-        .map_err(|e| CliError::InvalidArgument {
+    let frontmatter: Map<String, Value> =
+        serde_json::from_str(&entry.frontmatter_json).map_err(|e| CliError::InvalidArgument {
             message: format!("memory frontmatter is not valid JSON: {e}"),
         })?;
     let body = String::from_utf8_lossy(&entry.content_bytes).into_owned();
@@ -102,9 +102,7 @@ pub fn read_memory(repo: &Repository, id_or_path: &str) -> CliResult<MemLiftInpu
         .vault_retrieve(&path)
         .map_err(CliError::Repository)?
         .ok_or_else(|| CliError::InvalidArgument {
-            message: format!(
-                "memory not found: {id_or_path} (create with `atomic memory new`)"
-            ),
+            message: format!("memory not found: {id_or_path} (create with `atomic memory new`)"),
         })?;
     inputs_from_entry(&entry)
 }

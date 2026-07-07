@@ -85,7 +85,10 @@ impl Command for IntentValidate {
         }
 
         if self.json {
-            println!("{}", serde_json::to_string_pretty(&report_json(&report)).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report_json(&report)).unwrap()
+            );
         } else {
             print!("{report}");
         }
@@ -114,7 +117,10 @@ fn is_path_shaped(arg: &str) -> bool {
 /// `repo_root`. One violation per URN that does not resolve. With no repository
 /// the check is skipped — the gate still enforces presence; resolution needs a
 /// change store. (Ported from PR #102, adapted to the top-level `intent validate`.)
-fn check_evidence_resolution(evidence: &[(String, String)], repo_root: Option<&Path>) -> Vec<Violation> {
+fn check_evidence_resolution(
+    evidence: &[(String, String)],
+    repo_root: Option<&Path>,
+) -> Vec<Violation> {
     let mut violations = Vec::new();
     if evidence.is_empty() {
         return violations;
@@ -191,7 +197,11 @@ mod evidence_tests {
             Some(dir.path()),
         );
         assert_eq!(v.len(), 1);
-        assert!(v[0].message.contains("does not resolve"), "{}", v[0].message);
+        assert!(
+            v[0].message.contains("does not resolve"),
+            "{}",
+            v[0].message
+        );
     }
 
     #[test]

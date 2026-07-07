@@ -60,8 +60,8 @@ pub struct LiftInputs {
 /// (`serde_json::from_str` into a `Map`). A malformed frontmatter string is a
 /// clean argument error rather than an internal panic.
 pub fn inputs_from_entry(entry: &VaultEntry) -> CliResult<LiftInputs> {
-    let frontmatter: Map<String, Value> = serde_json::from_str(&entry.frontmatter_json)
-        .map_err(|e| CliError::InvalidArgument {
+    let frontmatter: Map<String, Value> =
+        serde_json::from_str(&entry.frontmatter_json).map_err(|e| CliError::InvalidArgument {
             message: format!("intent frontmatter is not valid JSON: {e}"),
         })?;
     let body = String::from_utf8_lossy(&entry.content_bytes).into_owned();
@@ -369,7 +369,10 @@ mod tests {
         let mut body = serde_json::to_string_pretty(&node.to_value()).unwrap();
         body.push('\n');
         let mut fm = serde_json::Map::new();
-        fm.insert("intentId".into(), Value::String(normalized_id(repo, id).unwrap()));
+        fm.insert(
+            "intentId".into(),
+            Value::String(normalized_id(repo, id).unwrap()),
+        );
         fm.insert(
             "sourceContentHash".into(),
             Value::String(source_content_hash(inputs)),
@@ -386,7 +389,12 @@ mod tests {
     }
 
     /// Mirror `attest`'s legacy sidecar write exactly ({node, source} wrapper).
-    fn write_legacy_sidecar(repo: &Repository, id: &str, node: &CanonicalNode, inputs: &LiftInputs) {
+    fn write_legacy_sidecar(
+        repo: &Repository,
+        id: &str,
+        node: &CanonicalNode,
+        inputs: &LiftInputs,
+    ) {
         let path = attested_sidecar_path(repo, id).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut artifact = serde_json::Map::new();

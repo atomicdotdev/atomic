@@ -46,9 +46,7 @@ pub mod vocab;
 pub use error::{CanonicalError, Result};
 pub use gate::{validate_intent, validate_memory, ValidationReport, Violation};
 pub use memory::MemoryNode;
-pub use node::{
-    AcceptanceCriterion, CanonicalNode, Constraint, Proof, Ref, ScopeItem, Task,
-};
+pub use node::{AcceptanceCriterion, CanonicalNode, Constraint, Proof, Ref, ScopeItem, Task};
 pub use prov::{attest_prov, project, verify_prov, ProvActivityInput};
 pub use render::{render, render_memory, Target};
 
@@ -70,7 +68,10 @@ pub fn lift_and_attest(
 }
 
 /// Verify an attested node's content hash and signature against a public key.
-pub fn verify(node: &CanonicalNode, public_key: &atomic_identity::keypair::PublicKey) -> Result<()> {
+pub fn verify(
+    node: &CanonicalNode,
+    public_key: &atomic_identity::keypair::PublicKey,
+) -> Result<()> {
     proof::verify(node, public_key)
 }
 

@@ -1499,7 +1499,10 @@ mod tests {
         // storage-hash semantics).
         assert_eq!(stored_hash, Hash::of(&body_bytes));
         let retrieved = repo.vault_retrieve(path).unwrap().unwrap();
-        assert_eq!(Hash::from_bytes(retrieved.content_hash), Hash::of(&body_bytes));
+        assert_eq!(
+            Hash::from_bytes(retrieved.content_hash),
+            Hash::of(&body_bytes)
+        );
 
         // Materialize to disk, then scan: the materialized body must hash back to
         // the exact same value, so the entry is Unchanged (no change reported).

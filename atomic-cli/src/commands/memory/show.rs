@@ -49,7 +49,10 @@ impl Command for MemoryShow {
         };
 
         if self.json {
-            println!("{}", serde_json::to_string_pretty(&node.to_value()).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&node.to_value()).unwrap()
+            );
         } else {
             print!("{}", render_memory(&node, Target::Cli));
         }

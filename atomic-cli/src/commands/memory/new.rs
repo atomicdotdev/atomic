@@ -82,10 +82,7 @@ impl Command for MemoryNew {
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
-        let id = self
-            .id
-            .clone()
-            .unwrap_or_else(generate_ulid_lowercased);
+        let id = self.id.clone().unwrap_or_else(generate_ulid_lowercased);
         let vault_path = bridge::normalize_memory_path(&id);
 
         // Build the frontmatter SPINE as FLAT SCALAR/array fields only (so it
@@ -107,8 +104,8 @@ impl Command for MemoryNew {
                 Value::Array(self.about.iter().cloned().map(Value::String).collect()),
             );
         }
-        let frontmatter_json = serde_json::to_string(&spine)
-            .expect("frontmatter spine serialization is infallible");
+        let frontmatter_json =
+            serde_json::to_string(&spine).expect("frontmatter spine serialization is infallible");
 
         // Store the body WITHOUT a frontmatter block; the spine goes through the
         // frontmatter_json arg. Enters redb + manifest.memory + merkle exactly
@@ -216,13 +213,19 @@ mod tests {
         let entry = repo.vault_retrieve(&vault_path).unwrap().expect("entry");
         assert_eq!(entry.entry_type, VaultEntryType::Memory);
         let fm: Map<String, Value> = serde_json::from_str(&entry.frontmatter_json).unwrap();
-        assert_eq!(fm.get("createdAt").and_then(Value::as_str), Some("2026-07-01T00:00:00+00:00"));
+        assert_eq!(
+            fm.get("createdAt").and_then(Value::as_str),
+            Some("2026-07-01T00:00:00+00:00")
+        );
         assert_eq!(
             fm.get("about").unwrap(),
             &Value::Array(vec![Value::String("a".into()), Value::String("b".into())])
         );
         let body = String::from_utf8_lossy(&entry.content_bytes);
-        assert!(body.contains(":::memory"), "body carries the :::memory container");
+        assert!(
+            body.contains(":::memory"),
+            "body carries the :::memory container"
+        );
         let node = lift_memory(&fm, &body).expect("scaffold lifts cleanly");
         assert_eq!(node.memory_kind, "constraint");
         assert_eq!(node.about, vec!["a".to_string(), "b".to_string()]);

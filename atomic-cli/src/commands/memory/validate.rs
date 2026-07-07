@@ -70,7 +70,10 @@ impl Command for MemoryValidate {
         let report = validate_memory(&node);
 
         if self.json {
-            println!("{}", serde_json::to_string_pretty(&report_json(&report)).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report_json(&report)).unwrap()
+            );
         } else {
             print!("{report}");
         }

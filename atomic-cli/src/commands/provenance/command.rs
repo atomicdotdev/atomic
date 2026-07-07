@@ -145,10 +145,7 @@ impl Command for ProvenanceShow {
 /// Load a change's provenance graphs: REV_DEPS-backed lookup, with a disk-scan
 /// fallback when REV_DEPS registration missed the change. Errors if no graph
 /// explains the change.
-fn load_graphs(
-    repo: &Repository,
-    change_hash: &Hash,
-) -> CliResult<Vec<(Hash, ProvenanceGraph)>> {
+fn load_graphs(repo: &Repository, change_hash: &Hash) -> CliResult<Vec<(Hash, ProvenanceGraph)>> {
     let mut graphs = repo
         .find_provenance_for_change(change_hash)
         .map_err(CliError::Repository)?;
@@ -213,10 +210,12 @@ fn resolve_change_target(repo: &Repository, target: &str) -> CliResult<Hash> {
 /// `atomic intent attest` does.
 fn resolve_person(
     identity: Option<&str>,
-) -> CliResult<(atomic_identity::identity::Identity, atomic_identity::keypair::KeyPair)> {
-    let store = IdentityStore::open_default().map_err(|e| {
-        CliError::Internal(anyhow::anyhow!("Failed to open identity store: {}", e))
-    })?;
+) -> CliResult<(
+    atomic_identity::identity::Identity,
+    atomic_identity::keypair::KeyPair,
+)> {
+    let store = IdentityStore::open_default()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to open identity store: {}", e)))?;
     let identity = if let Some(name) = identity {
         store
             .load_by_name(name)
@@ -277,7 +276,10 @@ fn print_trace(
     );
     for (i, (_, graph)) in graphs.iter().enumerate() {
         if graphs.len() > 1 {
-            println!("{}", hint(&format!("  [graph {} of {}]", i + 1, graphs.len())));
+            println!(
+                "{}",
+                hint(&format!("  [graph {} of {}]", i + 1, graphs.len()))
+            );
         }
         let input = map_graph_to_input(repo, graph, change_hash, person_did);
         print_activity_chain(repo, &input, graph);
@@ -316,7 +318,11 @@ fn print_activity_chain(repo: &Repository, input: &ProvActivityInput, graph: &Pr
         println!(
             "{indent}  {} {}",
             hint("agent"),
-            info(act.get("associatedWith").and_then(|v| v.as_str()).unwrap_or("?"))
+            info(
+                act.get("associatedWith")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+            )
         );
         println!(
             "{indent}  {} {} ({})",
@@ -327,7 +333,11 @@ fn print_activity_chain(repo: &Repository, input: &ProvActivityInput, graph: &Pr
         println!(
             "{indent}  {} {}",
             hint("person"),
-            info(act.get("actedOnBehalfOf").and_then(|v| v.as_str()).unwrap_or("?"))
+            info(
+                act.get("actedOnBehalfOf")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+            )
         );
         if let Some(parent) = act.get("turnParent").and_then(|v| v.as_str()) {
             println!("{indent}  {} {}", hint("turnParent"), info(parent));

@@ -11,12 +11,12 @@ use std::collections::HashMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VaultEntryType {
-    Session,     // 0
-    ToolResult,  // 1
-    Memory,      // 2
-    Intent,      // 3
-    Skill,       // 4
-    Scratch,     // 5
+    Session,    // 0
+    ToolResult, // 1
+    Memory,     // 2
+    Intent,     // 3
+    Skill,      // 4
+    Scratch,    // 5
     /// Signed Recording-the-Why attestation (JSON-LD body). Index 6 — APPEND-ONLY.
     /// postcard encodes enum discriminants positionally, so this MUST stay last and
     /// MUST NOT be reordered/inserted/deleted. Mixed-version sync caveat: an older

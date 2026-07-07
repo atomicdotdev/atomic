@@ -49,7 +49,10 @@ impl Command for IntentShow {
         };
 
         if self.json {
-            println!("{}", serde_json::to_string_pretty(&node.to_value()).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&node.to_value()).unwrap()
+            );
         } else {
             print!("{}", render(&node, Target::Cli));
         }

@@ -174,10 +174,7 @@ fn resolve_verifier(name: &Option<String>) -> CliResult<Option<Verifier>> {
 ///       (a legitimately other-signed node, NOT a failure — showing `✗` here
 ///       would be a false negative);
 ///     - same signer ⇒ run `verify`: `Ok` ⇒ `Yes`, `Err` ⇒ `No`.
-fn compute_verifies(
-    attested: &bridge::Attestation,
-    verifier: Option<&Verifier>,
-) -> Verifies {
+fn compute_verifies(attested: &bridge::Attestation, verifier: Option<&Verifier>) -> Verifies {
     let node = match attested {
         bridge::Attestation::Fresh(node) => node,
         bridge::Attestation::Stale(_) | bridge::Attestation::None => return Verifies::Na,
@@ -240,9 +237,7 @@ impl Command for IntentList {
 
         // Enumerate via the SAME source `atomic vault intent list` uses; already
         // sorted by id. Attestation entries are never in `manifest.intents`.
-        let intents = repo
-            .vault_intent_list(None)
-            .map_err(CliError::Repository)?;
+        let intents = repo.vault_intent_list(None).map_err(CliError::Repository)?;
 
         let rows: Vec<Row> = intents
             .iter()
@@ -452,7 +447,11 @@ mod tests {
         write_tracked(&repo, &ids[0], &node);
 
         let row = row_for(&repo, &ids[0], Some(&kp));
-        assert_eq!(row.attested, Attested::Fresh, "still fresh (hash anchor kept)");
+        assert_eq!(
+            row.attested,
+            Attested::Fresh,
+            "still fresh (hash anchor kept)"
+        );
         assert_eq!(row.verifies, Verifies::No, "tampered same-signer ⇒ '✗'");
         assert_eq!(row.verifies.table(), "✗");
     }

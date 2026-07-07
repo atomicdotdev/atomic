@@ -108,8 +108,12 @@ fn create_default_identity(home_dir: &Path) -> atomic_identity::keypair::PublicK
 fn repo_with_internal_change(repo_dir: &Path, home_dir: &Path) -> Hash {
     assert!(atomic(repo_dir, home_dir, &["init"]).status.success());
     std::fs::write(repo_dir.join("file.txt"), b"v1\n").unwrap();
-    assert!(atomic(repo_dir, home_dir, &["add", "file.txt"]).status.success());
-    assert!(atomic(repo_dir, home_dir, &["record", "-m", "rec"]).status.success());
+    assert!(atomic(repo_dir, home_dir, &["add", "file.txt"])
+        .status
+        .success());
+    assert!(atomic(repo_dir, home_dir, &["record", "-m", "rec"])
+        .status
+        .success());
 
     let repo = Repository::open(repo_dir).expect("open repo");
     let mut changes = repo.iter_changes();
@@ -198,7 +202,10 @@ fn provenance_show_defaults_unsigned_and_sign_flag_verifies_and_writes_nothing()
     );
 
     // Default `show` is UNSIGNED — the baseline's "signable, not signed" unit.
-    assert!(value.get("proof").is_none(), "default show must be unsigned");
+    assert!(
+        value.get("proof").is_none(),
+        "default show must be unsigned"
+    );
     assert!(value.get("attributedTo").is_none());
     assert!(value.get("contentHash").is_none());
 
@@ -240,7 +247,10 @@ fn provenance_show_defaults_unsigned_and_sign_flag_verifies_and_writes_nothing()
     );
     let trace_out = String::from_utf8(trace.stdout).unwrap();
     assert!(trace_out.contains("activity"), "trace shows the activity");
-    assert!(trace_out.contains("generated"), "trace shows generated edge");
+    assert!(
+        trace_out.contains("generated"),
+        "trace shows generated edge"
+    );
     assert!(
         trace_out.contains(&format!("urn:atomic:change:{}", change_hash.to_base32())),
         "trace shows the generated change urn"

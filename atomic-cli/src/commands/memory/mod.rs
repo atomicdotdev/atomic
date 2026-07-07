@@ -257,12 +257,19 @@ mod tests {
         // --- attest: sign + write tracked entry + legacy sidecar -------------
         let kp = KeyPair::generate();
         let identity = Identity::new("tester", &kp);
-        let node =
-            atomic_canonical::lift_and_attest_memory(&inputs.frontmatter, &inputs.body, &identity, &kp)
-                .unwrap();
+        let node = atomic_canonical::lift_and_attest_memory(
+            &inputs.frontmatter,
+            &inputs.body,
+            &identity,
+            &kp,
+        )
+        .unwrap();
         assert!(validate_memory(&node).conforms, "attested node conforms");
         verify_memory(&node, &kp.public).expect("self-verify");
-        assert_eq!(node.created_at, created_at, "createdAt stable through attest");
+        assert_eq!(
+            node.created_at, created_at,
+            "createdAt stable through attest"
+        );
 
         // legacy sidecar
         let sidecar_path = bridge::attested_sidecar_path(&repo, &id);
@@ -307,7 +314,10 @@ mod tests {
             other => panic!("expected Fresh, got {}", attestation_label(&other)),
         };
         assert!(validate_memory(&fresh).conforms, "attested memory conforms");
-        assert_eq!(fresh.created_at, created_at, "createdAt stable through re-read");
+        assert_eq!(
+            fresh.created_at, created_at,
+            "createdAt stable through re-read"
+        );
 
         // --- verify: Fresh, verify_memory OK ---------------------------------
         verify_memory(&fresh, &kp.public).expect("verify Fresh attested node");
@@ -319,7 +329,10 @@ mod tests {
             rendered.contains("The durable fact."),
             "rendered text present"
         );
-        assert!(fresh.attributed_to.is_some(), "author present on attested node");
+        assert!(
+            fresh.attributed_to.is_some(),
+            "author present on attested node"
+        );
         assert!(fresh.proof.is_some(), "proof present on attested node");
 
         // --- regression: `vault memory list` (prefix memory/) does NOT surface
@@ -354,11 +367,8 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        let node = lift_memory(
-            &fm,
-            ":::memory\n<!-- stub comment counts as text -->\n:::",
-        )
-        .unwrap();
+        let node =
+            lift_memory(&fm, ":::memory\n<!-- stub comment counts as text -->\n:::").unwrap();
         assert!(!node.text.trim().is_empty());
     }
 }

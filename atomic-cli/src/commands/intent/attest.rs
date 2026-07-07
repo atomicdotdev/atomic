@@ -128,7 +128,10 @@ impl Command for IntentAttest {
         artifact.insert("node".to_string(), node.to_value());
         let mut source = serde_json::Map::new();
         if let Some(vault_path) = bridge::vault_path_for(&repo, &self.id)? {
-            source.insert("vaultPath".to_string(), serde_json::Value::String(vault_path));
+            source.insert(
+                "vaultPath".to_string(),
+                serde_json::Value::String(vault_path),
+            );
         }
         source.insert(
             "sourceContentHash".to_string(),
@@ -187,10 +190,7 @@ impl Command for IntentAttest {
         repo.vault_materialize(&vault_path)
             .map_err(CliError::Repository)?;
 
-        let did = node
-            .attributed_to
-            .as_deref()
-            .unwrap_or("(unknown)");
+        let did = node.attributed_to.as_deref().unwrap_or("(unknown)");
         let proof_prefix = node
             .proof
             .as_ref()
@@ -201,7 +201,10 @@ impl Command for IntentAttest {
             .unwrap_or_default();
 
         if self.json {
-            println!("{}", serde_json::to_string_pretty(&node.to_value()).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&node.to_value()).unwrap()
+            );
         } else {
             println!("Attested intent: {}", self.id);
             println!("  vault:     .vault/{vault_path}");

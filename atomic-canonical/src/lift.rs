@@ -139,10 +139,9 @@ pub fn lift_intent(frontmatter: &Map<String, Value>, body: &str) -> Result<Canon
 }
 
 fn lift_ac(d: &Directive, human_key: &str, n: usize) -> Result<AcceptanceCriterion> {
-    let local = d
-        .id
-        .clone()
-        .unwrap_or_else(|| format!("{}-ac-{n}", slug(human_key)));
+    let local =
+        d.id.clone()
+            .unwrap_or_else(|| format!("{}-ac-{n}", slug(human_key)));
     Ok(AcceptanceCriterion {
         type_: NodeType::AcceptanceCriterion.as_str().to_string(),
         id: as_urn("ac", &local),
@@ -154,10 +153,9 @@ fn lift_ac(d: &Directive, human_key: &str, n: usize) -> Result<AcceptanceCriteri
 }
 
 fn lift_task(d: &Directive, human_key: &str, n: usize) -> Task {
-    let local = d
-        .id
-        .clone()
-        .unwrap_or_else(|| format!("{}-{n}", slug(human_key)));
+    let local =
+        d.id.clone()
+            .unwrap_or_else(|| format!("{}-{n}", slug(human_key)));
     let mut touches: Vec<String> = Vec::new();
     if let Some(f) = d.attr("touchesFile") {
         touches.push(f.to_string());
@@ -187,10 +185,9 @@ fn lift_task(d: &Directive, human_key: &str, n: usize) -> Task {
 /// `kind` is "scope-in" or "scope-out" and drives the generated id slug.
 /// Prose body is the unconstrained narrative (never graded).
 fn lift_scope(d: &Directive, human_key: &str, kind: &str, n: usize) -> ScopeItem {
-    let local = d
-        .id
-        .clone()
-        .unwrap_or_else(|| format!("{}-{kind}-{n}", slug(human_key)));
+    let local =
+        d.id.clone()
+            .unwrap_or_else(|| format!("{}-{kind}-{n}", slug(human_key)));
     ScopeItem {
         type_: NodeType::ScopeItem.as_str().to_string(),
         id: as_urn("scope", &local),
@@ -200,10 +197,9 @@ fn lift_scope(d: &Directive, human_key: &str, kind: &str, n: usize) -> ScopeItem
 
 /// Lift a `:::constraint` container into a `Constraint`.
 fn lift_constraint(d: &Directive, human_key: &str, n: usize) -> Constraint {
-    let local = d
-        .id
-        .clone()
-        .unwrap_or_else(|| format!("{}-constraint-{n}", slug(human_key)));
+    let local =
+        d.id.clone()
+            .unwrap_or_else(|| format!("{}-constraint-{n}", slug(human_key)));
     Constraint {
         type_: NodeType::Constraint.as_str().to_string(),
         id: as_urn("constraint", &local),
@@ -270,9 +266,11 @@ fn str_array(fm: &Map<String, Value>, key: &str) -> Vec<String> {
             .iter()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect(),
-        Some(Value::String(s)) if !s.is_empty() => {
-            s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
-        }
+        Some(Value::String(s)) if !s.is_empty() => s
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -284,7 +282,10 @@ pub fn parse_markdown(doc: &str) -> Result<(Map<String, Value>, String)> {
     // Normalize CRLF so a Windows-authored file parses identically to LF —
     // otherwise the "---\n" prefix match fails and the whole doc is silently
     // treated as body with empty frontmatter.
-    let normalized = doc.strip_prefix('\u{feff}').unwrap_or(doc).replace("\r\n", "\n");
+    let normalized = doc
+        .strip_prefix('\u{feff}')
+        .unwrap_or(doc)
+        .replace("\r\n", "\n");
     let doc = normalized.as_str();
     let rest = match doc.strip_prefix("---\n") {
         Some(r) => r,
@@ -367,10 +368,22 @@ Do not touch the global keyboard handler.
         assert_eq!(node.has_constraint.len(), 2);
 
         // Ids are well-formed urns generated from the slug + ordinal.
-        assert_eq!(node.has_scope_in[0].id, "urn:atomic:scope:word-5-scope-in-1");
-        assert_eq!(node.has_scope_out[0].id, "urn:atomic:scope:word-5-scope-out-1");
-        assert_eq!(node.has_constraint[0].id, "urn:atomic:constraint:word-5-constraint-1");
-        assert_eq!(node.has_constraint[1].id, "urn:atomic:constraint:word-5-constraint-2");
+        assert_eq!(
+            node.has_scope_in[0].id,
+            "urn:atomic:scope:word-5-scope-in-1"
+        );
+        assert_eq!(
+            node.has_scope_out[0].id,
+            "urn:atomic:scope:word-5-scope-out-1"
+        );
+        assert_eq!(
+            node.has_constraint[0].id,
+            "urn:atomic:constraint:word-5-constraint-1"
+        );
+        assert_eq!(
+            node.has_constraint[1].id,
+            "urn:atomic:constraint:word-5-constraint-2"
+        );
         assert!(node.has_scope_in[0].text.contains("src/App.tsx"));
     }
 
@@ -391,7 +404,11 @@ Do not touch the global keyboard handler.
         let body = ":::why\nLocal-only per :ref[the storage constraint]{to=urn:atomic:memory:01J8ZC edge=depends}, not a profile system.\n:::";
         let node = lift_intent(&fm(), body).unwrap();
         // The reason keeps the inline mention verbatim…
-        assert!(node.why.as_deref().unwrap().contains(":ref[the storage constraint]"));
+        assert!(node
+            .why
+            .as_deref()
+            .unwrap()
+            .contains(":ref[the storage constraint]"));
         // …and the edge lands on the dependency chain, typed and validated.
         assert_eq!(node.depends_on.len(), 1);
         assert_eq!(node.depends_on[0].to, "urn:atomic:memory:01J8ZC");

@@ -303,8 +303,14 @@ mod tests {
         let agent_id = agent.get("@id").and_then(Value::as_str).unwrap();
         assert!(agent_id.starts_with("urn:atomic:agent:"));
         assert!(!agent_id.starts_with("did:"));
-        assert_eq!(agent.get("label").and_then(Value::as_str), Some("Claude Code"));
-        assert_eq!(agent.get("vendor").and_then(Value::as_str), Some("anthropic"));
+        assert_eq!(
+            agent.get("label").and_then(Value::as_str),
+            Some("Claude Code")
+        );
+        assert_eq!(
+            agent.get("vendor").and_then(Value::as_str),
+            Some("anthropic")
+        );
 
         // Person @id == the real did:atomic.
         let person_node = node_of_type(&value, "prov:Person");
@@ -365,10 +371,10 @@ mod tests {
 
         // Tamper a signed field -> HashMismatch.
         let mut tampered = attested.clone();
-        tampered
-            .as_object_mut()
-            .unwrap()
-            .insert("@id".into(), Value::String("urn:atomic:provgraph:EVIL".into()));
+        tampered.as_object_mut().unwrap().insert(
+            "@id".into(),
+            Value::String("urn:atomic:provgraph:EVIL".into()),
+        );
         let err = verify_prov(&tampered, &kp.public).unwrap_err();
         assert!(
             matches!(err, CanonicalError::HashMismatch { .. }),

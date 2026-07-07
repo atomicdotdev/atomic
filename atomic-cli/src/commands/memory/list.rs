@@ -153,10 +153,7 @@ fn resolve_verifier(name: &Option<String>) -> CliResult<Option<Verifier>> {
 /// The DID-match-then-verify rule for a memory. Pure over its inputs so it can be
 /// unit-tested without a global `IdentityStore`. See the intent list's
 /// `compute_verifies` for the full rationale — identical rule, `verify_memory`.
-fn compute_verifies(
-    attested: &bridge::Attestation,
-    verifier: Option<&Verifier>,
-) -> Verifies {
+fn compute_verifies(attested: &bridge::Attestation, verifier: Option<&Verifier>) -> Verifies {
     let node = match attested {
         bridge::Attestation::Fresh(node) => node,
         bridge::Attestation::Stale(_) | bridge::Attestation::None => return Verifies::Na,
@@ -345,7 +342,10 @@ impl Command for MemoryList {
 /// The width of a column: the widest row cell, but at least the header width.
 fn col_width(cell_lens: impl Iterator<Item = usize>, header: &str) -> usize {
     let header_w = header.chars().count();
-    cell_lens.chain(std::iter::once(header_w)).max().unwrap_or(header_w)
+    cell_lens
+        .chain(std::iter::once(header_w))
+        .max()
+        .unwrap_or(header_w)
 }
 
 /// Is this `memory/…` entry the vault's index scaffold rather than a real

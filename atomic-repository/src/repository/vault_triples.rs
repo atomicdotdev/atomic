@@ -1021,7 +1021,10 @@ mod tests {
             "skill:run-tests"
         );
         assert_eq!(
-            entry_subject("attestations/PIMO-1/attested.md", VaultEntryType::Attestation),
+            entry_subject(
+                "attestations/PIMO-1/attested.md",
+                VaultEntryType::Attestation
+            ),
             "attestation:PIMO-1"
         );
     }

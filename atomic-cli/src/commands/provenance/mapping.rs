@@ -6,9 +6,7 @@
 //!
 //! Read-only, compute-on-demand: mapping never writes anything.
 
-use atomic_canonical::prov::{
-    activity_urn, change_urn, normalize_agent_slug, ProvActivityInput,
-};
+use atomic_canonical::prov::{activity_urn, change_urn, normalize_agent_slug, ProvActivityInput};
 use atomic_core::change::ProvenanceGraph;
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::Repository;

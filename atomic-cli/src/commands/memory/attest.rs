@@ -92,8 +92,8 @@ impl Command for MemoryAttest {
         // absent) + hash + sign.
         let node = lift_and_attest_memory(&inputs.frontmatter, &inputs.body, &identity, &keypair)
             .map_err(|e| CliError::InvalidArgument {
-                message: format!("could not attest memory: {e}"),
-            })?;
+            message: format!("could not attest memory: {e}"),
+        })?;
 
         // Belt-and-suspenders: re-gate the ATTESTED node — proof + attributedTo
         // must now satisfy the gate.
@@ -148,7 +148,10 @@ impl Command for MemoryAttest {
         // yaml_frontmatter_to_json. `sourceContentHash` contains ':' but no
         // ": " (colon-space), so it round-trips cleanly.
         let mut fm = serde_json::Map::new();
-        fm.insert("memoryId".into(), Value::String(bridge::memory_id(&self.id)));
+        fm.insert(
+            "memoryId".into(),
+            Value::String(bridge::memory_id(&self.id)),
+        );
         fm.insert(
             "sourceContentHash".into(),
             Value::String(bridge::source_content_hash(&inputs)),
@@ -177,7 +180,10 @@ impl Command for MemoryAttest {
             .unwrap_or_default();
 
         if self.json {
-            println!("{}", serde_json::to_string_pretty(&node.to_value()).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&node.to_value()).unwrap()
+            );
         } else {
             println!("Attested memory: {}", self.id);
             println!("  vault:     .vault/{vault_path}");
