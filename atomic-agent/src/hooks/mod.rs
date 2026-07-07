@@ -76,6 +76,35 @@ use std::path::Path;
 use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
 
+// Hook command guard
+
+/// Wrap an `atomic agent hooks …` invocation in the shell guard that installed
+/// hooks run behind.
+///
+/// The hook must only fire where Atomic's graph is reachable, but it must fire
+/// in **both** kinds of working tree:
+///
+/// * a canonical checkout, which has a `.atomic/` directory; and
+/// * an agent sandbox, which has **no** `.atomic/` of its own — only a
+///   `.atomic-sandbox` pointer file to the canonical graph.
+///
+/// Guarding on `.atomic` alone silently drops all provenance for sandboxed
+/// agents (the guard is false, so the recorder never runs). Adding the sandbox
+/// arm lets the hook fire there too; `atomic agent hooks` then resolves the
+/// pointer and records into the canonical graph.
+///
+/// POSIX `&&`/`||` are equal-precedence and left-associative, so
+/// `test -d .atomic || test -f .atomic-sandbox && CMD || true` parses as
+/// `(((test -d .atomic || test -f .atomic-sandbox) && CMD) || true)` — the
+/// recorder runs when either marker is present, and a recorder failure is
+/// swallowed so the agent turn is never blocked.
+pub(crate) fn guarded_hook_command(inner: &str) -> String {
+    format!(
+        "test -d .atomic || test -f {pointer} && {inner} || true",
+        pointer = atomic_repository::SANDBOX_POINTER,
+    )
+}
+
 // AgentHook Trait
 
 /// Trait for agent hook adapters.

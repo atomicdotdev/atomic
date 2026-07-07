@@ -1,9 +1,16 @@
+use std::collections::HashSet;
+
 use super::*;
 
 impl Repository {
     // History Methods
 
     /// Get a forward history log for the current view.
+    ///
+    /// For **draft** views, only changes that are "new" on this view are
+    /// returned — inherited changes from ancestor views are filtered out.
+    /// Pass `--all` (via [`HistoryOptions::include_inherited`]) to see
+    /// the full change log including inherited entries.
     ///
     /// Returns an iterator over history entries starting from the given
     /// sequence number and proceeding forward (oldest to newest).
@@ -41,6 +48,17 @@ impl Repository {
                 name: view_name.to_string(),
             })?;
 
+        // For draft views, build a set of ancestor change NodeIds so we
+        // can filter out inherited entries.  This makes `atomic log` on a
+        // draft view show only "what's new" rather than the full history
+        // of every ancestor view.
+        let ancestor_ids: Option<HashSet<NodeId>> =
+            if view.kind.is_draft() && !options.include_inherited {
+                Some(Self::collect_ancestor_change_ids(&txn, &view)?)
+            } else {
+                None
+            };
+
         let iter = crate::history::log(&txn, &view, &options)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
@@ -48,6 +66,13 @@ impl Repository {
         let mut entries = Vec::new();
         for result in iter {
             let mut entry = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+            // Skip inherited entries on draft views
+            if let Some(ref ids) = ancestor_ids {
+                if ids.contains(&entry.node_id) {
+                    continue;
+                }
+            }
 
             // Load header if requested
             if options.load_headers {
@@ -91,6 +116,12 @@ impl Repository {
         let mut entries = crate::history::reverse_log(&txn, &view, &options)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        // For draft views, filter out inherited entries
+        if view.kind.is_draft() && !options.include_inherited {
+            let ancestor_ids = Self::collect_ancestor_change_ids(&txn, &view)?;
+            entries.retain(|e| !ancestor_ids.contains(&e.node_id));
+        }
+
         // Load headers if requested
         if options.load_headers {
             for entry in &mut entries {
@@ -101,6 +132,33 @@ impl Repository {
         }
 
         Ok(entries)
+    }
+
+    /// Collect all change NodeIds from ancestor views' VIEW_CHANGES.
+    ///
+    /// Walks the parent chain and gathers each ancestor view's own
+    /// change entries.  The result is used by `log()` / `reverse_log()`
+    /// to filter out inherited entries on draft views.
+    fn collect_ancestor_change_ids<T: ViewTxnT>(
+        txn: &T,
+        view: &atomic_core::pristine::ViewState,
+    ) -> Result<HashSet<NodeId>, RepositoryError> {
+        let mut ids = HashSet::new();
+        let mut cursor = view.parent;
+        while let Some(pid) = cursor {
+            let parent = txn
+                .get_view_by_id(pid)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            match parent {
+                Some(p) => {
+                    let parent_ids = super::filter::collect_view_change_ids(txn, &p)?;
+                    ids.extend(parent_ids);
+                    cursor = p.parent;
+                }
+                None => break,
+            }
+        }
+        Ok(ids)
     }
 
     /// Get a summary of the current view's history.

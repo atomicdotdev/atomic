@@ -80,6 +80,12 @@ impl Repository {
         let mut directory_inodes: HashSet<atomic_core::types::Inode> = HashSet::new();
         // Cache inode → has_graph_content so we don't call inode_position twice
         let mut has_graph_content_cache: HashMap<PathBuf, bool> = HashMap::new();
+        // Files tracked globally (in TREE) but whose introducing change
+        // belongs to another view.  These must stay in `tracked_paths` so
+        // they don't surface as "Untracked" in the filesystem walk, but if
+        // they are absent from disk they must be silently skipped (not
+        // reported as "Deleted" — they were never on this view).
+        let mut foreign_paths: HashSet<PathBuf> = HashSet::new();
 
         let tree_iter = txn
             .iter_tree()
@@ -88,25 +94,39 @@ impl Repository {
         for result in tree_iter {
             let (path, inode) = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-            // View filter: skip files whose creating change is not on
-            // the current view.  Files in TREE without a graph position
-            // must be classified as Added, not Clean.  Files whose
-            // creating change is not in the current view's filter are
-            // skipped entirely — they belong to other views and must not
-            // appear in this view's status.
+            // Normalize path once (before view filter so foreign_paths
+            // uses the same key as tracked_paths).
+            let normalized = normalize_tracked_path(&path, &self.root);
+
+            // View filter: decide whether this file's graph content is
+            // visible on the current view.
+            //
+            // Files in TREE without a graph position → Added (not yet
+            // recorded).  Files whose creating change IS in the current
+            // view's filter → tracked normally.  Files whose creating
+            // change is NOT in the filter → "foreign": they belong to
+            // another view.  We keep them in tracked_paths (so the
+            // filesystem walk doesn't mark them Untracked) but flag them
+            // so that if they're absent from disk we skip them silently
+            // instead of reporting Deleted.
             let has_graph = if let Ok(Some(position)) = txn.inode_position(inode) {
                 if let Some(ref ids) = current_view_change_ids {
                     if !position.change.is_root() && !ids.contains(&position.change) {
-                        continue;
+                        // Foreign file — tracked globally, not on this view.
+                        // Include in tracked_paths with has_graph=false so
+                        // it shows as Added if on disk, and track it as
+                        // foreign so we skip it when not on disk.
+                        foreign_paths.insert(normalized.clone());
+                        false
+                    } else {
+                        true
                     }
+                } else {
+                    true
                 }
-                true
             } else {
                 false
             };
-
-            // Normalize path once
-            let normalized = normalize_tracked_path(&path, &self.root);
 
             // Apply path filter if specified
             if !options.path_filters.is_empty() {
@@ -208,6 +228,17 @@ impl Repository {
             let metadata = match std::fs::metadata(&abs_path) {
                 Ok(m) if m.is_file() => m,
                 _ => {
+                    // Foreign file not on disk — skip silently.
+                    // This file is tracked globally (in TREE) but its
+                    // graph content belongs to another view and it does
+                    // not exist on disk for THIS view.  Reporting it as
+                    // "Deleted" would be wrong (it was never present on
+                    // this view).
+                    if foreign_paths.contains(path) {
+                        found_on_disk.insert(path.clone());
+                        continue;
+                    }
+
                     // File missing from disk.  Check whether the deletion
                     // has already been recorded in the graph.
                     //

@@ -329,7 +329,7 @@ impl Push {
         // deliberately masked), which surfaces as a misleading "view not found".
         // Catching the missing credential here gives the user an accurate,
         // actionable error instead.
-        crate::commands::auth::check_push_credentials(&remote_url)?;
+        crate::commands::auth::check_push_credentials(&remote_url, identity_hint.as_deref())?;
 
         // Connect to remote
         let spinner = create_spinner("Connecting to remote...");

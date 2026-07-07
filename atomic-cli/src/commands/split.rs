@@ -214,9 +214,12 @@ impl Command for Split {
 
         // Optionally switch to the new view
         if self.switch {
-            repo.set_current_view(&self.name)
-                .map_err(CliError::Repository)?;
-            print_success(&format!("Switched to view: {}", style_view(&self.name)));
+            let result = repo.switch_view(&self.name).map_err(CliError::Repository)?;
+            print_success(&format!(
+                "Switched to view: {} ({} files updated)",
+                style_view(&self.name),
+                result.files_written,
+            ));
         } else {
             print_hint(&format!(
                 "Use 'atomic view switch {}' to switch to the new view",

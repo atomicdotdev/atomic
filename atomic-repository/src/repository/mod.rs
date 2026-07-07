@@ -193,6 +193,12 @@ pub struct Repository {
     pristine: Arc<Pristine>,
     /// The change store for persisting changes
     change_store: ChangeStore,
+    /// Whether this handle was opened for an agent sandbox (via
+    /// [`Repository::open_sandbox`]). A sandbox's `dot_dir`/`pristine`/
+    /// `change_store` point at the canonical repository while `current_view`
+    /// holds the sandbox's view (from its pointer file); it must not repoint
+    /// the canonical `current_view` on disk.
+    is_sandbox: bool,
 }
 
 impl std::fmt::Debug for Repository {
@@ -203,6 +209,7 @@ impl std::fmt::Debug for Repository {
             .field("current_view", &self.current_view)
             .field("pristine", &"<Pristine>")
             .field("change_store", &self.change_store)
+            .field("is_sandbox", &self.is_sandbox)
             .finish()
     }
 }
@@ -285,6 +292,7 @@ default = "{}"
             current_view: DEFAULT_VIEW.to_string(),
             pristine,
             change_store,
+            is_sandbox: false,
         })
     }
 
@@ -327,6 +335,7 @@ default = "{}"
             current_view,
             pristine,
             change_store,
+            is_sandbox: false,
         })
     }
 
@@ -363,6 +372,7 @@ default = "{}"
             current_view,
             pristine,
             change_store,
+            is_sandbox: false,
         })
     }
 
@@ -423,6 +433,7 @@ default = "{}"
             current_view,
             pristine,
             change_store,
+            is_sandbox: false,
         })
     }
 
@@ -460,6 +471,7 @@ default = "{}"
             current_view,
             pristine,
             change_store,
+            is_sandbox: false,
         })
     }
 
@@ -511,6 +523,25 @@ default = "{}"
         Self::find_root(path.as_ref()).is_ok()
     }
 
+    /// Resolve the **canonical** `.atomic` directory for a working path
+    /// *without* opening the database.
+    ///
+    /// If `path` is inside an agent sandbox, follows the `.atomic-sandbox`
+    /// pointer to the canonical repository; otherwise finds the enclosing
+    /// repository root. Returns `<canonical_root>/.atomic`.
+    ///
+    /// Use this for lock-free filesystem access to the canonical graph — e.g.
+    /// writing a provenance graph through [`ChangeStore`] —
+    /// where opening a full [`Repository`] would take the redb lock. In a
+    /// sandbox `path/.atomic` is a throwaway local dir (or absent), so joining
+    /// `.atomic` onto the working root would miss the real graph entirely.
+    pub fn canonical_dot_dir<P: AsRef<Path>>(path: P) -> Result<PathBuf, RepositoryError> {
+        if let Some((_working, canonical, _view)) = sandbox::detect_sandbox(path.as_ref()) {
+            return Ok(Self::find_root(&canonical)?.join(DOT_DIR));
+        }
+        Ok(Self::find_root(path.as_ref())?.join(DOT_DIR))
+    }
+
     /// Get the repository root path.
     #[inline]
     pub fn root(&self) -> &Path {
@@ -541,6 +572,17 @@ default = "{}"
         &self.current_view
     }
 
+    /// Whether this handle was opened for an agent sandbox.
+    ///
+    /// A sandbox records into the canonical graph on the view named in its
+    /// pointer file (held in `current_view`, never written back to the
+    /// canonical `current_view` on disk), so callers must not fork a new view
+    /// or repoint the current view for it.
+    #[inline]
+    pub fn is_sandbox(&self) -> bool {
+        self.is_sandbox
+    }
+
     /// Get the config file path.
     #[inline]
     pub fn config_path(&self) -> PathBuf {
@@ -551,20 +593,25 @@ default = "{}"
 
     /// Set the current view (internal, does not update working copy).
     ///
+    /// Update the view pointer on disk without materializing.
+    ///
     /// This updates both the in-memory state and persists the change to disk,
-    /// but does NOT update the working copy. Use `switch_view` instead for
-    /// the full switch operation that also updates the working copy.
+    /// but does **NOT** update the working copy.  The working copy may be
+    /// left inconsistent with the view pointer — `status()` handles this
+    /// gracefully (files tracked on other views show as `Added` rather than
+    /// `Untracked`), but callers should prefer `switch_view()` for any
+    /// user-facing view change.
     ///
-    /// # Arguments
-    ///
-    /// * `view` - The name of the view to switch to
+    /// This is `pub(crate)` to prevent external code from accidentally
+    /// desynchronising the view pointer and working copy.  Internal uses
+    /// (init, git import, agent record alignment) know they will
+    /// materialise or record immediately afterward.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The view does not exist in the pristine database
-    /// - The view file cannot be written
-    pub fn set_current_view(&mut self, view: &str) -> Result<(), RepositoryError> {
+    /// Returns an error if the view does not exist or the pointer file
+    /// cannot be written.
+    pub(crate) fn set_current_view(&mut self, view: &str) -> Result<(), RepositoryError> {
         // Verify the view exists in the pristine database
         {
             let txn = self
@@ -586,6 +633,42 @@ default = "{}"
         self.current_view = view.to_string();
         self.write_current_view(view)?;
         Ok(())
+    }
+
+    /// Align the view pointer without materializing the working copy.
+    ///
+    /// This persists the new view name to `.atomic/current_view` so that
+    /// subsequent `status()`, `add()`, and `record()` calls target the
+    /// correct view, but it does **not** add, remove, or update any files
+    /// on disk.
+    ///
+    /// Use this only when the caller will immediately populate the working
+    /// copy itself (e.g. the agent record hook, which creates files and
+    /// then records them).  For interactive view switches, use
+    /// [`Repository::switch_view`] instead — it materializes the working copy and
+    /// prevents desync between the pointer and disk state.
+    ///
+    /// `status()` handles the desynchronised state gracefully: files that
+    /// are tracked globally (in TREE) but whose introducing change belongs
+    /// to another view appear as `Added` (not `Untracked`), so there is
+    /// no contradictory "Untracked + already tracked" state even if the
+    /// caller forgets to materialise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the view does not exist or the pointer file
+    /// cannot be written.
+    pub fn align_to_view(&mut self, view: &str) -> Result<(), RepositoryError> {
+        self.set_current_view(view)
+    }
+
+    /// Set the current view on this handle only.
+    ///
+    /// This does not validate the view or persist `.atomic/current_view`. It is
+    /// intended for read-only handles that need `status()` to read another view.
+    #[inline]
+    pub fn set_current_view_in_memory(&mut self, view: &str) {
+        self.current_view = view.to_string();
     }
 
     // ── Internal helpers ────────────────────────────────────────────────

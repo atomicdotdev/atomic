@@ -344,12 +344,8 @@ fn install_hooks_at(path: &Path, force: bool) -> AgentResult<usize> {
 
     let mut installed = 0;
     for spec in CODEX_HOOK_DEFS {
-        if add_hook(
-            &mut config.hooks,
-            spec.event,
-            spec.command,
-            spec.status_message,
-        ) {
+        let command = crate::hooks::guarded_hook_command(spec.command);
+        if add_hook(&mut config.hooks, spec.event, &command, spec.status_message) {
             installed += 1;
         }
     }
@@ -615,30 +611,33 @@ struct HookDef {
     status_message: Option<&'static str>,
 }
 
+/// Codex hook definitions. `command` holds the bare `atomic agent hooks …`
+/// invocation; the shell guard is applied by [`crate::hooks::guarded_hook_command`]
+/// at install time so the guard stays in one place across all agents.
 const CODEX_HOOK_DEFS: &[HookDef] = &[
     HookDef {
         event: "SessionStart",
-        command: "test -d .atomic && atomic agent hooks codex session-start || true",
+        command: "atomic agent hooks codex session-start",
         status_message: Some("Atomic: tracking session"),
     },
     HookDef {
         event: "UserPromptSubmit",
-        command: "test -d .atomic && atomic agent hooks codex user-prompt-submit || true",
+        command: "atomic agent hooks codex user-prompt-submit",
         status_message: None,
     },
     HookDef {
         event: "Stop",
-        command: "test -d .atomic && atomic agent hooks codex stop || true",
+        command: "atomic agent hooks codex stop",
         status_message: None,
     },
     HookDef {
         event: "PreToolUse",
-        command: "test -d .atomic && atomic agent hooks codex pre-tool || true",
+        command: "atomic agent hooks codex pre-tool",
         status_message: None,
     },
     HookDef {
         event: "PostToolUse",
-        command: "test -d .atomic && atomic agent hooks codex post-tool || true",
+        command: "atomic agent hooks codex post-tool",
         status_message: None,
     },
 ];

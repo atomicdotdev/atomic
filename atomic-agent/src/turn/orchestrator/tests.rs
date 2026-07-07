@@ -132,6 +132,141 @@ async fn test_session_start_resumes_ended_session() {
     assert_eq!(session.turn_count, 3); // preserved
 }
 
+#[tokio::test]
+async fn test_session_start_in_sandbox_adopts_view_without_forking() {
+    // Canonical repository with a distinct view the sandbox operates on.
+    let canonical = TempDir::new().unwrap();
+    let mut repo = Repository::init(canonical.path()).unwrap();
+    let user_view = repo.current_view().to_string(); // "dev"
+    repo.create_view_from("agent-sbx", &user_view).unwrap();
+
+    // Provision a sandbox working tree bound to the agent view.
+    let sandbox_dir = TempDir::new().unwrap();
+    repo.provision_sandbox(sandbox_dir.path(), "agent-sbx")
+        .unwrap();
+    drop(repo); // release the canonical pristine lock before reopening
+
+    // Sanity: the sandbox opens on its provisioned view.
+    let sbx = Repository::open_existing(sandbox_dir.path()).unwrap();
+    assert!(sbx.is_sandbox());
+    assert_eq!(sbx.current_view(), "agent-sbx");
+    drop(sbx);
+
+    // Orchestrator rooted at the sandbox working tree (mirrors the hook path).
+    let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
+    let watcher = FallbackWatcher::new(WatcherConfig::new(sandbox_dir.path()));
+    let mut orch =
+        TurnOrchestrator::with_watcher(sandbox_dir.path(), session_store, Box::new(watcher));
+
+    orch.dispatch(session_start_event("sess-sbx"))
+        .await
+        .unwrap();
+
+    // The session records on the sandbox's own view — not a freshly forked one.
+    let session = orch.session_store.load("sess-sbx").unwrap().unwrap();
+    assert_eq!(session.view_name, "agent-sbx");
+    assert!(
+        session.parent_view.is_none(),
+        "sandbox session must not fork a child view"
+    );
+
+    // The canonical graph is untouched: no spurious agent view was forked and
+    // the current view was not repointed.
+    let canonical_after = Repository::open_existing(canonical.path()).unwrap();
+    let mut views = canonical_after.list_views().unwrap();
+    views.sort();
+    assert_eq!(
+        views,
+        vec!["agent-sbx".to_string(), user_view.clone()],
+        "sandbox session must not fork a new view into the canonical graph"
+    );
+    assert_eq!(canonical_after.current_view(), user_view);
+}
+
+#[tokio::test]
+async fn test_full_turn_in_sandbox_records_provenance_into_canonical_graph() {
+    // Canonical repo with a distinct view the sandbox operates on.
+    let canonical = TempDir::new().unwrap();
+    let repo = Repository::init(canonical.path()).unwrap();
+    // Default `atomic sandbox create` (no --from/--view) binds to the current
+    // shared view. Exercise that exact case.
+    let user_view = repo.current_view().to_string();
+
+    let sandbox_dir = TempDir::new().unwrap();
+    repo.provision_sandbox(sandbox_dir.path(), &user_view)
+        .unwrap();
+    drop(repo);
+
+    // Orchestrator rooted at the sandbox working tree (mirrors the hook path).
+    let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
+    let watcher = FallbackWatcher::new(WatcherConfig::new(sandbox_dir.path()));
+    let mut orch =
+        TurnOrchestrator::with_watcher(sandbox_dir.path(), session_store, Box::new(watcher));
+    orch.set_agent("claude-code", "Claude Code");
+
+    orch.dispatch(session_start_event("sess-sbx-prov"))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event("sess-sbx-prov", "Create agent.txt"))
+        .await
+        .unwrap();
+
+    // Agent writes a file into its sandbox working tree.
+    fs::write(sandbox_dir.path().join("agent.txt"), "agent work\n").unwrap();
+
+    let result = orch
+        .dispatch(turn_end_event("sess-sbx-prov"))
+        .await
+        .unwrap();
+
+    assert!(
+        result.was_recorded(),
+        "a turn that created a file in the sandbox must record a change"
+    );
+    let change_hash = result.change_recorded.as_ref().unwrap().hash;
+
+    // The provenance graph file must be written into the CANONICAL change
+    // store (not a throwaway `.atomic/changes` inside the sandbox). Phase 1 of
+    // the save is the lock-free durability guarantee; if it targets the
+    // sandbox's local dir, provenance is lost whenever the best-effort Phase 2
+    // (which takes the redb write lock) loses a race with a concurrent agent.
+    let canonical_changes = atomic_repository::ChangeStore::new(
+        canonical.path().join(".atomic").join("changes"),
+        atomic_repository::DEFAULT_CACHE_CAPACITY,
+    )
+    .unwrap();
+    assert!(
+        canonical_changes.count_provenance_graphs().unwrap() >= 1,
+        "provenance graph must be written to the canonical change store"
+    );
+
+    // Nothing should be written into a sandbox-local change store.
+    let sandbox_changes = sandbox_dir.path().join(".atomic").join("changes");
+    if sandbox_changes.is_dir() {
+        let local = atomic_repository::ChangeStore::new(
+            sandbox_changes,
+            atomic_repository::DEFAULT_CACHE_CAPACITY,
+        )
+        .unwrap();
+        assert_eq!(
+            local.count_provenance_graphs().unwrap(),
+            0,
+            "provenance must not be written to a throwaway change store inside the sandbox"
+        );
+    }
+
+    // End-to-end: the change and its provenance are both registered in the
+    // canonical graph.
+    let canonical_repo = Repository::open(canonical.path()).unwrap();
+    let provenance = canonical_repo
+        .find_provenance_for_change(&change_hash)
+        .unwrap();
+    assert!(
+        !provenance.is_empty(),
+        "provenance graph for the sandbox turn must be registered in the canonical graph"
+    );
+}
+
 // TurnStart tests
 
 #[tokio::test]
@@ -349,7 +484,8 @@ async fn test_session_attestation_covers_only_agent_recorded_changes() {
         let agent_view_history = repo
             .log(
                 atomic_repository::history::HistoryOptions::default()
-                    .view(&session_after_turn.view_name),
+                    .view(&session_after_turn.view_name)
+                    .include_inherited(true),
             )
             .unwrap();
         let inherited_hashes: Vec<_> = agent_view_history.iter().map(|e| e.hash).collect();

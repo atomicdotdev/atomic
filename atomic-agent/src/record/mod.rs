@@ -140,13 +140,18 @@ pub fn record_turn(
     // Step 1: Open the repository read-only for the initial status check.
     // This avoids blocking on the redb write lock — we only need read access
     // to decide whether there's work to do and which files are untracked.
-    let repo = atomic_repository::Repository::open_readonly(repo_root).map_err(|e| {
+    let mut repo = atomic_repository::Repository::open_readonly(repo_root).map_err(|e| {
         AgentError::RecordFailed {
             session_id: options.session.session_id.clone(),
             turn_number: options.turn_number,
             reason: format!("Failed to open repository (readonly): {}", e),
         }
     })?;
+
+    // `status()` reads current_view, while `record()` writes to session.view_name.
+    // Align the read-only handle before the first status check; this keeps the
+    // no-lock fast path and prevents direct callers from seeing false EmptyTurn.
+    repo.set_current_view_in_memory(&options.session.view_name);
 
     // Step 2: Status — find out what the agent changed.
     // Include untracked files because agent turns commonly create new source,
@@ -194,13 +199,33 @@ pub fn record_turn(
     // skips the table-init `begin_write()` that `open()` does — the tables
     // already exist and that write lock is the primary cause of hook hangs
     // when another process holds a transaction.
-    let repo = atomic_repository::Repository::open_existing(repo_root).map_err(|e| {
+    let mut repo = atomic_repository::Repository::open_existing(repo_root).map_err(|e| {
         AgentError::RecordFailed {
             session_id: options.session.session_id.clone(),
             turn_number: options.turn_number,
             reason: format!("Failed to open repository for recording: {}", e),
         }
     })?;
+
+    // Keep the write handle on the same view for post-add status and record.
+    // First turns may target a view that record/apply will create; other failures
+    // mean we cannot trust the detection/apply alignment.
+    match repo.align_to_view(&options.session.view_name) {
+        Ok(()) => {}
+        Err(atomic_repository::RepositoryError::ViewNotFound { .. }) => {
+            log::debug!(
+                "session view '{}' not yet created; first-turn apply will create it",
+                options.session.view_name
+            );
+        }
+        Err(e) => {
+            return Err(AgentError::RecordFailed {
+                session_id: options.session.session_id.clone(),
+                turn_number: options.turn_number,
+                reason: format!("Failed to align current view before record: {}", e),
+            });
+        }
+    }
 
     if !untracked_paths.is_empty() {
         log::info!(

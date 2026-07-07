@@ -409,7 +409,8 @@ impl GeminiCliHook {
 
         let mut count = 0;
         for (event_key, matcher, verb, hook_name) in &hook_defs {
-            let command = format!("test -d .atomic && {} {} || true", ATOMIC_HOOK_PREFIX, verb);
+            let command =
+                crate::hooks::guarded_hook_command(&format!("{} {}", ATOMIC_HOOK_PREFIX, verb));
 
             let matchers = match *event_key {
                 "session_start" => &mut hooks.session_start,
@@ -1153,12 +1154,16 @@ mod tests {
             "atomic agent hooks gemini-cli session-start"
         ));
         assert!(is_atomic_hook("atomic agent hooks gemini-cli after-agent"));
-        // Guarded format
+        // Guarded format (legacy, `.atomic`-only)
         assert!(is_atomic_hook(
             "test -d .atomic && atomic agent hooks gemini-cli session-start || true"
         ));
         assert!(is_atomic_hook(
             "test -d .atomic && atomic agent hooks gemini-cli after-agent || true"
+        ));
+        // Sandbox-aware guarded format (current)
+        assert!(is_atomic_hook(
+            "test -d .atomic || test -f .atomic-sandbox && atomic agent hooks gemini-cli session-start || true"
         ));
         // Non-atomic
         assert!(!is_atomic_hook("my-custom-hook --on-stop"));
