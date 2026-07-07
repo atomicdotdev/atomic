@@ -1,14 +1,12 @@
 # Atomic
 
-A mathematically sound distributed version control system — built for the age of AI.
+A Semantic Change Graph (SCG) to track memory, intent, provenance, and change as a single unit of work.  This is the evolution of source code management in the era of agents and agentic coding.
 
 ## Why Atomic?
 
 Git was designed for humans writing code in text editors. It tracks lines in files. That worked for 20 years.
 
 Now AI agents write most of the code. They work in sessions and turns, use multiple models, cost money per token, and produce changes that need to be audited, attributed, and explained. Git doesn't know about any of this — you're bolting on external tools to answer basic questions like "which model wrote this?" or "how much did this session cost?"
-
-Atomic is version control that understands AI-assisted development from the ground up.
 
 ## Atomic vs Git for Agentic Workflows
 
@@ -483,4 +481,4 @@ Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the f
 
 ## Acknowledgments
 
-Atomic builds on decades of research in patch theory, drawing inspiration from academic work on categorical semantics of version control and practical implementations that explored these ideas.
+Atomic builds on decades of research in patch theory, drawing inspiration from academic work on categorical semantics of version control and practical implementations that explored these ideas.  Thanks to the team at https://pijul.org for originating that work.
