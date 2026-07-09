@@ -210,20 +210,27 @@ pub fn record_turn(
     // Keep the write handle on the same view for post-add status and record.
     // First turns may target a view that record/apply will create; other failures
     // mean we cannot trust the detection/apply alignment.
-    match repo.align_to_view(&options.session.view_name) {
-        Ok(()) => {}
-        Err(atomic_repository::RepositoryError::ViewNotFound { .. }) => {
-            log::debug!(
-                "session view '{}' not yet created; first-turn apply will create it",
-                options.session.view_name
-            );
-        }
-        Err(e) => {
-            return Err(AgentError::RecordFailed {
-                session_id: options.session.session_id.clone(),
-                turn_number: options.turn_number,
-                reason: format!("Failed to align current view before record: {}", e),
-            });
+    //
+    // Sandboxes share the canonical .atomic: align_to_view would persist
+    // current_view and switch the real user's tree (same hazard as #99).
+    if repo.is_sandbox() {
+        repo.set_current_view_in_memory(&options.session.view_name);
+    } else {
+        match repo.align_to_view(&options.session.view_name) {
+            Ok(()) => {}
+            Err(atomic_repository::RepositoryError::ViewNotFound { .. }) => {
+                log::debug!(
+                    "session view '{}' not yet created; first-turn apply will create it",
+                    options.session.view_name
+                );
+            }
+            Err(e) => {
+                return Err(AgentError::RecordFailed {
+                    session_id: options.session.session_id.clone(),
+                    turn_number: options.turn_number,
+                    reason: format!("Failed to align current view before record: {}", e),
+                });
+            }
         }
     }
 

@@ -267,6 +267,49 @@ async fn test_full_turn_in_sandbox_records_provenance_into_canonical_graph() {
     );
 }
 
+/// Recording a sandbox turn must not persist the session view into the
+/// shared canonical current_view (#99 fixed session-start; this covers the
+/// record path). The sandbox is bound to a DIFFERENT view than the user's,
+/// so a persisted alignment would flip the pointer and fail the assert.
+#[tokio::test]
+async fn test_sandbox_turn_end_leaves_canonical_current_view_untouched() {
+    let canonical = TempDir::new().unwrap();
+    let mut repo = Repository::init(canonical.path()).unwrap();
+    let user_view = repo.current_view().to_string();
+    repo.create_view_from("agent-draft", &user_view).unwrap();
+
+    let sandbox_dir = TempDir::new().unwrap();
+    repo.provision_sandbox(sandbox_dir.path(), "agent-draft")
+        .unwrap();
+    drop(repo);
+
+    let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
+    let watcher = FallbackWatcher::new(WatcherConfig::new(sandbox_dir.path()));
+    let mut orch =
+        TurnOrchestrator::with_watcher(sandbox_dir.path(), session_store, Box::new(watcher));
+    orch.set_agent("claude-code", "Claude Code");
+
+    orch.dispatch(session_start_event("sess-sbx-view"))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event("sess-sbx-view", "Create agent.txt"))
+        .await
+        .unwrap();
+    fs::write(sandbox_dir.path().join("agent.txt"), "agent work\n").unwrap();
+    let result = orch
+        .dispatch(turn_end_event("sess-sbx-view"))
+        .await
+        .unwrap();
+    assert!(result.was_recorded(), "sandbox turn must record");
+
+    let canonical_repo = Repository::open_existing(canonical.path()).unwrap();
+    assert_eq!(
+        canonical_repo.current_view(),
+        user_view,
+        "recording a sandbox turn must not switch the user's current view"
+    );
+}
+
 // TurnStart tests
 
 #[tokio::test]
@@ -769,4 +812,227 @@ fn test_orchestrator_debug() {
     let debug = format!("{:?}", orch);
     assert!(debug.contains("TurnOrchestrator"));
     assert!(debug.contains("repo_root"));
+}
+
+// Managed-run adoption tests
+
+fn managed_context(view: Option<&str>) -> ManagedRunContext {
+    ManagedRunContext {
+        stamp: crate::turn::session::ManagedRunStamp {
+            run_id: "run-mng-1".to_string(),
+            owner_agent: "sherpa".to_string(),
+            owner_session_id: "sherpa-sess-1".to_string(),
+            work_item_id: Some("NONA-42".to_string()),
+        },
+        view: view.map(|v| v.to_string()),
+    }
+}
+
+/// Orchestrator rooted at a real initialized repository (recording works).
+fn make_repo_orchestrator(dir: &TempDir) -> TurnOrchestrator {
+    Repository::init(dir.path()).unwrap();
+    let session_store = SessionStore::for_repo(dir.path()).unwrap();
+    let watcher = FallbackWatcher::new(WatcherConfig::new(dir.path()));
+    TurnOrchestrator::with_watcher(dir.path(), session_store, Box::new(watcher))
+}
+
+#[tokio::test]
+async fn test_session_start_adopts_declared_managed_view() {
+    let dir = TempDir::new().unwrap();
+    let mut orch = make_repo_orchestrator(&dir);
+    orch.set_agent("codex", "Codex");
+    orch.set_managed_run(managed_context(Some("sherpa-run-view")));
+
+    let result = orch
+        .dispatch(session_start_event("sess-managed"))
+        .await
+        .unwrap();
+    assert!(result
+        .message
+        .as_deref()
+        .unwrap_or("")
+        .contains("sherpa-run-view"));
+
+    let session = orch.session_store.load("sess-managed").unwrap().unwrap();
+    assert_eq!(
+        session.view_name, "sherpa-run-view",
+        "session must adopt the declared managed-run view instead of forking"
+    );
+    assert_eq!(
+        session.parent_view.as_deref(),
+        Some("dev"),
+        "parent view is remembered so session-end can restore it"
+    );
+    let stamp = session
+        .managed_run
+        .expect("session must carry the run stamp");
+    assert_eq!(stamp.run_id, "run-mng-1");
+    assert_eq!(stamp.owner_agent, "sherpa");
+    assert_eq!(stamp.work_item_id.as_deref(), Some("NONA-42"));
+
+    // The working copy switched onto the declared view.
+    let repo = Repository::open_existing(dir.path()).unwrap();
+    assert_eq!(repo.current_view(), "sherpa-run-view");
+    drop(repo);
+
+    // A full turn records onto the declared view.
+    orch.dispatch(turn_start_event("sess-managed", "do work"))
+        .await
+        .unwrap();
+    fs::write(dir.path().join("work.rs"), "fn work() {}\n").unwrap();
+    let result = orch.dispatch(turn_end_event("sess-managed")).await.unwrap();
+    assert!(
+        result.was_recorded(),
+        "turn under a managed run must record normally — nothing is suppressed"
+    );
+    assert_eq!(result.view.as_deref(), Some("sherpa-run-view"));
+
+    // Session end restores the parent view.
+    orch.dispatch(session_end_event("sess-managed"))
+        .await
+        .unwrap();
+    let repo = Repository::open_existing(dir.path()).unwrap();
+    assert_eq!(
+        repo.current_view(),
+        "dev",
+        "session-end restores the user's view"
+    );
+}
+
+#[tokio::test]
+async fn test_managed_run_without_view_stamps_but_forks_normally() {
+    let dir = TempDir::new().unwrap();
+    let mut orch = make_repo_orchestrator(&dir);
+    orch.set_agent("codex", "Codex");
+    orch.set_managed_run(managed_context(None));
+
+    orch.dispatch(session_start_event("sess-stamp-only"))
+        .await
+        .unwrap();
+
+    let session = orch.session_store.load("sess-stamp-only").unwrap().unwrap();
+    assert!(
+        session.managed_run.is_some(),
+        "session must be stamped even when the run declares no view"
+    );
+    assert_ne!(
+        session.view_name, "dev",
+        "without a declared view the session forks its usual per-session view"
+    );
+    assert_eq!(session.parent_view.as_deref(), Some("dev"));
+}
+
+#[tokio::test]
+async fn test_sandbox_session_keeps_provisioned_view_under_managed_run() {
+    // Canonical repository with a distinct view the sandbox operates on.
+    let canonical = TempDir::new().unwrap();
+    let mut repo = Repository::init(canonical.path()).unwrap();
+    let user_view = repo.current_view().to_string();
+    repo.create_view_from("agent-sbx", &user_view).unwrap();
+
+    let sandbox_dir = TempDir::new().unwrap();
+    repo.provision_sandbox(sandbox_dir.path(), "agent-sbx")
+        .unwrap();
+    drop(repo);
+
+    let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
+    let watcher = FallbackWatcher::new(WatcherConfig::new(sandbox_dir.path()));
+    let mut orch =
+        TurnOrchestrator::with_watcher(sandbox_dir.path(), session_store, Box::new(watcher));
+    orch.set_agent("codex", "Codex");
+    // The run declares a DIFFERENT view — the sandbox pointer must win.
+    orch.set_managed_run(managed_context(Some("some-other-view")));
+
+    orch.dispatch(session_start_event("sess-sbx-managed"))
+        .await
+        .unwrap();
+
+    let session = orch
+        .session_store
+        .load("sess-sbx-managed")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.view_name, "agent-sbx",
+        "inside a sandbox the provisioned view always wins over the declared one"
+    );
+    assert!(session.managed_run.is_some(), "the stamp still applies");
+
+    // The canonical current view is untouched.
+    let repo = Repository::open_existing(canonical.path()).unwrap();
+    assert_eq!(repo.current_view(), user_view);
+}
+
+#[tokio::test]
+async fn test_preexisting_session_is_not_restamped() {
+    let dir = TempDir::new().unwrap();
+    let mut orch = make_repo_orchestrator(&dir);
+    orch.set_agent("claude-code", "Claude Code");
+
+    // Session born OUTSIDE any managed run.
+    orch.dispatch(session_start_event("sess-direct"))
+        .await
+        .unwrap();
+    assert!(orch
+        .session_store
+        .load("sess-direct")
+        .unwrap()
+        .unwrap()
+        .managed_run
+        .is_none());
+
+    // A lifecycle begins afterwards; re-entering the session must NOT
+    // attribute the pre-existing session to the run.
+    orch.set_managed_run(managed_context(Some("sherpa-run-view")));
+    orch.dispatch(session_start_event("sess-direct"))
+        .await
+        .unwrap();
+
+    let session = orch.session_store.load("sess-direct").unwrap().unwrap();
+    assert!(
+        session.managed_run.is_none(),
+        "pre-existing sessions are never re-attributed to a managed run"
+    );
+    assert_ne!(
+        session.view_name, "sherpa-run-view",
+        "pre-existing sessions keep their own view"
+    );
+}
+
+#[tokio::test]
+async fn test_sandbox_session_files_land_in_canonical_store() {
+    // Regression: sessions written by the REAL constructor (the hooks path)
+    // must land in the canonical .atomic/sessions — not in a throwaway
+    // .atomic/ inside the sandbox working tree — or `lifecycle end`'s
+    // stamp harvest never sees sandbox sessions.
+    let canonical = TempDir::new().unwrap();
+    let mut repo = Repository::init(canonical.path()).unwrap();
+    let user_view = repo.current_view().to_string();
+    repo.create_view_from("agent-sbx2", &user_view).unwrap();
+
+    let sandbox_dir = TempDir::new().unwrap();
+    repo.provision_sandbox(sandbox_dir.path(), "agent-sbx2")
+        .unwrap();
+    drop(repo);
+
+    let mut orch = TurnOrchestrator::new(sandbox_dir.path()).await.unwrap();
+    orch.set_agent("codex", "Codex");
+    orch.dispatch(session_start_event("sess-canon"))
+        .await
+        .unwrap();
+
+    assert!(
+        canonical
+            .path()
+            .join(".atomic/sessions/sess-canon.json")
+            .is_file(),
+        "sandbox session must be stored in the canonical session store"
+    );
+    assert!(
+        !sandbox_dir
+            .path()
+            .join(".atomic/sessions/sess-canon.json")
+            .exists(),
+        "sandbox session must not be stranded in a sandbox-local .atomic"
+    );
 }

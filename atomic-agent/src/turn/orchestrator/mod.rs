@@ -73,8 +73,28 @@ use crate::error::AgentResult;
 use crate::event::{HookType, TurnEvent};
 use crate::record::TurnRecordOutcome;
 use crate::turn::phase::Phase;
-use crate::turn::session::SessionStore;
+use crate::turn::session::{ManagedRunStamp, SessionStore};
 use crate::watcher::{self, FileWatcher, WatcherConfig};
+
+// ═══════════════════════════════════════════════════════════════════════
+// ManagedRunContext
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Context for a managed lifecycle run (`atomic agent lifecycle begin`),
+/// injected by the CLI hook handler.
+///
+/// Sessions CREATED under the run are stamped with [`ManagedRunStamp`] and
+/// adopt the declared view; pre-existing sessions are never re-attributed.
+#[derive(Clone, Debug)]
+pub struct ManagedRunContext {
+    /// The correlation stamp written onto sessions born under this run.
+    pub stamp: ManagedRunStamp,
+
+    /// View declared by the run owner; `None` = sessions fork their usual
+    /// per-session view. Inside a sandbox the provisioned sandbox view
+    /// always wins over a conflicting declared view.
+    pub view: Option<String>,
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // DispatchResult
@@ -209,6 +229,10 @@ pub struct TurnOrchestrator {
 
     /// Human-readable agent display name (e.g., "Claude Code").
     pub(crate) agent_display_name: String,
+
+    /// Managed-run context when a governing lifecycle covers this hook;
+    /// `None` for direct agent usage (behavior unchanged).
+    pub(crate) managed_run: Option<ManagedRunContext>,
 }
 
 impl TurnOrchestrator {
@@ -228,7 +252,13 @@ impl TurnOrchestrator {
     pub async fn new(repo_root: impl Into<PathBuf>) -> AgentResult<Self> {
         let repo_root = repo_root.into();
 
-        let session_store = SessionStore::for_repo(&repo_root)?;
+        // Sessions must live in the canonical `.atomic`, not a sandbox's
+        // throwaway one — `lifecycle end` harvests run stamps from the
+        // canonical session store. Same directory for a normal repository.
+        let session_store = match atomic_repository::Repository::canonical_dot_dir(&repo_root) {
+            Ok(dot_dir) => SessionStore::new(dot_dir.join("sessions"))?,
+            Err(_) => SessionStore::for_repo(&repo_root)?,
+        };
 
         let watcher_config = WatcherConfig::new(&repo_root);
         let watcher = watcher::create_watcher(watcher_config).await?;
@@ -239,6 +269,7 @@ impl TurnOrchestrator {
             watcher,
             agent_name: "unknown".to_string(),
             agent_display_name: "Unknown Agent".to_string(),
+            managed_run: None,
         })
     }
 
@@ -257,6 +288,7 @@ impl TurnOrchestrator {
             watcher,
             agent_name: "unknown".to_string(),
             agent_display_name: "Unknown Agent".to_string(),
+            managed_run: None,
         }
     }
 
@@ -268,6 +300,22 @@ impl TurnOrchestrator {
     pub fn set_agent(&mut self, name: impl Into<String>, display_name: impl Into<String>) {
         self.agent_name = name.into();
         self.agent_display_name = display_name.into();
+    }
+
+    /// Attach the managed-run context for this hook invocation
+    /// (see [`ManagedRunContext`]).
+    pub fn set_managed_run(&mut self, context: ManagedRunContext) {
+        self.managed_run = Some(context);
+    }
+
+    /// The view declared by the governing managed run, if any.
+    pub(crate) fn managed_view(&self) -> Option<&str> {
+        self.managed_run.as_ref().and_then(|m| m.view.as_deref())
+    }
+
+    /// The stamp to write onto sessions born under the managed run.
+    pub(crate) fn managed_stamp(&self) -> Option<ManagedRunStamp> {
+        self.managed_run.as_ref().map(|m| m.stamp.clone())
     }
 
     /// Returns the repository root path.
