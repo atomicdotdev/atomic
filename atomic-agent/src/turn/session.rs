@@ -61,6 +61,28 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AgentError, AgentResult};
 use crate::turn::phase::Phase;
 
+// ManagedRunStamp
+
+/// Correlation stamp for sessions born under a managed lifecycle
+/// (`atomic agent lifecycle begin`) — the edge between the orchestrator's
+/// run and the sessions/changes it produced. Pre-existing sessions are
+/// never stamped, so a concurrent direct session is not attributed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedRunStamp {
+    /// The managed run id (from `lifecycle begin`).
+    pub run_id: String,
+
+    /// The lifecycle owner agent (e.g. "sherpa").
+    pub owner_agent: String,
+
+    /// The owner's own session id for the run.
+    pub owner_session_id: String,
+
+    /// Optional work item the owner associated with the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+}
+
 // AgentSession
 
 /// State of an agent session.
@@ -191,6 +213,11 @@ pub struct AgentSession {
     /// this field existed) loadable as an empty vec.
     #[serde(default)]
     pub recorded_change_hashes: Vec<atomic_core::types::Hash>,
+
+    /// Managed-run stamp when created under a managed lifecycle; `None` for
+    /// direct sessions. `lifecycle end --json` harvests runs from this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_run: Option<ManagedRunStamp>,
 }
 
 impl AgentSession {
@@ -232,6 +259,7 @@ impl AgentSession {
             files_touched: Vec::new(),
             current_turn_started_at: None,
             recorded_change_hashes: Vec::new(),
+            managed_run: None,
         }
     }
 
@@ -994,6 +1022,34 @@ mod tests {
         // recorded_change_hashes was added later — old session files must
         // still load with this field as an empty vec (#[serde(default)])
         assert!(loaded.recorded_change_hashes.is_empty());
+        // managed_run was added later — old session files load with None
+        assert!(loaded.managed_run.is_none());
+    }
+
+    #[test]
+    fn test_serde_roundtrip_with_managed_run_stamp() {
+        let mut s = make_session();
+        s.managed_run = Some(ManagedRunStamp {
+            run_id: "run-abc".to_string(),
+            owner_agent: "sherpa".to_string(),
+            owner_session_id: "sherpa-sess-1".to_string(),
+            work_item_id: Some("NONA-12".to_string()),
+        });
+
+        let json = serde_json::to_string_pretty(&s).unwrap();
+        let loaded: AgentSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.managed_run, s.managed_run);
+    }
+
+    #[test]
+    fn test_managed_run_omitted_when_none() {
+        let s = make_session();
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            !json.contains("managed_run"),
+            "managed_run must be omitted for direct sessions, got: {}",
+            json
+        );
     }
 
     #[test]

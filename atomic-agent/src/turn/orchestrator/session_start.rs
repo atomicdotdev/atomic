@@ -122,6 +122,18 @@ impl TurnOrchestrator {
             }
         };
 
+        // Only sessions CREATED here get the run stamp — the early return
+        // above keeps pre-existing sessions out of the run's attribution.
+        if let Some(stamp) = self.managed_stamp() {
+            log::info!(
+                "Session {} runs under managed lifecycle {} (owner: {})",
+                session_id,
+                stamp.run_id,
+                stamp.owner_agent,
+            );
+            session.managed_run = Some(stamp);
+        }
+
         // Set transcript path if provided
         if let Some(ref path) = event.transcript_path {
             session.set_transcript_path(path);
@@ -171,6 +183,16 @@ impl TurnOrchestrator {
                     //     .atomic/current_view, clobbering the real user's
                     //     current view.
                     let current = repo.current_view().to_string();
+                    if let Some(declared) = self.managed_view() {
+                        if declared != current {
+                            log::debug!(
+                                "Managed run declares view '{}' but the sandbox is \
+                                 provisioned on '{}' — the sandbox pointer wins",
+                                declared,
+                                current,
+                            );
+                        }
+                    }
                     log::info!(
                         "Sandbox session {}: recording on provisioned view '{}' (no fork/switch)",
                         session_id,
@@ -181,6 +203,18 @@ impl TurnOrchestrator {
                 Ok(mut repo) => {
                     let current = repo.current_view().to_string();
                     session.set_parent_view(&current);
+
+                    // Adopt the run's declared view instead of forking a
+                    // per-session one. `create` below tolerates "already
+                    // exists" for the second session of the same run.
+                    if let Some(declared) = self.managed_view() {
+                        log::info!(
+                            "Session {} adopting managed-run view '{}' (declared by lifecycle)",
+                            session_id,
+                            declared,
+                        );
+                        session.view_name = declared.to_string();
+                    }
 
                     match repo.create_view_from(&session.view_name, &current) {
                         Ok(()) => {
@@ -270,6 +304,12 @@ impl TurnOrchestrator {
                 let vendor = vendor_from_agent_name(&self.agent_name);
                 session.agent_vendor = vendor.to_string();
 
+                // Fallback-created sessions carry the same run stamp as
+                // session-start-created ones.
+                if let Some(stamp) = self.managed_stamp() {
+                    session.managed_run = Some(stamp);
+                }
+
                 if let Some(ref path) = event.transcript_path {
                     session.set_transcript_path(path);
                 }
@@ -298,6 +338,35 @@ impl TurnOrchestrator {
                             current,
                         );
                         session.view_name = current;
+                    } else if let Some(declared) = self.managed_view() {
+                        // Adopt the run's declared view (same mechanics
+                        // as handle_session_start).
+                        log::info!(
+                            "Fallback session {} adopting managed-run view '{}'",
+                            session_id,
+                            declared,
+                        );
+                        session.set_parent_view(&current);
+                        session.view_name = declared.to_string();
+
+                        if let Err(e) = repo.create_view_from(&session.view_name, &current) {
+                            log::debug!(
+                                "Fallback session {} could not fork view '{}' from '{}': {} (non-fatal)",
+                                session_id,
+                                session.view_name,
+                                current,
+                                e,
+                            );
+                        }
+
+                        if let Err(e) = repo.set_current_view(&session.view_name) {
+                            log::warn!(
+                                "Fallback session {} could not switch to '{}': {} (non-fatal)",
+                                session_id,
+                                session.view_name,
+                                e,
+                            );
+                        }
                     } else if current != "dev" && current != "main" && current != "release" {
                         // Adopt the existing agent view (session-start
                         // likely created it before this fallback ran).

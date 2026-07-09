@@ -106,6 +106,9 @@ struct HookJsonResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     view: Option<String>,
     files: Vec<String>,
+    /// The managed run this hook participated in, when a lifecycle governs it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
 }
 
 impl Command for Hooks {
@@ -169,6 +172,20 @@ impl Command for Hooks {
             e
         })?;
 
+        // Resolve the managed run governing this hook, if any — hooks are
+        // never suppressed, sessions adopt the run's view + stamp.
+        let managed = super::lifecycle::find_governing_lifecycle_for_hook(&self.agent_name);
+        if let Some(lc) = &managed {
+            log::info!(
+                "hook {} {} participates in managed run {} (owner: {}, view: {})",
+                self.agent_name,
+                self.verb,
+                lc.run_id,
+                lc.owner_agent,
+                lc.view.as_deref().unwrap_or("-"),
+            );
+        }
+
         // Create a tokio runtime for the async orchestrator
         // Hook handlers are short-lived — one runtime per invocation is fine.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -201,6 +218,12 @@ impl Command for Hooks {
             // (e.g., "claude-code" / "Claude Code" instead of "unknown")
             orchestrator.set_agent(&agent_name, &agent_display);
 
+            // Under a managed lifecycle, sessions adopt the declared view
+            // and carry the run stamp (see lifecycle module docs).
+            if let Some(lc) = &managed {
+                orchestrator.set_managed_run(lc.to_managed_run_context());
+            }
+
             // Dispatch the event through the state machine → watcher → recorder
             let dispatch_result = orchestrator
                 .dispatch(event)
@@ -227,6 +250,7 @@ impl Command for Hooks {
 
         // Emit the recorded change hash for UI/bridge callers.
         if self.json {
+            let run_id = managed.as_ref().map(|lc| lc.run_id.clone());
             let json = match &result.change_recorded {
                 Some(outcome) => HookJsonResult {
                     session_id: result.session_id.clone(),
@@ -234,6 +258,7 @@ impl Command for Hooks {
                     change_hash: Some(outcome.hash.to_base32()),
                     view: result.view.clone(),
                     files: outcome.recorded_file_list().to_vec(),
+                    run_id,
                 },
                 None => HookJsonResult {
                     session_id: result.session_id.clone(),
@@ -241,6 +266,7 @@ impl Command for Hooks {
                     change_hash: None,
                     view: result.view.clone(),
                     files: Vec::new(),
+                    run_id,
                 },
             };
             match serde_json::to_string(&json) {
@@ -481,6 +507,7 @@ mod tests {
             change_hash: Some("ABC123".to_string()),
             view: Some("bold-creek-a3f2".to_string()),
             files: vec!["src/main.rs".to_string(), "src/lib.rs".to_string()],
+            run_id: Some("run-42".to_string()),
         };
         let parsed: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
@@ -491,6 +518,7 @@ mod tests {
         assert_eq!(parsed["view"], "bold-creek-a3f2");
         assert_eq!(parsed["files"][0], "src/main.rs");
         assert_eq!(parsed["files"][1], "src/lib.rs");
+        assert_eq!(parsed["run_id"], "run-42");
     }
 
     #[test]
@@ -501,6 +529,7 @@ mod tests {
             change_hash: None,
             view: None,
             files: Vec::new(),
+            run_id: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -514,6 +543,11 @@ mod tests {
         assert!(
             !json.contains("view"),
             "view must be omitted when None, got: {}",
+            json
+        );
+        assert!(
+            !json.contains("run_id"),
+            "run_id must be omitted outside managed runs, got: {}",
             json
         );
         assert_eq!(parsed["files"].as_array().unwrap().len(), 0);
