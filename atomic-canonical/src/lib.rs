@@ -9,7 +9,7 @@
 //! Three layers, kept apart:
 //! - **surface**  — markdown the author writes (frontmatter spine + directives)
 //! - **canonical** — the typed node that gets hashed and signed ([`node`])
-//! - **render**   — the read-time projection ([`render`])
+//! - **render**   — the read-time projection ([`render`](mod@render))
 //!
 //! Load-bearing principles enforced here: *presence is enforced, content is
 //! left honest* (the `why` is never schematized); *the vocabulary is closed*

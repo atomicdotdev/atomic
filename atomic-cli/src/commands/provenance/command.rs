@@ -164,7 +164,7 @@ fn load_graphs(repo: &Repository, change_hash: &Hash) -> CliResult<Vec<(Hash, Pr
     }
     // Most-recent first (a change explained by >1 graph shows all; the newest
     // leads). Both loaders sort/return unspecified order, so sort here.
-    graphs.sort_by(|(_, a), (_, b)| b.timestamp.cmp(&a.timestamp));
+    graphs.sort_by_key(|(_, g)| std::cmp::Reverse(g.timestamp));
     Ok(graphs)
 }
 

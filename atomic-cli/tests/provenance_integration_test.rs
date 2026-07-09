@@ -16,6 +16,12 @@
 //! The REV_DEPS fallback is exercised too: a graph whose explained change was
 //! never made internal is invisible to REV_DEPS, and the disk-scan fallback
 //! still finds it.
+//!
+//! Windows is excluded: the tests isolate the identity store by pointing `HOME`
+//! at a temp dir, but on Windows `dirs::home_dir()` resolves via the system API
+//! (FOLDERID_Profile) and ignores the env var, so the store cannot be redirected
+//! from a test. An explicit identity-store override (env/flag) would lift this.
+#![cfg(not(windows))]
 
 use std::collections::BTreeSet;
 use std::path::Path;
