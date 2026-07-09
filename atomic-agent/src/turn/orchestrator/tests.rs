@@ -296,7 +296,10 @@ async fn test_sandbox_turn_end_leaves_canonical_current_view_untouched() {
         .await
         .unwrap();
     fs::write(sandbox_dir.path().join("agent.txt"), "agent work\n").unwrap();
-    let result = orch.dispatch(turn_end_event("sess-sbx-view")).await.unwrap();
+    let result = orch
+        .dispatch(turn_end_event("sess-sbx-view"))
+        .await
+        .unwrap();
     assert!(result.was_recorded(), "sandbox turn must record");
 
     let canonical_repo = Repository::open_existing(canonical.path()).unwrap();
