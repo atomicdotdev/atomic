@@ -768,7 +768,7 @@ impl Repository {
 
     /// Find all provenance graphs that explain a change by scanning disk.
     ///
-    /// A read-only fallback for [`find_provenance_for_change`]: REV_DEPS
+    /// A read-only fallback for [`Self::find_provenance_for_change`]: REV_DEPS
     /// registration is best-effort (`save_provenance_graph` records the reverse
     /// dependency only when the explained change is already internal), so a graph
     /// whose change was not yet internal is invisible to REV_DEPS. This iterates
