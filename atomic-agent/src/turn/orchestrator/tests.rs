@@ -267,6 +267,49 @@ async fn test_full_turn_in_sandbox_records_provenance_into_canonical_graph() {
     );
 }
 
+/// Recording a sandbox turn must not persist the session view into the
+/// shared canonical current_view (#99 fixed session-start; this covers the
+/// record path). The sandbox is bound to a DIFFERENT view than the user's,
+/// so a persisted alignment would flip the pointer and fail the assert.
+#[tokio::test]
+async fn test_sandbox_turn_end_leaves_canonical_current_view_untouched() {
+    let canonical = TempDir::new().unwrap();
+    let mut repo = Repository::init(canonical.path()).unwrap();
+    let user_view = repo.current_view().to_string();
+    repo.create_view_from("agent-draft", &user_view).unwrap();
+
+    let sandbox_dir = TempDir::new().unwrap();
+    repo.provision_sandbox(sandbox_dir.path(), "agent-draft")
+        .unwrap();
+    drop(repo);
+
+    let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
+    let watcher = FallbackWatcher::new(WatcherConfig::new(sandbox_dir.path()));
+    let mut orch =
+        TurnOrchestrator::with_watcher(sandbox_dir.path(), session_store, Box::new(watcher));
+    orch.set_agent("claude-code", "Claude Code");
+
+    orch.dispatch(session_start_event("sess-sbx-view"))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event("sess-sbx-view", "Create agent.txt"))
+        .await
+        .unwrap();
+    fs::write(sandbox_dir.path().join("agent.txt"), "agent work\n").unwrap();
+    let result = orch
+        .dispatch(turn_end_event("sess-sbx-view"))
+        .await
+        .unwrap();
+    assert!(result.was_recorded(), "sandbox turn must record");
+
+    let canonical_repo = Repository::open_existing(canonical.path()).unwrap();
+    assert_eq!(
+        canonical_repo.current_view(),
+        user_view,
+        "recording a sandbox turn must not switch the user's current view"
+    );
+}
+
 // TurnStart tests
 
 #[tokio::test]
