@@ -611,7 +611,7 @@ default = "{}"
     ///
     /// Returns an error if the view does not exist or the pointer file
     /// cannot be written.
-    pub(crate) fn set_current_view(&mut self, view: &str) -> Result<(), RepositoryError> {
+    pub fn set_current_view(&mut self, view: &str) -> Result<(), RepositoryError> {
         // Verify the view exists in the pristine database
         {
             let txn = self
