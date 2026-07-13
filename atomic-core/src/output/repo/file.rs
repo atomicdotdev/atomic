@@ -859,7 +859,7 @@ where
 /// - `bool` - Whether retrieval had to resolve fork/cyclic structure via
 ///   [`resolve_conflicts_semantically`] (`!resolved.is_empty()`). Callers
 ///   that use this content as `old_content` for a subsequent positional
-///   diff (see `record_modified_file`/POMO-2) must consult this: a
+///   diff (see `record_modified_file`) must consult this: a
 ///   semantic-merge resolution is not guaranteed to structurally match
 ///   what a plain, unambiguous checkout would render for the same graph
 ///   state, so a positional diff against it can produce a corrupted hunk.

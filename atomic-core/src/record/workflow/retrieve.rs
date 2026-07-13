@@ -384,7 +384,7 @@ where
 /// Like [`retrieve_content_with_filter`], but additionally returns whether
 /// [`output_file_to_buffer_with_options`] had to fall back to semantic-merge
 /// resolution (see its docs). Callers that use this content as `old_content`
-/// for a subsequent positional diff (POMO-2) must consult this flag: such a
+/// for a subsequent positional diff must consult this flag: such a
 /// resolution is not guaranteed to structurally match what a plain checkout
 /// would render for the same graph state.
 pub fn retrieve_content_with_filter_and_fork_info<T, C>(

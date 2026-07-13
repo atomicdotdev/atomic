@@ -861,7 +861,9 @@ where
 /// path hit never involves fork resolution and always reports `false`. Only
 /// the fallback to `retrieve_content_with_filter_and_fork_info` can report
 /// `true`. Callers that use this content as `old_content` for a subsequent
-/// positional diff (POMO-2) must consult this flag.
+/// positional diff must consult this flag: a fork/cyclic resolution is not
+/// guaranteed to structurally match a plain checkout, so diffing against it
+/// can corrupt the file (hence the whole-file-replace safety fallback).
 pub(crate) fn retrieve_content_with_filter_fast_with_fork_info<T, C>(
     txn: &T,
     changes: &C,

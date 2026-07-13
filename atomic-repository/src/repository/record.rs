@@ -440,11 +440,11 @@ impl Repository {
                 // `had_fork_structure` is true when retrieval had to resolve a
                 // fork or cyclic conflict (semantic merge / change-DAG
                 // supersession) to produce this content — most concretely, a
-                // fork left over from the orphan-view duplication bug (POMO-1).
+                // fork left over from the orphan-view duplication bug.
                 // That resolution isn't guaranteed to structurally match what a
                 // plain, unambiguous checkout would render for the same graph
-                // state, so a positional diff against it can corrupt the file
-                // (POMO-2). We propagate the flag to `record_modified_file` via
+                // state, so a positional diff against it can corrupt the file.
+                // We propagate the flag to `record_modified_file` via
                 // `force_whole_file_replace` below instead of diffing against it.
                 let (old_content, had_fork_structure) = {
                     use atomic_core::output::alive::RetrieveOptions;
@@ -533,7 +533,7 @@ impl Repository {
                     log::warn!(
                         "record: '{}' had fork/cyclic conflict structure in its graph — \
                          forcing a whole-file replace instead of a positional diff \
-                         (POMO-2 safety fallback; expected to be rare and self-healing)",
+                         (whole-file-replace safety fallback; expected to be rare and self-healing)",
                         path
                     );
                     core_options.clone().force_whole_file_replace(true)

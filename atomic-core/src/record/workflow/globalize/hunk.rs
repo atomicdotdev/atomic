@@ -437,7 +437,8 @@ where
 {
     // Delegates to `delete_all_content` for "find every content vertex,
     // delete it" — see its docs for why this always uses the thorough
-    // SCC-aware traversal rather than a linear walk (POMO-2/2b).
+    // SCC-aware traversal rather than a linear walk (a linear walk would
+    // miss one branch of a genuine fork and leave stale content alive).
     let deletion = delete_all_content(ctx, inode_pos)?;
 
     let insertions = if should_use_opaque_generated_vertices(&local.path) {
@@ -539,7 +540,7 @@ where
     }
 
     // Fallback: whole-file deletion. `delete_all_content` already does the
-    // thorough search (POMO-2/2b), so no further fallback is needed here.
+    // thorough SCC-aware search, so no further fallback is needed here.
     let deletion = delete_all_content(ctx, inode_pos)?;
 
     Ok(vec![GraphOp::Edit {
@@ -565,12 +566,12 @@ where
 /// linear walk (`collect_sorted_content_vertices`, used elsewhere for
 /// targeted range lookups). A linear walk only follows one BLOCK-edge
 /// successor chain from the inode, so a genuine fork (two chains both
-/// anchored on the inode — exactly what the orphan-view duplication bug,
-/// POMO-1, produces) leaves one branch unvisited. It doesn't error on that
+/// anchored on the inode — exactly what the orphan-view duplication bug
+/// produces) leaves one branch unvisited. It doesn't error on that
 /// incomplete result, so callers that only fall back to the global search on
 /// an `Err` never actually reach it: `build_deletion_edges` happily succeeds
 /// on whatever partial list it's given, deleting only that branch and
-/// leaving the other alive (POMO-2). This function's whole purpose is
+/// leaving the other alive. This function's whole purpose is
 /// deleting *every* content vertex, so it always pays for the thorough
 /// traversal — it's a rare, non-hot-path fallback (opaque/legacy files,
 /// whole-file replace, or a full-file delete), so the extra cost is an

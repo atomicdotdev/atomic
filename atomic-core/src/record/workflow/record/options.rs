@@ -61,7 +61,7 @@ pub struct RecordingOptions {
     /// or cyclic conflict in the graph (see
     /// `retrieve_content_with_filter_and_fork_info` in the record path) —
     /// that resolution isn't guaranteed to structurally match what a plain
-    /// checkout renders for the same graph state (POMO-2), so a positional
+    /// checkout renders for the same graph state, so a positional
     /// diff against it can produce a corrupted hunk. A whole-file replace
     /// only needs "what's alive gets deleted, this is inserted fresh" to be
     /// true, which holds regardless of how `old_content` was resolved.

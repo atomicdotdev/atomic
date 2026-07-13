@@ -433,8 +433,8 @@ where
         return Ok(recorded);
     }
 
-    // POMO-2 safety fallback: if the caller's `old_content` came from
-    // resolving a fork or cyclic conflict (see
+    // Whole-file-replace safety fallback: if the caller's `old_content` came
+    // from resolving a fork or cyclic conflict (see
     // `retrieve_content_with_filter_and_fork_info`), it isn't guaranteed to
     // structurally match what a plain, unambiguous checkout would render for
     // the same graph state. A positional diff against it can therefore
@@ -445,8 +445,8 @@ where
     // this hunk through `globalize_replace_whole_file`'s safe fallback path
     // (the same path used for opaque/legacy files above), rather than a
     // targeted per-vertex diff that would trust old_content's mismatched
-    // shape. This mirrors the delete+add workaround used manually to recover
-    // main.go in the pomodoro-2 project before this fix existed.
+    // shape. This mirrors the delete+add workaround that was used manually to
+    // recover a corrupted file before this fix existed.
     if options.get_force_whole_file_replace() {
         let mut replace_hunk = BuiltHunk::new_replace_with_lines(
             Local::new(&detected.path, 1),

@@ -1,12 +1,12 @@
-//! Regression tests for POMO-1: recording a small, targeted edit to a
-//! large file should produce a small, proportional diff — not treat most
-//! of the file as newly-inserted content, which duplicates already-alive
-//! content in the graph once materialized.
+//! Regression tests for the orphan-view duplication bug: recording a small,
+//! targeted edit to a large file should produce a small, proportional diff —
+//! not treat most of the file as newly-inserted content, which duplicates
+//! already-alive content in the graph once materialized.
 //!
-//! Reported symptom (pomodoro-2 project, intent POMO-1): `main.go` ended
-//! up with every top-level function defined twice after a sequence of
-//! small, targeted edits ("increase header size", "match font size",
-//! "sort time options ascending"). `atomic change <hash>` stats on that
+//! Reported symptom: `main.go` ended up with every top-level function
+//! defined twice after a sequence of small, targeted edits ("increase
+//! header size", "match font size", "sort time options ascending").
+//! `atomic change <hash>` stats on that
 //! history showed 195-604 hunks per edit, almost all "new content"
 //! inserts with only 1-2 replace/delete hunks, for edits that should have
 //! touched a handful of lines.
@@ -78,7 +78,7 @@ fn test_small_edit_on_large_file_stays_proportional() {
     assert!(
         hunk_count <= 10,
         "a one-line edit should produce a handful of hunks, not {} \
-         (this is the 'almost the whole file is rewritten' bug — POMO-1)",
+         (this is the 'almost the whole file is rewritten' bug)",
         hunk_count
     );
 
@@ -149,7 +149,7 @@ fn test_sequential_small_edits_do_not_compound_duplication() {
         assert!(
             hunk_count <= 10,
             "'{}' should produce a handful of hunks, not {} \
-             (whole-file rewrite detected — POMO-1)",
+             (whole-file rewrite detected)",
             message,
             hunk_count
         );
@@ -173,7 +173,7 @@ fn test_sequential_small_edits_do_not_compound_duplication() {
             occurrences,
             1,
             "step{} should appear exactly once after {} sequential edits, \
-             found {} (duplication compounding — POMO-1)",
+             found {} (duplication compounding)",
             i,
             edits.len(),
             occurrences
@@ -242,7 +242,7 @@ fn test_cross_view_merge_large_file_post_merge_record_clean() {
     assert!(
         hunk_count <= 10,
         "the post-merge edit should produce a handful of hunks, not {} \
-         (whole-file rewrite detected on a large post-merge file — POMO-1)",
+         (whole-file rewrite detected on a large post-merge file)",
         hunk_count
     );
 
@@ -299,8 +299,8 @@ fn build_ordered_options(order: &[usize]) -> String {
 /// treats reordered-but-unchanged lines as brand-new content instead of
 /// recognizing them, the old (pre-sort) lines never get deleted and the
 /// materialized file ends up with every line twice — which is exactly
-/// what shipped in this project's `main.go` after "Sort time options
-/// ascending by time value" (see intent POMO-1).
+/// what shipped in the real-world `main.go` after "Sort time options
+/// ascending by time value".
 #[test]
 fn test_sorting_lines_does_not_duplicate_them() {
     let (temp_dir, repo) = create_temp_repo();
@@ -371,18 +371,19 @@ fn test_sorting_lines_does_not_duplicate_them() {
     );
 }
 
-/// POMO-2: after a file has been through the orphan-view duplication bug
-/// (POMO-1) and the resulting duplicate is merged into a shared view, does a
-/// *further*, ordinary in-place edit still get detected and recorded
+/// Positional-diff corruption: after a file has been through the orphan-view
+/// duplication bug and the resulting duplicate is merged into a shared view,
+/// does a *further*, ordinary in-place edit still get detected and recorded
 /// correctly? In the real project, a subsequent edit to the (already
 /// duplicated) `main.go` was detected by `atomic status` but produced a
 /// change with zero hunks for the file — `atomic record`/`atomic diff`
 /// silently disagreed with `status` about whether anything had changed.
 ///
 /// This reproduces the orphan-view mechanism directly at the `Repository`
-/// level (bypassing `record_turn()`, which is now self-healing per POMO-1's
-/// fix and would refuse to create the orphan) to recreate the exact lineage,
-/// then attempts one more plain, ordinary edit on top and checks whether
+/// level (bypassing `record_turn()`, which is now self-healing per the
+/// orphan-view duplication fix and would refuse to create the orphan) to
+/// recreate the exact lineage, then attempts one more plain, ordinary edit
+/// on top and checks whether
 /// `status` and `record` agree about it.
 #[test]
 fn test_further_edit_after_orphan_view_merge_is_still_detected() {
@@ -400,8 +401,9 @@ fn test_further_edit_after_orphan_view_merge_is_still_detected() {
     record_all(&repo, "Add main.go");
 
     // Step 2: simulate an orphaned session view directly — the exact
-    // low-level mechanism from POMO-1. `RecordOptions::view("orphan-xyz")`
-    // with a view name that doesn't exist yet reaches `open_or_create_view`'s
+    // low-level mechanism of the orphan-view duplication bug.
+    // `RecordOptions::view("orphan-xyz")` with a view name that doesn't
+    // exist yet reaches `open_or_create_view`'s
     // parentless-Shared fallback, since nothing here calls
     // `create_view_from` first (unlike a properly-forked session).
     let edited = initial.replacen("return 40\n", "return 4000\n", 1);
@@ -417,7 +419,8 @@ fn test_further_edit_after_orphan_view_merge_is_still_detected() {
     .expect("orphan record should succeed (it's the duplication bug, not a crash)");
 
     // Step 3: merge the orphan view into dev — this is what reproduces the
-    // duplication (confirmed already by POMO-1's tests); not re-asserted here.
+    // duplication (confirmed already by the orphan-view duplication tests);
+    // not re-asserted here.
     repo.insert_from_view(CrossViewInsertOptions::new("orphan-xyz", "dev"))
         .unwrap();
     repo.materialize().unwrap();
@@ -515,9 +518,10 @@ fn test_further_edit_after_orphan_view_merge_is_still_detected() {
 ///
 /// `globalize_delete`'s whole-file fallback shares `delete_all_content` with
 /// `globalize_replace_whole_file` — both used to rely on a linear graph walk
-/// that only follows one branch of a genuine fork (POMO-2's second bug
-/// layer). This confirms emptying a file that went through the orphan-view
-/// duplication lineage actually removes *every* alive copy, not just one —
+/// that only follows one branch of a genuine fork (the second layer of the
+/// positional-diff corruption bug). This confirms emptying a file that went
+/// through the orphan-view duplication lineage actually removes *every*
+/// alive copy, not just one —
 /// which matters because a phantom surviving branch wouldn't show up in the
 /// working copy (the file just looks empty either way) but would still be
 /// live in the graph, ready to resurface via a later insert, push, or fork
@@ -535,9 +539,9 @@ fn test_emptying_file_after_orphan_view_merge_removes_every_copy() {
     repo.add("main.go", TrackingOptions::default()).unwrap();
     record_all(&repo, "Add main.go");
 
-    // Step 2: simulate an orphaned session view directly (POMO-1's
-    // mechanism), producing a second, duplicate copy of the file's content
-    // once merged.
+    // Step 2: simulate an orphaned session view directly (the orphan-view
+    // duplication mechanism), producing a second, duplicate copy of the
+    // file's content once merged.
     let edited = initial.replacen("return 40\n", "return 4000\n", 1);
     std::fs::write(&file, &edited).unwrap();
     repo.record(

@@ -1017,7 +1017,7 @@ fn test_outcome_recorded_file_list_empty() {
     assert!(outcome.recorded_file_list().is_empty());
 }
 
-// POMO-1: orphaned session view duplication
+// Orphaned session view duplication
 
 /// Build a Go-like source file with `count` distinct top-level functions,
 /// each with a unique, greppable marker line.
@@ -1036,9 +1036,10 @@ fn count_occurrences(content: &str, pattern: &str) -> usize {
     content.matches(pattern).count()
 }
 
-/// Reproduces the real-world mechanism behind POMO-1: a session whose
-/// `SessionStart` fork never ran (or failed silently), so its view doesn't
-/// exist yet when `record_turn()` is called for the first time.
+/// Reproduces the real-world mechanism behind the orphan-view duplication
+/// bug: a session whose `SessionStart` fork never ran (or failed silently),
+/// so its view doesn't exist yet when `record_turn()` is called for the
+/// first time.
 ///
 /// Before the fix, `record_turn()` would fall through to whatever view
 /// happened to be `current_view` on the raw `Repository` handle it opens
@@ -1108,12 +1109,12 @@ fn test_orphaned_session_view_duplicates_content_on_merge() {
 
     // Session B: simulates a SessionStart fork that never ran (or failed) —
     // its view does not exist yet when record_turn() is called. Per the
-    // POMO-1 fix, record_turn() must self-heal by forking it just-in-time
-    // from its intended parent ("dev"), NOT from whatever view happens to
-    // be current on the internally-opened Repository handle (which after
-    // session A's turn is "session-a" — forking from there would leak
-    // session A's edit into session B's history and, once both are merged
-    // into dev, resurrect it as a duplicate).
+    // orphan-view duplication fix, record_turn() must self-heal by forking
+    // it just-in-time from its intended parent ("dev"), NOT from whatever
+    // view happens to be current on the internally-opened Repository handle
+    // (which after session A's turn is "session-a" — forking from there
+    // would leak session A's edit into session B's history and, once both
+    // are merged into dev, resurrect it as a duplicate).
     let mut session_b = AgentSession::new("session-b", "claude-code", "Claude Code");
     session_b.view_name = "session-b".to_string();
     session_b.set_parent_view("dev");
@@ -1155,7 +1156,7 @@ fn test_orphaned_session_view_duplicates_content_on_merge() {
         assert_eq!(
             occurrences, 1,
             "step{} should appear exactly once after merging both session views, \
-             found {} (orphan-view duplication bug — POMO-1)",
+             found {} (orphan-view duplication bug)",
             i, occurrences
         );
     }

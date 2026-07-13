@@ -216,7 +216,7 @@ pub fn record_turn(
     if repo.is_sandbox() {
         repo.set_current_view_in_memory(&options.session.view_name);
     } else {
-        // POMO-1: a missing session view here is NOT the normal first-turn
+        // A missing session view here is NOT the normal first-turn
         // case (that path creates the view during `apply_after_record`, well
         // after we already aligned successfully once). If we reach this
         // branch it means the SessionStart fork that should have created
