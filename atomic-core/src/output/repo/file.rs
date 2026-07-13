@@ -856,6 +856,13 @@ where
 /// A tuple of:
 /// - `Vec<u8>` - The file content at the filtered state
 /// - `Vec<FileConflict>` - Any conflicts detected
+/// - `bool` - Whether retrieval had to resolve fork/cyclic structure via
+///   [`resolve_conflicts_semantically`] (`!resolved.is_empty()`). Callers
+///   that use this content as `old_content` for a subsequent positional
+///   diff (see `record_modified_file`/POMO-2) must consult this: a
+///   semantic-merge resolution is not guaranteed to structurally match
+///   what a plain, unambiguous checkout would render for the same graph
+///   state, so a positional diff against it can produce a corrupted hunk.
 ///
 /// # Errors
 ///
@@ -898,7 +905,7 @@ pub fn output_file_to_buffer_with_options<T, C>(
     position: Position<NodeId>,
     _file_options: FileOutputOptions,
     retrieve_options: RetrieveOptions,
-) -> Result<(Vec<u8>, Vec<FileConflict>), OutputError>
+) -> Result<(Vec<u8>, Vec<FileConflict>, bool), OutputError>
 where
     T: GraphTxnT,
     C: ChangeStore,
@@ -909,7 +916,7 @@ where
 
     // Handle empty graph (no content at this state)
     if retrieve_result.graph.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), false));
     }
 
     // Compute SCC ordering
@@ -934,6 +941,7 @@ where
 
     // Attempt semantic merge for any conflicting SCCs
     let resolved = resolve_conflicts_semantically(txn, changes, &graph, &order);
+    let had_fork_structure = !resolved.is_empty();
 
     // Output the graph content (with semantic merge resolution)
     output_graph_content_resolved(changes, hash_fn, &graph, &order, &mut writer, &resolved)?;
@@ -953,7 +961,7 @@ where
         }
     }
 
-    Ok((content, conflicts))
+    Ok((content, conflicts, had_fork_structure))
 }
 
 // TESTS

@@ -849,6 +849,30 @@ where
     T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::InodeGraphOps,
     C: atomic_core::change::ChangeStore,
 {
+    retrieve_content_with_filter_fast_with_fork_info(txn, changes, inode, position, options)
+        .map(|(content, _had_fork_structure)| content)
+}
+
+/// Like [`retrieve_content_with_filter_fast`], but also reports whether
+/// retrieval had to resolve fork/cyclic structure to produce the content.
+///
+/// The inode-linear fast path only ever follows an unambiguous single
+/// successor chain (bailing to the full graph walk on any fork), so a fast-
+/// path hit never involves fork resolution and always reports `false`. Only
+/// the fallback to `retrieve_content_with_filter_and_fork_info` can report
+/// `true`. Callers that use this content as `old_content` for a subsequent
+/// positional diff (POMO-2) must consult this flag.
+pub(crate) fn retrieve_content_with_filter_fast_with_fork_info<T, C>(
+    txn: &T,
+    changes: &C,
+    inode: Inode,
+    position: Position<NodeId>,
+    options: atomic_core::output::alive::RetrieveOptions,
+) -> atomic_core::record::RecordResult<(Vec<u8>, bool)>
+where
+    T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::InodeGraphOps,
+    C: atomic_core::change::ChangeStore,
+{
     let trace_retrieve = std::env::var_os("ATOMIC_TRACE_RETRIEVE").is_some();
 
     // Try the inode-linear fast path first (works with or without filter).
@@ -861,14 +885,14 @@ where
                 content.len()
             );
         }
-        return Ok(content);
+        return Ok((content, false));
     }
 
     if trace_retrieve {
         eprintln!("[retrieve_content_with_filter_fast] falling back to retrieve_graph");
     }
 
-    atomic_core::record::workflow::retrieve::retrieve_content_with_filter(
+    atomic_core::record::workflow::retrieve::retrieve_content_with_filter_and_fork_info(
         txn, changes, position, options,
     )
 }

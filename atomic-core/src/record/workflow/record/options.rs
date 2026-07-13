@@ -53,6 +53,19 @@ pub struct RecordingOptions {
 
     /// Number of context lines for hunks.
     context_lines: usize,
+
+    /// Force a whole-file replace instead of a positional diff against
+    /// `old_content`.
+    ///
+    /// Set this when the caller's `old_content` came from resolving a fork
+    /// or cyclic conflict in the graph (see
+    /// `retrieve_content_with_filter_and_fork_info` in the record path) —
+    /// that resolution isn't guaranteed to structurally match what a plain
+    /// checkout renders for the same graph state (POMO-2), so a positional
+    /// diff against it can produce a corrupted hunk. A whole-file replace
+    /// only needs "what's alive gets deleted, this is inserted fresh" to be
+    /// true, which holds regardless of how `old_content` was resolved.
+    force_whole_file_replace: bool,
 }
 
 impl RecordingOptions {
@@ -207,6 +220,27 @@ impl RecordingOptions {
         self
     }
 
+    /// Force a whole-file replace instead of a positional diff against
+    /// `old_content`.
+    ///
+    /// # Arguments
+    ///
+    /// * `force` - Whether to force a whole-file replace
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use atomic_core::record::workflow::record::RecordingOptions;
+    ///
+    /// let options = RecordingOptions::new().force_whole_file_replace(true);
+    /// assert!(options.get_force_whole_file_replace());
+    /// ```
+    #[must_use]
+    pub fn force_whole_file_replace(mut self, force: bool) -> Self {
+        self.force_whole_file_replace = force;
+        self
+    }
+
     /// Get the algorithm setting.
     #[must_use]
     pub fn get_algorithm(&self) -> Algorithm {
@@ -243,6 +277,12 @@ impl RecordingOptions {
         self.context_lines
     }
 
+    /// Get the force-whole-file-replace setting.
+    #[must_use]
+    pub fn get_force_whole_file_replace(&self) -> bool {
+        self.force_whole_file_replace
+    }
+
     /// Check if a file size exceeds the maximum.
     #[must_use]
     pub fn exceeds_max_size(&self, size: usize) -> bool {
@@ -269,6 +309,7 @@ impl Default for RecordingOptions {
             skip_binary: false,
             record_empty_files: true,
             context_lines: Self::DEFAULT_CONTEXT_LINES,
+            force_whole_file_replace: false,
         }
     }
 }

@@ -27,10 +27,16 @@ assert_import_clean_with_bootstrap() {
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
 
-        # Ignore the repository bootstrap artifacts materialized by `atomic init`.
-        case "$line" in
-            \?*\ .atomicignore) continue ;;
-            \?*\ .vault/*) continue ;;
+        # Ignore the repository bootstrap artifacts materialized by
+        # `atomic init`/`atomic git import` (vault scaffold + .atomicignore).
+        # These can show up as untracked ("??") or already-added ("A ")
+        # depending on whether the import step auto-adds them, so match on
+        # the path regardless of the leading status flag(s).
+        local path
+        path="$(echo "$line" | sed -E 's/^[^[:space:]]+[[:space:]]+//')"
+        case "$path" in
+            .atomicignore) continue ;;
+            .vault/*) continue ;;
         esac
 
         unexpected+="${line}"$'\n'
@@ -40,6 +46,33 @@ assert_import_clean_with_bootstrap() {
         _pass "$desc"
     else
         _fail "$desc" "unexpected status entries: $(printf '%s' "$unexpected" | head -10)"
+    fi
+}
+
+# Assert that `atomic diff` (working copy) shows no changes other than the
+# repository bootstrap artifacts (vault scaffold + .atomicignore), which are
+# added but not recorded by `atomic git import` and so appear as new-file
+# diffs on the working copy.
+assert_no_diff_except_bootstrap() {
+    local desc="$1"
+    local diff_out
+    diff_out="$(atomic diff 2>/dev/null || true)"
+
+    local unexpected=""
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^diff\ --atomic\ a/.*\ b/(.*)\ \( ]]; then
+            local path="${BASH_REMATCH[1]}"
+            case "$path" in
+                .atomicignore | .vault/*) continue ;;
+                *) unexpected+="${path}"$'\n' ;;
+            esac
+        fi
+    done <<< "$diff_out"
+
+    if [[ -z "$unexpected" ]]; then
+        _pass "$desc"
+    else
+        _fail "$desc" "atomic diff shows unexpected changes for: $(printf '%s' "$unexpected" | head -10)"
     fi
 }
 
@@ -80,12 +113,7 @@ assert_success "import succeeds" atomic git import
 assert_import_clean_with_bootstrap "working tree clean after import"
 
 # Double-check: atomic diff should show nothing
-diff_out="$(atomic diff 2>/dev/null || true)"
-if echo "$diff_out" | grep -qE '^diff --atomic'; then
-    _fail "no diff after import" "atomic diff shows unexpected changes"
-else
-    _pass "no diff after import"
-fi
+assert_no_diff_except_bootstrap "no diff after import"
 
 # Verify beta still exists and has correct content
 assert_file_exists "beta.txt survives deletion of siblings" "beta.txt"
@@ -163,12 +191,7 @@ assert_success "import with binary modification succeeds" atomic git import
 assert_import_clean_with_bootstrap "clean after binary modification import"
 
 # Also verify diff shows nothing
-diff_out="$(atomic diff 2>/dev/null || true)"
-if echo "$diff_out" | grep -qE '^diff --atomic'; then
-    _fail "no diff after binary modification import" "atomic diff shows changes for binary file"
-else
-    _pass "no diff after binary modification import"
-fi
+assert_no_diff_except_bootstrap "no diff after binary modification import"
 
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -453,12 +476,7 @@ for f in "${deleted_files[@]}"; do
 done
 
 # Final consistency check: atomic diff should be empty
-diff_out="$(atomic diff 2>/dev/null || true)"
-if echo "$diff_out" | grep -qE '^diff --atomic'; then
-    _fail "no diff in stress test" "atomic diff shows unexpected changes"
-else
-    _pass "no diff in stress test"
-fi
+assert_no_diff_except_bootstrap "no diff in stress test"
 
 # ════════════════════════════════════════════════════════════════════════════
 # Summary

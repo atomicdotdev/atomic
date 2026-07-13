@@ -110,7 +110,7 @@ impl Repository {
 
         let record_t0 = std::time::Instant::now();
 
-        use super::content::retrieve_content_with_filter_fast;
+        use super::content::retrieve_content_with_filter_fast_with_fork_info;
 
         // Pre-compute the change filter and cached graph transaction ONCE
         // for the entire record operation.  Previously, get_file_content()
@@ -436,11 +436,21 @@ impl Repository {
                 };
 
                 // Old content = the file as the current view sees it in the graph.
-                let old_content = {
+                //
+                // `had_fork_structure` is true when retrieval had to resolve a
+                // fork or cyclic conflict (semantic merge / change-DAG
+                // supersession) to produce this content — most concretely, a
+                // fork left over from the orphan-view duplication bug (POMO-1).
+                // That resolution isn't guaranteed to structurally match what a
+                // plain, unambiguous checkout would render for the same graph
+                // state, so a positional diff against it can corrupt the file
+                // (POMO-2). We propagate the flag to `record_modified_file` via
+                // `force_whole_file_replace` below instead of diffing against it.
+                let (old_content, had_fork_structure) = {
                     use atomic_core::output::alive::RetrieveOptions;
                     let opts =
                         RetrieveOptions::new().with_change_filter(shared_change_filter.clone());
-                    match retrieve_content_with_filter_fast(
+                    match retrieve_content_with_filter_fast_with_fork_info(
                         &shared_cached_txn,
                         &self.change_store,
                         file_inode,
@@ -519,12 +529,23 @@ impl Repository {
                 detected.inode = Some(file_inode);
                 detected.position = Some(file_position);
                 let working_copy = FileSystem::from_root(&self.root);
+                let file_options = if had_fork_structure {
+                    log::warn!(
+                        "record: '{}' had fork/cyclic conflict structure in its graph — \
+                         forcing a whole-file replace instead of a positional diff \
+                         (POMO-2 safety fallback; expected to be rare and self-healing)",
+                        path
+                    );
+                    core_options.clone().force_whole_file_replace(true)
+                } else {
+                    core_options.clone()
+                };
                 match record_modified_file(
                     &working_copy,
                     &detected,
                     &old_content,
                     crdt_old_content.as_deref(),
-                    &core_options,
+                    &file_options,
                     existing_trunk_id,
                     existing_branches_slice,
                 ) {
