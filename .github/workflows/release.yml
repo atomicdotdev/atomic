@@ -1,8 +1,21 @@
 name: Release
 
 on:
+  # Push to the release branch (legacy/manual path) or a version tag.
   push:
     branches: [release]
+    tags: ['v*']
+  # Callable from the Prepare Release dispatch workflow, which bumps the
+  # version, merges dev into release, and then invokes this build directly.
+  # Invoking via workflow_call runs in the same workflow run, so it works
+  # with the default GITHUB_TOKEN (no PAT needed to chain the build).
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to build the release from."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -23,6 +36,8 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Extract version from Cargo.toml
         id: version
@@ -71,6 +86,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.90
@@ -145,6 +162,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref || github.ref }}
           # Full history so generate-notes can diff against the previous tag
           fetch-depth: 0
 
@@ -248,6 +266,12 @@ jobs:
           echo "Generated release notes:"
           cat release-notes.md
 
+      - name: Resolve target commit
+        id: target
+        # Use the commit actually checked out (the release branch/tag/SHA),
+        # not github.sha — under workflow_call the latter is the caller's ref.
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -261,7 +285,7 @@ jobs:
 
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
-            --target "${{ github.sha }}" \
+            --target "${{ steps.target.outputs.sha }}" \
             --title "Atomic ${TAG}" \
             --notes-file release-notes.md \
             $PRERELEASE_FLAG \

@@ -1,0 +1,77 @@
+name: Prepare Release
+
+# Manual "one button" release. From the GitHub Actions UI, run this workflow
+# with the new version (e.g. 0.9.1). It:
+#   1. Bumps the workspace version in Cargo.toml (+ Cargo.lock) on dev.
+#   2. Merges dev into release.
+#   3. Invokes the Release workflow to build binaries and cut the GitHub
+#      release + v<version> tag.
+#
+# No PAT required: step 3 runs the release build via workflow_call in this
+# same run, so the default GITHUB_TOKEN is sufficient.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "New version, semver without leading v (e.g. 0.9.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    name: Bump version and merge to release
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.merge.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Validate version
+        run: |
+          echo "${{ inputs.version }}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
+            || { echo "::error::Invalid version '${{ inputs.version }}' (expected e.g. 0.9.1)"; exit 1; }
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump workspace version in Cargo.toml
+        run: |
+          sed -i -E 's/^version = "[^"]*"/version = "${{ inputs.version }}"/' Cargo.toml
+          grep -m1 '^version = ' Cargo.toml
+
+      - name: Update Cargo.lock
+        run: cargo update --workspace
+
+      - name: Commit and push to dev
+        run: |
+          git add Cargo.toml Cargo.lock
+          git commit -m "Bump version to ${{ inputs.version }}"
+          git push origin HEAD:dev
+
+      - name: Merge dev into release
+        id: merge
+        run: |
+          git fetch origin release
+          git checkout -B release origin/release
+          git merge --no-ff dev -m "Merge dev into release"
+          git push origin HEAD:release
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Build and release
+    needs: bump
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: write
+    secrets: inherit
+    with:
+      ref: ${{ needs.bump.outputs.sha }}
