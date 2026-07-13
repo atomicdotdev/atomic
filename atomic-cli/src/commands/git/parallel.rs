@@ -3316,7 +3316,7 @@ impl ParallelImporter {
                 }
                 CommitClassification::Merge => {
                     stats.merges += 1;
-                    let tag_name = format!("merge-{}", &info.short_sha);
+                    let tag_name = format!("merge-{}", info.short_sha);
                     let metadata = serde_json::json!({
                         "git": {
                             "sha": info.git_sha,
@@ -3344,7 +3344,7 @@ impl ParallelImporter {
                     let tag_name = if let Some(pr) = pr_number {
                         format!("pr-{}", pr)
                     } else {
-                        format!("squash-{}", &info.short_sha)
+                        format!("squash-{}", info.short_sha)
                     };
                     let metadata = serde_json::json!({
                         "git": {

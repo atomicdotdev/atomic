@@ -11,6 +11,7 @@ mod edit_tests;
 mod history_tests;
 mod init_tests;
 mod integration_tests;
+mod record_duplication_tests;
 mod record_tests;
 mod status_tests;
 

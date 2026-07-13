@@ -374,9 +374,32 @@ where
     T: GraphTxnT,
     C: ChangeStore,
 {
+    retrieve_content_with_filter_and_fork_info(txn, changes, position, options)
+        .map(|(content, _had_fork_structure)| content)
+}
+
+/// Retrieve content with a change filter, also reporting whether retrieval
+/// had to resolve fork/cyclic structure to produce it.
+///
+/// Like [`retrieve_content_with_filter`], but additionally returns whether
+/// [`output_file_to_buffer_with_options`] had to fall back to semantic-merge
+/// resolution (see its docs). Callers that use this content as `old_content`
+/// for a subsequent positional diff must consult this flag: such a
+/// resolution is not guaranteed to structurally match what a plain checkout
+/// would render for the same graph state.
+pub fn retrieve_content_with_filter_and_fork_info<T, C>(
+    txn: &T,
+    changes: &C,
+    position: Position<NodeId>,
+    options: RetrieveOptions,
+) -> RecordResult<(Vec<u8>, bool)>
+where
+    T: GraphTxnT,
+    C: ChangeStore,
+{
     // Check for root position - it has no content
     if position == Position::ROOT {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
 
     // Convert RetrieveOptions to FileOutputOptions, preserving the change filter
@@ -389,7 +412,7 @@ where
     }
 
     // Use output_file_to_buffer_with_options which accepts RetrieveOptions
-    let (content, _conflicts) =
+    let (content, _conflicts, had_fork_structure) =
         match output_file_to_buffer_with_options(txn, changes, position, file_opts, options) {
             Ok(result) => result,
             Err(e) => {
@@ -401,7 +424,7 @@ where
             }
         };
 
-    Ok(content)
+    Ok((content, had_fork_structure))
 }
 
 /// Retrieve content at the state before a specific sequence.

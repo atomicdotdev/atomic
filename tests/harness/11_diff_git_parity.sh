@@ -472,16 +472,24 @@ else
         atomic_h=$(echo "$logline" | awk '{print $1}')
         [[ -z "$atomic_h" ]] && continue
         change_detail=$( (cd "$GIT_REPO" && atomic change "$atomic_h" 2>/dev/null) || true )
-        git_sha=$(echo "$change_detail" | grep "Commit:" | awk '{print $2}')
+        # Not every change has "Commit:" metadata — the vault-scaffold and
+        # .atomicignore changes atomic git import creates alongside the
+        # actual git-derived history don't. Under set -e/pipefail, grep
+        # finding no match must not abort the whole script.
+        git_sha=$(echo "$change_detail" | grep "Commit:" | awk '{print $2}' || true)
         if [[ -n "$git_sha" ]]; then
             # Store the full git SHA so we can match short SHAs of any length
             MAP_GIT_SHAS+=("$git_sha")
             MAP_ATOMIC_HASHES+=("$atomic_h")
         fi
-        # Stop once we have all 4 commits mapped
+        # Stop once we have all 4 commits mapped.
+        # ${MAP_GIT_SHAS[@]:-} (not "${MAP_GIT_SHAS[@]}"): bash 3.2 (macOS's
+        # default /bin/bash) treats expanding an empty array as an unbound
+        # variable under `set -u`, which is active here via helpers.sh.
         _found=0
         for _s in "${COMMIT_SHAS[@]}"; do
-            for _ms in "${MAP_GIT_SHAS[@]}"; do
+            for _ms in "${MAP_GIT_SHAS[@]:-}"; do
+                [[ -z "$_ms" ]] && continue
                 # Match if the full SHA starts with the short SHA
                 [[ "$_ms" == "${_s}"* ]] && _found=$((_found+1)) && break
             done

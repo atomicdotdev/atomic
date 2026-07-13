@@ -495,13 +495,18 @@ impl Diff {
             let rm_orig_idx = rm_entries[*ri].0;
             let add_orig_idx = add_entries[*ai].0;
 
-            // Only pull an add forward if there are no other Added lines
-            // between the remove and the matched add in the original order.
-            // Intervening Added lines represent genuinely new content that
-            // belongs before the matched line in the new file — moving the
-            // matched add past them would put it in the wrong position.
-            let has_intervening_adds = (rm_orig_idx + 1..add_orig_idx).any(|i| lines[i].is_added());
-            if has_intervening_adds {
+            // Only pull an add forward, never backward — the add must come
+            // after the remove in the original order, or "pulling it
+            // forward" would instead duplicate a line already emitted at
+            // its earlier original position.
+            //
+            // Intervening Added lines between the remove and its matched add
+            // are allowed: pairing readability (showing what a buried
+            // modification actually changed) matters more here than
+            // preserving their exact relative display position, which is
+            // the whole point of this heuristic — see the "buried
+            // modification" and "pairing at scale" cases this exists for.
+            if add_orig_idx <= rm_orig_idx {
                 continue;
             }
 

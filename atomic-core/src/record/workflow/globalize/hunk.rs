@@ -435,19 +435,11 @@ fn globalize_replace_whole_file<T>(
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    let content_vertices = find_content_vertices_cached(ctx, inode, inode_pos)?;
-    let deletion_edges = match build_deletion_edges(ctx, &content_vertices) {
-        Ok(edges) => edges,
-        Err(_) => {
-            let global_vertices = find_content_vertices_global(ctx.txn(), inode_pos)?;
-            build_deletion_edges(ctx, &global_vertices)?
-        }
-    };
-
-    let deletion = EdgeUpdate {
-        edges: deletion_edges,
-        inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
-    };
+    // Delegates to `delete_all_content` for "find every content vertex,
+    // delete it" — see its docs for why this always uses the thorough
+    // SCC-aware traversal rather than a linear walk (a linear walk would
+    // miss one branch of a genuine fork and leave stale content alive).
+    let deletion = delete_all_content(ctx, inode_pos)?;
 
     let insertions = if should_use_opaque_generated_vertices(&local.path) {
         vec![create_content_vertex(
@@ -547,18 +539,9 @@ where
         }
     }
 
-    // Fallback: whole-file deletion.
-    let deletion = match delete_all_content(ctx, inode, inode_pos) {
-        Ok(d) => d,
-        Err(_) => {
-            let global_vertices = find_content_vertices_global(ctx.txn(), inode_pos)?;
-            let deletion_edges = build_deletion_edges(ctx, &global_vertices)?;
-            EdgeUpdate {
-                edges: deletion_edges,
-                inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
-            }
-        }
-    };
+    // Fallback: whole-file deletion. `delete_all_content` already does the
+    // thorough SCC-aware search, so no further fallback is needed here.
+    let deletion = delete_all_content(ctx, inode_pos)?;
 
     Ok(vec![GraphOp::Edit {
         change: Atom::EdgeUpdate(deletion),
@@ -575,17 +558,32 @@ where
 /// deleted.
 ///
 /// This is the single place where "find all content vertices → create
-/// deletion edges" happens. Both [`globalize_replace`] and
+/// deletion edges" happens. Both [`globalize_replace_whole_file`] and
 /// [`globalize_delete`] delegate here.
+///
+/// Uses [`find_content_vertices_global`] — the full SCC-aware traversal via
+/// `retrieve_graph`, the same one used for display/diffing — rather than a
+/// linear walk (`collect_sorted_content_vertices`, used elsewhere for
+/// targeted range lookups). A linear walk only follows one BLOCK-edge
+/// successor chain from the inode, so a genuine fork (two chains both
+/// anchored on the inode — exactly what the orphan-view duplication bug
+/// produces) leaves one branch unvisited. It doesn't error on that
+/// incomplete result, so callers that only fall back to the global search on
+/// an `Err` never actually reach it: `build_deletion_edges` happily succeeds
+/// on whatever partial list it's given, deleting only that branch and
+/// leaving the other alive. This function's whole purpose is
+/// deleting *every* content vertex, so it always pays for the thorough
+/// traversal — it's a rare, non-hot-path fallback (opaque/legacy files,
+/// whole-file replace, or a full-file delete), so the extra cost is an
+/// acceptable trade for actually being complete.
 fn delete_all_content<T>(
     ctx: &mut GlobalizeContext<'_, T>,
-    inode: Inode,
     inode_pos: Position<NodeId>,
 ) -> GlobalizeResult<EdgeUpdate<Option<Hash>>>
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    let content_vertices = find_content_vertices_cached(ctx, inode, inode_pos)?;
+    let content_vertices = find_content_vertices_global(ctx.txn(), inode_pos)?;
     let deletion_edges = build_deletion_edges(ctx, &content_vertices)?;
 
     Ok(EdgeUpdate {
@@ -704,23 +702,6 @@ fn classify_insert(
 }
 
 fn collect_sorted_content_vertices_cached<T>(
-    ctx: &mut GlobalizeContext<'_, T>,
-    inode: Inode,
-    inode_pos: Position<NodeId>,
-) -> GlobalizeResult<Vec<GraphNode<NodeId>>>
-where
-    T: GraphTxnT + InodeGraphOps,
-{
-    if let Some(vertices) = ctx.content_vertices_cache.get(&inode) {
-        return Ok(vertices.clone());
-    }
-
-    let vertices = collect_sorted_content_vertices(ctx.txn, inode, inode_pos)?;
-    ctx.content_vertices_cache.insert(inode, vertices.clone());
-    Ok(vertices)
-}
-
-fn find_content_vertices_cached<T>(
     ctx: &mut GlobalizeContext<'_, T>,
     inode: Inode,
     inode_pos: Position<NodeId>,

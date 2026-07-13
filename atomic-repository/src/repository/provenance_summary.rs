@@ -338,10 +338,12 @@ mod tests {
 
     #[test]
     fn ai_authored_pct_excludes_system() {
-        let mut s = ProvenanceSummary::default();
-        s.ai_changes = 4;
-        s.human_changes = 1;
-        s.system_changes = 2; // bootstrap excluded from headline denominator
+        let s = ProvenanceSummary {
+            ai_changes: 4,
+            human_changes: 1,
+            system_changes: 2, // bootstrap excluded from headline denominator
+            ..Default::default()
+        };
         assert_eq!(s.authored_denominator(), 5);
         assert!((s.ai_authored_pct().unwrap() - 80.0).abs() < 1e-9);
         // ai_all_changes_pct uses total: 4 / 7
@@ -350,18 +352,22 @@ mod tests {
 
     #[test]
     fn ai_authored_pct_none_when_only_system() {
-        let mut s = ProvenanceSummary::default();
-        s.system_changes = 3;
+        let s = ProvenanceSummary {
+            system_changes: 3,
+            ..Default::default()
+        };
         assert_eq!(s.authored_denominator(), 0);
         assert_eq!(s.ai_authored_pct(), None);
     }
 
     #[test]
     fn needs_attention_does_not_count_as_human() {
-        let mut s = ProvenanceSummary::default();
-        s.ai_changes = 1;
-        s.human_changes = 0;
-        s.needs_attention_changes = 2; // must NOT be in denominator
+        let s = ProvenanceSummary {
+            ai_changes: 1,
+            human_changes: 0,
+            needs_attention_changes: 2, // must NOT be in denominator
+            ..Default::default()
+        };
         assert_eq!(s.authored_denominator(), 1);
         assert_eq!(s.ai_authored_pct(), Some(100.0));
     }
@@ -370,10 +376,12 @@ mod tests {
     fn unreadable_changes_do_not_skew_percent() {
         // Unreadable changes are reported separately, NOT counted in any
         // bucket — they must not silently change the denominator.
-        let mut s = ProvenanceSummary::default();
-        s.ai_changes = 4;
-        s.human_changes = 1;
-        s.unreadable_changes = 3;
+        let s = ProvenanceSummary {
+            ai_changes: 4,
+            human_changes: 1,
+            unreadable_changes: 3,
+            ..Default::default()
+        };
         assert_eq!(s.authored_denominator(), 5);
         assert_eq!(s.ai_authored_pct(), Some(80.0));
         // total_changes excludes unreadable by design
