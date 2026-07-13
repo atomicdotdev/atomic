@@ -170,7 +170,8 @@ fn test_sequential_small_edits_do_not_compound_duplication() {
         let marker = format!("// marker[{i}]");
         let occurrences = count_occurrences(&content, &marker);
         assert_eq!(
-            occurrences, 1,
+            occurrences,
+            1,
             "step{} should appear exactly once after {} sequential edits, \
              found {} (duplication compounding — POMO-1)",
             i,
@@ -262,9 +263,18 @@ fn test_cross_view_merge_large_file_post_merge_record_clean() {
         );
     }
 
-    assert!(content.contains("return 3000"), "feature's edit should survive the merge");
-    assert!(content.contains("return 9000"), "dev's edit should survive the merge");
-    assert!(content.contains("return 6000"), "post-merge edit should be present");
+    assert!(
+        content.contains("return 3000"),
+        "feature's edit should survive the merge"
+    );
+    assert!(
+        content.contains("return 9000"),
+        "dev's edit should survive the merge"
+    );
+    assert!(
+        content.contains("return 6000"),
+        "post-merge edit should be present"
+    );
 }
 
 /// Build a slice-literal-style block of `count` lines, one per value in
@@ -423,7 +433,9 @@ fn test_further_edit_after_orphan_view_merge_is_still_detected() {
     );
     std::fs::write(&file, &further_edited).unwrap();
 
-    let status = repo.status(StatusOptions::default()).expect("status failed");
+    let status = repo
+        .status(StatusOptions::default())
+        .expect("status failed");
     let modified_paths: Vec<String> = status
         .modified()
         .map(|e| e.path().to_string_lossy().to_string())

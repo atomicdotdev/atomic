@@ -264,16 +264,15 @@ pub fn record_turn(
                     }
                 }
 
-                repo.align_to_view(&options.session.view_name).map_err(|e| {
-                    AgentError::RecordFailed {
+                repo.align_to_view(&options.session.view_name)
+                    .map_err(|e| AgentError::RecordFailed {
                         session_id: options.session.session_id.clone(),
                         turn_number: options.turn_number,
                         reason: format!(
                             "Failed to align to session view '{}' after forking it: {}",
                             options.session.view_name, e
                         ),
-                    }
-                })?;
+                    })?;
             }
             Err(e) => {
                 return Err(AgentError::RecordFailed {
