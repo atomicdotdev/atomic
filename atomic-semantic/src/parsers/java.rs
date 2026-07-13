@@ -207,7 +207,7 @@ impl JavaParser {
 
         let exported = self.has_modifier(node, source, "public");
 
-        let sig = format!("{}enum {}", if exported { "public " } else { "" }, &name);
+        let sig = format!("{}enum {}", if exported { "public " } else { "" }, name);
         let mut entity = Entity::new(name, EntityKind::Enum, file_path, line, end_line);
         entity = entity.with_signature(sig);
         if exported {
@@ -235,7 +235,7 @@ impl JavaParser {
         let sig = format!(
             "{}record {}{}",
             if exported { "public " } else { "" },
-            &name,
+            name,
             params
         );
         let mut entity = Entity::new(name, EntityKind::Class, file_path, line, end_line);

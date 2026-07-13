@@ -83,8 +83,11 @@ create_file "feature.txt" "feature content"
 assert_success "add feature.txt" atomic add feature.txt
 record_change "Add feature.txt on feature" >/dev/null 2>&1 || true
 
-# Log on feature should have 2 entries (base + feature file)
-feature_log="$(atomic log 2>/dev/null || true)"
+# Log on feature should have 2 entries (base + feature file). Draft views
+# hide ancestor-inherited entries by default (git-branch-log semantics);
+# --all shows the full history including what was explicitly pulled in via
+# insert_from_view.
+feature_log="$(atomic log --all 2>/dev/null || true)"
 feature_count="$(echo "$feature_log" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
 
 if [[ $feature_count -ge 2 ]]; then
@@ -389,9 +392,11 @@ record_change "Add removable on dev" >/dev/null 2>&1 || true
 new_view "feature" >/dev/null 2>&1 || true
 insert_from_view "dev" "feature" >/dev/null 2>&1 || true
 
-# Verify feature has the change
+# Verify feature has the change. --all needed: the change is still
+# present in dev's own log at this point, so the draft-view ancestor
+# filter would otherwise hide it (it was pulled in via insert_from_view).
 switch_view "feature" >/dev/null 2>&1 || true
-feature_log_before="$(atomic log 2>/dev/null || true)"
+feature_log_before="$(atomic log --all 2>/dev/null || true)"
 if echo "$feature_log_before" | grep -qF "Add removable on dev"; then
     _pass "feature log has removable change before unrecord"
 else
@@ -587,7 +592,9 @@ else
     _pass "feature record completes"
 fi
 
-feature_log="$(atomic log 2>/dev/null || true)"
+# --all: feature inherited "Add app.py v1" via insert_from_view, which the
+# draft-view ancestor filter would otherwise hide since it's also on dev.
+feature_log="$(atomic log --all 2>/dev/null || true)"
 feature_count="$(echo "$feature_log" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
 if [[ $feature_count -ge 2 ]]; then
     _pass "feature log has 2+ entries ($feature_count)"
@@ -819,7 +826,9 @@ for i in 4 5; do
     record_change "Add file${i}" >/dev/null 2>&1 || true
 done
 
-feature_log="$(atomic log 2>/dev/null || true)"
+# --all: expected_feature counts the 3 inherited dev changes too, which
+# the draft-view ancestor filter would otherwise hide.
+feature_log="$(atomic log --all 2>/dev/null || true)"
 feature_count="$(echo "$feature_log" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
 expected_feature=$((BASE + 5))
 if [[ $feature_count -eq $expected_feature ]]; then
@@ -862,9 +871,10 @@ else
     _fail "dev has $expected_after_unrecord changes after unrecord" "got $dev_count4"
 fi
 
-# Feature should still have BASE+5 (unrecord was on dev)
+# Feature should still have BASE+5 (unrecord was on dev). --all: same
+# ancestor-filter reasoning as above.
 switch_view "feature" >/dev/null 2>&1 || true
-feature_log2="$(atomic log 2>/dev/null || true)"
+feature_log2="$(atomic log --all 2>/dev/null || true)"
 feature_count2="$(echo "$feature_log2" | grep -cE '^[[:space:]]*#[0-9]+|^[0-9a-f]{8,}' || true)"
 if [[ $feature_count2 -eq $expected_feature ]]; then
     _pass "feature still has $expected_feature changes after dev unrecord"

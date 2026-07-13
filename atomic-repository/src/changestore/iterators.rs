@@ -128,36 +128,33 @@ impl<'a> AttestationIterator<'a> {
 
     fn next_from_files(&mut self) -> Option<ChangeStoreResult<Hash>> {
         loop {
-            if let Some(ref mut files) = self.current_files {
-                match files.next() {
-                    Some(Ok(entry)) => {
-                        let path = entry.path();
-                        if !path.is_file() {
-                            continue;
-                        }
-                        if path
-                            .extension()
-                            .is_none_or(|e| e != atomic_core::change::ATTESTATION_EXTENSION)
-                        {
-                            continue;
-                        }
-                        // Extract hash from filename (strip extension)
-                        let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                            Some(s) => s.to_string(),
-                            None => continue,
-                        };
-                        match Hash::from_base32(stem.as_bytes()) {
-                            Some(hash) => return Some(Ok(hash)),
-                            None => continue,
-                        }
+            let files = self.current_files.as_mut()?;
+            match files.next() {
+                Some(Ok(entry)) => {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
                     }
-                    Some(Err(e)) => return Some(Err(e.into())),
-                    None => {
-                        self.current_files = None;
+                    if path
+                        .extension()
+                        .is_none_or(|e| e != atomic_core::change::ATTESTATION_EXTENSION)
+                    {
+                        continue;
+                    }
+                    // Extract hash from filename (strip extension)
+                    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                        Some(s) => s.to_string(),
+                        None => continue,
+                    };
+                    match Hash::from_base32(stem.as_bytes()) {
+                        Some(hash) => return Some(Ok(hash)),
+                        None => continue,
                     }
                 }
-            } else {
-                return None;
+                Some(Err(e)) => return Some(Err(e.into())),
+                None => {
+                    self.current_files = None;
+                }
             }
         }
     }
@@ -216,36 +213,33 @@ impl ProvenanceIterator {
 
     fn next_from_files(&mut self) -> Option<ChangeStoreResult<Hash>> {
         loop {
-            if let Some(ref mut files) = self.current_files {
-                match files.next() {
-                    Some(Ok(entry)) => {
-                        let path = entry.path();
-                        if !path.is_file() {
-                            continue;
-                        }
-                        if path
-                            .extension()
-                            .is_none_or(|e| e != atomic_core::change::PROVENANCE_GRAPH_EXTENSION)
-                        {
-                            continue;
-                        }
-                        // Extract hash from filename (strip extension)
-                        let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                            Some(s) => s.to_string(),
-                            None => continue,
-                        };
-                        match Hash::from_base32(stem.as_bytes()) {
-                            Some(hash) => return Some(Ok(hash)),
-                            None => continue,
-                        }
+            let files = self.current_files.as_mut()?;
+            match files.next() {
+                Some(Ok(entry)) => {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
                     }
-                    Some(Err(e)) => return Some(Err(e.into())),
-                    None => {
-                        self.current_files = None;
+                    if path
+                        .extension()
+                        .is_none_or(|e| e != atomic_core::change::PROVENANCE_GRAPH_EXTENSION)
+                    {
+                        continue;
+                    }
+                    // Extract hash from filename (strip extension)
+                    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                        Some(s) => s.to_string(),
+                        None => continue,
+                    };
+                    match Hash::from_base32(stem.as_bytes()) {
+                        Some(hash) => return Some(Ok(hash)),
+                        None => continue,
                     }
                 }
-            } else {
-                return None;
+                Some(Err(e)) => return Some(Err(e.into())),
+                None => {
+                    self.current_files = None;
+                }
             }
         }
     }

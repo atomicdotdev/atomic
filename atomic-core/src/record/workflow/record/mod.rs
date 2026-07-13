@@ -156,7 +156,7 @@ pub use types::{RecordedFile, RecordingResult, RecordingStats};
 
 use crate::change::{Encoding, FileOps, Local};
 use crate::crdt::{BranchId, TrunkId};
-use crate::diff::DiffOp;
+use crate::diff::{DiffOp, Line};
 use crate::output::WorkingCopyRead;
 use crate::types::NodeId;
 
@@ -430,6 +430,37 @@ where
         recorded.add_hunk(replace_hunk);
         recorded.set_content(new_content);
         recorded.set_opaque_generated(true);
+        return Ok(recorded);
+    }
+
+    // Whole-file-replace safety fallback: if the caller's `old_content` came
+    // from resolving a fork or cyclic conflict (see
+    // `retrieve_content_with_filter_and_fork_info`), it isn't guaranteed to
+    // structurally match what a plain, unambiguous checkout would render for
+    // the same graph state. A positional diff against it can therefore
+    // produce a corrupted hunk. Skip the positional diff entirely and emit a
+    // single whole-file replace instead — "what's alive gets deleted, this is
+    // inserted fresh" holds regardless of how `old_content` was resolved.
+    // `deleted_lines: vec![usize::MAX]` is a deliberate sentinel that routes
+    // this hunk through `globalize_replace_whole_file`'s safe fallback path
+    // (the same path used for opaque/legacy files above), rather than a
+    // targeted per-vertex diff that would trust old_content's mismatched
+    // shape. This mirrors the delete+add workaround that was used manually to
+    // recover a corrupted file before this fix existed.
+    if options.get_force_whole_file_replace() {
+        let mut replace_hunk = BuiltHunk::new_replace_with_lines(
+            Local::new(&detected.path, 1),
+            Some(encoding),
+            vec![usize::MAX],
+            0,
+            0,
+            Line::from_bytes(&new_content).len(),
+        );
+        replace_hunk.content_start = Some(0);
+        replace_hunk.content_end = Some(new_content.len() as u64);
+        recorded.add_hunk(replace_hunk);
+        recorded.set_content(new_content);
+
         return Ok(recorded);
     }
 

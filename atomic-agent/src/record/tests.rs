@@ -1016,3 +1016,157 @@ fn test_outcome_recorded_file_list_empty() {
 
     assert!(outcome.recorded_file_list().is_empty());
 }
+
+// Orphaned session view duplication
+
+/// Build a Go-like source file with `count` distinct top-level functions,
+/// each with a unique, greppable marker line.
+fn build_source(count: usize) -> String {
+    let mut out = String::new();
+    out.push_str("package main\n\n");
+    for i in 0..count {
+        out.push_str(&format!(
+            "func step{i}() int {{\n    // marker[{i}]\n    return {i}\n}}\n\n"
+        ));
+    }
+    out
+}
+
+fn count_occurrences(content: &str, pattern: &str) -> usize {
+    content.matches(pattern).count()
+}
+
+/// Reproduces the real-world mechanism behind the orphan-view duplication
+/// bug: a session whose `SessionStart` fork never ran (or failed silently),
+/// so its view doesn't exist yet when `record_turn()` is called for the
+/// first time.
+///
+/// Before the fix, `record_turn()` would fall through to whatever view
+/// happened to be `current_view` on the raw `Repository` handle it opens
+/// internally — not necessarily this session's intended parent — and record
+/// the turn there. Once that view and the session's own (separately
+/// forked) view were both later merged into `dev`, the divergent baselines
+/// meant the same pre-existing content could be recorded twice.
+///
+/// This test drives two sessions through `record_turn()` directly: session
+/// A whose view is properly forked from `dev` beforehand (the normal path),
+/// and session B whose view is deliberately left unforked (the orphan
+/// path). Per the fix, `record_turn()` must self-heal session B by forking
+/// its view just-in-time from its intended parent (`dev`) rather than
+/// silently recording onto the wrong view. After merging both sessions'
+/// views into `dev`, every function in the file must appear exactly once.
+#[test]
+fn test_orphaned_session_view_duplicates_content_on_merge() {
+    use atomic_repository::apply::CrossViewInsertOptions;
+    use atomic_repository::Repository;
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let repo_root = temp_dir.path();
+    let file = repo_root.join("main.go");
+
+    let initial = build_source(80);
+    std::fs::write(&file, &initial).unwrap();
+
+    {
+        let repo = Repository::init(repo_root).unwrap();
+        repo.add(
+            "main.go",
+            atomic_repository::tracking::TrackingOptions::default(),
+        )
+        .unwrap();
+        let header = atomic_core::change::ChangeHeader::new("Add main.go");
+        let options = atomic_repository::record::RecordOptions::new()
+            .with_all(true)
+            .save_to_store(true)
+            .apply_after_record(true);
+        repo.record(header, options).unwrap();
+    }
+
+    // Session A: SessionStart properly forks its view from "dev" before any
+    // turn is recorded — the normal, non-buggy path.
+    {
+        let mut repo = Repository::open_existing(repo_root).unwrap();
+        repo.create_view_from("session-a", "dev").unwrap();
+    }
+
+    let mut session_a = AgentSession::new("session-a", "claude-code", "Claude Code");
+    session_a.view_name = "session-a".to_string();
+    session_a.set_parent_view("dev");
+
+    let edited_a = initial.replacen("return 10\n", "return 1000\n", 1);
+    std::fs::write(&file, &edited_a).unwrap();
+
+    let event_a = TurnEvent::new("session-a", HookType::TurnEnd);
+    let options_a = TurnRecordOptions {
+        session: &session_a,
+        event: &event_a,
+        turn_number: 1,
+        turn_duration_ms: 1000,
+        prompt: Some("Bump step10".to_string()),
+    };
+    record_turn(repo_root, &options_a).unwrap();
+
+    // Session B: simulates a SessionStart fork that never ran (or failed) —
+    // its view does not exist yet when record_turn() is called. Per the
+    // orphan-view duplication fix, record_turn() must self-heal by forking
+    // it just-in-time from its intended parent ("dev"), NOT from whatever
+    // view happens to be current on the internally-opened Repository handle
+    // (which after session A's turn is "session-a" — forking from there
+    // would leak session A's edit into session B's history and, once both
+    // are merged into dev, resurrect it as a duplicate).
+    let mut session_b = AgentSession::new("session-b", "claude-code", "Claude Code");
+    session_b.view_name = "session-b".to_string();
+    session_b.set_parent_view("dev");
+
+    let edited_b = initial.replacen("return 70\n", "return 7000\n", 1);
+    std::fs::write(&file, &edited_b).unwrap();
+
+    let event_b = TurnEvent::new("session-b", HookType::TurnEnd);
+    let options_b = TurnRecordOptions {
+        session: &session_b,
+        event: &event_b,
+        turn_number: 1,
+        turn_duration_ms: 1000,
+        prompt: Some("Bump step70".to_string()),
+    };
+    record_turn(repo_root, &options_b)
+        .expect("record_turn should self-heal an orphaned session view rather than fail");
+
+    // Merge both session views into dev.
+    {
+        let repo = Repository::open_existing(repo_root).unwrap();
+        repo.insert_from_view(CrossViewInsertOptions::new("session-a", "dev"))
+            .unwrap();
+        repo.insert_from_view(CrossViewInsertOptions::new("session-b", "dev"))
+            .unwrap();
+        repo.materialize().unwrap();
+    }
+
+    let repo = Repository::open_existing(repo_root).unwrap();
+    let content = repo
+        .get_file_content_on_view("main.go", "dev")
+        .unwrap()
+        .expect("file should exist on dev");
+    let content = String::from_utf8(content).unwrap();
+
+    for i in 0..80 {
+        let marker = format!("// marker[{i}]");
+        let occurrences = count_occurrences(&content, &marker);
+        assert_eq!(
+            occurrences, 1,
+            "step{} should appear exactly once after merging both session views, \
+             found {} (orphan-view duplication bug)",
+            i, occurrences
+        );
+    }
+
+    assert!(
+        content.contains("return 1000"),
+        "session A's edit should survive the merge"
+    );
+    assert!(
+        content.contains("return 7000"),
+        "session B's edit should survive the merge"
+    );
+}
