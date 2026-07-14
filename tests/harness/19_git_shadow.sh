@@ -307,7 +307,88 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════════════════
-# Section 9: GitLab MR format detection
+# Section 9: Git-owned materialization after importing all local branches
+# ════════════════════════════════════════════════════════════════════════
+
+begin_section "Git shadow: Git owns the checked-out branch"
+
+make_temp_repo "git-owned-materialization"
+init_git_repo
+
+git_commit "Main baseline" "shared.txt" "main baseline"
+PRIMARY_BRANCH=$(git_default_branch)
+git checkout -b zz-materialization 2>/dev/null
+git_commit "Feature content" "feature-only.txt" "feature content"
+printf '#!/bin/sh\necho feature\n' > feature-tool.sh
+chmod +x feature-tool.sh
+ln -s shared.txt feature-link
+git add feature-tool.sh feature-link
+git commit --quiet -m "Add executable and symlink"
+git checkout "$PRIMARY_BRANCH" 2>/dev/null
+
+# `--all` imports every local Git branch. Git remains checked out on the
+# primary branch, so Atomic must not leave the worktree materialized as the
+# final non-HEAD Atomic view.
+assert_success "import all local branches" atomic git import --all --no-vault
+
+assert_file_not_exists "feature file is absent from Git's checked-out branch" "feature-only.txt"
+assert_file_not_exists "feature executable is absent from Git's checked-out branch" "feature-tool.sh"
+assert_file_not_exists "feature symlink is absent from Git's checked-out branch" "feature-link"
+assert_file_content "primary branch content survives import" "shared.txt" "main baseline"
+
+GIT_STATUS_AFTER_ALL=$(git status --short)
+if [[ -z "$GIT_STATUS_AFTER_ALL" ]]; then
+    _pass "git status stays clean after all-branch import"
+else
+    _fail "git status stays clean after all-branch import" "$GIT_STATUS_AFTER_ALL"
+fi
+
+# Switching branches remains a Git-owned materialization. Incremental import
+# must index this checkout rather than writing Atomic's version over it.
+git checkout zz-materialization 2>/dev/null
+assert_success "incremental import of checked-out feature" atomic git import --incremental --branch zz-materialization --no-vault
+assert_file_content "feature checkout remains intact" "feature-only.txt" "feature content"
+if [[ -x feature-tool.sh ]]; then
+    _pass "Git executable bit remains intact"
+else
+    _fail "Git executable bit remains intact" "feature-tool.sh is not executable"
+fi
+if [[ -L feature-link ]]; then
+    _pass "Git symlink type remains intact"
+else
+    _fail "Git symlink type remains intact" "feature-link is not a symlink"
+fi
+
+GIT_STATUS_AFTER_FEATURE=$(git status --short)
+if [[ -z "$GIT_STATUS_AFTER_FEATURE" ]]; then
+    _pass "git status stays clean after checked-out feature import"
+else
+    _fail "git status stays clean after checked-out feature import" "$GIT_STATUS_AFTER_FEATURE"
+fi
+
+# Switching views must not move Git's administrative state even though `.git`
+# is ignored by the Atomic repository after Git import. Git remains able to
+# own and restore its checked-out worktree after the switch.
+assert_success "Atomic view switch materializes primary view" atomic view switch "$PRIMARY_BRANCH"
+assert_dir_exists "Atomic view switch preserves Git metadata" ".git"
+GIT_STATUS_AFTER_ATOMIC_SWITCH=$(git status --short)
+if [[ -z "$GIT_STATUS_AFTER_ATOMIC_SWITCH" ]]; then
+    _pass "Atomic view switch preserves a clean Git checkout"
+else
+    _fail "Atomic view switch preserves a clean Git checkout" "$GIT_STATUS_AFTER_ATOMIC_SWITCH"
+fi
+git checkout "$PRIMARY_BRANCH" 2>/dev/null
+assert_success "incremental import restores Git-owned primary checkout" atomic git import --incremental --branch "$PRIMARY_BRANCH" --no-vault
+
+GIT_STATUS_AFTER_RESTORE=$(git status --short)
+if [[ -z "$GIT_STATUS_AFTER_RESTORE" ]]; then
+    _pass "Git checkout restores a clean shared worktree"
+else
+    _fail "Git checkout restores a clean shared worktree" "$GIT_STATUS_AFTER_RESTORE"
+fi
+
+# ════════════════════════════════════════════════════════════════════════
+# Section 10: GitLab MR format detection
 # ════════════════════════════════════════════════════════════════════════
 
 begin_section "Multi-forge: GitLab MR format"
