@@ -160,12 +160,14 @@ fn validate_existing_git_checkout(path: &Path) -> CliResult<()> {
         ),
     })?;
 
-    let workdir = git_repo.workdir().ok_or_else(|| CliError::InvalidArgument {
-        message: format!(
-            "--into-existing requires a non-bare Git checkout: {}",
-            path.display()
-        ),
-    })?;
+    let workdir = git_repo
+        .workdir()
+        .ok_or_else(|| CliError::InvalidArgument {
+            message: format!(
+                "--into-existing requires a non-bare Git checkout: {}",
+                path.display()
+            ),
+        })?;
 
     let target = std::fs::canonicalize(path).map_err(|e| CliError::InvalidPath {
         path: path.to_path_buf(),
@@ -325,7 +327,8 @@ impl Clone {
             repo.create_shared_view(&self.view)
                 .map_err(CliError::Repository)?;
         }
-        repo.align_to_view(&self.view).map_err(CliError::Repository)?;
+        repo.align_to_view(&self.view)
+            .map_err(CliError::Repository)?;
 
         // Connect to remote
         let spinner = create_spinner("Connecting to remote...");
