@@ -620,6 +620,7 @@ fn pretty_tool(description: &str) -> String {
         "copilot" => "Copilot",
         "sherpa" => "Sherpa",
         "pi" => "Pi",
+        "kilo" => "Kilo Code",
         other => other,
     }
     .to_string()
@@ -797,6 +798,7 @@ mod tests {
         assert_eq!(pretty_tool("Editor: cursor"), "Cursor");
         assert_eq!(pretty_tool("IDE Plugin: copilot"), "Copilot");
         assert_eq!(pretty_tool("CLI: gemini-cli"), "Gemini CLI");
+        assert_eq!(pretty_tool("CLI: kilo"), "Kilo Code");
     }
 
     #[test]
