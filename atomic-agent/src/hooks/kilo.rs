@@ -348,6 +348,8 @@ impl AgentHook for KiloHook {
 
     fn supported_hooks(&self) -> Vec<HookType> {
         vec![
+            HookType::SessionStart,
+            HookType::SessionEnd,
             HookType::TurnStart,
             HookType::TurnEnd,
             HookType::PreToolUse,
@@ -362,6 +364,14 @@ impl AgentHook for KiloHook {
 
     fn hook_verbs(&self) -> Vec<&str> {
         vec![
+            // Plugin verbs (Kilo CLI runtime, same as OpenCode)
+            "session-start",
+            "session-end",
+            "user-prompt",
+            "stop",
+            "before-tool",
+            "after-tool",
+            // Legacy shell-script verbs (AGENTS.md fallback)
             "prompt-submit",
             "agent-stop",
             "pre-tool-use",
@@ -392,16 +402,37 @@ fn timestamp_hex() -> String {
 
 /// Convert a Kilo-specific verb to a [`HookType`].
 ///
-/// Kilo uses these verbs:
+/// Kilo supports two sets of verbs:
 ///
-/// | Verb              | HookType     |
-/// |-------------------|--------------|
-/// | `prompt-submit`   | TurnStart    |
-/// | `agent-stop`      | TurnEnd      |
-/// | `pre-tool-use`    | PreToolUse   |
-/// | `post-tool-use`   | PostToolUse  |
+/// **Plugin verbs** (from `atomic-hooks.ts`, same as OpenCode):
+///
+/// | Verb              | HookType       |
+/// |-------------------|----------------|
+/// | `session-start`   | SessionStart   |
+/// | `session-end`     | SessionEnd     |
+/// | `user-prompt`     | TurnStart      |
+/// | `stop`            | TurnEnd        |
+/// | `before-tool`     | PreToolUse     |
+/// | `after-tool`      | PostToolUse    |
+///
+/// **Legacy shell-script verbs** (from AGENTS.md CLI fallback):
+///
+/// | Verb              | HookType       |
+/// |-------------------|----------------|
+/// | `prompt-submit`   | TurnStart      |
+/// | `agent-stop`      | TurnEnd        |
+/// | `pre-tool-use`    | PreToolUse     |
+/// | `post-tool-use`   | PostToolUse    |
 pub fn verb_to_hook_type(verb: &str) -> Option<HookType> {
     match verb {
+        // Plugin verbs (Kilo CLI runtime)
+        "session-start" => Some(HookType::SessionStart),
+        "session-end" => Some(HookType::SessionEnd),
+        "user-prompt" => Some(HookType::TurnStart),
+        "stop" => Some(HookType::TurnEnd),
+        "before-tool" => Some(HookType::PreToolUse),
+        "after-tool" => Some(HookType::PostToolUse),
+        // Legacy shell-script verbs
         "prompt-submit" => Some(HookType::TurnStart),
         "agent-stop" => Some(HookType::TurnEnd),
         "pre-tool-use" => Some(HookType::PreToolUse),
@@ -440,22 +471,29 @@ mod tests {
     fn test_supported_hooks() {
         let hook = make_hook();
         let hooks = hook.supported_hooks();
+        assert_eq!(hooks.len(), 6);
+        assert!(hooks.contains(&HookType::SessionStart));
+        assert!(hooks.contains(&HookType::SessionEnd));
         assert!(hooks.contains(&HookType::TurnStart));
         assert!(hooks.contains(&HookType::TurnEnd));
         assert!(hooks.contains(&HookType::PreToolUse));
         assert!(hooks.contains(&HookType::PostToolUse));
-        assert!(!hooks.contains(&HookType::SessionStart));
-        assert!(!hooks.contains(&HookType::SessionEnd));
     }
 
     #[test]
     fn test_hook_verbs() {
         let hook = make_hook();
         let verbs = hook.hook_verbs();
+        // Plugin verbs
+        assert!(verbs.contains(&"session-start"));
+        assert!(verbs.contains(&"session-end"));
+        assert!(verbs.contains(&"user-prompt"));
+        assert!(verbs.contains(&"stop"));
+        assert!(verbs.contains(&"before-tool"));
+        assert!(verbs.contains(&"after-tool"));
+        // Legacy shell verbs
         assert!(verbs.contains(&"prompt-submit"));
         assert!(verbs.contains(&"agent-stop"));
-        assert!(verbs.contains(&"pre-tool-use"));
-        assert!(verbs.contains(&"post-tool-use"));
     }
 
     #[test]
@@ -587,7 +625,20 @@ mod tests {
     // -- Verb mapping tests --
 
     #[test]
-    fn test_verb_to_hook_type() {
+    fn test_verb_to_hook_type_plugin_verbs() {
+        assert_eq!(
+            verb_to_hook_type("session-start"),
+            Some(HookType::SessionStart)
+        );
+        assert_eq!(verb_to_hook_type("session-end"), Some(HookType::SessionEnd));
+        assert_eq!(verb_to_hook_type("user-prompt"), Some(HookType::TurnStart));
+        assert_eq!(verb_to_hook_type("stop"), Some(HookType::TurnEnd));
+        assert_eq!(verb_to_hook_type("before-tool"), Some(HookType::PreToolUse));
+        assert_eq!(verb_to_hook_type("after-tool"), Some(HookType::PostToolUse));
+    }
+
+    #[test]
+    fn test_verb_to_hook_type_legacy_verbs() {
         assert_eq!(
             verb_to_hook_type("prompt-submit"),
             Some(HookType::TurnStart)
@@ -601,6 +652,10 @@ mod tests {
             verb_to_hook_type("post-tool-use"),
             Some(HookType::PostToolUse)
         );
+    }
+
+    #[test]
+    fn test_verb_to_hook_type_unknown() {
         assert_eq!(verb_to_hook_type("unknown"), None);
     }
 
