@@ -212,10 +212,10 @@ impl HookType {
             "before-tool" => Some(HookType::PreToolUse),
             "after-tool" | "post_tool_call" => Some(HookType::PostToolUse),
 
-            // Kiro IDE turn boundaries
+            // Kiro IDE / Kilo Code turn boundaries
             // ("prompt-submit" already matched above for Devin — same mapping)
             "agent-stop" => Some(HookType::TurnEnd),
-            // Kiro tool use
+            // Kiro / Kilo tool use
             "pre-tool-use" => Some(HookType::PreToolUse),
             "post-tool-use" => Some(HookType::PostToolUse),
             // Kiro post-task is already handled above ("post-task" → PostToolUse)

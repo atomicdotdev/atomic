@@ -26,9 +26,11 @@
 //! resolution. If the clone fails partway through, the `CleanupGuard`
 //! ensures the partially created directory is removed.
 
+use std::path::Path;
 use std::time::Duration;
 
 use clap::Parser;
+use git2::Repository as GitRepository;
 
 use atomic_core::types::Base32;
 use atomic_remote::{HttpRemote, HttpRemoteConfig};
@@ -38,7 +40,8 @@ use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{
     create_progress_bar, create_spinner, error, finish_error, finish_success, hash as style_hash,
-    hint, print_blank, print_hint, print_success, print_warning, success, view as style_view,
+    hint, print_blank, print_hint, print_info, print_success, print_warning, success,
+    view as style_view,
 };
 
 use super::helpers::{
@@ -135,6 +138,61 @@ pub struct Clone {
     /// Useful for examining changes before applying.
     #[arg(long)]
     pub download_only: bool,
+
+    /// Bootstrap Atomic in an existing Git checkout without materializing
+    /// Atomic content over Git's working tree.
+    #[arg(long, requires = "path", conflicts_with = "download_only")]
+    pub into_existing: bool,
+}
+
+fn validate_existing_git_checkout(path: &Path) -> CliResult<()> {
+    if !path.is_dir() {
+        return Err(CliError::InvalidPath {
+            path: path.to_path_buf(),
+            source: None,
+        });
+    }
+
+    let git_repo = GitRepository::discover(path).map_err(|_| CliError::InvalidArgument {
+        message: format!(
+            "--into-existing requires an existing Git checkout: {}",
+            path.display()
+        ),
+    })?;
+
+    let workdir = git_repo
+        .workdir()
+        .ok_or_else(|| CliError::InvalidArgument {
+            message: format!(
+                "--into-existing requires a non-bare Git checkout: {}",
+                path.display()
+            ),
+        })?;
+
+    let target = std::fs::canonicalize(path).map_err(|e| CliError::InvalidPath {
+        path: path.to_path_buf(),
+        source: Some(e),
+    })?;
+    let workdir = std::fs::canonicalize(workdir).map_err(|e| CliError::InvalidPath {
+        path: workdir.to_path_buf(),
+        source: Some(e),
+    })?;
+    if target != workdir {
+        return Err(CliError::InvalidArgument {
+            message: format!(
+                "--into-existing must target the Git worktree root: {}",
+                path.display()
+            ),
+        });
+    }
+
+    if path.join(".atomic").exists() {
+        return Err(CliError::RepositoryExists {
+            path: path.join(".atomic"),
+        });
+    }
+
+    Ok(())
 }
 
 impl Clone {
@@ -161,6 +219,7 @@ impl Clone {
             insecure: false,
             timeout: DEFAULT_TIMEOUT_SECS,
             download_only: false,
+            into_existing: false,
         }
     }
 
@@ -191,6 +250,12 @@ impl Clone {
     /// Builder: set the download-only flag.
     pub fn with_download_only(mut self, download_only: bool) -> Self {
         self.download_only = download_only;
+        self
+    }
+
+    /// Builder: bootstrap an existing Git checkout.
+    pub fn with_into_existing(mut self, into_existing: bool) -> Self {
+        self.into_existing = into_existing;
         self
     }
 
@@ -236,25 +301,34 @@ impl Clone {
         );
         print_blank();
 
-        // Validate target doesn't exist
-        validate_target_path(&target_path)?;
-
-        // Create cleanup guard - will remove directory if we fail
-        let guard = CleanupGuard::new(target_path.clone());
-
-        // Create target directory
-        std::fs::create_dir_all(&target_path).map_err(|e| CliError::InvalidPath {
-            path: target_path.clone(),
-            source: Some(e),
-        })?;
+        let guard = if self.into_existing {
+            validate_existing_git_checkout(&target_path)?;
+            None
+        } else {
+            validate_target_path(&target_path)?;
+            std::fs::create_dir_all(&target_path).map_err(|e| CliError::InvalidPath {
+                path: target_path.clone(),
+                source: Some(e),
+            })?;
+            Some(CleanupGuard::new(target_path.clone()))
+        };
 
         // Initialize repository
         let spinner = create_spinner("Initializing repository...");
-        let repo = Repository::init(&target_path).map_err(|e| {
+        let mut repo = Repository::init(&target_path).map_err(|e| {
             finish_error(&spinner, "Failed to initialize");
             CliError::Repository(e)
         })?;
         finish_success(&spinner, "Repository initialized");
+
+        // Clone must insert remote changes into the requested local view,
+        // rather than whichever default view repository initialization chose.
+        if !repo.view_exists(&self.view).map_err(CliError::Repository)? {
+            repo.create_shared_view(&self.view)
+                .map_err(CliError::Repository)?;
+        }
+        repo.align_to_view(&self.view)
+            .map_err(CliError::Repository)?;
 
         // Connect to remote
         let spinner = create_spinner("Connecting to remote...");
@@ -294,7 +368,9 @@ impl Clone {
             ));
 
             // Disable cleanup guard - clone succeeded
-            guard.disable();
+            if let Some(guard) = guard {
+                guard.disable();
+            }
             return Ok(());
         }
 
@@ -446,7 +522,9 @@ impl Clone {
             print_hint("Use 'atomic insert' to insert the downloaded changes");
 
             // Disable cleanup guard - clone succeeded
-            guard.disable();
+            if let Some(guard) = guard {
+                guard.disable();
+            }
             return Ok(());
         }
 
@@ -488,17 +566,21 @@ impl Clone {
                 }
             }
 
-            // Output the working copy — reconstruct files from the graph
-            match repo.materialize() {
-                Ok(output) => {
-                    log::info!(
-                        "Output working copy: {} files, {} dirs",
-                        output.files_written,
-                        output.directories_created
-                    );
-                }
-                Err(e) => {
-                    apply_errors.push(format!("output working copy: {}", e));
+            if self.into_existing {
+                print_info("Preserving the existing Git working copy.");
+            } else {
+                // Output the working copy — reconstruct files from the graph
+                match repo.materialize() {
+                    Ok(output) => {
+                        log::info!(
+                            "Output working copy: {} files, {} dirs",
+                            output.files_written,
+                            output.directories_created
+                        );
+                    }
+                    Err(e) => {
+                        apply_errors.push(format!("output working copy: {}", e));
+                    }
                 }
             }
 
@@ -590,8 +672,14 @@ impl Clone {
             ));
         }
 
+        if self.into_existing {
+            print_hint("Next: run 'atomic git import --incremental' to import the Git checkout.");
+        }
+
         // Disable cleanup guard - clone succeeded
-        guard.disable();
+        if let Some(guard) = guard {
+            guard.disable();
+        }
 
         Ok(())
     }
@@ -653,6 +741,7 @@ mod tests {
         assert!(!clone.insecure);
         assert_eq!(clone.timeout, DEFAULT_TIMEOUT_SECS);
         assert!(!clone.download_only);
+        assert!(!clone.into_existing);
     }
 
     /// Test Default trait implementation.
@@ -698,6 +787,12 @@ mod tests {
         assert!(clone.download_only);
     }
 
+    #[test]
+    fn test_clone_with_into_existing() {
+        let clone = Clone::new("https://example.com/repo".to_string()).with_into_existing(true);
+        assert!(clone.into_existing);
+    }
+
     /// Test chaining multiple builder methods.
     #[test]
     fn test_clone_builder_chain() {
@@ -706,7 +801,8 @@ mod tests {
             .with_view("dev")
             .with_insecure(true)
             .with_timeout(120)
-            .with_download_only(true);
+            .with_download_only(true)
+            .with_into_existing(true);
 
         assert_eq!(clone.url, "https://example.com/repo");
         assert_eq!(clone.path, Some("my-project".to_string()));
@@ -714,6 +810,7 @@ mod tests {
         assert!(clone.insecure);
         assert_eq!(clone.timeout, 120);
         assert!(clone.download_only);
+        assert!(clone.into_existing);
     }
 
     /// Test Clone can be cloned (the trait, not the command).
@@ -788,6 +885,43 @@ mod tests {
     fn test_get_display_name_fallback() {
         let clone = Clone::new(String::new());
         assert_eq!(clone.get_display_name(), "repo");
+    }
+
+    #[test]
+    fn test_validate_existing_git_checkout_accepts_git_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        GitRepository::init(dir.path()).unwrap();
+
+        assert!(validate_existing_git_checkout(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_existing_git_checkout_rejects_non_git_directory() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(validate_existing_git_checkout(dir.path()).is_err());
+    }
+
+    #[test]
+    fn test_validate_existing_git_checkout_rejects_git_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        GitRepository::init(dir.path()).unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+
+        assert!(validate_existing_git_checkout(&child).is_err());
+    }
+
+    #[test]
+    fn test_validate_existing_git_checkout_rejects_atomic_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        GitRepository::init(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join(".atomic")).unwrap();
+
+        assert!(matches!(
+            validate_existing_git_checkout(dir.path()),
+            Err(CliError::RepositoryExists { .. })
+        ));
     }
 
     // Constant Tests

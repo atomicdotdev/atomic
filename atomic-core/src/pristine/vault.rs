@@ -11,12 +11,18 @@ use std::collections::HashMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VaultEntryType {
-    Session,
-    ToolResult,
-    Memory,
-    Intent,
-    Skill,
-    Scratch,
+    Session,    // 0
+    ToolResult, // 1
+    Memory,     // 2
+    Intent,     // 3
+    Skill,      // 4
+    Scratch,    // 5
+    /// Signed Recording-the-Why attestation (JSON-LD body). Index 6 — APPEND-ONLY.
+    /// postcard encodes enum discriminants positionally, so this MUST stay last and
+    /// MUST NOT be reordered/inserted/deleted. Mixed-version sync caveat: an older
+    /// binary that predates this variant cannot postcard-decode an Attestation row
+    /// and will error on that entry; newer readers are unaffected.
+    Attestation, // 6
 }
 
 impl VaultEntryType {
@@ -28,6 +34,7 @@ impl VaultEntryType {
             Self::Intent => "intent",
             Self::Skill => "skill",
             Self::Scratch => "scratch",
+            Self::Attestation => "attestation",
         }
     }
 
@@ -47,6 +54,7 @@ impl std::str::FromStr for VaultEntryType {
             "intent" => Ok(Self::Intent),
             "skill" => Ok(Self::Skill),
             "scratch" => Ok(Self::Scratch),
+            "attestation" => Ok(Self::Attestation),
             _ => Err(format!("unknown vault entry type: {s}")),
         }
     }
@@ -490,6 +498,7 @@ mod tests {
             (VaultEntryType::Intent, "intent"),
             (VaultEntryType::Skill, "skill"),
             (VaultEntryType::Scratch, "scratch"),
+            (VaultEntryType::Attestation, "attestation"),
         ];
 
         for (ty, expected_str) in &types {
@@ -499,6 +508,35 @@ mod tests {
         }
 
         assert_eq!(VaultEntryType::parse("unknown"), None);
+    }
+
+    #[test]
+    fn test_vault_entry_type_roundtrip() {
+        // as_str / from_str / Display round-trip for the appended Attestation
+        // variant.
+        assert_eq!(VaultEntryType::Attestation.as_str(), "attestation");
+        assert_eq!(VaultEntryType::Attestation.to_string(), "attestation");
+        assert_eq!(
+            "attestation".parse::<VaultEntryType>().unwrap(),
+            VaultEntryType::Attestation
+        );
+
+        // postcard encodes the enum discriminant positionally: Attestation is
+        // index 6 (last). Round-trip a full VaultEntry through postcard and
+        // confirm the discriminant decodes back to Attestation.
+        let entry = VaultEntry::new(
+            VaultEntryType::Attestation,
+            b"{\"@id\":\"x\"}\n".to_vec(),
+            "{}".to_string(),
+            "2025-01-15T12:00:00Z".to_string(),
+        );
+        let bytes = postcard::to_allocvec(&entry).expect("serialize");
+        let decoded: VaultEntry = postcard::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(decoded.entry_type, VaultEntryType::Attestation);
+        // Positional discriminant sanity: the first byte encodes the variant
+        // index (6) for this small enum.
+        let ty_bytes = postcard::to_allocvec(&VaultEntryType::Attestation).expect("serialize ty");
+        assert_eq!(ty_bytes, vec![6]);
     }
 
     #[test]

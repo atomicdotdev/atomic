@@ -231,9 +231,22 @@ impl Repository {
     /// Called as a side effect of `vault_store` and `vault_store_entry`.
     /// Best-effort — logs on failure but never fails the parent operation.
     fn vault_auto_index(&self, path: &str) {
-        // KG indexing
+        // Signed attestation blobs must not pollute semantic search, and they
+        // contribute no KG triples (vault_extract_kg early-returns empty for
+        // Attestation). Skip embedding entirely for them.
+        let is_attestation = matches!(
+            self.vault_retrieve(path),
+            Ok(Some(e)) if e.entry_type == VaultEntryType::Attestation
+        );
+
+        // KG indexing — safe: extract_kg returns empty for Attestation, so
+        // vault_store_kg deletes any stale rows and stores nothing.
         if let Err(e) = self.vault_index_kg(path) {
             log::debug!("Auto KG index for {}: {}", path, e);
+        }
+
+        if is_attestation {
+            return; // do NOT embed
         }
 
         // Embedding
@@ -948,6 +961,8 @@ fn infer_entry_type(path: &str) -> VaultEntryType {
         VaultEntryType::Skill
     } else if path.starts_with("intents/") {
         VaultEntryType::Intent
+    } else if path.starts_with("attestations/") {
+        VaultEntryType::Attestation
     } else {
         // scratch/ prefix or any unknown path
         VaultEntryType::Scratch
@@ -1446,6 +1461,77 @@ mod tests {
         );
         assert_eq!(infer_entry_type("scratch/idea.md"), VaultEntryType::Scratch);
         assert_eq!(infer_entry_type("unknown/file.md"), VaultEntryType::Scratch);
+        assert_eq!(
+            infer_entry_type("attestations/PIMO-1/attested.md"),
+            VaultEntryType::Attestation
+        );
+    }
+
+    #[test]
+    fn test_attestation_entry_scan_unchanged() {
+        // The trailing-newline byte-identity invariant (critic #1): the stored
+        // content_bytes end in exactly one '\n', so render_entry_to_markdown
+        // appends NO extra newline and the first vault_scan sees the
+        // materialized body's hash == the stored blake3(content) == Unchanged.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        // Body = pretty JSON + a single trailing '\n' (exactly how attest builds it).
+        let node_json =
+            serde_json::to_string_pretty(&serde_json::json!({"@id": "atomic:intent:PIMO-1"}))
+                .unwrap();
+        let mut body = node_json;
+        body.push('\n');
+        let body_bytes = body.clone().into_bytes();
+
+        let path = "attestations/PIMO-1/attested.md";
+        let stored_hash = repo
+            .vault_store(
+                path,
+                VaultEntryType::Attestation,
+                body_bytes.clone(),
+                r#"{"intentId":"PIMO-1"}"#.to_string(),
+            )
+            .unwrap();
+
+        // The stored content hash is blake3 of the body-with-newline (unchanged
+        // storage-hash semantics).
+        assert_eq!(stored_hash, Hash::of(&body_bytes));
+        let retrieved = repo.vault_retrieve(path).unwrap().unwrap();
+        assert_eq!(
+            Hash::from_bytes(retrieved.content_hash),
+            Hash::of(&body_bytes)
+        );
+
+        // Materialize to disk, then scan: the materialized body must hash back to
+        // the exact same value, so the entry is Unchanged (no change reported).
+        repo.vault_materialize(path).unwrap();
+        let changes = repo.vault_scan_working_copy().unwrap();
+        assert!(
+            !changes.iter().any(|c| c.path == path),
+            "attestation entry must scan as Unchanged; got changes: {changes:?}"
+        );
+    }
+
+    #[test]
+    fn test_attestation_not_embedded() {
+        // The guard in vault_auto_index must skip embedding for Attestation
+        // entries (signed blobs must not pollute semantic search).
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        let before = repo.vault_embedding_count().unwrap();
+        repo.vault_store(
+            "attestations/PIMO-1/attested.md",
+            VaultEntryType::Attestation,
+            b"{\n  \"@id\": \"atomic:intent:PIMO-1\"\n}\n".to_vec(),
+            r#"{"intentId":"PIMO-1"}"#.to_string(),
+        )
+        .unwrap();
+        let after = repo.vault_embedding_count().unwrap();
+        assert_eq!(before, after, "attestation entry must not be embedded");
     }
 
     #[test]

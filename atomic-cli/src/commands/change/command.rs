@@ -594,6 +594,10 @@ impl ChangeCmd {
     }
 
     /// Format the provenance decision graph for display.
+    ///
+    /// When `--verbose` is passed via the top-level `-p` flag the display
+    /// includes the structured `detail` field from each provenance node so
+    /// the user can see the actual commands, file paths, and diffs.
     fn format_provenance_graph(&self, change_hash: &Hash, repo: &Repository) -> String {
         let mut output = String::new();
 
@@ -646,13 +650,23 @@ impl ChangeCmd {
                     format!(" {}", hint(&format!("[{}]", tool)))
                 };
 
+                // Extract a one-line detail string from the structured detail JSON
+                let detail_str = node
+                    .detail
+                    .as_ref()
+                    .and_then(|d| format_node_detail(d))
+                    .map(|s| format!("\n      {}", hint(&s)))
+                    .unwrap_or_default();
+
                 output.push_str(&format!(
-                    "  {} {} {}{}{}\n",
+                    "  {} {} {}{}{}{}
+",
                     kind_styled,
                     hint("\u{00bb}"),
                     node.summary,
                     tool_str,
-                    hint(&duration)
+                    hint(&duration),
+                    detail_str,
                 ));
             }
 
@@ -699,6 +713,50 @@ impl ChangeCmd {
         };
         print!("{}", output);
     }
+}
+
+/// Extract a human-readable one-liner from a provenance node's detail JSON.
+///
+/// Returns `None` if the detail is empty or has no interesting fields.
+fn format_node_detail(detail: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(detail).ok()?;
+    let obj = v.as_object()?;
+
+    // Command (bash/execution nodes)
+    if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
+        let truncated = if cmd.len() > 120 {
+            format!("{}...", &cmd[..117])
+        } else {
+            cmd.to_string()
+        };
+        return Some(format!("$ {}", truncated));
+    }
+
+    // File path (read/write/edit nodes)
+    if let Some(file) = obj
+        .get("file")
+        .or_else(|| obj.get("file_path"))
+        .or_else(|| obj.get("target"))
+        .and_then(|v| v.as_str())
+    {
+        let op = obj.get("operation").and_then(|v| v.as_str()).unwrap_or("");
+        if op.is_empty() {
+            return Some(file.to_string());
+        }
+        return Some(format!("{}: {}", op, file));
+    }
+
+    // Output summary (fallback for nodes with only output)
+    if let Some(summary) = obj.get("output_summary").and_then(|v| v.as_str()) {
+        let truncated = if summary.len() > 120 {
+            format!("{}...", &summary[..117])
+        } else {
+            summary.to_string()
+        };
+        return Some(truncated);
+    }
+
+    None
 }
 
 impl Default for ChangeCmd {

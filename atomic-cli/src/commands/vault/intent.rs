@@ -1,5 +1,12 @@
 //! `atomic vault intent` — manage vault intents (tasks).
 //!
+//! DEPRECATED: this command family is superseded by the canonical
+//! `atomic intent` commands (`atomic intent new/show/list/validate/
+//! attest/verify`), which scaffold the full acceptance-criteria / why /
+//! tasks template. `atomic vault intent create` only produces a bare,
+//! title-only intent. These commands still work but emit a deprecation
+//! warning; prefer `atomic intent` for new work.
+//!
 //! Intents represent planned work items that can be linked to goals.
 //! They track status, priority, assignee, and related goals.
 //!
@@ -81,7 +88,11 @@ fn resolve_active_session(repo: &Repository) -> Option<(String, u32)> {
 /// Subcommands for intent management.
 #[derive(Subcommand, Debug)]
 pub enum IntentCommands {
-    /// Create a new intent.
+    /// [DEPRECATED: use `atomic intent new`] Create a new intent.
+    ///
+    /// Deprecated: `atomic vault intent create` produces a bare,
+    /// title-only intent. Use `atomic intent new`, which scaffolds the
+    /// full acceptance-criteria / why / tasks template.
     ///
     /// Creates an intent (task) with a title and optional metadata.
     /// Intents can be linked to goals to track which work addresses them.
@@ -94,7 +105,7 @@ pub enum IntentCommands {
     /// ```
     Create(IntentCreate),
 
-    /// List intents.
+    /// [DEPRECATED: use `atomic intent list`] List intents.
     ///
     /// Shows intents filtered by status. Defaults to showing all intents.
     ///
@@ -106,7 +117,7 @@ pub enum IntentCommands {
     /// ```
     List(IntentList),
 
-    /// Show an intent's content.
+    /// [DEPRECATED: use `atomic intent show`] Show an intent's content.
     ///
     /// Displays the full content of an intent by its ID.
     ///
@@ -118,7 +129,7 @@ pub enum IntentCommands {
     /// ```
     Show(IntentShow),
 
-    /// Update an intent's fields.
+    /// [DEPRECATED: use `atomic intent update`] Update an intent's fields.
     ///
     /// Modifies the status, assignee, priority, title, or Markdown body
     /// of an existing intent. The body can be set inline with `--body`
@@ -134,7 +145,7 @@ pub enum IntentCommands {
     /// ```
     Update(IntentUpdate),
 
-    /// Delete an unstarted backlog intent.
+    /// [DEPRECATED: use `atomic intent delete`] Delete an unstarted backlog intent.
     ///
     /// Removes an accidental draft intent from the vault. Only backlog
     /// intents with no linked goals can be deleted. Use --force to skip the
@@ -148,7 +159,7 @@ pub enum IntentCommands {
     /// ```
     Delete(IntentDelete),
 
-    /// Link a goal to an intent.
+    /// [DEPRECATED: use `atomic intent link`] Link a goal to an intent.
     ///
     /// Associates a goal with an intent so that the work done in the goal
     /// is tracked against the intent.
@@ -163,7 +174,11 @@ pub enum IntentCommands {
 
 // Intent Command
 
-/// Manage vault intents (tasks).
+/// [DEPRECATED: use `atomic intent`] Manage vault intents (tasks).
+///
+/// Deprecated in favor of the canonical `atomic intent` family
+/// (`atomic intent new/show/list/validate/attest/verify`), which
+/// scaffolds the full acceptance-criteria / why / tasks template.
 ///
 /// Intents represent planned work items that can be linked to goals.
 /// They track status, priority, assignee, and related goals.
@@ -176,6 +191,32 @@ pub struct Intent {
 
 impl Command for Intent {
     fn run(&self) -> CliResult<()> {
+        // Emit a one-time deprecation notice steering users to the
+        // canonical `atomic intent` family (Recording the Why), which
+        // scaffolds the full acceptance-criteria / why / tasks template.
+        let msg = match &self.command {
+            IntentCommands::Create(_) => {
+                "`atomic vault intent create` is deprecated; use `atomic intent new` instead \
+                 (it scaffolds acceptance criteria / why / tasks)."
+            }
+            IntentCommands::List(_) => {
+                "`atomic vault intent list` is deprecated; use `atomic intent list` instead."
+            }
+            IntentCommands::Show(_) => {
+                "`atomic vault intent show` is deprecated; use `atomic intent show` instead."
+            }
+            IntentCommands::Update(_) => {
+                "`atomic vault intent update` is deprecated; use `atomic intent update` instead."
+            }
+            IntentCommands::Delete(_) => {
+                "`atomic vault intent delete` is deprecated; use `atomic intent delete` instead."
+            }
+            IntentCommands::Link(_) => {
+                "`atomic vault intent link` is deprecated; use `atomic intent link` instead."
+            }
+        };
+        eprintln!("warning: {msg}");
+
         match &self.command {
             IntentCommands::Create(cmd) => cmd.run(),
             IntentCommands::List(cmd) => cmd.run(),

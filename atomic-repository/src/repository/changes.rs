@@ -766,6 +766,42 @@ impl Repository {
         Ok(graphs)
     }
 
+    /// Find all provenance graphs that explain a change by scanning disk.
+    ///
+    /// A read-only fallback for [`Self::find_provenance_for_change`]: REV_DEPS
+    /// registration is best-effort (`save_provenance_graph` records the reverse
+    /// dependency only when the explained change is already internal), so a graph
+    /// whose change was not yet internal is invisible to REV_DEPS. This iterates
+    /// every provenance graph file and keeps those whose `changes_explained`
+    /// contains `change_hash`. It writes nothing — pure compute-on-demand.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(Hash, ProvenanceGraph)` pairs explaining this change,
+    /// ordered by timestamp (oldest first).
+    pub fn find_provenance_for_change_scan(
+        &self,
+        change_hash: &Hash,
+    ) -> Result<Vec<(Hash, atomic_core::change::ProvenanceGraph)>, RepositoryError> {
+        let mut graphs = Vec::new();
+
+        for result in self.change_store.iter_provenance_graphs() {
+            let hash = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+            match self.load_provenance_graph(&hash) {
+                Ok(graph) if graph.explains_change(change_hash) => {
+                    graphs.push((hash, graph));
+                }
+                _ => continue,
+            }
+        }
+
+        // Sort by timestamp (oldest first) for stable ordering.
+        graphs.sort_by_key(|(_, g)| g.timestamp);
+
+        Ok(graphs)
+    }
+
     /// Find all provenance graphs for a session by scanning disk.
     ///
     /// Iterates over all provenance graph files and filters by session ID.

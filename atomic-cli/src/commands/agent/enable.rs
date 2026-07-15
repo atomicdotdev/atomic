@@ -238,6 +238,7 @@ impl Command for Enable {
         // Summary
         if total_installed > 0 {
             let has_opencode = agents_to_install.contains(&"opencode");
+            let has_kilo = agents_to_install.contains(&"kilo");
             println!();
             println!("Each agent turn will be recorded as an Atomic change with:");
             println!("  • AI provenance (vendor, model, tokens, cost)");
@@ -247,6 +248,11 @@ impl Command for Enable {
                 println!();
                 println!("For the full OpenCode integration (agent, skills, provenance):");
                 println!("  npm install -g atomic-opencode && npx atomic-opencode");
+            }
+            if has_kilo {
+                println!();
+                println!("For the full Kilo Code integration (rules, agent mode, provenance):");
+                println!("  npm install -g atomic-kilo && npx atomic-kilo");
             }
             println!();
             println!("Use 'atomic agent status' to check integration status.");

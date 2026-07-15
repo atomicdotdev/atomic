@@ -280,9 +280,14 @@ impl Disable {
                     );
                     println!("  Uninstall skills/steering: npx atomic-kiro --uninstall");
                 }
+                "kilo" => {
+                    print_success("Kilo Code hooks are configured through kilo.jsonc.");
+                    println!("  Remove rules/agent from .kilo/ directory manually.");
+                    println!("  Uninstall: npx atomic-kilo --uninstall");
+                }
                 other => {
                     print_warning(&format!(
-                        "Global disable is not supported for '{}'. Supported agents: claude-code, gemini-cli, kiro",
+                        "Global disable is not supported for '{}'. Supported agents: claude-code, gemini-cli, kilo, kiro",
                         other
                     ));
                 }
