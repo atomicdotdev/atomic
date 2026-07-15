@@ -156,7 +156,11 @@ pub enum VaultCommands {
     /// ```
     Goal(Goal),
 
-    /// Manage vault intents (tasks).
+    /// [DEPRECATED: use `atomic intent`] Manage vault intents (tasks).
+    ///
+    /// Deprecated in favor of the canonical `atomic intent` family
+    /// (`atomic intent new/show/list/validate/attest/verify`), which
+    /// scaffolds the full acceptance-criteria / why / tasks template.
     ///
     /// Intents are lightweight task descriptions that can be linked
     /// to goals.
