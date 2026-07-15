@@ -187,18 +187,10 @@ pub enum VaultCommands {
     /// ```
     Memory(Memory),
 
-    /// Retrieve memories relevant to a task, for prompt injection.
+    /// Research Vault memories relevant to a task.
     ///
     /// Ranks vault memories against free-text terms, an intent, or
-    /// file paths, and emits an injectable markdown block (or JSON).
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// atomic vault context --intent PIMO-1
-    /// atomic vault context "authentication tokens"
-    /// atomic vault context --files src/auth/login.rs --json
-    /// ```
+    /// file paths, and emits prompt-ready Markdown (or JSON).
     Context(Context),
 
     /// Get tool result summaries for a goal.

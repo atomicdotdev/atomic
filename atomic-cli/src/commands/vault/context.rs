@@ -1,11 +1,11 @@
-//! `atomic vault context` — retrieve memories relevant to a task.
+//! `atomic vault context` — research memories relevant to a task.
 //!
-//! Assembles a small, ranked bundle of vault memories for injection into
-//! an AI agent's prompt at run start (the pre-task retrieval step of the
-//! knowledge flywheel). Seeds come from free-text query terms, an intent
-//! (`--intent`), or file paths (`--files`); candidates are gathered from
-//! the knowledge graph (keyword search + graph neighbors) and ranked by
-//! relevance, graph adjacency, and recency.
+//! Assembles a small, ranked bundle of Vault memory candidates before Intent
+//! creation or implementation. Seeds come from free-text query terms, an
+//! Intent (`--intent`), or file paths (`--files`); candidates are gathered
+//! from the knowledge graph and current Vault bodies, then ranked by relevance,
+//! graph adjacency, and recency. Retrieval does not claim that a candidate was
+//! selected or used.
 //!
 //! With no seeds at all, the most recently updated memories are returned.
 //!
@@ -26,7 +26,7 @@
 //! # Examples
 //!
 //! ```text
-//! # Memories relevant to an intent (typical pre-run injection)
+//! # Memories relevant to an accepted intent
 //! atomic vault context --intent PIMO-1
 //!
 //! # Free-text query
@@ -35,15 +35,16 @@
 //! # Memories that reference a specific file
 //! atomic vault context --files src/auth/login.rs
 //!
-//! # Machine-readable envelope (injectable markdown + exact memory revisions)
+//! # Machine-readable envelope (prompt-ready markdown + exact revisions)
 //! atomic vault context --intent PIMO-1 --json
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use clap::Parser;
 
-use atomic_core::pristine::vault::{KgNode, VaultEntryType};
+use atomic_core::pristine::tables::tokenize_for_fts;
+use atomic_core::pristine::vault::{KgNode, VaultEntry, VaultEntryType};
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::Repository;
 
@@ -55,6 +56,10 @@ use crate::error::{CliError, CliResult};
 /// Default maximum number of memories returned.
 const DEFAULT_LIMIT: usize = 5;
 
+/// Keep retrieval work and output bounded for callers that pass generated
+/// arguments rather than a human-entered value.
+const MAX_LIMIT: usize = 100;
+
 /// Default total character budget across all memory bodies.
 const DEFAULT_BUDGET_CHARS: usize = 8000;
 
@@ -63,14 +68,14 @@ const DEFAULT_BUDGET_CHARS: usize = 8000;
 /// letting a long intent dominate the query.
 const INTENT_BODY_SEED_CHARS: usize = 2000;
 
-/// Versioned machine-readable contract consumed by Sherpa/noname.
+/// Versioned machine-readable contract available to agent integrations.
 const JSON_SCHEMA_VERSION: u32 = 1;
 
 /// Identifies the ranking recipe in run provenance and future retrieval evals.
-const RANKER_VERSION: &str = "vault-context-v1";
+const RANKER_VERSION: &str = "vault-context-v2";
 
-/// Fetch this many times `--limit` from the KG search so that filtering
-/// to memory nodes still leaves enough candidates.
+/// Fetch this many times `--limit` from typed KG search so body and graph
+/// signals can rerank a useful candidate pool.
 const SEARCH_POOL_MULTIPLIER: usize = 4;
 
 /// Score bonus for memories directly connected (in the KG) to the seed
@@ -83,9 +88,9 @@ const NEIGHBOR_BONUS: f64 = 0.75;
 /// below a rank-0 label match.
 const BODY_MATCH_WEIGHT: f64 = 0.8;
 
-/// Seed terms shorter than this are ignored by the body scan
-/// (stop-word noise).
-const MIN_TERM_LEN: usize = 3;
+/// Useful language/domain terms that the shared FTS tokenizer drops because
+/// they are shorter than three characters.
+const SHORT_TECH_TERMS: &[&str] = &["ai", "go", "r", "c"];
 
 /// Weight of the recency component in the final score.
 const RECENCY_WEIGHT: f64 = 0.25;
@@ -106,9 +111,12 @@ const EXCLUDED_MEMORY_TYPES: &[&str] = &["index"];
 
 // Context Command
 
-/// Retrieve memories relevant to a task, for prompt injection.
+/// Retrieve memory candidates relevant to a task.
 #[derive(Parser, Debug)]
-#[command(name = "context")]
+#[command(
+    name = "context",
+    after_help = "Examples:\n  atomic vault context --intent PIMO-1\n  atomic vault context \"authentication tokens\"\n  atomic vault context --files src/auth/login.rs --json"
+)]
 pub struct Context {
     /// Free-text query terms.
     pub query: Vec<String>,
@@ -130,7 +138,7 @@ pub struct Context {
     #[arg(long, default_value_t = DEFAULT_BUDGET_CHARS)]
     pub budget_chars: usize,
 
-    /// Output format: "md" (injectable block) or "json".
+    /// Output format: "md" (prompt-ready block) or "json".
     #[arg(long, default_value = "md")]
     pub format: String,
 
@@ -148,10 +156,16 @@ impl Command for Context {
             });
         }
 
-        let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        if !(1..=MAX_LIMIT).contains(&self.limit) {
+            return Err(CliError::InvalidArgument {
+                message: format!("--limit must be between 1 and {MAX_LIMIT}"),
+            });
+        }
 
-        let limit = self.limit.max(1);
+        let root = find_repository_root()?;
+        let repo = Repository::open_readonly(&root).map_err(CliError::Repository)?;
+
+        let limit = self.limit;
         let candidates = self.gather_candidates(&repo, limit)?;
         let items = resolve_and_rank(&repo, candidates, limit)?;
         let items = apply_budget(items, self.budget_chars);
@@ -194,11 +208,11 @@ impl Context {
 
         let seed_query = seed_terms.join(" ");
         if !seed_query.trim().is_empty() {
-            let pool = limit * SEARCH_POOL_MULTIPLIER;
+            let pool = limit.saturating_mul(SEARCH_POOL_MULTIPLIER);
             let nodes = repo
-                .vault_kg_search(&seed_query, pool, None)
+                .vault_kg_search_by_kind(&seed_query, pool, "memory")
                 .map_err(CliError::Repository)?;
-            for (rank, node) in nodes.iter().filter(|n| n.kind == "memory").enumerate() {
+            for (rank, node) in nodes.iter().enumerate() {
                 let base = rank_score(rank);
                 merge_candidate(
                     &mut candidates,
@@ -217,9 +231,21 @@ impl Context {
                 .vault_list("memory/", Some(VaultEntryType::Memory))
                 .map_err(CliError::Repository)?;
             metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-            for meta in metas.into_iter().take(limit * 2) {
+            for meta in metas {
+                let Some(entry) = repo
+                    .vault_retrieve(&meta.path)
+                    .map_err(CliError::Repository)?
+                else {
+                    continue;
+                };
+                if !is_eligible_memory(&entry) {
+                    continue;
+                }
                 if let Some(node_id) = memory_path_to_node_id(&meta.path) {
                     merge_candidate(&mut candidates, &node_id, Some(meta.path), 0.0, false);
+                }
+                if candidates.len() >= limit {
+                    break;
                 }
             }
         }
@@ -256,6 +282,9 @@ impl Context {
             else {
                 continue;
             };
+            if !is_eligible_memory(&entry) {
+                continue;
+            }
             let body = String::from_utf8_lossy(&entry.content_bytes);
             let matched = body_match_fraction(&terms, &body);
             if matched > 0.0 {
@@ -275,7 +304,7 @@ impl Context {
         candidates: &mut HashMap<String, CandidateScore>,
     ) -> CliResult<()> {
         let manifest = repo.vault_manifest().map_err(CliError::Repository)?;
-        let (_, summary) = manifest
+        let (resolved_id, summary) = manifest
             .intents
             .iter()
             .find(|(id, _)| id.eq_ignore_ascii_case(intent_id))
@@ -285,8 +314,18 @@ impl Context {
 
         seed_terms.push(summary.title.clone());
 
+        // Legacy manifest entries may not have `vault_path`. Reuse the same
+        // path resolution fallback as the rest of the Intent API rather than
+        // querying an empty path and the meaningless `intent:` KG node.
+        let intent_path = repo
+            .vault_intent_path(resolved_id)
+            .map_err(CliError::Repository)?
+            .ok_or_else(|| CliError::InvalidArgument {
+                message: format!("Intent not found: {}", intent_id),
+            })?;
+
         if let Some(entry) = repo
-            .vault_retrieve(&summary.vault_path)
+            .vault_retrieve(&intent_path)
             .map_err(CliError::Repository)?
         {
             seed_terms.extend(frontmatter_labels(&entry.frontmatter_json));
@@ -297,7 +336,7 @@ impl Context {
             }
         }
 
-        let node_id = intent_path_to_node_id(&summary.vault_path);
+        let node_id = intent_path_to_node_id(&intent_path);
         // Intent -> referenced file/domain -> memory is commonly two hops.
         add_memory_neighbors(repo, &node_id, 2, candidates)?;
         Ok(())
@@ -327,7 +366,13 @@ struct CandidateScore {
 /// A memory selected for output.
 #[derive(Clone, Debug, PartialEq)]
 struct MemoryItem {
+    /// Canonical RDF/resource identity when present, otherwise the KG identity.
     memory_id: String,
+    /// Identity currently used by the KG. This may differ from `memory_id`.
+    kg_node_id: String,
+    /// Hash of entry type, stored frontmatter, and body.
+    revision_hash: String,
+    /// Existing body-only hash used by content/embedding caches.
     content_hash: String,
     path: String,
     name: String,
@@ -408,14 +453,13 @@ fn resolve_and_rank(
             continue; // stale KG node — the entry no longer exists
         };
 
+        if !is_eligible_memory(&entry) {
+            continue;
+        }
         let kind = frontmatter_kind(&entry.frontmatter_json);
-        if EXCLUDED_MEMORY_TYPES.contains(&kind.as_str()) {
+        let Some(status) = frontmatter_status(&entry.frontmatter_json) else {
             continue;
-        }
-        let status = frontmatter_status(&entry.frontmatter_json);
-        if !status.eq_ignore_ascii_case("active") {
-            continue;
-        }
+        };
 
         let memory_id =
             frontmatter_memory_id(&entry.frontmatter_json).unwrap_or_else(|| node_id.clone());
@@ -429,6 +473,8 @@ fn resolve_and_rank(
         let recency = recency_score(&entry.updated_at, now);
         items.push(MemoryItem {
             memory_id,
+            kg_node_id: node_id,
+            revision_hash: vault_revision_hash(&entry),
             content_hash: Hash::from_bytes(entry.content_hash).to_base32(),
             path,
             name,
@@ -461,27 +507,31 @@ fn rank_score(rank: usize) -> f64 {
     1.0 / (1.0 + rank as f64)
 }
 
-/// Lowercased, deduplicated seed terms of at least [`MIN_TERM_LEN`] chars.
+/// Lowercased, deduplicated terms using KG FTS rules plus a small allowlist of
+/// meaningful short technology names. Exact token matching prevents substring
+/// matches such as `rust` in `trust`.
 fn search_terms(seed_query: &str) -> Vec<String> {
-    let mut terms: Vec<String> = seed_query
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.chars().count() >= MIN_TERM_LEN)
-        .map(|t| t.to_lowercase())
-        .collect();
+    let mut terms = tokenize_for_fts(seed_query);
+    terms.extend(
+        seed_query
+            .split(|character: char| !character.is_alphanumeric() && character != '_')
+            .map(str::to_lowercase)
+            .filter(|term| SHORT_TECH_TERMS.contains(&term.as_str())),
+    );
     terms.sort();
     terms.dedup();
     terms
 }
 
-/// Fraction of seed terms found in the body (case-insensitive).
+/// Fraction of seed terms present as exact body tokens (case-insensitive).
 fn body_match_fraction(terms: &[String], body: &str) -> f64 {
     if terms.is_empty() {
         return 0.0;
     }
-    let body_lower = body.to_lowercase();
+    let body_tokens: HashSet<String> = search_terms(body).into_iter().collect();
     let matched = terms
         .iter()
-        .filter(|t| body_lower.contains(t.as_str()))
+        .filter(|term| body_tokens.contains(*term))
         .count();
     matched as f64 / terms.len() as f64
 }
@@ -572,8 +622,13 @@ fn frontmatter_kind(frontmatter_json: &str) -> String {
         .unwrap_or_else(|| "project".to_string())
 }
 
-fn frontmatter_status(frontmatter_json: &str) -> String {
-    frontmatter_string(frontmatter_json, &["status"]).unwrap_or_else(|| "active".to_string())
+fn frontmatter_status(frontmatter_json: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(frontmatter_json).ok()?;
+    match value.get("status") {
+        None => Some("active".to_string()),
+        Some(serde_json::Value::String(status)) if !status.is_empty() => Some(status.clone()),
+        Some(_) => None,
+    }
 }
 
 fn frontmatter_name(frontmatter_json: &str) -> Option<String> {
@@ -611,25 +666,66 @@ fn frontmatter_labels(frontmatter_json: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn is_eligible_memory(entry: &VaultEntry) -> bool {
+    if entry.entry_type != VaultEntryType::Memory {
+        return false;
+    }
+    let kind = frontmatter_kind(&entry.frontmatter_json);
+    if EXCLUDED_MEMORY_TYPES.contains(&kind.as_str()) {
+        return false;
+    }
+    frontmatter_status(&entry.frontmatter_json)
+        .is_some_and(|status| status.eq_ignore_ascii_case("active"))
+}
+
+/// Identify the exact stored knowledge revision, not only its Markdown body.
+/// Length-prefixing keeps the hash input unambiguous while preserving the raw
+/// stored frontmatter as part of the revision contract.
+fn vault_revision_hash(entry: &VaultEntry) -> String {
+    let mut bytes = b"atomic-vault-revision-v1".to_vec();
+    append_hash_field(&mut bytes, entry.entry_type.as_str().as_bytes());
+    append_hash_field(&mut bytes, entry.frontmatter_json.as_bytes());
+    append_hash_field(&mut bytes, &entry.content_bytes);
+    Hash::of(&bytes).to_base32()
+}
+
+fn append_hash_field(target: &mut Vec<u8>, value: &[u8]) {
+    target.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    target.extend_from_slice(value);
+}
+
 // Budget
 
-/// Truncate bodies so their combined length fits `budget_chars`,
-/// splitting the budget evenly across the selected memories.
-fn apply_budget(items: Vec<MemoryItem>, budget_chars: usize) -> Vec<MemoryItem> {
+/// Truncate bodies so their combined length fits `budget_chars`. Start with an
+/// even allocation, then give unused capacity from short bodies to higher-ranked
+/// items instead of silently discarding available context.
+fn apply_budget(mut items: Vec<MemoryItem>, budget_chars: usize) -> Vec<MemoryItem> {
     if items.is_empty() {
         return items;
     }
-    let per_item = budget_chars / items.len();
+    let lengths: Vec<usize> = items.iter().map(|item| item.body.chars().count()).collect();
+    let baseline = budget_chars / items.len();
+    let mut allocations: Vec<usize> = lengths
+        .iter()
+        .map(|length| (*length).min(baseline))
+        .collect();
+    let mut remaining = budget_chars.saturating_sub(allocations.iter().sum());
+    for (allocation, length) in allocations.iter_mut().zip(&lengths) {
+        let extra = length.saturating_sub(*allocation).min(remaining);
+        *allocation += extra;
+        remaining -= extra;
+        if remaining == 0 {
+            break;
+        }
+    }
+
+    for ((item, allocation), length) in items.iter_mut().zip(allocations).zip(lengths) {
+        if allocation < length {
+            item.body = truncate_chars(&item.body, allocation);
+            item.truncated = true;
+        }
+    }
     items
-        .into_iter()
-        .map(|mut item| {
-            if item.body.chars().count() > per_item {
-                item.body = truncate_chars(&item.body, per_item);
-                item.truncated = true;
-            }
-            item
-        })
-        .collect()
 }
 
 /// Truncate to at most `max_chars` characters on a char boundary.
@@ -639,7 +735,7 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 
 // Rendering
 
-/// Render the injectable markdown block. Empty input renders to an
+/// Render the prompt-ready markdown block. Empty input renders to an
 /// empty string so callers can prepend unconditionally.
 fn render_md(items: &[MemoryItem]) -> String {
     if items.is_empty() {
@@ -662,7 +758,7 @@ fn render_md(items: &[MemoryItem]) -> String {
         out.push_str(&format!(
             "Source: {} @ {}\n{}\n",
             prompt_metadata(&item.memory_id),
-            item.content_hash,
+            item.revision_hash,
             MEMORY_DATA_START
         ));
         out.push_str(&escape_memory_delimiters(&item.body));
@@ -686,6 +782,8 @@ fn render_json(items: &[MemoryItem], md: &str, request: &Context, limit: usize) 
         .map(|item| {
             serde_json::json!({
                 "memory_id": item.memory_id,
+                "kg_node_id": item.kg_node_id,
+                "revision_hash": item.revision_hash,
                 "content_hash": item.content_hash,
                 "path": item.path,
                 "name": item.name,
@@ -742,11 +840,14 @@ fn preview(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atomic_repository::IntentCreateOptions;
 
     fn item(name: &str, score: f64, body: &str) -> MemoryItem {
         MemoryItem {
             memory_id: format!("memory:{name}"),
-            content_hash: "revision-hash".to_string(),
+            kg_node_id: format!("memory:{name}"),
+            revision_hash: "revision-hash".to_string(),
+            content_hash: "body-hash".to_string(),
             path: format!("memory/{}.md", name),
             name: name.to_string(),
             kind: "project".to_string(),
@@ -768,6 +869,38 @@ mod tests {
             budget_chars: 8000,
             format: "json".to_string(),
             json: true,
+        }
+    }
+
+    #[test]
+    fn test_run_rejects_unknown_format_before_repository_lookup() {
+        let mut request = request();
+        request.format = "yaml".to_string();
+        request.json = false;
+
+        match request.run().unwrap_err() {
+            CliError::InvalidArgument { message } => {
+                assert_eq!(message, "Unknown format: yaml (expected md or json)");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_run_rejects_limit_outside_supported_range() {
+        for limit in [0, MAX_LIMIT + 1] {
+            let mut request = request();
+            request.limit = limit;
+
+            match request.run().unwrap_err() {
+                CliError::InvalidArgument { message } => {
+                    assert_eq!(
+                        message,
+                        format!("--limit must be between 1 and {MAX_LIMIT}")
+                    );
+                }
+                other => panic!("expected InvalidArgument, got {other:?}"),
+            }
         }
     }
 
@@ -873,9 +1006,13 @@ mod tests {
     fn test_search_terms_filters_and_dedupes() {
         assert_eq!(
             search_terms("Fix the JWT-token fix in AUTH"),
-            vec!["auth", "fix", "jwt", "the", "token"]
+            vec!["auth", "fix", "jwt", "token"]
         );
         assert!(search_terms("a an").is_empty());
+        assert_eq!(
+            search_terms("AI service in Go"),
+            vec!["ai", "go", "service"]
+        );
     }
 
     #[test]
@@ -892,6 +1029,12 @@ mod tests {
     fn test_body_match_fraction_case_insensitive() {
         let terms = search_terms("RS256");
         assert_eq!(body_match_fraction(&terms, "uses rs256 signing"), 1.0);
+    }
+
+    #[test]
+    fn test_body_match_fraction_requires_exact_tokens() {
+        let terms = search_terms("rust auth");
+        assert_eq!(body_match_fraction(&terms, "trust the author"), 0.0);
     }
 
     #[test]
@@ -915,8 +1058,31 @@ mod tests {
             frontmatter_memory_id(fm).as_deref(),
             Some("urn:atomic:memory:01J8ZC4R8T")
         );
-        assert_eq!(frontmatter_status(fm), "superseded");
-        assert_eq!(frontmatter_status("{}"), "active");
+        assert_eq!(frontmatter_status(fm).as_deref(), Some("superseded"));
+        assert_eq!(frontmatter_status("{}").as_deref(), Some("active"));
+        assert_eq!(frontmatter_status(r#"{"status":null}"#), None);
+        assert_eq!(frontmatter_status("not json"), None);
+    }
+
+    #[test]
+    fn test_revision_hash_includes_frontmatter_and_body() {
+        let original = VaultEntry::new(
+            VaultEntryType::Memory,
+            b"same body".to_vec(),
+            r#"{"name":"auth","status":"active"}"#.to_string(),
+            "2026-07-01T00:00:00Z".to_string(),
+        );
+        let metadata_update = VaultEntry::new(
+            VaultEntryType::Memory,
+            b"same body".to_vec(),
+            r#"{"name":"auth","status":"superseded"}"#.to_string(),
+            "2026-07-02T00:00:00Z".to_string(),
+        );
+        assert_eq!(original.content_hash, metadata_update.content_hash);
+        assert_ne!(
+            vault_revision_hash(&original),
+            vault_revision_hash(&metadata_update)
+        );
     }
 
     #[test]
@@ -986,6 +1152,15 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_budget_reuses_capacity_from_short_bodies() {
+        let items = vec![item("short", 1.0, "x"), item("long", 0.5, &"y".repeat(999))];
+        let out = apply_budget(items, 1000);
+        assert_eq!(out[0].body.chars().count(), 1);
+        assert_eq!(out[1].body.chars().count(), 999);
+        assert!(!out[1].truncated);
+    }
+
+    #[test]
     fn test_truncate_chars_multibyte_safe() {
         assert_eq!(truncate_chars("héllo", 2), "hé");
         assert_eq!(truncate_chars("知识飞轮", 2), "知识");
@@ -1038,7 +1213,9 @@ mod tests {
         assert_eq!(parsed["retrieval"]["ranker_version"], RANKER_VERSION);
         assert_eq!(parsed["retrieval"]["intent"], "PIMO-1");
         assert_eq!(parsed["memories"][0]["memory_id"], "memory:arch");
-        assert_eq!(parsed["memories"][0]["content_hash"], "revision-hash");
+        assert_eq!(parsed["memories"][0]["kg_node_id"], "memory:arch");
+        assert_eq!(parsed["memories"][0]["revision_hash"], "revision-hash");
+        assert_eq!(parsed["memories"][0]["content_hash"], "body-hash");
         assert_eq!(parsed["memories"][0]["path"], "memory/arch.md");
         assert_eq!(parsed["memories"][0]["name"], "arch");
         assert_eq!(parsed["memories"][0]["kind"], "project");
@@ -1086,6 +1263,138 @@ mod tests {
         request.files = vec!["src/no-memory-neighbors.rs".to_string()];
 
         assert!(request.gather_candidates(&repo, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_recent_fallback_filters_inactive_before_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        let active = VaultEntry::new(
+            VaultEntryType::Memory,
+            b"useful older memory".to_vec(),
+            r#"{"name":"useful","status":"active"}"#.to_string(),
+            "2026-07-01T00:00:00Z".to_string(),
+        );
+        repo.vault_store_entry("memory/useful.md", &active).unwrap();
+        for day in 2..=4 {
+            let inactive = VaultEntry::new(
+                VaultEntryType::Memory,
+                format!("retired {day}").into_bytes(),
+                format!(r#"{{"name":"retired-{day}","status":"retracted"}}"#),
+                format!("2026-07-0{day}T00:00:00Z"),
+            );
+            repo.vault_store_entry(&format!("memory/retired-{day}.md"), &inactive)
+                .unwrap();
+        }
+
+        let mut request = request();
+        request.query.clear();
+        request.intent = None;
+        request.files.clear();
+        let candidates = request.gather_candidates(&repo, 1).unwrap();
+        let items = resolve_and_rank(&repo, candidates, 1).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "useful");
+    }
+
+    #[test]
+    fn test_free_text_seed_retrieves_current_memory_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+        repo.vault_store(
+            "memory/auth-decision.md",
+            VaultEntryType::Memory,
+            b"Use RS256 signing rather than HS256.".to_vec(),
+            r#"{"uid":"auth-decision","name":"Auth decision","status":"active"}"#.to_string(),
+        )
+        .unwrap();
+
+        let request = Context {
+            query: vec!["rs256".to_string()],
+            intent: None,
+            files: vec![],
+            limit: 5,
+            budget_chars: 8000,
+            format: "json".to_string(),
+            json: true,
+        };
+        let candidates = request.gather_candidates(&repo, 5).unwrap();
+        let items = resolve_and_rank(&repo, candidates, 5).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].memory_id, "urn:atomic:memory:auth-decision");
+        assert_eq!(items[0].kg_node_id, "memory:auth-decision");
+        assert!(items[0].body.contains("RS256"));
+    }
+
+    #[test]
+    fn test_intent_seed_retrieves_matching_source_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+        repo.vault_store(
+            "memory/auth-decision.md",
+            VaultEntryType::Memory,
+            b"Authentication signing must use RS256.".to_vec(),
+            r#"{"name":"Auth decision","status":"active"}"#.to_string(),
+        )
+        .unwrap();
+        let intent = repo
+            .vault_intent_create(IntentCreateOptions {
+                title: "Implement RS256 authentication".to_string(),
+                priority: Some("high".to_string()),
+                assignee: None,
+                labels: vec!["rs256".to_string(), "authentication".to_string()],
+                session_id: Some("context-test".to_string()),
+                turn_id: Some(1),
+            })
+            .unwrap();
+
+        let request = Context {
+            query: vec![],
+            intent: Some(intent.id),
+            files: vec![],
+            limit: 5,
+            budget_chars: 8000,
+            format: "md".to_string(),
+            json: false,
+        };
+        let candidates = request.gather_candidates(&repo, 5).unwrap();
+        let items = resolve_and_rank(&repo, candidates, 5).unwrap();
+        assert!(items
+            .iter()
+            .any(|item| item.kg_node_id == "memory:auth-decision"));
+    }
+
+    #[test]
+    fn test_file_seed_retrieves_memory_with_punctuated_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+        repo.vault_store(
+            "memory/auth-file.md",
+            VaultEntryType::Memory,
+            b"This applies to src/auth.rs.".to_vec(),
+            r#"{"name":"Auth file","status":"active"}"#.to_string(),
+        )
+        .unwrap();
+
+        let request = Context {
+            query: vec![],
+            intent: None,
+            files: vec!["src/auth.rs".to_string()],
+            limit: 5,
+            budget_chars: 8000,
+            format: "md".to_string(),
+            json: false,
+        };
+        let candidates = request.gather_candidates(&repo, 5).unwrap();
+        let items = resolve_and_rank(&repo, candidates, 5).unwrap();
+        assert!(items
+            .iter()
+            .any(|item| item.kg_node_id == "memory:auth-file"));
     }
 
     #[test]

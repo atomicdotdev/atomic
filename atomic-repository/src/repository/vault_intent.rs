@@ -319,6 +319,16 @@ impl Repository {
             })
     }
 
+    /// Resolve an Intent display ID to its current Vault path.
+    ///
+    /// This exposes the same legacy-manifest fallback used by `intent show` so
+    /// read-only consumers do not need to assume `IntentSummary.vault_path` is
+    /// populated.
+    pub fn vault_intent_path(&self, intent_id: &str) -> Result<Option<String>, RepositoryError> {
+        let full_id = self.normalize_intent_id(intent_id)?;
+        self.find_intent_path(&full_id)
+    }
+
     /// Delete an unstarted backlog intent.
     ///
     /// This is intentionally conservative: only backlog intents with no linked
@@ -1357,6 +1367,32 @@ The authentication module has no rate limiting.
         let dir = tempdir().unwrap();
         let repo = init_repo_with_vault(dir.path());
         assert!(repo.vault_intent_show("VAULT-999").is_err());
+    }
+
+    #[test]
+    fn test_vault_intent_path_resolves_legacy_manifest_entry() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let intent = repo
+            .vault_intent_create(create_opts("Legacy path lookup"))
+            .unwrap();
+
+        // Simulate a manifest created before IntentSummary.vault_path existed.
+        let mut txn = repo.pristine.write_txn().unwrap();
+        let mut manifest = txn.get_vault_manifest().unwrap();
+        manifest
+            .intents
+            .get_mut(&intent.id)
+            .unwrap()
+            .vault_path
+            .clear();
+        txn.put_vault_manifest(&manifest).unwrap();
+        txn.commit().unwrap();
+
+        assert_eq!(
+            repo.vault_intent_path(&intent.id).unwrap(),
+            Some(intent.intent_file)
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
 use super::*;
 use crate::content_search::{has_content_index, search_content, ContentSearchOptions};
 use atomic_core::pristine::ontology::{edge_kind, predicate};
+use atomic_core::pristine::tables::tokenize_for_fts;
 use atomic_core::pristine::vault::{KgEdge, KgNode, KgSubgraph, VaultEntry, VaultEntryType};
 use atomic_core::pristine::{KgMutTxnT, KgTxnT};
 
@@ -325,6 +326,78 @@ impl Repository {
 
         Ok(results)
     }
+
+    /// Full-text search restricted to one KG node kind before top-N selection.
+    ///
+    /// Typed callers must not fetch a mixed global top-N and filter afterward:
+    /// higher-weight file/module results can otherwise crowd every matching
+    /// memory out of a small result window. This path intentionally searches
+    /// KG node metadata only; source-file content search is not relevant to
+    /// memory-only retrieval.
+    pub fn vault_kg_search_by_kind(
+        &self,
+        query: &str,
+        limit: usize,
+        kind: &str,
+    ) -> Result<Vec<KgNode>, RepositoryError> {
+        use std::collections::HashSet;
+
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let query_tokens: HashSet<String> = tokenize_for_fts(query).into_iter().collect();
+        if query_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let matches = txn
+            .kg_fts_match_ids(query)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut ranked = Vec::new();
+        for (node_id, _) in matches {
+            let Some(node) = txn
+                .get_kg_node(&node_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            else {
+                continue;
+            };
+            if node.kind != kind {
+                continue;
+            }
+
+            // Legacy KG FTS only appended postings. Re-check the current node
+            // text so obsolete postings cannot make a renamed node match.
+            let hits = kg_node_fts_hit_count(&node, &query_tokens);
+            if hits > 0 {
+                ranked.push((hits, node));
+            }
+        }
+
+        ranked.sort_by(|(hits_a, node_a), (hits_b, node_b)| {
+            hits_b.cmp(hits_a).then_with(|| node_a.id.cmp(&node_b.id))
+        });
+        ranked.truncate(limit);
+        Ok(ranked.into_iter().map(|(_, node)| node).collect())
+    }
+}
+
+fn kg_node_fts_hit_count(node: &KgNode, query_tokens: &std::collections::HashSet<String>) -> usize {
+    let mut text = String::with_capacity(node.id.len() + node.label.len() + 64);
+    text.push_str(&node.id);
+    text.push(' ');
+    text.push_str(&node.label);
+    if let Some(summary) = &node.summary {
+        text.push(' ');
+        text.push_str(summary);
+    }
+    let node_tokens: std::collections::HashSet<String> =
+        tokenize_for_fts(&text).into_iter().collect();
+    query_tokens.intersection(&node_tokens).count()
 }
 
 /// Compute a ranking score from a node ID and match counts.
@@ -762,9 +835,11 @@ fn extract_content_edges(
     };
 
     for word in content.split_whitespace() {
-        let clean = word.trim_matches(|c: char| {
-            c == '`' || c == '"' || c == '\'' || c == '(' || c == ')' || c == ','
-        });
+        let clean = word
+            .trim_start_matches(['`', '"', '\'', '(', '[', '{', '<'])
+            .trim_end_matches([
+                '`', '"', '\'', ')', ',', ']', '}', '>', '.', ';', ':', '!', '?',
+            ]);
         if looks_like_file_path(clean) {
             edges.push(KgEdge::new(
                 subject,
@@ -1082,6 +1157,21 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_content_edges_trims_sentence_punctuation() {
+        let mut edges = Vec::new();
+        extract_content_edges(
+            "memory:auth",
+            VaultEntryType::Memory,
+            "See src/auth.rs. Also check [crates/core/src/lib.rs].",
+            &mut edges,
+        );
+        assert!(edges.iter().any(|edge| edge.to_id == "file:src/auth.rs"));
+        assert!(edges
+            .iter()
+            .any(|edge| edge.to_id == "file:crates/core/src/lib.rs"));
+    }
+
+    #[test]
     fn test_extract_scratch_returns_empty() {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
@@ -1242,5 +1332,85 @@ mod tests {
                 .and_then(|path| path.as_str()),
             Some("memory/architecture.md")
         );
+    }
+
+    #[test]
+    fn test_kg_search_by_kind_filters_before_top_n() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        let files: Vec<KgNode> = (0..20)
+            .map(|index| {
+                KgNode::new(
+                    format!("file:src/authentication-{index}.rs"),
+                    "file",
+                    format!("authentication-{index}.rs"),
+                    "test",
+                )
+            })
+            .collect();
+        let mut txn = repo.pristine.write_txn().unwrap();
+        txn.init_kg().unwrap();
+        for node in &files {
+            txn.upsert_kg_node(node).unwrap();
+        }
+        txn.commit().unwrap();
+        repo.vault_store(
+            "memory/authentication.md",
+            VaultEntryType::Memory,
+            b"Current authentication decision".to_vec(),
+            r#"{"name":"authentication","status":"active"}"#.to_string(),
+        )
+        .unwrap();
+
+        let mixed = repo.vault_kg_search("authentication", 5, None).unwrap();
+        assert!(mixed.iter().all(|node| node.kind == "file"));
+
+        let memories = repo
+            .vault_kg_search_by_kind("authentication", 5, "memory")
+            .unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].id, "memory:authentication");
+    }
+
+    #[test]
+    fn test_kg_search_by_kind_rejects_legacy_stale_postings() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        let mut txn = repo.pristine.write_txn().unwrap();
+        txn.init_kg().unwrap();
+        txn.upsert_kg_node(&KgNode::new(
+            "memory:decision",
+            "memory",
+            "authentication",
+            "test",
+        ))
+        .unwrap();
+        txn.commit().unwrap();
+
+        // Legacy writers appended the new terms without removing the old
+        // "authentication" posting for the same node ID.
+        let mut txn = repo.pristine.write_txn().unwrap();
+        txn.upsert_kg_node(&KgNode::new(
+            "memory:decision",
+            "memory",
+            "payments",
+            "test",
+        ))
+        .unwrap();
+        txn.commit().unwrap();
+
+        assert!(repo
+            .vault_kg_search_by_kind("authentication", 5, "memory")
+            .unwrap()
+            .is_empty());
+        let current = repo
+            .vault_kg_search_by_kind("payments", 5, "memory")
+            .unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, "memory:decision");
     }
 }
