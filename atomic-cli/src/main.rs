@@ -66,9 +66,12 @@ use commands::{
     Identity,
     Init,
     Insert,
+    Intent,
     Log,
+    Memory,
     Move,
     ProjectCmd,
+    Provenance,
     Pull,
     Push,
     Query,
@@ -94,7 +97,7 @@ use commands::{
 // Team features (conditional)
 #[cfg(feature = "teams")]
 use commands::{OrgCmd, TeamCmd};
-use output::{print_error, print_hint};
+use output::{hint, print_error};
 
 // CLI Argument Definitions
 
@@ -694,6 +697,72 @@ enum Commands {
     /// ```
     Vault(Vault),
 
+    /// Record the "why": lift, validate, attest, and render canonical intents.
+    ///
+    /// A sibling of `atomic vault`. Drives the `atomic-canonical` engine over
+    /// real vault intents, persisting attestations additively as sidecar files
+    /// under `.atomic/` — the stored vault entries are never mutated. Distinct
+    /// from the vault-scoped `atomic vault intent ...` tree.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Scaffold a directive-based intent
+    /// atomic intent new "Fix the login flow"
+    ///
+    /// # Validate it against the canonical shapes
+    /// atomic intent validate PIMO-1
+    ///
+    /// # Render the canonical projection
+    /// atomic intent show PIMO-1
+    ///
+    /// # Sign it into a canonical sidecar
+    /// atomic intent attest PIMO-1
+    /// ```
+    #[command(name = "intent")]
+    Intent(Intent),
+
+    /// Record the "why" for durable context: lift, validate, attest, and render
+    /// canonical memories.
+    ///
+    /// A sibling of the raw `atomic vault memory` tree, driving the
+    /// `atomic-canonical` engine for MEMORIES. Attestations are persisted
+    /// additively as tracked vault entries.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Scaffold a directive-based memory
+    /// atomic memory new --kind constraint
+    ///
+    /// # Gate it against the canonical shapes
+    /// atomic memory validate 01j8zc4r8t
+    ///
+    /// # Sign it into a tracked attestation
+    /// atomic memory attest 01j8zc4r8t
+    /// ```
+    #[command(name = "memory")]
+    Memory(Memory),
+
+    /// Project & trace W3C PROV over the provenance atomic already captures.
+    ///
+    /// Read-only, compute-on-demand: projects the per-turn `ProvenanceGraph`
+    /// into a signed W3C PROV JSON-LD named subgraph. The capture path is never
+    /// touched and nothing is written. The person's real `did:atomic` signs the
+    /// projection; the agent is a non-verifiable descriptive label.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Walk the flywheel chain for a change
+    /// atomic provenance trace <change>
+    ///
+    /// # Emit the signed PROV JSON-LD artifact
+    /// atomic provenance show <change>
+    /// ```
+    #[command(name = "provenance")]
+    Provenance(Provenance),
+
     /// Remove the last change from the current view.
     ///
     /// The change is removed from the view's change log but NOT deleted
@@ -815,16 +884,24 @@ fn main() {
         Commands::Query(query) => query.run(),
 
         Commands::Vault(vault) => vault.run(),
+
+        Commands::Intent(intent) => intent.run(),
+
+        Commands::Memory(memory) => memory.run(),
+
+        Commands::Provenance(provenance) => provenance.run(),
     };
 
     // Handle errors with user-friendly output
     if let Err(err) = result {
         print_error(&err.to_string());
 
-        // Print suggestion if available
+        // Print suggestion if available — to STDERR, alongside the error itself,
+        // so a command's stdout (e.g. `--json` output on an erroring path) is
+        // never polluted by a diagnostic hint.
         if let Some(suggestion) = err.suggestion() {
-            println!();
-            print_hint(&format!("Hint: {}", suggestion));
+            eprintln!();
+            eprintln!("{}", hint(&format!("Hint: {}", suggestion)));
         }
 
         // Exit with appropriate code

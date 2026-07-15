@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "atomic-agent",
+    "atomic-canonical",
     "atomic-cli",
     "atomic-core",
     "atomic-config",
@@ -24,6 +25,7 @@ rust-version = "1.90"
 [workspace.dependencies]
 # Core
 atomic-agent = { path = "atomic-agent" }
+atomic-canonical = { path = "atomic-canonical" }
 atomic-core = { path = "atomic-core" }
 atomic-config = { path = "atomic-config" }
 atomic-identity = { path = "atomic-identity" }
@@ -45,6 +47,7 @@ rayon = "1.10"
 fastcdc = "3.1"
 
 # Hashing & Crypto
+bs58 = "0.5"
 blake3 = "1.5"
 ed25519-dalek = { version = "2.1", features = ["serde"] }
 rand = "0.8"

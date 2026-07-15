@@ -142,11 +142,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomic-canonical"
+version = "0.9.1"
+dependencies = [
+ "atomic-identity",
+ "blake3",
+ "bs58",
+ "chrono",
+ "data-encoding",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "atomic-cli"
 version = "0.9.1"
 dependencies = [
  "anyhow",
  "atomic-agent",
+ "atomic-canonical",
  "atomic-config",
  "atomic-core",
  "atomic-identity",
@@ -154,6 +169,7 @@ dependencies = [
  "atomic-repository",
  "atomic-semantic",
  "atomic-teams",
+ "blake3",
  "bytes",
  "chrono",
  "clap",
@@ -393,6 +409,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
 ]
 
 [[package]]

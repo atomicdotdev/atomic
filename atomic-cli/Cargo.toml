@@ -23,6 +23,7 @@ path = "src/main.rs"
 [dependencies]
 # Internal crates
 atomic-agent = { workspace = true }
+atomic-canonical = { workspace = true }
 atomic-core = { workspace = true }
 atomic-config = { workspace = true }
 atomic-identity = { workspace = true }
@@ -59,6 +60,9 @@ dirs = "5"
 
 # Base32/Base64 encoding
 data-encoding = "2.6"
+
+# Hashing (source-content digest for canonical intent sidecars)
+blake3 = { workspace = true }
 
 # Open URLs in default browser (for device auth flow)
 open = "5"

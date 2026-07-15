@@ -45,6 +45,7 @@ impl Repository {
             VaultEntryType::Skill => "skill",
             VaultEntryType::ToolResult => "tool_result",
             VaultEntryType::Scratch => return Ok((nodes, edges)), // no KG data for scratch
+            VaultEntryType::Attestation => return Ok((nodes, edges)), // signed blob: no KG data
         };
 
         // Derive a label from the subject (the part after the colon)
@@ -557,6 +558,14 @@ fn entry_subject(path: &str, entry_type: VaultEntryType) -> String {
         VaultEntryType::Scratch => {
             format!("scratch:{}", path.replace('/', ":"))
         }
+        VaultEntryType::Attestation => {
+            // attestations/<sanitized-intent-id>/attested.md -> attestation:<sanitized-intent-id>
+            let name = path
+                .strip_prefix("attestations/")
+                .and_then(|s| s.strip_suffix("/attested.md"))
+                .unwrap_or(path);
+            format!("attestation:{}", name)
+        }
     }
 }
 
@@ -1011,6 +1020,13 @@ mod tests {
             entry_subject("skills/run-tests.md", VaultEntryType::Skill),
             "skill:run-tests"
         );
+        assert_eq!(
+            entry_subject(
+                "attestations/PIMO-1/attested.md",
+                VaultEntryType::Attestation
+            ),
+            "attestation:PIMO-1"
+        );
     }
 
     #[test]
@@ -1088,6 +1104,28 @@ mod tests {
         );
 
         let (nodes, edges) = repo.vault_extract_kg("scratch/temp.md", &entry).unwrap();
+        assert!(nodes.is_empty());
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn test_extract_attestation_returns_empty() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        // A signed attestation blob contributes ZERO KG nodes/edges (the kind
+        // match early-returns empty, mirroring Scratch).
+        let entry = VaultEntry::new(
+            VaultEntryType::Attestation,
+            b"{\"@id\":\"atomic:intent:PIMO-1\"}\n".to_vec(),
+            r#"{"intentId":"PIMO-1"}"#.to_string(),
+            "2025-01-01T00:00:00Z".to_string(),
+        );
+
+        let (nodes, edges) = repo
+            .vault_extract_kg("attestations/PIMO-1/attested.md", &entry)
+            .unwrap();
         assert!(nodes.is_empty());
         assert!(edges.is_empty());
     }

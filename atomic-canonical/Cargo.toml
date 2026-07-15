@@ -1,0 +1,19 @@
+[package]
+name = "atomic-canonical"
+description = "Recording the Why — canonical typed nodes (JSON-LD), JCS+BLAKE3 hashing, Data Integrity proofs, the lift, and the SHACL-style gate"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+bs58 = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+data-encoding = { workspace = true }
+atomic-identity = { workspace = true }
