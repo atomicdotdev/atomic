@@ -50,7 +50,11 @@ impl Repository {
         // Derive a label from the subject (the part after the colon)
         let label = subject.split_once(':').map(|(_, l)| l).unwrap_or(&subject);
 
-        let mut node = KgNode::new(&subject, kind, label, "vault");
+        // Keep storage location separate from node identity. Consumers can
+        // resolve a stable/canonical node ID back to its materialized vault
+        // entry without parsing the ID or assuming it matches the filename.
+        let mut node = KgNode::new(&subject, kind, label, "vault")
+            .with_metadata(serde_json::json!({ "vault_path": path }));
 
         // Extract from frontmatter
         if let Ok(fm) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
@@ -621,7 +625,10 @@ fn extract_frontmatter_kg(
                 ));
             }
             if let Some(s) = fm.get("status").and_then(|v| v.as_str()) {
-                node.metadata = Some(serde_json::json!({ "status": s }));
+                let md = node.metadata.get_or_insert_with(|| serde_json::json!({}));
+                if let Some(obj) = md.as_object_mut() {
+                    obj.insert("status".to_string(), serde_json::json!(s));
+                }
             }
         }
         VaultEntryType::Intent => {
@@ -1227,5 +1234,13 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].kind, "memory");
         assert_eq!(nodes[0].summary.as_deref(), Some("architecture"));
+        assert_eq!(
+            nodes[0]
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("vault_path"))
+                .and_then(|path| path.as_str()),
+            Some("memory/architecture.md")
+        );
     }
 }
