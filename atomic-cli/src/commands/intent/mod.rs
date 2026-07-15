@@ -15,6 +15,10 @@
 //! atomic intent new <TITLE>          Scaffold a directive-based intent
 //! atomic intent attest <ID>          Sign an intent into a tracked attestation entry
 //! atomic intent verify <ID>          Verify a signed intent's attestation
+//! atomic intent list                 List the vault's intents (attestation-aware)
+//! atomic intent update <ID>          Update a stored intent's fields
+//! atomic intent delete <ID>          Delete an unstarted backlog intent
+//! atomic intent link <ID> --goal <G> Link a goal to a stored intent
 //! ```
 //!
 //! # Persistence — additive by construction
@@ -31,16 +35,22 @@ use crate::error::CliResult;
 
 pub mod attest;
 pub mod bridge;
+pub mod delete;
+pub mod link;
 pub mod list;
 pub mod new;
 pub mod show;
+pub mod update;
 pub mod validate;
 pub mod verify;
 
 pub use attest::IntentAttest;
+pub use delete::IntentDelete;
+pub use link::IntentLink;
 pub use list::IntentList;
 pub use new::IntentNew;
 pub use show::IntentShow;
+pub use update::IntentUpdate;
 pub use validate::IntentValidate;
 pub use verify::IntentVerify;
 
@@ -146,6 +156,52 @@ pub enum IntentCommands {
     /// atomic intent list --json
     /// ```
     List(IntentList),
+
+    /// Update a stored intent's fields (status, priority, title, body).
+    ///
+    /// The canonical-family replacement for `atomic vault intent update`. It
+    /// delegates to the same repository write path, so the frontmatter/body
+    /// updates and the started-or-linked guard (behind `--force`) behave
+    /// identically. The body can be set inline with `--body` or piped via
+    /// `--body-stdin`.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic intent update PIMO-1 --status in-progress
+    /// atomic intent update PIMO-1 --assignee bob --priority critical
+    /// atomic intent update PIMO-1 --body "# Fix auth\n\n## Problem\n..."
+    /// cat plan.md | atomic intent update PIMO-1 --body-stdin
+    /// ```
+    Update(IntentUpdate),
+
+    /// Delete an unstarted backlog intent.
+    ///
+    /// The canonical-family replacement for `atomic vault intent delete`. It
+    /// delegates to the same repository path and enforces the same guard: only
+    /// backlog intents with no linked goals can be deleted. Use `--force` to
+    /// skip the confirmation prompt.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic intent delete PIMO-1
+    /// atomic intent delete PIMO-1 --force
+    /// ```
+    Delete(IntentDelete),
+
+    /// Link a goal to a stored intent.
+    ///
+    /// The canonical-family replacement for `atomic vault intent link`. It
+    /// delegates to the same repository path, associating a goal with an intent
+    /// so the work done in the goal is tracked against the intent.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic intent link PIMO-1 --goal swift-meadow-a3f2
+    /// ```
+    Link(IntentLink),
 }
 
 /// Record the "why": lift, validate, attest, and render canonical intents.
@@ -169,6 +225,9 @@ impl Command for Intent {
             IntentCommands::Attest(cmd) => cmd.run(),
             IntentCommands::Verify(cmd) => cmd.run(),
             IntentCommands::List(cmd) => cmd.run(),
+            IntentCommands::Update(cmd) => cmd.run(),
+            IntentCommands::Delete(cmd) => cmd.run(),
+            IntentCommands::Link(cmd) => cmd.run(),
         }
     }
 }

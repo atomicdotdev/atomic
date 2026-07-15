@@ -129,7 +129,7 @@ pub enum IntentCommands {
     /// ```
     Show(IntentShow),
 
-    /// [DEPRECATED: use the `atomic intent` family] Update an intent's fields.
+    /// [DEPRECATED: use `atomic intent update`] Update an intent's fields.
     ///
     /// Modifies the status, assignee, priority, title, or Markdown body
     /// of an existing intent. The body can be set inline with `--body`
@@ -145,7 +145,7 @@ pub enum IntentCommands {
     /// ```
     Update(IntentUpdate),
 
-    /// [DEPRECATED: use the `atomic intent` family] Delete an unstarted backlog intent.
+    /// [DEPRECATED: use `atomic intent delete`] Delete an unstarted backlog intent.
     ///
     /// Removes an accidental draft intent from the vault. Only backlog
     /// intents with no linked goals can be deleted. Use --force to skip the
@@ -159,7 +159,7 @@ pub enum IntentCommands {
     /// ```
     Delete(IntentDelete),
 
-    /// [DEPRECATED: use the `atomic intent` family] Link a goal to an intent.
+    /// [DEPRECATED: use `atomic intent link`] Link a goal to an intent.
     ///
     /// Associates a goal with an intent so that the work done in the goal
     /// is tracked against the intent.
@@ -206,13 +206,13 @@ impl Command for Intent {
                 "`atomic vault intent show` is deprecated; use `atomic intent show` instead."
             }
             IntentCommands::Update(_) => {
-                "`atomic vault intent update` is deprecated; use the `atomic intent` family instead."
+                "`atomic vault intent update` is deprecated; use `atomic intent update` instead."
             }
             IntentCommands::Delete(_) => {
-                "`atomic vault intent delete` is deprecated; use the `atomic intent` family instead."
+                "`atomic vault intent delete` is deprecated; use `atomic intent delete` instead."
             }
             IntentCommands::Link(_) => {
-                "`atomic vault intent link` is deprecated; use the `atomic intent` family instead."
+                "`atomic vault intent link` is deprecated; use `atomic intent link` instead."
             }
         };
         eprintln!("warning: {msg}");
