@@ -310,8 +310,9 @@ impl Repository {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
 
-            // Never move .atomic into the working copy
-            if name_str == DOT_DIR {
+            // Never move VCS administrative directories into the working copy.
+            // `.git` belongs to Git's checkout and must not be view-scoped.
+            if name_str == DOT_DIR || name_str == ".git" {
                 continue;
             }
 
@@ -393,8 +394,10 @@ impl Repository {
                     Err(_) => continue,
                 };
 
-                // Never touch the .atomic directory itself.
-                if rel.starts_with(DOT_DIR) {
+                // Never touch VCS administrative directories. `.git` can be
+                // ignored by `.atomicignore` after `atomic git import`, but
+                // it remains owned by Git rather than a view workspace.
+                if rel.starts_with(DOT_DIR) || rel.starts_with(".git") {
                     continue;
                 }
 
