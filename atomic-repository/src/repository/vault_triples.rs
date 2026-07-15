@@ -8,7 +8,7 @@ use crate::content_search::{has_content_index, search_content, ContentSearchOpti
 use atomic_core::pristine::ontology::{edge_kind, predicate};
 use atomic_core::pristine::tables::tokenize_for_fts;
 use atomic_core::pristine::vault::{KgEdge, KgNode, KgSubgraph, VaultEntry, VaultEntryType};
-use atomic_core::pristine::{KgMutTxnT, KgTxnT};
+use atomic_core::pristine::{KgMutTxnT, KgTxnT, VaultTxnT};
 
 impl Repository {
     /// Initialize the knowledge graph tables.
@@ -76,31 +76,125 @@ impl Repository {
         let content = String::from_utf8_lossy(&entry.content_bytes);
         extract_content_edges(&subject, entry.entry_type, &content, &mut edges);
 
+        // Edge direction is not enough to determine ownership. In particular,
+        // an Intent's symmetric `BLOCKS` edge points *into* the Intent node.
+        // Persist the source Vault path so an update replaces only edges
+        // derived from that entry while preserving RDF links owned elsewhere.
+        for edge in &mut edges {
+            let metadata = edge.metadata.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert(
+                    "derived_from_vault_path".to_string(),
+                    serde_json::json!(path),
+                );
+            }
+        }
+
         nodes.push(node);
         Ok((nodes, edges))
     }
 
-    /// Store KG nodes and edges for a vault entry, replacing any existing
-    /// nodes/edges derived from that path.
+    /// Store KG nodes and edges previously returned by [`Self::vault_extract_kg`],
+    /// replacing existing derived data for that path.
+    ///
+    /// The supplied triples must still match the current Vault entry. Prefer
+    /// [`Self::vault_index_kg`] when the caller does not need the two-step API.
     pub fn vault_store_kg(
         &self,
         path: &str,
         nodes: &[KgNode],
         edges: &[KgEdge],
     ) -> Result<usize, RepositoryError> {
+        let current_entry =
+            self.vault_retrieve(path)?
+                .ok_or_else(|| RepositoryError::FileNotFound {
+                    path: std::path::PathBuf::from(path),
+                })?;
+        let (current_nodes, current_edges) = self.vault_extract_kg(path, &current_entry)?;
+        if nodes != current_nodes || edges != current_edges {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "KG data for '{path}' no longer matches the current Vault entry; re-extract or call vault_index_kg"
+                ),
+            });
+        }
+        self.vault_store_kg_inner(path, nodes, edges, Some(&current_entry))
+    }
+
+    fn vault_store_kg_inner(
+        &self,
+        path: &str,
+        nodes: &[KgNode],
+        edges: &[KgEdge],
+        expected_entry: Option<&VaultEntry>,
+    ) -> Result<usize, RepositoryError> {
+        // Today vault KG identities are path-derived. Prefer the primary node
+        // identified by its vault_path metadata so ToolResult updates remove
+        // their real `tool:` node rather than a guessed `vault:` node.
+        let subject = nodes
+            .iter()
+            .find(|node| {
+                node.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("vault_path"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(path)
+            })
+            .or_else(|| nodes.iter().find(|node| node.id == path_to_subject(path)))
+            .or_else(|| (nodes.len() == 1).then(|| &nodes[0]))
+            .map(|node| node.id.clone())
+            .unwrap_or_else(|| path_to_subject(path));
+
         let mut txn = self
             .pristine
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Delete old data keyed by the path's primary node ID
-        let subject = path_to_subject(path);
-        let _ = txn
-            .del_kg_edges_for_node(&subject)
+        // Extraction happens before the write transaction. If the source was
+        // updated or deleted meanwhile, this result is stale and must not
+        // recreate derived KG data after the newer source operation commits.
+        if let Some(expected) = expected_entry {
+            let current = txn
+                .get_vault_entry(path)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let still_current = current.is_some_and(|entry| {
+                entry.entry_type == expected.entry_type
+                    && entry.content_hash == expected.content_hash
+                    && entry.frontmatter_json == expected.frontmatter_json
+            });
+            if !still_current {
+                return Ok(0);
+            }
+        }
+
+        txn.init_kg()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        let _ = txn
-            .del_kg_node(&subject)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if nodes.iter().any(|node| node.id == subject) {
+            // This is an in-place replacement of the same resource. Remove
+            // relationships derived from this Vault entry, but preserve edges
+            // from other resources that point at it (for example an Intent's
+            // RDF/PROV link to a source Memory). `upsert_kg_node` below replaces
+            // the node metadata and FTS terms transactionally.
+            let outgoing = txn
+                .get_kg_edges_from(&subject)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let incoming = txn
+                .get_kg_edges_to(&subject)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            for edge in outgoing.iter().chain(&incoming) {
+                if !edge_is_owned_by_vault_entry(edge, path, &subject) {
+                    continue;
+                }
+                txn.del_kg_edge(&edge.from_id, &edge.to_id, &edge.kind)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            }
+        } else {
+            // No replacement node was extracted (for example an entry that no
+            // longer participates in the KG), so remove the resource fully.
+            txn.del_kg_node(&subject)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
 
         // Store new nodes
         for node in nodes {
@@ -127,7 +221,7 @@ impl Repository {
                 path: std::path::PathBuf::from(path),
             })?;
         let (nodes, edges) = self.vault_extract_kg(path, &entry)?;
-        self.vault_store_kg(path, &nodes, &edges)
+        self.vault_store_kg_inner(path, &nodes, &edges, Some(&entry))
     }
 
     /// Re-index all vault entries into the knowledge graph.
@@ -167,14 +261,31 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // ── Phase 1: Collect ALL matching node IDs (cheap — no node fetching) ──
+        // ── Phase 1: Collect and validate matching node IDs ─────────────────
 
-        // KG FTS: every node ID that matches any query token, with hit counts.
-        let kg_matches: HashMap<String, usize> = txn
+        // Legacy KG FTS only appended postings, and a read-only repository
+        // cannot run the reverse-index migration. Treat the index as a
+        // candidate generator, then recompute hits from the current KG node.
+        // This prevents stale label/summary terms from being served before the
+        // next write-time migration and also protects against mixed-version
+        // writers that may have appended an obsolete posting.
+        let query_tokens: HashSet<String> = tokenize_for_fts(query).into_iter().collect();
+        let indexed_matches = txn
             .kg_fts_match_ids(query)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .into_iter()
-            .collect();
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let mut kg_matches: HashMap<String, usize> = HashMap::new();
+        for (node_id, _) in indexed_matches {
+            let Some(node) = txn
+                .get_kg_node(&node_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            else {
+                continue;
+            };
+            let current_hits = kg_node_fts_hit_count(&node, &query_tokens);
+            if current_hits > 0 {
+                kg_matches.insert(node_id, current_hits);
+            }
+        }
 
         // Content search: file-level matches from syntext, grouped by path.
         let mut content_counts: HashMap<String, usize> = HashMap::new();
@@ -401,6 +512,26 @@ fn kg_node_fts_hit_count(node: &KgNode, query_tokens: &std::collections::HashSet
     query_tokens.intersection(&node_tokens).count()
 }
 
+/// Whether an existing edge should be replaced when `path` is re-indexed.
+///
+/// New edges carry explicit ownership. The direction/kind fallbacks clean up
+/// legacy edges created before ownership metadata existed:
+/// - outgoing edges were derived from the subject entry;
+/// - incoming `BLOCKS` edges were the symmetric half of that Intent's
+///   `blocked_by` relationship.
+fn edge_is_owned_by_vault_entry(edge: &KgEdge, path: &str, subject: &str) -> bool {
+    if let Some(owner) = edge
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("derived_from_vault_path"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return owner == path;
+    }
+
+    edge.from_id == subject || (edge.to_id == subject && edge.kind == edge_kind::BLOCKS)
+}
+
 /// Compute a ranking score from a node ID and match counts.
 ///
 /// Higher score = more relevant.  Works on IDs only (no node fetching needed).
@@ -595,7 +726,7 @@ impl Repository {
 // ── Extraction helpers ──────────────────────────────────────────
 
 /// Derive a subject URI from a vault path and entry type.
-fn entry_subject(path: &str, entry_type: VaultEntryType) -> String {
+pub(super) fn entry_subject(path: &str, entry_type: VaultEntryType) -> String {
     match entry_type {
         VaultEntryType::Session => {
             // goals/swift-meadow-a3f2/_goal.md -> goal:swift-meadow-a3f2
@@ -1046,33 +1177,231 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         repo.init_vault().unwrap();
+        let path = "goals/abc/_goal.md";
+        repo.vault_store(
+            path,
+            VaultEntryType::Session,
+            b"Used src/main.rs".to_vec(),
+            r#"{"developer":"alice"}"#.to_string(),
+        )
+        .unwrap();
+        let first_entry = repo.vault_retrieve(path).unwrap().unwrap();
+        let (first_nodes, first_edges) = repo.vault_extract_kg(path, &first_entry).unwrap();
+        assert!(
+            repo.vault_store_kg(path, &first_nodes, &first_edges)
+                .unwrap()
+                > 0
+        );
 
-        let nodes = vec![KgNode::new("goal:abc", "goal", "abc", "vault")];
-        let edges = vec![KgEdge::new(
-            "goal:abc",
-            "file:src/main.rs",
-            edge_kind::REFERENCES,
-        )];
+        repo.vault_store(
+            path,
+            VaultEntryType::Session,
+            b"Used src/lib.rs".to_vec(),
+            r#"{"developer":"alice"}"#.to_string(),
+        )
+        .unwrap();
 
-        let count = repo
-            .vault_store_kg("goals/abc/_goal.md", &nodes, &edges)
+        // A delayed caller cannot write triples extracted from the old source.
+        assert!(repo
+            .vault_store_kg(path, &first_nodes, &first_edges)
+            .is_err());
+
+        let current_entry = repo.vault_retrieve(path).unwrap().unwrap();
+        let (current_nodes, current_edges) = repo.vault_extract_kg(path, &current_entry).unwrap();
+        repo.vault_store_kg(path, &current_nodes, &current_edges)
             .unwrap();
-        assert_eq!(count, 2);
 
-        // Store again with different edges — old data should be replaced
-        let edges2 = vec![KgEdge::new(
-            "goal:abc",
-            "file:src/lib.rs",
-            edge_kind::REFERENCES,
-        )];
-        let count2 = repo
-            .vault_store_kg("goals/abc/_goal.md", &nodes, &edges2)
-            .unwrap();
-        assert_eq!(count2, 2);
+        let subgraph = repo.vault_kg_neighbors("goal:abc", 1).unwrap();
+        assert!(subgraph
+            .edges
+            .iter()
+            .any(|edge| edge.to_id == "file:src/lib.rs"));
+        assert!(!subgraph
+            .edges
+            .iter()
+            .any(|edge| edge.to_id == "file:src/main.rs"));
+    }
 
-        // The node should still exist
-        let node = repo.vault_kg_node("goal:abc").unwrap();
-        assert!(node.is_some());
+    #[test]
+    fn test_tool_result_update_and_delete_clean_derived_data() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        let path = "goals/demo/toolu_123.md";
+        let node_id = entry_subject(path, VaultEntryType::ToolResult);
+        let previous_node_id = entry_subject(path, VaultEntryType::Memory);
+
+        // Reclassifying an existing path must remove the identity derived from
+        // the previous entry type before the new node is indexed.
+        repo.vault_store(
+            path,
+            VaultEntryType::Memory,
+            b"temporary memory".to_vec(),
+            r#"{"name":"temporary"}"#.to_string(),
+        )
+        .unwrap();
+        assert!(repo.vault_kg_node(&previous_node_id).unwrap().is_some());
+
+        repo.vault_store(
+            path,
+            VaultEntryType::ToolResult,
+            b"read src/auth.rs".to_vec(),
+            r#"{"description":"staletooltoken"}"#.to_string(),
+        )
+        .unwrap();
+
+        assert!(repo.vault_kg_node(&previous_node_id).unwrap().is_none());
+        assert!(repo.vault_kg_node(&node_id).unwrap().is_some());
+        assert!(repo
+            .vault_kg_search("staletooltoken", 10, None)
+            .unwrap()
+            .iter()
+            .any(|node| node.id == node_id));
+        let stale_entry = repo.vault_retrieve(path).unwrap().unwrap();
+        let (stale_nodes, stale_edges) = repo.vault_extract_kg(path, &stale_entry).unwrap();
+
+        repo.vault_store(
+            path,
+            VaultEntryType::ToolResult,
+            b"read src/main.rs".to_vec(),
+            r#"{"description":"currenttooltoken"}"#.to_string(),
+        )
+        .unwrap();
+
+        // A slow indexer that extracted the previous entry must not overwrite
+        // the newer KG state after the source update has committed.
+        assert_eq!(
+            repo.vault_store_kg_inner(path, &stale_nodes, &stale_edges, Some(&stale_entry),)
+                .unwrap(),
+            0
+        );
+
+        assert!(repo
+            .vault_kg_search("staletooltoken", 10, None)
+            .unwrap()
+            .is_empty());
+        assert!(repo
+            .vault_kg_search("currenttooltoken", 10, None)
+            .unwrap()
+            .iter()
+            .any(|node| node.id == node_id));
+        let graph = repo.vault_kg_neighbors(&node_id, 1).unwrap();
+        assert!(!graph
+            .edges
+            .iter()
+            .any(|edge| edge.to_id == "file:src/auth.rs"));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.to_id == "file:src/main.rs"));
+
+        assert!(repo.vault_delete(path).unwrap());
+        assert!(repo.vault_kg_node(&node_id).unwrap().is_none());
+        assert!(repo
+            .vault_kg_search("currenttooltoken", 10, None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_vault_node_update_preserves_incoming_relationships() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        repo.vault_store(
+            "memory/target.md",
+            VaultEntryType::Memory,
+            b"Original target knowledge".to_vec(),
+            r#"{"name":"target"}"#.to_string(),
+        )
+        .unwrap();
+        repo.vault_store(
+            "memory/source.md",
+            VaultEntryType::Memory,
+            b"This decision uses [[target]]".to_vec(),
+            r#"{"name":"source"}"#.to_string(),
+        )
+        .unwrap();
+
+        let incoming_exists = |repo: &Repository| {
+            repo.vault_kg_neighbors("memory:source", 1)
+                .unwrap()
+                .edges
+                .iter()
+                .any(|edge| {
+                    edge.from_id == "memory:source"
+                        && edge.to_id == "memory:target"
+                        && edge.kind == edge_kind::REFERENCES
+                })
+        };
+        assert!(incoming_exists(&repo));
+
+        // Replacing the target's metadata/body must not erase another Vault
+        // entry's RDF/KG relationship to that same resource.
+        repo.vault_store(
+            "memory/target.md",
+            VaultEntryType::Memory,
+            b"Updated target knowledge".to_vec(),
+            r#"{"name":"target","description":"current target"}"#.to_string(),
+        )
+        .unwrap();
+        assert!(incoming_exists(&repo));
+
+        // A real delete still cascades the now-dangling relationship.
+        assert!(repo.vault_delete("memory/target.md").unwrap());
+        assert!(!incoming_exists(&repo));
+    }
+
+    #[test]
+    fn test_vault_node_update_removes_owned_reverse_relationships() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+        let path = "intents/demo/intent.md";
+
+        repo.vault_store(
+            path,
+            VaultEntryType::Intent,
+            b"# Demo".to_vec(),
+            r#"{"title":"Demo","blocked_by":["BLOCKER"]}"#.to_string(),
+        )
+        .unwrap();
+        let has_reverse_block = |repo: &Repository| {
+            repo.vault_kg_neighbors("intent:DEMO", 1)
+                .unwrap()
+                .edges
+                .iter()
+                .any(|edge| {
+                    edge.from_id == "intent:BLOCKER"
+                        && edge.to_id == "intent:DEMO"
+                        && edge.kind == edge_kind::BLOCKS
+                })
+        };
+        assert!(has_reverse_block(&repo));
+
+        repo.vault_store(
+            path,
+            VaultEntryType::Intent,
+            b"# Demo".to_vec(),
+            r#"{"title":"Demo","blocked_by":[]}"#.to_string(),
+        )
+        .unwrap();
+        assert!(!has_reverse_block(&repo));
+    }
+
+    #[test]
+    fn test_current_node_validation_rejects_obsolete_fts_term() {
+        let node = KgNode::new("memory:payment-decision", "memory", "payments", "vault")
+            .with_summary("Use payment service v2");
+        let old_query: std::collections::HashSet<String> =
+            tokenize_for_fts("authentication").into_iter().collect();
+        let current_query: std::collections::HashSet<String> =
+            tokenize_for_fts("payments").into_iter().collect();
+
+        assert_eq!(kg_node_fts_hit_count(&node, &old_query), 0);
+        assert_eq!(kg_node_fts_hit_count(&node, &current_query), 1);
     }
 
     #[test]

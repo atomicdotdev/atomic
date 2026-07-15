@@ -1121,6 +1121,51 @@ mod tests {
     }
 
     #[test]
+    fn test_memory_scan_tracks_metadata_body_update_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        let path = "memory/auth-decision.md";
+        repo.vault_store(
+            path,
+            VaultEntryType::Memory,
+            b"Use oldnarwhal for service tokens".to_vec(),
+            r#"{"name":"auth-decision","description":"Authentication choice","status":"active"}"#
+                .to_string(),
+        )
+        .unwrap();
+
+        let mut request = request();
+        request.intent = None;
+        request.files.clear();
+        request.query = vec!["oldnarwhal".to_string()];
+        assert_eq!(request.gather_candidates(&repo, 5).unwrap().len(), 1);
+
+        repo.vault_store(
+            path,
+            VaultEntryType::Memory,
+            b"Use newmanatee for service tokens".to_vec(),
+            r#"{"name":"auth-decision","description":"OIDC zanzibar choice","status":"active"}"#
+                .to_string(),
+        )
+        .unwrap();
+        assert!(request.gather_candidates(&repo, 5).unwrap().is_empty());
+
+        request.query = vec!["newmanatee".to_string()];
+        assert_eq!(request.gather_candidates(&repo, 5).unwrap().len(), 1);
+        request.query = vec!["zanzibar".to_string()];
+        assert_eq!(
+            request.gather_candidates(&repo, 5).unwrap().len(),
+            1,
+            "description-only terms should be searchable without a content index"
+        );
+
+        assert!(repo.vault_delete(path).unwrap());
+        assert!(request.gather_candidates(&repo, 5).unwrap().is_empty());
+    }
+
+    #[test]
     fn test_frontmatter_labels() {
         assert_eq!(
             frontmatter_labels(r#"{"labels":["auth","backend"]}"#),

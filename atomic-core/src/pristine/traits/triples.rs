@@ -67,7 +67,7 @@ pub trait KgTxnT {
         })
     }
 
-    /// Full-text search over node labels and summaries.
+    /// Full-text search over node IDs, labels, and summaries.
     fn kg_fts_search(&self, query: &str, limit: usize) -> Result<Vec<KgNode>, PristineError>;
 
     /// Return ALL matching node IDs with hit counts (no truncation, no node fetching).
@@ -86,13 +86,13 @@ pub trait KgTxnT {
 
 /// Write operations on the knowledge graph.
 pub trait KgMutTxnT: KgTxnT {
-    /// Insert or update a KG node.
+    /// Insert or update a KG node, replacing its previous full-text tokens.
     fn upsert_kg_node(&mut self, node: &KgNode) -> Result<(), PristineError>;
 
     /// Insert a KG edge (idempotent — ignores duplicates).
     fn upsert_kg_edge(&mut self, edge: &KgEdge) -> Result<(), PristineError>;
 
-    /// Delete a KG node and all its edges.
+    /// Delete a KG node, all its edges, and all its full-text tokens.
     fn del_kg_node(&mut self, id: &str) -> Result<bool, PristineError>;
 
     /// Delete a specific edge.

@@ -9,6 +9,150 @@ use crate::pristine::vault::{KgEdge, KgNode};
 
 use super::WriteTxn;
 
+const KG_FTS_REVERSE_SCHEMA_KEY: &str = "fts_reverse_schema";
+const KG_FTS_REVERSE_SCHEMA_VERSION: u32 = 2;
+
+fn kg_node_fts_text(node: &KgNode) -> String {
+    let mut text = String::with_capacity(node.id.len() + node.label.len() + 64);
+    text.push_str(&node.id);
+    text.push(' ');
+    text.push_str(&node.label);
+    if let Some(summary) = &node.summary {
+        text.push(' ');
+        text.push_str(summary);
+    }
+    text
+}
+
+impl WriteTxn<'_> {
+    /// Ensure the reverse FTS index exists and rebuild both directions once for
+    /// databases created before replacement-safe indexing was introduced.
+    fn ensure_kg_fts_schema(&mut self) -> PristineResult<()> {
+        self.txn.open_multimap_table(KG_FTS)?;
+        self.txn.open_multimap_table(KG_FTS_BY_NODE)?;
+
+        let current_version = {
+            let metadata = self.txn.open_table(KG_INDEX_META)?;
+            let stored_version = metadata.get(KG_FTS_REVERSE_SCHEMA_KEY)?;
+            match stored_version {
+                Some(value) => value.value(),
+                None => 0,
+            }
+        };
+        if current_version >= KG_FTS_REVERSE_SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        // Legacy KG FTS only ever appended postings. Rebuild from KG_NODES so
+        // both orphan postings and obsolete label/summary tokens disappear.
+        let nodes_to_index = {
+            let nodes = self.txn.open_table(KG_NODES)?;
+            let mut indexed = Vec::new();
+            for entry in nodes.iter()? {
+                let (node_id, node_bytes) = entry?;
+                let node: KgNode = serde_json::from_slice(node_bytes.value()).map_err(|e| {
+                    PristineError::Serialization {
+                        message: e.to_string(),
+                    }
+                })?;
+                let tokens: std::collections::HashSet<String> =
+                    tokenize_for_fts(&kg_node_fts_text(&node))
+                        .into_iter()
+                        .collect();
+                indexed.push((node_id.value().to_string(), tokens));
+            }
+            indexed
+        };
+
+        let forward_keys = {
+            let fts = self.txn.open_multimap_table(KG_FTS)?;
+            let mut keys = Vec::new();
+            for entry in fts.iter()? {
+                keys.push(entry?.0.value().to_string());
+            }
+            keys
+        };
+        {
+            let mut fts = self.txn.open_multimap_table(KG_FTS)?;
+            for token in forward_keys {
+                fts.remove_all(token.as_str())?;
+            }
+        }
+
+        let reverse_keys = {
+            let reverse = self.txn.open_multimap_table(KG_FTS_BY_NODE)?;
+            let mut keys = Vec::new();
+            for entry in reverse.iter()? {
+                keys.push(entry?.0.value().to_string());
+            }
+            keys
+        };
+        {
+            let mut reverse = self.txn.open_multimap_table(KG_FTS_BY_NODE)?;
+            for node_id in reverse_keys {
+                reverse.remove_all(node_id.as_str())?;
+            }
+        }
+
+        {
+            let mut fts = self.txn.open_multimap_table(KG_FTS)?;
+            let mut reverse = self.txn.open_multimap_table(KG_FTS_BY_NODE)?;
+            for (node_id, tokens) in nodes_to_index {
+                for token in tokens {
+                    fts.insert(token.as_str(), node_id.as_str())?;
+                    reverse.insert(node_id.as_str(), token.as_str())?;
+                }
+            }
+        }
+        {
+            let mut metadata = self.txn.open_table(KG_INDEX_META)?;
+            metadata.insert(KG_FTS_REVERSE_SCHEMA_KEY, KG_FTS_REVERSE_SCHEMA_VERSION)?;
+        }
+
+        Ok(())
+    }
+
+    fn remove_kg_fts_entries(&mut self, node_id: &str) -> PristineResult<()> {
+        self.ensure_kg_fts_schema()?;
+
+        let tokens = {
+            let mut reverse = self.txn.open_multimap_table(KG_FTS_BY_NODE)?;
+            let removed = reverse.remove_all(node_id)?;
+            let mut tokens = Vec::new();
+            for token in removed {
+                tokens.push(token?.value().to_string());
+            }
+            tokens
+        };
+
+        let mut fts = self.txn.open_multimap_table(KG_FTS)?;
+        for token in tokens {
+            fts.remove(token.as_str(), node_id)?;
+        }
+        Ok(())
+    }
+
+    fn add_kg_fts_entries(&mut self, node_id: &str, text: &str) -> PristineResult<()> {
+        self.ensure_kg_fts_schema()?;
+        let tokens: std::collections::HashSet<String> =
+            tokenize_for_fts(text).into_iter().collect();
+
+        {
+            let mut fts = self.txn.open_multimap_table(KG_FTS)?;
+            for token in &tokens {
+                fts.insert(token.as_str(), node_id)?;
+            }
+        }
+        {
+            let mut reverse = self.txn.open_multimap_table(KG_FTS_BY_NODE)?;
+            for token in &tokens {
+                reverse.insert(node_id, token.as_str())?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<'a> KgTxnT for WriteTxn<'a> {
     fn get_kg_node(&self, id: &str) -> PristineResult<Option<KgNode>> {
         let table = match self.txn.open_table(KG_NODES) {
@@ -199,6 +343,10 @@ impl<'a> KgTxnT for WriteTxn<'a> {
 
 impl<'a> KgMutTxnT for WriteTxn<'a> {
     fn upsert_kg_node(&mut self, node: &KgNode) -> PristineResult<()> {
+        // Replacement semantics are important: old ID/label/summary tokens
+        // must disappear before the same node ID is re-indexed.
+        self.remove_kg_fts_entries(&node.id)?;
+
         let mut table = self.txn.open_table(KG_NODES)?;
         let bytes = serde_json::to_vec(node).map_err(|e| PristineError::Serialization {
             message: e.to_string(),
@@ -206,21 +354,7 @@ impl<'a> KgMutTxnT for WriteTxn<'a> {
         table.insert(node.id.as_str(), bytes.as_slice())?;
         drop(table);
 
-        // Update FTS index: add new tokens (duplicates are harmless
-        // in a multimap — the node_id appears multiple times but deduplication
-        // happens at query time via HashMap).
-        let mut fts_table = self.txn.open_multimap_table(KG_FTS)?;
-        let mut text = String::with_capacity(node.id.len() + node.label.len() + 64);
-        text.push_str(&node.id);
-        text.push(' ');
-        text.push_str(&node.label);
-        if let Some(ref summary) = node.summary {
-            text.push(' ');
-            text.push_str(summary);
-        }
-        for token in tokenize_for_fts(&text) {
-            fts_table.insert(token.as_str(), node.id.as_str())?;
-        }
+        self.add_kg_fts_entries(&node.id, &kg_node_fts_text(node))?;
 
         Ok(())
     }
@@ -250,16 +384,16 @@ impl<'a> KgMutTxnT for WriteTxn<'a> {
         // First delete all edges for this node
         self.del_kg_edges_for_node(id)?;
 
+        // Remove indexed ID/label/summary tokens before the node ID can be
+        // reused. Otherwise old metadata can reappear in search results.
+        self.remove_kg_fts_entries(id)?;
+
         // Delete the node
         let mut table = match self.txn.open_table(KG_NODES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
             Err(e) => return Err(PristineError::from(e)),
         };
-
-        // Note: orphan FTS entries are harmless — get_kg_node returns None for
-        // deleted nodes so they're filtered out at query time. A full reindex
-        // cleans them up.
 
         let result = table.remove(id)?.is_some();
         drop(table);
@@ -310,7 +444,7 @@ impl<'a> KgMutTxnT for WriteTxn<'a> {
         self.txn.open_table(KG_EDGES)?;
         self.txn.open_multimap_table(KG_EDGES_FROM)?;
         self.txn.open_multimap_table(KG_EDGES_TO)?;
-        self.txn.open_multimap_table(KG_FTS)?;
+        self.ensure_kg_fts_schema()?;
         Ok(())
     }
 }
@@ -449,6 +583,83 @@ mod tests {
         let results = txn.kg_fts_search("logging", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "change:def");
+
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn test_kg_upsert_replaces_fts_tokens() {
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("db")).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+        txn.init_kg().unwrap();
+
+        let old = KgNode::new("memory:build", "memory", "Build", "vault")
+            .with_summary("obsoletecapybara summary");
+        txn.upsert_kg_node(&old).unwrap();
+        assert_eq!(txn.kg_fts_match_ids("obsoletecapybara").unwrap().len(), 1);
+
+        let updated = KgNode::new("memory:build", "memory", "Build", "vault")
+            .with_summary("currentwombat summary");
+        txn.upsert_kg_node(&updated).unwrap();
+
+        assert!(txn.kg_fts_match_ids("obsoletecapybara").unwrap().is_empty());
+        assert_eq!(txn.kg_fts_match_ids("currentwombat").unwrap().len(), 1);
+
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn test_kg_delete_prevents_stale_tokens_reappearing_when_id_is_reused() {
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("db")).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+        txn.init_kg().unwrap();
+
+        let node = KgNode::new("memory:reused", "memory", "Original", "vault")
+            .with_summary("ghostplatypus");
+        txn.upsert_kg_node(&node).unwrap();
+        assert!(txn.del_kg_node(&node.id).unwrap());
+
+        let replacement = KgNode::new("memory:reused", "memory", "Replacement", "vault");
+        txn.upsert_kg_node(&replacement).unwrap();
+        assert!(txn.kg_fts_match_ids("ghostplatypus").unwrap().is_empty());
+
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn test_kg_init_rebuilds_current_entries_and_prunes_stale_postings() {
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("db")).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+
+        // Simulate an index written before replacement-safe indexing existed,
+        // including obsolete metadata and a deleted node's orphan posting.
+        {
+            let node = KgNode::new("memory:legacy", "memory", "Legacy", "vault")
+                .with_summary("legacyechidna");
+            let bytes = serde_json::to_vec(&node).unwrap();
+            let mut nodes = txn.txn.open_table(KG_NODES).unwrap();
+            nodes.insert(node.id.as_str(), bytes.as_slice()).unwrap();
+
+            let mut legacy_fts = txn.txn.open_multimap_table(KG_FTS).unwrap();
+            legacy_fts.insert("legacyechidna", "memory:legacy").unwrap();
+            legacy_fts
+                .insert("obsoletecapybara", "memory:legacy")
+                .unwrap();
+            legacy_fts
+                .insert("orphanpangolin", "memory:deleted")
+                .unwrap();
+        }
+
+        txn.init_kg().unwrap();
+        assert_eq!(txn.kg_fts_match_ids("legacyechidna").unwrap().len(), 1);
+        assert!(txn.kg_fts_match_ids("obsoletecapybara").unwrap().is_empty());
+        assert!(txn.kg_fts_match_ids("orphanpangolin").unwrap().is_empty());
+
+        assert!(txn.del_kg_node("memory:legacy").unwrap());
+        assert!(txn.kg_fts_match_ids("legacyechidna").unwrap().is_empty());
 
         txn.commit().unwrap();
     }
