@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use clap::{Parser, Subcommand};
 
 use atomic_core::pristine::vault::{KgEdge, KgNode};
+use atomic_core::types::{Base32, Hash};
 use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
@@ -136,15 +137,17 @@ pub enum QueryCommands {
     /// ```
     Embed(QueryEmbed),
 
-    /// Rebuild the KG from VCS data (changes, files, views).
+    /// Enrich the KG from VCS data (changes, files, views).
     ///
     /// VCS data is enriched into the KG automatically after each record.
-    /// Use this command to do a full rebuild.
+    /// Pass `--change` to materialize exact recorded changes, or omit it to do
+    /// a full rebuild.
     ///
     /// # Examples
     ///
     /// ```text
     /// atomic vault query enrich
+    /// atomic vault query enrich --change <full-change-hash>
     /// ```
     Enrich(QueryEnrich),
 
@@ -1466,14 +1469,127 @@ impl Command for QueryIndex {
     }
 }
 
-/// Rebuild the KG from VCS data (changes, files, views, dependencies).
+/// Enrich the KG from VCS data (changes, files, views, dependencies).
 #[derive(Parser, Debug)]
-pub struct QueryEnrich;
+pub struct QueryEnrich {
+    /// Enrich only this exact recorded change. Repeat for multiple changes.
+    /// Without this option, all VCS-derived KG data is rebuilt.
+    #[arg(long = "change", value_name = "FULL_HASH")]
+    pub changes: Vec<String>,
+}
+
+fn parse_change_hash(value: &str) -> CliResult<Hash> {
+    Hash::from_base32(value.as_bytes()).ok_or_else(|| CliError::InvalidArgument {
+        message: format!("invalid full change hash '{value}'; expected a 52-character base32 hash"),
+    })
+}
+
+#[cfg(test)]
+mod enrich_tests {
+    use super::*;
+    use atomic_core::change::ChangeHeader;
+    use atomic_repository::record::RecordOptions;
+    use std::path::PathBuf;
+
+    struct DirGuard {
+        original: PathBuf,
+    }
+
+    impl DirGuard {
+        fn new() -> Self {
+            Self {
+                original: std::env::current_dir().unwrap(),
+            }
+        }
+    }
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    #[test]
+    fn parses_repeated_targeted_change_flags() {
+        let first = "A".repeat(52);
+        let second = "B".repeat(52);
+        let parsed = QueryEnrich::try_parse_from([
+            "enrich",
+            "--change",
+            first.as_str(),
+            "--change",
+            second.as_str(),
+        ])
+        .unwrap();
+
+        assert_eq!(parsed.changes, vec![first, second]);
+    }
+
+    #[test]
+    fn rejects_change_prefix_for_targeted_enrichment() {
+        let error = parse_change_hash("ABC123").unwrap_err();
+        assert!(matches!(error, CliError::InvalidArgument { .. }));
+        assert!(error.to_string().contains("expected a 52-character"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn targeted_enrichment_materializes_a_change_recorded_without_kg_work() {
+        let _guard = DirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        repo.init_kg().unwrap();
+
+        std::fs::write(temp.path().join("lesson.txt"), "durable fact\n").unwrap();
+        repo.add("lesson.txt", Default::default()).unwrap();
+        let outcome = repo
+            .record(
+                ChangeHeader::builder()
+                    .message("Agent-authored change")
+                    .build(),
+                RecordOptions::new().enrich_kg(false),
+            )
+            .unwrap();
+        let full_hash = outcome.hash().to_base32();
+        let node_id = format!("change:{}", &full_hash[..12]);
+        assert!(repo.vault_kg_node(&node_id).unwrap().is_none());
+        drop(repo);
+
+        std::env::set_current_dir(temp.path()).unwrap();
+        QueryEnrich {
+            changes: vec![full_hash],
+        }
+        .run()
+        .unwrap();
+
+        let repo = Repository::open(temp.path()).unwrap();
+        assert!(repo.vault_kg_node(&node_id).unwrap().is_some());
+    }
+}
 
 impl Command for QueryEnrich {
     fn run(&self) -> CliResult<()> {
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
+
+        // Agent stop hooks intentionally record with KG enrichment disabled to
+        // keep their latency low. Consumers that need immediate RDF lineage can
+        // enrich only the exact changes they are about to reference instead of
+        // scanning every view, file, module, change, and source entity.
+        if !self.changes.is_empty() {
+            let hashes = self
+                .changes
+                .iter()
+                .map(|value| parse_change_hash(value))
+                .collect::<CliResult<Vec<_>>>()?;
+
+            for hash in &hashes {
+                repo.kg_enrich_change(hash).map_err(CliError::Repository)?;
+            }
+
+            println!("Enriched {} change(s).", hashes.len());
+            return Ok(());
+        }
 
         let mut total = atomic_repository::KgEnrichStats::default();
 
