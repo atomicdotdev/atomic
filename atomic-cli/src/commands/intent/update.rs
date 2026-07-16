@@ -40,6 +40,11 @@ pub struct IntentUpdate {
     #[arg(long)]
     pub title: Option<String>,
 
+    /// Rejection reason. Persisted as `rejection_reason` + `rejected_at`
+    /// (normally passed alongside `--status rejected`).
+    #[arg(long)]
+    pub reason: Option<String>,
+
     /// New Markdown body content, provided inline.
     #[arg(long, conflicts_with = "body_stdin")]
     pub body: Option<String>,
@@ -80,12 +85,13 @@ impl Command for IntentUpdate {
             && self.assignee.is_none()
             && self.priority.is_none()
             && self.title.is_none()
+            && self.reason.is_none()
             && content.is_none()
         {
             return Err(CliError::InvalidArgument {
                 message: "Nothing to update. Provide at least one of \
-                    --status, --assignee, --priority, --title, --body, \
-                    or --body-stdin."
+                    --status, --assignee, --priority, --title, --reason, \
+                    --body, or --body-stdin."
                     .to_string(),
             });
         }
@@ -100,6 +106,7 @@ impl Command for IntentUpdate {
                     priority: self.priority.clone(),
                     title: self.title.clone(),
                     content,
+                    reason: self.reason.clone(),
                     force: self.force,
                 },
             )

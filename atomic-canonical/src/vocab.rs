@@ -38,7 +38,9 @@ impl NodeType {
 }
 
 /// Intent status value set (mirrors the doc's `IntentShape` `sh:in`).
-pub const INTENT_STATUS: &[&str] = &["backlog", "todo", "in_progress", "done"];
+/// `rejected` is a terminal state (an intent that was reviewed and turned down).
+pub const INTENT_STATUS: &[&str] =
+    &["backlog", "todo", "in_progress", "done", "rejected"];
 
 /// Acceptance-criterion status value set.
 pub const AC_STATUS: &[&str] = &["open", "met"];

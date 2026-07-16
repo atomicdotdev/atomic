@@ -482,6 +482,7 @@ impl Command for IntentUpdate {
                     priority: self.priority.clone(),
                     title: self.title.clone(),
                     content,
+                    reason: None,
                     force: self.force,
                 },
             )
