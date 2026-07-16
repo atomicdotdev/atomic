@@ -73,6 +73,8 @@ pub struct IntentUpdateOptions {
     pub priority: Option<String>,
     /// New title.
     pub title: Option<String>,
+    /// Replace the source-memory RDF ids that informed this Intent.
+    pub informed_by: Option<Vec<String>>,
     /// New Markdown body content. When `None`, the existing body is kept.
     pub content: Option<String>,
     /// Icebox reason. When set, persists `icebox_reason` and stamps
@@ -516,6 +518,20 @@ impl Repository {
             fm.insert(
                 "iceboxed_at".to_string(),
                 serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+            );
+        }
+        if let Some(ref sources) = options.informed_by {
+            let mut unique = Vec::new();
+            for source in sources.iter().map(|source| source.trim()) {
+                if !source.is_empty() && !unique.iter().any(|existing| existing == source) {
+                    unique.push(source.to_string());
+                }
+            }
+            fm.insert(
+                "informedBy".to_string(),
+                serde_json::Value::Array(
+                    unique.into_iter().map(serde_json::Value::String).collect(),
+                ),
             );
         }
         let new_fm = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
@@ -979,6 +995,58 @@ mod tests {
         // Manifest should reflect update
         let manifest = repo.vault_manifest().unwrap();
         assert_eq!(manifest.intents[&result.id].status, "in-progress");
+    }
+
+    #[test]
+    fn test_intent_update_preserves_reason_and_lineage_metadata() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let result = repo
+            .vault_intent_create(create_opts("Use prior project knowledge"))
+            .unwrap();
+
+        repo.vault_intent_update(
+            &result.id,
+            IntentUpdateOptions {
+                status: Some("icebox".to_string()),
+                reason: Some("Waiting for the upstream API".to_string()),
+                informed_by: Some(vec![
+                    "memory:auth-decision".to_string(),
+                    "urn:atomic:memory:retry-policy".to_string(),
+                    "memory:auth-decision".to_string(),
+                ]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let entry = repo.vault_intent_show(&result.id).unwrap();
+        let fm: serde_json::Value = serde_json::from_str(&entry.frontmatter_json).unwrap();
+        assert_eq!(fm["icebox_reason"], "Waiting for the upstream API");
+        assert!(fm["iceboxed_at"].is_string());
+        assert_eq!(
+            fm["informedBy"],
+            serde_json::json!(["memory:auth-decision", "urn:atomic:memory:retry-policy"])
+        );
+
+        let (_, edges) = repo.vault_extract_kg(&result.intent_file, &entry).unwrap();
+        assert!(edges.iter().any(|edge| {
+            edge.kind == atomic_core::pristine::ontology::predicate::INFORMED_BY
+                && edge.to_id == "memory:auth-decision"
+        }));
+        let retry_policy = edges
+            .iter()
+            .find(|edge| {
+                edge.kind == atomic_core::pristine::ontology::predicate::INFORMED_BY
+                    && edge.to_id == "memory:retry-policy"
+            })
+            .expect("missing retry-policy lineage edge");
+        let metadata = retry_policy.metadata.as_ref().unwrap();
+        assert_eq!(metadata["rdf_target"], "urn:atomic:memory:retry-policy");
+        assert_eq!(
+            metadata["derived_from_vault_path"],
+            result.intent_file.as_str()
+        );
     }
 
     #[test]
