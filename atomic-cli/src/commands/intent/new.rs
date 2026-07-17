@@ -29,11 +29,11 @@ const FEATURE_SCAFFOLD: &str = "\
      content is never graded — but it must be present. Replace this stub. -->
 :::
 
-:::acceptance-criterion{#{id}-ac-1 status=open}
+:::acceptance-criterion{#{id}-ac-1 status=unmet}
 <!-- A single, checkable outcome that means this intent is done. -->
 :::
 
-:::task{#{id}-1 status=open criteria={id}-ac-1}
+:::task{#{id}-1 status=unmet criteria={id}-ac-1}
 <!-- A concrete work item toward the criterion above. Name the file(s) it
      touches with one or more ::file-ref leaves. -->
 ::file-ref{path=path/to/file}

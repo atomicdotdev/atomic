@@ -1,5 +1,6 @@
-//! `atomic memory new --kind <k> [--about m1,m2]` — scaffold a directive-based
-//! memory into the vault.
+//! `atomic memory new --kind <k> [--about m1,m2] [--derived-from id1,id2]` —
+//! scaffold a directive-based memory into the vault, or write supplied text
+//! directly for non-interactive workflows.
 //!
 //! Unlike `atomic intent new` (which delegates to `vault_intent_create`), there
 //! is NO dedicated repository create method for memories. This writes directly
@@ -45,6 +46,16 @@ pub struct MemoryNew {
     #[arg(long, value_delimiter = ',')]
     pub about: Vec<String>,
 
+    /// Intent, change, or source-memory RDF ids this learning was derived from
+    /// (comma-separated, optional).
+    #[arg(long, value_delimiter = ',')]
+    pub derived_from: Vec<String>,
+
+    /// Durable memory text for a non-interactive workflow. When omitted, write
+    /// the editable `:::memory` scaffold.
+    #[arg(long)]
+    pub text: Option<String>,
+
     /// Explicit memory id (the filename stem). Defaults to a freshly generated
     /// lowercased ULID.
     #[arg(long)]
@@ -78,6 +89,15 @@ impl Command for MemoryNew {
                 ),
             });
         }
+        if self
+            .text
+            .as_ref()
+            .is_some_and(|text| text.trim().is_empty())
+        {
+            return Err(CliError::InvalidArgument {
+                message: "memory text cannot be empty".to_string(),
+            });
+        }
 
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
@@ -104,8 +124,26 @@ impl Command for MemoryNew {
                 Value::Array(self.about.iter().cloned().map(Value::String).collect()),
             );
         }
+        if !self.derived_from.is_empty() {
+            spine.insert(
+                "derivedFrom".into(),
+                Value::Array(
+                    self.derived_from
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+        }
         let frontmatter_json =
             serde_json::to_string(&spine).expect("frontmatter spine serialization is infallible");
+
+        let body = self
+            .text
+            .as_deref()
+            .map(|text| format!("{}\n", text.trim()))
+            .unwrap_or_else(|| MEMORY_SCAFFOLD.to_string());
 
         // Store the body WITHOUT a frontmatter block; the spine goes through the
         // frontmatter_json arg. Enters redb + manifest.memory + merkle exactly
@@ -113,7 +151,7 @@ impl Command for MemoryNew {
         repo.vault_store(
             &vault_path,
             VaultEntryType::Memory,
-            MEMORY_SCAFFOLD.as_bytes().to_vec(),
+            body.into_bytes(),
             frontmatter_json,
         )
         .map_err(CliError::Repository)?;
@@ -123,8 +161,13 @@ impl Command for MemoryNew {
         println!("Created memory: {id}");
         println!("  file: .vault/{vault_path}");
         println!("  kind: {}", self.kind);
+        if !self.derived_from.is_empty() {
+            println!("  derived from: {} source(s)", self.derived_from.len());
+        }
         println!();
-        println!("Edit the :::memory stub, then:");
+        if self.text.is_none() {
+            println!("Edit the :::memory stub, then:");
+        }
         println!("  atomic memory validate {id}");
         println!("  atomic memory attest {id}");
 
@@ -234,5 +277,31 @@ mod tests {
         // Materialized to disk.
         let on_disk = repo.vault_dir().join(&vault_path);
         assert!(on_disk.exists(), "materialized at {}", on_disk.display());
+    }
+
+    #[test]
+    fn test_learning_inputs_lift_as_provenance() {
+        let mut spine = Map::new();
+        spine.insert("uid".into(), Value::String("learning-run-1".into()));
+        spine.insert("memoryKind".into(), Value::String("lesson".into()));
+        spine.insert("status".into(), Value::String("active".into()));
+        spine.insert(
+            "derivedFrom".into(),
+            Value::Array(vec![
+                Value::String("urn:atomic:intent:demo-1".into()),
+                Value::String("urn:atomic:change:abc".into()),
+                Value::String("urn:atomic:memory:source-1".into()),
+            ]),
+        );
+
+        let node = lift_memory(
+            &spine,
+            "Use the health-check timeout from project memory, not a new default.\n",
+        )
+        .expect("non-interactive learning lifts");
+        assert_eq!(node.memory_kind, "lesson");
+        assert_eq!(node.derived_from.len(), 3);
+        assert_eq!(node.derived_from[0], "urn:atomic:intent:demo-1");
+        assert!(node.text.contains("health-check timeout"));
     }
 }

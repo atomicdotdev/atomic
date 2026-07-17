@@ -73,8 +73,13 @@ pub struct IntentUpdateOptions {
     pub priority: Option<String>,
     /// New title.
     pub title: Option<String>,
+    /// Replace the source-memory RDF ids that informed this Intent.
+    pub informed_by: Option<Vec<String>>,
     /// New Markdown body content. When `None`, the existing body is kept.
     pub content: Option<String>,
+    /// Icebox reason. When set, persists `icebox_reason` and stamps
+    /// `iceboxed_at` (normally accompanies `status = icebox`).
+    pub reason: Option<String>,
     /// Allow rewriting the body after the intent has started or been linked.
     pub force: bool,
 }
@@ -319,6 +324,16 @@ impl Repository {
             })
     }
 
+    /// Resolve an Intent display ID to its current Vault path.
+    ///
+    /// This exposes the same legacy-manifest fallback used by `intent show` so
+    /// read-only consumers do not need to assume `IntentSummary.vault_path` is
+    /// populated.
+    pub fn vault_intent_path(&self, intent_id: &str) -> Result<Option<String>, RepositoryError> {
+        let full_id = self.normalize_intent_id(intent_id)?;
+        self.find_intent_path(&full_id)
+    }
+
     /// Delete an unstarted backlog intent.
     ///
     /// This is intentionally conservative: only backlog intents with no linked
@@ -495,6 +510,30 @@ impl Repository {
                 serde_json::Value::String(title.clone()),
             );
         }
+        if let Some(ref reason) = options.reason {
+            fm.insert(
+                "icebox_reason".to_string(),
+                serde_json::Value::String(reason.clone()),
+            );
+            fm.insert(
+                "iceboxed_at".to_string(),
+                serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+            );
+        }
+        if let Some(ref sources) = options.informed_by {
+            let mut unique = Vec::new();
+            for source in sources.iter().map(|source| source.trim()) {
+                if !source.is_empty() && !unique.iter().any(|existing| existing == source) {
+                    unique.push(source.to_string());
+                }
+            }
+            fm.insert(
+                "informedBy".to_string(),
+                serde_json::Value::Array(
+                    unique.into_iter().map(serde_json::Value::String).collect(),
+                ),
+            );
+        }
         let new_fm = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
 
         let new_content = match options.content {
@@ -598,12 +637,16 @@ impl Repository {
         let goals = fm
             .entry("goals".to_string())
             .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-        if let serde_json::Value::Array(ref mut arr) = goals {
-            let goal_val = serde_json::Value::String(goal_name.to_string());
-            if !arr.contains(&goal_val) {
-                arr.push(goal_val);
-            }
+        let goals = goals
+            .as_array_mut()
+            .ok_or_else(|| RepositoryError::InvalidOperation {
+                message: format!("Intent '{}' has a non-array goals field", full_id),
+            })?;
+        let goal_val = serde_json::Value::String(goal_name.to_string());
+        if !goals.contains(&goal_val) {
+            goals.push(goal_val);
         }
+        let goal_count = goals.len() as u32;
         let new_fm = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
 
         self.vault_store(&intent_file, VaultEntryType::Intent, content_bytes, new_fm)?;
@@ -618,7 +661,10 @@ impl Repository {
                 .get_vault_manifest()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             if let Some(summary) = manifest.intents.get_mut(&full_id) {
-                summary.goals = summary.goals.saturating_add(1);
+                summary.goals = goal_count;
+            }
+            if let Some(goal) = manifest.goals.get_mut(goal_name) {
+                goal.intent = Some(full_id.clone());
             }
             txn.put_vault_manifest(&manifest)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -949,6 +995,58 @@ mod tests {
         // Manifest should reflect update
         let manifest = repo.vault_manifest().unwrap();
         assert_eq!(manifest.intents[&result.id].status, "in-progress");
+    }
+
+    #[test]
+    fn test_intent_update_preserves_reason_and_lineage_metadata() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let result = repo
+            .vault_intent_create(create_opts("Use prior project knowledge"))
+            .unwrap();
+
+        repo.vault_intent_update(
+            &result.id,
+            IntentUpdateOptions {
+                status: Some("icebox".to_string()),
+                reason: Some("Waiting for the upstream API".to_string()),
+                informed_by: Some(vec![
+                    "memory:auth-decision".to_string(),
+                    "urn:atomic:memory:retry-policy".to_string(),
+                    "memory:auth-decision".to_string(),
+                ]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let entry = repo.vault_intent_show(&result.id).unwrap();
+        let fm: serde_json::Value = serde_json::from_str(&entry.frontmatter_json).unwrap();
+        assert_eq!(fm["icebox_reason"], "Waiting for the upstream API");
+        assert!(fm["iceboxed_at"].is_string());
+        assert_eq!(
+            fm["informedBy"],
+            serde_json::json!(["memory:auth-decision", "urn:atomic:memory:retry-policy"])
+        );
+
+        let (_, edges) = repo.vault_extract_kg(&result.intent_file, &entry).unwrap();
+        assert!(edges.iter().any(|edge| {
+            edge.kind == atomic_core::pristine::ontology::predicate::INFORMED_BY
+                && edge.to_id == "memory:auth-decision"
+        }));
+        let retry_policy = edges
+            .iter()
+            .find(|edge| {
+                edge.kind == atomic_core::pristine::ontology::predicate::INFORMED_BY
+                    && edge.to_id == "memory:retry-policy"
+            })
+            .expect("missing retry-policy lineage edge");
+        let metadata = retry_policy.metadata.as_ref().unwrap();
+        assert_eq!(metadata["rdf_target"], "urn:atomic:memory:retry-policy");
+        assert_eq!(
+            metadata["derived_from_vault_path"],
+            result.intent_file.as_str()
+        );
     }
 
     #[test]
@@ -1360,6 +1458,32 @@ The authentication module has no rate limiting.
     }
 
     #[test]
+    fn test_vault_intent_path_resolves_legacy_manifest_entry() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let intent = repo
+            .vault_intent_create(create_opts("Legacy path lookup"))
+            .unwrap();
+
+        // Simulate a manifest created before IntentSummary.vault_path existed.
+        let mut txn = repo.pristine.write_txn().unwrap();
+        let mut manifest = txn.get_vault_manifest().unwrap();
+        manifest
+            .intents
+            .get_mut(&intent.id)
+            .unwrap()
+            .vault_path
+            .clear();
+        txn.put_vault_manifest(&manifest).unwrap();
+        txn.commit().unwrap();
+
+        assert_eq!(
+            repo.vault_intent_path(&intent.id).unwrap(),
+            Some(intent.intent_file)
+        );
+    }
+
+    #[test]
     fn test_intent_create_without_vault() {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
@@ -1417,9 +1541,9 @@ The authentication module has no rate limiting.
         let goals = fm.get("goals").unwrap().as_array().unwrap();
         assert_eq!(goals.len(), 1);
 
-        // But manifest counter increments each time
+        // The manifest count follows unique links as well.
         let manifest = repo.vault_manifest().unwrap();
-        assert_eq!(manifest.intents[&intent.id].goals, 2);
+        assert_eq!(manifest.intents[&intent.id].goals, 1);
     }
 
     #[test]

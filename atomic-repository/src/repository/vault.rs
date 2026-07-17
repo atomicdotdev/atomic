@@ -168,7 +168,30 @@ impl Repository {
             .pristine
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        use atomic_core::pristine::{VaultMutTxnT, VaultTxnT};
+        use atomic_core::pristine::{KgMutTxnT, VaultMutTxnT, VaultTxnT};
+
+        let previous_entry = txn
+            .get_vault_entry(path)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let cascade_updates = match previous_entry.as_ref() {
+            Some(previous) if previous.entry_type != entry_type => {
+                unlink_goal_from_intent_entries(&mut txn, path, previous, &now)?
+            }
+            _ => Vec::new(),
+        };
+        if let Some(previous_entry_type) = previous_entry
+            .as_ref()
+            .map(|previous| previous.entry_type)
+            .filter(|previous| *previous != entry_type)
+        {
+            txn.init_kg()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            txn.del_kg_node(&super::vault_triples::entry_subject(
+                path,
+                previous_entry_type,
+            ))
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
 
         txn.put_vault_entry(path, &entry)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -177,7 +200,8 @@ impl Repository {
         let mut manifest = txn
             .get_vault_manifest()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        update_manifest_for_store(&mut manifest, path, &entry, &now);
+        update_manifest_for_store(&mut manifest, path, &entry, previous_entry.as_ref(), &now);
+        apply_cascaded_intent_manifest_updates(&mut manifest, &cascade_updates, &now);
         txn.put_vault_manifest(&manifest)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
@@ -185,6 +209,16 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         self.vault_auto_index(path);
+        for update in cascade_updates {
+            self.vault_auto_index(&update.path);
+            if let Err(error) = self.vault_materialize(&update.path) {
+                log::warn!(
+                    "Failed to materialize Intent '{}' after Goal unlink: {}",
+                    update.path,
+                    error
+                );
+            }
+        }
 
         Ok(content_hash)
     }
@@ -200,21 +234,45 @@ impl Repository {
         entry: &VaultEntry,
     ) -> Result<Hash, RepositoryError> {
         let content_hash = Hash::from_bytes(entry.content_hash);
+        let now = chrono::Utc::now().to_rfc3339();
 
         let mut txn = self
             .pristine
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        use atomic_core::pristine::{VaultMutTxnT, VaultTxnT};
+        use atomic_core::pristine::{KgMutTxnT, VaultMutTxnT, VaultTxnT};
+
+        let previous_entry = txn
+            .get_vault_entry(path)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let cascade_updates = match previous_entry.as_ref() {
+            Some(previous) if previous.entry_type != entry.entry_type => {
+                unlink_goal_from_intent_entries(&mut txn, path, previous, &now)?
+            }
+            _ => Vec::new(),
+        };
+        if let Some(previous_entry_type) = previous_entry
+            .as_ref()
+            .map(|previous| previous.entry_type)
+            .filter(|previous| *previous != entry.entry_type)
+        {
+            txn.init_kg()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            txn.del_kg_node(&super::vault_triples::entry_subject(
+                path,
+                previous_entry_type,
+            ))
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
 
         txn.put_vault_entry(path, entry)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let now = chrono::Utc::now().to_rfc3339();
         let mut manifest = txn
             .get_vault_manifest()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        update_manifest_for_store(&mut manifest, path, entry, &now);
+        update_manifest_for_store(&mut manifest, path, entry, previous_entry.as_ref(), &now);
+        apply_cascaded_intent_manifest_updates(&mut manifest, &cascade_updates, &now);
         txn.put_vault_manifest(&manifest)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
@@ -222,6 +280,16 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         self.vault_auto_index(path);
+        for update in cascade_updates {
+            self.vault_auto_index(&update.path);
+            if let Err(error) = self.vault_materialize(&update.path) {
+                log::warn!(
+                    "Failed to materialize Intent '{}' after Goal unlink: {}",
+                    update.path,
+                    error
+                );
+            }
+        }
 
         Ok(content_hash)
     }
@@ -302,24 +370,59 @@ impl Repository {
             .pristine
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        use atomic_core::pristine::{VaultMutTxnT, VaultTxnT};
+        use atomic_core::pristine::{EmbeddingsMutTxnT, KgMutTxnT, VaultMutTxnT, VaultTxnT};
+
+        let previous_entry = txn
+            .get_vault_entry(path)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let cascade_updates = if let Some(previous_entry) = previous_entry.as_ref() {
+            unlink_goal_from_intent_entries(&mut txn, path, previous_entry, &now)?
+        } else {
+            Vec::new()
+        };
+        let entry_type = previous_entry
+            .as_ref()
+            .map(|entry| entry.entry_type)
+            .unwrap_or_else(|| infer_entry_type(path));
+
+        txn.init_kg()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let existed = txn
             .del_vault_entry(path)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        // KG and embeddings are derived from the Vault entry. Clean both even
+        // if the source entry is already missing so a retry repairs stale data.
+        let node_id = super::vault_triples::entry_subject(path, entry_type);
+        txn.del_kg_node(&node_id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.del_embeddings(path)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
         if existed {
-            let now = chrono::Utc::now().to_rfc3339();
             let mut manifest = txn
                 .get_vault_manifest()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            update_manifest_for_delete(&mut manifest, path, &now);
+            update_manifest_for_delete(&mut manifest, path, previous_entry.as_ref(), &now);
+            apply_cascaded_intent_manifest_updates(&mut manifest, &cascade_updates, &now);
             txn.put_vault_manifest(&manifest)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
         }
 
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        for update in cascade_updates {
+            self.vault_auto_index(&update.path);
+            if let Err(error) = self.vault_materialize(&update.path) {
+                log::warn!(
+                    "Failed to materialize Intent '{}' after Goal deletion: {}",
+                    update.path,
+                    error
+                );
+            }
+        }
         Ok(existed)
     }
 
@@ -441,7 +544,7 @@ impl Repository {
     ///
     /// Files are identified as changed if:
     /// - They don't exist in redb (new file)
-    /// - Their content hash differs from the stored entry
+    /// - Their body hash or user frontmatter differs from the stored entry
     ///
     /// Ignores non-`.md` files and `_manifest.json`.
     pub fn vault_scan_working_copy(&self) -> Result<Vec<VaultFileChange>, RepositoryError> {
@@ -491,14 +594,19 @@ impl Repository {
             // Parse into frontmatter + body
             let (frontmatter_json, body) = parse_markdown_frontmatter(&file_content);
 
-            // Compute hash of the body (not frontmatter)
+            // Body hashes remain useful for content/embedding caches, but
+            // frontmatter is also knowledge: status, labels, identity, and
+            // descriptions affect retrieval and KG extraction.
             let body_bytes = body.as_bytes();
             let new_hash = Hash::of(body_bytes);
 
             // Check if this is new or changed
             let existing = self.vault_retrieve(&rel_path_str)?;
             let change_type = match &existing {
-                Some(entry) if Hash::from_bytes(entry.content_hash) == new_hash => {
+                Some(entry)
+                    if Hash::from_bytes(entry.content_hash) == new_hash
+                        && frontmatter_json_equal(&entry.frontmatter_json, &frontmatter_json) =>
+                {
                     continue; // Unchanged, skip
                 }
                 Some(_) => VaultChangeType::Modified,
@@ -576,17 +684,153 @@ impl Repository {
 
 // ── Manifest helpers ────────────────────────────────────────────────────
 
+struct CascadedIntentUpdate {
+    path: String,
+    previous_entry: VaultEntry,
+    current_entry: VaultEntry,
+    intent_id: Option<String>,
+    goal_count: u32,
+}
+
+/// Remove a Goal reference from every current Intent source before that Goal
+/// is deleted or reclassified. The Vault entries are updated in the caller's
+/// transaction; KG re-indexing and materialization happen after commit.
+fn unlink_goal_from_intent_entries(
+    txn: &mut atomic_core::pristine::WriteTxn<'_>,
+    path: &str,
+    entry: &VaultEntry,
+    now: &str,
+) -> Result<Vec<CascadedIntentUpdate>, RepositoryError> {
+    use atomic_core::pristine::{VaultMutTxnT, VaultTxnT};
+
+    if entry.entry_type != VaultEntryType::Session {
+        return Ok(Vec::new());
+    }
+    let Some(goal_id) = vault_frontmatter_string(entry, "goal_id").or_else(|| {
+        path.strip_prefix("goals/")
+            .and_then(|rest| rest.strip_suffix("/_goal.md"))
+            .map(str::to_string)
+    }) else {
+        return Ok(Vec::new());
+    };
+
+    let intents = txn
+        .list_vault_entries("intents/", Some(VaultEntryType::Intent))
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    let mut updates = Vec::new();
+    for meta in intents {
+        let Some(mut current_entry) = txn
+            .get_vault_entry(&meta.path)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        else {
+            continue;
+        };
+        let previous_entry = current_entry.clone();
+        let Ok(mut frontmatter) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+            &current_entry.frontmatter_json,
+        ) else {
+            continue;
+        };
+
+        let Some(goals) = frontmatter
+            .get_mut("goals")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        let previous_len = goals.len();
+        goals.retain(|goal| goal.as_str() != Some(goal_id.as_str()));
+        if goals.len() == previous_len {
+            continue;
+        }
+        let goal_count = goals.len() as u32;
+        let intent_id = frontmatter
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        current_entry.frontmatter_json = serde_json::to_string(&frontmatter)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        current_entry.updated_at = now.to_string();
+        txn.put_vault_entry(&meta.path, &current_entry)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        updates.push(CascadedIntentUpdate {
+            path: meta.path,
+            previous_entry,
+            current_entry,
+            intent_id,
+            goal_count,
+        });
+    }
+    Ok(updates)
+}
+
+fn apply_cascaded_intent_manifest_updates(
+    manifest: &mut VaultManifest,
+    updates: &[CascadedIntentUpdate],
+    now: &str,
+) {
+    for update in updates {
+        update_manifest_for_store(
+            manifest,
+            &update.path,
+            &update.current_entry,
+            Some(&update.previous_entry),
+            now,
+        );
+        let summary_id = update
+            .intent_id
+            .as_ref()
+            .filter(|intent_id| manifest.intents.contains_key(*intent_id))
+            .cloned()
+            .or_else(|| {
+                manifest
+                    .intents
+                    .iter()
+                    .find(|(_, summary)| summary.vault_path == update.path)
+                    .map(|(intent_id, _)| intent_id.clone())
+            });
+        if let Some(summary_id) = summary_id {
+            if let Some(summary) = manifest.intents.get_mut(&summary_id) {
+                summary.goals = update.goal_count;
+            }
+        }
+    }
+}
+
+fn vault_frontmatter_string(entry: &VaultEntry, key: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&entry.frontmatter_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
 /// Update the manifest when a vault entry is stored.
 fn update_manifest_for_store(
     manifest: &mut VaultManifest,
     path: &str,
     entry: &VaultEntry,
+    previous_entry: Option<&VaultEntry>,
     now: &str,
 ) {
     let hash_str = Hash::from_bytes(entry.content_hash).to_base32();
     let bytes = entry.content_size() as u64;
 
-    // Update type-specific index
+    // A path may change entry type. Remove the old classification and any
+    // higher-level Goal/Intent summary before inserting the new one so the
+    // manifest represents one current entry.
+    if let Some(previous) =
+        previous_entry.filter(|previous| previous.entry_type != entry.entry_type)
+    {
+        remove_manifest_summary_for_entry(manifest, path, previous);
+    }
+    manifest.memory.remove(path);
+    manifest.skills.remove(path);
+
+    // Update type-specific index.
     match entry.entry_type {
         VaultEntryType::Memory => {
             manifest.memory.insert(
@@ -612,10 +856,16 @@ fn update_manifest_for_store(
         _ => {}
     }
 
-    // Recompute totals by iterating all entries would be expensive,
-    // so we do incremental updates.
-    manifest.file_count = manifest.file_count.saturating_add(1);
-    manifest.total_bytes = manifest.total_bytes.saturating_add(bytes);
+    // Maintain exact incremental totals for insert and replacement.
+    if let Some(previous) = previous_entry {
+        manifest.total_bytes = manifest
+            .total_bytes
+            .saturating_sub(previous.content_size() as u64)
+            .saturating_add(bytes);
+    } else {
+        manifest.file_count = manifest.file_count.saturating_add(1);
+        manifest.total_bytes = manifest.total_bytes.saturating_add(bytes);
+    }
 
     // Update merkle: Hash(previous_merkle || content_hash)
     let prev_merkle = if manifest.merkle.is_empty() {
@@ -631,18 +881,26 @@ fn update_manifest_for_store(
 }
 
 /// Update the manifest when a vault entry is deleted.
-fn update_manifest_for_delete(manifest: &mut VaultManifest, path: &str, now: &str) {
+fn update_manifest_for_delete(
+    manifest: &mut VaultManifest,
+    path: &str,
+    previous_entry: Option<&VaultEntry>,
+    now: &str,
+) {
     // Remove from type-specific indexes
     manifest.memory.remove(path);
     manifest.skills.remove(path);
-    manifest.goals.remove(path);
-    manifest.intents.remove(path);
+    if let Some(previous_entry) = previous_entry {
+        remove_manifest_summary_for_entry(manifest, path, previous_entry);
+    }
 
     // Decrement file count (floor at 0)
     manifest.file_count = manifest.file_count.saturating_sub(1);
-
-    // We can't easily adjust total_bytes without knowing the old entry's size,
-    // so we leave it as-is. Use vault_recompute_manifest_totals() for accuracy.
+    if let Some(previous_entry) = previous_entry {
+        manifest.total_bytes = manifest
+            .total_bytes
+            .saturating_sub(previous_entry.content_size() as u64);
+    }
     // The merkle also changes on delete.
     let prev_merkle = if manifest.merkle.is_empty() {
         Merkle::ZERO
@@ -655,6 +913,37 @@ fn update_manifest_for_delete(manifest: &mut VaultManifest, path: &str, now: &st
     manifest.merkle = new_merkle.to_base32();
 
     manifest.updated_at = now.to_string();
+}
+
+/// Remove the manifest summary owned by a Goal or Intent Vault entry.
+///
+/// Goal summaries are keyed by `goal_id`, while Intent summaries are keyed by
+/// display ID and carry their Vault path. Neither map is keyed by `path`, so a
+/// plain `remove(path)` leaves ghost summaries behind.
+fn remove_manifest_summary_for_entry(manifest: &mut VaultManifest, path: &str, entry: &VaultEntry) {
+    match entry.entry_type {
+        VaultEntryType::Session => {
+            let goal_id = vault_frontmatter_string(entry, "goal_id").or_else(|| {
+                path.strip_prefix("goals/")
+                    .and_then(|rest| rest.strip_suffix("/_goal.md"))
+                    .map(str::to_string)
+            });
+            if let Some(goal) = goal_id.and_then(|goal_id| manifest.goals.remove(&goal_id)) {
+                if let Some(intent_id) = goal.intent {
+                    if let Some(intent) = manifest.intents.get_mut(&intent_id) {
+                        intent.goals = intent.goals.saturating_sub(1);
+                    }
+                }
+            }
+        }
+        VaultEntryType::Intent => {
+            let intent_id = vault_frontmatter_string(entry, "id");
+            manifest.intents.retain(|id, summary| {
+                summary.vault_path != path && intent_id.as_deref() != Some(id.as_str())
+            });
+        }
+        _ => {}
+    }
 }
 
 // ── Materialization helpers ─────────────────────────────────────────────
@@ -733,16 +1022,24 @@ fn write_frontmatter_field(output: &mut String, key: &str, value: &serde_json::V
     use std::fmt::Write;
     match value {
         serde_json::Value::String(s) => {
-            // Use bare value for simple strings, quoted for strings with special chars.
-            // Note: bare colons are fine in YAML values (e.g. timestamps "12:00:00");
-            // only ": " (colon-space) is ambiguous as a nested key-value separator.
-            if s.contains(": ")
+            // Keep simple strings readable, but quote values that our parser
+            // would otherwise reinterpret as another scalar/container type.
+            // JSON string syntax is valid YAML and preserves escapes.
+            let parsed_unquoted = parse_yaml_value(s);
+            let has_edge_whitespace = s.chars().next().is_some_and(char::is_whitespace)
+                || s.chars().last().is_some_and(char::is_whitespace);
+            if parsed_unquoted != serde_json::Value::String(s.clone())
+                || s.contains(": ")
                 || s.contains('#')
                 || s.contains('\n')
                 || s.starts_with('{')
                 || s.starts_with('[')
+                || s.starts_with('"')
+                || s.starts_with('\'')
+                || has_edge_whitespace
             {
-                let _ = writeln!(output, "{}: \"{}\"", key, s.replace('\"', "\\\""));
+                let rendered = serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
+                let _ = writeln!(output, "{}: {}", key, rendered);
             } else {
                 let _ = writeln!(output, "{}: {}", key, s);
             }
@@ -754,14 +1051,8 @@ fn write_frontmatter_field(output: &mut String, key: &str, value: &serde_json::V
             let _ = writeln!(output, "{}: {}", key, b);
         }
         serde_json::Value::Array(arr) => {
-            let items: Vec<String> = arr
-                .iter()
-                .map(|v| match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-                .collect();
-            let _ = writeln!(output, "{}: [{}]", key, items.join(", "));
+            let rendered = serde_json::to_string(arr).unwrap_or_else(|_| "[]".to_string());
+            let _ = writeln!(output, "{}: {}", key, rendered);
         }
         serde_json::Value::Object(_) => {
             // Inline JSON for nested objects
@@ -845,6 +1136,16 @@ fn parse_markdown_frontmatter(content: &str) -> (String, String) {
     (frontmatter_json, body)
 }
 
+fn frontmatter_json_equal(left: &str, right: &str) -> bool {
+    match (
+        serde_json::from_str::<serde_json::Value>(left),
+        serde_json::from_str::<serde_json::Value>(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
 /// Convert simple YAML frontmatter to a JSON string.
 ///
 /// Handles common YAML patterns:
@@ -883,7 +1184,10 @@ fn yaml_frontmatter_to_json(yaml: &str) -> String {
 
         // Skip system fields that we inject during materialization
         // (they'll be reconstructed, not stored in frontmatter_json)
-        if key == "entry_type" || key == "content_hash" {
+        if matches!(
+            key.as_str(),
+            "entry_type" | "content_hash" | "created_at" | "updated_at"
+        ) {
             continue;
         }
 
@@ -896,13 +1200,16 @@ fn yaml_frontmatter_to_json(yaml: &str) -> String {
 
 /// Parse a YAML value string into a serde_json::Value.
 fn parse_yaml_value(s: &str) -> serde_json::Value {
-    // Remove surrounding quotes if present
-    let s =
-        if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-            &s[1..s.len() - 1]
-        } else {
-            s
-        };
+    // Quoted values remain strings even when their contents look like another
+    // scalar type. Decode JSON-style double-quoted escapes losslessly.
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        return serde_json::from_str::<String>(s)
+            .map(serde_json::Value::String)
+            .unwrap_or_else(|_| serde_json::Value::String(s[1..s.len() - 1].to_string()));
+    }
+    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        return serde_json::Value::String(s[1..s.len() - 1].replace("''", "'"));
+    }
 
     // Try as integer
     if let Ok(n) = s.parse::<i64>() {
@@ -923,7 +1230,15 @@ fn parse_yaml_value(s: &str) -> serde_json::Value {
         _ => {}
     }
 
-    // Try as array [a, b, c]
+    // Materialized arrays/objects use JSON syntax, which is also valid YAML.
+    // Parse it first so quoted commas and nested values remain lossless.
+    if (s.starts_with('[') && s.ends_with(']')) || (s.starts_with('{') && s.ends_with('}')) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(s) {
+            return value;
+        }
+    }
+
+    // Also accept simple hand-authored YAML arrays such as [a, b, c].
     if s.starts_with('[') && s.ends_with(']') {
         let inner = s[1..s.len() - 1].trim();
         if inner.is_empty() {
@@ -934,13 +1249,6 @@ fn parse_yaml_value(s: &str) -> serde_json::Value {
             .map(|item| parse_yaml_value(item.trim()))
             .collect();
         return serde_json::Value::Array(items);
-    }
-
-    // Try as inline JSON object
-    if s.starts_with('{') && s.ends_with('}') {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-            return v;
-        }
     }
 
     // Default: string
@@ -972,7 +1280,8 @@ fn infer_entry_type(path: &str) -> VaultEntryType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomic_core::pristine::VaultEntryType;
+    use atomic_core::pristine::vault::{GoalSummary, IntentSummary, TokenCounts};
+    use atomic_core::pristine::{EmbeddingsTxnT, VaultEntryType, VaultMutTxnT, VaultTxnT};
     use tempfile::tempdir;
 
     #[test]
@@ -1126,6 +1435,169 @@ mod tests {
     }
 
     #[test]
+    fn test_manifest_replacement_tracks_current_type_and_totals() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+        let baseline = repo.vault_manifest().unwrap();
+        let path = "memory/reclassified.md";
+
+        repo.vault_store(
+            path,
+            VaultEntryType::Memory,
+            b"old".to_vec(),
+            r#"{"name":"old"}"#.to_string(),
+        )
+        .unwrap();
+        let inserted = repo.vault_manifest().unwrap();
+        assert_eq!(inserted.file_count, baseline.file_count + 1);
+        assert_eq!(inserted.total_bytes, baseline.total_bytes + 3);
+        assert!(inserted.memory.contains_key(path));
+
+        repo.vault_store(
+            path,
+            VaultEntryType::Skill,
+            b"new skill".to_vec(),
+            r#"{"name":"new"}"#.to_string(),
+        )
+        .unwrap();
+        let replaced = repo.vault_manifest().unwrap();
+        assert_eq!(replaced.file_count, baseline.file_count + 1);
+        assert_eq!(replaced.total_bytes, baseline.total_bytes + 9);
+        assert!(!replaced.memory.contains_key(path));
+        assert!(replaced.skills.contains_key(path));
+
+        assert!(repo.vault_delete(path).unwrap());
+        let deleted = repo.vault_manifest().unwrap();
+        assert_eq!(deleted.file_count, baseline.file_count);
+        assert_eq!(deleted.total_bytes, baseline.total_bytes);
+        assert!(!deleted.skills.contains_key(path));
+    }
+
+    #[test]
+    fn test_vault_delete_removes_goal_and_intent_manifest_summaries() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+        let goal_path = "goals/test-goal/_goal.md";
+        let intent_path = "intents/manual/alice/1/intent.md";
+
+        repo.vault_store(
+            goal_path,
+            VaultEntryType::Session,
+            b"# Goal".to_vec(),
+            r#"{"goal_id":"test-goal","intent":"TEST-1"}"#.to_string(),
+        )
+        .unwrap();
+        repo.vault_store(
+            intent_path,
+            VaultEntryType::Intent,
+            b"# Intent".to_vec(),
+            r#"{"goals":["test-goal"],"id":"TEST-1","title":"Test"}"#.to_string(),
+        )
+        .unwrap();
+
+        {
+            let mut txn = repo.pristine.write_txn().unwrap();
+            let mut manifest = txn.get_vault_manifest().unwrap();
+            manifest.goals.insert(
+                "test-goal".to_string(),
+                GoalSummary {
+                    developer: "alice".to_string(),
+                    intent: Some("TEST-1".to_string()),
+                    status: "active".to_string(),
+                    started_at: "2025-01-01T00:00:00Z".to_string(),
+                    turns: 0,
+                    tokens: TokenCounts::default(),
+                    tool_results: Vec::new(),
+                    findings_hash: None,
+                    bytes: 0,
+                },
+            );
+            manifest.intents.insert(
+                "TEST-1".to_string(),
+                IntentSummary {
+                    status: "backlog".to_string(),
+                    priority: "medium".to_string(),
+                    assignee: None,
+                    goals: 1,
+                    blocked_by: Vec::new(),
+                    title: "Test".to_string(),
+                    vault_path: intent_path.to_string(),
+                },
+            );
+            txn.put_vault_manifest(&manifest).unwrap();
+            txn.commit().unwrap();
+        }
+
+        assert!(repo.vault_delete(goal_path).unwrap());
+        let after_goal = repo.vault_manifest().unwrap();
+        assert!(!after_goal.goals.contains_key("test-goal"));
+        assert_eq!(after_goal.intents["TEST-1"].goals, 0);
+        let intent = repo.vault_retrieve(intent_path).unwrap().unwrap();
+        let intent_frontmatter: serde_json::Value =
+            serde_json::from_str(&intent.frontmatter_json).unwrap();
+        assert_eq!(intent_frontmatter["goals"], serde_json::json!([]));
+        assert!(repo.vault_dir().join(intent_path).exists());
+
+        // Reclassifying a Goal path follows the same unlink lifecycle.
+        let reclassified_goal_path = "goals/reclassified/_goal.md";
+        repo.vault_store(
+            reclassified_goal_path,
+            VaultEntryType::Session,
+            b"# Reclassified Goal".to_vec(),
+            r#"{"goal_id":"reclassified"}"#.to_string(),
+        )
+        .unwrap();
+        repo.vault_store(
+            intent_path,
+            VaultEntryType::Intent,
+            b"# Intent".to_vec(),
+            r#"{"goals":["reclassified"],"id":"TEST-1","title":"Test"}"#.to_string(),
+        )
+        .unwrap();
+        {
+            let mut txn = repo.pristine.write_txn().unwrap();
+            let mut manifest = txn.get_vault_manifest().unwrap();
+            manifest.goals.insert(
+                "reclassified".to_string(),
+                GoalSummary {
+                    developer: "alice".to_string(),
+                    intent: Some("TEST-1".to_string()),
+                    status: "active".to_string(),
+                    started_at: "2025-01-01T00:00:00Z".to_string(),
+                    turns: 0,
+                    tokens: TokenCounts::default(),
+                    tool_results: Vec::new(),
+                    findings_hash: None,
+                    bytes: 0,
+                },
+            );
+            manifest.intents.get_mut("TEST-1").unwrap().goals = 1;
+            txn.put_vault_manifest(&manifest).unwrap();
+            txn.commit().unwrap();
+        }
+        repo.vault_store(
+            reclassified_goal_path,
+            VaultEntryType::Scratch,
+            b"No longer a Goal".to_vec(),
+            "{}".to_string(),
+        )
+        .unwrap();
+        let after_reclassification = repo.vault_manifest().unwrap();
+        assert!(!after_reclassification.goals.contains_key("reclassified"));
+        assert_eq!(after_reclassification.intents["TEST-1"].goals, 0);
+        let intent = repo.vault_retrieve(intent_path).unwrap().unwrap();
+        let intent_frontmatter: serde_json::Value =
+            serde_json::from_str(&intent.frontmatter_json).unwrap();
+        assert_eq!(intent_frontmatter["goals"], serde_json::json!([]));
+
+        assert!(repo.vault_delete(intent_path).unwrap());
+        let after_intent = repo.vault_manifest().unwrap();
+        assert!(!after_intent.intents.contains_key("TEST-1"));
+    }
+
+    #[test]
     fn test_vault_manifest_merkle() {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
@@ -1209,6 +1681,31 @@ mod tests {
 
         let all = repo.vault_list("", None).unwrap();
         assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn test_vault_delete_cleans_embeddings() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+        let path = "memory/delete-embedding.md";
+
+        repo.vault_store(
+            path,
+            VaultEntryType::Memory,
+            b"Unique semantic memory content".to_vec(),
+            r#"{"name":"delete-embedding"}"#.to_string(),
+        )
+        .unwrap();
+
+        {
+            let txn = repo.pristine.read_txn().unwrap();
+            assert!(txn.get_embedding(path, 0).unwrap().is_some());
+        }
+
+        assert!(repo.vault_delete(path).unwrap());
+        let txn = repo.pristine.read_txn().unwrap();
+        assert!(txn.get_embedding(path, 0).unwrap().is_none());
     }
 
     #[test]
@@ -1573,6 +2070,77 @@ mod tests {
             .unwrap();
         let content = String::from_utf8_lossy(&entry.content_bytes);
         assert!(content.contains("Modified content."));
+    }
+
+    #[test]
+    fn test_vault_deflation_detects_frontmatter_only_change() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+        let path = "memory/status-change.md";
+        repo.vault_store(
+            path,
+            VaultEntryType::Memory,
+            b"Same body.\n".to_vec(),
+            r#"{"name":"status-change","status":"active"}"#.to_string(),
+        )
+        .unwrap();
+        repo.vault_materialize(path).unwrap();
+
+        // Materializing without edits must round-trip as unchanged.
+        assert!(repo.vault_scan_working_copy().unwrap().is_empty());
+
+        let disk_path = repo.vault_dir().join(path);
+        let original = std::fs::read_to_string(&disk_path).unwrap();
+        let modified = original.replace("status: active", "status: retracted");
+        std::fs::write(&disk_path, modified).unwrap();
+
+        let changes = repo.vault_scan_working_copy().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change_type, VaultChangeType::Modified);
+        repo.vault_record_working_copy().unwrap();
+
+        let entry = repo.vault_retrieve(path).unwrap().unwrap();
+        let frontmatter: serde_json::Value = serde_json::from_str(&entry.frontmatter_json).unwrap();
+        assert_eq!(frontmatter["status"], "retracted");
+    }
+
+    #[test]
+    fn test_vault_frontmatter_materialization_preserves_json_types() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+        let path = "memory/frontmatter-types.md";
+        let frontmatter = serde_json::json!({
+            "boolean": true,
+            "boolean_string": "true",
+            "number": 123,
+            "number_string": "123",
+            "null_string": "null",
+            "array_string": "[draft]",
+            "labels": ["true", "a,b", 123, false],
+            "nested": {"status": "null"}
+        });
+
+        repo.vault_store(
+            path,
+            VaultEntryType::Memory,
+            b"Same body.\n".to_vec(),
+            frontmatter.to_string(),
+        )
+        .unwrap();
+        repo.vault_materialize(path).unwrap();
+
+        assert!(
+            repo.vault_scan_working_copy().unwrap().is_empty(),
+            "materializing an entry must not create a semantic frontmatter change"
+        );
+        let markdown = std::fs::read_to_string(repo.vault_dir().join(path)).unwrap();
+        let (parsed, _) = parse_markdown_frontmatter(&markdown);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parsed).unwrap(),
+            frontmatter
+        );
     }
 
     #[test]

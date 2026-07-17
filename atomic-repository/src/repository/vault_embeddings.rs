@@ -7,7 +7,7 @@
 
 use super::*;
 use atomic_core::pristine::vault::{EmbeddingRecord, SearchResult, VaultEntryType};
-use atomic_core::pristine::{EmbeddingsMutTxnT, EmbeddingsTxnT};
+use atomic_core::pristine::{EmbeddingsMutTxnT, EmbeddingsTxnT, VaultTxnT};
 
 /// Configuration for the embedding pipeline.
 #[derive(Debug, Clone)]
@@ -72,6 +72,17 @@ impl Repository {
                 .pristine
                 .read_txn()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let still_current = txn
+                .get_vault_entry(path)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .is_some_and(|current| {
+                    current.entry_type == entry.entry_type
+                        && current.content_hash == content_hash
+                        && current.introduced_by == entry.introduced_by
+                });
+            if !still_current {
+                return Ok(0);
+            }
             if let Ok(Some(existing)) = txn.get_embedding(path, 0) {
                 if existing.content_hash == content_hash {
                     return Ok(0); // Content unchanged, skip
@@ -82,45 +93,48 @@ impl Repository {
         // Chunk the content
         let chunks = chunk_by_heading(&content, config.max_chunk_tokens);
 
-        // Delete old embeddings for this path
-        {
-            let mut txn = self
-                .pristine
-                .write_txn()
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            let _ = txn
-                .del_embeddings(path)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            txn.commit()
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        }
-
-        // Embed and store each chunk
-        let mut txn = self
-            .pristine
-            .write_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let mut count = 0;
+        // Compute vectors before opening the write transaction. This keeps the
+        // database lock short and gives us one final source validation before
+        // atomically replacing all derived chunks.
+        let mut records = Vec::new();
         for (idx, chunk) in chunks.iter().enumerate() {
             if chunk.text.trim().is_empty() {
                 continue;
             }
 
-            let vector = embed_fn(&chunk.text);
-            let preview = chunk.text.chars().take(200).collect::<String>();
-
             let record = EmbeddingRecord {
-                vector,
+                vector: embed_fn(&chunk.text),
                 content_hash,
                 introduced_by: entry.introduced_by,
                 chunk_idx: idx as u32,
-                preview,
+                preview: chunk.text.chars().take(200).collect(),
             };
+            records.push((idx as u32, record));
+        }
 
-            txn.put_embedding(path, idx as u32, &record)
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let still_current = txn
+            .get_vault_entry(path)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .is_some_and(|current| {
+                current.entry_type == entry.entry_type
+                    && current.content_hash == content_hash
+                    && current.introduced_by == entry.introduced_by
+            });
+        if !still_current {
+            return Ok(0);
+        }
+
+        txn.del_embeddings(path)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let count = records.len();
+        for (idx, record) in records {
+            txn.put_embedding(path, idx, &record)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            count += 1;
         }
 
         txn.commit()
@@ -436,6 +450,47 @@ mod tests {
             .vault_embed("memory/test.md", &test_embed, &config)
             .unwrap();
         assert_eq!(c2, 0);
+    }
+
+    #[test]
+    fn test_vault_embed_does_not_recreate_chunks_after_concurrent_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+        let path = "memory/delete-during-embed.md";
+
+        repo.vault_store(
+            path,
+            VaultEntryType::Memory,
+            b"# Delete during embed\n\nOne chunk of content.\n".to_vec(),
+            "{}".to_string(),
+        )
+        .unwrap();
+
+        // Force a fresh embedding pass, then delete the source while vectors
+        // are being computed. The stale pass must not recreate derived chunks.
+        {
+            let mut txn = repo.pristine.write_txn().unwrap();
+            txn.del_embeddings(path).unwrap();
+            txn.commit().unwrap();
+        }
+        let config = EmbedConfig {
+            max_chunk_tokens: 512,
+            dimensions: 8,
+        };
+        let delete_during_embed = |text: &str| {
+            assert!(repo.vault_delete(path).unwrap());
+            test_embed(text)
+        };
+
+        assert_eq!(
+            repo.vault_embed(path, &delete_during_embed, &config)
+                .unwrap(),
+            0
+        );
+        let txn = repo.pristine.read_txn().unwrap();
+        assert!(txn.get_vault_entry(path).unwrap().is_none());
+        assert!(txn.get_embedding(path, 0).unwrap().is_none());
     }
 
     #[test]

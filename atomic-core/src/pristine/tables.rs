@@ -590,9 +590,18 @@ pub const KG_EDGES_TO: MultimapTableDefinition<&str, &str> =
 
 /// KG full-text search inverted index: token → \[node_id\] (multimap)
 ///
-/// Simple inverted index for keyword search over node labels and summaries.
-/// Tokens are lowercase, alphanumeric words extracted from label + summary.
+/// Simple inverted index for keyword search over node IDs, labels, and summaries.
 pub const KG_FTS: MultimapTableDefinition<&str, &str> = MultimapTableDefinition::new("kg_fts");
+
+/// Reverse KG full-text index: node_id → \[token\] (multimap)
+///
+/// Lets node replacement and deletion remove every token previously associated
+/// with that node without scanning the whole inverted index.
+pub const KG_FTS_BY_NODE: MultimapTableDefinition<&str, &str> =
+    MultimapTableDefinition::new("kg_fts_by_node");
+
+/// KG index metadata used for transactional index migrations.
+pub const KG_INDEX_META: TableDefinition<&str, u32> = TableDefinition::new("kg_index_meta");
 
 // Embedding Tables (vector similarity search)
 

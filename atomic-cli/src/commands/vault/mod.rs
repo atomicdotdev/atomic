@@ -16,6 +16,7 @@
 //!   goal          Manage vault goals
 //!   intent        Manage vault intents (tasks)
 //!   memory        Manage vault memory (shared knowledge)
+//!   context       Retrieve memories relevant to a task
 //!   summaries     Get tool result summaries for a goal
 //!
 //! Options:
@@ -41,6 +42,7 @@
 //! $ atomic vault sync
 //! ```
 
+pub mod context;
 pub mod goal;
 pub mod init;
 pub mod intent;
@@ -53,6 +55,7 @@ pub mod sync;
 
 use clap::Subcommand;
 
+pub use context::Context;
 pub use goal::Goal;
 pub use init::Init;
 pub use intent::Intent;
@@ -188,6 +191,12 @@ pub enum VaultCommands {
     /// ```
     Memory(Memory),
 
+    /// Research Vault memories relevant to a task.
+    ///
+    /// Ranks vault memories against free-text terms, an intent, or
+    /// file paths, and emits prompt-ready Markdown (or JSON).
+    Context(Context),
+
     /// Get tool result summaries for a goal.
     ///
     /// Retrieves previews of tool results stored in the vault,
@@ -234,6 +243,7 @@ impl Command for Vault {
             VaultCommands::Goal(cmd) => cmd.run(),
             VaultCommands::Intent(cmd) => cmd.run(),
             VaultCommands::Memory(cmd) => cmd.run(),
+            VaultCommands::Context(cmd) => cmd.run(),
             VaultCommands::Summaries(cmd) => cmd.run(),
             VaultCommands::Query(cmd) => cmd.run(),
         }
@@ -259,6 +269,7 @@ mod tests {
                 VaultCommands::Goal(_) => "goal",
                 VaultCommands::Intent(_) => "intent",
                 VaultCommands::Memory(_) => "memory",
+                VaultCommands::Context(_) => "context",
                 VaultCommands::Summaries(_) => "summaries",
                 VaultCommands::Query(_) => "query",
             }
@@ -274,9 +285,10 @@ mod tests {
             "goal",
             "intent",
             "memory",
+            "context",
             "summaries",
             "query",
         ];
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
     }
 }

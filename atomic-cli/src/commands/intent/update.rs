@@ -2,9 +2,9 @@
 //!
 //! The canonical-family analogue of `atomic vault intent update`. It delegates
 //! to the exact same [`Repository::vault_intent_update`] write path, so its
-//! behavior (frontmatter/status/priority/title updates, body replacement, the
-//! started-or-linked guard behind `--force`) is byte-for-byte identical to the
-//! vault verb it supersedes.
+//! behavior (frontmatter/status/priority/title/reason/source-memory updates,
+//! body replacement, the started-or-linked guard behind `--force`) is
+//! byte-for-byte identical to the vault verb it supersedes.
 
 use clap::Parser;
 
@@ -15,9 +15,9 @@ use crate::error::{CliError, CliResult};
 
 /// Update an intent's fields.
 ///
-/// Modifies the status, assignee, priority, title, or Markdown body of an
-/// existing intent. The body can be set inline with `--body` or piped via
-/// `--body-stdin`.
+/// Modifies the status, assignee, priority, title, icebox reason, source-memory
+/// provenance, or Markdown body of an existing intent. The body can be set
+/// inline with `--body` or piped via `--body-stdin`.
 #[derive(Parser, Debug)]
 #[command(name = "update")]
 pub struct IntentUpdate {
@@ -39,6 +39,15 @@ pub struct IntentUpdate {
     /// New title.
     #[arg(long)]
     pub title: Option<String>,
+
+    /// Reason the intent is being iceboxed. Persisted as `icebox_reason` +
+    /// `iceboxed_at` (normally passed alongside `--status icebox`).
+    #[arg(long)]
+    pub reason: Option<String>,
+
+    /// Source-memory RDF ids that informed this Intent (comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    pub informed_by: Vec<String>,
 
     /// New Markdown body content, provided inline.
     #[arg(long, conflicts_with = "body_stdin")]
@@ -80,12 +89,15 @@ impl Command for IntentUpdate {
             && self.assignee.is_none()
             && self.priority.is_none()
             && self.title.is_none()
+            && self.reason.is_none()
+            && self.informed_by.is_empty()
             && content.is_none()
         {
             return Err(CliError::InvalidArgument {
                 message: "Nothing to update. Provide at least one of \
-                    --status, --assignee, --priority, --title, --body, \
-                    or --body-stdin."
+                    --status, --assignee, --priority, --title, --reason, \
+                    --informed-by, \
+                    --body, or --body-stdin."
                     .to_string(),
             });
         }
@@ -99,7 +111,9 @@ impl Command for IntentUpdate {
                     assignee: self.assignee.clone(),
                     priority: self.priority.clone(),
                     title: self.title.clone(),
+                    informed_by: (!self.informed_by.is_empty()).then(|| self.informed_by.clone()),
                     content,
+                    reason: self.reason.clone(),
                     force: self.force,
                 },
             )
@@ -113,6 +127,9 @@ impl Command for IntentUpdate {
         }
         if body_updated {
             println!("  body: updated");
+        }
+        if !self.informed_by.is_empty() {
+            println!("  informed by: {} source(s)", self.informed_by.len());
         }
 
         Ok(())
