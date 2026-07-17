@@ -40,8 +40,8 @@ pub struct IntentUpdate {
     #[arg(long)]
     pub title: Option<String>,
 
-    /// Rejection reason. Persisted as `rejection_reason` + `rejected_at`
-    /// (normally passed alongside `--status rejected`).
+    /// Reason the intent is being iceboxed. Persisted as `icebox_reason` +
+    /// `iceboxed_at` (normally passed alongside `--status icebox`).
     #[arg(long)]
     pub reason: Option<String>,
 

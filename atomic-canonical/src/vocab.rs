@@ -38,8 +38,8 @@ impl NodeType {
 }
 
 /// Intent status value set (mirrors the doc's `IntentShape` `sh:in`).
-/// `rejected` is a terminal state (an intent that was reviewed and turned down).
-pub const INTENT_STATUS: &[&str] = &["backlog", "todo", "in_progress", "done", "rejected"];
+/// `icebox` is a terminal state (an intent reviewed and set aside — not built).
+pub const INTENT_STATUS: &[&str] = &["backlog", "todo", "in_progress", "done", "icebox"];
 
 /// Acceptance-criterion status value set. `unmet`/`met` are the official values
 /// (an acceptance criterion is either met or not); the legacy `open` is still
