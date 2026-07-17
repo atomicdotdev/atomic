@@ -7,7 +7,9 @@ use super::*;
 use crate::content_search::{has_content_index, search_content, ContentSearchOptions};
 use atomic_core::pristine::ontology::{edge_kind, predicate};
 use atomic_core::pristine::tables::tokenize_for_fts;
-use atomic_core::pristine::vault::{KgEdge, KgNode, KgSubgraph, VaultEntry, VaultEntryType};
+use atomic_core::pristine::vault::{
+    KgEdge, KgNode, KgSubgraph, VaultEntry, VaultEntryType, VaultManifest,
+};
 use atomic_core::pristine::{KgMutTxnT, KgTxnT, VaultTxnT};
 
 impl Repository {
@@ -76,11 +78,28 @@ impl Repository {
         let content = String::from_utf8_lossy(&entry.content_bytes);
         extract_content_edges(&subject, entry.entry_type, &content, &mut edges);
 
+        // Canonical RDF ids and today's path-keyed KG ids are not always the
+        // same. In particular, a canonical `urn:atomic:intent:atom-1` may live
+        // at `intents/manual/<identity>/1/intent.md`. Resolve through the
+        // manifest so lineage edges reach the actual indexed node while their
+        // metadata retains the exact RDF target.
+        let manifest = self.vault_manifest().ok();
+
         // Edge direction is not enough to determine ownership. In particular,
         // an Intent's symmetric `BLOCKS` edge points *into* the Intent node.
         // Persist the source Vault path so an update replaces only edges
         // derived from that entry while preserving RDF links owned elsewhere.
         for edge in &mut edges {
+            let rdf_target = edge
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("rdf_target"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if let Some(rdf_target) = rdf_target {
+                edge.to_id = rdf_target_to_kg_id(&rdf_target, manifest.as_ref());
+            }
+
             let metadata = edge.metadata.get_or_insert_with(|| serde_json::json!({}));
             if let Some(object) = metadata.as_object_mut() {
                 object.insert(
@@ -908,12 +927,18 @@ fn extract_frontmatter_kg(
                     }
                 }
             }
+            for source in frontmatter_links(fm, "informedBy") {
+                edges.push(rdf_link_edge(subject, source, predicate::INFORMED_BY));
+            }
         }
         VaultEntryType::Memory => {
             if let Some(s) = fm.get("name").and_then(|v| v.as_str()) {
                 if node.summary.is_none() {
                     node.summary = Some(s.to_string());
                 }
+            }
+            for source in frontmatter_links(fm, "derivedFrom") {
+                edges.push(rdf_link_edge(subject, source, predicate::WAS_DERIVED_FROM));
             }
         }
         VaultEntryType::Skill => {
@@ -938,6 +963,56 @@ fn extract_frontmatter_kg(
         }
         _ => {}
     }
+}
+
+/// Read an RDF-link field from frontmatter. Canonical writers use arrays, but
+/// accepting a comma-delimited scalar keeps old hand-authored entries usable.
+fn frontmatter_links<'a>(
+    fm: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Vec<&'a str> {
+    match fm.get(key) {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect(),
+        Some(serde_json::Value::String(value)) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Project a canonical RDF id onto the path-keyed KG id used by today's
+/// derived index. The original RDF target remains in edge metadata, so the KG
+/// can traverse current nodes without losing the exact lineage identifier.
+fn rdf_link_edge(subject: &str, rdf_target: &str, predicate: &str) -> KgEdge {
+    KgEdge::new(subject, rdf_target_to_kg_id(rdf_target, None), predicate)
+        .with_metadata(serde_json::json!({ "rdf_target": rdf_target }))
+}
+
+fn rdf_target_to_kg_id(target: &str, manifest: Option<&VaultManifest>) -> String {
+    if let Some(id) = target.strip_prefix("urn:atomic:memory:") {
+        return format!("memory:{id}");
+    }
+    if let Some(id) = target.strip_prefix("urn:atomic:intent:") {
+        if let Some(summary) =
+            manifest.and_then(|manifest| manifest.intents.get(&id.to_uppercase()))
+        {
+            if !summary.vault_path.is_empty() {
+                return entry_subject(&summary.vault_path, VaultEntryType::Intent);
+            }
+        }
+        return format!("intent:{}", id.to_uppercase());
+    }
+    if let Some(hash) = target.strip_prefix("urn:atomic:change:") {
+        return format!("change:{}", hash.chars().take(12).collect::<String>());
+    }
+    target.to_string()
 }
 
 /// Extract edges from content text (wiki-links, file paths).
@@ -1065,7 +1140,7 @@ mod tests {
         let entry = VaultEntry::new(
             VaultEntryType::Intent,
             b"# Fix auth\n\nSee [[architecture]]\n".to_vec(),
-            r#"{"title":"Fix auth","status":"in-progress","priority":"high","assignee":"bob","labels":["auth","security"]}"#.to_string(),
+            r#"{"title":"Fix auth","status":"in-progress","priority":"high","assignee":"bob","labels":["auth","security"],"informedBy":["urn:atomic:memory:architecture"]}"#.to_string(),
             "2025-01-01T00:00:00Z".to_string(),
         );
 
@@ -1109,6 +1184,88 @@ mod tests {
                 .iter()
                 .any(|e| e.kind == edge_kind::REFERENCES && e.to_id == "memory:architecture"),
             "Missing REFERENCES edge for wiki-link"
+        );
+        let informed = edges
+            .iter()
+            .find(|e| e.kind == predicate::INFORMED_BY)
+            .expect("Missing atom:informedBy edge");
+        assert_eq!(informed.to_id, "memory:architecture");
+        assert_eq!(
+            informed.metadata.as_ref().unwrap()["rdf_target"],
+            "urn:atomic:memory:architecture"
+        );
+    }
+
+    #[test]
+    fn test_extract_learning_memory_lineage() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        let entry = VaultEntry::new(
+            VaultEntryType::Memory,
+            b"A reusable lesson learned from the accepted implementation.\n".to_vec(),
+            r#"{"uid":"learning-1","memoryKind":"lesson","status":"active","derivedFrom":["urn:atomic:intent:temp-2","urn:atomic:change:ABCDEFGHIJKLMNOPQRSTUVWXYZ","urn:atomic:memory:source-1"]}"#.to_string(),
+            "2026-07-16T00:00:00Z".to_string(),
+        );
+
+        let (_, edges) = repo
+            .vault_extract_kg("memory/learning-1.md", &entry)
+            .unwrap();
+        let lineage: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.kind == predicate::WAS_DERIVED_FROM)
+            .map(|edge| edge.to_id.as_str())
+            .collect();
+        assert_eq!(
+            lineage,
+            vec!["intent:TEMP-2", "change:ABCDEFGHIJKL", "memory:source-1"]
+        );
+    }
+
+    #[test]
+    fn test_learning_intent_rdf_id_resolves_to_path_keyed_kg_node() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+        let intent = repo
+            .vault_intent_create(IntentCreateOptions {
+                title: "Demo lineage".to_string(),
+                priority: None,
+                assignee: None,
+                labels: Vec::new(),
+                session_id: None,
+                turn_id: None,
+            })
+            .unwrap();
+        let canonical_intent = format!("urn:atomic:intent:{}", intent.id.to_lowercase());
+        let frontmatter = serde_json::json!({
+            "uid": "learning-path-resolution",
+            "memoryKind": "lesson",
+            "status": "active",
+            "derivedFrom": [canonical_intent.clone()]
+        });
+        let entry = VaultEntry::new(
+            VaultEntryType::Memory,
+            b"A learned fact.\n".to_vec(),
+            frontmatter.to_string(),
+            "2026-07-16T00:00:00Z".to_string(),
+        );
+
+        let (_, edges) = repo
+            .vault_extract_kg("memory/learning-path-resolution.md", &entry)
+            .unwrap();
+        let derived = edges
+            .iter()
+            .find(|edge| edge.kind == predicate::WAS_DERIVED_FROM)
+            .expect("learning should link to its Intent");
+        assert_eq!(
+            derived.to_id,
+            entry_subject(&intent.intent_file, VaultEntryType::Intent)
+        );
+        assert_eq!(
+            derived.metadata.as_ref().unwrap()["rdf_target"],
+            canonical_intent
         );
     }
 

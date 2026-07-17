@@ -159,6 +159,13 @@ fn render_memory_cli(node: &MemoryNode) -> String {
         }
     }
 
+    if !node.derived_from.is_empty() {
+        s.push_str("\nDerived From\n");
+        for source in &node.derived_from {
+            s.push_str(&format!("  • {source}\n"));
+        }
+    }
+
     // Revision chain (only if present).
     if node.supersedes.is_some() || node.previous_revision.is_some() {
         s.push_str("\nRevision\n");
@@ -273,6 +280,10 @@ mod tests {
                 "urn:atomic:module:storage".to_string(),
                 "urn:atomic:module:replication".to_string(),
             ],
+            derived_from: vec![
+                "urn:atomic:intent:render-intent".to_string(),
+                "urn:atomic:change:render-change".to_string(),
+            ],
             status: "active".to_string(),
             supersedes: None,
             previous_revision: None,
@@ -289,6 +300,8 @@ mod tests {
         assert!(text.contains("constraint"));
         assert!(text.contains("urn:atomic:module:storage"));
         assert!(text.contains("urn:atomic:module:replication"));
+        assert!(text.contains("Derived From"));
+        assert!(text.contains("urn:atomic:intent:render-intent"));
         assert!(text.contains("no single ordering authority for multi-region writes"));
     }
 }

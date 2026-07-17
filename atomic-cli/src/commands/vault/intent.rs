@@ -422,6 +422,10 @@ pub struct IntentUpdate {
     #[arg(long)]
     pub title: Option<String>,
 
+    /// Source-memory RDF ids that informed this Intent (comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    pub informed_by: Vec<String>,
+
     /// New Markdown body content, provided inline.
     #[arg(long, conflicts_with = "body_stdin")]
     pub body: Option<String>,
@@ -462,12 +466,13 @@ impl Command for IntentUpdate {
             && self.assignee.is_none()
             && self.priority.is_none()
             && self.title.is_none()
+            && self.informed_by.is_empty()
             && content.is_none()
         {
             return Err(CliError::InvalidArgument {
                 message: "Nothing to update. Provide at least one of \
-                    --status, --assignee, --priority, --title, --body, \
-                    or --body-stdin."
+                    --status, --assignee, --priority, --title, --informed-by, \
+                    --body, or --body-stdin."
                     .to_string(),
             });
         }
@@ -481,6 +486,7 @@ impl Command for IntentUpdate {
                     assignee: self.assignee.clone(),
                     priority: self.priority.clone(),
                     title: self.title.clone(),
+                    informed_by: (!self.informed_by.is_empty()).then(|| self.informed_by.clone()),
                     content,
                     reason: None,
                     force: self.force,
@@ -496,6 +502,9 @@ impl Command for IntentUpdate {
         }
         if body_updated {
             println!("  body: updated");
+        }
+        if !self.informed_by.is_empty() {
+            println!("  informed by: {} source(s)", self.informed_by.len());
         }
 
         Ok(())

@@ -48,6 +48,7 @@
 
     "memoryKind": "atom:memoryKind",
     "about": { "@id": "atom:about", "@type": "@id" },
+    "derivedFrom": { "@id": "prov:wasDerivedFrom", "@type": "@id" },
     "supersedes": { "@id": "atom:supersedes", "@type": "@id" },
     "previousRevision": { "@id": "atom:previousRevision", "@type": "@id" },
 

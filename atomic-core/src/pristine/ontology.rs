@@ -5,6 +5,8 @@
 
 /// Ontology prefix constants.
 pub mod prefix {
+    /// Atomic's canonical domain ontology.
+    pub const ATOM: &str = "atom";
     /// W3C Provenance Ontology — who did what, when, using what.
     pub const PROV: &str = "prov";
     /// Simple Knowledge Organization System — concepts, hierarchies.
@@ -28,6 +30,10 @@ pub mod predicate {
     pub const WAS_GENERATED_BY: &str = "prov:wasGeneratedBy";
     /// An activity was informed by another activity.
     pub const WAS_INFORMED_BY: &str = "prov:wasInformedBy";
+    /// An entity was derived from another entity.
+    pub const WAS_DERIVED_FROM: &str = "prov:wasDerivedFrom";
+    /// An Atomic Intent was informed by a Memory.
+    pub const INFORMED_BY: &str = "atom:informedBy";
 
     // ── SKOS (Knowledge Organization) ────────────────────────────
     /// Broader concept (e.g., "authentication" → "security").
@@ -140,6 +146,8 @@ pub fn is_known_predicate(pred: &str) -> bool {
             | predicate::USED
             | predicate::WAS_GENERATED_BY
             | predicate::WAS_INFORMED_BY
+            | predicate::WAS_DERIVED_FROM
+            | predicate::INFORMED_BY
             | predicate::BROADER
             | predicate::NARROWER
             | predicate::SUBJECT
@@ -169,6 +177,8 @@ pub fn all_predicates() -> Vec<&'static str> {
         predicate::USED,
         predicate::WAS_GENERATED_BY,
         predicate::WAS_INFORMED_BY,
+        predicate::WAS_DERIVED_FROM,
+        predicate::INFORMED_BY,
         predicate::BROADER,
         predicate::NARROWER,
         predicate::SUBJECT,
@@ -208,7 +218,7 @@ mod tests {
 
     #[test]
     fn predicate_count() {
-        assert_eq!(all_predicates().len(), 23);
+        assert_eq!(all_predicates().len(), 25);
     }
 
     #[test]

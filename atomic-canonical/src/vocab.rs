@@ -91,6 +91,7 @@ pub const EDGE_NAMES: &[&str] = &[
     "supersedes",
     "previousRevision",
     "about",
+    "derivedFrom",
     "satisfies",
     "touchesFile",
     "depends",

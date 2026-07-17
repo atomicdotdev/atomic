@@ -10,8 +10,10 @@
 //!
 //! ## Directionality (load-bearing)
 //! A memory references its *inputs*, never its future uses. The only outward
-//! edges are `about` (the modules/domains it is relevant to) and the revision
-//! chain (`supersedes` / `previousRevision`). There is deliberately **no**
+//! edges name its inputs: `about` (the modules/domains it is relevant to),
+//! `derivedFrom` (the Intent, changes, and source memories that produced a
+//! learned memory), and the revision chain (`supersedes` /
+//! `previousRevision`). There is deliberately **no**
 //! field for the intents that consume it — an intent names the memories that
 //! informed it via `informedBy`; a memory never lists its consumers. That
 //! absence is what lets memories stay stable while intents accrete around them.
@@ -58,10 +60,15 @@ pub struct MemoryNode {
     /// INPUT edges only — the modules/services/domains this memory is about.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub about: Vec<String>,
+    /// Provenance inputs for a distilled learning. This points backward to the
+    /// accepted Intent, generated changes, and source memories; it never points
+    /// forward to future consumers.
+    #[serde(rename = "derivedFrom", default, skip_serializing_if = "Vec::is_empty")]
+    pub derived_from: Vec<String>,
     pub status: String,
 
-    // Revision chain (the only edges besides `about`). Omitted when absent so
-    // no empty JSON-LD keys leak into the hash.
+    // Revision chain. Omitted when absent so no empty JSON-LD keys leak into
+    // the hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<String>,
     #[serde(
@@ -122,8 +129,9 @@ impl MemoryNode {
 
 /// Lift a memory from its frontmatter spine and markdown body.
 ///
-/// `memoryKind`, `status`, `about`, `supersedes`, and `previousRevision` are
-/// read from the frontmatter. The text is lifted from the FIRST `:::memory`
+/// `memoryKind`, `status`, `about`, `derivedFrom`, `supersedes`, and
+/// `previousRevision` are read from the frontmatter. The text is lifted from
+/// the FIRST `:::memory`
 /// container directive if present (single authoring site), else falls back to
 /// the whole trimmed body.
 pub fn lift_memory(frontmatter: &Map<String, Value>, body: &str) -> Result<MemoryNode> {
@@ -155,6 +163,7 @@ pub fn lift_memory(frontmatter: &Map<String, Value>, body: &str) -> Result<Memor
         memory_kind,
         text,
         about: str_array(frontmatter, "about"),
+        derived_from: str_array(frontmatter, "derivedFrom"),
         status,
         supersedes: opt_str(frontmatter, "supersedes"),
         previous_revision: opt_str(frontmatter, "previousRevision"),
@@ -258,7 +267,12 @@ mod tests {
             "uid": "01J8ZC4R8T",
             "memoryKind": "constraint",
             "status": "active",
-            "about": ["urn:atomic:module:storage", "urn:atomic:module:replication"]
+            "about": ["urn:atomic:module:storage", "urn:atomic:module:replication"],
+            "derivedFrom": [
+                "urn:atomic:intent:word-5",
+                "urn:atomic:change:abc123",
+                "urn:atomic:memory:source-1"
+            ]
         })
         .as_object()
         .unwrap()
@@ -278,6 +292,14 @@ mod tests {
             vec![
                 "urn:atomic:module:storage".to_string(),
                 "urn:atomic:module:replication".to_string()
+            ]
+        );
+        assert_eq!(
+            node.derived_from,
+            vec![
+                "urn:atomic:intent:word-5".to_string(),
+                "urn:atomic:change:abc123".to_string(),
+                "urn:atomic:memory:source-1".to_string(),
             ]
         );
         assert!(node.text.contains("no single ordering authority"));
