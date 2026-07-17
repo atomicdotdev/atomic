@@ -38,10 +38,13 @@ impl NodeType {
 }
 
 /// Intent status value set (mirrors the doc's `IntentShape` `sh:in`).
-pub const INTENT_STATUS: &[&str] = &["backlog", "todo", "in_progress", "done"];
+/// `icebox` is a terminal state (an intent reviewed and set aside — not built).
+pub const INTENT_STATUS: &[&str] = &["backlog", "todo", "in_progress", "done", "icebox"];
 
-/// Acceptance-criterion status value set.
-pub const AC_STATUS: &[&str] = &["open", "met"];
+/// Acceptance-criterion status value set. `unmet`/`met` are the official values
+/// (an acceptance criterion is either met or not); the legacy `open` is still
+/// accepted by [`is_known_ac_status`] so pre-existing intents keep conforming.
+pub const AC_STATUS: &[&str] = &["unmet", "met"];
 
 /// Directive names recognized by the parser + lift (closed set).
 /// Container directives wrap prose; leaf directives carry only edges.
@@ -125,9 +128,10 @@ pub fn is_known_intent_status(value: &str) -> bool {
     INTENT_STATUS.contains(&value)
 }
 
-/// Is this a valid acceptance-criterion status value?
+/// Is this a valid acceptance-criterion status value? Accepts the official
+/// `unmet`/`met` plus the deprecated legacy `open` (== `unmet`) for back-compat.
 pub fn is_known_ac_status(value: &str) -> bool {
-    AC_STATUS.contains(&value)
+    AC_STATUS.contains(&value) || value == "open"
 }
 
 /// Is this a valid memory kind? Unknown ⇒ gate error (closed vocabulary).

@@ -75,6 +75,9 @@ pub struct IntentUpdateOptions {
     pub title: Option<String>,
     /// New Markdown body content. When `None`, the existing body is kept.
     pub content: Option<String>,
+    /// Icebox reason. When set, persists `icebox_reason` and stamps
+    /// `iceboxed_at` (normally accompanies `status = icebox`).
+    pub reason: Option<String>,
     /// Allow rewriting the body after the intent has started or been linked.
     pub force: bool,
 }
@@ -503,6 +506,16 @@ impl Repository {
             fm.insert(
                 "title".to_string(),
                 serde_json::Value::String(title.clone()),
+            );
+        }
+        if let Some(ref reason) = options.reason {
+            fm.insert(
+                "icebox_reason".to_string(),
+                serde_json::Value::String(reason.clone()),
+            );
+            fm.insert(
+                "iceboxed_at".to_string(),
+                serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
             );
         }
         let new_fm = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
