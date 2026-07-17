@@ -16,7 +16,7 @@ use crate::output::{create_spinner, finish_error, finish_success};
 pub enum QueryCommands {
     /// Search the knowledge graph by keywords.
     ///
-    /// Performs full-text search over KG node labels and summaries,
+    /// Performs full-text search over KG node IDs, labels, and summaries,
     /// returning matching nodes ranked by relevance.
     ///
     /// # Examples
@@ -1027,14 +1027,14 @@ fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> String {
 /// Search the knowledge graph.
 #[derive(Parser, Debug)]
 pub struct QueryNodes {
-    /// Search query text (keyword search over node labels and summaries).
+    /// Search query text (keyword search over node IDs, labels, and summaries).
     pub query: String,
 
     /// Maximum results.
     #[arg(long, short = 'k', default_value = "10")]
     pub limit: usize,
 
-    /// Filter by node kind (change, entity, file, view).
+    /// Filter by node kind (change, entity, file, view, memory, intent, goal).
     ///
     /// When set, only nodes of this kind are returned.
     /// Without this flag, all kinds are returned.

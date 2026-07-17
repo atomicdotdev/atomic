@@ -621,12 +621,16 @@ impl Repository {
         let goals = fm
             .entry("goals".to_string())
             .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-        if let serde_json::Value::Array(ref mut arr) = goals {
-            let goal_val = serde_json::Value::String(goal_name.to_string());
-            if !arr.contains(&goal_val) {
-                arr.push(goal_val);
-            }
+        let goals = goals
+            .as_array_mut()
+            .ok_or_else(|| RepositoryError::InvalidOperation {
+                message: format!("Intent '{}' has a non-array goals field", full_id),
+            })?;
+        let goal_val = serde_json::Value::String(goal_name.to_string());
+        if !goals.contains(&goal_val) {
+            goals.push(goal_val);
         }
+        let goal_count = goals.len() as u32;
         let new_fm = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
 
         self.vault_store(&intent_file, VaultEntryType::Intent, content_bytes, new_fm)?;
@@ -641,7 +645,10 @@ impl Repository {
                 .get_vault_manifest()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             if let Some(summary) = manifest.intents.get_mut(&full_id) {
-                summary.goals = summary.goals.saturating_add(1);
+                summary.goals = goal_count;
+            }
+            if let Some(goal) = manifest.goals.get_mut(goal_name) {
+                goal.intent = Some(full_id.clone());
             }
             txn.put_vault_manifest(&manifest)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -1466,9 +1473,9 @@ The authentication module has no rate limiting.
         let goals = fm.get("goals").unwrap().as_array().unwrap();
         assert_eq!(goals.len(), 1);
 
-        // But manifest counter increments each time
+        // The manifest count follows unique links as well.
         let manifest = repo.vault_manifest().unwrap();
-        assert_eq!(manifest.intents[&intent.id].goals, 2);
+        assert_eq!(manifest.intents[&intent.id].goals, 1);
     }
 
     #[test]
