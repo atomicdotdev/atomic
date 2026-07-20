@@ -30,7 +30,7 @@ Now AI agents write most of the code. They work in sessions and turns, use multi
 Enable agent hooks once. Every turn is recorded automatically.
 
 ```bash
-# Enable for your agent (auto-detects Claude Code, Gemini CLI, OpenCode)
+# Enable for your agent (auto-detects Claude Code, Antigravity CLI, Gemini CLI, OpenCode)
 atomic agent enable
 
 # That's it. Every agent turn now produces an Atomic change with:
@@ -94,7 +94,7 @@ Atomic handles this with `[workspace] expose`:
 ```toml
 # .atomic/config.toml
 [workspace]
-expose = [".opencode", ".vscode", ".idea", ".claude", ".gemini"]
+expose = [".opencode", ".vscode", ".idea", ".claude", ".gemini", ".agents"]
 ```
 
 - **`.atomicignore`** = "don't track" (same as `.gitignore`). By default, all ignored files are **shelved per-view** on switch.
@@ -113,7 +113,7 @@ You can also set `expose` globally in `~/.atomic/config.toml` so it applies to e
 ```toml
 # ~/.atomic/config.toml
 [workspace]
-expose = [".opencode", ".vscode", ".idea", ".claude", ".gemini"]
+expose = [".opencode", ".vscode", ".idea", ".claude", ".gemini", ".agents"]
 ```
 
 Global and repo-local patterns are merged — a repo can add project-specific entries without repeating the global ones.
@@ -355,7 +355,8 @@ Every change stores two parallel representations:
 | Agent | Config | Hook System |
 |-------|--------|-------------|
 | Claude Code | `.claude/settings.json` | Native hooks |
-| Gemini CLI | `.gemini/settings.json` | Native hooks |
+| Antigravity CLI (`agy`) | `~/.gemini/config/plugins/atomic/` | Plugin hooks |
+| Gemini CLI (deprecated) | `.gemini/settings.json` | Native hooks |
 | OpenCode | `.opencode/plugins/atomic/` | Plugin-based |
 
 ## Documentation

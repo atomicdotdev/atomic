@@ -68,7 +68,14 @@ pub const DEFAULT_VIEW_NAME: &str = "dev";
 ///
 /// These are tool/editor configs that are project-wide, not per-view.
 /// Everything else in `.atomicignore` gets shelved per-view on switch.
-pub const DEFAULT_EXPOSE: &[&str] = &[".opencode", ".vscode", ".idea", ".claude", ".gemini"];
+pub const DEFAULT_EXPOSE: &[&str] = &[
+    ".opencode",
+    ".vscode",
+    ".idea",
+    ".claude",
+    ".gemini",
+    ".agents",
+];
 
 /// Get the .atomicignore content for a given project kind.
 ///

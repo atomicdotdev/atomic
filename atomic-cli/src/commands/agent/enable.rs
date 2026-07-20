@@ -153,15 +153,21 @@ impl Command for Enable {
                     return Ok(());
                 }
 
-                // Default to the first available agent (claude-code)
+                // Default to Claude Code when nothing is detected (fall back
+                // to the first registered agent if it is ever unavailable).
+                let default_agent = if available.contains(&"claude-code") {
+                    "claude-code"
+                } else {
+                    available[0]
+                };
                 print_warning(&format!(
                     "No agent detected in this repository. Defaulting to '{}'.",
-                    available[0],
+                    default_agent,
                 ));
                 print_warning(
-                    "Create a .claude/ or .gemini/ directory first, or use --agent <name>.",
+                    "Create a .claude/, .gemini/, or .agents/ directory first, or use --agent <name>.",
                 );
-                vec![available[0]]
+                vec![default_agent]
             } else if detected.len() == 1 {
                 detected
             } else {
@@ -305,8 +311,10 @@ impl Enable {
     /// Supports:
     /// - `claude-code` → `~/.claude/settings.json`
     /// - `gemini-cli` → `~/.gemini/settings.json`
+    /// - `agy` → `~/.gemini/config/plugins/atomic/hooks.json` (plugin)
     /// - `codex` → `~/.codex/hooks.json`
     fn run_global(&self) -> CliResult<()> {
+        use atomic_agent::hooks::agy::AgyHook;
         use atomic_agent::hooks::claude_code::ClaudeCodeHook;
         use atomic_agent::hooks::codex::CodexHook;
         use atomic_agent::hooks::gemini_cli::GeminiCliHook;
@@ -380,6 +388,41 @@ impl Enable {
                 }
             }
 
+            "agy" => {
+                let hook = AgyHook::new();
+
+                if !self.force && hook.is_installed_global() {
+                    print_success(
+                        "Hooks already installed via the ~/.gemini/config/plugins/atomic/ plugin.",
+                    );
+                    println!("  Use --force to reinstall.");
+                    return Ok(());
+                }
+
+                match hook.install_global(self.force) {
+                    Ok(count) if count > 0 => {
+                        print_success(&format!(
+                            "Installed {} hook{} for Antigravity CLI as an agy plugin",
+                            count,
+                            if count == 1 { "" } else { "s" },
+                        ));
+                        println!();
+                        println!("Hooks written to: ~/.gemini/config/plugins/atomic/hooks.json");
+                        println!();
+                        println!("Every agy session in a project with .atomic/ will now:");
+                        println!("  • Record each turn as an Atomic change with full provenance");
+                        println!("  • Track session metadata (turn number, timing, files)");
+                        println!("  • Capture tool calls through the post-tool hook");
+                    }
+                    Ok(_) => {
+                        print_success("Hooks already up to date.");
+                    }
+                    Err(e) => {
+                        print_error(&format!("Failed to install hooks: {}", e));
+                    }
+                }
+            }
+
             "codex" => {
                 let hook = CodexHook::new();
 
@@ -429,7 +472,7 @@ impl Enable {
 
             other => {
                 print_warning(&format!(
-                    "Global install is not supported for '{}'. Supported agents: claude-code, gemini-cli, codex, kiro",
+                    "Global install is not supported for '{}'. Supported agents: claude-code, gemini-cli, agy, codex, kiro",
                     other
                 ));
             }
