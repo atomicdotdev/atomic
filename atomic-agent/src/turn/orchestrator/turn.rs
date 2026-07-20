@@ -324,6 +324,23 @@ impl TurnOrchestrator {
             }
         }
 
+        // Agents without a SessionEnd lifecycle hook (Antigravity CLI) never
+        // trigger `handle_session_end`, so their attestations would never be
+        // created. Their Stop payload carries `fullyIdle: true` when the
+        // execution loop fully terminated — that is their terminal signal.
+        // `create_session_attestation` is incremental (covers only newly
+        // recorded hashes) and chained via `previous_attestation`, so
+        // calling it after every idle Stop is safe and idempotent.
+        let fully_idle = event
+            .raw_json
+            .as_ref()
+            .and_then(|r| r.get("fullyIdle"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if fully_idle {
+            self.create_session_attestation(&session);
+        }
+
         self.session_store.save(&session)?;
 
         Ok(dispatch)

@@ -605,6 +605,102 @@ async fn test_session_end_skips_attestation_when_no_recorded_changes() {
     );
 }
 
+// Antigravity CLI has no SessionEnd hook — its Stop payload's
+// `fullyIdle: true` is the terminal signal that drives attestation.
+#[tokio::test]
+async fn test_fully_idle_turn_end_creates_attestation() {
+    let dir = TempDir::new().unwrap();
+    Repository::init(dir.path()).unwrap();
+    let mut orch = make_orchestrator(&dir);
+    orch.set_agent("agy", "Antigravity CLI");
+
+    orch.dispatch(session_start_event("sess-agy-1")).await.unwrap();
+    orch.dispatch(turn_start_event("sess-agy-1", "Create agy-file.txt"))
+        .await
+        .unwrap();
+
+    fs::write(dir.path().join("agy-file.txt"), "written by agy\n").unwrap();
+
+    let agy_stop = turn_end_event("sess-agy-1").with_raw_json(serde_json::json!({
+        "conversationId": "sess-agy-1",
+        "terminationReason": "model_stop",
+        "fullyIdle": true
+    }));
+    let turn_result = orch.dispatch(agy_stop).await.unwrap();
+    assert!(turn_result.change_recorded.is_some());
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let attestations: Vec<_> = repo
+        .change_store()
+        .iter_attestations()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert_eq!(
+        attestations.len(),
+        1,
+        "Stop with fullyIdle=true must create an attestation",
+    );
+    let attest = repo.load_attestation(&attestations[0]).unwrap();
+    assert_eq!(attest.session_id, "sess-agy-1");
+    assert_eq!(attest.changes_covered.len(), 1);
+
+    // A second idle Stop with no new changes must NOT create a duplicate.
+    orch.dispatch(turn_start_event("sess-agy-1", "no-op turn"))
+        .await
+        .unwrap();
+    let agy_stop_again = turn_end_event("sess-agy-1").with_raw_json(serde_json::json!({
+        "conversationId": "sess-agy-1",
+        "terminationReason": "model_stop",
+        "fullyIdle": true
+    }));
+    orch.dispatch(agy_stop_again).await.unwrap();
+
+    let attestations_after: Vec<_> = repo
+        .change_store()
+        .iter_attestations()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert_eq!(
+        attestations_after.len(),
+        1,
+        "fullyIdle Stop with nothing new to attest must be a no-op",
+    );
+}
+
+#[tokio::test]
+async fn test_non_idle_turn_end_skips_attestation() {
+    let dir = TempDir::new().unwrap();
+    Repository::init(dir.path()).unwrap();
+    let mut orch = make_orchestrator(&dir);
+    orch.set_agent("agy", "Antigravity CLI");
+
+    orch.dispatch(session_start_event("sess-agy-2")).await.unwrap();
+    orch.dispatch(turn_start_event("sess-agy-2", "Create agy-file.txt"))
+        .await
+        .unwrap();
+
+    fs::write(dir.path().join("agy-file.txt"), "written by agy\n").unwrap();
+
+    // fullyIdle: false — background tasks still running, agent not done.
+    let agy_stop_busy = turn_end_event("sess-agy-2").with_raw_json(serde_json::json!({
+        "conversationId": "sess-agy-2",
+        "terminationReason": "model_stop",
+        "fullyIdle": false
+    }));
+    orch.dispatch(agy_stop_busy).await.unwrap();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let attestations: Vec<_> = repo
+        .change_store()
+        .iter_attestations()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert!(
+        attestations.is_empty(),
+        "Stop with fullyIdle=false must not create an attestation",
+    );
+}
+
 #[tokio::test]
 async fn test_turn_end_with_file_changes() {
     let dir = TempDir::new().unwrap();
