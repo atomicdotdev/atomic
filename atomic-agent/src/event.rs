@@ -56,14 +56,14 @@ use serde::{Deserialize, Serialize};
 ///
 /// These map to agent-specific hook names:
 ///
-/// | HookType       | Claude Code            | Gemini CLI        | Hermes Agent     |
+/// | HookType       | Claude Code            | Gemini CLI        | Antigravity CLI  |
 /// |----------------|------------------------|-------------------|------------------|
-/// | SessionStart   | session-start          | session-start     | on_session_start |
-/// | SessionEnd     | session-end            | session-end       | on_session_end   |
-/// | TurnStart      | user-prompt-submit     | before-model      | pre_llm_call     |
-/// | TurnEnd        | stop                   | after-model       | post_llm_call    |
-/// | PreToolUse     | pre-task               | before-tool       | pre_tool_call    |
-/// | PostToolUse    | post-task / post-todo  | after-tool        | post_tool_call   |
+/// | SessionStart   | session-start          | session-start     | —                |
+/// | SessionEnd     | session-end            | session-end       | —                |
+/// | TurnStart      | user-prompt-submit     | before-agent      | pre-invocation   |
+/// | TurnEnd        | stop                   | after-agent       | stop             |
+/// | PreToolUse     | pre-task               | before-tool       | —                |
+/// | PostToolUse    | post-task / post-todo  | after-tool        | post-tool-use    |
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookType {
@@ -145,6 +145,10 @@ impl HookType {
     /// assert_eq!(HookType::from_verb("before-agent"), Some(HookType::TurnStart));
     /// assert_eq!(HookType::from_verb("after-agent"), Some(HookType::TurnEnd));
     ///
+    /// // Antigravity CLI (agy) verbs
+    /// assert_eq!(HookType::from_verb("pre-invocation"), Some(HookType::TurnStart));
+    /// assert_eq!(HookType::from_verb("stop"), Some(HookType::TurnEnd));
+    ///
     /// // OpenCode verbs
     /// assert_eq!(HookType::from_verb("user-prompt"), Some(HookType::TurnStart));
     ///
@@ -183,6 +187,10 @@ impl HookType {
             // Gemini CLI turn boundaries
             "before-agent" => Some(HookType::TurnStart),
             "after-agent" => Some(HookType::TurnEnd),
+
+            // Antigravity CLI (agy) turn boundaries
+            // ("stop" already matched above for Claude Code — same mapping)
+            "pre-invocation" => Some(HookType::TurnStart),
 
             // Devin Desktop turn boundaries
             "prompt-submit" => Some(HookType::TurnStart),

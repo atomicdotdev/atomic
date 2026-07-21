@@ -165,12 +165,35 @@ impl Command for Hooks {
             ))
         })?;
 
-        // Find the repository root
-        let repo_root = find_repository_root().map_err(|e| {
-            // Log to stderr — the agent should continue even if Atomic can't find a repo
-            eprintln!("[atomic] Warning: {}", e);
-            e
-        })?;
+        // Find the repository root. Agents whose hooks run detached from the
+        // workspace (e.g., Antigravity plugin hooks, which execute with the
+        // plugin directory as cwd) supply candidate directories from the
+        // event payload; everyone else resolves from the process cwd.
+        let repo_root = match agent.repo_root_hints(&event) {
+            Some(hints) => {
+                let resolved = hints
+                    .iter()
+                    .find_map(|dir| crate::commands::find_repository_root_from(dir).ok());
+                match resolved {
+                    Some(root) => root,
+                    None => {
+                        // The workspace that fired this hook is not an Atomic
+                        // repository — nothing to record. Exit quietly (with
+                        // the agent's stdout contract satisfied) so the hook
+                        // never shows up as a failure in the agent's UI.
+                        if let Some(response) = agent.stdout_response(hook_type) {
+                            println!("{}", response);
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            None => find_repository_root().map_err(|e| {
+                // Log to stderr — the agent should continue even if Atomic can't find a repo
+                eprintln!("[atomic] Warning: {}", e);
+                e
+            })?,
+        };
 
         // Resolve the managed run governing this hook, if any — hooks are
         // never suppressed, sessions adopt the run's view + stamp.
@@ -246,6 +269,12 @@ impl Command for Hooks {
         // Keep hook stdout quiet by default; some agent TUIs display it directly.
         if let Some(ref message) = result.message {
             log::debug!("Hook response: {}", message);
+        }
+
+        // Some agents (e.g., Antigravity) read a JSON object from hook stdout
+        // as part of their hook contract. Print the adapter's response body.
+        if let Some(response) = agent.stdout_response(hook_type) {
+            println!("{}", response);
         }
 
         // Emit the recorded change hash for UI/bridge callers.

@@ -86,6 +86,7 @@ The format varies by agent and session:
 | Agent | Session ID | Author |
 |---|---|---|
 | Claude Code | `60f5cbd2-aa23-...` | `claude+60f5 <lee@atomic.dev>` |
+| Antigravity CLI | `ec33ebf9-0cba-...` | `agy+ec33 <lee@atomic.dev>` |
 | Gemini CLI | `abcd1234-...` | `gemini+abcd <lee@atomic.dev>` |
 | Codex | `9876fedc-...` | `codex+9876 <lee@atomic.dev>` |
 
@@ -301,12 +302,13 @@ atomic agent hooks <agent> <verb>              # internal, called by agent hooks
 
 | Agent | Status | Hook Format |
 |---|---|---|
+| **Antigravity CLI (`agy`)** | ✅ Implemented | Plugin (`~/.gemini/config/plugins/atomic/hooks.json`), 3 hooks |
 | **Claude Code** | ✅ Implemented | `.claude/settings.json`, 7 hooks |
 | **Cline** | ✅ Implemented | `.cline/settings.json` |
 | **Codex** | ✅ Implemented | `.codex/hooks.json` |
 | **Copilot** | ✅ Implemented | `.github/copilot-hooks.yml` |
 | **Cursor** | ✅ Implemented | `.cursor/hooks.json` |
-| **Gemini CLI** | ✅ Implemented | `.gemini/settings.json` |
+| **Gemini CLI** (deprecated) | ✅ Implemented | `.gemini/settings.json` |
 | **Kiro** | ✅ Implemented | IDE panel + shell scripts (via `atomic-kiro` package) |
 | **OpenCode** | ✅ Implemented | `.opencode/hooks.json` |
 | **Pi** | ✅ Implemented | Extension-based (`atomic-pi` package) |
