@@ -614,7 +614,9 @@ async fn test_fully_idle_turn_end_creates_attestation() {
     let mut orch = make_orchestrator(&dir);
     orch.set_agent("agy", "Antigravity CLI");
 
-    orch.dispatch(session_start_event("sess-agy-1")).await.unwrap();
+    orch.dispatch(session_start_event("sess-agy-1"))
+        .await
+        .unwrap();
     orch.dispatch(turn_start_event("sess-agy-1", "Create agy-file.txt"))
         .await
         .unwrap();
@@ -674,7 +676,9 @@ async fn test_non_idle_turn_end_skips_attestation() {
     let mut orch = make_orchestrator(&dir);
     orch.set_agent("agy", "Antigravity CLI");
 
-    orch.dispatch(session_start_event("sess-agy-2")).await.unwrap();
+    orch.dispatch(session_start_event("sess-agy-2"))
+        .await
+        .unwrap();
     orch.dispatch(turn_start_event("sess-agy-2", "Create agy-file.txt"))
         .await
         .unwrap();
