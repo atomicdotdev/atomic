@@ -9,26 +9,24 @@
 //! atomic view list [OPTIONS]
 //!
 //! Options:
-//!   -v, --verbose  Show additional details (state hash, change count)
+//!   -s, --short    Show only view names (no metadata)
 //!   -h, --help     Print help information
 //! ```
 //!
 //! # Examples
 //!
-//! List all views:
+//! List all views (default — shows metadata):
 //! ```text
 //! $ atomic view list
-//!   dev
-//! * feature-auth
-//!   release-1.0
+//!   dev              [shared]    (3 changes)                 state: 2AAAAAAAA...
+//! * feature-auth     [draft]     (2 changes, 3 inherited)   state: XYZABCDEF...  parent: dev
 //! ```
 //!
-//! List with verbose output:
+//! Short listing (names only):
 //! ```text
-//! $ atomic view list --verbose
-//!   dev           (0 changes)   state: 2AAAAAAAA...
-//! * feature-auth  (3 changes)   state: XYZABCDEF...
-//!   release-1.0   (10 changes)  state: 123456789...
+//! $ atomic view list --short
+//!   dev
+//! * feature-auth
 //! ```
 
 use clap::Parser;
@@ -47,22 +45,29 @@ use std::path::PathBuf;
 /// List all views.
 ///
 /// Shows all views in the repository with the current view marked
-/// with an asterisk (*).
+/// with an asterisk (*). By default, displays metadata (scope, change
+/// count, state hash, parent). Use `--short` for names only.
 #[derive(Parser, Debug, Default)]
 #[command(name = "list")]
 pub struct List {
+    /// Show only view names (no metadata).
+    #[arg(long, short = 's')]
+    pub short: bool,
+
     /// Show additional details (state hash, change count).
     ///
-    /// When enabled, displays the Merkle state hash and number of
-    /// changes for each view.
-    #[arg(long, short = 'v')]
+    /// This is now the default behavior. Kept for backward compatibility.
+    #[arg(long, short = 'v', hide = true)]
     pub verbose: bool,
 }
 
 impl List {
     /// Create a new List command with default settings.
     pub fn new() -> Self {
-        Self { verbose: false }
+        Self {
+            short: false,
+            verbose: false,
+        }
     }
 
     /// Builder: set the verbose flag.
@@ -99,22 +104,18 @@ impl Command for List {
         let mut sorted_views = views;
         sorted_views.sort();
 
-        // Calculate padding for alignment in verbose mode
+        // Calculate padding for alignment
         let max_name_len = sorted_views.iter().map(|s| s.len()).max().unwrap_or(0);
 
         for view in sorted_views {
             let is_current = view == current;
             let marker = if is_current { "*" } else { " " };
 
-            if self.verbose {
-                // Get view info for verbose output
+            if self.short {
+                println!("{} {}", marker, style_view(&view));
+            } else {
                 match repo.get_view_info(&view) {
                     Ok(info) => {
-                        let change_word = if info.change_count == 1 {
-                            "change"
-                        } else {
-                            "changes"
-                        };
                         let kind_tag = match info.kind_label() {
                             "draft" => "[draft]",
                             _ => "[shared]",
@@ -123,13 +124,27 @@ impl Command for List {
                             Some(p) => format!("  parent: {}", style_view(p)),
                             None => String::new(),
                         };
+                        // Show own changes for views with a parent;
+                        // show total for root views.
+                        let change_display = if info.parent_name.is_some() {
+                            let own = info.own_change_count;
+                            let inherited = info.change_count.saturating_sub(info.own_change_count);
+                            if own == 1 {
+                                format!("({} change, {} inherited)", own, inherited)
+                            } else {
+                                format!("({} changes, {} inherited)", own, inherited)
+                            }
+                        } else if info.change_count == 1 {
+                            format!("({} change)", info.change_count)
+                        } else {
+                            format!("({} changes)", info.change_count)
+                        };
                         println!(
-                            "{} {:<width$}  {:<10}  ({} {})  state: {}{}",
+                            "{} {:<width$}  {:<10}  {}  state: {}{}",
                             marker,
                             style_view(&view),
                             kind_tag,
-                            info.change_count,
-                            change_word,
+                            change_display,
                             info.state_short(),
                             parent_info,
                             width = max_name_len
@@ -140,8 +155,6 @@ impl Command for List {
                         println!("{} {}", marker, style_view(&view));
                     }
                 }
-            } else {
-                println!("{} {}", marker, style_view(&view));
             }
         }
 
@@ -185,13 +198,14 @@ mod tests {
     #[test]
     fn test_default() {
         let cmd = List::default();
+        assert!(!cmd.short);
         assert!(!cmd.verbose);
     }
 
     #[test]
     fn test_new() {
         let cmd = List::new();
-        assert!(!cmd.verbose);
+        assert!(!cmd.short);
     }
 
     #[test]
@@ -221,7 +235,7 @@ mod tests {
         // Change to the repo directory
         std::env::set_current_dir(repo_path).unwrap();
 
-        // List views
+        // List views (default = verbose)
         let cmd = List::new();
         let result = cmd.run();
         assert!(result.is_ok());
@@ -271,7 +285,7 @@ mod tests {
         // Change to the repo directory
         std::env::set_current_dir(repo_path).unwrap();
 
-        // List views with verbose output
+        // List views with verbose output (same as default now)
         let cmd = List::new().with_verbose(true);
         let result = cmd.run();
         assert!(result.is_ok());

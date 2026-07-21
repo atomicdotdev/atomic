@@ -13,7 +13,7 @@
 //! * `T` — a read-only graph transaction implementing [`GraphTxnT`]
 //! * `C` — a change store implementing [`ChangeStore`]
 
-use super::three_way::{three_way_merge, tokenize, ThreeWayResult};
+use super::three_way::{three_way_merge, tokenize, MergeToken, ThreeWayResult};
 use super::{ConflictGroup, MergeOutcome, MergeSource};
 use crate::change::ChangeStore;
 use crate::pristine::{GraphTxnT, PristineError};
@@ -87,99 +87,189 @@ impl<'a, T: GraphTxnT, C: ChangeStore> SemanticMergeEngine<'a, T, C> {
     ///
     /// Returns [`PristineError`] on database access failure.
     pub fn try_merge(&self, group: &ConflictGroup) -> Result<MergeOutcome, PristineError> {
-        // Only two-way conflicts are candidates (the most common case).
-        if group.vertex_count() != 2 {
+        // ── Step 1: Read content for every vertex in the group ────────
+        //
+        // If any vertex's content is unreadable we give up immediately.
+        let mut vertex_contents: Vec<(GraphNode<NodeId>, Vec<u8>)> = Vec::new();
+        for v in &group.vertices {
+            match self.get_vertex_content(v) {
+                Ok(c) => vertex_contents.push((*v, c)),
+                Err(e) => {
+                    log::debug!("try_merge: cannot read vertex {}: {}", v, e);
+                    return Ok(MergeOutcome::NoCrdtData);
+                }
+            }
+        }
+        if vertex_contents.is_empty() {
+            return Ok(MergeOutcome::NoCrdtData);
+        }
+
+        // ── Step 2: Deduplicate identical-content vertices ────────────
+        //
+        // Collapse vertices that share byte-identical content into a
+        // single representative.  This handles the common N-way fork
+        // where multiple concurrent changes insert the same whitespace
+        // or the same boilerplate line.  Indices of surviving (unique)
+        // vertices are collected in `unique`; everything else lands in
+        // `skipped` so the caller can mark them.
+        let mut unique: Vec<usize> = vec![0];
+        let mut skipped: Vec<usize> = Vec::new();
+        for i in 1..vertex_contents.len() {
+            if unique
+                .iter()
+                .any(|&j| vertex_contents[j].1 == vertex_contents[i].1)
+            {
+                skipped.push(i);
+            } else {
+                unique.push(i);
+            }
+        }
+
+        // All vertices identical — no conflict at all.
+        if unique.len() == 1 && !skipped.is_empty() {
+            log::info!(
+                "try_merge: all {} vertices identical ({} bytes), deduplicating",
+                vertex_contents.len(),
+                vertex_contents[0].1.len(),
+            );
+            return Ok(MergeOutcome::AutoMerged {
+                content: vertex_contents[0].1.clone(),
+                sources: vec![MergeSource::new(vertex_contents[0].0.change, 0)],
+            });
+        }
+
+        // Partial dedup: log, but continue with the unique subset.
+        if !skipped.is_empty() {
+            log::info!(
+                "try_merge: dedup reduced {}-way fork to {}-way",
+                vertex_contents.len(),
+                unique.len(),
+            );
+        }
+
+        // After dedup we need exactly 2 unique sides for the merge
+        // pipeline below.  If there are still >2 unique sides, return
+        // NoCrdtData and let the caller emit markers for what remains.
+        if unique.len() != 2 {
             log::debug!(
-                "SemanticMergeEngine::try_merge: skipping {}-way conflict (only 2-way supported)",
-                group.vertex_count(),
+                "try_merge: {}-way conflict after dedup (only 2-way supported)",
+                unique.len(),
             );
             return Ok(MergeOutcome::NoCrdtData);
         }
 
-        let v_left = &group.vertices[0];
-        let v_right = &group.vertices[1];
+        let (v_left, left_content) = &vertex_contents[unique[0]];
+        let (v_right, right_content) = &vertex_contents[unique[1]];
 
-        // Step 1-2: Get content bytes for both competing vertices.
-        let left_content = match self.get_vertex_content(v_left) {
-            Ok(c) => c,
-            Err(e) => {
-                log::debug!(
-                    "SemanticMergeEngine::try_merge: cannot read left vertex {}: {}",
-                    v_left,
-                    e,
-                );
-                return Ok(MergeOutcome::NoCrdtData);
-            }
-        };
-
-        let right_content = match self.get_vertex_content(v_right) {
-            Ok(c) => c,
-            Err(e) => {
-                log::debug!(
-                    "SemanticMergeEngine::try_merge: cannot read right vertex {}: {}",
-                    v_right,
-                    e,
-                );
-                return Ok(MergeOutcome::NoCrdtData);
-            }
-        };
-
-        // Step 3: Find the common ancestor vertex (the dead vertex both sides
-        // replaced). Try the explicit `ancestor` field first, then fall back
-        // to graph-based discovery using the `parent` field.
+        // ── Step 3: Find the base (ancestor) for three-way merge ─────
+        //
+        // Strategy:
+        //   a) Explicit ancestor on the ConflictGroup
+        //   b) Graph-based ancestor discovery (dead vertex deleted by both)
+        //   c) Subsumption: use the shorter side as base (handles
+        //      concurrent insertions where one side is a token-level
+        //      superset of the other)
         let base_content = if let Some(ref ancestor) = group.ancestor {
             match self.get_vertex_content(ancestor) {
-                Ok(c) => c,
+                Ok(c) => Some(c),
                 Err(e) => {
-                    log::debug!(
-                        "SemanticMergeEngine::try_merge: cannot read ancestor {}: {}",
-                        ancestor,
-                        e,
-                    );
-                    return Ok(MergeOutcome::NoCrdtData);
+                    log::debug!("try_merge: cannot read ancestor {}: {}", ancestor, e);
+                    None
                 }
             }
         } else if let Some(ref parent) = group.parent {
             match self.find_ancestor_content(parent, v_left.change, v_right.change) {
-                Ok(Some(content)) => content,
-                Ok(None) => {
-                    log::debug!(
-                        "SemanticMergeEngine::try_merge: no ancestor found from parent {}",
-                        parent,
-                    );
-                    return Ok(MergeOutcome::NoCrdtData);
-                }
+                Ok(content) => content, // Some or None
                 Err(e) => {
-                    log::debug!(
-                        "SemanticMergeEngine::try_merge: ancestor search failed: {}",
-                        e,
-                    );
-                    return Ok(MergeOutcome::NoCrdtData);
+                    log::debug!("try_merge: ancestor search failed: {}", e);
+                    None
                 }
             }
         } else {
-            log::debug!(
-                "SemanticMergeEngine::try_merge: no ancestor or parent available, \
-                 falling back to NoCrdtData",
-            );
-            return Ok(MergeOutcome::NoCrdtData);
+            None
         };
 
-        // Step 5: Tokenize all three versions.
-        let base_tokens = tokenize(&base_content);
-        let left_tokens = tokenize(&left_content);
-        let right_tokens = tokenize(&right_content);
+        // ── Step 4: Three-way merge (ancestor → left, ancestor → right) ─
+        if let Some(ref base) = base_content {
+            let result = self.run_three_way(base, left_content, right_content, v_left, v_right);
+            if !matches!(result, Ok(MergeOutcome::NoCrdtData)) {
+                return result;
+            }
+        }
 
-        // Step 6-7-8: Three-way merge at the token level.
+        // ── Step 5: Subsumption for concurrent insertions ────────────
+        //
+        // No dead ancestor exists (both sides are pure additions).
+        // Check if one side's tokens are a subsequence of the other's.
+        // If so, the superset side subsumes the other and wins.
+        //
+        // This handles:
+        //   "{A, B, C}"  vs  "{A, B, C, D, E}"  →  keep the superset
+        //   "\n"         vs  "use HashMap;\n"    →  keep the longer one
+        let left_tokens = tokenize(left_content);
+        let right_tokens = tokenize(right_content);
+
+        // Check: are right's tokens a subsequence of left's? (left ⊇ right)
+        if is_token_subsequence(&right_tokens, &left_tokens) {
+            log::info!(
+                "try_merge: subsumption resolved ({} ⊇ {} bytes)",
+                left_content.len(),
+                right_content.len(),
+            );
+            return Ok(MergeOutcome::AutoMerged {
+                content: left_content.clone(),
+                sources: vec![
+                    MergeSource::new(v_left.change, left_tokens.len()),
+                    MergeSource::new(v_right.change, 0),
+                ],
+            });
+        }
+
+        // Check: are left's tokens a subsequence of right's? (right ⊇ left)
+        if is_token_subsequence(&left_tokens, &right_tokens) {
+            log::info!(
+                "try_merge: subsumption resolved ({} ⊇ {} bytes, reverse)",
+                right_content.len(),
+                left_content.len(),
+            );
+            return Ok(MergeOutcome::AutoMerged {
+                content: right_content.clone(),
+                sources: vec![
+                    MergeSource::new(v_right.change, right_tokens.len()),
+                    MergeSource::new(v_left.change, 0),
+                ],
+            });
+        }
+
+        log::debug!(
+            "try_merge: no resolution for concurrent insertion ({} vs {} bytes)",
+            left_content.len(),
+            right_content.len(),
+        );
+        Ok(MergeOutcome::NoCrdtData)
+    }
+
+    /// Run a three-way merge given a known base.
+    fn run_three_way(
+        &self,
+        base: &[u8],
+        left: &[u8],
+        right: &[u8],
+        v_left: &GraphNode<NodeId>,
+        v_right: &GraphNode<NodeId>,
+    ) -> Result<MergeOutcome, PristineError> {
+        let base_tokens = tokenize(base);
+        let left_tokens = tokenize(left);
+        let right_tokens = tokenize(right);
+
         match three_way_merge(&base_tokens, &left_tokens, &right_tokens) {
             ThreeWayResult::Merged(content) => {
                 log::debug!(
-                    "SemanticMergeEngine::try_merge: auto-merged {} + {} → {} bytes",
-                    left_content.len(),
-                    right_content.len(),
+                    "try_merge: auto-merged {} + {} → {} bytes",
+                    left.len(),
+                    right.len(),
                     content.len(),
                 );
-
                 let left_token_count = left_tokens
                     .iter()
                     .zip(base_tokens.iter())
@@ -190,7 +280,6 @@ impl<'a, T: GraphTxnT, C: ChangeStore> SemanticMergeEngine<'a, T, C> {
                     .zip(base_tokens.iter())
                     .filter(|(r, b)| r != b)
                     .count();
-
                 Ok(MergeOutcome::AutoMerged {
                     content,
                     sources: vec![
@@ -200,15 +289,11 @@ impl<'a, T: GraphTxnT, C: ChangeStore> SemanticMergeEngine<'a, T, C> {
                 })
             }
             ThreeWayResult::Conflict => {
-                log::debug!(
-                    "SemanticMergeEngine::try_merge: conflict between {} and {}",
-                    v_left,
-                    v_right,
-                );
+                log::debug!("try_merge: conflict between {} and {}", v_left, v_right);
                 Ok(MergeOutcome::Conflict {
-                    base: base_content,
-                    left: left_content,
-                    right: right_content,
+                    base: base.to_vec(),
+                    left: left.to_vec(),
+                    right: right.to_vec(),
                     left_change: v_left.change,
                     right_change: v_right.change,
                 })
@@ -290,6 +375,33 @@ impl<'a, T: GraphTxnT, C: ChangeStore> SemanticMergeEngine<'a, T, C> {
 
         Ok(None)
     }
+}
+
+/// Check whether `sub`'s tokens are a subsequence of `sup`'s tokens.
+///
+/// A subsequence means every token in `sub` appears in `sup` in the
+/// same order, possibly with extra tokens interspersed in `sup`.
+///
+/// This is used for concurrent insertion resolution: if side A's tokens
+/// are a subsequence of side B's, then B is a superset that contains
+/// everything A has plus more — B subsumes A.
+fn is_token_subsequence(sub: &[MergeToken], sup: &[MergeToken]) -> bool {
+    if sub.is_empty() {
+        return true;
+    }
+    if sub.len() > sup.len() {
+        return false;
+    }
+    let mut si = 0; // index into sub
+    for token in sup {
+        if token == &sub[si] {
+            si += 1;
+            if si == sub.len() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ===========================================================================
