@@ -332,6 +332,7 @@ Every change stores two parallel representations:
 | `atomic agent disable` | Remove agent hooks |
 | `atomic agent status` | Show active sessions and hook status |
 | `atomic agent explain <id>` | Generate AI reasoning summary for a session |
+| `atomic agent recall <query>` | Search local prior turns as non-durable evidence |
 | `atomic agent attest` | List and inspect attestations |
 
 ### Vault Commands

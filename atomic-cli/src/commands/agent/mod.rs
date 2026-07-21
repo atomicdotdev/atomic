@@ -11,6 +11,7 @@
 //! ├── enable   — Install agent hooks (e.g., into .claude/settings.json)
 //! ├── disable  — Remove agent hooks
 //! ├── status   — Show active sessions, installed agents, watcher state
+//! ├── recall   — Search local prior turns as non-durable evidence
 //! └── hooks    — Internal hook handlers (called by agent hooks, hidden)
 //!     └── <agent> <verb>  — e.g., `atomic agent hooks claude-code stop`
 //! ```
@@ -43,6 +44,7 @@ mod enable;
 mod explain;
 mod hooks;
 mod lifecycle;
+mod recall;
 mod status;
 
 use clap::{Args, Subcommand};
@@ -55,6 +57,7 @@ pub use disable::Disable;
 pub use enable::Enable;
 pub use explain::Explain;
 pub use lifecycle::Lifecycle;
+pub use recall::Recall;
 pub use status::AgentStatus;
 
 // Agent Command
@@ -170,6 +173,20 @@ pub enum AgentCommands {
     /// ```
     Explain(Explain),
 
+    /// Search prior recorded agent work for task-relevant evidence.
+    ///
+    /// Recall is read-only and searches this repository's recorded turn
+    /// changes, including saved reasoning when available. Results are
+    /// historical evidence, not approved Vault Memory or instructions.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic agent recall "authentication timeout"
+    /// atomic agent recall "authentication timeout" --json
+    /// ```
+    Recall(Recall),
+
     /// List and inspect attestations.
     ///
     /// Shows graph-level audit nodes that capture AI cost, token usage,
@@ -220,6 +237,7 @@ impl Command for Agent {
             AgentCommands::Disable(cmd) => cmd.run(),
             AgentCommands::Status(cmd) => cmd.run(),
             AgentCommands::Explain(cmd) => cmd.run(),
+            AgentCommands::Recall(cmd) => cmd.run(),
             AgentCommands::Attest(cmd) => cmd.run(),
             AgentCommands::Lifecycle(cmd) => cmd.run(),
             AgentCommands::Hooks(cmd) => cmd.run(),
@@ -241,5 +259,6 @@ mod tests {
         let _disable = AgentCommands::Disable(Disable::default_for_test());
         let _status = AgentCommands::Status(AgentStatus::default_for_test());
         let _explain = AgentCommands::Explain(Explain::default_for_test());
+        let _recall = AgentCommands::Recall(Recall::default_for_test());
     }
 }

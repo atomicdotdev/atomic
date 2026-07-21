@@ -182,6 +182,7 @@ dependencies = [
  "indicatif",
  "log",
  "open",
+ "postcard",
  "rayon",
  "reqwest",
  "serde",
@@ -192,6 +193,7 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
