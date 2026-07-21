@@ -1,0 +1,24 @@
+# Provenance: Learned Representations of the Patch Monoid — Position Paper
+
+- **Date:** 2026-07-19
+- **Rounds:** 1 research round (4 parallel researchers + lead codebase inspection), 1 review pass, 1 rewrite (implementation plan → position paper)
+- **Sources consulted:** 40+ (13 GNN/hyperbolic papers, 27 conflict/evaluation/software-ML papers, 18 Rust ML sources, 6 Atomic codebase modules)
+- **Sources accepted:** 30 (numbered references in final paper)
+- **Sources rejected:** None dead; safetensors URL returns 301 redirect (still accessible)
+- **Verification:** PASS WITH NOTES
+  - Bracket computation: bilinear approximation set as default; full bracket noted as ablation
+  - Temporal features: added to L1 input features per JITGNN/temporal-graph evidence
+  - All key source URLs verified reachable (curl spot-check)
+  - Codebase claims verified via direct code inspection (EdgeFlags, CRDT tables, ai/ module, EMBEDDINGS table)
+  - No experimental results reported or claimed — position paper explicitly states this
+- **Plan:** outputs/.plans/atomic-neural-graph.md
+- **Research files:**
+  - outputs/.drafts/atomic-neural-graph-research-T1.md (GNN + hyperbolic)
+  - outputs/.drafts/atomic-neural-graph-research-T2.md (self-supervised VCS ML)
+  - outputs/.drafts/atomic-neural-graph-research-T3.md (candle/Rust inference)
+  - outputs/.drafts/atomic-neural-graph-research-T4.md (conflict prediction + eval)
+  - outputs/.drafts/atomic-neural-graph-research-T5.md (Atomic codebase inspection)
+  - outputs/.drafts/atomic-neural-graph-draft.md (original implementation plan draft)
+  - outputs/.drafts/atomic-neural-graph-verification.md (review findings)
+  - outputs/.drafts/atomic-neural-graph-revised.md (revised implementation plan)
+- **Final form:** Position paper (merged from design doc + provenance; implementation details condensed to Appendix A)

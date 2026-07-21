@@ -164,3 +164,17 @@ fuzz/artifacts/
 
 packages/node_modules/
 packages/dist/
+/outputs/.drafts/atomic-neural-graph-cited.md
+/outputs/.drafts/atomic-neural-graph-draft.md
+/outputs/.drafts/atomic-neural-graph-research-T1.md
+/outputs/.drafts/atomic-neural-graph-research-T2.md
+/outputs/.drafts/atomic-neural-graph-research-T3.md
+/outputs/.drafts/atomic-neural-graph-research-T4.md
+/outputs/.drafts/atomic-neural-graph-research-T5.md
+/outputs/.drafts/atomic-neural-graph-revised.md
+/outputs/.drafts/atomic-neural-graph-verification.md
+/outputs/.plans/atomic-neural-graph-T1.md
+/outputs/.plans/atomic-neural-graph-T2.md
+/outputs/.plans/atomic-neural-graph-T3.md
+/outputs/.plans/atomic-neural-graph-T4.md
+/outputs/.plans/atomic-neural-graph.md

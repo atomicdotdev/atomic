@@ -10,8 +10,12 @@ pub struct ViewInfo {
     pub name: String,
     /// The current Merkle state (hash of all inserted changes)
     pub state: Merkle,
-    /// The number of changes inserted into this view
+    /// Total number of changes in this view's VIEW_CHANGES
+    /// (includes inherited changes for draft views).
     pub change_count: u64,
+    /// Number of changes unique to this view (not in the parent).
+    /// For shared views or views without a parent, this equals `change_count`.
+    pub own_change_count: u64,
     /// View scope (Draft or Shared)
     pub scope: ViewScope,
     /// Parent view name, if any
@@ -509,19 +513,30 @@ impl Repository {
                 name: name.to_string(),
             })?;
 
-        // Resolve parent name if the view has a parent
-        let parent_name = if let Some(parent_id) = view.parent {
-            txn.get_view_by_id(parent_id)
+        // Resolve parent name and compute own change count.
+        let (parent_name, parent_change_count) = if let Some(parent_id) = view.parent {
+            match txn
+                .get_view_by_id(parent_id)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?
-                .map(|p| p.name)
+            {
+                Some(p) => (Some(p.name), p.change_count),
+                None => (None, 0),
+            }
         } else {
-            None
+            (None, 0)
+        };
+
+        let own_change_count = if view.parent.is_some() {
+            view.change_count.saturating_sub(parent_change_count)
+        } else {
+            view.change_count
         };
 
         Ok(ViewInfo {
             name: view.name.clone(),
             state: view.state,
             change_count: view.change_count,
+            own_change_count,
             scope: view.kind,
             parent_name,
         })

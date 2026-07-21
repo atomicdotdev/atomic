@@ -411,8 +411,8 @@ where
                 resolved.insert_unresolved_fork(fork.children.clone());
             }
             Ok(MergeOutcome::NoCrdtData) | Ok(MergeOutcome::Clean(_)) => {
-                // No CRDT data — still need to wrap the fork in markers
-                // so both sides are visible to the user.
+                // NoCrdtData after dedup means >2 unique sides remain.
+                // Emit markers for all children.
                 resolved.insert_unresolved_fork(fork.children.clone());
             }
             Err(e) => {
