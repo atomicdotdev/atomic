@@ -113,6 +113,7 @@ const SECTION_NOTE: &str =
 ///
 /// assert_eq!(context_file_for_agent("claude-code"), "CLAUDE.md");
 /// assert_eq!(context_file_for_agent("gemini-cli"), "GEMINI.md");
+/// assert_eq!(context_file_for_agent("agy"), "AGENTS.md");
 /// assert_eq!(context_file_for_agent("codex"), "codex.md");
 /// assert_eq!(context_file_for_agent("opencode"), "opencode.md");
 /// assert_eq!(context_file_for_agent("kiro"), "AGENTS.md");
@@ -122,6 +123,7 @@ pub fn context_file_for_agent(agent_name: &str) -> &'static str {
     match agent_name {
         "claude-code" => "CLAUDE.md",
         "gemini-cli" => "GEMINI.md",
+        "agy" => "AGENTS.md",
         "codex" => "codex.md",
         "opencode" => "opencode.md",
         "kiro" => "AGENTS.md",

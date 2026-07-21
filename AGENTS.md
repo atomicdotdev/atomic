@@ -383,7 +383,7 @@ Relevant code: `atomic-config/src/lib.rs` (`WorkspaceConfig`, `RepoConfig`),
 **Summary**: All ignored files are shelved per-view by default. Paths in
 `[workspace] expose` are the exception — they persist across all views.
 `atomic init` seeds `expose` with common tool configs (`.opencode`, `.vscode`,
-`.idea`, `.claude`, `.gemini`). No per-language shelve lists needed.
+`.idea`, `.claude`, `.gemini`, `.agents`). No per-language shelve lists needed.
 
 ### Single GRAPH Architecture
 

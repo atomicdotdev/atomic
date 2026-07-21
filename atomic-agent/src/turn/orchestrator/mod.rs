@@ -375,6 +375,7 @@ pub(crate) fn vendor_from_agent_name(agent_name: &str) -> &'static str {
         "copilot" => "github",
         "cursor" => "anthropic",
         "gemini-cli" => "google",
+        "agy" => "google",
         "codex" => "openai",
         "kiro" => "amazon-bedrock",
         "opencode" => "openai",

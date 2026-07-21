@@ -613,6 +613,7 @@ fn pretty_tool(description: &str) -> String {
         "claude-code" => "Claude Code",
         "codex" => "Codex",
         "gemini-cli" => "Gemini CLI",
+        "agy" => "Antigravity CLI",
         "cursor" => "Cursor",
         "devin" => "Devin Desktop",
         "cline" => "Cline",

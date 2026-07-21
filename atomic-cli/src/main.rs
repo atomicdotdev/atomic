@@ -138,9 +138,9 @@ struct Cli {
 enum Commands {
     /// Manage AI agent integration.
     ///
-    /// Install hooks for AI coding agents (Claude Code, Gemini CLI, Codex,
-    /// OpenCode) so that each agent turn is automatically recorded as an
-    /// Atomic change with full provenance and session metadata.
+    /// Install hooks for AI coding agents (Claude Code, Antigravity CLI,
+    /// Gemini CLI, Codex, OpenCode) so that each agent turn is automatically
+    /// recorded as an Atomic change with full provenance and session metadata.
     ///
     /// # Examples
     ///

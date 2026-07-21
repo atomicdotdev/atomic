@@ -56,6 +56,7 @@
 //! assert!(names.contains(&"claude-code"));
 //! ```
 
+pub mod agy;
 pub mod claude_code;
 pub mod cline;
 pub mod codex;
@@ -231,6 +232,32 @@ pub trait AgentHook: Send + Sync + fmt::Debug {
     /// Claude Code returns:
     /// `["session-start", "session-end", "stop", "user-prompt-submit", "pre-task", "post-task", "post-todo"]`
     fn hook_verbs(&self) -> Vec<&str>;
+
+    /// Returns the response body the agent expects on hook stdout, if any.
+    ///
+    /// Most agents ignore hook stdout (or display it to the user), so the
+    /// default is `None` — stay quiet. Some agents read a JSON object from
+    /// stdout as part of their hook contract (e.g., Antigravity's
+    /// `PostToolUse` expects `{}`); adapters for those agents return the
+    /// body to print after the event is dispatched.
+    fn stdout_response(&self, hook_type: HookType) -> Option<&'static str> {
+        let _ = hook_type;
+        None
+    }
+
+    /// Returns directories to search for the repository root, derived from
+    /// the parsed event, if the agent's hooks do not run with the workspace
+    /// as the process working directory.
+    ///
+    /// Most agents execute hooks in the workspace, so the default (`None`)
+    /// means "resolve from the current directory". Antigravity executes
+    /// plugin hooks with the plugin's install directory as cwd, so its
+    /// adapter returns the event's `workspacePaths` instead. The first
+    /// directory containing a repository (or sandbox pointer) wins.
+    fn repo_root_hints(&self, event: &TurnEvent) -> Option<Vec<std::path::PathBuf>> {
+        let _ = event;
+        None
+    }
 }
 
 // AgentRegistry
@@ -275,6 +302,7 @@ impl AgentRegistry {
     /// Create a registry pre-populated with all built-in agent adapters.
     ///
     /// Currently includes:
+    /// - Antigravity CLI (`agy`)
     /// - Claude Code (`claude-code`)
     /// - Cline (`cline`)
     /// - Codex (`codex`)
@@ -290,6 +318,7 @@ impl AgentRegistry {
     /// - Sherpa (`sherpa`)
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
+        registry.register(Box::new(agy::AgyHook::new()));
         registry.register(Box::new(claude_code::ClaudeCodeHook::new()));
         registry.register(Box::new(cline::ClineHook::new()));
         registry.register(Box::new(codex::CodexHook::new()));
