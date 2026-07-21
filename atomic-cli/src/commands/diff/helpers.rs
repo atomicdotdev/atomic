@@ -21,6 +21,48 @@ impl Diff {
         print_info("No changes detected");
     }
 
+    /// Check whether a repository-relative path passes the positional
+    /// file filter (`atomic diff --change <hash> <file>...`).
+    ///
+    /// Returns `true` when no files were specified (no filtering) or when
+    /// the path exactly matches one of the given files. A leading `./` on
+    /// either side is tolerated.
+    pub(super) fn file_matches_filter(&self, path: &str) -> bool {
+        if self.files.is_empty() {
+            return true;
+        }
+        let path = path.strip_prefix("./").unwrap_or(path);
+        self.files.iter().any(|f| {
+            let f = f.strip_prefix("./").unwrap_or(f.as_str());
+            f == path
+        })
+    }
+
+    /// Filter computed file diffs down to the paths given on the command
+    /// line, rebuilding the aggregate stats from the surviving entries.
+    ///
+    /// This is a no-op when no positional files were specified.
+    pub(super) fn filter_file_diffs(
+        &self,
+        file_diffs: Vec<FileDiff>,
+        stats: DiffStats,
+    ) -> (Vec<FileDiff>, DiffStats) {
+        if self.files.is_empty() {
+            return (file_diffs, stats);
+        }
+        let file_diffs: Vec<FileDiff> = file_diffs
+            .into_iter()
+            .filter(|d| {
+                self.file_matches_filter(&d.old_path) || self.file_matches_filter(&d.new_path)
+            })
+            .collect();
+        let mut stats = DiffStats::new();
+        for d in &file_diffs {
+            stats.add_file(d.stats.clone());
+        }
+        (file_diffs, stats)
+    }
+
     /// Show the diff for a specific change by hash or prefix.
     ///
     /// This displays the content introduced by the change using state-based
@@ -52,6 +94,7 @@ impl Diff {
         // FileOps or the expensive graph reconstruction fallback. Graph-first
         // imported changes may intentionally have no FileOps yet.
         if let Some((file_diffs, stats)) = Self::build_git_import_file_diffs(&change) {
+            let (file_diffs, stats) = self.filter_file_diffs(file_diffs, stats);
             return self.print_change_file_diffs(&change, &hash, config, file_diffs, stats);
         }
 
@@ -76,6 +119,7 @@ impl Diff {
         config: &DiffOutputConfig,
     ) -> CliResult<()> {
         if let Some((file_diffs, stats)) = Self::build_git_import_file_diffs(change) {
+            let (file_diffs, stats) = self.filter_file_diffs(file_diffs, stats);
             if file_diffs.is_empty() {
                 self.print_no_changes();
                 return Ok(());
@@ -105,6 +149,12 @@ impl Diff {
 
         for ops in file_ops {
             let file_path = ops.path();
+
+            // Honor the positional file filter (`diff --change <hash> <file>`)
+            if !self.file_matches_filter(file_path) {
+                continue;
+            }
+
             let trunk_op = ops.trunk_op();
             let line_ops = ops.line_ops();
 
@@ -553,8 +603,12 @@ impl Diff {
     ) -> CliResult<()> {
         use atomic_repository::get_files_in_change;
 
-        // Get all files modified by this change
-        let modified_files = get_files_in_change(change);
+        // Get all files modified by this change, honoring the positional
+        // file filter (`diff --change <hash> <file>`)
+        let modified_files: Vec<_> = get_files_in_change(change)
+            .into_iter()
+            .filter(|path| self.file_matches_filter(path))
+            .collect();
 
         if modified_files.is_empty() {
             self.print_no_changes();

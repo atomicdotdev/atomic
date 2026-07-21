@@ -625,6 +625,90 @@ mod tests {
         assert_eq!(diff.change, Some("abc123".to_string()));
     }
 
+    // File filter tests (`diff --change <hash> <file>`)
+
+    #[test]
+    fn test_file_matches_filter_empty_matches_everything() {
+        let diff = Diff::new();
+        assert!(diff.file_matches_filter("src/lib.rs"));
+        assert!(diff.file_matches_filter("a.txt"));
+    }
+
+    #[test]
+    fn test_file_matches_filter_exact_match() {
+        let diff = Diff::new().with_files(vec!["a.txt"]);
+        assert!(diff.file_matches_filter("a.txt"));
+        assert!(!diff.file_matches_filter("b.txt"));
+        assert!(!diff.file_matches_filter("dir/a.txt"));
+    }
+
+    #[test]
+    fn test_file_matches_filter_tolerates_dot_slash_prefix() {
+        let diff = Diff::new().with_files(vec!["./a.txt"]);
+        assert!(diff.file_matches_filter("a.txt"));
+
+        let diff = Diff::new().with_files(vec!["b.txt"]);
+        assert!(diff.file_matches_filter("./b.txt"));
+    }
+
+    #[test]
+    fn test_filter_file_diffs_no_files_is_noop() {
+        let diff = Diff::new();
+        let mut stats = DiffStats::new();
+        let d = FileDiff::modified("a.txt");
+        stats.add_file(d.stats.clone());
+        let (diffs, stats) = diff.filter_file_diffs(vec![d], stats);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(stats.file_count(), 1);
+    }
+
+    #[test]
+    fn test_filter_file_diffs_keeps_only_matching_files() {
+        let diff = Diff::new().with_files(vec!["a.txt"]);
+
+        let mut a = FileDiff::modified("a.txt");
+        a.stats = FileDiffStats::modified("a.txt", 2, 1);
+        let mut b = FileDiff::modified("b.txt");
+        b.stats = FileDiffStats::modified("b.txt", 5, 5);
+
+        let mut stats = DiffStats::new();
+        stats.add_file(a.stats.clone());
+        stats.add_file(b.stats.clone());
+
+        let (diffs, stats) = diff.filter_file_diffs(vec![a, b], stats);
+
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].new_path, "a.txt");
+        // Stats are rebuilt from the surviving entries only
+        assert_eq!(stats.file_count(), 1);
+        assert_eq!(stats.total_insertions(), 2);
+        assert_eq!(stats.total_deletions(), 1);
+    }
+
+    #[test]
+    fn test_filter_file_diffs_added_file_matches_new_path() {
+        // Added files have old_path == "/dev/null"; the filter must match
+        // against new_path.
+        let diff = Diff::new().with_files(vec!["new.txt"]);
+
+        let mut added = FileDiff::added("new.txt");
+        added.stats = FileDiffStats::added("new.txt", 3);
+
+        let (diffs, stats) = diff.filter_file_diffs(vec![added], DiffStats::new());
+
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(stats.total_insertions(), 3);
+    }
+
+    #[test]
+    fn test_filter_file_diffs_no_match_yields_empty() {
+        let diff = Diff::new().with_files(vec!["nonexistent.txt"]);
+        let d = FileDiff::modified("a.txt");
+        let (diffs, stats) = diff.filter_file_diffs(vec![d], DiffStats::new());
+        assert!(diffs.is_empty());
+        assert!(!stats.has_changes());
+    }
+
     #[test]
     fn test_git_import_diff_metadata_without_file_ops_builds_file_diff() {
         use atomic_core::change::ChangeHeader;
