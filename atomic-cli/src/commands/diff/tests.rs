@@ -709,6 +709,160 @@ mod tests {
         assert!(!stats.has_changes());
     }
 
+    // Hunk grouping tests (true offsets + context from FileOps line numbers)
+
+    use super::super::helpers::NumberedLine;
+
+    /// Build before-content lines "l1".."lN".
+    fn before_lines(n: usize) -> Vec<Vec<u8>> {
+        (1..=n).map(|i| format!("l{}", i).into_bytes()).collect()
+    }
+
+    #[test]
+    fn test_hunks_pure_insertion_zero_context_header() {
+        // Insert two lines after old line 15 (new lines 17,18; one prior
+        // insertion nets +1).
+        let changed = vec![
+            NumberedLine::added("x", 17, 1),
+            NumberedLine::added("y", 18, 2),
+        ];
+        let hunks = Diff::hunks_from_changed_lines(&changed, None, 3);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].header(), "@@ -15,0 +17,2 @@");
+        assert_eq!(hunks[0].lines.len(), 2);
+        assert!(hunks[0].lines.iter().all(|l| l.is_added()));
+    }
+
+    #[test]
+    fn test_hunks_pure_insertion_with_context() {
+        let before = before_lines(30);
+        let changed = vec![
+            NumberedLine::added("x", 17, 1),
+            NumberedLine::added("y", 18, 2),
+        ];
+        let hunks = Diff::hunks_from_changed_lines(&changed, Some(&before), 3);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].header(), "@@ -13,6 +14,8 @@");
+
+        let lines = &hunks[0].lines;
+        assert_eq!(lines.len(), 8);
+        // 3 context before (old 13-15 / new 14-16), 2 added, 3 context after
+        assert!(lines[0].is_context() && lines[0].content == "l13");
+        assert!(lines[1].is_context() && lines[1].content == "l14");
+        assert!(lines[2].is_context() && lines[2].content == "l15");
+        assert_eq!(lines[2].new_line_num, Some(16));
+        assert!(lines[3].is_added() && lines[3].new_line_num == Some(17));
+        assert!(lines[4].is_added() && lines[4].new_line_num == Some(18));
+        assert!(lines[5].is_context() && lines[5].content == "l16");
+        assert_eq!(lines[5].new_line_num, Some(19));
+        assert!(lines[7].is_context() && lines[7].content == "l18");
+    }
+
+    #[test]
+    fn test_hunks_pure_deletion_with_context() {
+        let before = before_lines(40);
+        let changed = vec![
+            NumberedLine::removed("a", 30, 0),
+            NumberedLine::removed("b", 31, -1),
+        ];
+        let hunks = Diff::hunks_from_changed_lines(&changed, Some(&before), 3);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].header(), "@@ -27,8 +27,6 @@");
+
+        let lines = &hunks[0].lines;
+        // 3 context, 2 removed, 3 context
+        assert_eq!(lines.len(), 8);
+        assert!(lines[0].is_context() && lines[0].content == "l27");
+        assert!(lines[3].is_removed() && lines[3].old_line_num == Some(30));
+        assert!(lines[4].is_removed() && lines[4].old_line_num == Some(31));
+        assert!(lines[5].is_context() && lines[5].content == "l32");
+        assert_eq!(lines[5].new_line_num, Some(30));
+    }
+
+    #[test]
+    fn test_hunks_full_file_deletion_zero_context() {
+        // Entire 3-line file deleted: git convention is @@ -1,3 +0,0 @@
+        let changed = vec![
+            NumberedLine::removed("a", 1, 0),
+            NumberedLine::removed("b", 2, -1),
+            NumberedLine::removed("c", 3, -2),
+        ];
+        let hunks = Diff::hunks_from_changed_lines(&changed, None, 3);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].header(), "@@ -1,3 +0,0 @@");
+    }
+
+    #[test]
+    fn test_hunks_new_file_header() {
+        // Brand-new file: git convention is @@ -0,0 +1,N @@
+        let changed = vec![
+            NumberedLine::added("a", 1, 0),
+            NumberedLine::added("b", 2, 1),
+            NumberedLine::added("c", 3, 2),
+        ];
+        let hunks = Diff::hunks_from_changed_lines(&changed, None, 3);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].header(), "@@ -0,0 +1,3 @@");
+    }
+
+    #[test]
+    fn test_hunks_split_on_gap_beyond_double_context() {
+        // Insertions after old lines 10 and 15: 5 unchanged lines between
+        // them, so with context 0 they form separate hunks.
+        let changed = vec![
+            NumberedLine::added("x", 11, 0),
+            NumberedLine::added("y", 17, 1),
+        ];
+        let hunks = Diff::hunks_from_changed_lines(&changed, None, 0);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].header(), "@@ -10,0 +11,1 @@");
+        assert_eq!(hunks[1].header(), "@@ -15,0 +17,1 @@");
+    }
+
+    #[test]
+    fn test_hunks_merge_within_double_context() {
+        // Same two insertions (boundaries 10 and 15) merge when context 3
+        // bridges the 5 unchanged lines between them.
+        let before = before_lines(30);
+        let changed = vec![
+            NumberedLine::added("x", 11, 0),
+            NumberedLine::added("y", 17, 1),
+        ];
+        let hunks = Diff::hunks_from_changed_lines(&changed, Some(&before), 3);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].header(), "@@ -8,11 +8,13 @@");
+
+        let lines = &hunks[0].lines;
+        // ctx 8,9,10 | +11 | ctx old 11-15 (new 12-16) | +17 | ctx old 16-18
+        assert_eq!(lines.len(), 13);
+        assert!(lines[3].is_added() && lines[3].new_line_num == Some(11));
+        assert!(lines[4].is_context() && lines[4].content == "l11");
+        assert_eq!(lines[4].new_line_num, Some(12));
+        assert!(lines[9].is_added() && lines[9].new_line_num == Some(17));
+        assert!(lines[10].is_context() && lines[10].content == "l16");
+        assert_eq!(lines[10].new_line_num, Some(18));
+    }
+
+    #[test]
+    fn test_hunks_modify_pair_offsets() {
+        // A Modify emits adjacent removed+added at line 5.
+        let changed = vec![
+            NumberedLine::removed("old", 5, 0),
+            NumberedLine::added("new", 5, -1),
+        ];
+        let hunks = Diff::hunks_from_changed_lines(&changed, None, 3);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].header(), "@@ -5,1 +5,1 @@");
+        assert!(hunks[0].lines[0].is_removed());
+        assert!(hunks[0].lines[1].is_added());
+    }
+
+    #[test]
+    fn test_hunks_empty_input() {
+        let hunks = Diff::hunks_from_changed_lines(&[], None, 3);
+        assert!(hunks.is_empty());
+    }
+
     #[test]
     fn test_git_import_diff_metadata_without_file_ops_builds_file_diff() {
         use atomic_core::change::ChangeHeader;
