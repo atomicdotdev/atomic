@@ -131,6 +131,7 @@ impl CodexHook {
             path: PathBuf::from("~/.codex/hooks.json"),
             reason: "Could not determine home directory for Codex hooks".to_string(),
         })?;
+        ensure_hooks_feature(&path)?;
         install_hooks_at(&path, force)
     }
 
@@ -287,7 +288,9 @@ impl AgentHook for CodexHook {
     }
 
     fn install(&self, repo_root: &Path) -> AgentResult<usize> {
-        install_hooks_at(&Self::local_hooks_path(repo_root), false)
+        let path = Self::local_hooks_path(repo_root);
+        ensure_hooks_feature(&path)?;
+        install_hooks_at(&path, false)
     }
 
     fn uninstall(&self, repo_root: &Path) -> AgentResult<()> {
@@ -352,6 +355,91 @@ fn install_hooks_at(path: &Path, force: bool) -> AgentResult<usize> {
 
     write_hooks_file(path, &config)?;
     Ok(installed)
+}
+
+/// Ensure Codex's `[features] hooks = true` flag is set in the `config.toml`
+/// sibling to the given hooks file, migrating the deprecated `codex_hooks`
+/// name if present (mirrors the atomic-codex install script).
+///
+/// Without this flag Codex never fires the hooks, so a hooks-only install
+/// would be inert. Returns `true` if the file was changed. The flag is left
+/// in place on uninstall — other tools may rely on it.
+fn ensure_hooks_feature(hooks_path: &Path) -> AgentResult<bool> {
+    let Some(config_dir) = hooks_path.parent() else {
+        return Ok(false);
+    };
+    let config_path = config_dir.join("config.toml");
+
+    let mut doc: toml::Value = if config_path.exists() {
+        let content =
+            std::fs::read_to_string(&config_path).map_err(|e| AgentError::ConfigError {
+                operation: "read config.toml".to_string(),
+                path: config_path.clone(),
+                reason: e.to_string(),
+            })?;
+        if content.trim().is_empty() {
+            toml::Value::Table(Default::default())
+        } else {
+            content
+                .parse::<toml::Value>()
+                .map_err(|e| AgentError::ConfigError {
+                    operation: "parse config.toml".to_string(),
+                    path: config_path.clone(),
+                    reason: e.to_string(),
+                })?
+        }
+    } else {
+        toml::Value::Table(Default::default())
+    };
+
+    let Some(root) = doc.as_table_mut() else {
+        return Ok(false);
+    };
+    let features = root
+        .entry("features".to_string())
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    let Some(features) = features.as_table_mut() else {
+        return Ok(false);
+    };
+
+    let mut changed = false;
+
+    // Migrate the deprecated flag name (only the enabled form, mirroring
+    // the install script's `codex_hooks = true` → `hooks = true` sed).
+    if features.get("codex_hooks") == Some(&toml::Value::Boolean(true)) {
+        features.remove("codex_hooks");
+        changed = true;
+    }
+
+    if features.get("hooks") != Some(&toml::Value::Boolean(true)) {
+        features.insert("hooks".to_string(), toml::Value::Boolean(true));
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(false);
+    }
+
+    if !config_dir.exists() {
+        std::fs::create_dir_all(config_dir).map_err(|e| AgentError::ConfigError {
+            operation: "create directory".to_string(),
+            path: config_dir.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+    }
+
+    let serialized = toml::to_string_pretty(&doc).map_err(|e| AgentError::ConfigError {
+        operation: "serialize config.toml".to_string(),
+        path: config_path.clone(),
+        reason: e.to_string(),
+    })?;
+    std::fs::write(&config_path, serialized).map_err(|e| AgentError::ConfigError {
+        operation: "write config.toml".to_string(),
+        path: config_path,
+        reason: e.to_string(),
+    })?;
+
+    Ok(true)
 }
 
 fn uninstall_hooks_at(path: &Path) -> AgentResult<()> {
@@ -954,5 +1042,85 @@ mod tests {
         let hooks_path = dir.path().join(CODEX_DIR).join(HOOKS_FILE);
         install_hooks_at(&hooks_path, false).unwrap();
         assert_eq!(install_hooks_at(&hooks_path, true).unwrap(), 5);
+    }
+
+    // Feature flag tests ([features] hooks = true in config.toml)
+
+    #[test]
+    fn test_install_creates_config_toml_with_hooks_flag() {
+        let dir = TempDir::new().unwrap();
+        make_hook().install(dir.path()).unwrap();
+
+        let config_path = dir.path().join(CODEX_DIR).join("config.toml");
+        assert!(config_path.exists());
+        let doc: toml::Value = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            doc.get("features").and_then(|f| f.get("hooks")),
+            Some(&toml::Value::Boolean(true))
+        );
+    }
+
+    #[test]
+    fn test_feature_flag_migrates_codex_hooks() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(CODEX_DIR);
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            "[features]\ncodex_hooks = true\n",
+        )
+        .unwrap();
+
+        make_hook().install(dir.path()).unwrap();
+
+        let doc: toml::Value = std::fs::read_to_string(codex_dir.join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let features = doc.get("features").unwrap();
+        assert_eq!(features.get("hooks"), Some(&toml::Value::Boolean(true)));
+        assert!(features.get("codex_hooks").is_none());
+    }
+
+    #[test]
+    fn test_feature_flag_preserves_other_settings() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(CODEX_DIR);
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            "model = \"gpt-5\"\n\n[features]\nunified_exec = true\n",
+        )
+        .unwrap();
+
+        make_hook().install(dir.path()).unwrap();
+
+        let doc: toml::Value = std::fs::read_to_string(codex_dir.join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            doc.get("model"),
+            Some(&toml::Value::String("gpt-5".to_string()))
+        );
+        let features = doc.get("features").unwrap();
+        assert_eq!(
+            features.get("unified_exec"),
+            Some(&toml::Value::Boolean(true))
+        );
+        assert_eq!(features.get("hooks"), Some(&toml::Value::Boolean(true)));
+    }
+
+    #[test]
+    fn test_feature_flag_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let hooks_path = dir.path().join(CODEX_DIR).join(HOOKS_FILE);
+
+        assert!(ensure_hooks_feature(&hooks_path).unwrap());
+        // Second run is a no-op.
+        assert!(!ensure_hooks_feature(&hooks_path).unwrap());
     }
 }

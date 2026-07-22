@@ -21,6 +21,7 @@ watchman_client = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
 postcard = { workspace = true }
+toml = { workspace = true }
 
 # Compression (for transcript storage in unhashed section)
 zstd = { workspace = true }
