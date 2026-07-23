@@ -108,6 +108,15 @@ pub struct ServerConfig {
     /// Example: `identity = "alice-staging"`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
+
+    /// Whether the server is a single-tenant deployment.
+    ///
+    /// Single-tenant servers (reported by the registration response's
+    /// `mode = "single"`) serve exactly one organization at their bare host:
+    /// org-scoped URLs are NOT prefixed with the org slug — every path is
+    /// already scoped to the single tenant server-side.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub single_tenant: bool,
 }
 
 impl ServerConfig {
@@ -123,8 +132,17 @@ impl ServerConfig {
     ///
     /// Given `url = "http://localhost:8080"` and `org = "alice"`,
     /// returns `"http://alice.localhost:8080"`.
+    ///
+    /// For single-tenant servers the org is already implied by the server
+    /// itself, so the URL is returned unchanged (no `{org}.` prefix).
     pub fn org_base_url(&self, org_slug: &str) -> Option<String> {
         let url = self.url.as_ref()?;
+
+        // Single-tenant: the bare host is already tenant-scoped server-side;
+        // prefixing would produce bogus hosts like `org.org.org.example.com`.
+        if self.single_tenant {
+            return Some(url.trim_end_matches('/').to_string());
+        }
 
         // Parse the URL to extract scheme, host, port
         let url_parsed = url::Url::parse(url).ok()?;
@@ -465,6 +483,7 @@ mod tests {
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
             identity: None,
+            single_tenant: false,
         };
         assert!(config.is_configured());
 
@@ -474,6 +493,7 @@ mod tests {
             default_org: None,
             default_workspaces: BTreeMap::new(),
             identity: None,
+            single_tenant: false,
         };
         assert!(!partial.is_configured());
 
@@ -483,6 +503,7 @@ mod tests {
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
             identity: None,
+            single_tenant: false,
         };
         assert!(!partial.is_configured());
     }
@@ -494,6 +515,7 @@ mod tests {
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
             identity: None,
+            single_tenant: false,
         };
         assert_eq!(
             config.org_base_url("alice"),
@@ -512,6 +534,7 @@ mod tests {
             default_org: None,
             default_workspaces: BTreeMap::new(),
             identity: None,
+            single_tenant: false,
         };
         assert_eq!(
             config.org_base_url("alice"),
@@ -526,6 +549,7 @@ mod tests {
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
             identity: None,
+            single_tenant: false,
         };
         assert_eq!(
             config.default_org_base_url(),
@@ -538,6 +562,7 @@ mod tests {
             default_org: None,
             default_workspaces: BTreeMap::new(),
             identity: None,
+            single_tenant: false,
         };
         assert!(config.default_org_base_url().is_none());
     }
@@ -549,6 +574,7 @@ mod tests {
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
             identity: None,
+            single_tenant: false,
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -573,6 +599,7 @@ mod tests {
                 default_org: Some("alice".to_string()),
                 default_workspaces: BTreeMap::new(),
                 identity: None,
+                single_tenant: false,
             },
             ..GlobalConfig::default()
         };
@@ -597,6 +624,7 @@ mod tests {
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
             identity: None,
+            single_tenant: false,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         assert!(!toml_str.contains("default_workspaces"));
@@ -613,6 +641,7 @@ mod tests {
             default_org: Some("alice".to_string()),
             default_workspaces: workspaces,
             identity: None,
+            single_tenant: false,
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -664,5 +693,60 @@ email = "test@example.com"
         assert!(!parsed.server.is_configured());
         assert!(parsed.server.url.is_none());
         assert!(parsed.server.default_org.is_none());
+    }
+
+    #[test]
+    fn test_org_base_url_single_tenant_not_prefixed() {
+        let config = ServerConfig {
+            url: Some("https://storage.acme.com".to_string()),
+            default_org: Some("acme".to_string()),
+            default_workspaces: BTreeMap::new(),
+            identity: None,
+            single_tenant: true,
+        };
+        // Single-tenant: the bare host is already tenant-scoped — no org prefix.
+        assert_eq!(
+            config.org_base_url("acme").as_deref(),
+            Some("https://storage.acme.com")
+        );
+        // Any org slug returns the bare host unchanged.
+        assert_eq!(
+            config.org_base_url("anything-else").as_deref(),
+            Some("https://storage.acme.com")
+        );
+        assert_eq!(
+            config.default_org_base_url().as_deref(),
+            Some("https://storage.acme.com")
+        );
+    }
+
+    #[test]
+    fn test_org_base_url_single_tenant_strips_trailing_slash() {
+        let config = ServerConfig {
+            url: Some("https://storage.acme.com/".to_string()),
+            default_org: Some("acme".to_string()),
+            default_workspaces: BTreeMap::new(),
+            identity: None,
+            single_tenant: true,
+        };
+        assert_eq!(
+            config.org_base_url("acme").as_deref(),
+            Some("https://storage.acme.com")
+        );
+    }
+
+    #[test]
+    fn test_single_tenant_defaults_false_for_legacy_configs() {
+        // Configs written before the field existed must deserialize as
+        // multi-tenant (org-prefixed) — no migration needed.
+        let legacy = r#"url = "https://atomic.storage"
+default_org = "alice"
+"#;
+        let config: ServerConfig = toml::from_str(legacy).unwrap();
+        assert!(!config.single_tenant);
+        assert_eq!(
+            config.org_base_url("alice").as_deref(),
+            Some("https://alice.atomic.storage")
+        );
     }
 }

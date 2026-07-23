@@ -203,6 +203,12 @@ impl Register {
                 .get("base_url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("(unknown)");
+            // Single-tenant deployments report `mode: "single"` (field added
+            // server-side in v1.4.0; absent on older servers = multi-tenant).
+            // On a single-tenant server the typed URL IS the tenant URL —
+            // no `{org}.` prefixing — so the profile must keep it verbatim
+            // and mark the server single-tenant.
+            let (single_tenant, role) = parse_tenancy_mode(data);
 
             let clean_server_url = self.server_url.trim_end_matches('/').to_string();
             let mut config = GlobalConfig::load().map_err(|e| {
@@ -223,6 +229,7 @@ impl Register {
                     default_org: Some(slug.to_string()),
                     default_workspaces: std::collections::BTreeMap::new(),
                     identity: Some(identity.name.clone()),
+                    single_tenant,
                 };
 
                 config.servers.insert(profile_name.clone(), profile);
@@ -248,6 +255,7 @@ impl Register {
                 // Default path: update the legacy [server] block.
                 config.server.url = Some(clean_server_url.clone());
                 config.server.default_org = Some(slug.to_string());
+                config.server.single_tenant = single_tenant;
             }
 
             config.save().map_err(|e| {
@@ -260,6 +268,12 @@ impl Register {
             println!("  Slug:      {slug}");
             println!("  URL:       {base_url}");
             println!("  Identity:  {} ({})", identity.name, identity.id.short());
+            if single_tenant {
+                println!(
+                    "  Mode:      single-tenant (role: {})",
+                    role.unwrap_or("member")
+                );
+            }
 
             if slug != username {
                 println!();
@@ -356,6 +370,18 @@ fn derive_profile_name(server_url: &str) -> Option<String> {
     }
 }
 
+/// Interpret the registration response's tenancy signal.
+///
+/// `mode: "single"` (server v1.4.0+) marks a single-tenant deployment and
+/// carries the org `role` the identity received; anything else — `"multi"`
+/// or a missing field (older servers) — keeps multi-tenant URL semantics.
+/// Returns `(single_tenant, role)`.
+fn parse_tenancy_mode(data: &serde_json::Value) -> (bool, Option<&str>) {
+    let single = data.get("mode").and_then(|v| v.as_str()) == Some("single");
+    let role = data.get("role").and_then(|v| v.as_str());
+    (single, role)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +409,32 @@ mod tests {
 
         assert_eq!(endpoint_a, "https://atomic.storage/register");
         assert_eq!(endpoint_b, "https://atomic.storage/register");
+    }
+
+    #[test]
+    fn tenancy_mode_single_with_role() {
+        let data = serde_json::json!({"mode": "single", "role": "owner"});
+        let (single, role) = parse_tenancy_mode(&data);
+        assert!(single);
+        assert_eq!(role, Some("owner"));
+    }
+
+    #[test]
+    fn tenancy_mode_multi() {
+        let data = serde_json::json!({"mode": "multi"});
+        let (single, role) = parse_tenancy_mode(&data);
+        assert!(!single);
+        assert_eq!(role, None);
+    }
+
+    #[test]
+    fn tenancy_mode_missing_field_defaults_multi() {
+        // Legacy server responses (pre-mode field) must not flip profile
+        // semantics — they keep org-prefixed URLs.
+        let data = serde_json::json!({"slug": "alice", "base_url": "https://alice.atomic.storage"});
+        let (single, role) = parse_tenancy_mode(&data);
+        assert!(!single);
+        assert_eq!(role, None);
     }
 
     #[test]

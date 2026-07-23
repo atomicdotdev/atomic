@@ -253,6 +253,9 @@ impl ServerCmd {
             default_org: add.org.clone(),
             default_workspaces: std::collections::BTreeMap::new(),
             identity: add.identity.clone(),
+            // Auto-detected at registration; manual profiles default to
+            // multi-tenant URL semantics.
+            single_tenant: false,
         };
 
         config.servers.insert(add.name.clone(), profile);
