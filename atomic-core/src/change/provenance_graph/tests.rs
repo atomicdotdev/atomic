@@ -108,7 +108,7 @@ fn test_builder_minimal() {
         .timestamp(1000)
         .build();
 
-    assert_eq!(graph.version, 2);
+    assert_eq!(graph.version, 3);
     assert_eq!(graph.timestamp, 1000);
     assert_eq!(graph.session_id, "sess-1");
     assert_eq!(graph.agent_name, "agent");
@@ -155,7 +155,7 @@ fn test_profile_roundtrips_through_serialization() {
 fn test_profile_absent_on_old_graph_deserializes_as_none() {
     // Simulate a v1 payload: build a ProvenanceGraphV1 directly and
     // serialize it with postcard (no profile field), then wrap it with
-    // the PRVG magic and verify that deserialize upgrades it to v2 with
+    // the PRVG magic and verify that deserialize upgrades it to v3 with
     // profile = None.
     let v1 = ProvenanceGraphV1 {
         version: 1,
@@ -179,8 +179,34 @@ fn test_profile_absent_on_old_graph_deserializes_as_none() {
 
     assert!(loaded.profile.is_none());
     // Version is upgraded to current schema version in memory.
-    assert_eq!(loaded.version, 2);
+    assert_eq!(loaded.version, 3);
     assert_eq!(loaded.session_id, "sess-old");
+}
+
+#[test]
+fn test_v2_graph_upgrades_without_generic_context() {
+    let v2 = ProvenanceGraphV2 {
+        version: 2,
+        timestamp: 600,
+        session_id: "sess-v2".into(),
+        agent_name: "opencode".into(),
+        agent_display_name: "OpenCode".into(),
+        agent_vendor: "openai".into(),
+        nodes: Vec::new(),
+        edges: Vec::new(),
+        changes_explained: Vec::new(),
+        previous: None,
+        stats: ProvenanceStats::default(),
+        profile: None,
+    };
+    let payload = postcard::to_allocvec(&v2).unwrap();
+    let mut bytes = b"PRVG".to_vec();
+    bytes.extend_from_slice(&payload);
+
+    let (loaded, _) = ProvenanceGraph::deserialize(&bytes).unwrap();
+    assert_eq!(loaded.version, 3);
+    assert_eq!(loaded.plan_id, None);
+    assert!(loaded.todos.is_empty());
 }
 
 #[test]
@@ -288,11 +314,33 @@ fn test_serialize_deserialize_roundtrip_minimal() {
     let bytes = graph.serialize().unwrap();
     let (loaded, hash) = ProvenanceGraph::deserialize(&bytes).unwrap();
 
-    assert_eq!(loaded.version, 2);
+    assert_eq!(loaded.version, 3);
     assert_eq!(loaded.session_id, "sess-1");
     assert_eq!(loaded.agent_name, "agent");
     assert_eq!(loaded.timestamp, 1000);
     assert!(!hash.to_base32().is_empty());
+}
+
+#[test]
+fn test_generic_plan_and_todos_roundtrip() {
+    use crate::change::session::SessionTodo;
+
+    let graph = ProvenanceGraph::builder("sess-plan", "opencode")
+        .plan_id("ATOM-20")
+        .todos(vec![SessionTodo {
+            id: "todo-1".into(),
+            content: "Emit hasTodo".into(),
+            status: "completed".into(),
+            priority: "high".into(),
+        }])
+        .build();
+    let bytes = graph.serialize().unwrap();
+    let (loaded, _) = ProvenanceGraph::deserialize(&bytes).unwrap();
+
+    assert_eq!(loaded.plan_id.as_deref(), Some("ATOM-20"));
+    assert_eq!(loaded.todos.len(), 1);
+    assert_eq!(loaded.todos[0].id, "todo-1");
+    assert_eq!(loaded.todos[0].status, "completed");
 }
 
 #[test]

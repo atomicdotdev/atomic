@@ -296,6 +296,326 @@ impl Repository {
         Ok(hash)
     }
 
+    /// Build and persist the latest content-addressed manifest for a session.
+    ///
+    /// `parent_session`/`fork_turn` record fork lineage when a session was
+    /// created by forking another at a specific turn boundary.
+    pub fn publish_session_manifest_with_fork(
+        &self,
+        session_id: &str,
+        parent_session: Option<Hash>,
+        fork_turn: Option<u32>,
+    ) -> Result<Hash, RepositoryError> {
+        use atomic_core::change::session::SessionManifest;
+
+        let (_, turns) = self.get_session_ledger(session_id)?.ok_or_else(|| {
+            RepositoryError::Database(format!("session not found: {}", session_id))
+        })?;
+        let goal_provenance = turns
+            .iter()
+            .find_map(|turn| turn.goal.as_ref().map(|_| turn.provenance_hash));
+        let manifest = SessionManifest {
+            schema_version: 2,
+            session_id: session_id.to_string(),
+            goal_provenance,
+            turns,
+            parent_session,
+            fork_turn,
+        };
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let hash = txn
+            .save_session_manifest(&manifest)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(hash)
+    }
+
+    /// Build and persist the latest content-addressed manifest for a session.
+    pub fn publish_session_manifest(&self, session_id: &str) -> Result<Hash, RepositoryError> {
+        self.publish_session_manifest_with_fork(session_id, None, None)
+    }
+
+    /// Load an immutable session manifest by content hash.
+    pub fn get_session_manifest(
+        &self,
+        hash: &Hash,
+    ) -> Result<Option<atomic_core::change::session::SessionManifest>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.get_session_manifest(hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))
+    }
+
+    /// Resolve the latest manifest hash for an external session ID.
+    pub fn get_session_head(&self, session_id: &str) -> Result<Option<Hash>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.get_session_head(session_id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))
+    }
+
+    /// Store a session manifest received from another repository.
+    ///
+    /// Idempotent: storing the same content hash twice is a no-op. The
+    /// convenience head advances to this manifest for its session ID.
+    pub fn ingest_session_manifest(
+        &self,
+        manifest: &atomic_core::change::session::SessionManifest,
+    ) -> Result<Hash, RepositoryError> {
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let hash = txn
+            .save_session_manifest(manifest)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(hash)
+    }
+
+    /// Rebuild session indexes from stored provenance graphs.
+    ///
+    /// Idempotent: existing `(session, provenance)` pairs are skipped, so a
+    /// rebuilt repository never gains duplicate turns. Corrupt provenance
+    /// files are reported in the result rather than aborting the rebuild.
+    /// Returns `(indexed_count, skipped_existing, corrupt_count)`.
+    pub fn rebuild_session_index(&self) -> Result<(usize, usize, usize), RepositoryError> {
+        use atomic_core::change::session::{encode_session_turn_key, session_turn_namespace};
+
+        let mut indexed = 0usize;
+        let mut skipped = 0usize;
+        let mut corrupt = 0usize;
+
+        // Collect (hash, graph) pairs first so each write txn is short-lived.
+        let mut graphs: Vec<(Hash, atomic_core::change::ProvenanceGraph)> = Vec::new();
+        for result in self.change_store.iter_provenance_graphs() {
+            match result {
+                Ok(hash) => match self.load_provenance_graph(&hash) {
+                    Ok(graph) => graphs.push((hash, graph)),
+                    Err(_) => corrupt += 1,
+                },
+                Err(_) => corrupt += 1,
+            }
+        }
+
+        // Group by session and sort each group by timestamp so turn numbers
+        // are deterministic even for graphs indexed out of order.
+        let mut by_session: std::collections::BTreeMap<
+            String,
+            Vec<(Hash, atomic_core::change::ProvenanceGraph)>,
+        > = std::collections::BTreeMap::new();
+        for (hash, graph) in graphs {
+            by_session
+                .entry(graph.session_id.clone())
+                .or_default()
+                .push((hash, graph));
+        }
+
+        for (session_id, mut session_graphs) in by_session {
+            session_graphs.sort_by_key(|(_, g)| g.timestamp);
+
+            // Read existing reverse entries once to detect already-indexed
+            // provenance hashes.
+            let existing: std::collections::HashSet<Hash> = {
+                let txn = self
+                    .pristine
+                    .read_txn()
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                let record = txn
+                    .get_session_record(&session_id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                let mut set = std::collections::HashSet::new();
+                if record.is_some() {
+                    for turn in txn
+                        .get_session_turns(&session_id)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    {
+                        set.insert(turn.provenance_hash);
+                    }
+                }
+                set
+            };
+
+            let json_path = self
+                .dot_dir
+                .join("sessions")
+                .join(format!("{}.json", session_id))
+                .to_string_lossy()
+                .to_string();
+
+            let mut txn = self
+                .pristine
+                .write_txn()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let mut any_new = false;
+            for (hash, graph) in &session_graphs {
+                if existing.contains(hash) {
+                    skipped += 1;
+                    continue;
+                }
+                // Determine the turn number: existing count if present,
+                // otherwise position in the sorted group.
+                let turn_number = {
+                    let ns = session_turn_namespace(&session_id);
+                    let current = txn
+                        .count_session_turns(&ns)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    current as u32
+                };
+                let key = encode_session_turn_key(session_turn_namespace(&session_id), turn_number);
+                txn.index_turn_at(&session_id, &json_path, hash, graph, turn_number, &key)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                any_new = true;
+                indexed += 1;
+            }
+            txn.commit()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+            if any_new {
+                if let Err(e) = self.publish_session_manifest(&session_id) {
+                    log::warn!("Manifest publication failed for {}: {}", session_id, e);
+                }
+            }
+        }
+
+        Ok((indexed, skipped, corrupt))
+    }
+
+    /// Reconcile lifecycle metadata for an agent session.
+    ///
+    /// Called from session start/end hooks. `ended_at: None` marks the
+    /// session active (clearing a stale end marker on resume); `Some(ts)`
+    /// marks it ended. Best-effort callers treat failures as recoverable
+    /// divergence — the JSON session file remains the runtime fallback and
+    /// `rebuild_session_index` can reconcile later.
+    pub fn upsert_session_lifecycle(
+        &self,
+        session_id: &str,
+        view_name: Option<String>,
+        parent_view: Option<String>,
+        ended_at: Option<i64>,
+    ) -> Result<(), RepositoryError> {
+        let json_path = self
+            .dot_dir
+            .join("sessions")
+            .join(format!("{}.json", session_id))
+            .to_string_lossy()
+            .to_string();
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.upsert_session_lifecycle(session_id, &json_path, view_name, parent_view, ended_at)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Create a forked session from a parent at a turn boundary.
+    ///
+    /// The child inherits the parent's turn records through `fork_turn` as an
+    /// immutable ledger prefix. No provenance graphs or session rows are
+    /// copied — the child manifest references the parent by content hash.
+    ///
+    /// Returns `(parent_manifest_hash, child_manifest_hash)`.
+    pub fn fork_session(
+        &self,
+        parent_session_id: &str,
+        fork_turn: u32,
+        child_session_id: &str,
+    ) -> Result<(Hash, Hash), RepositoryError> {
+        // Resolve the parent ledger and manifest.
+        let (parent_record, parent_turns) =
+            self.get_session_ledger(parent_session_id)?.ok_or_else(|| {
+                RepositoryError::Database(format!(
+                    "parent session not found: {}",
+                    parent_session_id
+                ))
+            })?;
+
+        let last_parent_turn = parent_record.turn_count.saturating_sub(1);
+        if fork_turn > last_parent_turn && parent_record.turn_count > 0 {
+            return Err(RepositoryError::Database(format!(
+                "fork turn {} exceeds parent turn {} for session {}",
+                fork_turn, last_parent_turn, parent_session_id
+            )));
+        }
+
+        let parent_manifest = self
+            .publish_session_manifest(parent_session_id)
+            .map_err(|e| RepositoryError::Database(format!("parent manifest: {}", e)))?;
+
+        // Seed the child session record with the inherited ledger prefix:
+        // turns 0..=fork_turn from the parent. The child reuses the parent's
+        // immutable turn rows — we copy the references, not the provenance.
+        let inherited: Vec<atomic_core::change::session::SessionTurn> = parent_turns
+            .into_iter()
+            .filter(|t| t.turn_number <= fork_turn)
+            .map(|mut t| {
+                t.session_id = child_session_id.to_string();
+                t
+            })
+            .collect();
+
+        let child_json_path = self
+            .dot_dir
+            .join("sessions")
+            .join(format!("{}.json", child_session_id))
+            .to_string_lossy()
+            .to_string();
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        for turn in &inherited {
+            txn.index_inherited_turn(child_session_id, &child_json_path, turn)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
+        // Create the child record even when no turns are inherited.
+        if inherited.is_empty() {
+            txn.index_empty_session(
+                child_session_id,
+                &child_json_path,
+                parent_record.view_name.clone(),
+                parent_record.parent_view.clone(),
+            )
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
+        // Taxonomy: child session prov:wasDerivedFrom parent session (ATOM-16),
+        // in the same transaction as the inherited ledger prefix.
+        txn.emit_session_fork_kg(
+            child_session_id,
+            parent_session_id,
+            fork_turn,
+            &parent_manifest,
+        )
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let child_manifest = self
+            .publish_session_manifest_with_fork(
+                child_session_id,
+                Some(parent_manifest),
+                Some(fork_turn),
+            )
+            .map_err(|e| RepositoryError::Database(format!("child manifest: {}", e)))?;
+
+        Ok((parent_manifest, child_manifest))
+    }
+
     /// Load an attestation from the repository by hash.
     pub fn load_attestation(
         &self,
@@ -677,8 +997,31 @@ impl Repository {
         txn.populate_session_tables(prov_id.get(), graph)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        // Maintain the Atomic-native session ledger alongside the provenance
+        // registration. The JSON file is a mutable runtime cache; this index
+        // connects the external session identity to immutable turn objects.
+        let json_path = self
+            .dot_dir
+            .join("sessions")
+            .join(format!("{}.json", graph.session_id))
+            .to_string_lossy()
+            .to_string();
+        txn.index_session_turn(&graph.session_id, &json_path, &hash, graph)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Publish the immutable session manifest after the provenance/index
+        // transaction commits. A failed publication never invalidates the
+        // already-committed provenance graph; it can be rebuilt later.
+        if let Err(e) = self.publish_session_manifest(&graph.session_id) {
+            log::warn!(
+                "Session {} indexed but manifest publication failed: {}",
+                graph.session_id,
+                e
+            );
+        }
 
         Ok(hash)
     }
@@ -837,6 +1180,84 @@ impl Repository {
         graphs.sort_by_key(|(_, g)| g.timestamp);
 
         Ok(graphs)
+    }
+
+    /// Read the Atomic-native indexed ledger for a session.
+    ///
+    /// Unlike `find_provenance_for_session`, this reads only the session index
+    /// and turn records; it does not scan unrelated provenance files.
+    pub fn get_session_ledger(
+        &self,
+        session_id: &str,
+    ) -> Result<
+        Option<(
+            atomic_core::change::session::SessionRecord,
+            Vec<atomic_core::change::session::SessionTurn>,
+        )>,
+        RepositoryError,
+    > {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let record = txn
+            .get_session_record(session_id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        match record {
+            Some(record) => {
+                let turns = txn
+                    .get_session_turns(session_id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                Ok(Some((record, turns)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// List recent session ledgers, newest activity first.
+    ///
+    /// Recency is the latest turn timestamp, falling back to `ended_at` and
+    /// then `started_at`. Session ID breaks timestamp ties deterministically.
+    pub fn list_session_ledgers(
+        &self,
+        limit: usize,
+    ) -> Result<
+        Vec<(
+            atomic_core::change::session::SessionRecord,
+            Vec<atomic_core::change::session::SessionTurn>,
+        )>,
+        RepositoryError,
+    > {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let records = txn
+            .list_session_records()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let mut ledgers = Vec::with_capacity(records.len());
+        for record in records {
+            let turns = txn
+                .get_session_turns(&record.session_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            ledgers.push((record, turns));
+        }
+        ledgers.sort_by(|(a_record, a_turns), (b_record, b_turns)| {
+            let activity =
+                |record: &atomic_core::change::session::SessionRecord,
+                 turns: &[atomic_core::change::session::SessionTurn]| {
+                    turns
+                        .last()
+                        .map(|turn| turn.timestamp)
+                        .or(record.ended_at)
+                        .unwrap_or(record.started_at)
+                };
+            activity(b_record, b_turns)
+                .cmp(&activity(a_record, a_turns))
+                .then_with(|| a_record.session_id.cmp(&b_record.session_id))
+        });
+        ledgers.truncate(limit);
+        Ok(ledgers)
     }
 
     // =========================================================================

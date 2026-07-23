@@ -619,8 +619,18 @@ impl Push {
         // Upload provenance graphs that explain the pushed changes.
         // Provenance graphs are causal decision DAGs — they travel with
         // their dependencies but aren't part of any view's changelog.
+        //
+        // Same model as .change files: query the server's flat inventory,
+        // upload only what it does not already hold.
         let mut provenance_count = 0;
         {
+            let remote_provenance: std::collections::HashSet<String> = remote
+                .get_provenance_list()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+
             let all_pushed_hashes: Vec<Hash> = to_upload.iter().map(|c| c.hash).collect();
 
             // Collect unique provenance graphs — same dedup logic as attestations.
@@ -647,6 +657,11 @@ impl Push {
                     .all(|h| all_pushed_hashes.contains(h));
 
                 if !all_explained {
+                    continue;
+                }
+
+                // Skip provenance the server already holds (presence delta).
+                if remote_provenance.contains(&prov_hash.to_base32()) {
                     continue;
                 }
 

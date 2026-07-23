@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use atomic_core::types::Base32;
+use atomic_core::types::{Base32, Hash};
 use atomic_remote::{HttpRemote, HttpRemoteConfig};
 use atomic_repository::history::HistoryOptions;
 use atomic_repository::{InsertOptions, Repository};
@@ -535,6 +535,74 @@ impl Pull {
                 format_bytes(stats.bytes_transferred)
             ),
         );
+
+        // Sync provenance graphs using the same model as .change files:
+        // the server advertises a flat inventory, we pull the hashes we do
+        // not have. Saving each graph registers its dependencies (best
+        // effort), indexes the session ledger, and publishes the session
+        // manifest locally — the receiving repository rebuilds the full
+        // Atomic session index without any relationship queries against
+        // the server.
+        let mut provenance_count = 0usize;
+        match remote.get_provenance_list().await {
+            Ok(remote_provenance) => {
+                for prov_hash_str in remote_provenance {
+                    let Some(prov_hash) = Hash::from_base32(prov_hash_str.as_bytes()) else {
+                        continue;
+                    };
+                    if repo.has_provenance_graph(&prov_hash) {
+                        continue;
+                    }
+                    match remote.download_provenance(&prov_hash_str).await {
+                        Ok(data) => {
+                            match atomic_core::change::ProvenanceGraph::deserialize(&data) {
+                                Ok((graph, computed)) => {
+                                    if computed != prov_hash {
+                                        print_warning(&format!(
+                                            "Provenance {} failed hash verification — skipped",
+                                            &prov_hash_str[..12.min(prov_hash_str.len())]
+                                        ));
+                                        continue;
+                                    }
+                                    match repo.save_provenance_graph(&graph) {
+                                        Ok(_) => provenance_count += 1,
+                                        Err(e) => print_warning(&format!(
+                                            "Failed to register provenance {}: {}",
+                                            &prov_hash_str[..12.min(prov_hash_str.len())],
+                                            e
+                                        )),
+                                    }
+                                }
+                                Err(e) => print_warning(&format!(
+                                    "Corrupt provenance {}: {}",
+                                    &prov_hash_str[..12.min(prov_hash_str.len())],
+                                    e
+                                )),
+                            }
+                        }
+                        Err(e) => print_warning(&format!(
+                            "Failed to download provenance {}: {}",
+                            &prov_hash_str[..12.min(prov_hash_str.len())],
+                            e
+                        )),
+                    }
+                }
+            }
+            Err(_) => {
+                // Server does not support the provenance inventory extension —
+                // provenance sync is skipped, not fatal.
+                print_hint(
+                    "Remote does not support provenance sync; session provenance stays local",
+                );
+            }
+        }
+        if provenance_count > 0 {
+            println!(
+                "  {} {}",
+                success("✓"),
+                format_count(provenance_count, "provenance graph")
+            );
+        }
 
         // Apply changes (unless download-only)
         if self.download_only {

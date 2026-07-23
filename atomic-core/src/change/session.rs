@@ -27,6 +27,175 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::Hash;
+
+/// Repository-indexed identity and current state for an agent session.
+///
+/// The JSON file under `.atomic/sessions/` remains mutable runtime state. This
+/// record is the durable Atomic index that connects that file to the immutable
+/// turn/provenance ledger.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub session_id: String,
+    pub json_path: String,
+    pub view_name: Option<String>,
+    pub parent_view: Option<String>,
+    pub first_provenance: Option<Hash>,
+    pub latest_provenance: Option<Hash>,
+    pub turn_count: u32,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+}
+
+/// Index entry connecting one session turn to its immutable Atomic objects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionTurn {
+    pub session_id: String,
+    pub turn_number: u32,
+    pub goal: Option<String>,
+    pub provenance_hash: Hash,
+    pub change_hashes: Vec<Hash>,
+    pub previous_provenance: Option<Hash>,
+    pub timestamp: i64,
+    /// Stable vault work-item/intent ID governing this turn, when known.
+    #[serde(default)]
+    pub plan_id: Option<String>,
+    /// Todo snapshot captured at the end of this turn.
+    #[serde(default)]
+    pub todos: Vec<SessionTodo>,
+}
+
+/// Generic todo snapshot carried by provenance and the session ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTodo {
+    /// Upstream stable ID when supplied; otherwise a turn-local snapshot ID.
+    pub id: String,
+    pub content: String,
+    pub status: String,
+    pub priority: String,
+}
+
+/// Pre-plan/todo SessionTurn encoding (ATOM-15).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionTurnV1 {
+    session_id: String,
+    turn_number: u32,
+    goal: Option<String>,
+    provenance_hash: Hash,
+    change_hashes: Vec<Hash>,
+    previous_provenance: Option<Hash>,
+    timestamp: i64,
+}
+
+impl From<SessionTurnV1> for SessionTurn {
+    fn from(value: SessionTurnV1) -> Self {
+        Self {
+            session_id: value.session_id,
+            turn_number: value.turn_number,
+            goal: value.goal,
+            provenance_hash: value.provenance_hash,
+            change_hashes: value.change_hashes,
+            previous_provenance: value.previous_provenance,
+            timestamp: value.timestamp,
+            plan_id: None,
+            todos: Vec::new(),
+        }
+    }
+}
+
+/// Pre-plan/todo SessionManifest encoding (schema v1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionManifestV1 {
+    schema_version: u8,
+    session_id: String,
+    goal_provenance: Option<Hash>,
+    turns: Vec<SessionTurnV1>,
+    parent_session: Option<Hash>,
+    fork_turn: Option<u32>,
+}
+
+/// Portable, content-addressed root for an Atomic session ledger.
+///
+/// The manifest deliberately contains external hashes and no repository-local
+/// Redb IDs. Local indexes can be rebuilt from it after synchronization.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionManifest {
+    pub schema_version: u8,
+    pub session_id: String,
+    pub goal_provenance: Option<Hash>,
+    pub turns: Vec<SessionTurn>,
+    pub parent_session: Option<Hash>,
+    pub fork_turn: Option<u32>,
+}
+
+impl SessionRecord {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).expect("SessionRecord serialization")
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes)
+    }
+}
+
+impl SessionTurn {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).expect("SessionTurn serialization")
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes)
+            .or_else(|_| postcard::from_bytes::<SessionTurnV1>(bytes).map(SessionTurn::from))
+    }
+}
+
+impl SessionManifest {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).expect("SessionManifest serialization")
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes).or_else(|_| {
+            postcard::from_bytes::<SessionManifestV1>(bytes).map(|legacy| Self {
+                schema_version: 2,
+                session_id: legacy.session_id,
+                goal_provenance: legacy.goal_provenance,
+                turns: legacy.turns.into_iter().map(SessionTurn::from).collect(),
+                parent_session: legacy.parent_session,
+                fork_turn: legacy.fork_turn,
+            })
+        })
+    }
+
+    /// Return the content hash of this exact manifest encoding.
+    pub fn content_hash(&self) -> Hash {
+        Hash::of(&self.to_bytes())
+    }
+}
+
+/// Encode `(session_namespace, turn_number)` for ordered Redb scans.
+#[inline]
+pub fn encode_session_turn_key(session_id: [u8; 32], turn_number: u32) -> [u8; 40] {
+    let mut key = [0u8; 40];
+    key[0..32].copy_from_slice(&session_id);
+    key[36..40].copy_from_slice(&turn_number.to_be_bytes());
+    key
+}
+
+/// Decode a session turn key.
+#[inline]
+pub fn decode_session_turn_key(key: &[u8; 40]) -> ([u8; 32], u32) {
+    let session_id = key[0..32].try_into().unwrap();
+    let turn_number = u32::from_be_bytes(key[36..40].try_into().unwrap());
+    (session_id, turn_number)
+}
+
+/// Derive the local ordered-index prefix for an external session ID.
+#[inline]
+pub fn session_turn_namespace(session_id: &str) -> [u8; 32] {
+    *blake3::hash(session_id.as_bytes()).as_bytes()
+}
+
 // ---------------------------------------------------------------------------
 // Value types
 // ---------------------------------------------------------------------------
@@ -662,5 +831,122 @@ mod tests {
             "expected compact serialization, got {} bytes",
             bytes.len()
         );
+    }
+
+    #[test]
+    fn test_session_record_roundtrip() {
+        let record = SessionRecord {
+            session_id: "sess-1".into(),
+            json_path: ".atomic/sessions/sess-1.json".into(),
+            view_name: Some("agent-sess-1".into()),
+            parent_view: Some("main".into()),
+            first_provenance: Some(Hash::of(b"p0")),
+            latest_provenance: Some(Hash::of(b"p1")),
+            turn_count: 2,
+            started_at: 100,
+            ended_at: None,
+        };
+
+        assert_eq!(
+            SessionRecord::from_bytes(&record.to_bytes()).unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn test_session_turn_roundtrip_and_key_ordering() {
+        let turn = SessionTurn {
+            session_id: "sess-1".into(),
+            turn_number: 7,
+            goal: Some("Test goal".into()),
+            provenance_hash: Hash::of(b"p7"),
+            change_hashes: vec![Hash::of(b"c7")],
+            previous_provenance: Some(Hash::of(b"p6")),
+            timestamp: 700,
+            plan_id: Some("ATOM-20".into()),
+            todos: vec![SessionTodo {
+                id: "todo-1".into(),
+                content: "Wire RDF links".into(),
+                status: "completed".into(),
+                priority: "high".into(),
+            }],
+        };
+        assert_eq!(SessionTurn::from_bytes(&turn.to_bytes()).unwrap(), turn);
+
+        let namespace = session_turn_namespace("sess-1");
+        let earlier = encode_session_turn_key(namespace, 1);
+        let later = encode_session_turn_key(namespace, 2);
+        assert!(earlier < later);
+        assert_eq!(decode_session_turn_key(&later), (namespace, 2));
+    }
+
+    #[test]
+    fn test_session_turn_reads_pre_context_encoding() {
+        #[derive(Serialize)]
+        struct LegacyTurn {
+            session_id: String,
+            turn_number: u32,
+            goal: Option<String>,
+            provenance_hash: Hash,
+            change_hashes: Vec<Hash>,
+            previous_provenance: Option<Hash>,
+            timestamp: i64,
+        }
+
+        let legacy = LegacyTurn {
+            session_id: "legacy".into(),
+            turn_number: 0,
+            goal: Some("Old turn".into()),
+            provenance_hash: Hash::of(b"p"),
+            change_hashes: vec![Hash::of(b"c")],
+            previous_provenance: None,
+            timestamp: 1,
+        };
+        let bytes = postcard::to_allocvec(&legacy).unwrap();
+        let loaded = SessionTurn::from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.session_id, "legacy");
+        assert_eq!(loaded.plan_id, None);
+        assert!(loaded.todos.is_empty());
+    }
+
+    #[test]
+    fn test_session_manifest_roundtrip_and_content_hash() {
+        let manifest = SessionManifest {
+            schema_version: 2,
+            session_id: "sess-1".into(),
+            goal_provenance: Some(Hash::of(b"goal")),
+            turns: Vec::new(),
+            parent_session: None,
+            fork_turn: None,
+        };
+        let bytes = manifest.to_bytes();
+        assert_eq!(SessionManifest::from_bytes(&bytes).unwrap(), manifest);
+        assert_eq!(manifest.content_hash(), Hash::of(&bytes));
+    }
+
+    #[test]
+    fn test_session_manifest_reads_schema_v1_turns() {
+        let legacy = SessionManifestV1 {
+            schema_version: 1,
+            session_id: "legacy-manifest".into(),
+            goal_provenance: None,
+            turns: vec![SessionTurnV1 {
+                session_id: "legacy-manifest".into(),
+                turn_number: 0,
+                goal: Some("Old".into()),
+                provenance_hash: Hash::of(b"p"),
+                change_hashes: vec![],
+                previous_provenance: None,
+                timestamp: 1,
+            }],
+            parent_session: None,
+            fork_turn: None,
+        };
+        let bytes = postcard::to_allocvec(&legacy).unwrap();
+        let loaded = SessionManifest::from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.turns.len(), 1);
+        assert_eq!(loaded.turns[0].plan_id, None);
+        assert!(loaded.turns[0].todos.is_empty());
     }
 }

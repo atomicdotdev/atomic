@@ -534,6 +534,23 @@ pub const SESSION_PHASES: TableDefinition<&[u8; 16], &[u8]> =
 /// Intent metadata for the turn. One entry per provenance graph.
 pub const SESSION_INTENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("session_intents");
 
+/// Atomic session index: external session ID → indexed session metadata.
+pub const SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("sessions");
+
+/// Ordered session turns: (BLAKE3(session ID), turn number) → SessionTurn.
+pub const SESSION_TURNS: TableDefinition<&[u8; 40], &[u8]> = TableDefinition::new("session_turns");
+
+/// Reverse provenance lookup: provenance hash → session turn key.
+pub const SESSION_PROVENANCE: TableDefinition<&[u8; 32], &[u8; 40]> =
+    TableDefinition::new("session_provenance");
+
+/// Immutable content-addressed session manifests.
+pub const SESSION_MANIFESTS: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("session_manifests");
+
+/// Mutable convenience pointer from external session ID to latest manifest.
+pub const SESSION_HEADS: TableDefinition<&str, &[u8; 32]> = TableDefinition::new("session_heads");
+
 // Vault Tables (shared project knowledge store)
 //
 // The vault stores project knowledge (sessions, memory, skills, intents)
