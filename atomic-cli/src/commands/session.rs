@@ -1,5 +1,7 @@
 //! Atomic-native session ledger inspection.
 
+use std::collections::HashMap;
+
 use clap::{Args, Subcommand};
 
 use atomic_core::types::Base32;
@@ -129,12 +131,45 @@ fn show_recent_sessions(repo: &Repository, limit: usize, json: bool) -> CliResul
         return Ok(());
     }
 
+    let intent_map = build_session_intent_map(repo);
+
+    // Compute column width for SESSION: at least the header width, but wide enough
+    // to show full session IDs so they can be copied for `atomic session show <id>`.
+    let ses_width = ledgers
+        .iter()
+        .map(|(r, _)| r.session_id.len())
+        .max()
+        .unwrap_or(0)
+        .max("SESSION".len());
+
+    // Count intents per session.
+    let intent_counts: Vec<usize> = ledgers
+        .iter()
+        .map(|(record, turns)| {
+            // Prefer plan_id from turns (managed-run).
+            let from_turns: std::collections::HashSet<&str> =
+                turns.iter().filter_map(|t| t.plan_id.as_deref()).collect();
+            if !from_turns.is_empty() {
+                return from_turns.len();
+            }
+            intent_map
+                .get(&record.session_id)
+                .map(|ids| ids.len())
+                .unwrap_or(0)
+        })
+        .collect();
+
     println!("Recent sessions ({}):", ledgers.len());
     println!(
-        "  {:<22} {:<22} {:<8} {:>5}  {:<12} LAST ACTIVITY",
-        "SESSION", "VIEW", "STATUS", "TURNS", "PLAN"
+        "  {:<sw$} {:<22} {:<8} {:>5}  {:>7}  LAST ACTIVITY",
+        "SESSION",
+        "VIEW",
+        "STATUS",
+        "TURNS",
+        "INTENTS",
+        sw = ses_width,
     );
-    for (record, turns) in ledgers {
+    for ((record, turns), intent_count) in ledgers.into_iter().zip(intent_counts) {
         let status = if record.ended_at.is_some() {
             "ended"
         } else {
@@ -148,19 +183,20 @@ fn show_recent_sessions(repo: &Repository, limit: usize, json: bool) -> CliResul
         let activity = chrono::DateTime::from_timestamp(activity, 0)
             .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_else(|| activity.to_string());
-        let plan = turns
-            .iter()
-            .rev()
-            .find_map(|turn| turn.plan_id.as_deref())
-            .unwrap_or("—");
+        let intents_display = if intent_count > 0 {
+            intent_count.to_string()
+        } else {
+            "—".to_string()
+        };
         println!(
-            "  {:<22} {:<22} {:<8} {:>5}  {:<12} {}",
-            truncate_column(&record.session_id, 22),
+            "  {:<sw$} {:<22} {:<8} {:>5}  {:>7}  {}",
+            &record.session_id,
             truncate_column(record.view_name.as_deref().unwrap_or("—"), 22),
             status,
             record.turn_count,
-            truncate_column(plan, 12),
+            &intents_display,
             activity,
+            sw = ses_width,
         );
         if let Some(goal) = turns.last().and_then(|turn| turn.goal.as_deref()) {
             println!("    {}", single_line(goal));
@@ -187,6 +223,9 @@ fn show_session_detail(repo: &Repository, session_id: &str, json: bool) -> CliRe
         return Ok(());
     }
 
+    // Build turn→intent map for this session from vault paths.
+    let turn_intents = build_turn_intent_map(repo, session_id);
+
     println!("Session {}", record.session_id);
     println!(
         "  Status: {}",
@@ -204,6 +243,18 @@ fn show_session_detail(repo: &Repository, session_id: &str, json: bool) -> CliRe
     }
     println!("  JSON: {}", record.json_path);
     println!("  Turns: {}", record.turn_count);
+
+    // Show all intents linked to this session.
+    let all_intents: Vec<&str> = {
+        let mut ids: Vec<&str> = turn_intents.values().map(|s| s.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    };
+    if !all_intents.is_empty() {
+        println!("  Intents: {}", all_intents.join(", "));
+    }
+
     if let Ok(Some(head)) = repo.get_session_head(session_id) {
         println!("  Manifest head: {}", head.to_base32());
         if let Ok(Some(manifest)) = repo.get_session_manifest(&head) {
@@ -222,7 +273,11 @@ fn show_session_detail(repo: &Repository, session_id: &str, json: bool) -> CliRe
         println!("  Latest provenance: {}", latest.to_base32());
     }
 
-    for turn in turns {
+    // Track the "current" intent across turns: a turn that created an
+    // intent sets it; a continuation turn inherits the previous one.
+    let mut current_intent: Option<&str> = None;
+
+    for turn in &turns {
         let changes = turn
             .change_hashes
             .iter()
@@ -234,15 +289,25 @@ fn show_session_detail(repo: &Repository, session_id: &str, json: bool) -> CliRe
             turn.turn_number,
             turn.provenance_hash.to_base32()
         );
-        if let Some(goal) = turn.goal {
-            println!("  Goal marker: {}", goal);
+
+        // Resolve this turn's intent: explicit plan_id > vault path > inherited.
+        let turn_intent = turn
+            .plan_id
+            .as_deref()
+            .or_else(|| turn_intents.get(&turn.turn_number).map(|s| s.as_str()));
+        if let Some(id) = turn_intent {
+            current_intent = Some(id);
+            println!("  Intent: {}", id);
+        } else if let Some(inherited) = current_intent {
+            println!("  Intent: {} (continued)", inherited);
         }
-        if let Some(plan_id) = turn.plan_id {
-            println!("  Plan: {}", plan_id);
+
+        if let Some(goal) = &turn.goal {
+            println!("  Goal marker: {}", goal);
         }
         if !turn.todos.is_empty() {
             println!("  Todos ({}):", turn.todos.len());
-            for todo in turn.todos {
+            for todo in &turn.todos {
                 let (marker, unknown_status) = todo_status_marker(&todo.status);
                 let content = single_line(&todo.content);
                 let priority = if todo.priority.is_empty() {
@@ -264,12 +329,82 @@ fn show_session_detail(repo: &Repository, session_id: &str, json: bool) -> CliRe
                 &changes
             }
         );
-        if let Some(previous) = turn.previous_provenance {
+        if let Some(previous) = &turn.previous_provenance {
             println!("  Previous: {}", previous.to_base32());
         }
     }
 
     Ok(())
+}
+
+/// Build a map from session_id → vec of unique intent IDs by parsing vault
+/// intent paths (`intents/<view>/<session_id>/<turn>/intent.md`).
+fn build_session_intent_map(repo: &Repository) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    let manifest = match repo.vault_manifest() {
+        Ok(m) => m,
+        Err(_) => return map,
+    };
+    for (intent_id, summary) in &manifest.intents {
+        if let Some(session_id) = parse_session_from_vault_path(&summary.vault_path) {
+            let ids = map.entry(session_id).or_default();
+            if !ids.contains(intent_id) {
+                ids.push(intent_id.clone());
+            }
+        }
+    }
+    // Sort intent IDs within each session for stable display.
+    for ids in map.values_mut() {
+        ids.sort();
+    }
+    map
+}
+
+/// Build a map from turn_number → intent_id for a specific session by parsing
+/// vault intent paths (`intents/<view>/<session_id>/<turn>/intent.md`).
+fn build_turn_intent_map(repo: &Repository, session_id: &str) -> HashMap<u32, String> {
+    let mut map: HashMap<u32, String> = HashMap::new();
+    let manifest = match repo.vault_manifest() {
+        Ok(m) => m,
+        Err(_) => return map,
+    };
+    for (intent_id, summary) in &manifest.intents {
+        if let Some((sid, turn)) = parse_session_and_turn_from_vault_path(&summary.vault_path) {
+            if sid == session_id {
+                map.insert(turn, intent_id.clone());
+            }
+        }
+    }
+    map
+}
+
+/// Extract session_id from a vault intent path.
+/// Expected format: `intents/<view>/<session_id>/<turn>/intent.md`
+fn parse_session_from_vault_path(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    // intents / <view> / <session_id> / <turn> / intent.md
+    if parts.len() >= 5 && parts[0] == "intents" && parts[1] != "manual" {
+        Some(parts[2].to_string())
+    } else {
+        None
+    }
+}
+
+/// Extract (session_id, turn_number) from a vault intent path.
+/// Expected format: `intents/<view>/<session_id>/<turn>/intent.md`
+///
+/// The turn ID in the path is `turn_count + 1` at creation time (see
+/// `resolve_active_session` in vault/intent.rs), so we subtract 1 to
+/// get the actual session turn number.
+fn parse_session_and_turn_from_vault_path(path: &str) -> Option<(String, u32)> {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() >= 5 && parts[0] == "intents" && parts[1] != "manual" {
+        let path_turn: u32 = parts[3].parse().ok()?;
+        let session_turn = path_turn.checked_sub(1)?;
+        Some((parts[2].to_string(), session_turn))
+    } else {
+        None
+    }
 }
 
 fn truncate_column(value: &str, width: usize) -> String {
@@ -323,5 +458,55 @@ mod tests {
     fn session_columns_truncate_deterministically() {
         assert_eq!(truncate_column("short", 8), "short");
         assert_eq!(truncate_column("abcdefghij", 8), "abcdefg…");
+    }
+
+    #[test]
+    fn parse_session_from_agent_intent_path() {
+        let path = "intents/fresh-ridge-394a/ses_0739e30edffecd2BVayyUHjQpY/0/intent.md";
+        assert_eq!(
+            parse_session_from_vault_path(path).as_deref(),
+            Some("ses_0739e30edffecd2BVayyUHjQpY")
+        );
+    }
+
+    #[test]
+    fn parse_session_and_turn_from_agent_intent_path() {
+        // Path turn "2" → session turn 1 (path is turn_count+1 at creation)
+        let path = "intents/fresh-ridge-394a/ses_0739e30edffecd2BVayyUHjQpY/2/intent.md";
+        let (sid, turn) = parse_session_and_turn_from_vault_path(path).unwrap();
+        assert_eq!(sid, "ses_0739e30edffecd2BVayyUHjQpY");
+        assert_eq!(turn, 1);
+    }
+
+    #[test]
+    fn parse_session_and_turn_path_turn_1_maps_to_session_turn_0() {
+        let path = "intents/dev/ses_abc/1/intent.md";
+        let (_, turn) = parse_session_and_turn_from_vault_path(path).unwrap();
+        assert_eq!(turn, 0);
+    }
+
+    #[test]
+    fn parse_session_and_turn_path_turn_0_returns_none() {
+        // Path turn 0 would underflow to session turn -1; reject it.
+        let path = "intents/dev/ses_abc/0/intent.md";
+        assert_eq!(parse_session_and_turn_from_vault_path(path), None);
+    }
+
+    #[test]
+    fn parse_session_from_manual_intent_path_returns_none() {
+        let path = "intents/manual/alice/1/intent.md";
+        assert_eq!(parse_session_from_vault_path(path), None);
+    }
+
+    #[test]
+    fn parse_session_from_short_path_returns_none() {
+        assert_eq!(parse_session_from_vault_path("intents/view"), None);
+        assert_eq!(parse_session_from_vault_path(""), None);
+    }
+
+    #[test]
+    fn parse_session_and_turn_non_numeric_turn_returns_none() {
+        let path = "intents/dev/ses_abc/not-a-number/intent.md";
+        assert_eq!(parse_session_and_turn_from_vault_path(path), None);
     }
 }
