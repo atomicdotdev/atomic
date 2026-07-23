@@ -82,6 +82,7 @@ use commands::{
     Revise,
     Sandbox,
     ServerCmd,
+    Session,
     Split,
     Stash,
     Status,
@@ -256,6 +257,15 @@ enum Commands {
     /// atomic sandbox create agent-2 --dest /tmp/agent-2
     /// ```
     Sandbox(Sandbox),
+
+    /// Inspect the Atomic-native agent session ledger.
+    ///
+    /// ```text
+    /// atomic session show <session-id>
+    /// atomic session show <session-id> --json
+    /// ```
+    #[command(name = "session")]
+    Session(Session),
 
     /// Split a view (create a new view from an existing one).
     ///
@@ -830,6 +840,8 @@ fn main() {
         Commands::Restore(restore) => restore.run(),
 
         Commands::Sandbox(sandbox) => sandbox.run(),
+
+        Commands::Session(session) => session.run(),
 
         Commands::Split(split) => split.run(),
 

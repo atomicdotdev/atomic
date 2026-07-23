@@ -30,6 +30,7 @@ use std::process::{Command, Output};
 use atomic_canonical::did::did_for_public_key;
 use atomic_canonical::prov::verify_prov;
 use atomic_core::change::provenance_graph::{ProvenanceNode, ProvenanceNodeKind};
+use atomic_core::change::session::SessionTodo;
 use atomic_core::change::ProvenanceGraph;
 use atomic_core::types::{Base32, Hash};
 use atomic_identity::IdentityStore;
@@ -333,5 +334,125 @@ fn provenance_trace_uses_scan_fallback_when_rev_deps_missing() {
     assert!(
         out.contains(&format!("urn:atomic:change:{}", phantom_change.to_base32())),
         "fallback trace shows the generated change urn"
+    );
+}
+
+#[test]
+fn session_show_reads_ordered_atomic_ledger() {
+    let repo_tmp = TempDir::new().unwrap();
+    let home_tmp = TempDir::new().unwrap();
+    let repo_dir = repo_tmp.path();
+    let home_dir = home_tmp.path();
+    let session_id = "ledger-session";
+
+    assert!(atomic(repo_dir, home_dir, &["init"]).status.success());
+    let first_change = Hash::of(b"ledger-change-0");
+    let second_change = Hash::of(b"ledger-change-1");
+    {
+        let repo = Repository::open(repo_dir).expect("open repo");
+        let first = repo
+            .save_provenance_graph(
+                &ProvenanceGraph::builder(session_id, "opencode")
+                    .plan_id("ATOM-25")
+                    .todos(vec![
+                        SessionTodo {
+                            id: "todo-1".into(),
+                            content: "Render session\noutput".into(),
+                            status: "completed".into(),
+                            priority: "high".into(),
+                        },
+                        SessionTodo {
+                            id: "todo-2".into(),
+                            content: "Keep output readable".into(),
+                            status: "in_progress".into(),
+                            priority: "medium".into(),
+                        },
+                    ])
+                    .add_node(goal_node())
+                    .add_change_explained(first_change)
+                    .build(),
+            )
+            .expect("save first graph");
+        repo.save_provenance_graph(
+            &ProvenanceGraph::builder(session_id, "opencode")
+                .previous(first)
+                .add_change_explained(second_change)
+                .build(),
+        )
+        .expect("save second graph");
+
+        let ledger = repo
+            .get_session_ledger(session_id)
+            .expect("read ledger")
+            .expect("ledger exists");
+        assert_eq!(ledger.0.session_id, session_id);
+        assert_eq!(ledger.0.turn_count, 2);
+        assert_eq!(ledger.1.len(), 2);
+        assert_eq!(ledger.1[0].turn_number, 0);
+        assert_eq!(ledger.1[1].turn_number, 1);
+        assert_eq!(ledger.1[1].previous_provenance, Some(first));
+        repo.upsert_session_lifecycle(
+            session_id,
+            Some("agent-ledger".into()),
+            Some("dev".into()),
+            None,
+        )
+        .expect("lifecycle metadata");
+    }
+
+    let show = atomic(repo_dir, home_dir, &["session", "show", session_id]);
+    assert!(
+        show.status.success(),
+        "session show failed: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let output = String::from_utf8(show.stdout).unwrap();
+    assert!(output.contains("Session ledger-session"));
+    assert!(output.contains("Turn 0"));
+    assert!(output.contains("Goal marker: Fix the auth bug"));
+    assert!(output.contains("Plan: ATOM-25"));
+    assert!(output.contains("Todos (2):"));
+    assert!(output.contains("[x] [high] Render session output"));
+    assert!(output.contains("[~] [medium] Keep output readable"));
+    assert!(output.contains("Turn 1"));
+
+    let recent = atomic(repo_dir, home_dir, &["session", "show", "-n", "1"]);
+    assert!(recent.status.success());
+    let recent_output = String::from_utf8(recent.stdout).unwrap();
+    assert!(recent_output.contains("Recent sessions (1):"));
+    assert!(recent_output.contains("ledger-session"));
+    assert!(recent_output.contains("agent-ledger"));
+    assert!(recent_output.contains("ATOM-25"));
+
+    let recent_json = atomic(repo_dir, home_dir, &["session", "show", "--json"]);
+    assert!(recent_json.status.success());
+    let value: Value = serde_json::from_slice(&recent_json.stdout).unwrap();
+    assert_eq!(value.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn session_show_without_id_handles_empty_repository() {
+    let repo_tmp = TempDir::new().unwrap();
+    let home_tmp = TempDir::new().unwrap();
+    assert!(atomic(repo_tmp.path(), home_tmp.path(), &["init"])
+        .status
+        .success());
+
+    let show = atomic(repo_tmp.path(), home_tmp.path(), &["session", "show"]);
+    assert!(show.status.success());
+    assert_eq!(
+        String::from_utf8(show.stdout).unwrap().trim(),
+        "No sessions recorded."
+    );
+
+    let json = atomic(
+        repo_tmp.path(),
+        home_tmp.path(),
+        &["session", "show", "--json"],
+    );
+    assert!(json.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&json.stdout).unwrap(),
+        serde_json::json!([])
     );
 }

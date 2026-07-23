@@ -126,6 +126,11 @@ impl Pristine {
             write_txn.open_table(SESSION_TODOS)?;
             write_txn.open_table(SESSION_PHASES)?;
             write_txn.open_table(SESSION_INTENTS)?;
+            write_txn.open_table(SESSIONS)?;
+            write_txn.open_table(SESSION_TURNS)?;
+            write_txn.open_table(SESSION_PROVENANCE)?;
+            write_txn.open_table(SESSION_MANIFESTS)?;
+            write_txn.open_table(SESSION_HEADS)?;
         }
         write_txn.commit()?;
 

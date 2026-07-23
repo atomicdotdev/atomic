@@ -34,6 +34,12 @@ pub mod predicate {
     pub const WAS_DERIVED_FROM: &str = "prov:wasDerivedFrom";
     /// An Atomic Intent was informed by a Memory.
     pub const INFORMED_BY: &str = "atom:informedBy";
+    /// An activity executed a plan (e.g., session turn → vault intent).
+    pub const HAD_PLAN: &str = "prov:hadPlan";
+    /// A collection contains a member (e.g., session → session turn).
+    pub const HAD_MEMBER: &str = "prov:hadMember";
+    /// An activity generated an entity (e.g., session turn → change).
+    pub const GENERATED: &str = "prov:generated";
 
     // ── SKOS (Knowledge Organization) ────────────────────────────
     /// Broader concept (e.g., "authentication" → "security").
@@ -80,6 +86,10 @@ pub mod predicate {
     pub const HAS_LABEL: &str = "vault:hasLabel";
     /// Entity has priority.
     pub const PRIORITY: &str = "vault:priority";
+    /// A session turn is explained by a provenance graph.
+    pub const EXPLAINED_BY: &str = "vault:explainedBy";
+    /// A session turn produced a todo snapshot (status in edge metadata).
+    pub const HAS_TODO: &str = "vault:hasTodo";
 }
 
 /// Vault entity type constants (used as objects with `rdf:type`).
@@ -92,6 +102,14 @@ pub mod entity_type {
     pub const FILE: &str = "vault:File";
     pub const IDENTITY: &str = "vault:Identity";
     pub const CONCEPT: &str = "vault:Concept";
+    /// An agent session (one ledger).
+    pub const SESSION: &str = "vault:Session";
+    /// One turn row in a session ledger.
+    pub const SESSION_TURN: &str = "vault:SessionTurn";
+    /// A todo item tracked by an intent or snapshotted by a turn.
+    pub const TODO: &str = "vault:Todo";
+    /// A content-addressed provenance graph explaining turn(s)/change(s).
+    pub const PROVENANCE: &str = "vault:ProvenanceGraph";
 }
 
 /// Edge kinds used in the knowledge graph.
@@ -167,6 +185,11 @@ pub fn is_known_predicate(pred: &str) -> bool {
             | predicate::APPLIES_TO
             | predicate::HAS_LABEL
             | predicate::PRIORITY
+            | predicate::HAD_PLAN
+            | predicate::HAD_MEMBER
+            | predicate::GENERATED
+            | predicate::EXPLAINED_BY
+            | predicate::HAS_TODO
     )
 }
 
@@ -198,6 +221,11 @@ pub fn all_predicates() -> Vec<&'static str> {
         predicate::APPLIES_TO,
         predicate::HAS_LABEL,
         predicate::PRIORITY,
+        predicate::HAD_PLAN,
+        predicate::HAD_MEMBER,
+        predicate::GENERATED,
+        predicate::EXPLAINED_BY,
+        predicate::HAS_TODO,
     ]
 }
 
@@ -218,7 +246,30 @@ mod tests {
 
     #[test]
     fn predicate_count() {
-        assert_eq!(all_predicates().len(), 25);
+        assert_eq!(all_predicates().len(), 30);
+    }
+
+    #[test]
+    fn session_ledger_terms_registered() {
+        // The ledger taxonomy vocabulary: session/turn typing plus the
+        // execution and explanation relations.
+        for pred in [
+            predicate::HAD_PLAN,
+            predicate::HAD_MEMBER,
+            predicate::GENERATED,
+            predicate::EXPLAINED_BY,
+            predicate::HAS_TODO,
+        ] {
+            assert!(is_known_predicate(pred));
+        }
+        for ty in [
+            entity_type::SESSION,
+            entity_type::SESSION_TURN,
+            entity_type::TODO,
+            entity_type::PROVENANCE,
+        ] {
+            assert!(ty.starts_with("vault:"));
+        }
     }
 
     #[test]
