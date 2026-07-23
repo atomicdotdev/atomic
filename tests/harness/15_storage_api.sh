@@ -79,11 +79,7 @@ check_server() {
 }
 
 if ! check_server; then
-    echo ""
-    echo "${YELLOW}SKIPPING: atomic-storage server not reachable at ${SERVER_URL}${RESET}"
-    echo "${YELLOW}  Start the server first, or set ATOMIC_SERVER_URL to point to a running instance.${RESET}"
-    echo ""
-    exit 0
+    skip_suite "atomic-storage server not reachable at ${SERVER_URL}; start it or set ATOMIC_SERVER_URL"
 fi
 
 echo ""

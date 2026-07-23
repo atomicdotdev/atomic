@@ -119,6 +119,13 @@ assert_paired_diff() {
     fi
 }
 
+# Return only actual +/- change lines from Atomic's unified diff output.
+# Context lines are intentionally rendered around changes and must not be
+# mistaken for modified content.
+extract_atomic_change_lines() {
+    grep -E '^\+[^+]|^-[^-]' || true
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Pairing: Single modified line among additions"
 # ═══════════════════════════════════════════════════════════════════════════
@@ -299,6 +306,7 @@ record_change "Production config" >/dev/null 2>&1
 
 HASH="$(get_last_change_hash)"
 DIFF_OUT="$(atomic diff --no-color -c "$HASH" 2>&1)"
+CHANGE_LINES="$(printf '%s\n' "$DIFF_OUT" | extract_atomic_change_lines)"
 
 assert_paired_diff \
     "Multi mod: HOST localhost→0.0.0.0 paired" \
@@ -322,12 +330,12 @@ assert_paired_diff \
 assert_output_not_contains \
     "Multi mod: unchanged DB_PORT not in diff" \
     "DB_PORT = 5432" \
-    echo "$DIFF_OUT"
+    echo "$CHANGE_LINES"
 
 assert_output_not_contains \
     "Multi mod: unchanged DB_NAME not in diff" \
     'DB_NAME = "myapp"' \
-    echo "$DIFF_OUT"
+    echo "$CHANGE_LINES"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Pairing: Modification buried in large insertion block"
@@ -562,6 +570,7 @@ record_change "Update even constants, add comments" >/dev/null 2>&1
 
 HASH="$(get_last_change_hash)"
 DIFF_OUT="$(atomic diff --no-color -c "$HASH" 2>&1)"
+CHANGE_LINES="$(printf '%s\n' "$DIFF_OUT" | extract_atomic_change_lines)"
 
 # Check that each modified line is paired
 PAIR_SUCCESS=0
@@ -604,14 +613,19 @@ else
         "Only $PAIR_SUCCESS/10 modifications paired ($PAIR_FAIL failed). Expected ≥8."
 fi
 
-# Verify unchanged lines are NOT in the diff
+# Verify unchanged lines are NOT among the +/- change lines. They may appear
+# as legitimate context around a nearby modification.
+UNCHANGED_FOUND=0
 for i in 1 3 5 7 9; do
-    if echo "$DIFF_OUT" | grep -qF "VALUE_${i} = \"original_${i}\""; then
+    if echo "$CHANGE_LINES" | grep -qF "VALUE_${i} = \"original_${i}\""; then
         _fail "Scale: unchanged VALUE_${i} should not be in diff" \
             "VALUE_${i} appeared in diff but was not modified"
+        UNCHANGED_FOUND=1
     fi
 done
-_pass "Scale: unchanged odd constants not in diff"
+if [[ "$UNCHANGED_FOUND" -eq 0 ]]; then
+    _pass "Scale: unchanged odd constants not in diff"
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Pairing: Mixed adds, deletes, and modifications"

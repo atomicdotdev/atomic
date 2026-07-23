@@ -57,6 +57,11 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      - name: Run CLI semantic diff harness
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: ATOMIC_BIN="$PWD/target/debug/atomic" bash tests/harness/run_all.sh 09
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
