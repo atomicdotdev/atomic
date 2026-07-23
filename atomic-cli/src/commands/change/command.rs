@@ -439,8 +439,8 @@ impl ChangeCmd {
             }
         }
 
-        // Session ledger (causal decision DAG from .provenance file)
-        output.push_str(&self.format_session_ledger(hash, repo));
+        // Change ledger (causal decision DAG from .provenance file)
+        output.push_str(&self.format_change_ledger(hash, repo));
 
         output
     }
@@ -548,19 +548,31 @@ impl ChangeCmd {
         if !prov.metadata.is_empty() {
             output.push_str("  Metadata:\n");
             for (key, value) in &prov.metadata {
-                output.push_str(&format!("    {}: {}\n", hint(key), info(value)));
+                // turn_number is recorded as 1-indexed but session ledger
+                // turns are 0-indexed; display the 0-indexed value.
+                let display_value = if key == "turn_number" {
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .and_then(|n| n.checked_sub(1))
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| value.clone())
+                } else {
+                    value.clone()
+                };
+                output.push_str(&format!("    {}: {}\n", hint(key), info(&display_value)));
             }
         }
 
         output
     }
 
-    /// Format the session ledger (causal decision DAG) for display.
+    /// Format the change ledger (causal decision DAG) for display.
     ///
     /// Displays the structured provenance graph stored in the `.provenance`
     /// file: goals, tool executions, explorations, commitments, and patch
     /// proposals that led to this change.
-    fn format_session_ledger(&self, change_hash: &Hash, repo: &Repository) -> String {
+    fn format_change_ledger(&self, change_hash: &Hash, repo: &Repository) -> String {
         let mut output = String::new();
 
         let graphs = match repo.find_provenance_for_change(change_hash) {
@@ -582,7 +594,7 @@ impl ChangeCmd {
         };
 
         for (_graph_hash, graph) in &graphs {
-            output.push_str(&format!("{}\n", emphasis("=== Session Ledger ===")));
+            output.push_str(&format!("{}\n", emphasis("=== Change Ledger ===")));
             output.push_str(&format!("  Session: {}\n", info(&graph.session_id)));
             output.push_str(&format!(
                 "  Agent:   {} ({})\n",
