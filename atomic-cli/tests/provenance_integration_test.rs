@@ -410,7 +410,7 @@ fn session_show_reads_ordered_atomic_ledger() {
     assert!(output.contains("Session ledger-session"));
     assert!(output.contains("Turn 0"));
     assert!(output.contains("Goal marker: Fix the auth bug"));
-    assert!(output.contains("Plan: ATOM-25"));
+    assert!(output.contains("Intent: ATOM-25"));
     assert!(output.contains("Todos (2):"));
     assert!(output.contains("[x] [high] Render session output"));
     assert!(output.contains("[~] [medium] Keep output readable"));
@@ -422,7 +422,8 @@ fn session_show_reads_ordered_atomic_ledger() {
     assert!(recent_output.contains("Recent sessions (1):"));
     assert!(recent_output.contains("ledger-session"));
     assert!(recent_output.contains("agent-ledger"));
-    assert!(recent_output.contains("ATOM-25"));
+    // The list view shows intent count; detail view shows individual IDs.
+    assert!(recent_output.contains("INTENTS"));
 
     let recent_json = atomic(repo_dir, home_dir, &["session", "show", "--json"]);
     assert!(recent_json.status.success());
