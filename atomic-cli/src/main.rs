@@ -908,3 +908,14 @@ fn main() {
         std::process::exit(err.exit_code());
     }
 }
+
+#[cfg(test)]
+mod cli_definition_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn clap_command_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+}
