@@ -131,8 +131,8 @@ fn show_recent_sessions(repo: &Repository, limit: usize, json: bool) -> CliResul
 
     println!("Recent sessions ({}):", ledgers.len());
     println!(
-        "  {:<22} {:<22} {:<8} {:>5}  {:<12} {}",
-        "SESSION", "VIEW", "STATUS", "TURNS", "PLAN", "LAST ACTIVITY"
+        "  {:<22} {:<22} {:<8} {:>5}  {:<12} LAST ACTIVITY",
+        "SESSION", "VIEW", "STATUS", "TURNS", "PLAN"
     );
     for (record, turns) in ledgers {
         let status = if record.ended_at.is_some() {
