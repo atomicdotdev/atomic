@@ -37,6 +37,11 @@ impl Command for IntentDelete {
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
+        // Verify the intent exists before asking for confirmation, so a
+        // typo'd ID fails fast instead of after the destructive prompt.
+        repo.vault_intent_show(&self.id)
+            .map_err(CliError::Repository)?;
+
         if !self.force {
             let prompt = format!(
                 "Discard intent '{}'? This removes the unstarted draft from the vault.",

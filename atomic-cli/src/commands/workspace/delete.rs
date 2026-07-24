@@ -71,6 +71,15 @@ impl Command for WorkspaceDelete {
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
 
         rt.block_on(async {
+            let (client, org_slug) = build_client_with_org(self.org.as_deref(), None).await?;
+
+            // Verify the workspace exists before asking for confirmation, so a
+            // typo'd slug fails fast instead of after the destructive prompt.
+            client
+                .get_workspace(&self.slug)
+                .await
+                .map_err(remote_err)?;
+
             // Confirm unless --force is set.
             if !self.force {
                 print_warning(&format!(
@@ -89,8 +98,6 @@ impl Command for WorkspaceDelete {
                     return Err(CliError::Cancelled);
                 }
             }
-
-            let (client, org_slug) = build_client_with_org(self.org.as_deref(), None).await?;
 
             client
                 .delete_workspace(&self.slug)

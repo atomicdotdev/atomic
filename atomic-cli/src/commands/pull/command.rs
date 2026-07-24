@@ -105,9 +105,10 @@ pub struct Pull {
     /// Remote name or URL to pull from.
     ///
     /// Can be a configured remote name (like "origin") or a full URL.
-    /// If not specified, uses the default remote "origin".
-    #[arg(default_value = DEFAULT_REMOTE)]
-    pub remote: String,
+    /// If not specified, uses the remote configured with
+    /// `atomic remote default <name>`, falling back to "origin".
+    #[arg()]
+    pub remote: Option<String>,
 
     /// Local view to pull into.
     ///
@@ -174,12 +175,12 @@ impl Pull {
     /// use atomic::commands::pull::Pull;
     ///
     /// let pull = Pull::new();
-    /// assert_eq!(pull.remote, "origin");
+    /// assert!(pull.remote.is_none());
     /// assert!(!pull.dry_run);
     /// ```
     pub fn new() -> Self {
         Self {
-            remote: DEFAULT_REMOTE.to_string(),
+            remote: None,
             to_view: None,
             from_view: None,
             dry_run: false,
@@ -193,7 +194,7 @@ impl Pull {
 
     /// Builder: set the remote name or URL.
     pub fn with_remote(mut self, remote: impl Into<String>) -> Self {
-        self.remote = remote.into();
+        self.remote = Some(remote.into());
         self
     }
 
@@ -247,24 +248,40 @@ impl Pull {
 
     // Internal Helper Methods
 
-    /// Resolve the remote URL and any identity hint from the `--identity` flag.
+    /// Resolve the remote name to operate on.
     ///
-    /// Returns `(url, identity_hint)` where `identity_hint` comes solely from
-    /// the `--identity` CLI flag. If absent, `attach_identity` falls back to
-    /// URL-subdomain inference.
-    fn resolve_remote_url(&self, repo: &Repository) -> CliResult<(String, Option<String>)> {
+    /// Explicit CLI argument wins; otherwise the remote configured with
+    /// `atomic remote default <name>` (which itself falls back to "origin"
+    /// or the only configured remote); otherwise the literal "origin".
+    fn resolve_remote_name(&self, repo: &Repository) -> String {
+        match &self.remote {
+            Some(name) => name.clone(),
+            None => repo
+                .get_default_remote()
+                .map(|(name, _entry)| name)
+                .unwrap_or_else(|_| DEFAULT_REMOTE.to_string()),
+        }
+    }
+
+    /// Resolve the remote name, URL, and any identity hint from the
+    /// `--identity` flag.
+    ///
+    /// Returns `(name, url, identity_hint)` where `identity_hint` comes
+    /// solely from the `--identity` CLI flag. If absent, `attach_identity`
+    /// falls back to URL-subdomain inference.
+    fn resolve_remote_url(&self, repo: &Repository) -> CliResult<(String, String, Option<String>)> {
+        let remote_name = self.resolve_remote_name(repo);
+
         // If it looks like a URL, use it directly
-        if self.remote.contains("://") {
-            return Ok((self.remote.clone(), self.identity.clone()));
+        if remote_name.contains("://") {
+            return Ok((remote_name.clone(), remote_name, self.identity.clone()));
         }
 
         // Look up named remote in repository configuration
-        match repo.get_remote(&self.remote) {
-            Ok(entry) => Ok((entry.url, self.identity.clone())),
+        match repo.get_remote(&remote_name) {
+            Ok(entry) => Ok((remote_name, entry.url, self.identity.clone())),
             Err(atomic_repository::RepositoryError::RemoteNotFound { .. }) => {
-                Err(CliError::RemoteNotFound {
-                    name: self.remote.clone(),
-                })
+                Err(CliError::RemoteNotFound { name: remote_name })
             }
             Err(e) => Err(CliError::Repository(e)),
         }
@@ -309,6 +326,7 @@ impl Pull {
     /// Shows what changes would be pulled without actually pulling them.
     fn display_dry_run(
         &self,
+        remote_name: &str,
         remote_url: &str,
         remote_view: &str,
         to_download: &[PullChange],
@@ -321,7 +339,7 @@ impl Pull {
         println!(
             "Would pull {} from {} (view: {}):",
             format_count(to_download.len(), "change"),
-            self.remote,
+            remote_name,
             remote_view
         );
         print_blank();
@@ -373,8 +391,8 @@ impl Pull {
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
 
-        // Resolve remote URL and identity hint
-        let (remote_url, identity_hint) = self.resolve_remote_url(&repo)?;
+        // Resolve remote name, URL, and identity hint
+        let (remote_name, remote_url, identity_hint) = self.resolve_remote_url(&repo)?;
 
         // Determine views
         let local_view = self.get_local_view(&repo);
@@ -383,7 +401,7 @@ impl Pull {
         // Print header
         println!(
             "Pulling from {} ({})",
-            style_view(&self.remote),
+            style_view(&remote_name),
             hint(&remote_url)
         );
 
@@ -453,7 +471,7 @@ impl Pull {
 
         // Handle dry run
         if self.dry_run {
-            return self.display_dry_run(&remote_url, &remote_view, &to_download);
+            return self.display_dry_run(&remote_name, &remote_url, &remote_view, &to_download);
         }
 
         // Check for nothing to pull
@@ -594,6 +612,7 @@ impl Pull {
         }
 
         // Materialize the working copy so on-disk files reflect the new state
+        let mut materialize_failed = false;
         if stats.has_applied() {
             let mat_spinner = create_spinner("Updating working copy...");
             match repo.materialize() {
@@ -604,6 +623,7 @@ impl Pull {
                     );
                 }
                 Err(e) => {
+                    materialize_failed = true;
                     finish_error(&mat_spinner, "Failed to update working copy");
                     print_warning(&format!(
                         "Applied {} but failed to update working copy: {}",
@@ -703,20 +723,34 @@ impl Pull {
             }
         }
 
-        // Final summary
+        // Final summary. Download, apply, and materialize failures were
+        // already printed above — exit non-zero so scripts don't mistake a
+        // partial pull for success.
         print_blank();
-        if stats.has_failures() {
+        if stats.has_failures() || !apply_errors.is_empty() || materialize_failed {
             print_warning(&format!(
-                "Pull completed with errors: {} downloaded, {} failed",
-                stats.changes_downloaded, stats.changes_failed
+                "Pull completed with errors: {} downloaded, {} failed to download, {} failed to apply",
+                stats.changes_downloaded,
+                stats.changes_failed,
+                apply_errors.len(),
             ));
-        } else {
-            print_success(&format!(
-                "Pull complete: {} downloaded and applied to {}",
-                format_count(stats.changes_downloaded, "change"),
-                local_view
-            ));
+            return Err(CliError::Internal(anyhow::anyhow!(
+                "pull completed with errors ({} download, {} apply{})",
+                stats.changes_failed,
+                apply_errors.len(),
+                if materialize_failed {
+                    ", working copy not updated"
+                } else {
+                    ""
+                },
+            )));
         }
+
+        print_success(&format!(
+            "Pull complete: {} downloaded and applied to {}",
+            format_count(stats.changes_downloaded, "change"),
+            local_view
+        ));
 
         Ok(())
     }
@@ -765,7 +799,7 @@ mod tests {
     fn test_pull_new() {
         let pull = Pull::new();
 
-        assert_eq!(pull.remote, DEFAULT_REMOTE);
+        assert!(pull.remote.is_none());
         assert!(pull.to_view.is_none());
         assert!(pull.from_view.is_none());
         assert!(!pull.dry_run);
@@ -779,21 +813,21 @@ mod tests {
     #[test]
     fn test_pull_default() {
         let pull: Pull = Default::default();
-        assert_eq!(pull.remote, DEFAULT_REMOTE);
+        assert!(pull.remote.is_none());
     }
 
     /// Test with_remote builder method.
     #[test]
     fn test_pull_with_remote() {
         let pull = Pull::new().with_remote("upstream");
-        assert_eq!(pull.remote, "upstream");
+        assert_eq!(pull.remote.as_deref(), Some("upstream"));
     }
 
     /// Test with_remote with URL.
     #[test]
     fn test_pull_with_remote_url() {
         let pull = Pull::new().with_remote("https://example.com/repo");
-        assert_eq!(pull.remote, "https://example.com/repo");
+        assert_eq!(pull.remote.as_deref(), Some("https://example.com/repo"));
     }
 
     /// Test with_to_view builder method.
@@ -861,7 +895,7 @@ mod tests {
             .with_timeout(120)
             .with_download_only(true);
 
-        assert_eq!(pull.remote, "upstream");
+        assert_eq!(pull.remote.as_deref(), Some("upstream"));
         assert_eq!(pull.to_view, Some("feature".to_string()));
         assert_eq!(pull.from_view, Some("main".to_string()));
         assert!(pull.dry_run);
@@ -878,7 +912,7 @@ mod tests {
 
         let cloned = original.clone();
 
-        assert_eq!(cloned.remote, "test");
+        assert_eq!(cloned.remote.as_deref(), Some("test"));
         assert!(cloned.dry_run);
     }
 

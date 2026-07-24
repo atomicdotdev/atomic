@@ -85,6 +85,18 @@ impl Command for TeamDelete {
 
 impl TeamDelete {
     async fn execute(&self) -> CliResult<()> {
+        let client = build_client(self.org.as_deref(), None).await?;
+        let org_slug = client.org_slug().to_string();
+
+        // Verify the team exists before asking for confirmation, so a typo'd
+        // slug fails fast instead of after the destructive prompt.
+        atomic_teams::team::get_team(&client, &org_slug, &self.slug)
+            .await
+            .map_err(|e| CliError::RemoteError {
+                message: e.to_string(),
+                url: None,
+            })?;
+
         // Prompt for confirmation unless --force is set.
         if !self.force {
             print_warning(&format!(
@@ -104,9 +116,6 @@ impl TeamDelete {
                 return Err(CliError::Cancelled);
             }
         }
-
-        let client = build_client(self.org.as_deref(), None).await?;
-        let org_slug = client.org_slug().to_string();
 
         atomic_teams::team::delete_team(&client, &org_slug, &self.slug)
             .await

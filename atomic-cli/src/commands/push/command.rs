@@ -78,9 +78,10 @@ pub struct Push {
     /// Remote name or URL to push to.
     ///
     /// Can be a configured remote name (like "origin") or a full URL.
-    /// If not specified, uses the default remote "origin".
-    #[arg(default_value = DEFAULT_REMOTE)]
-    pub remote: String,
+    /// If not specified, uses the remote configured with
+    /// `atomic remote default <name>`, falling back to "origin".
+    #[arg()]
+    pub remote: Option<String>,
 
     /// Remote view to push to.
     ///
@@ -142,12 +143,12 @@ impl Push {
     /// use atomic::commands::push::Push;
     ///
     /// let push = Push::new();
-    /// assert_eq!(push.remote, "origin");
+    /// assert!(push.remote.is_none());
     /// assert!(!push.dry_run);
     /// ```
     pub fn new() -> Self {
         Self {
-            remote: DEFAULT_REMOTE.to_string(),
+            remote: None,
             to_view: None,
             from_view: None,
             dry_run: false,
@@ -161,7 +162,7 @@ impl Push {
 
     /// Builder: set the remote name or URL.
     pub fn with_remote(mut self, remote: impl Into<String>) -> Self {
-        self.remote = remote.into();
+        self.remote = Some(remote.into());
         self
     }
 
@@ -175,6 +176,21 @@ impl Push {
     pub fn with_from_view(mut self, view: impl Into<String>) -> Self {
         self.from_view = Some(view.into());
         self
+    }
+
+    /// Resolve the remote name to operate on.
+    ///
+    /// Explicit CLI argument wins; otherwise the remote configured with
+    /// `atomic remote default <name>` (which itself falls back to "origin"
+    /// or the only configured remote); otherwise the literal "origin".
+    fn resolve_remote_name(&self, repo: &Repository) -> String {
+        match &self.remote {
+            Some(name) => name.clone(),
+            None => repo
+                .get_default_remote()
+                .map(|(name, _entry)| name)
+                .unwrap_or_else(|_| DEFAULT_REMOTE.to_string()),
+        }
     }
 
     /// Builder: set the dry-run flag.
@@ -213,24 +229,25 @@ impl Push {
         self
     }
 
-    /// Resolve the remote URL and any identity hint from the `--identity` flag.
+    /// Resolve the remote name, URL, and any identity hint from the
+    /// `--identity` flag.
     ///
-    /// Returns `(url, identity_hint)` where `identity_hint` comes solely from
-    /// the `--identity` CLI flag. If absent, `attach_identity` falls back to
-    /// URL-subdomain inference.
-    fn resolve_remote_url(&self, repo: &Repository) -> CliResult<(String, Option<String>)> {
+    /// Returns `(name, url, identity_hint)` where `identity_hint` comes
+    /// solely from the `--identity` CLI flag. If absent, `attach_identity`
+    /// falls back to URL-subdomain inference.
+    fn resolve_remote_url(&self, repo: &Repository) -> CliResult<(String, String, Option<String>)> {
+        let remote_name = self.resolve_remote_name(repo);
+
         // If it looks like a URL, use it directly
-        if self.remote.contains("://") {
-            return Ok((self.remote.clone(), self.identity.clone()));
+        if remote_name.contains("://") {
+            return Ok((remote_name.clone(), remote_name, self.identity.clone()));
         }
 
         // Look up named remote in repository configuration
-        match repo.get_remote(&self.remote) {
-            Ok(entry) => Ok((entry.url, self.identity.clone())),
+        match repo.get_remote(&remote_name) {
+            Ok(entry) => Ok((remote_name, entry.url, self.identity.clone())),
             Err(atomic_repository::RepositoryError::RemoteNotFound { .. }) => {
-                Err(CliError::RemoteNotFound {
-                    name: self.remote.clone(),
-                })
+                Err(CliError::RemoteNotFound { name: remote_name })
             }
             Err(e) => Err(CliError::Repository(e)),
         }
@@ -273,6 +290,7 @@ impl Push {
     /// Display the dry run preview.
     fn display_dry_run(
         &self,
+        remote_name: &str,
         remote_url: &str,
         remote_view: &str,
         to_upload: &[PushChange],
@@ -285,7 +303,7 @@ impl Push {
         println!(
             "Would push {} to {} (view: {}):",
             format_count(to_upload.len(), "change"),
-            self.remote,
+            remote_name,
             remote_view
         );
         print_blank();
@@ -308,8 +326,8 @@ impl Push {
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
 
-        // Resolve remote URL and identity hint
-        let (remote_url, identity_hint) = self.resolve_remote_url(&repo)?;
+        // Resolve remote name, URL, and identity hint
+        let (remote_name, remote_url, identity_hint) = self.resolve_remote_url(&repo)?;
 
         // Determine views
         let local_view = self.get_local_view(&repo);
@@ -319,7 +337,7 @@ impl Push {
         // Print header
         println!(
             "Pushing to {} ({})",
-            style_view(&self.remote),
+            style_view(&remote_name),
             hint(&remote_url)
         );
 
@@ -427,7 +445,7 @@ impl Push {
 
         // Handle dry run
         if self.dry_run {
-            return self.display_dry_run(&remote_url, &remote_view, &to_upload);
+            return self.display_dry_run(&remote_name, &remote_url, &remote_view, &to_upload);
         }
 
         // Check for nothing to push
@@ -484,7 +502,7 @@ impl Push {
             print_blank();
             print_success(&format!(
                 "Push complete: {} view created on {}",
-                remote_view, self.remote
+                remote_view, remote_name
             ));
             return Ok(());
         }
@@ -805,7 +823,7 @@ mod tests {
     #[test]
     fn test_push_new() {
         let push = Push::new();
-        assert_eq!(push.remote, "origin");
+        assert!(push.remote.is_none());
         assert!(push.to_view.is_none());
         assert!(push.from_view.is_none());
         assert!(!push.dry_run);
@@ -818,19 +836,19 @@ mod tests {
     #[test]
     fn test_push_default() {
         let push = Push::default();
-        assert_eq!(push.remote, "origin");
+        assert!(push.remote.is_none());
     }
 
     #[test]
     fn test_push_with_remote() {
         let push = Push::new().with_remote("upstream");
-        assert_eq!(push.remote, "upstream");
+        assert_eq!(push.remote.as_deref(), Some("upstream"));
     }
 
     #[test]
     fn test_push_with_remote_url() {
         let push = Push::new().with_remote("https://example.com/repo");
-        assert_eq!(push.remote, "https://example.com/repo");
+        assert_eq!(push.remote.as_deref(), Some("https://example.com/repo"));
     }
 
     #[test]
@@ -890,7 +908,7 @@ mod tests {
             .with_insecure(true)
             .with_timeout(120);
 
-        assert_eq!(push.remote, "upstream");
+        assert_eq!(push.remote.as_deref(), Some("upstream"));
         assert_eq!(push.to_view, Some("main".to_string()));
         assert_eq!(push.from_view, Some("feature".to_string()));
         assert!(push.dry_run);
@@ -911,7 +929,7 @@ mod tests {
 
     #[test]
     fn test_push_debug() {
-        let push = Push::new();
+        let push = Push::new().with_remote("origin");
         let debug_str = format!("{:?}", push);
 
         assert!(debug_str.contains("Push"));

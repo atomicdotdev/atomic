@@ -1027,6 +1027,21 @@ fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> String {
     )
 }
 
+/// Truncate `s` to at most `max_chars` characters for display, appending
+/// `...` when content was removed.
+///
+/// Operates on char boundaries, so multi-byte content (CJK, emoji) never
+/// panics — unlike byte slicing (`&s[..n]`), which aborts with a
+/// char-boundary panic on such input.
+fn truncate_display(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let kept: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+        format!("{}...", kept)
+    }
+}
+
 /// Search the knowledge graph.
 #[derive(Parser, Debug)]
 pub struct QueryNodes {
@@ -1099,12 +1114,7 @@ impl Command for QueryNodes {
                 let summary_display = if summary.is_empty() {
                     String::new()
                 } else {
-                    let truncated = if summary.len() > 60 {
-                        format!("{}...", &summary[..57])
-                    } else {
-                        summary.to_string()
-                    };
-                    format!("  {}", truncated)
+                    format!("  {}", truncate_display(summary, 60))
                 };
                 println!("  [{}] {}{}", node.kind, node.id, summary_display);
             }
@@ -1150,12 +1160,7 @@ impl Command for QueryNeighbors {
                 let summary_display = if summary.is_empty() {
                     String::new()
                 } else {
-                    let truncated = if summary.len() > 50 {
-                        format!("{}...", &summary[..47])
-                    } else {
-                        summary.to_string()
-                    };
-                    format!("  {}", truncated)
+                    format!("  {}", truncate_display(summary, 50))
                 };
                 println!("  [{}] {}{}", node.kind, node.id, summary_display);
             }
@@ -1811,7 +1816,8 @@ impl Command for PlanExec {
                 for node in &result.nodes {
                     print!("  [{}] {}", node.kind, node.label);
                     if let Some(ref s) = node.summary {
-                        let short = if s.len() > 60 { &s[..60] } else { s };
+                        // Char-based truncation: byte slicing panics on CJK/emoji.
+                        let short: String = s.chars().take(60).collect();
                         print!(": {}", short);
                     }
                     println!();
@@ -1831,7 +1837,8 @@ impl Command for PlanExec {
             if !result.content.is_empty() {
                 println!("\nContent ({} entries):", result.content.len());
                 for (path, text) in &result.content {
-                    let preview = if text.len() > 100 { &text[..100] } else { text };
+                    // Char-based truncation: byte slicing panics on CJK/emoji.
+                    let preview: String = text.chars().take(100).collect();
                     println!("  {}: {}...", path, preview.replace('\n', " "));
                 }
             }
@@ -1963,5 +1970,52 @@ impl Command for QueryAsk {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_display;
+
+    #[test]
+    fn test_truncate_display_short_ascii_unchanged() {
+        assert_eq!(truncate_display("hello", 60), "hello");
+    }
+
+    #[test]
+    fn test_truncate_display_long_ascii_truncated() {
+        let s = "a".repeat(80);
+        let out = truncate_display(&s, 60);
+        assert_eq!(out, format!("{}...", "a".repeat(57)));
+    }
+
+    #[test]
+    fn test_truncate_display_exact_limit_unchanged() {
+        let s = "b".repeat(60);
+        assert_eq!(truncate_display(&s, 60), s);
+    }
+
+    #[test]
+    fn test_truncate_display_cjk_no_panic() {
+        // Regression: byte slicing (&s[..57]) panicked on multi-byte content
+        // when byte 57 fell inside a character (e.g. "x" + CJK text).
+        let s = format!("x{}", "修复认证模块中的关键安全漏洞并添加全面的单元测试覆盖率以确保长期稳定性和可维护性");
+        let out = truncate_display(&s, 60);
+        assert!(out.ends_with("...") || out == s);
+        // Result must be valid UTF-8 with at most 60 chars before the ellipsis
+        assert!(out.trim_end_matches("...").chars().count() <= 60);
+    }
+
+    #[test]
+    fn test_truncate_display_emoji_within_limit_unchanged() {
+        let s = "🚀".repeat(40); // 4-byte chars: any byte index not divisible by 4 is mid-char
+        assert_eq!(truncate_display(&s, 50), s);
+    }
+
+    #[test]
+    fn test_truncate_display_emoji_truncated() {
+        let s = "🚀".repeat(80);
+        let out = truncate_display(&s, 50);
+        assert_eq!(out, format!("{}...", "🚀".repeat(47)));
     }
 }
