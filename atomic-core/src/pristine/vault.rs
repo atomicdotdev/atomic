@@ -157,7 +157,12 @@ pub struct MemorySummary {
 }
 
 /// Summary of an intent in the manifest.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// Keyed in the manifest by the intent's stable [`ULID`](https://github.com/ulid/spec)
+/// `uid`. The `human_key` (`PROJECT::author::seq`) is a display alias composed
+/// from `project`/`author`/`seq`; it is never the primary identity, so two
+/// teammates minting the same sequence never collide on the real key.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IntentSummary {
     pub status: String,
     pub priority: String,
@@ -173,6 +178,27 @@ pub struct IntentSummary {
     /// The vault path to the intent file.
     #[serde(default)]
     pub vault_path: String,
+    /// Stable primary identity (ULID). Empty on legacy pre-ULID entries.
+    #[serde(default)]
+    pub uid: String,
+    /// Rendered human display key, e.g. `PIMO::lee-faus::3`.
+    #[serde(default)]
+    pub human_key: String,
+    /// Project code component of the human key (e.g. `PIMO`).
+    #[serde(default)]
+    pub project: String,
+    /// Author handle component of the human key (e.g. `lee-faus`).
+    #[serde(default)]
+    pub author: String,
+    /// Per-author sequence component of the human key.
+    #[serde(default)]
+    pub seq: u32,
+    /// Agent session that created this intent (provenance, not identity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Turn number within the session at creation (1-indexed, as `turn_count+1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u32>,
 }
 
 /// Summary of a skill file in the manifest.
@@ -225,13 +251,24 @@ pub struct VaultManifest {
     pub file_count: u32,
 
     /// Auto-incrementing counter for intent IDs. Next ID to assign.
+    ///
+    /// Legacy (pre-ULID) global counter. Retained for backward compatibility;
+    /// the ULID identity model uses per-author counters in `intent_seq`.
     #[serde(default = "default_next_intent_id")]
     pub next_intent_id: u32,
 
-    /// Project prefix for intent IDs (e.g., "PIMO", "ATOM").
+    /// Project prefix / code for intent human keys (e.g., "PIMO", "ATOM").
     /// Derived from the project directory name on vault init.
     #[serde(default)]
     pub intent_prefix: String,
+
+    /// Per-author sequence counters for human keys (`author` -> next `seq`).
+    ///
+    /// Each author increments only their own counter, so offline teammates
+    /// never collide on a human key (`PROJECT::author::seq`) even though the
+    /// primary identity is the ULID.
+    #[serde(default)]
+    pub intent_seq: HashMap<String, u32>,
 }
 
 fn default_next_intent_id() -> u32 {
@@ -253,6 +290,7 @@ impl Default for VaultManifest {
             file_count: 0,
             next_intent_id: 1,
             intent_prefix: String::new(),
+            intent_seq: HashMap::new(),
         }
     }
 }
@@ -281,6 +319,10 @@ impl VaultManifest {
 
     /// Get the next intent ID and advance the counter.
     /// Returns a string like "PIMO-1", "ATOM-42".
+    ///
+    /// Legacy (pre-ULID) allocation. New intents use
+    /// [`allocate_author_seq`](Self::allocate_author_seq) +
+    /// [`compose_human_key`](Self::compose_human_key) and a ULID primary id.
     pub fn allocate_intent_id(&mut self) -> String {
         let id = self.next_intent_id;
         self.next_intent_id = id.saturating_add(1);
@@ -291,6 +333,100 @@ impl VaultManifest {
         };
         format!("{}-{}", prefix, id)
     }
+
+    /// The project code used in human keys (falls back to `VAULT`).
+    pub fn project_code(&self) -> &str {
+        if self.intent_prefix.is_empty() {
+            "VAULT"
+        } else {
+            &self.intent_prefix
+        }
+    }
+
+    /// Allocate the next per-author sequence number, advancing that author's
+    /// counter. Each author has an independent counter so offline teammates
+    /// never collide on a human key.
+    pub fn allocate_author_seq(&mut self, author: &str) -> u32 {
+        let next = self.intent_seq.entry(author.to_string()).or_insert(1);
+        let seq = *next;
+        *next = seq.saturating_add(1);
+        seq
+    }
+
+    /// Compose the human display key `PROJECT::author::seq`.
+    ///
+    /// The project is uppercased (it is a code); the author handle is kept
+    /// verbatim (it may contain `-`), which is unambiguous because the fields
+    /// are separated by [`HUMAN_KEY_SEP`] (`::`), not `-`.
+    pub fn compose_human_key(project: &str, author: &str, seq: u32) -> String {
+        format!(
+            "{}{sep}{}{sep}{}",
+            project.to_uppercase(),
+            author,
+            seq,
+            sep = HUMAN_KEY_SEP
+        )
+    }
+}
+
+/// The field separator for human intent keys. `::` (not `-`) so an author
+/// handle containing a hyphen (e.g. `lee-faus`) stays unambiguous.
+pub const HUMAN_KEY_SEP: &str = "::";
+
+/// A parsed intent reference: either a stable id (ULID / prefix) or a fully
+/// composed human key to match against `IntentSummary::human_key`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IntentRef {
+    /// A ULID or ULID prefix — matched against intent `uid`s.
+    Uid(String),
+    /// A fully composed human key (`PROJECT::author::seq`).
+    HumanKey(String),
+}
+
+/// Resolve a user-supplied intent reference into a [`IntentRef`], filling in
+/// the current project and author so the common case is just a number.
+///
+/// Rules (the project is never required from the user):
+/// - `3`            -> `HumanKey("<PROJECT>::<author>::3")`
+/// - `alice::3`     -> `HumanKey("<PROJECT>::alice::3")` (other teammate)
+/// - `PIMO::lee::3` -> `HumanKey("PIMO::lee::3")` (exact, project uppercased)
+/// - otherwise      -> `Uid(<input uppercased>)` (a ULID or its prefix)
+pub fn parse_intent_reference(
+    input: &str,
+    default_project: &str,
+    default_author: &str,
+) -> IntentRef {
+    let t = input.trim();
+
+    if t.contains(HUMAN_KEY_SEP) {
+        let parts: Vec<&str> = t.split(HUMAN_KEY_SEP).collect();
+        return match parts.len() {
+            3 => IntentRef::HumanKey(VaultManifest::compose_human_key(
+                parts[0],
+                parts[1],
+                parts[2].parse().unwrap_or(0),
+            )),
+            2 => IntentRef::HumanKey(VaultManifest::compose_human_key(
+                default_project,
+                parts[0],
+                parts[1].parse().unwrap_or(0),
+            )),
+            _ => IntentRef::HumanKey(t.to_string()),
+        };
+    }
+
+    // A bare sequence number resolves to the current project + author.
+    if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
+        return IntentRef::HumanKey(VaultManifest::compose_human_key(
+            default_project,
+            default_author,
+            t.parse().unwrap_or(0),
+        ));
+    }
+
+    // Anything else is treated as a ULID (or a ULID prefix). ULIDs are
+    // Crockford base32 and canonically uppercase.
+    IntentRef::Uid(t.to_uppercase())
 }
 
 // ── Knowledge Graph ─────────────────────────────────────────────
@@ -452,6 +588,64 @@ pub struct SearchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_human_key_uppercases_project_and_keeps_author() {
+        assert_eq!(
+            VaultManifest::compose_human_key("pimo", "lee-faus", 3),
+            "PIMO::lee-faus::3"
+        );
+    }
+
+    #[test]
+    fn per_author_counters_are_independent() {
+        let mut m = VaultManifest::default();
+        assert_eq!(m.allocate_author_seq("lee"), 1);
+        assert_eq!(m.allocate_author_seq("lee"), 2);
+        // A different author starts from 1 — no collision with lee's sequence.
+        assert_eq!(m.allocate_author_seq("alice"), 1);
+        assert_eq!(m.allocate_author_seq("lee"), 3);
+        assert_eq!(m.allocate_author_seq("alice"), 2);
+    }
+
+    #[test]
+    fn parse_reference_bare_number_uses_project_and_author() {
+        assert_eq!(
+            parse_intent_reference("3", "PIMO", "lee-faus"),
+            IntentRef::HumanKey("PIMO::lee-faus::3".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_reference_author_scoped_overrides_only_author() {
+        assert_eq!(
+            parse_intent_reference("alice::3", "PIMO", "lee-faus"),
+            IntentRef::HumanKey("PIMO::alice::3".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_reference_full_key_is_exact_with_project_uppercased() {
+        assert_eq!(
+            parse_intent_reference("pimo::lee-faus::7", "OTHER", "someone"),
+            IntentRef::HumanKey("PIMO::lee-faus::7".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_reference_ulid_is_treated_as_uid() {
+        // A ULID (26 Crockford base32 chars) is not a number and has no '::'.
+        let ulid = "01J8ZE7G2WABCDEFGHJKMNPQRS";
+        assert_eq!(
+            parse_intent_reference(ulid, "PIMO", "lee"),
+            IntentRef::Uid(ulid.to_string())
+        );
+        // A short prefix is also treated as a uid (prefix match happens later).
+        assert_eq!(
+            parse_intent_reference("01j8ze", "PIMO", "lee"),
+            IntentRef::Uid("01J8ZE".to_string())
+        );
+    }
 
     #[test]
     fn vault_entry_roundtrip() {

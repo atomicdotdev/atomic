@@ -88,8 +88,10 @@ pub struct Task {
     pub task_status: String,
     #[serde(rename = "touchesFile", default, skip_serializing_if = "Vec::is_empty")]
     pub touches_file: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub satisfies: Option<String>,
+    /// The acceptance criteria this task fulfills. A task may satisfy more than
+    /// one criterion, so this is a list of `urn:atomic:ac:*` ids, not a scalar.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub satisfies: Vec<String>,
 }
 
 /// A Data Integrity proof (`eddsa-jcs-2022`).

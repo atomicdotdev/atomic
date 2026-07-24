@@ -115,34 +115,15 @@ fn sanitize_id(id: &str) -> String {
 ///    manifest stay as the bare number — the same on both paths, so reconciliation
 ///    still holds).
 pub fn normalized_id(repo: &Repository, id: &str) -> CliResult<String> {
-    let manifest = repo.vault_manifest().map_err(CliError::Repository)?;
-
-    // (1) direct case-insensitive manifest-key match (PREFIX-N / prefix-n forms).
-    if let Some(key) = manifest.intents.keys().find(|k| k.eq_ignore_ascii_case(id)) {
-        return Ok(key.clone());
+    // Resolution lives in exactly one place — the repository resolver — which
+    // fills in the current project + author for a bare number, matches full
+    // human keys, and resolves ULIDs/prefixes. When nothing resolves (e.g. a
+    // reference to an intent with no manifest entry yet), fall back to the
+    // uppercased raw arg so `attest` still produces a deterministic sidecar id.
+    match repo.resolve_intent_key(id) {
+        Ok(key) => Ok(key),
+        Err(_) => Ok(id.to_uppercase()),
     }
-
-    // (2) bare number -> expand with the manifest prefix, then confirm against a
-    //     manifest key (case-insensitively) so we return the canonical key form.
-    if id.parse::<u32>().is_ok() {
-        let prefix = if manifest.intent_prefix.is_empty() {
-            "VAULT".to_string()
-        } else {
-            manifest.intent_prefix.clone()
-        };
-        let expanded = format!("{prefix}-{id}");
-        if let Some(key) = manifest
-            .intents
-            .keys()
-            .find(|k| k.eq_ignore_ascii_case(&expanded))
-        {
-            return Ok(key.clone());
-        }
-        return Ok(expanded);
-    }
-
-    // (3) fallback: raw arg uppercased.
-    Ok(id.to_uppercase())
 }
 
 /// The tracked-vault path for an intent's attestation:
@@ -530,8 +511,8 @@ mod tests {
         let (repo, id, inputs, _dir) = repo_with_intent();
         let (node, _kp) = attested_node(&inputs);
 
-        // The bare-number alias (e.g. "1" for "NONA-1").
-        let num = id.rsplit('-').next().unwrap().to_string();
+        // The bare-number alias (e.g. "1" for "NONA::user::1").
+        let num = id.rsplit("::").next().unwrap().to_string();
         let normalized = attested_sidecar_path(&repo, &num).unwrap();
 
         // Write the sidecar at the RAW-arg location an M1a build used.

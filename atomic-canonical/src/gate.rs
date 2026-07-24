@@ -159,6 +159,30 @@ pub fn validate_intent(node: &CanonicalNode) -> ValidationReport {
         }
     }
 
+    // Referential integrity: every `satisfies` edge on a task must point at an
+    // acceptance criterion that this intent actually declares. A dangling edge
+    // means the task claims to fulfill a criterion that does not exist (a typo
+    // or a stale reference), which would silently break the task→criterion link.
+    let ac_ids: std::collections::HashSet<&str> = node
+        .has_acceptance_criterion
+        .iter()
+        .map(|ac| ac.id.as_str())
+        .collect();
+    for task in &node.has_task {
+        for target in &task.satisfies {
+            if !ac_ids.contains(target.as_str()) {
+                out.push(Violation {
+                    focus_node: task.id.clone(),
+                    shape: "TaskShape".into(),
+                    path: Some("satisfies".into()),
+                    message: format!(
+                        "task satisfies '{target}' which is not an acceptance criterion on this intent"
+                    ),
+                });
+            }
+        }
+    }
+
     ValidationReport::from(out)
 }
 
@@ -245,7 +269,7 @@ pub fn validate_memory(node: &MemoryNode) -> ValidationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::{ScopeItem, CONTEXT_URL};
+    use crate::node::{AcceptanceCriterion, ScopeItem, Task, CONTEXT_URL};
     use crate::proof;
     use crate::vocab::NodeType;
     use atomic_identity::identity::Identity;
@@ -256,6 +280,28 @@ mod tests {
             type_: NodeType::ScopeItem.as_str().to_string(),
             id: id.to_string(),
             text: text.to_string(),
+        }
+    }
+
+    fn ac(id: &str) -> AcceptanceCriterion {
+        AcceptanceCriterion {
+            type_: NodeType::AcceptanceCriterion.as_str().to_string(),
+            id: id.to_string(),
+            text: "a checkable outcome".to_string(),
+            ac_status: "unmet".to_string(),
+            verified_by: None,
+            evidence: None,
+        }
+    }
+
+    fn task(id: &str, satisfies: &[&str]) -> Task {
+        Task {
+            type_: NodeType::Task.as_str().to_string(),
+            id: id.to_string(),
+            text: "a work item".to_string(),
+            task_status: "open".to_string(),
+            touches_file: Vec::new(),
+            satisfies: satisfies.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -312,6 +358,40 @@ mod tests {
         // No scope section at all: a minimal intent is not forced to declare it.
         let node = attested_base();
         assert!(validate_intent(&node).conforms);
+    }
+
+    #[test]
+    fn gate_accepts_task_satisfying_declared_criteria() {
+        let mut node = attested_base();
+        node.has_acceptance_criterion = vec![
+            ac("urn:atomic:ac:gate-1-ac-1"),
+            ac("urn:atomic:ac:gate-1-ac-2"),
+        ];
+        node.has_task = vec![task(
+            "urn:atomic:task:gate-1-1",
+            &["urn:atomic:ac:gate-1-ac-1", "urn:atomic:ac:gate-1-ac-2"],
+        )];
+        assert!(
+            validate_intent(&node).conforms,
+            "{}",
+            validate_intent(&node)
+        );
+    }
+
+    #[test]
+    fn gate_rejects_task_satisfying_unknown_criterion() {
+        let mut node = attested_base();
+        node.has_acceptance_criterion = vec![ac("urn:atomic:ac:gate-1-ac-1")];
+        // The second target does not exist on this intent.
+        node.has_task = vec![task(
+            "urn:atomic:task:gate-1-1",
+            &["urn:atomic:ac:gate-1-ac-1", "urn:atomic:ac:gate-1-ac-9"],
+        )];
+        let report = validate_intent(&node);
+        assert!(!report.conforms);
+        assert!(report.results.iter().any(|v| v.shape == "TaskShape"
+            && v.path.as_deref() == Some("satisfies")
+            && v.message.contains("gate-1-ac-9")));
     }
 
     /// A minimal, fully attested Memory that conforms — the base for mutation.

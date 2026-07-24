@@ -78,6 +78,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # IDs
 uuid = { version = "1.0", features = ["serde", "v4"] }
+ulid = "1"
 
 # Utilities
 thiserror = "1.0"

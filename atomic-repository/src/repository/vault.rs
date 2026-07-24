@@ -396,6 +396,10 @@ impl Repository {
         // KG and embeddings are derived from the Vault entry. Clean both even
         // if the source entry is already missing so a retry repairs stale data.
         let node_id = super::vault_triples::entry_subject(path, entry_type);
+        // Remove projected child nodes (tasks, acceptance criteria, scope,
+        // constraints) before the subject so an intent deletion does not orphan
+        // them or their SATISFIES/TOUCHES edges. No-op for non-intent subjects.
+        super::vault_triples::delete_intent_child_nodes(&mut txn, &node_id)?;
         txn.del_kg_node(&node_id)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         txn.del_embeddings(path)
@@ -1524,6 +1528,7 @@ mod tests {
                     blocked_by: Vec::new(),
                     title: "Test".to_string(),
                     vault_path: intent_path.to_string(),
+                    ..Default::default()
                 },
             );
             txn.put_vault_manifest(&manifest).unwrap();

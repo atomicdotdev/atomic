@@ -337,74 +337,61 @@ fn show_session_detail(repo: &Repository, session_id: &str, json: bool) -> CliRe
     Ok(())
 }
 
-/// Build a map from session_id → vec of unique intent IDs by parsing vault
-/// intent paths (`intents/<view>/<session_id>/<turn>/intent.md`).
+/// Build a map from session_id → vec of unique intent human keys, read from the
+/// vault manifest's per-intent `session` provenance field.
 fn build_session_intent_map(repo: &Repository) -> HashMap<String, Vec<String>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     let manifest = match repo.vault_manifest() {
         Ok(m) => m,
         Err(_) => return map,
     };
-    for (intent_id, summary) in &manifest.intents {
-        if let Some(session_id) = parse_session_from_vault_path(&summary.vault_path) {
-            let ids = map.entry(session_id).or_default();
-            if !ids.contains(intent_id) {
-                ids.push(intent_id.clone());
+    for (key, summary) in &manifest.intents {
+        if let Some(session_id) = &summary.session {
+            let label = if summary.human_key.is_empty() {
+                key.clone()
+            } else {
+                summary.human_key.clone()
+            };
+            let ids = map.entry(session_id.clone()).or_default();
+            if !ids.contains(&label) {
+                ids.push(label);
             }
         }
     }
-    // Sort intent IDs within each session for stable display.
+    // Sort intent keys within each session for stable display.
     for ids in map.values_mut() {
         ids.sort();
     }
     map
 }
 
-/// Build a map from turn_number → intent_id for a specific session by parsing
-/// vault intent paths (`intents/<view>/<session_id>/<turn>/intent.md`).
+/// Build a map from session turn_number → intent human key for a specific
+/// session, read from the manifest's `session`/`turn` provenance fields.
+///
+/// The stored `turn` is `turn_count + 1` at creation time (see
+/// `resolve_active_session` in vault/intent.rs), so we subtract 1 to recover
+/// the 0-indexed session-ledger turn number.
 fn build_turn_intent_map(repo: &Repository, session_id: &str) -> HashMap<u32, String> {
     let mut map: HashMap<u32, String> = HashMap::new();
     let manifest = match repo.vault_manifest() {
         Ok(m) => m,
         Err(_) => return map,
     };
-    for (intent_id, summary) in &manifest.intents {
-        if let Some((sid, turn)) = parse_session_and_turn_from_vault_path(&summary.vault_path) {
-            if sid == session_id {
-                map.insert(turn, intent_id.clone());
-            }
+    for (key, summary) in &manifest.intents {
+        if summary.session.as_deref() != Some(session_id) {
+            continue;
         }
+        let Some(session_turn) = summary.turn.and_then(|t| t.checked_sub(1)) else {
+            continue;
+        };
+        let label = if summary.human_key.is_empty() {
+            key.clone()
+        } else {
+            summary.human_key.clone()
+        };
+        map.insert(session_turn, label);
     }
     map
-}
-
-/// Extract session_id from a vault intent path.
-/// Expected format: `intents/<view>/<session_id>/<turn>/intent.md`
-fn parse_session_from_vault_path(path: &str) -> Option<String> {
-    let parts: Vec<&str> = path.split('/').collect();
-    // intents / <view> / <session_id> / <turn> / intent.md
-    if parts.len() >= 5 && parts[0] == "intents" && parts[1] != "manual" {
-        Some(parts[2].to_string())
-    } else {
-        None
-    }
-}
-
-/// Extract (session_id, turn_number) from a vault intent path.
-/// Expected format: `intents/<view>/<session_id>/<turn>/intent.md`
-///
-/// The turn ID in the path is `turn_count + 1` at creation time (see
-/// `resolve_active_session` in vault/intent.rs), so we subtract 1 to
-/// get the actual session turn number.
-fn parse_session_and_turn_from_vault_path(path: &str) -> Option<(String, u32)> {
-    let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() >= 5 && parts[0] == "intents" && parts[1] != "manual" {
-        let path_turn: u32 = parts[3].parse().ok()?;
-        let session_turn = path_turn.checked_sub(1)?;
-        Some((parts[2].to_string(), session_turn))
-    } else {
-        None
-    }
 }
 
 fn truncate_column(value: &str, width: usize) -> String {
@@ -461,52 +448,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_from_agent_intent_path() {
-        let path = "intents/fresh-ridge-394a/ses_0739e30edffecd2BVayyUHjQpY/0/intent.md";
-        assert_eq!(
-            parse_session_from_vault_path(path).as_deref(),
-            Some("ses_0739e30edffecd2BVayyUHjQpY")
-        );
-    }
+    fn session_intent_maps_read_from_manifest_provenance() {
+        use atomic_repository::{IntentCreateOptions, Repository};
 
-    #[test]
-    fn parse_session_and_turn_from_agent_intent_path() {
-        // Path turn "2" → session turn 1 (path is turn_count+1 at creation)
-        let path = "intents/fresh-ridge-394a/ses_0739e30edffecd2BVayyUHjQpY/2/intent.md";
-        let (sid, turn) = parse_session_and_turn_from_vault_path(path).unwrap();
-        assert_eq!(sid, "ses_0739e30edffecd2BVayyUHjQpY");
-        assert_eq!(turn, 1);
-    }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
 
-    #[test]
-    fn parse_session_and_turn_path_turn_1_maps_to_session_turn_0() {
-        let path = "intents/dev/ses_abc/1/intent.md";
-        let (_, turn) = parse_session_and_turn_from_vault_path(path).unwrap();
-        assert_eq!(turn, 0);
-    }
+        let mk = |title: &str, session: &str, turn: u32| IntentCreateOptions {
+            title: title.to_string(),
+            priority: None,
+            assignee: None,
+            labels: Vec::new(),
+            session_id: Some(session.to_string()),
+            turn_id: Some(turn),
+        };
 
-    #[test]
-    fn parse_session_and_turn_path_turn_0_returns_none() {
-        // Path turn 0 would underflow to session turn -1; reject it.
-        let path = "intents/dev/ses_abc/0/intent.md";
-        assert_eq!(parse_session_and_turn_from_vault_path(path), None);
-    }
+        // Two intents in ses-x (turns 1 and 2), one in ses-y.
+        let a = repo.vault_intent_create(mk("A", "ses-x", 1)).unwrap();
+        let b = repo.vault_intent_create(mk("B", "ses-x", 2)).unwrap();
+        let _c = repo.vault_intent_create(mk("C", "ses-y", 1)).unwrap();
 
-    #[test]
-    fn parse_session_from_manual_intent_path_returns_none() {
-        let path = "intents/manual/alice/1/intent.md";
-        assert_eq!(parse_session_from_vault_path(path), None);
-    }
+        let by_session = build_session_intent_map(&repo);
+        assert_eq!(by_session.get("ses-x").map(Vec::len), Some(2));
+        assert_eq!(by_session.get("ses-y").map(Vec::len), Some(1));
 
-    #[test]
-    fn parse_session_from_short_path_returns_none() {
-        assert_eq!(parse_session_from_vault_path("intents/view"), None);
-        assert_eq!(parse_session_from_vault_path(""), None);
-    }
-
-    #[test]
-    fn parse_session_and_turn_non_numeric_turn_returns_none() {
-        let path = "intents/dev/ses_abc/not-a-number/intent.md";
-        assert_eq!(parse_session_and_turn_from_vault_path(path), None);
+        // Stored turn is turn_count+1, so 1/2 map to session turns 0/1.
+        let turns = build_turn_intent_map(&repo, "ses-x");
+        assert_eq!(turns.get(&0), Some(&a.id));
+        assert_eq!(turns.get(&1), Some(&b.id));
     }
 }
