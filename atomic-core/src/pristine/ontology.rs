@@ -110,6 +110,14 @@ pub mod entity_type {
     pub const TODO: &str = "vault:Todo";
     /// A content-addressed provenance graph explaining turn(s)/change(s).
     pub const PROVENANCE: &str = "vault:ProvenanceGraph";
+    /// A decomposed task lifted from an intent's directive body.
+    pub const TASK: &str = "vault:Task";
+    /// An acceptance criterion lifted from an intent's directive body.
+    pub const ACCEPTANCE_CRITERION: &str = "vault:AcceptanceCriterion";
+    /// A scope boundary item lifted from an intent's directive body.
+    pub const SCOPE_ITEM: &str = "vault:ScopeItem";
+    /// A constraint lifted from an intent's directive body.
+    pub const CONSTRAINT: &str = "vault:Constraint";
 }
 
 /// Edge kinds used in the knowledge graph.
@@ -154,6 +162,22 @@ pub mod edge_kind {
     pub const PART_OF: &str = "PART_OF";
     /// File includes/imports another file (via #include or import statement).
     pub const INCLUDES: &str = "INCLUDES";
+
+    // ── Intent decomposition (lifted from the directive body) ────
+    /// Intent has a task (decomposed work item).
+    pub const HAS_TASK: &str = "HAS_TASK";
+    /// Intent has an acceptance criterion.
+    pub const HAS_ACCEPTANCE_CRITERION: &str = "HAS_ACCEPTANCE_CRITERION";
+    /// Intent declares an in-scope boundary item.
+    pub const HAS_SCOPE_IN: &str = "HAS_SCOPE_IN";
+    /// Intent declares an out-of-scope boundary item.
+    pub const HAS_SCOPE_OUT: &str = "HAS_SCOPE_OUT";
+    /// Intent declares a constraint the implementation must respect.
+    pub const HAS_CONSTRAINT: &str = "HAS_CONSTRAINT";
+    /// Task fulfills an acceptance criterion.
+    pub const SATISFIES: &str = "SATISFIES";
+    /// Task touches a file.
+    pub const TOUCHES: &str = "TOUCHES";
 }
 
 /// Check if a predicate string is a known predicate.
