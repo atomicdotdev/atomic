@@ -105,8 +105,11 @@ pub struct Pull {
     /// Remote name or URL to pull from.
     ///
     /// Can be a configured remote name (like "origin") or a full URL.
-    /// If not specified, uses the remote configured with
-    /// `atomic remote default <name>`, falling back to "origin".
+    ///
+    /// If not specified, the remote is resolved in this order: the remote
+    /// marked default by `atomic remote default <name>`; then "origin" if
+    /// it is configured; then the sole configured remote if there is
+    /// exactly one; then the literal "origin".
     #[arg()]
     pub remote: Option<String>,
 
