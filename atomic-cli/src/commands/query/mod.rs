@@ -1996,26 +1996,34 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_display_cjk_no_panic() {
+    fn test_truncate_display_three_byte_chars_no_panic() {
         // Regression: byte slicing (&s[..57]) panicked on multi-byte content
-        // when byte 57 fell inside a character (e.g. "x" + CJK text).
-        let s = format!("x{}", "修复认证模块中的关键安全漏洞并添加全面的单元测试覆盖率以确保长期稳定性和可维护性");
-        let out = truncate_display(&s, 60);
-        assert!(out.ends_with("...") || out == s);
-        // Result must be valid UTF-8 with at most 60 chars before the ellipsis
-        assert!(out.trim_end_matches("...").chars().count() <= 60);
+        // when byte 57 fell inside a character. "x" + 3-byte chars (U+20AC)
+        // shifts alignment so byte 57 is mid-char, while the char count (41)
+        // stays within the display limit.
+        let s = format!("x{}", "\u{20ac}".repeat(40));
+        assert!(s.len() > 60); // byte length exceeds the old byte-based check
+        assert_eq!(truncate_display(&s, 60), s); // 41 chars: no truncation
     }
 
     #[test]
-    fn test_truncate_display_emoji_within_limit_unchanged() {
-        let s = "🚀".repeat(40); // 4-byte chars: any byte index not divisible by 4 is mid-char
+    fn test_truncate_display_three_byte_chars_truncated() {
+        let s = format!("x{}", "\u{20ac}".repeat(80)); // 81 chars, 241 bytes
+        let out = truncate_display(&s, 60);
+        assert_eq!(out, format!("x{}...", "\u{20ac}".repeat(56)));
+    }
+
+    #[test]
+    fn test_truncate_display_four_byte_chars_within_limit_unchanged() {
+        // 4-byte chars (U+1F680): any byte index not divisible by 4 is mid-char
+        let s = "\u{1f680}".repeat(40);
         assert_eq!(truncate_display(&s, 50), s);
     }
 
     #[test]
-    fn test_truncate_display_emoji_truncated() {
-        let s = "🚀".repeat(80);
+    fn test_truncate_display_four_byte_chars_truncated() {
+        let s = "\u{1f680}".repeat(80);
         let out = truncate_display(&s, 50);
-        assert_eq!(out, format!("{}...", "🚀".repeat(47)));
+        assert_eq!(out, format!("{}...", "\u{1f680}".repeat(47)));
     }
 }
