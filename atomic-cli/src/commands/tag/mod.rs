@@ -37,9 +37,6 @@
 //! $ atomic tag create v1.0.0 -m "Release version 1.0.0"
 //! Created annotated tag: v1.0.0
 //!
-//! # Create a tag with author information
-//! $ atomic tag create v1.0.0 -m "Release" --author "Alice <alice@example.com>"
-//! Created annotated tag: v1.0.0
 //! ```
 //!
 //! ## Listing Tags

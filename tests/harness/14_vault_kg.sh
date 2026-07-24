@@ -164,6 +164,32 @@ else
     _fail "intent link" "could not extract intent ID from create output"
 fi
 
+# The deprecated vault intent family remains a supported compatibility path
+# while embedded skills still invoke it. Keep one end-to-end lifecycle test so
+# future cleanup cannot silently break that path before the migration finishes.
+run_cmd atomic vault intent create --title "Legacy compatibility"
+assert_ran "deprecated vault intent create remains functional" "Created intent: [A-Za-z0-9-]+-[0-9]+"
+
+legacy_id="$(echo "$OUT" | sed -n 's/.*Created intent: \([A-Za-z0-9-]*\).*/\1/p' | head -1)"
+
+run_cmd atomic vault intent list --json
+assert_ran "deprecated vault intent list remains functional" "legacy compatibility"
+
+if [[ -n "$legacy_id" ]]; then
+    run_cmd atomic vault intent show "$legacy_id" --json
+    assert_ran "deprecated vault intent show remains functional" "legacy compatibility"
+
+    run_cmd atomic vault intent update "$legacy_id" --status in-progress
+    assert_ran "deprecated vault intent update remains functional" "Updated intent: $legacy_id"
+
+    run_cmd atomic vault intent link "$legacy_id" --goal intent-goal
+    assert_ran "deprecated vault intent link remains functional" "Linked goal 'intent-goal'"
+else
+    _fail "deprecated vault intent show" "could not extract intent ID from create output"
+    _fail "deprecated vault intent update" "could not extract intent ID from create output"
+    _fail "deprecated vault intent link" "could not extract intent ID from create output"
+fi
+
 # ════════════════════════════════════════════════════════════════════════════
 # Section 4: Record + Vault Integration
 # ════════════════════════════════════════════════════════════════════════════
