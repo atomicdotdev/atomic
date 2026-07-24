@@ -85,17 +85,18 @@ impl OrgDelete {
     async fn execute(&self) -> CliResult<()> {
         let client = build_client(self.org.as_deref(), None).await?;
 
-        // Verify the organization exists before asking for confirmation, so a
-        // typo'd slug fails fast instead of after the destructive prompt.
-        atomic_teams::org::get_org(&client, &self.slug)
-            .await
-            .map_err(|e| CliError::RemoteError {
-                message: e.to_string(),
-                url: None,
-            })?;
-
-        // Prompt for confirmation unless --force is set.
+        // Prompt for confirmation unless --force is set. --force skips the
+        // existence precheck too, keeping scripted deletes to a single request.
         if !self.force {
+            // Verify the organization exists before asking for confirmation,
+            // so a typo'd slug fails fast instead of after the prompt.
+            atomic_teams::org::get_org(&client, &self.slug)
+                .await
+                .map_err(|e| CliError::RemoteError {
+                    message: e.to_string(),
+                    url: None,
+                })?;
+
             print_warning(&format!(
                 "This will permanently delete organization '{}' and all its data.",
                 self.slug

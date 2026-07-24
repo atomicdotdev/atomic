@@ -130,7 +130,9 @@ impl Command for Enable {
             if detected.is_empty() {
                 // No agents detected — refuse rather than blanket-installing
                 // hooks for every registered agent into configs that don't exist.
-                print_error("No agents detected in this repository — nothing to enable with --all.");
+                print_error(
+                    "No agents detected in this repository — nothing to enable with --all.",
+                );
                 print_warning(
                     "Create a .claude/, .gemini/, or .agents/ directory first, or use --agent <name>.",
                 );
