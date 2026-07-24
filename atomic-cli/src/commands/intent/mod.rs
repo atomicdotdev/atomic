@@ -1,11 +1,17 @@
 //! `atomic intent` — the canonical "record the why" engine surface.
 //!
 //! This is a NEW top-level command, a sibling of `atomic vault` (see
-//! [`crate::commands::vault`]). It is distinct from the existing vault-scoped
-//! former `atomic vault intent ...` tree (now removed): that
-//! tree manages the raw vault entries (create/list/show/update/delete/link),
-//! while this one drives the `atomic-canonical` engine — lifting a stored intent
-//! into a canonical JSON-LD node, gating it, attesting it, and rendering it.
+//! [`crate::commands::vault`]). It is distinct from the vault-scoped
+//! `atomic vault intent ...` tree, which still ships and is marked
+//! DEPRECATED: that tree manages the raw vault entries
+//! (create/list/show/update/delete/link), while this one drives the
+//! `atomic-canonical` engine — lifting a stored intent into a canonical
+//! JSON-LD node, gating it, attesting it, and rendering it.
+//!
+//! The two are not yet output-compatible (`atomic intent list --json` omits
+//! titles, `atomic intent new` has no `--priority`/`--json`), so the
+//! deprecated tree cannot be removed until a migration lands that also
+//! updates the vault skills embedded in `vault_defaults.rs`.
 //!
 //! # Verbs
 //!

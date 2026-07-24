@@ -17,7 +17,6 @@
 //!       --view <NAME>      View to use for sequence lookup (default: current)
 //!   -f, --format <FORMAT>  Output format (default, short, json)
 //!       --show-deps        Show dependency details
-//!       --show-hunks       Show graph_op details
 //!   -h, --help             Print help information
 //! ```
 //!

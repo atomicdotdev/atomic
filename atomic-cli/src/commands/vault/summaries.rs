@@ -11,9 +11,10 @@
 //!
 //! Options:
 //!       --goal <NAME>     Goal name to get summaries for
-//!       --json            Output as JSON (default for this command)
 //!   -h, --help            Print help information
 //! ```
+//!
+//! Output is always JSON.
 //!
 //! # Examples
 //!

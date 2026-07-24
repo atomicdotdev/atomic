@@ -14,7 +14,6 @@
 //!       --all              Show all views' history
 //!       --view <NAME>      Show history for specific view
 //!       --tags-only        Only show tagged changes
-//!       --path <PATH>      Show only changes affecting this path
 //!   -f, --format <FORMAT>  Output format (default, short, oneline, json)
 //!       --reverse          Show in reverse order (oldest first)
 //!       --from <SEQ>       Start from sequence number

@@ -11,7 +11,7 @@ use crate::error::{CliError, CliResult};
 
 /// Show an intent as a rendered read-time projection.
 ///
-/// Distinct from the former `atomic vault intent show`, which dumped the
+/// Distinct from the deprecated `atomic vault intent show`, which dumps the
 /// raw stored body. This projects the lifted canonical node.
 #[derive(Parser, Debug)]
 #[command(name = "show")]
