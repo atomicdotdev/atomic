@@ -220,9 +220,15 @@ _skip() {
 }
 
 # Mark the entire suite as skipped and stop it immediately.
+# If assertions have already failed, the suite FAILS instead — a skip must
+# never mask earlier failures as "skipped" in the runner's summary.
 # Usage: skip_suite "reason"
 skip_suite() {
     local reason="$1"
+    if [[ ${TESTS_FAILED:-0} -gt 0 ]]; then
+        echo "${RED}NOT skipping ($reason): $TESTS_FAILED assertion(s) already failed${RESET}"
+        exit 1
+    fi
     echo "${YELLOW}SKIPPING: $reason${RESET}"
     exit "$HARNESS_SKIP_EXIT"
 }

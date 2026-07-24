@@ -122,8 +122,13 @@ assert_paired_diff() {
 # Return only actual +/- change lines from Atomic's unified diff output.
 # Context lines are intentionally rendered around changes and must not be
 # mistaken for modified content.
+#
+# Filters out only the `+++ b/…` / `--- a/…` file headers. Requiring a
+# non-+/- second character instead would drop real change lines whose
+# content starts with '+' or '-' (rendered as `++…`/`--…`) and added or
+# deleted blank lines (a bare `+` or `-`).
 extract_atomic_change_lines() {
-    grep -E '^\+[^+]|^-[^-]' || true
+    grep -E '^[+-]' | grep -vE '^\+\+\+ b/|^--- a/' || true
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
