@@ -15,7 +15,6 @@
 //!
 //! Options:
 //!   -n, --dry-run  Show what would be moved without doing it
-//!   -f, --force    Force move even if destination exists
 //!   -h, --help     Print help information
 //! ```
 //!
@@ -75,7 +74,6 @@ use crate::output::{print_hint, print_success, print_warning};
 /// # Options
 ///
 /// - `--dry-run` / `-n`: Preview what would be moved
-/// - `--force` / `-f`: Force move even if destination exists (overwrite tracking)
 #[derive(Parser, Debug, Clone)]
 #[command(name = "move")]
 #[derive(Default)]
@@ -98,14 +96,6 @@ pub struct Move {
     /// modify the repository or filesystem.
     #[arg(short = 'n', long = "dry-run")]
     pub dry_run: bool,
-
-    /// Force move even if destination tracking exists.
-    ///
-    /// This will overwrite the destination's tracking entry if it exists.
-    /// The destination file on disk is NOT overwritten unless you explicitly
-    /// remove it first.
-    #[arg(short = 'f', long = "force")]
-    pub force: bool,
 }
 
 impl Move {
@@ -115,19 +105,12 @@ impl Move {
             source: source.into(),
             destination: destination.into(),
             dry_run: false,
-            force: false,
         }
     }
 
     /// Builder: set the dry-run flag.
     pub fn with_dry_run(mut self, dry_run: bool) -> Self {
         self.dry_run = dry_run;
-        self
-    }
-
-    /// Builder: set the force flag.
-    pub fn with_force(mut self, force: bool) -> Self {
-        self.force = force;
         self
     }
 
@@ -217,14 +200,29 @@ impl Command for Move {
             return Err(CliError::FileNotFound { path: source_path });
         }
 
-        // Check if destination is already tracked (unless force)
-        if !self.force
-            && repo
-                .is_tracked(&destination)
-                .map_err(CliError::Repository)?
+        // A tracked destination is always an error: the tracking layer
+        // rejects it anyway, and forcing past it destroyed the destination
+        // file on disk (the old --force flag was removed for that reason).
+        if repo
+            .is_tracked(&destination)
+            .map_err(CliError::Repository)?
         {
             return Err(CliError::FileAlreadyTracked {
                 path: PathBuf::from(&destination),
+            });
+        }
+
+        // Refuse to overwrite ANY existing file at the resolved destination,
+        // tracked or not — fs::rename replaces it silently and the previous
+        // content is unrecoverable. (Moving INTO an existing directory is
+        // fine: resolve_destination already appended the source filename.)
+        let destination_disk = repo_root.join(&destination);
+        if destination_disk.exists() {
+            return Err(CliError::InvalidArgument {
+                message: format!(
+                    "destination '{}' already exists on disk; move it away or choose another name",
+                    destination
+                ),
             });
         }
 
@@ -286,7 +284,6 @@ mod tests {
         assert_eq!(cmd.source, "old.rs");
         assert_eq!(cmd.destination, "new.rs");
         assert!(!cmd.dry_run);
-        assert!(!cmd.force);
     }
 
     #[test]
@@ -295,7 +292,6 @@ mod tests {
         assert!(cmd.source.is_empty());
         assert!(cmd.destination.is_empty());
         assert!(!cmd.dry_run);
-        assert!(!cmd.force);
     }
 
     #[test]
@@ -305,21 +301,12 @@ mod tests {
     }
 
     #[test]
-    fn test_move_with_force() {
-        let cmd = Move::new("old.rs", "new.rs").with_force(true);
-        assert!(cmd.force);
-    }
-
-    #[test]
     fn test_move_builder_chain() {
-        let cmd = Move::new("src/old.rs", "src/new.rs")
-            .with_dry_run(true)
-            .with_force(true);
+        let cmd = Move::new("src/old.rs", "src/new.rs").with_dry_run(true);
 
         assert_eq!(cmd.source, "src/old.rs");
         assert_eq!(cmd.destination, "src/new.rs");
         assert!(cmd.dry_run);
-        assert!(cmd.force);
     }
 
     // Path Resolution Tests
@@ -370,15 +357,12 @@ mod tests {
 
     #[test]
     fn test_move_clone() {
-        let cmd = Move::new("old.rs", "new.rs")
-            .with_dry_run(true)
-            .with_force(true);
+        let cmd = Move::new("old.rs", "new.rs").with_dry_run(true);
         let cloned = cmd.clone();
 
         assert_eq!(cloned.source, cmd.source);
         assert_eq!(cloned.destination, cmd.destination);
         assert_eq!(cloned.dry_run, cmd.dry_run);
-        assert_eq!(cloned.force, cmd.force);
     }
 
     // Normalize Path Tests
@@ -408,5 +392,96 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let result = cmd.normalize_path(temp.path(), "/completely/different/path.rs");
         assert!(result.is_err());
+    }
+
+    // Run-level Data-Safety Tests
+
+    struct DirGuard {
+        original: PathBuf,
+    }
+
+    impl DirGuard {
+        fn new() -> Self {
+            Self {
+                original: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            }
+        }
+    }
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    fn init_repo_with_tracked(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let _repo = atomic_repository::Repository::init(temp.path()).unwrap();
+        }
+        for (name, content) in files {
+            std::fs::write(temp.path().join(name), content).unwrap();
+        }
+        std::env::set_current_dir(temp.path()).unwrap();
+        let add = crate::commands::add::Add::new()
+            .with_files(files.iter().map(|(n, _)| n.to_string()).collect::<Vec<_>>());
+        add.run().unwrap();
+        temp
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_move_refuses_existing_untracked_destination() {
+        let _guard = DirGuard::new();
+        let temp = init_repo_with_tracked(&[("src.txt", "SOURCE")]);
+        std::fs::write(temp.path().join("dest.txt"), "PRECIOUS-UNTRACKED").unwrap();
+
+        let result = Move::new("src.txt", "dest.txt").run();
+
+        assert!(result.is_err(), "move onto an existing file must fail");
+        let dest = std::fs::read_to_string(temp.path().join("dest.txt")).unwrap();
+        assert_eq!(dest, "PRECIOUS-UNTRACKED", "destination must be untouched");
+        let src = std::fs::read_to_string(temp.path().join("src.txt")).unwrap();
+        assert_eq!(src, "SOURCE", "source must still exist");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_move_refuses_tracked_destination() {
+        let _guard = DirGuard::new();
+        let temp = init_repo_with_tracked(&[("a.txt", "A"), ("b.txt", "TRACKED-B")]);
+
+        let result = Move::new("a.txt", "b.txt").run();
+
+        assert!(result.is_err(), "move onto a tracked file must fail");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("b.txt")).unwrap(),
+            "TRACKED-B"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("a.txt")).unwrap(),
+            "A"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_move_into_existing_directory_works() {
+        let _guard = DirGuard::new();
+        let temp = init_repo_with_tracked(&[("file.txt", "CONTENT")]);
+        std::fs::create_dir(temp.path().join("sub")).unwrap();
+
+        let result = Move::new("file.txt", "sub").run();
+
+        assert!(
+            result.is_ok(),
+            "move into a directory failed: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("sub/file.txt")).unwrap(),
+            "CONTENT"
+        );
+        assert!(!temp.path().join("file.txt").exists());
     }
 }

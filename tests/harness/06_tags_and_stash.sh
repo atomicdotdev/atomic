@@ -554,8 +554,12 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Stash: Stash with new untracked files (--include-untracked)"
+begin_section "Stash: Untracked files are left in place"
 # ═══════════════════════════════════════════════════════════════════════════
+#
+# The --include-untracked flag was removed: it copied untracked files into
+# the stash sidecar but never cleaned them from the working copy, while
+# still printing "clean". Untracked files now simply stay untouched.
 
 make_temp_repo "stash-untracked"
 init_repo
@@ -568,20 +572,19 @@ record_change "base" >/dev/null 2>&1 || true
 create_file "newfile.txt" "I am new"
 overwrite_file "tracked.txt" "modified tracked"
 
-# Stash with --include-untracked
-stash_iu="$(atomic stash push --include-untracked 2>&1)"
-if echo "$stash_iu" | grep -qiE "saved|stash"; then
-    _pass "stash with --include-untracked succeeds"
-else
-    _pass "stash with --include-untracked completed"
-fi
+# The removed flag must stay removed
+assert_failure "stash rejects removed --include-untracked flag" \
+    atomic stash push --include-untracked
 
-# tracked.txt should be restored
+# Plain stash: tracked change saved, untracked file left alone
+assert_success "stash saves tracked changes" atomic stash push
 assert_file_content "tracked.txt restored" "tracked.txt" "tracked"
+assert_file_exists "untracked file left in working copy" "newfile.txt"
 
 # Pop and verify
 atomic stash pop >/dev/null 2>&1 || true
 assert_file_content "tracked.txt modified after pop" "tracked.txt" "modified tracked"
+assert_file_content "untracked file untouched by pop" "newfile.txt" "I am new"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Stash: Stash with custom message"

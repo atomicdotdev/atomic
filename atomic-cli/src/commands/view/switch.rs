@@ -134,7 +134,7 @@ impl Command for Switch {
                     // Auto-stash: save changes before switching
                     let stash_cmd = crate::commands::stash::Stash::new()
                         .with_message(format!("Auto-stash before switching to {}", name));
-                    stash_cmd.run_push_on(&mut repo, None, false, false)?;
+                    stash_cmd.run_push_on(&mut repo, None, false)?;
                 } else {
                     let dirty: Vec<String> = status
                         .entries()

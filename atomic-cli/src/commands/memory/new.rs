@@ -105,6 +105,21 @@ impl Command for MemoryNew {
         let id = self.id.clone().unwrap_or_else(generate_ulid_lowercased);
         let vault_path = bridge::normalize_memory_path(&id);
 
+        // Refuse to overwrite an existing memory: the entry may be attested,
+        // and vault_store would silently replace it while the old attestation
+        // keeps signing the previous content.
+        if repo
+            .vault_retrieve(&vault_path)
+            .map_err(CliError::Repository)?
+            .is_some()
+        {
+            return Err(CliError::InvalidArgument {
+                message: format!(
+                    "memory '{id}' already exists at .vault/{vault_path}; choose a different --id"
+                ),
+            });
+        }
+
         // Build the frontmatter SPINE as FLAT SCALAR/array fields only (so it
         // survives yaml_frontmatter_to_json round-trip). Do NOT write
         // attributedTo/proof/contentHash — attest fills those. createdAt is
@@ -303,5 +318,62 @@ mod tests {
         assert_eq!(node.derived_from.len(), 3);
         assert_eq!(node.derived_from[0], "urn:atomic:intent:demo-1");
         assert!(node.text.contains("health-check timeout"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_new_refuses_duplicate_id() {
+        struct DirGuard {
+            original: std::path::PathBuf,
+        }
+        impl DirGuard {
+            fn new() -> Self {
+                Self {
+                    original: std::env::current_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("/")),
+                }
+            }
+        }
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.original);
+            }
+        }
+
+        let _guard = DirGuard::new();
+        let dir = tempdir().unwrap();
+        {
+            let repo = Repository::init(dir.path()).unwrap();
+            repo.init_vault().unwrap();
+        }
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let first = MemoryNew {
+            kind: "constraint".into(),
+            about: vec![],
+            derived_from: vec![],
+            text: Some("original fact".into()),
+            id: Some("dup01".into()),
+            status: "active".into(),
+        };
+        first.run().expect("first create succeeds");
+
+        let overwrite = MemoryNew {
+            kind: "preference".into(),
+            about: vec![],
+            derived_from: vec![],
+            text: Some("REPLACED".into()),
+            id: Some("dup01".into()),
+            status: "active".into(),
+        };
+        let err = overwrite.run().expect_err("duplicate id must be rejected");
+        assert!(
+            err.to_string().contains("already exists"),
+            "unexpected error: {err}"
+        );
+
+        let on_disk = std::fs::read_to_string(dir.path().join(".vault/memory/dup01.md")).unwrap();
+        assert!(on_disk.contains("original fact"));
+        assert!(!on_disk.contains("REPLACED"));
     }
 }
