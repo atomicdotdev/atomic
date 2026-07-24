@@ -39,15 +39,16 @@
 //! reading whole files. Antigravity imports plugin skills and exposes them
 //! to the agent for task-based selection.
 //!
-//! # AGENTS.md Managed Section
+//! # Agent Instruction File
 //!
-//! Skills are on-demand — nothing forces the agent to read them. So
-//! project-level install additionally writes a small managed section into
-//! the repo's `AGENTS.md` (between `<!-- atomic:tools:start/end -->`
-//! markers) with the KG-first discovery rules. agy reads `AGENTS.md` as
-//! workspace context, making the workflow always-on for that repo. User
-//! content outside the markers is preserved; `uninstall` removes the
-//! section.
+//! The agent-facing instruction file (VCS rules, intent workflow, recording
+//! rules) is **required** for the integration to work as designed — without
+//! it the agent falls back to grep-and-read and git. Its canonical copy is
+//! `atomic-repository/vault/AGENTS.md`, a plain markdown file mirrored as
+//! `AGENTS.md` in the atomic-agy integration repository. On install, this
+//! adapter writes it into the project's `AGENTS.md` as a managed section
+//! (`<!-- atomic:tools:start/end -->` markers) and refreshes it on rerun
+//! when the canonical content changes; `uninstall` removes it.
 //!
 //! # Hook Execution Environment (Important)
 //!
@@ -171,45 +172,17 @@ const SECTION_START: &str = "<!-- atomic:tools:start -->";
 /// End marker for the managed Atomic section in `AGENTS.md`.
 const SECTION_END: &str = "<!-- atomic:tools:end -->";
 
-/// The managed section teaching the agent Atomic's code discovery workflow.
+/// The agent instruction file — VCS rules, intent workflow, recording
+/// rules, skills list.
 ///
-/// Written into the repo's `AGENTS.md` between the markers — agy reads that
-/// file as workspace context, which is how the agent learns to prefer the
-/// vault knowledge graph over grep-and-read, and `atomic` commands over
-/// `git`. Everything between the markers is Atomic-managed; user content
-/// outside them is preserved.
-const SECTION_BODY: &str = r#"## Atomic Code Intelligence
-
-This repository uses Atomic for version control. Its vault knowledge graph
-indexes every function, struct, trait, enum, and module, plus recorded
-changes — **search the KG first for code discovery, before grep or reading
-whole files**.
-
-1. `atomic vault query search "term"` — find entities, files, and changes by
-   keyword (use 1–2 specific words, not natural language)
-2. `atomic vault query neighbors <node-id>` — explore callers, definitions,
-   and changes; copy node IDs verbatim from search results
-3. Read files only after the KG tells you where to look
-
-Use grep only for literal strings and error messages the KG does not index.
-The KG is populated from recorded changes — unrecorded work will not appear
-in it.
-
-## Atomic, not git
-
-Atomic is the source of truth for this repository's history. **Use `atomic`
-commands, not `git`**, even if a `.git/` directory is present:
-
-- History: `atomic log` (not `git log`); inspect one change with
-  `atomic change <hash>`
-- Working copy: `atomic status` and `atomic diff` (not `git status` /
-  `git diff`)
-- Save work: `atomic record -m "..."` (not `git commit` — git commits
-  bypass Atomic's graph and provenance)
-- Parallel work: `atomic view` manages views, not branches
-
-Never run `git checkout`, `git reset`, or `git restore` — they fight the
-working copy Atomic materializes from its graph."#;
+/// The canonical copy lives at `atomic-repository/vault/AGENTS.md` (and is
+/// mirrored as `AGENTS.md` in the atomic-agy integration repository) —
+/// a plain markdown file, not embedded prose. It is written into the
+/// project's `AGENTS.md` between the markers above so the agent gets the
+/// standard workflow on `atomic agent enable`, and refreshed on rerun when
+/// the canonical content changes. User content outside the markers is
+/// preserved.
+const SECTION_BODY: &str = include_str!("../../../atomic-repository/vault/AGENTS.md");
 
 /// The plugin manifest written alongside `hooks.json`.
 const PLUGIN_MANIFEST: &str = r#"{
@@ -234,6 +207,10 @@ const PLUGIN_SKILLS: &[(&str, &str)] = &[
     (
         "atomic-vault.md",
         include_str!("../../../atomic-repository/vault/skills/atomic-vault.md"),
+    ),
+    (
+        "atomic-vcs.md",
+        include_str!("../../../atomic-repository/vault/skills/atomic-vcs.md"),
     ),
 ];
 
@@ -778,7 +755,9 @@ impl AgyHook {
     // AGENTS.md managed section
 
     /// Insert or replace the managed Atomic section in the repo's
-    /// `AGENTS.md`, creating the file if needed. Returns `true` if the file
+    /// `AGENTS.md`, creating the file if needed. The section content comes
+    /// from the canonical `atomic-repository/vault/AGENTS.md` (mirrored by
+    /// the atomic-agy integration repository). Returns `true` if the file
     /// was written.
     fn upsert_agents_md_section(repo_root: &Path) -> AgentResult<bool> {
         let path = repo_root.join(AGENTS_MD_FILE);
@@ -827,9 +806,10 @@ impl AgyHook {
         Ok(true)
     }
 
-    /// Remove the managed Atomic section from the repo's `AGENTS.md`,
-    /// preserving everything else. Deletes the file only if nothing else
-    /// remains. Returns `true` if the file was changed.
+    /// Remove a managed Atomic section from the repo's `AGENTS.md`, if one
+    /// exists from an older Atomic release that wrote it on install.
+    /// Preserves everything else in the file and deletes the file only if
+    /// nothing else remains. Returns `true` if the file was changed.
     fn remove_agents_md_section(repo_root: &Path) -> AgentResult<bool> {
         let path = repo_root.join(AGENTS_MD_FILE);
         if !path.exists() {
@@ -992,8 +972,9 @@ impl AgentHook for AgyHook {
     fn install(&self, repo_root: &Path) -> AgentResult<usize> {
         // Two-part install:
         // 1. Global plugin (hooks + skills) — the only mechanism agy fires.
-        // 2. Managed AGENTS.md section in the repo — teaches the agent the
-        //    KG-first discovery workflow.
+        // 2. Managed AGENTS.md section in the repo — the standard agent
+        //    instruction file, required for the agent to follow Atomic's
+        //    workflow (KG-first discovery, intent turns, recording rules).
         let count = self.install_global(false)?;
         Self::upsert_agents_md_section(repo_root)?;
         Ok(count)
@@ -1009,8 +990,8 @@ impl AgentHook for AgyHook {
     fn is_installed(&self, repo_root: &Path) -> bool {
         // Installed means both halves are present *and current*: the global
         // plugin and the repo's AGENTS.md section. Checking the section
-        // content (not just its markers) means an Atomic upgrade with
-        // revised guidance is picked up by a plain `agent enable` rerun.
+        // content (not just its markers) means an update to the canonical
+        // instruction file is picked up by a plain `agent enable` rerun.
         if !self.is_installed_global() {
             return false;
         }
@@ -1831,10 +1812,10 @@ mod tests {
         let content = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
         assert!(content.contains(SECTION_START));
         assert!(content.contains(SECTION_END));
+        // Content comes from the canonical atomic-repository/vault/AGENTS.md.
+        assert!(content.contains("Atomic VCS Agent"));
+        assert!(content.contains("Do NOT run `atomic add` or `atomic record`"));
         assert!(content.contains("atomic vault query search"));
-        // VCS preference guidance: atomic commands over git.
-        assert!(content.contains("atomic log"));
-        assert!(content.contains("not `git log`"));
     }
 
     #[test]
@@ -1875,7 +1856,7 @@ mod tests {
 
         let content = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
         assert!(!content.contains("old stale content"));
-        assert!(content.contains("atomic vault query search"));
+        assert!(content.contains("Atomic VCS Agent"));
         assert!(content.starts_with("# Project\n\n"));
     }
 
@@ -1894,7 +1875,6 @@ mod tests {
 
         let content = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
         assert!(!content.contains(SECTION_START));
-        assert!(!content.contains("atomic vault query"));
         assert!(content.contains("# My Project"));
         assert!(content.contains("Custom rules here."));
         // No trailing blank-line debris.
