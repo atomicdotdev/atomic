@@ -2,7 +2,7 @@
 //!
 //! This is a NEW top-level command, a sibling of `atomic vault` (see
 //! [`crate::commands::vault`]). It is distinct from the existing vault-scoped
-//! `atomic vault intent ...` tree ([`crate::commands::vault::intent`]): that
+//! former `atomic vault intent ...` tree (now removed): that
 //! tree manages the raw vault entries (create/list/show/update/delete/link),
 //! while this one drives the `atomic-canonical` engine — lifting a stored intent
 //! into a canonical JSON-LD node, gating it, attesting it, and rendering it.

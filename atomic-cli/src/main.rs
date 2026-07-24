@@ -693,7 +693,7 @@ enum Commands {
     /// atomic vault session start
     ///
     /// # Create an intent
-    /// atomic vault intent create --title "Fix auth"
+    /// atomic intent new "Fix auth"
     /// ```
     Vault(Vault),
 

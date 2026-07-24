@@ -199,7 +199,6 @@ mod tests {
         assert!(cmd.view.is_none());
         assert_eq!(cmd.format, ChangeFormat::Default);
         assert!(!cmd.show_deps);
-        assert!(!cmd.show_hunks);
         assert!(!cmd.full_hash);
     }
 
@@ -241,12 +240,6 @@ mod tests {
     }
 
     #[test]
-    fn test_change_cmd_with_show_hunks() {
-        let cmd = ChangeCmd::new().with_show_hunks(true);
-        assert!(cmd.show_hunks);
-    }
-
-    #[test]
     fn test_change_cmd_with_full_hash() {
         let cmd = ChangeCmd::new().with_full_hash(true);
         assert!(cmd.full_hash);
@@ -259,14 +252,12 @@ mod tests {
             .with_view("main")
             .with_format(ChangeFormat::Short)
             .with_show_deps(true)
-            .with_show_hunks(true)
             .with_full_hash(true);
 
         assert_eq!(cmd.identifier, Some("ABC123".to_string()));
         assert_eq!(cmd.view, Some("main".to_string()));
         assert_eq!(cmd.format, ChangeFormat::Short);
         assert!(cmd.show_deps);
-        assert!(cmd.show_hunks);
         assert!(cmd.full_hash);
     }
 
@@ -638,20 +629,6 @@ mod tests {
         let _repo = Repository::init(".").unwrap();
 
         let cmd = ChangeCmd::new().with_show_deps(true);
-        let result = cmd.run();
-
-        // Will fail (no changes) but shouldn't panic
-        assert!(result.is_err());
-    }
-
-    #[test]
-    #[serial]
-    fn test_change_run_with_show_hunks() {
-        let _guard = TestGuard::new();
-
-        let _repo = Repository::init(".").unwrap();
-
-        let cmd = ChangeCmd::new().with_show_hunks(true);
         let result = cmd.run();
 
         // Will fail (no changes) but shouldn't panic

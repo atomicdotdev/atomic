@@ -83,7 +83,7 @@ use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, format_timestamp_relative, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{print_blank, print_hint, print_success, print_warning, view as style_view};
+use crate::output::{print_hint, print_success, print_warning, view as style_view};
 
 // Constants
 
@@ -172,10 +172,6 @@ pub enum StashSubcommand {
         /// Stash to show (e.g., "stash@{0}" or "0"). Defaults to most recent.
         #[arg(value_name = "STASH")]
         stash: Option<String>,
-
-        /// Show full diff output.
-        #[arg(short, long)]
-        patch: bool,
     },
 
     /// Delete a stash without applying.
@@ -632,7 +628,7 @@ impl Stash {
     }
 
     /// Execute stash show.
-    fn run_show(&self, repo: &Repository, stash_ref: Option<&str>, patch: bool) -> CliResult<()> {
+    fn run_show(&self, repo: &Repository, stash_ref: Option<&str>) -> CliResult<()> {
         let stash = self.parse_stash_ref(repo, stash_ref)?;
 
         println!("{}", stash.reference());
@@ -649,12 +645,6 @@ impl Stash {
             .map_err(CliError::Repository)?;
 
         println!("  Changes: {}", info.change_count);
-
-        if patch {
-            // TODO: Implement full diff output
-            print_blank();
-            print_hint("Full diff output not yet implemented");
-        }
 
         Ok(())
     }
@@ -740,9 +730,7 @@ impl Command for Stash {
             Some(StashSubcommand::Pop { stash }) => self.run_pop(&mut repo, stash.as_deref()),
             Some(StashSubcommand::Apply { stash }) => self.run_apply(&mut repo, stash.as_deref()),
             Some(StashSubcommand::List) => self.run_list(&repo),
-            Some(StashSubcommand::Show { stash, patch }) => {
-                self.run_show(&repo, stash.as_deref(), *patch)
-            }
+            Some(StashSubcommand::Show { stash }) => self.run_show(&repo, stash.as_deref()),
             Some(StashSubcommand::Drop { stash }) => self.run_drop(&mut repo, stash.as_deref()),
             Some(StashSubcommand::Clear { force }) => self.run_clear(&mut repo, *force),
         }

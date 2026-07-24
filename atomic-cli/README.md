@@ -772,8 +772,7 @@ atomic apply preview feature --to-stack main
 |--------|-------------|
 | `--to-stack <NAME>` | Target stack (default: current) |
 | `--from-stack <NAME>` | Source stack |
-| `--deps` | Automatically apply dependencies (default: true) |
-| `--allow-conflicts` | Proceed even if conflicts arise |
+| `--allow-conflicts` | Proceed even if conflicts arise (not available for `pick`) |
 
 ---
 

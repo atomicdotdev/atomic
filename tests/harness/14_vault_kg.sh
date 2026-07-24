@@ -120,20 +120,20 @@ make_temp_repo "vault-intents"
 init_repo --vault
 
 # Create an intent — must print the assigned ID
-run_cmd atomic vault intent create --title "Fix authentication" --priority high
-assert_ran "intent create returns an ID" "Created intent: [A-Za-z0-9-]+-[0-9]+"
+run_cmd atomic intent new "Fix authentication"
+assert_ran "intent new returns an ID" "Created intent: [A-Za-z0-9-]+-[0-9]+"
 
 first_id="$(echo "$OUT" | sed -n 's/.*Created intent: \([A-Za-z0-9-]*\).*/\1/p' | head -1)"
 
-# List intents
-run_cmd atomic vault intent list --json
-assert_ran "intent appears in list with title" "fix authentication"
+# List intents — canonical list JSON carries id/status, not the title
+run_cmd atomic intent list --json
+assert_ran "intent appears in list by ID" "\"id\": \"$first_id\""
 
 # Create a second intent
-run_cmd atomic vault intent create --title "Add logging"
-assert_ran "second intent create succeeds" "Created intent:"
+run_cmd atomic intent new "Add logging"
+assert_ran "second intent new succeeds" "Created intent:"
 
-run_cmd atomic vault intent list --json
+run_cmd atomic intent list --json
 intent_count="$(echo "$OUT" | grep -c '"id"' || true)"
 if [[ $RC -eq 0 && "$intent_count" -ge 2 ]]; then
     _pass "multiple intents created (count: $intent_count)"
@@ -143,10 +143,10 @@ fi
 
 # Show the first intent by ID
 if [[ -n "$first_id" ]]; then
-    run_cmd atomic vault intent show "$first_id" --json
+    run_cmd atomic intent show "$first_id" --json
     assert_ran "intent show returns detail for $first_id" "fix authentication"
 
-    run_cmd atomic vault intent update "$first_id" --status in-progress
+    run_cmd atomic intent update "$first_id" --status in-progress
     assert_ran "intent update sets status" "Updated intent: $first_id"
 else
     _fail "intent show" "could not extract intent ID from create output"
@@ -158,7 +158,7 @@ run_cmd atomic vault goal start --name intent-goal
 assert_ran "goal for linking created" "Started goal: intent-goal"
 
 if [[ -n "$first_id" ]]; then
-    run_cmd atomic vault intent link "$first_id" --goal intent-goal
+    run_cmd atomic intent link --goal intent-goal "$first_id"
     assert_ran "intent linked to goal" "link|intent-goal"
 else
     _fail "intent link" "could not extract intent ID from create output"

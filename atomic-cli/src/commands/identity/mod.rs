@@ -270,14 +270,17 @@ pub struct Default {
     #[arg(long, short = 'u')]
     pub usage: Option<String>,
 
-    /// Clear the default identity instead of setting one.
-    #[arg(long, conflicts_with = "name")]
+    /// Clear the global default identity instead of setting one.
+    ///
+    /// Clearing a usage-specific default is not supported, so --clear
+    /// cannot be combined with --usage.
+    #[arg(long, conflicts_with_all = ["name", "usage"])]
     pub clear: bool,
 }
 
 impl Command for Default {
     fn run(&self) -> CliResult<()> {
-        use crate::output::{print_success, print_warning};
+        use crate::output::print_success;
         use atomic_identity::{IdentityStore, IdentityUsage};
 
         let mut store = IdentityStore::open_default().map_err(|e| {
@@ -288,25 +291,11 @@ impl Command for Default {
         })?;
 
         if self.clear {
-            // Clear the default
-            if let Some(usage_str) = &self.usage {
-                let usage = IdentityUsage::parse(usage_str);
-                // Clear usage-specific default by setting global default
-                // Note: The store doesn't have a clear_default_for_usage method yet
-                // For now, we just inform the user
-                print_warning(&format!(
-                    "Clearing default for usage '{}' is not yet supported",
-                    usage
-                ));
-            } else {
-                store.clear_default().map_err(|e| {
-                    crate::error::CliError::Internal(anyhow::anyhow!(
-                        "Failed to clear default: {}",
-                        e
-                    ))
-                })?;
-                print_success("Cleared default identity");
-            }
+            // Clear the global default (--clear conflicts with --usage in clap)
+            store.clear_default().map_err(|e| {
+                crate::error::CliError::Internal(anyhow::anyhow!("Failed to clear default: {}", e))
+            })?;
+            print_success("Cleared default identity");
         } else if let Some(name) = &self.name {
             // Load the identity by name
             let identity = store

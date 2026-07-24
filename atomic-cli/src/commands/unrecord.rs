@@ -1,17 +1,13 @@
 //! The `unrecord` command for removing changes from a view.
 //!
 //! This module implements the `atomic unrecord` command, which removes
-//! the most recent change (or a specific change) from the current view's
-//! change log. The change itself is NOT deleted from the change store —
+//! the most recent change from the current view's change log. The change itself is NOT deleted from the change store —
 //! it can be re-inserted later via `atomic insert`.
 //!
 //! # Usage
 //!
 //! ```text
-//! atomic unrecord [OPTIONS] [CHANGE]
-//!
-//! Arguments:
-//!   [CHANGE]  Hash or prefix of the change to unrecord (default: last change)
+//! atomic unrecord [OPTIONS]
 //!
 //! Options:
 //!   -n, --dry-run   Preview what would be unrecorded
@@ -23,12 +19,6 @@
 //! Unrecord the most recent change:
 //! ```text
 //! $ atomic unrecord
-//! Unrecorded: ABCDEF12 "Add feature file"
-//! ```
-//!
-//! Unrecord a specific change by hash prefix:
-//! ```text
-//! $ atomic unrecord ABCDEF
 //! Unrecorded: ABCDEF12 "Add feature file"
 //! ```
 //!
@@ -68,13 +58,6 @@ use crate::output::{print_success, print_warning};
 #[derive(Parser, Debug, Default)]
 #[command(name = "unrecord")]
 pub struct Unrecord {
-    /// Hash or prefix of the change to unrecord.
-    ///
-    /// If not specified, the most recent change on the current view
-    /// is unrecorded. Provide a hash prefix to unrecord a specific change.
-    #[arg(value_name = "CHANGE")]
-    pub change: Option<String>,
-
     /// Preview what would be unrecorded without doing it.
     #[arg(short = 'n', long = "dry-run")]
     pub dry_run: bool,
@@ -96,27 +79,17 @@ impl Command for Unrecord {
             UnrecordOptions::new()
         };
 
-        let outcome = if let Some(ref _prefix) = self.change {
-            // TODO: support unrecording a specific change by hash prefix
-            // once hash_from_prefix is available on the transaction trait.
-            return Err(CliError::InvalidArgument {
-                message: "Unrecording a specific change by hash is not yet supported. \
-                          Use `atomic unrecord` (no argument) to unrecord the last change."
-                    .to_string(),
-            });
-        } else {
-            // Unrecord the most recent change
-            repo.unrecord_last(options).map_err(|e| match e {
-                atomic_repository::RepositoryError::Unrecord(msg)
-                    if msg.contains("empty") || msg.contains("Empty") =>
-                {
-                    CliError::InvalidArgument {
-                        message: "View is empty — nothing to unrecord".to_string(),
-                    }
+        // Unrecord the most recent change
+        let outcome = repo.unrecord_last(options).map_err(|e| match e {
+            atomic_repository::RepositoryError::Unrecord(msg)
+                if msg.contains("empty") || msg.contains("Empty") =>
+            {
+                CliError::InvalidArgument {
+                    message: "View is empty — nothing to unrecord".to_string(),
                 }
-                other => CliError::Repository(other),
-            })?
-        };
+            }
+            other => CliError::Repository(other),
+        })?;
 
         if outcome.was_dry_run {
             for hash in &outcome.unrecorded {
@@ -139,7 +112,6 @@ mod tests {
     #[test]
     fn test_default() {
         let cmd = Unrecord::default();
-        assert!(cmd.change.is_none());
         assert!(!cmd.dry_run);
     }
 }

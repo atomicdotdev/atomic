@@ -41,10 +41,6 @@ pub struct Insert {
     #[arg(long)]
     view: Option<String>,
 
-    /// Insert dependencies automatically.
-    #[arg(long, default_value = "true")]
-    deps: bool,
-
     /// Allow conflicts during insert.
     #[arg(long)]
     allow_conflicts: bool,
@@ -85,10 +81,6 @@ pub struct FromViewArgs {
     #[arg(long)]
     to_view: Option<String>,
 
-    /// Insert dependencies automatically.
-    #[arg(long, default_value = "true")]
-    deps: bool,
-
     /// Allow conflicts during insert.
     #[arg(long)]
     allow_conflicts: bool,
@@ -113,10 +105,6 @@ pub struct TagArgs {
     #[arg(long)]
     to_view: Option<String>,
 
-    /// Insert dependencies automatically.
-    #[arg(long, default_value = "true")]
-    deps: bool,
-
     /// Allow conflicts during insert.
     #[arg(long)]
     allow_conflicts: bool,
@@ -136,14 +124,6 @@ pub struct PickArgs {
     /// Target view to insert changes into (default: current view).
     #[arg(long)]
     to_view: Option<String>,
-
-    /// Insert dependencies automatically.
-    #[arg(long, default_value = "true")]
-    deps: bool,
-
-    /// Allow conflicts during insert.
-    #[arg(long)]
-    allow_conflicts: bool,
 }
 
 /// Arguments for previewing what would be inserted.
@@ -196,7 +176,7 @@ fn run_single_insert(repo: &Repository, change_str: &str, args: &Insert) -> CliR
     let is_current_view = args.view.is_none() || args.view.as_deref() == Some(repo.current_view());
 
     let options = InsertOptions::default()
-        .apply_deps(args.deps)
+        .apply_deps(true)
         .allow_conflict(args.allow_conflicts);
 
     let options = if let Some(ref view) = args.view {
@@ -207,14 +187,11 @@ fn run_single_insert(repo: &Repository, change_str: &str, args: &Insert) -> CliR
 
     output::print_info(&format!("Inserting change {}...", format_hash(&hash, true)));
 
-    let outcome = if args.deps {
-        repo.insert_change_rec(&hash, options)
-    } else {
-        repo.insert_change(&hash, options)
-    }
-    .map_err(|e| CliError::Conflict {
-        description: e.to_string(),
-    })?;
+    let outcome = repo
+        .insert_change_rec(&hash, options)
+        .map_err(|e| CliError::Conflict {
+            description: e.to_string(),
+        })?;
 
     print_insert_outcome(
         &outcome.stats.applied_hashes,
@@ -250,7 +227,7 @@ fn run_from_view(repo: &Repository, args: &FromViewArgs) -> CliResult<()> {
     ));
 
     let options = CrossViewInsertOptions::new(&args.from_view, &to_view)
-        .with_dependencies(args.deps)
+        .with_dependencies(true)
         .allow_conflicts(args.allow_conflicts)
         .dry_run(args.dry_run);
 
@@ -323,7 +300,7 @@ fn run_tag(repo: &Repository, args: &TagArgs) -> CliResult<()> {
 
     let options = CrossViewInsertOptions::new(&from_view, &to_view)
         .up_to_tag(&args.tag_name)
-        .with_dependencies(args.deps)
+        .with_dependencies(true)
         .allow_conflicts(args.allow_conflicts)
         .dry_run(args.dry_run);
 
@@ -587,7 +564,6 @@ mod tests {
         let _ = InsertSubcommand::FromView(FromViewArgs {
             from_view: "feature".to_string(),
             to_view: Some("main".to_string()),
-            deps: true,
             allow_conflicts: false,
             dry_run: false,
         });
@@ -596,7 +572,6 @@ mod tests {
             tag_name: "v1.0.0".to_string(),
             from_view: Some("feature".to_string()),
             to_view: Some("main".to_string()),
-            deps: true,
             allow_conflicts: false,
             dry_run: false,
         });
@@ -604,8 +579,6 @@ mod tests {
         let _ = InsertSubcommand::Pick(PickArgs {
             changes: vec!["abc123".to_string()],
             to_view: None,
-            deps: true,
-            allow_conflicts: false,
         });
 
         let _ = InsertSubcommand::Preview(PreviewArgs {
@@ -620,14 +593,12 @@ mod tests {
         let args = FromViewArgs {
             from_view: "feature".to_string(),
             to_view: None,
-            deps: true,
             allow_conflicts: false,
             dry_run: false,
         };
 
         assert_eq!(args.from_view, "feature");
         assert!(args.to_view.is_none());
-        assert!(args.deps);
         assert!(!args.allow_conflicts);
         assert!(!args.dry_run);
     }
@@ -638,7 +609,6 @@ mod tests {
             tag_name: "v1.0.0".to_string(),
             from_view: Some("feature".to_string()),
             to_view: Some("main".to_string()),
-            deps: false,
             allow_conflicts: true,
             dry_run: true,
         };
@@ -646,7 +616,6 @@ mod tests {
         assert_eq!(args.tag_name, "v1.0.0");
         assert_eq!(args.from_view, Some("feature".to_string()));
         assert_eq!(args.to_view, Some("main".to_string()));
-        assert!(!args.deps);
         assert!(args.allow_conflicts);
         assert!(args.dry_run);
     }
@@ -660,8 +629,6 @@ mod tests {
                 "ghi789".to_string(),
             ],
             to_view: Some("main".to_string()),
-            deps: true,
-            allow_conflicts: false,
         };
 
         assert_eq!(args.changes.len(), 3);

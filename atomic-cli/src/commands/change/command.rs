@@ -60,12 +60,6 @@ pub struct ChangeCmd {
     #[arg(long = "show-deps")]
     pub show_deps: bool,
 
-    /// Show graph_op details.
-    ///
-    /// When enabled, shows detailed information about each graph_op.
-    #[arg(long = "show-hunks")]
-    pub show_hunks: bool,
-
     /// Show full hashes instead of abbreviated.
     #[arg(long = "full-hash")]
     pub full_hash: bool,
@@ -94,7 +88,6 @@ impl ChangeCmd {
             view: None,
             format: ChangeFormat::Default,
             show_deps: false,
-            show_hunks: false,
             full_hash: false,
             show_attest: false,
             show_provenance: false,
@@ -122,12 +115,6 @@ impl ChangeCmd {
     /// Builder: set show-deps flag.
     pub fn with_show_deps(mut self, show_deps: bool) -> Self {
         self.show_deps = show_deps;
-        self
-    }
-
-    /// Builder: set show-hunks flag.
-    pub fn with_show_hunks(mut self, show_hunks: bool) -> Self {
-        self.show_hunks = show_hunks;
         self
     }
 

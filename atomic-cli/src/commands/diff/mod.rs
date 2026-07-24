@@ -40,7 +40,6 @@
 //!       --stat                Show diffstat summary only
 //!       --no-color            Disable colored output
 //!       --word-diff           Enable token-level diff highlighting
-//!       --cached              Show staged changes (not yet implemented)
 //!       --name-only           Show only names of changed files
 //!       --name-status         Show names and status of changed files
 //!   -h, --help                Print help information

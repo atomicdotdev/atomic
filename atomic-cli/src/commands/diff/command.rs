@@ -63,14 +63,6 @@ pub struct Diff {
     #[arg(long)]
     pub untracked: bool,
 
-    /// Show staged changes (reserved for future use).
-    #[arg(long, hide = true)]
-    pub cached: bool,
-
-    /// View to compare against.
-    #[arg(long)]
-    pub view: Option<String>,
-
     /// Enable token-level diff highlighting (CRDT-powered).
     ///
     /// Shows exactly which tokens changed within a line, not just
@@ -93,8 +85,6 @@ impl Diff {
             name_status: false,
             short: false,
             untracked: false,
-            cached: false,
-            view: None,
             word_diff: false,
         }
     }
@@ -148,12 +138,6 @@ impl Diff {
     /// Builder: set the name-status flag.
     pub fn with_name_status(mut self, name_status: bool) -> Self {
         self.name_status = name_status;
-        self
-    }
-
-    /// Builder: set the view to compare against.
-    pub fn with_view(mut self, view: impl Into<String>) -> Self {
-        self.view = Some(view.into());
         self
     }
 

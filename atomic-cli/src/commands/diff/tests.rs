@@ -596,8 +596,6 @@ mod tests {
         assert!(!diff.no_color);
         assert!(!diff.name_only);
         assert!(!diff.name_status);
-        assert!(!diff.cached);
-        assert!(diff.view.is_none());
     }
 
     #[test]
@@ -932,12 +930,6 @@ mod tests {
     fn test_diff_with_name_status() {
         let diff = Diff::new().with_name_status(true);
         assert!(diff.name_status);
-    }
-
-    #[test]
-    fn test_diff_with_view() {
-        let diff = Diff::new().with_view("feature");
-        assert_eq!(diff.view, Some("feature".to_string()));
     }
 
     #[test]

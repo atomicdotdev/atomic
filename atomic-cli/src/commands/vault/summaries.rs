@@ -52,10 +52,6 @@ pub struct Summaries {
     /// are returned.
     #[arg(long)]
     pub goal: Option<String>,
-
-    /// Output as JSON (this is the default for summaries).
-    #[arg(long)]
-    pub json: bool,
 }
 
 impl Command for Summaries {

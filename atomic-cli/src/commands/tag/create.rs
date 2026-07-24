@@ -14,8 +14,6 @@
 //!
 //! Options:
 //!   -m, --message <MSG>   Message for an annotated tag
-//!   -a, --author <AUTHOR> Author for an annotated tag (format: "Name <email>")
-//!   -s, --view <VIEW>     View to tag (default: current view)
 //!   -f, --force           Overwrite existing tag
 //!   -h, --help            Print help information
 //! ```
@@ -45,35 +43,6 @@ use crate::output::{emphasis, print_success};
 #[cfg(test)]
 use std::path::PathBuf;
 
-// Author Parsing
-
-/// Parse an author string in the format `"Name <email>"` or just `"Name"`.
-///
-/// # Arguments
-///
-/// * `s` - The author string to parse
-///
-/// # Returns
-///
-/// A tuple of (name, optional_email).
-fn parse_author(s: &str) -> (String, Option<String>) {
-    let s = s.trim();
-
-    // Try to match "Name <email>" format
-    if let Some(start) = s.find('<') {
-        if let Some(end) = s.find('>') {
-            if start < end {
-                let name = s[..start].trim().to_string();
-                let email = s[start + 1..end].trim().to_string();
-                return (name, Some(email));
-            }
-        }
-    }
-
-    // Just a name
-    (s.to_string(), None)
-}
-
 // Create Command
 
 /// Create a new tag.
@@ -96,19 +65,6 @@ pub struct Create {
     #[arg(long, short = 'm', value_name = "MESSAGE")]
     pub message: Option<String>,
 
-    /// Author for an annotated tag.
-    ///
-    /// Format: `"Name <email>"` or just `"Name"`.
-    /// If not provided, uses the default identity.
-    #[arg(long, short = 'a', value_name = "AUTHOR")]
-    pub author: Option<String>,
-
-    /// View to tag.
-    ///
-    /// If not provided, uses the current view.
-    #[arg(long, short = 's', value_name = "VIEW")]
-    pub view: Option<String>,
-
     /// Overwrite existing tag.
     ///
     /// If a tag with this name already exists, overwrite it.
@@ -122,8 +78,6 @@ impl Create {
         Self {
             name: None,
             message: None,
-            author: None,
-            view: None,
             force: false,
         }
     }
@@ -133,8 +87,6 @@ impl Create {
         Self {
             name: Some(name.into()),
             message: None,
-            author: None,
-            view: None,
             force: false,
         }
     }
@@ -142,18 +94,6 @@ impl Create {
     /// Builder: set the message.
     pub fn with_message(mut self, message: impl Into<String>) -> Self {
         self.message = Some(message.into());
-        self
-    }
-
-    /// Builder: set the author.
-    pub fn with_author(mut self, author: impl Into<String>) -> Self {
-        self.author = Some(author.into());
-        self
-    }
-
-    /// Builder: set the view.
-    pub fn with_view(mut self, view: impl Into<String>) -> Self {
-        self.view = Some(view.into());
         self
     }
 
@@ -236,38 +176,6 @@ mod tests {
     use serial_test::serial;
 
     // -------------------------------------------------------------------------
-    // Author Parsing Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_parse_author_with_email() {
-        let (name, email) = parse_author("Alice <alice@example.com>");
-        assert_eq!(name, "Alice");
-        assert_eq!(email, Some("alice@example.com".to_string()));
-    }
-
-    #[test]
-    fn test_parse_author_without_email() {
-        let (name, email) = parse_author("Bob");
-        assert_eq!(name, "Bob");
-        assert_eq!(email, None);
-    }
-
-    #[test]
-    fn test_parse_author_with_spaces() {
-        let (name, email) = parse_author("  Alice Smith  <alice@example.com>  ");
-        assert_eq!(name, "Alice Smith");
-        assert_eq!(email, Some("alice@example.com".to_string()));
-    }
-
-    #[test]
-    fn test_parse_author_empty_email() {
-        let (name, email) = parse_author("Alice <>");
-        assert_eq!(name, "Alice");
-        assert_eq!(email, Some("".to_string()));
-    }
-
-    // -------------------------------------------------------------------------
     // Command Builder Tests
     // -------------------------------------------------------------------------
 
@@ -276,7 +184,6 @@ mod tests {
         let cmd = Create::with_name("v1.0.0");
         assert_eq!(cmd.name, Some("v1.0.0".to_string()));
         assert!(cmd.message.is_none());
-        assert!(cmd.author.is_none());
         assert!(!cmd.force);
     }
 
@@ -285,18 +192,6 @@ mod tests {
         let cmd = Create::with_name("v1.0.0").with_message("Release 1.0");
         assert_eq!(cmd.name, Some("v1.0.0".to_string()));
         assert_eq!(cmd.message, Some("Release 1.0".to_string()));
-    }
-
-    #[test]
-    fn test_create_with_author() {
-        let cmd = Create::with_name("v1.0.0").with_author("Alice <alice@example.com>");
-        assert_eq!(cmd.author, Some("Alice <alice@example.com>".to_string()));
-    }
-
-    #[test]
-    fn test_create_with_view() {
-        let cmd = Create::with_name("v1.0.0").with_view("release");
-        assert_eq!(cmd.view, Some("release".to_string()));
     }
 
     #[test]
@@ -310,8 +205,6 @@ mod tests {
         let cmd = Create::default();
         assert!(cmd.name.is_none());
         assert!(cmd.message.is_none());
-        assert!(cmd.author.is_none());
-        assert!(cmd.view.is_none());
         assert!(!cmd.force);
     }
 
@@ -404,9 +297,7 @@ mod tests {
         // Change to the repo directory
         std::env::set_current_dir(repo_path).unwrap();
 
-        let cmd = Create::with_name("v1.0.0")
-            .with_message("Release version 1.0.0")
-            .with_author("Alice <alice@example.com>");
+        let cmd = Create::with_name("v1.0.0").with_message("Release version 1.0.0");
         let result = cmd.run();
         assert!(result.is_ok());
 

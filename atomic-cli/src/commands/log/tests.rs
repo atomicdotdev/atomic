@@ -186,7 +186,6 @@ mod tests {
         assert!(log.count.is_none());
         assert!(log.view.is_none());
         assert!(!log.tags_only);
-        assert!(log.path.is_none());
         assert_eq!(log.format, LogFormat::Default);
         assert!(!log.reverse);
         assert!(log.from.is_none());
@@ -225,12 +224,6 @@ mod tests {
     }
 
     #[test]
-    fn test_log_with_path() {
-        let log = Log::new().with_path("src/lib.rs");
-        assert_eq!(log.path, Some("src/lib.rs".to_string()));
-    }
-
-    #[test]
     fn test_log_with_format() {
         let log = Log::new().with_format(LogFormat::Oneline);
         assert_eq!(log.format, LogFormat::Oneline);
@@ -260,7 +253,6 @@ mod tests {
             .with_count(20)
             .with_view("release")
             .with_tags_only(true)
-            .with_path("docs/")
             .with_format(LogFormat::Json)
             .with_reverse(true)
             .with_from(50)
@@ -269,7 +261,6 @@ mod tests {
         assert_eq!(log.count, Some(20));
         assert_eq!(log.view, Some("release".to_string()));
         assert!(log.tags_only);
-        assert_eq!(log.path, Some("docs/".to_string()));
         assert_eq!(log.format, LogFormat::Json);
         assert!(log.reverse);
         assert_eq!(log.from, Some(50));

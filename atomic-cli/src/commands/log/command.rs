@@ -51,13 +51,6 @@ pub struct Log {
     #[arg(long = "tags-only")]
     pub tags_only: bool,
 
-    /// Filter to changes affecting a specific path.
-    ///
-    /// Shows only changes that modified the given file or directory.
-    /// Note: This requires loading change content for filtering.
-    #[arg(long = "path", value_name = "PATH")]
-    pub path: Option<String>,
-
     /// Output format.
     ///
     /// Controls how changes are displayed:
@@ -116,7 +109,6 @@ impl Log {
             count: None,
             view: None,
             tags_only: false,
-            path: None,
             format: LogFormat::Default,
             reverse: false,
             from: None,
@@ -140,12 +132,6 @@ impl Log {
     /// Builder: set tags-only filter.
     pub fn with_tags_only(mut self, tags_only: bool) -> Self {
         self.tags_only = tags_only;
-        self
-    }
-
-    /// Builder: set path filter.
-    pub fn with_path(mut self, path: impl Into<String>) -> Self {
-        self.path = Some(path.into());
         self
     }
 
@@ -515,18 +501,6 @@ impl Command for Log {
         if entries.is_empty() {
             self.print_empty_history(view_name);
             return Ok(());
-        }
-
-        // Filter by path if specified (requires loading change content)
-        // Note: Path filtering is a placeholder - full implementation would
-        // require inspecting each change's hunks for the affected paths
-        if let Some(ref _path) = self.path {
-            // Path filtering would be implemented here
-            // For now, we show a warning and continue with unfiltered results
-            eprintln!(
-                "{}",
-                warning("Note: Path filtering is not yet fully implemented")
-            );
         }
 
         // Draft views now filter inherited changes by default (the
