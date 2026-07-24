@@ -212,12 +212,18 @@ impl Command for Move {
             });
         }
 
-        // Refuse to overwrite ANY existing file at the resolved destination,
+        // Refuse to overwrite ANY existing entry at the resolved destination,
         // tracked or not — fs::rename replaces it silently and the previous
         // content is unrecoverable. (Moving INTO an existing directory is
         // fine: resolve_destination already appended the source filename.)
+        //
+        // symlink_metadata rather than Path::exists(): exists() follows the
+        // link and reports false for a dangling symlink, which let rename
+        // destroy it. A case-only rename is exempt — see is_same_file.
         let destination_disk = repo_root.join(&destination);
-        if destination_disk.exists() {
+        if std::fs::symlink_metadata(&destination_disk).is_ok()
+            && !is_same_file(&source_path, &destination_disk)
+        {
             return Err(CliError::InvalidArgument {
                 message: format!(
                     "destination '{}' already exists on disk; move it away or choose another name",
@@ -267,6 +273,26 @@ impl Command for Move {
                 Err(CliError::Repository(e))
             }
         }
+    }
+}
+
+/// Whether two paths that both exist refer to the same entry on disk.
+///
+/// On case-insensitive filesystems (APFS, NTFS) a case-only rename such as
+/// `atomic move File.txt file.txt` has a destination that "already exists" —
+/// it *is* the source. Canonicalizing both sides resolves the real casing so
+/// that rename is allowed through, while any genuinely distinct destination
+/// still gets refused.
+///
+/// Fails closed: if either side cannot be canonicalized the paths are treated
+/// as distinct, so the caller refuses the move rather than overwriting.
+fn is_same_file(source: &Path, destination: &Path) -> bool {
+    match (
+        std::fs::canonicalize(source),
+        std::fs::canonicalize(destination),
+    ) {
+        (Ok(source), Ok(destination)) => source == destination,
+        _ => false,
     }
 }
 
@@ -483,5 +509,53 @@ mod tests {
             "CONTENT"
         );
         assert!(!temp.path().join("file.txt").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_move_allows_case_only_rename() {
+        let _guard = DirGuard::new();
+        let temp = init_repo_with_tracked(&[("File.txt", "CONTENT")]);
+
+        // On a case-insensitive filesystem the destination "already exists"
+        // because it is the source. The guard must not block that.
+        let result = Move::new("File.txt", "file.txt").run();
+
+        assert!(
+            result.is_ok(),
+            "case-only rename must be allowed: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "CONTENT"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn test_move_refuses_dangling_symlink_destination() {
+        let _guard = DirGuard::new();
+        let temp = init_repo_with_tracked(&[("src.txt", "SOURCE")]);
+        let dangling = temp.path().join("dangling.txt");
+        std::os::unix::fs::symlink(temp.path().join("no-such-target"), &dangling).unwrap();
+
+        let result = Move::new("src.txt", "dangling.txt").run();
+
+        assert!(
+            result.is_err(),
+            "move onto a dangling symlink must fail — Path::exists() reports \
+             false for it, which let rename destroy the link"
+        );
+        assert!(
+            std::fs::symlink_metadata(&dangling).unwrap().is_symlink(),
+            "the symlink must survive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("src.txt")).unwrap(),
+            "SOURCE",
+            "source must still exist"
+        );
     }
 }
