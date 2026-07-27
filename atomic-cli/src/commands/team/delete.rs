@@ -88,11 +88,9 @@ impl TeamDelete {
         let client = build_client(self.org.as_deref(), None).await?;
         let org_slug = client.org_slug().to_string();
 
-        // Prompt for confirmation unless --force is set. --force skips the
-        // existence precheck too, keeping scripted deletes to a single request.
+        // `--force` skips both the precheck and confirmation.
         if !self.force {
-            // Verify the team exists before asking for confirmation, so a
-            // typo'd slug fails fast instead of after the prompt.
+            // Check that the team exists before prompting.
             atomic_teams::team::get_team(&client, &org_slug, &self.slug)
                 .await
                 .map_err(|e| CliError::RemoteError {

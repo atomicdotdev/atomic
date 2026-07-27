@@ -128,8 +128,7 @@ impl Command for Enable {
             // Install for all detected agents
             let detected = registry.detect(&repo_root);
             if detected.is_empty() {
-                // No agents detected — refuse rather than blanket-installing
-                // hooks for every registered agent into configs that don't exist.
+                // Do not install hooks when no agent is detected.
                 print_error(
                     "No agents detected in this repository — nothing to enable with --all.",
                 );

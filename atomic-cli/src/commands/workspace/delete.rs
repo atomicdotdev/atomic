@@ -73,11 +73,9 @@ impl Command for WorkspaceDelete {
         rt.block_on(async {
             let (client, org_slug) = build_client_with_org(self.org.as_deref(), None).await?;
 
-            // Confirm unless --force is set. --force skips the existence
-            // precheck too, keeping scripted deletes to a single request.
+            // `--force` skips both the precheck and confirmation.
             if !self.force {
-                // Verify the workspace exists before asking for confirmation,
-                // so a typo'd slug fails fast instead of after the prompt.
+                // Check that the workspace exists before prompting.
                 client.get_workspace(&self.slug).await.map_err(remote_err)?;
 
                 print_warning(&format!(

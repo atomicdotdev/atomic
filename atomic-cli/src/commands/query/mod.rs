@@ -1027,12 +1027,7 @@ fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> String {
     )
 }
 
-/// Truncate `s` to at most `max_chars` characters for display, appending
-/// `...` when content was removed.
-///
-/// Operates on char boundaries, so multi-byte content (CJK, emoji) never
-/// panics — unlike byte slicing (`&s[..n]`), which aborts with a
-/// char-boundary panic on such input.
+/// Truncate display text on character boundaries and append `...`.
 fn truncate_display(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
@@ -1816,7 +1811,7 @@ impl Command for PlanExec {
                 for node in &result.nodes {
                     print!("  [{}] {}", node.kind, node.label);
                     if let Some(ref s) = node.summary {
-                        // Char-based truncation: byte slicing panics on CJK/emoji.
+                        // Truncate safely for Unicode text.
                         let short: String = s.chars().take(60).collect();
                         print!(": {}", short);
                     }
@@ -1837,7 +1832,7 @@ impl Command for PlanExec {
             if !result.content.is_empty() {
                 println!("\nContent ({} entries):", result.content.len());
                 for (path, text) in &result.content {
-                    // Char-based truncation: byte slicing panics on CJK/emoji.
+                    // Truncate safely for Unicode text.
                     let preview: String = text.chars().take(100).collect();
                     println!("  {}: {}...", path, preview.replace('\n', " "));
                 }
@@ -1997,10 +1992,7 @@ mod tests {
 
     #[test]
     fn test_truncate_display_three_byte_chars_no_panic() {
-        // Regression: byte slicing (&s[..57]) panicked on multi-byte content
-        // when byte 57 fell inside a character. "x" + 3-byte chars (U+20AC)
-        // shifts alignment so byte 57 is mid-char, while the char count (41)
-        // stays within the display limit.
+        // Regression test for three-byte characters.
         let s = format!("x{}", "\u{20ac}".repeat(40));
         assert!(s.len() > 60); // byte length exceeds the old byte-based check
         assert_eq!(truncate_display(&s, 60), s); // 41 chars: no truncation
@@ -2015,7 +2007,7 @@ mod tests {
 
     #[test]
     fn test_truncate_display_four_byte_chars_within_limit_unchanged() {
-        // 4-byte chars (U+1F680): any byte index not divisible by 4 is mid-char
+        // Regression test for four-byte characters.
         let s = "\u{1f680}".repeat(40);
         assert_eq!(truncate_display(&s, 50), s);
     }

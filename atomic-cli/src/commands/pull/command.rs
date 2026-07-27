@@ -106,10 +106,7 @@ pub struct Pull {
     ///
     /// Can be a configured remote name (like "origin") or a full URL.
     ///
-    /// If not specified, the remote is resolved in this order: the remote
-    /// marked default by `atomic remote default <name>`; then "origin" if
-    /// it is configured; then the sole configured remote if there is
-    /// exactly one; then the literal "origin".
+    /// Defaults to the configured remote, then `origin`.
     #[arg()]
     pub remote: Option<String>,
 
@@ -251,11 +248,7 @@ impl Pull {
 
     // Internal Helper Methods
 
-    /// Resolve the remote name to operate on.
-    ///
-    /// Explicit CLI argument wins; otherwise the remote configured with
-    /// `atomic remote default <name>` (which itself falls back to "origin"
-    /// or the only configured remote); otherwise the literal "origin".
+    /// Use the explicit remote first, then the repository default.
     fn resolve_remote_name(&self, repo: &Repository) -> String {
         match &self.remote {
             Some(name) => name.clone(),
@@ -266,12 +259,7 @@ impl Pull {
         }
     }
 
-    /// Resolve the remote name, URL, and any identity hint from the
-    /// `--identity` flag.
-    ///
-    /// Returns `(name, url, identity_hint)` where `identity_hint` comes
-    /// solely from the `--identity` CLI flag. If absent, `attach_identity`
-    /// falls back to URL-subdomain inference.
+    /// Resolve the remote and optional identity override.
     fn resolve_remote_url(&self, repo: &Repository) -> CliResult<(String, String, Option<String>)> {
         let remote_name = self.resolve_remote_name(repo);
 
@@ -726,9 +714,7 @@ impl Pull {
             }
         }
 
-        // Final summary. Download, apply, and materialize failures were
-        // already printed above — exit non-zero so scripts don't mistake a
-        // partial pull for success.
+        // Keep partial output, but return failure when any step failed.
         print_blank();
         if stats.has_failures() || !apply_errors.is_empty() || materialize_failed {
             print_warning(&format!(

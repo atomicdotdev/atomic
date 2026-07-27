@@ -85,11 +85,9 @@ impl OrgDelete {
     async fn execute(&self) -> CliResult<()> {
         let client = build_client(self.org.as_deref(), None).await?;
 
-        // Prompt for confirmation unless --force is set. --force skips the
-        // existence precheck too, keeping scripted deletes to a single request.
+        // `--force` skips both the precheck and confirmation.
         if !self.force {
-            // Verify the organization exists before asking for confirmation,
-            // so a typo'd slug fails fast instead of after the prompt.
+            // Check that the organization exists before prompting.
             atomic_teams::org::get_org(&client, &self.slug)
                 .await
                 .map_err(|e| CliError::RemoteError {

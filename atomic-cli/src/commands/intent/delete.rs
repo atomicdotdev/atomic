@@ -38,9 +38,7 @@ impl Command for IntentDelete {
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
         if !self.force {
-            // Verify the intent exists before asking for confirmation, so a
-            // typo'd ID fails fast instead of after the destructive prompt.
-            // --force skips the precheck, matching the other delete commands.
+            // Check that the intent exists before prompting.
             repo.vault_intent_show(&self.id)
                 .map_err(CliError::Repository)?;
 

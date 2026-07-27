@@ -657,9 +657,7 @@ impl Clone {
 
         progress.phase = ClonePhase::Complete;
 
-        // Final summary. Download and apply failures were already printed
-        // above — exit non-zero so scripts don't mistake a partial clone for
-        // success (the partially-cloned repository is kept on disk).
+        // Keep partial output, but return failure when any step failed.
         print_blank();
         if stats.has_failures() || !apply_errors.is_empty() {
             print_warning(&format!(
@@ -675,7 +673,7 @@ impl Clone {
                 );
             }
 
-            // Keep the partial clone: disable the cleanup guard before failing.
+            // Preserve the partial clone before returning the error.
             if let Some(guard) = guard {
                 guard.disable();
             }
