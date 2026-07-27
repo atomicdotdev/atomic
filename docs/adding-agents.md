@@ -57,7 +57,7 @@ Agent support spans three repositories. Know which one owns which concern:
 | Repo | Role | What lives here |
 |------|------|-----------------|
 | **`atomic`** (this repo) | The engine + CLI | The `atomic-agent` crate: per-agent *hook adapters*, the `AgentRegistry`, the verb→event map, the `TurnOrchestrator` that does the recording, and the `atomic agent …` CLI. This is where you write Rust so Atomic can *understand* your agent. |
-| **`atomic-<agent>`** (e.g. [`atomic-opencode`](https://github.com/atomicdotdev/atomic-opencode), [`atomic-claude`](https://github.com/atomicdotdev/atomic-claude)) | The integration package | The agent-facing glue: the system prompt, the skills, the wiring that makes the agent call back into `atomic agent hooks …` (a plugin or a hooks manifest), and an installer. Published to npm / installed via `install.sh`. |
+| **`atomic-<agent>`** (e.g. [`atomic-opencode`](https://github.com/atomicdotdev/atomic-opencode), [`atomic-claude`](https://github.com/atomicdotdev/atomic-claude)) | The integration package | The agent-facing glue: the system prompt, the skills, the wiring that makes the agent call back into `atomic agent hooks …` (a plugin or a hooks manifest), and an **`atomic-integration.toml`** describing what gets installed where. Published as a public project on **Atomic storage** — `atomic agent enable` syncs and installs it. |
 | **`atomic-agents`** ([repo](https://github.com/atomicdotdev/atomic-agents)) | The test harness | An ACP-based harness that spawns each agent, sends real prompts, and asserts on the ACP stream and repository side effects. This is where you register your agent so it gets *tested*. |
 
 ---
@@ -437,6 +437,53 @@ on every event.
 
 ---
 
+## How installation works: the integrations engine
+
+Everything above is about *runtime* — how the agent reports to Atomic once
+it's set up. But how does the integration get onto the user's machine in the
+first place? **Through Atomic itself.**
+
+Integration packages are published as **public projects on Atomic storage**.
+`atomic agent enable --agent <name>` then:
+
+```
+1. registry.toml (embedded in the CLI)   →  agent = storage URL + view
+2. atomic clone (Atomic's own sync)      →  ~/.atomic/integrations/<agent>/repo
+3. read atomic-integration.toml          →  check requires.atomic vs CLI version
+4. copy files (never symlinks)           →  merge JSON settings (never clobber)
+5. write receipt.json                    →  clean uninstall + user-file protection
+```
+
+Two artifacts make this work, and they live in different places on purpose:
+
+| Artifact | Question it answers | Where it lives |
+|----------|--------------------|----------------|
+| **`registry.toml`** (`atomic-agent/src/integrations/registry.toml`) | **Where to fetch** — adapter name → storage URL + view | In the **atomic** repo, embedded at build time. Adding an agent = a one-line PR here. |
+| **`atomic-integration.toml`** | **What to install** — files→destinations, settings manifests to merge, `requires.atomic` semver gate | In the **integration repo** (each `atomic-<agent>` package). The producer's contract: change the package layout without a CLI release. |
+
+Key properties of this model:
+
+- **The CLI executes nothing from the package** — no `install.sh`, no
+  postinstall. Files are copied, JSON is merged. Pure Rust, Windows-safe,
+  no bash/node/bun at install time.
+- **User files are sacred.** A destination the CLI didn't install, or one the
+  user modified since, is skipped (unless `--force`). The receipt
+  (`~/.atomic/integrations/<agent>/receipt.json`) is what makes this possible.
+- **Uninstall is receipt-driven** — `atomic agent disable --agent <name>`
+  removes exactly what was installed and strips hook commands from settings,
+  without needing the package on disk.
+- **Offline after first sync**; `atomic agent enable --agent <name> --from
+  <path>` installs from a local checkout for development (this replaces
+  `./install.sh` — see Part 2).
+
+The engine lives in `atomic-agent/src/integrations/` (registry, manifest,
+installer, receipt). **Adapters never install anything themselves** — the
+agy adapter learned this lesson too: its once-embedded installer (plugin
+staging, `AGENTS.md` managed sections) was deleted in favor of the
+`atomic-agy` package; nothing agent-specific ships in the binary.
+
+---
+
 ## Building the integration
 
 Now the concrete work, in three parts. Everything above is the theory; this is
@@ -488,12 +535,13 @@ Key responsibilities of `parse_event`:
 An agent need not support all six hook types — return only what it can
 actually emit from `supported_hooks()` and `hook_verbs()`.
 
-Regarding `install`/`uninstall`/`is_installed`: if the integration package
-handles installation itself (plugin or manifest style), these are near no-ops.
-OpenCode's adapter just checks whether the plugin file exists, because the
-`atomic-opencode` npm package owns installation. Only implement real
-config-file writing here if you want `atomic agent enable --agent <name>` to
-be the installer.
+Regarding `install`/`uninstall`/`is_installed`: **adapters don't install
+anything** — the integrations engine does (see [How installation
+works](#how-installation-works-the-integrations-engine)). Implement these as
+presence checks so `enable`/`disable`/`status` can report state: OpenCode's
+`install()` just returns whether the plugin file exists, and `uninstall()` is
+a no-op (removal is receipt-driven). Only implement real config-file writing
+here for agents that have no external package at all.
 
 #### 1.2 Register the adapter
 
@@ -510,6 +558,22 @@ registry.register(Box::new(myagent::MyAgentHook::new()));
 
 That is the *only* place that decides which agents exist. `atomic agent
 hooks`, `enable`, `status`, and auto-detection all read from this registry.
+
+#### 1.2b Add the agent to the integrations registry
+
+If the agent has an external package (it should — see Part 2), add one entry
+to `atomic-agent/src/integrations/registry.toml` pointing at its Atomic
+storage project:
+
+```toml
+[agents.myagent]
+url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-myagent/code"
+view = "release"
+```
+
+This is what makes `atomic agent enable --agent myagent` fetch and install
+the package. Without an entry, `enable` falls back to the adapter's
+(presence-check) `install()` and nothing is installed.
 
 #### 1.3 Map the agent's verbs to hook types
 
@@ -553,26 +617,25 @@ they install themselves.
 
 ### Part 2 — The integration package `atomic-<agent>` (required)
 
-A separate repo (published so users can install it). It contains no Atomic
-Rust code — only the agent-facing assets and the wiring.
+A separate repo, published as a **public project on Atomic storage** (GitHub
+mirror optional). It contains no Atomic Rust code — only the agent-facing
+assets, the wiring, and the manifest that makes it installable.
 
 Standard layout (see [`atomic-opencode`](https://github.com/atomicdotdev/atomic-opencode)
 and [`atomic-claude`](https://github.com/atomicdotdev/atomic-claude)):
 
 ```
 atomic-<agent>/
+├── atomic-integration.toml           # REQUIRED — the install manifest (below)
 ├── agents/<agent>.md   or  CLAUDE.md / AGENTS.md   # system prompt (see above)
 ├── skills/
 │   ├── atomic-vault/SKILL.md
 │   ├── atomic-vcs/SKILL.md
 │   └── code-intelligence/SKILL.md
-├── hooks/<agent>.atomic-hooks.json   # manifest  (config-file style)
+├── hooks/<agent>.atomic-hooks.json   # settings manifest (config-file style)
 │   —or—
-├── plugins/atomic-hooks.ts           # plugin    (plugin style)
-├── install.sh                        # dev install (symlinks into the agent's config dir)
-├── install.js                        # npm postinstall equivalent
-├── package.json
-└── README.md
+├── plugins/atomic-hooks.ts           # plugin (plugin style)
+└── README.md                         # notes the definitive source is Atomic storage
 ```
 
 You have already seen the three ingredients — the prompt, the skills, and the
@@ -580,16 +643,89 @@ wiring — in the conceptual half of this doc. Assembly notes:
 
 - **Prompt**: ship it under the filename convention your agent reads (see the
   table in [The system prompt](#the-system-prompt-agentsmd-and-friends)).
-- **Skills**: copy the three core `SKILL.md` files verbatim; the installer
-  symlinks them into the agent's skills directory (e.g.
+- **Skills**: copy the three core `SKILL.md` files verbatim; the manifest
+  copies them into the agent's skills directory (e.g.
   `~/.config/opencode/skills/`, `~/.claude/skills/`).
 - **Wiring**: whichever style the agent's extension model dictates (see
   [Plugin vs. config file](#plugin-vs-config-file-choosing-the-wiring)).
-  Guard every hook: `test -d .atomic && … || true`.
-- **Installer**: `install.sh` (dev) symlinks the prompt + skills and, for
-  manifest style, calls `atomic agent enable --hooks <manifest>`. `install.js`
-  is the npm `postinstall` equivalent. Copy from whichever existing package
-  matches your style.
+  Guard every hook: `test -d .atomic || test -f .atomic-sandbox && … || true`
+  (the sandbox-aware form — a `.atomic`-only guard silently drops provenance
+  for sandboxed agents).
+
+#### 2.4 The `atomic-integration.toml` manifest
+
+This file is what `atomic agent enable` installs by. It replaces any
+`install.sh`/`install.js` — the CLI never executes the package, it reads
+this:
+
+```toml
+schema = 1
+agent = "myagent"              # must match the adapter name in the registry
+version = "1.0.0"
+
+[requires]
+atomic = ">=0.11.0"            # semver gate — older CLIs get a hard error,
+                               # not a silently broken install
+
+# Every file to copy, package-relative src → absolute dst (~ expands):
+[[file]]
+src = "agents/atomic.md"
+dst = "~/.config/myagent/agents/atomic.md"
+
+[[file]]
+src = "skills/atomic-vault/SKILL.md"
+dst = "~/.config/myagent/skills/atomic-vault/SKILL.md"
+
+# Settings manifests to merge (the hooks-manifest format — same engine as
+# `atomic agent enable --hooks`):
+[[settings]]
+manifest = "hooks/myagent.atomic-hooks.json"
+```
+
+Rules of thumb:
+
+- `[[file]]` copies (permissions preserved); destinations the user owns or
+  modified are skipped unless `--force`. Absolute paths inside the package
+  (`src` starting with `/` or containing `..`) are rejected.
+- `[[settings]]` is also how you register things in the agent's own JSON
+  config without clobbering it — e.g. atomic-opencode registers its plugin in
+  `opencode.json` via a merge-only manifest (`"hooks": {}`, just a `merge`
+  block); the engine deep-merges objects and unions arrays.
+- If the package needs something the schema can't express (a native plugin
+  manager, TOML edits), that's a gap — document it as a manual step in the
+  README and bring it up for a schema extension rather than working around it
+  with a script.
+
+#### 2.5 Publish the package to Atomic storage
+
+The package's definitive home is its Atomic storage project — full git
+history, imported with `atomic git import` (never squashed records):
+
+```bash
+cd atomic-<agent>
+git commit -am "..." && git push            # keep the GitHub mirror current
+rm -rf .atomic && atomic git import          # import full git history
+atomic project create atomic-<agent> --org atomic --workspace oss
+atomic project update oss/atomic-<agent> --visibility public --org atomic
+atomic remote add origin https://atomic.atomic.storage/workspaces/oss/projects/atomic-<agent>/code
+atomic push
+```
+
+Then add the `registry.toml` entry (step 1.2b) so `enable` can find it.
+Public visibility matters: private projects can't be pulled anonymously, and
+the failure surfaces as a confusing "view not found".
+
+#### 2.6 Development loop
+
+Work on the package locally and install from the checkout — no push needed:
+
+```bash
+atomic agent enable --agent myagent --from ~/code/work/atomic-myagent
+atomic agent disable --agent myagent        # clean removal, then iterate
+```
+
+This uses the exact same installer as the storage path, so what you test
+locally is what users get.
 
 ### Part 3 — Register the agent in the test harness (required)
 
@@ -619,6 +755,16 @@ Notes:
   in `AGENTS_DIR` (default `~/Projects/agents`) *and* the registry knows how
   to spawn it on this platform.
 
+The harness has **two** complementary suites for your agent:
+
+- `tests/install_integration.rs` — the **install half**: pulls your package
+  from Atomic storage in a sandboxed `$HOME`, asserts every receipt-listed
+  file and settings merge landed, then disables and asserts clean removal.
+  Covers all 11 current agents; add your adapter name to the `ADAPTERS` list
+  and the `install_test!` macro block. Run:
+  `ATOMIC_BIN=$(pwd)/target/debug/atomic cargo test -p atomic-agent-harness --test install_integration -- --ignored --nocapture`
+- `tests/acp_integration.rs` — the **behavior half** (below).
+
 ---
 
 ## Testing: use the agent harness
@@ -626,38 +772,46 @@ Notes:
 **Do not rely on manual smoke tests alone — register your agent in the
 [harness](https://github.com/atomicdotdev/atomic-agents) and run it.** The
 harness exists precisely because integrations fail in ways unit tests can't
-see: it spawns the *real agent* over ACP, sends it *real prompts*, and asserts
-on both the ACP stream and the repository side effects. It verifies your
-prompt and skills actually work — that the agent responds, uses code search,
-checks repo status, and creates intents the way the workflow demands.
+see. Two suites cover the two halves:
 
-The shared `all_agents_*` integration tests live in
-`crates/atomic-agent-harness/tests/acp_integration.rs`. They are `#[ignore]`d
-by default (they make real LLM calls); run them explicitly:
+- **Install half** (`install_integration.rs`): does your package actually
+  install from storage? (It caught a real bug in atomic-devin the day it was
+  written — hook commands pointing at scripts that never resolved.)
+- **Behavior half** (`acp_integration.rs`): it spawns the *real agent* over
+  ACP, sends it *real prompts*, and asserts on both the ACP stream and the
+  repository side effects — that the agent responds, uses code search, checks
+  repo status, and creates intents the way the workflow demands.
+
+Both are `#[ignore]`d by default (the ACP suite makes real LLM calls; the
+install suite hits storage). Run them explicitly:
 
 ```bash
 # 1. Build atomic with your adapter and run its unit tests.
 cargo build -p atomic
 cargo test -p atomic-agent          # adapter unit tests — copy opencode.rs's test module
 
-# 2. Install the integration package (dev mode: symlinks, edits go live immediately).
-cd ~/code/work/atomic-<agent> && ./install.sh
+# 2. Dev-loop the package install (same installer as the storage path).
+cd /some/atomic/repo
+atomic agent enable --agent <agent> --from ~/code/work/atomic-<agent>
+atomic agent disable --agent <agent>
 
 # 3. Manual smoke test — this is exactly what the agent will do.
-cd /some/atomic/repo
 echo '{"session_id":"t1","cwd":"'"$PWD"'"}' | atomic agent hooks <agent> session-start
 echo '{"session_id":"t1","prompt":"hi","model":"...","provider":"..."}' | atomic agent hooks <agent> user-prompt
 echo '{"session_id":"t1","turn_number":1}' | atomic agent hooks <agent> stop
 atomic agent attest                 # confirm a provenance/attestation record appeared
 
-# 4. Full ACP integration test via the harness (needs API key + package in AGENTS_DIR).
+# 4. Harness: install verification from storage (all agents, ~20s).
 cd ~/code/work/atomic-agents
+ATOMIC_BIN=$(pwd)/../atomic/target/debug/atomic \
+  cargo test -p atomic-agent-harness --test install_integration -- --ignored --nocapture
+
+# 5. Harness: full ACP behavior test (needs API key + package in AGENTS_DIR).
 cargo test -p atomic-agent-harness --test acp_integration -- --ignored --nocapture
 ```
 
-Step 3 validates the capture half (events → provenance). Step 4 validates the
-behavior half (prompt + skills → correct agent behavior). You want both green
-before calling the integration done.
+Steps 2–4 validate the install + capture halves; step 5 validates behavior.
+You want all of them green before calling the integration done.
 
 ---
 
@@ -665,28 +819,31 @@ before calling the integration done.
 
 **In `atomic` (this repo):**
 
-- [ ] `atomic-agent/src/hooks/<agent>.rs` implements `AgentHook`.
+- [ ] `atomic-agent/src/hooks/<agent>.rs` implements `AgentHook` (parser + presence checks — no installer).
 - [ ] Registered in `AgentRegistry::with_defaults()` (`hooks/mod.rs`), module declared.
+- [ ] Entry in `atomic-agent/src/integrations/registry.toml` (storage URL + view).
 - [ ] Any new verbs added to `HookType::from_verb` (`event.rs`).
 - [ ] Vendor arm in `vendor_from_agent_name` (`record/provenance.rs`).
 - [ ] Author classification in `provenance_summary.rs` (`KNOWN_AGENT_PREFIXES` + fallback list).
 - [ ] Display name in `pretty_tool` (`agent/attest.rs`).
-- [ ] (Optional) `enable --global` arm (`agent/enable.rs`).
 - [ ] `cargo test -p atomic-agent` passes; adapter has unit tests (copy `opencode.rs`'s test module).
 
 **In `atomic-<agent>` (integration package):**
 
+- [ ] `atomic-integration.toml` with `agent` matching the adapter name, `requires.atomic`, all `[[file]]` srcs verified to exist.
 - [ ] System prompt in the agent's convention (`CLAUDE.md` / `AGENTS.md` / `agents/*.md` / …).
 - [ ] Skills: `atomic-vault`, `atomic-vcs`, `code-intelligence`.
 - [ ] Lifecycle wiring: a hooks manifest **or** a plugin that calls `atomic agent hooks <agent> <verb>`.
-- [ ] Every hook guarded with `test -d .atomic && … || true`.
-- [ ] `install.sh` / `install.js` + `package.json` + `README.md`.
+- [ ] Every hook guarded with `test -d .atomic || test -f .atomic-sandbox && … || true`.
+- [ ] Pushed to Atomic storage (`git import` for full history), project **public**, README notes the definitive source.
+- [ ] `atomic agent enable --agent <name> --from .` installs and `disable` removes it cleanly.
 
 **In `atomic-agents` (harness):**
 
 - [ ] `AgentEntry` added to `AGENT_REGISTRY` (`env.rs`).
 - [ ] `registry_id` matches the canonical ACP registry (add spawn hint to `spawn.rs` if stdio-only).
-- [ ] `acp_integration` tests pass for your agent.
+- [ ] Adapter name added to `install_integration.rs` (`ADAPTERS` + `install_test!`).
+- [ ] `install_integration` and `acp_integration` tests pass for your agent.
 
 ## Example repositories
 
@@ -703,10 +860,13 @@ before calling the integration done.
 - Example adapter (plugin style): `atomic-agent/src/hooks/opencode.rs`
 - More adapters: `atomic-agent/src/hooks/{claude_code,codex,gemini_cli,cursor,…}.rs`
 - Verb → hook-type map: `atomic-agent/src/event.rs` (`HookType::from_verb`)
-- Manifest install engine: `atomic-agent/src/hooks/manifest.rs`
+- Integrations engine: `atomic-agent/src/integrations/` (`registry.toml`,
+  `manifest.rs`, `install.rs`, `receipt.rs`)
+- Manifest install engine (settings merge): `atomic-agent/src/hooks/manifest.rs`
 - Orchestrator (does the recording): `atomic-agent/src/turn/orchestrator.rs`
 - Hooks CLI entry: `atomic-cli/src/commands/agent/hooks.rs`
 - Enable/attest CLI: `atomic-cli/src/commands/agent/{enable,attest}.rs`
 - Provenance mapping: `atomic-agent/src/record/provenance.rs`,
   `atomic-repository/src/repository/provenance_summary.rs`
 - Test harness registry: `atomic-agents/crates/atomic-agent-harness/src/env.rs`
+- Install test suite: `atomic-agents/crates/atomic-agent-harness/tests/install_integration.rs`
