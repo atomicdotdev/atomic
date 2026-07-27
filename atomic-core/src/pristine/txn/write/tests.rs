@@ -982,8 +982,11 @@ mod tests {
     }
 
     #[test]
-    fn test_populate_session_tables_skips_non_sherpa() {
-        use crate::change::provenance_graph::ProvenanceGraph;
+    fn test_populate_session_tables_indexes_any_agent() {
+        use crate::change::provenance_graph::{
+            ProvenanceGraph, ProvenanceNode, ProvenanceNodeKind,
+        };
+        use crate::change::session::*;
 
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("pristine");
@@ -991,20 +994,79 @@ mod tests {
 
         let mut txn = pristine.write_txn().unwrap();
 
-        // Generic graph (no profile) — should be a no-op.
+        // Generic (non-Sherpa) graph: no profile, and a `detail`-less Goal
+        // node exactly as `atomic-agent`'s `append_goal` produces, plus a
+        // Todo node shaped like `append_todo_snapshot`. Provenance from any
+        // agent must now be indexed, not skipped.
+        let todo_detail = serde_json::json!({
+            "todo_id": "todo-7",
+            "content": "Wire up the parser",
+            "status": "completed",
+            "priority": "medium",
+            "record_type": "todo",
+        });
+
         let graph = ProvenanceGraph::builder("sess-xyz", "claude-code")
             .timestamp(1_700_000_000)
+            .add_node(ProvenanceNode {
+                id: "g0".to_string(),
+                kind: ProvenanceNodeKind::Goal,
+                timestamp: 1_700_000_000_000,
+                summary: "Implement the parser".to_string(),
+                detail: None,
+                change_hash: None,
+                tool_name: None,
+                tool_call_id: None,
+                duration_ms: None,
+                classified: false,
+                confidence: None,
+                consolidated_from: vec![],
+            })
+            .add_node(ProvenanceNode {
+                id: "t0".to_string(),
+                kind: ProvenanceNodeKind::Todo,
+                timestamp: 1_700_000_001_000,
+                summary: "Wire up the parser".to_string(),
+                detail: Some(todo_detail.to_string()),
+                change_hash: None,
+                tool_name: None,
+                tool_call_id: None,
+                duration_ms: None,
+                classified: false,
+                confidence: None,
+                consolidated_from: vec![],
+            })
             .build();
 
         assert!(graph.profile.is_none());
-        txn.populate_session_tables(99, &graph).unwrap();
 
-        // SESSION_EVENTS should be empty for this provenance_id.
+        let provenance_id: u64 = 99;
+        txn.populate_session_tables(provenance_id, &graph).unwrap();
+
+        // Every node is recorded as a SessionEvent, regardless of profile.
         {
-            use crate::change::session::encode_session_event_key;
             let events_table = txn.txn.open_table(SESSION_EVENTS).unwrap();
-            let key = encode_session_event_key(99, 0);
-            assert!(events_table.get(&key).unwrap().is_none());
+            for seq in 0u64..2 {
+                let key = encode_session_event_key(provenance_id, seq);
+                assert!(
+                    events_table.get(&key).unwrap().is_some(),
+                    "event {seq} must be indexed for a non-Sherpa graph"
+                );
+            }
+            let key2 = encode_session_event_key(provenance_id, 2);
+            assert!(events_table.get(&key2).unwrap().is_none());
+        }
+
+        // The Todo node populates SESSION_TODOS with its generic detail.
+        {
+            let todos_table = txn.txn.open_table(SESSION_TODOS).unwrap();
+            let key = encode_session_todo_key(provenance_id, "todo-7");
+            let guard = todos_table.get(&key).unwrap().expect("todo must exist");
+            let todo = TodoSnapshot::from_bytes(guard.value()).unwrap();
+            assert_eq!(todo.todo_id, "todo-7");
+            assert_eq!(todo.content, "Wire up the parser");
+            assert_eq!(todo.final_status, "completed");
+            assert_eq!(todo.priority, "medium");
         }
 
         txn.commit().unwrap();

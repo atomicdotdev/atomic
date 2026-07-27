@@ -121,7 +121,7 @@ impl Pristine {
             // Git SHA index (git commit SHA → entity_id)
             write_txn.open_table(GIT_SHA_INDEX)?;
 
-            // Session tables (Sherpa-enriched provenance data)
+            // Session tables (provenance-derived session data, any agent)
             write_txn.open_table(SESSION_EVENTS)?;
             write_txn.open_table(SESSION_TODOS)?;
             write_txn.open_table(SESSION_PHASES)?;

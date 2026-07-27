@@ -493,12 +493,14 @@ pub const CHANGE_CHUNKS: TableDefinition<&[u8; 36], &[u8; 32]> =
 pub const CHANGE_UNHASHED: TableDefinition<&[u8; 32], &[u8]> =
     TableDefinition::new("change_unhashed");
 
-// Session Tables (Sherpa-enriched provenance data)
+// Session Tables (provenance-derived session data)
 //
-// Populated when `ProvenanceGraph.profile == "sherpa-trace/1.0.0"`.
-// These tables store the structured turn data extracted from the Petri net
-// replay log. Values are postcard-encoded session structs from
-// `atomic_core::change::session`.
+// Populated from every provenance graph, regardless of the producing agent.
+// Sherpa graphs (`profile == "sherpa-trace/1.0.0"`) carry the richest
+// structured `detail` (intent/phase breakdowns from the Petri net replay
+// log); graphs from other agents contribute session events plus whatever
+// todo/verification data their nodes provide. Values are postcard-encoded
+// session structs from `atomic_core::change::session`.
 //
 // Composite keys use the same `[u8; 16]` shape as `VIEW_CHANGES`:
 // first 8 bytes = provenance_id (u64, big-endian), second 8 bytes = secondary

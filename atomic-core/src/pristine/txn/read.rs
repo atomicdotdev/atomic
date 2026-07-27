@@ -640,8 +640,8 @@ impl ReadTxn {
 
     /// Get all session events for a provenance graph.
     ///
-    /// Returns events in sequence order. Empty if the provenance is not Sherpa
-    /// or has no session data.
+    /// Returns events in sequence order (one per provenance node, for any
+    /// agent). Empty only if the provenance has no nodes / no session data.
     pub fn get_session_events(
         &self,
         provenance_id: u64,
@@ -673,8 +673,8 @@ impl ReadTxn {
 
     /// Get all todos for a provenance graph.
     ///
-    /// Returns snapshots of all todo items from the turn.
-    /// Empty if the provenance is not Sherpa or has no session data.
+    /// Returns snapshots of all todo items from the turn, for any agent.
+    /// Empty if the provenance recorded no todos / no session data.
     pub fn get_session_todos(
         &self,
         provenance_id: u64,
@@ -703,8 +703,9 @@ impl ReadTxn {
 
     /// Get phase timing breakdown for a provenance graph.
     ///
-    /// Returns timing data for each phase in the turn.
-    /// Empty if the provenance is not Sherpa or has no session data.
+    /// Returns timing data for each phase in the turn. Populated from the
+    /// per-phase token breakdown that Sherpa graphs carry; empty for agents
+    /// that do not emit phase timing.
     pub fn get_session_phases(
         &self,
         provenance_id: u64,
@@ -733,7 +734,9 @@ impl ReadTxn {
 
     /// Get intent metadata for a provenance graph.
     ///
-    /// Returns the intent entry if this is a Sherpa provenance, `None` otherwise.
+    /// Returns the intent entry when the graph carries a Goal node with intent
+    /// `detail` (Sherpa graphs always do; other agents when available),
+    /// `None` otherwise.
     pub fn get_session_intent(
         &self,
         provenance_id: u64,
