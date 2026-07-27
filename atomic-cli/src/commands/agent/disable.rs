@@ -80,10 +80,7 @@ impl Disable {
 
 /// Agents with anything to uninstall: adapter-reported installs (hooks in
 /// agent config) plus agents with an integration receipt (package files).
-fn agents_with_installs(
-    registry: &AgentRegistry,
-    repo_root: &std::path::Path,
-) -> Vec<String> {
+fn agents_with_installs(registry: &AgentRegistry, repo_root: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = registry
         .installed(repo_root)
         .iter()

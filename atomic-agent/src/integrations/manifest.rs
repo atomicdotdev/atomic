@@ -101,11 +101,10 @@ impl IntegrationManifest {
             agent: self.agent.clone(),
             reason: format!("invalid requires.atomic '{req_str}': {e}"),
         })?;
-        let current =
-            semver::Version::parse(cli_version).map_err(|e| AgentError::Integration {
-                agent: self.agent.clone(),
-                reason: format!("cannot parse CLI version '{cli_version}': {e}"),
-            })?;
+        let current = semver::Version::parse(cli_version).map_err(|e| AgentError::Integration {
+            agent: self.agent.clone(),
+            reason: format!("cannot parse CLI version '{cli_version}': {e}"),
+        })?;
         if !req.matches(&current) {
             return Err(AgentError::IntegrationVersionMismatch {
                 agent: self.agent.clone(),
@@ -227,10 +226,7 @@ manifest = "hooks/opencode.atomic-hooks.json"
         );
         let m = IntegrationManifest::load(tmp.path()).unwrap();
         let err = m.check_cli_version("0.10.0").unwrap_err();
-        assert!(matches!(
-            err,
-            AgentError::IntegrationVersionMismatch { .. }
-        ));
+        assert!(matches!(err, AgentError::IntegrationVersionMismatch { .. }));
         assert!(err.to_string().contains("requires atomic >=0.11.0"));
     }
 

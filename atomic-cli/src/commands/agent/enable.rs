@@ -328,9 +328,8 @@ fn sync_integration_package(
     spec: &atomic_agent::integrations::IntegrationSpec,
     force: bool,
 ) -> CliResult<std::path::PathBuf> {
-    let cache = atomic_agent::integrations::cache_repo_dir(agent_name).map_err(|e| {
-        crate::error::CliError::Internal(anyhow::anyhow!(e.to_string()))
-    })?;
+    let cache = atomic_agent::integrations::cache_repo_dir(agent_name)
+        .map_err(|e| crate::error::CliError::Internal(anyhow::anyhow!(e.to_string())))?;
 
     if force && cache.exists() {
         std::fs::remove_dir_all(&cache).map_err(crate::error::CliError::Io)?;

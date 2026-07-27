@@ -135,10 +135,11 @@ impl Receipt {
             return Ok(None);
         }
         let text = std::fs::read_to_string(&path)?;
-        let receipt: Receipt = serde_json::from_str(&text).map_err(|e| AgentError::Integration {
-            agent: agent.to_string(),
-            reason: format!("corrupt receipt at {}: {}", path.display(), e),
-        })?;
+        let receipt: Receipt =
+            serde_json::from_str(&text).map_err(|e| AgentError::Integration {
+                agent: agent.to_string(),
+                reason: format!("corrupt receipt at {}: {}", path.display(), e),
+            })?;
         Ok(Some(receipt))
     }
 

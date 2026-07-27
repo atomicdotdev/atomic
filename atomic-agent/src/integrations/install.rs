@@ -139,7 +139,10 @@ pub fn install_from_dir(pkg_dir: &Path, opts: &InstallOptions) -> AgentResult<In
                 });
                 // Keep protecting this file: preserve any prior receipt entry
                 // so a later --force still knows whether it was ours.
-                if let Some(old) = previous.as_ref().and_then(|r| r.files.iter().find(|f| f.dst == dst)) {
+                if let Some(old) = previous
+                    .as_ref()
+                    .and_then(|r| r.files.iter().find(|f| f.dst == dst))
+                {
                     receipt_files.push(old.clone());
                 }
                 continue;
@@ -162,15 +165,22 @@ pub fn install_from_dir(pkg_dir: &Path, opts: &InstallOptions) -> AgentResult<In
         // Record (target, hooks_key, command_prefix) so uninstall works even
         // after the package is gone.
         let hook_manifest: hooks_manifest::HookManifest = {
-            let text = std::fs::read_to_string(&settings_path).map_err(|e| {
-                AgentError::Integration {
+            let text =
+                std::fs::read_to_string(&settings_path).map_err(|e| AgentError::Integration {
                     agent: manifest.agent.clone(),
-                    reason: format!("cannot read settings manifest {}: {}", settings_path.display(), e),
-                }
-            })?;
+                    reason: format!(
+                        "cannot read settings manifest {}: {}",
+                        settings_path.display(),
+                        e
+                    ),
+                })?;
             serde_json::from_str(&text).map_err(|e| AgentError::Integration {
                 agent: manifest.agent.clone(),
-                reason: format!("invalid settings manifest {}: {}", settings_path.display(), e),
+                reason: format!(
+                    "invalid settings manifest {}: {}",
+                    settings_path.display(),
+                    e
+                ),
             })?
         };
         receipt_settings.push(ReceiptSettings {
@@ -260,11 +270,7 @@ enum Decision {
 }
 
 /// Decide what to do with a destination that may already exist.
-fn install_decision(
-    dst: &Path,
-    previous: Option<&Receipt>,
-    force: bool,
-) -> AgentResult<Decision> {
+fn install_decision(dst: &Path, previous: Option<&Receipt>, force: bool) -> AgentResult<Decision> {
     if !dst.exists() {
         return Ok(Decision::Install);
     }
@@ -316,6 +322,14 @@ mod tests {
     use crate::integrations::MANIFEST_FILE;
     use serial_test::serial;
 
+    /// Render a filesystem path for embedding in a TOML basic (double-quoted)
+    /// string. On Windows, paths contain backslashes, which TOML treats as
+    /// escape-sequence introducers (`\Users` → invalid unicode escape), so
+    /// they must be doubled.
+    fn toml_path(path: &Path) -> String {
+        path.display().to_string().replace('\\', "\\\\")
+    }
+
     /// Build a fake package in a tempdir: manifest + two files + a settings
     /// manifest. Returns (pkg_dir, dst_dir) tempdirs.
     fn fake_package(agent: &str) -> (tempfile::TempDir, tempfile::TempDir) {
@@ -362,8 +376,8 @@ dst = "{}/skills.md"
 [[settings]]
 manifest = "hooks/hooks.json"
 "#,
-                dst.path().display(),
-                dst.path().display()
+                toml_path(dst.path()),
+                toml_path(dst.path())
             ),
         )
         .unwrap();
@@ -408,7 +422,10 @@ manifest = "hooks/hooks.json"
         let receipt = Receipt::load("testagent").unwrap().unwrap();
         assert_eq!(receipt.files.len(), 2);
         assert_eq!(receipt.settings.len(), 1);
-        assert_eq!(receipt.settings[0].command_prefix, "atomic agent hooks testagent");
+        assert_eq!(
+            receipt.settings[0].command_prefix,
+            "atomic agent hooks testagent"
+        );
 
         std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
     }
@@ -435,7 +452,7 @@ manifest = "hooks/hooks.json"
                 "[[settings]]",
                 "[[file]]\nsrc = \"new.md\"\ndst = \"FOREIGN\"\n\n[[settings]]",
             )
-            .replace("FOREIGN", &dst.path().join("foreign.md").display().to_string());
+            .replace("FOREIGN", &toml_path(&dst.path().join("foreign.md")));
         std::fs::write(pkg.path().join(MANIFEST_FILE), manifest_text).unwrap();
 
         let outcome = install_from_dir(pkg.path(), &opts(false)).unwrap();
@@ -507,7 +524,10 @@ manifest = "hooks/hooks.json"
             &std::fs::read_to_string(dst.path().join("settings.json")).unwrap(),
         )
         .unwrap();
-        let stop_entries = settings["hooks"]["Stop"].as_array().cloned().unwrap_or_default();
+        let stop_entries = settings["hooks"]["Stop"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         assert!(!stop_entries
             .iter()
             .any(|e| e.to_string().contains("atomic agent hooks testagent")));
@@ -543,7 +563,7 @@ manifest = "hooks/hooks.json"
             pkg.path().join(MANIFEST_FILE),
             format!(
                 "schema = 1\nagent = \"evil\"\nversion = \"1.0.0\"\n\n[[file]]\nsrc = \"../../etc/passwd\"\ndst = \"{}/x\"\n",
-                dst.path().display()
+                toml_path(dst.path())
             ),
         )
         .unwrap();
