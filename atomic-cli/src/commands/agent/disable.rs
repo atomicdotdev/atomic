@@ -78,6 +78,28 @@ impl Disable {
     }
 }
 
+/// Agents with anything to uninstall: adapter-reported installs (hooks in
+/// agent config) plus agents with an integration receipt (package files).
+fn agents_with_installs(
+    registry: &AgentRegistry,
+    repo_root: &std::path::Path,
+) -> Vec<String> {
+    let mut names: Vec<String> = registry
+        .installed(repo_root)
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for name in atomic_agent::integrations::registered_integrations() {
+        if names.iter().any(|n| n == &name) {
+            continue;
+        }
+        if let Ok(Some(_)) = atomic_agent::integrations::Receipt::load(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
 impl Command for Disable {
     fn run(&self) -> CliResult<()> {
         // Data-driven uninstall — mirrors `enable --hooks`.
@@ -91,13 +113,12 @@ impl Command for Disable {
         }
 
         let repo_root = find_repository_root()?;
-
         let registry = AgentRegistry::with_defaults();
 
         // Determine which agents to uninstall
-        let agents_to_disable: Vec<&str> = if self.all {
+        let agents_to_disable: Vec<String> = if self.all {
             // Uninstall from all agents that have hooks installed
-            let installed = registry.installed(&repo_root);
+            let installed = agents_with_installs(&registry, &repo_root);
             if installed.is_empty() {
                 println!("No agent hooks are currently installed.");
                 return Ok(());
@@ -110,10 +131,10 @@ impl Command for Disable {
                 .map_err(|e| crate::error::CliError::InvalidArgument {
                     message: format!("Unknown agent '{}': {}", name, e),
                 })?;
-            vec![name.as_str()]
+            vec![name.clone()]
         } else {
             // Auto: uninstall from all agents that have hooks installed
-            let installed = registry.installed(&repo_root);
+            let installed = agents_with_installs(&registry, &repo_root);
             if installed.is_empty() {
                 println!("No agent hooks are currently installed.");
                 println!("Use 'atomic agent enable' to install hooks first.");
@@ -137,26 +158,62 @@ impl Command for Disable {
                 }
             };
 
-            if !agent.is_installed(&repo_root) {
+            let mut removed_any = false;
+
+            // Integration package installed via `enable` — remove it per its
+            // receipt (files we own only; user-modified files are kept).
+            let receipt_exists = atomic_agent::integrations::Receipt::load(agent_name)
+                .map(|r| r.is_some())
+                .unwrap_or(false);
+            if receipt_exists {
+                match atomic_agent::integrations::uninstall(agent_name) {
+                    Ok(outcome) => {
+                        print_success(&format!(
+                            "Removed {} integration ({} file{}, {} kept user-modified, {} hook commands stripped)",
+                            agent.display_name(),
+                            outcome.removed.len(),
+                            if outcome.removed.len() == 1 { "" } else { "s" },
+                            outcome.kept_modified.len(),
+                            outcome.settings_hooks_removed,
+                        ));
+                        for kept in &outcome.kept_modified {
+                            println!("    keep: {} (modified since install)", kept.display());
+                        }
+                        removed_any = true;
+                    }
+                    Err(e) => {
+                        print_error(&format!(
+                            "Failed to remove {} integration: {}",
+                            agent.display_name(),
+                            e,
+                        ));
+                    }
+                }
+            }
+
+            if agent.is_installed(&repo_root) {
+                match agent.uninstall(&repo_root) {
+                    Ok(()) => {
+                        print_success(&format!("Removed hooks for {}", agent.display_name(),));
+                        removed_any = true;
+                    }
+                    Err(e) => {
+                        print_error(&format!(
+                            "Failed to remove hooks for {}: {}",
+                            agent.display_name(),
+                            e,
+                        ));
+                    }
+                }
+            }
+
+            if removed_any {
+                total_removed += 1;
+            } else {
                 println!(
                     "  No Atomic hooks installed for {} — skipping.",
                     agent.display_name(),
                 );
-                continue;
-            }
-
-            match agent.uninstall(&repo_root) {
-                Ok(()) => {
-                    print_success(&format!("Removed hooks for {}", agent.display_name(),));
-                    total_removed += 1;
-                }
-                Err(e) => {
-                    print_error(&format!(
-                        "Failed to remove hooks for {}: {}",
-                        agent.display_name(),
-                        e,
-                    ));
-                }
             }
         }
 

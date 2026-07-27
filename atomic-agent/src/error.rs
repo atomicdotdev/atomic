@@ -274,6 +274,28 @@ pub enum AgentError {
         reason: String,
     },
 
+    // Integration Package Errors
+    /// An integration package operation failed (registry resolution,
+    /// manifest parsing, file installation, or receipt handling).
+    #[error("Integration package error for '{agent}': {reason}")]
+    Integration {
+        /// Which agent's integration was being installed.
+        agent: String,
+        /// What went wrong.
+        reason: String,
+    },
+
+    /// The integration package requires a different CLI version.
+    #[error("Integration '{agent}' requires atomic {requires}, but you have {current} — upgrade atomic or install an older integration")]
+    IntegrationVersionMismatch {
+        /// Which agent's integration was rejected.
+        agent: String,
+        /// The version requirement from the package manifest.
+        requires: String,
+        /// The running CLI version.
+        current: String,
+    },
+
     // Generic Wrappers
     /// An IO error occurred.
     #[error("IO error: {0}")]

@@ -98,33 +98,37 @@ pub fn install_from_manifest(manifest_path: &Path) -> AgentResult<ManifestOutcom
 
     let mut root = read_json_object(&target)?;
 
-    let entry = root
-        .entry(manifest.hooks_key.clone())
-        .or_insert_with(|| Value::Object(Map::new()));
-    if !entry.is_object() {
-        *entry = Value::Object(Map::new());
-    }
-    let hooks = entry
-        .as_object_mut()
-        .expect("entry was just ensured to be an object");
-
-    // Remove our previous entries first so command/event changes take effect.
-    let removed = remove_prefixed(hooks, &manifest.command_prefix);
-
+    // Merge-only manifests (no hooks) must not create an empty hooks key.
+    let mut removed = 0;
     let mut added = 0;
-    for (event, entries) in &manifest.hooks {
-        let Some(src_entries) = entries.as_array() else {
-            continue;
-        };
-        let dst = hooks
-            .entry(event.clone())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        let Some(dst_entries) = dst.as_array_mut() else {
-            continue;
-        };
-        for entry in src_entries {
-            dst_entries.push(entry.clone());
-            added += count_commands(entry);
+    if !manifest.hooks.is_empty() {
+        let entry = root
+            .entry(manifest.hooks_key.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !entry.is_object() {
+            *entry = Value::Object(Map::new());
+        }
+        let hooks = entry
+            .as_object_mut()
+            .expect("entry was just ensured to be an object");
+
+        // Remove our previous entries first so command/event changes take effect.
+        removed = remove_prefixed(hooks, &manifest.command_prefix);
+
+        for (event, entries) in &manifest.hooks {
+            let Some(src_entries) = entries.as_array() else {
+                continue;
+            };
+            let dst = hooks
+                .entry(event.clone())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            let Some(dst_entries) = dst.as_array_mut() else {
+                continue;
+            };
+            for entry in src_entries {
+                dst_entries.push(entry.clone());
+                added += count_commands(entry);
+            }
         }
     }
 
@@ -175,6 +179,40 @@ pub fn uninstall_from_manifest(manifest_path: &Path) -> AgentResult<ManifestOutc
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Remove hook commands identified by `command_prefix` from `hooks_key` in
+/// `target`, without needing the original manifest file.
+///
+/// Used by receipt-driven integration uninstalls, where the receipt records
+/// `(target, hooks_key, command_prefix)` but the package may no longer exist
+/// on disk.
+pub fn uninstall_prefixed(
+    target: &Path,
+    hooks_key: &str,
+    command_prefix: &str,
+) -> AgentResult<ManifestOutcome> {
+    if !target.exists() {
+        return Ok(ManifestOutcome {
+            target: target.to_path_buf(),
+            added: 0,
+            removed: 0,
+        });
+    }
+
+    let mut root = read_json_object(target)?;
+    let mut removed = 0;
+    if let Some(hooks) = root.get_mut(hooks_key).and_then(Value::as_object_mut) {
+        removed = remove_prefixed(hooks, command_prefix);
+    }
+
+    write_json_object(target, &root)?;
+
+    Ok(ManifestOutcome {
+        target: target.to_path_buf(),
+        added: 0,
+        removed,
+    })
+}
 
 fn read_manifest(path: &Path) -> AgentResult<HookManifest> {
     let content = std::fs::read_to_string(path).map_err(|e| AgentError::ConfigError {
