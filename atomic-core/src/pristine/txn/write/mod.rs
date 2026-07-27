@@ -56,12 +56,18 @@ impl<'a> WriteTxn<'a> {
         }
     }
 
-    /// Populate the session tables from a Sherpa provenance graph.
+    /// Populate the session tables from a provenance graph.
     ///
-    /// Called during `save_provenance_graph` when the graph has
-    /// `profile == "sherpa-trace/1.0.0"`. Extracts session data from
-    /// the provenance nodes' `detail` fields and writes to the four
-    /// session tables.
+    /// Called during `save_provenance_graph` for provenance produced by
+    /// **any** agent — Sherpa, Claude Code, OpenCode, the generic
+    /// `atomic-agent`, etc. Sherpa graphs (`profile ==
+    /// "sherpa-trace/1.0.0"`) carry richer structured `detail` JSON
+    /// (intent/todo/phase/verification), so they populate the intent and
+    /// phase tables more fully; graphs from other agents still record every
+    /// node as a `SessionEvent` and contribute todos/verification wherever
+    /// their nodes and `detail` fields allow. Every extraction below reads
+    /// `detail` defensively with fallbacks, so a missing Sherpa-specific key
+    /// simply yields a sensible default rather than skipping the graph.
     ///
     /// Best-effort: parse errors on individual nodes are logged and skipped.
     pub fn populate_session_tables(
@@ -72,11 +78,10 @@ impl<'a> WriteTxn<'a> {
         use crate::change::provenance_graph::ProvenanceNodeKind;
         use crate::change::session::*;
 
-        // Gate on profile — only populate for Sherpa graphs.
-        match graph.profile.as_deref() {
-            Some(crate::change::provenance_graph::SHERPA_PROFILE) => {}
-            _ => return Ok(()),
-        }
+        // No profile gate: provenance from any agent is indexed into the
+        // session tables. The per-node extraction below is profile-agnostic
+        // and falls back to node summary / kind labels when the richer
+        // Sherpa-specific `detail` keys are absent.
 
         // Open all four tables.
         let mut events_table = self.txn.open_table(SESSION_EVENTS)?;

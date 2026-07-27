@@ -991,9 +991,10 @@ impl Repository {
             }
         }
 
-        // Populate session tables if this is a Sherpa provenance graph.
-        // The write transaction is still open, so this is atomic with
-        // the provenance registration above.
+        // Populate session tables from the provenance graph, for any agent
+        // (Sherpa, Claude Code, OpenCode, generic atomic-agent, ...). The
+        // write transaction is still open, so this is atomic with the
+        // provenance registration above.
         txn.populate_session_tables(prov_id.get(), graph)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
@@ -1266,8 +1267,8 @@ impl Repository {
 
     /// Get the full ordered replay log for a provenance graph.
     ///
-    /// Returns all session events ordered by sequence number.
-    /// Empty if the provenance is not Sherpa or has no session data.
+    /// Returns all session events ordered by sequence number, for provenance
+    /// from any agent. Empty only if the graph has no nodes / no session data.
     pub fn get_session_events(
         &self,
         provenance_hash: &Hash,
@@ -1288,8 +1289,8 @@ impl Repository {
 
     /// Get all todos for a provenance graph.
     ///
-    /// Returns snapshots of all todo items from the turn.
-    /// Empty if the provenance is not Sherpa or has no session data.
+    /// Returns snapshots of all todo items from the turn, for any agent.
+    /// Empty if the provenance recorded no todos / no session data.
     pub fn get_session_todos(
         &self,
         provenance_hash: &Hash,
@@ -1310,8 +1311,9 @@ impl Repository {
 
     /// Get phase timing breakdown for a provenance graph.
     ///
-    /// Returns timing data for each phase in the turn.
-    /// Empty if the provenance is not Sherpa or has no session data.
+    /// Returns timing data for each phase in the turn. Populated from the
+    /// per-phase token breakdown Sherpa graphs carry; empty for agents that
+    /// do not emit phase timing.
     pub fn get_session_phases(
         &self,
         provenance_hash: &Hash,
@@ -1332,7 +1334,8 @@ impl Repository {
 
     /// Get intent metadata for a provenance graph.
     ///
-    /// Returns the intent entry if this is a Sherpa provenance, `None` otherwise.
+    /// Returns the intent entry when the graph carries a Goal node with intent
+    /// `detail`, `None` otherwise.
     pub fn get_session_intent(
         &self,
         provenance_hash: &Hash,
@@ -1351,11 +1354,13 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
-    /// Check if a provenance graph has session data.
+    /// Check if a provenance graph has populated session data.
     ///
-    /// Returns `true` if the graph is a Sherpa provenance with populated
-    /// session tables. This is a fast gate for the UI — checking this first
-    /// avoids hitting the session tables for non-Sherpa provenance.
+    /// Returns `true` when the graph has at least one indexed session event
+    /// (every provenance node produces one, for any agent). This is a fast
+    /// gate for the UI. Note it is intentionally broader than
+    /// [`Self::get_session_intent`]: a generic agent graph whose Goal node
+    /// carries no intent `detail` still has session data (events, todos).
     pub fn has_session_data(&self, provenance_hash: &Hash) -> bool {
         let txn = match self.pristine.read_txn() {
             Ok(t) => t,
@@ -1367,9 +1372,8 @@ impl Repository {
             _ => return false,
         };
 
-        txn.get_session_intent(provenance_id)
-            .ok()
-            .flatten()
-            .is_some()
+        txn.get_session_events(provenance_id)
+            .map(|events| !events.is_empty())
+            .unwrap_or(false)
     }
 }
