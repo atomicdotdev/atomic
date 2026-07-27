@@ -430,10 +430,11 @@ impl Enable {
     /// Supports:
     /// - `claude-code` → `~/.claude/settings.json`
     /// - `gemini-cli` → `~/.gemini/settings.json`
-    /// - `agy` → `~/.gemini/config/plugins/atomic/hooks.json` (plugin)
     /// - `codex` → `~/.codex/hooks.json`
+    ///
+    /// agy is intentionally absent: its plugin is inherently global and is
+    /// installed by the integrations engine via the standard `enable` path.
     fn run_global(&self) -> CliResult<()> {
-        use atomic_agent::hooks::agy::AgyHook;
         use atomic_agent::hooks::claude_code::ClaudeCodeHook;
         use atomic_agent::hooks::codex::CodexHook;
         use atomic_agent::hooks::gemini_cli::GeminiCliHook;
@@ -508,38 +509,14 @@ impl Enable {
             }
 
             "agy" => {
-                let hook = AgyHook::new();
-
-                if !self.force && hook.is_installed_global() {
-                    print_success(
-                        "Hooks already installed via the ~/.gemini/config/plugins/atomic/ plugin.",
-                    );
-                    println!("  Use --force to reinstall.");
-                    return Ok(());
-                }
-
-                match hook.install_global(self.force) {
-                    Ok(count) if count > 0 => {
-                        print_success(&format!(
-                            "Installed {} hook{} for Antigravity CLI as an agy plugin",
-                            count,
-                            if count == 1 { "" } else { "s" },
-                        ));
-                        println!();
-                        println!("Hooks written to: ~/.gemini/config/plugins/atomic/hooks.json");
-                        println!();
-                        println!("Every agy session in a project with .atomic/ will now:");
-                        println!("  • Record each turn as an Atomic change with full provenance");
-                        println!("  • Track session metadata (turn number, timing, files)");
-                        println!("  • Capture tool calls through the post-tool hook");
-                    }
-                    Ok(_) => {
-                        print_success("Hooks already up to date.");
-                    }
-                    Err(e) => {
-                        print_error(&format!("Failed to install hooks: {}", e));
-                    }
-                }
+                // agy's plugin is inherently global — the integration package
+                // install (the standard repo-scoped `enable` path) *is* the
+                // global install.
+                println!("The agy plugin is global by nature — install it with:");
+                println!("  atomic agent enable --agent agy");
+                println!();
+                println!("(No --global needed; the integrations engine stages the plugin");
+                println!(" at ~/.gemini/config/plugins/atomic/ from the atomic-agy package.)");
             }
 
             "codex" => {
@@ -580,18 +557,17 @@ impl Enable {
             "kiro" => {
                 print_success("Kiro hooks are configured through the IDE panel.");
                 println!();
-                println!("Install the atomic-kiro package for skills, steering, and hook scripts:");
-                println!("  npx atomic-kiro");
+                println!("Install the atomic-kiro integration (skills, steering, hook scripts):");
+                println!("  atomic agent enable --agent kiro");
                 println!();
                 println!(
                     "Then configure hooks in Kiro IDE \u{2192} Agent Steering & Skills panel."
                 );
-                println!("See: https://github.com/atomicdotdev/atomic-kiro");
             }
 
             other => {
                 print_warning(&format!(
-                    "Global install is not supported for '{}'. Supported agents: claude-code, gemini-cli, agy, codex, kiro",
+                    "Global install is not supported for '{}'. Supported agents: claude-code, gemini-cli, codex, kiro (agy via plain enable)",
                     other
                 ));
             }

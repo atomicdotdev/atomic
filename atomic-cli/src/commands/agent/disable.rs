@@ -269,7 +269,6 @@ impl Disable {
     /// - `agy` → `~/.gemini/config/plugins/atomic/` (plugin)
     /// - No `--agent` flag → removes from all agents that have global hooks
     fn run_global(&self) -> CliResult<()> {
-        use atomic_agent::hooks::agy::AgyHook;
         use atomic_agent::hooks::claude_code::ClaudeCodeHook;
         use atomic_agent::hooks::gemini_cli::GeminiCliHook;
 
@@ -284,7 +283,11 @@ impl Disable {
             if GeminiCliHook::new().is_installed_global() {
                 found.push("gemini-cli");
             }
-            if AgyHook::new().is_installed_global() {
+            // agy's global plugin is integration-installed; check its receipt.
+            if atomic_agent::integrations::Receipt::load("agy")
+                .map(|r| r.is_some())
+                .unwrap_or(false)
+            {
                 found.push("agy");
             }
             found
@@ -336,19 +339,18 @@ impl Disable {
                     }
                 }
                 "agy" => {
-                    let hook = AgyHook::new();
-                    if !hook.is_installed_global() {
-                        continue;
-                    }
-                    match hook.uninstall_global() {
-                        Ok(()) => {
-                            print_success(
-                                "Removed the atomic plugin from ~/.gemini/config/plugins/",
-                            );
+                    // The agy plugin is integration-installed — remove it
+                    // per its receipt (plugin files, skills, registration).
+                    match atomic_agent::integrations::uninstall("agy") {
+                        Ok(outcome) => {
+                            print_success(&format!(
+                                "Removed the atomic plugin from ~/.gemini/config/plugins/ ({} files)",
+                                outcome.removed.len(),
+                            ));
                             total_removed += 1;
                         }
                         Err(e) => {
-                            print_error(&format!("Failed to remove Antigravity CLI hooks: {}", e));
+                            print_error(&format!("Failed to remove Antigravity CLI plugin: {}", e));
                         }
                     }
                 }
@@ -357,7 +359,7 @@ impl Disable {
                     println!(
                         "  Remove hooks manually in Kiro IDE \u{2192} Agent Steering & Skills."
                     );
-                    println!("  Uninstall skills/steering: npx atomic-kiro --uninstall");
+                    println!("  Uninstall the integration: atomic agent disable --agent kiro");
                 }
                 "kilo" => {
                     print_success("Kilo Code hooks are configured through kilo.jsonc.");
