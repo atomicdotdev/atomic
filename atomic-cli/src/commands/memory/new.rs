@@ -105,9 +105,7 @@ impl Command for MemoryNew {
         let id = self.id.clone().unwrap_or_else(generate_ulid_lowercased);
         let vault_path = bridge::normalize_memory_path(&id);
 
-        // Refuse to overwrite an existing memory: the entry may be attested,
-        // and vault_store would silently replace it while the old attestation
-        // keeps signing the previous content.
+        // Do not overwrite a memory or invalidate its attestation.
         if repo
             .vault_retrieve(&vault_path)
             .map_err(CliError::Repository)?

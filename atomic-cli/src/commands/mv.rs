@@ -200,9 +200,7 @@ impl Command for Move {
             return Err(CliError::FileNotFound { path: source_path });
         }
 
-        // A tracked destination is always an error: the tracking layer
-        // rejects it anyway, and forcing past it destroyed the destination
-        // file on disk (the old --force flag was removed for that reason).
+        // The repository cannot move onto an already tracked path.
         if repo
             .is_tracked(&destination)
             .map_err(CliError::Repository)?
@@ -212,14 +210,8 @@ impl Command for Move {
             });
         }
 
-        // Refuse to overwrite ANY existing entry at the resolved destination,
-        // tracked or not — fs::rename replaces it silently and the previous
-        // content is unrecoverable. (Moving INTO an existing directory is
-        // fine: resolve_destination already appended the source filename.)
-        //
-        // symlink_metadata rather than Path::exists(): exists() follows the
-        // link and reports false for a dangling symlink, which let rename
-        // destroy it. A case-only rename is exempt — see is_same_file.
+        // `rename` overwrites existing files, so reject any destination entry.
+        // `symlink_metadata` also detects dangling symlinks.
         let destination_disk = repo_root.join(&destination);
         if std::fs::symlink_metadata(&destination_disk).is_ok()
             && !is_same_file(&source_path, &destination_disk)
@@ -276,16 +268,9 @@ impl Command for Move {
     }
 }
 
-/// Whether two paths that both exist refer to the same entry on disk.
+/// Returns true when both paths resolve to the same entry.
 ///
-/// On case-insensitive filesystems (APFS, NTFS) a case-only rename such as
-/// `atomic move File.txt file.txt` has a destination that "already exists" —
-/// it *is* the source. Canonicalizing both sides resolves the real casing so
-/// that rename is allowed through, while any genuinely distinct destination
-/// still gets refused.
-///
-/// Fails closed: if either side cannot be canonicalized the paths are treated
-/// as distinct, so the caller refuses the move rather than overwriting.
+/// This allows case-only renames. Errors return false so moves fail safely.
 fn is_same_file(source: &Path, destination: &Path) -> bool {
     match (
         std::fs::canonicalize(source),
@@ -517,8 +502,7 @@ mod tests {
         let _guard = DirGuard::new();
         let temp = init_repo_with_tracked(&[("File.txt", "CONTENT")]);
 
-        // On a case-insensitive filesystem the destination "already exists"
-        // because it is the source. The guard must not block that.
+        // The destination is the source on case-insensitive filesystems.
         let result = Move::new("File.txt", "file.txt").run();
 
         assert!(
