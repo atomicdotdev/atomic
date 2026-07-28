@@ -198,7 +198,15 @@ impl AgentHook for GrokHook {
         match hook_type {
             HookType::TurnStart => {
                 if let Some(prompt) = parsed.prompt.filter(|p| !p.is_empty()) {
-                    event = event.with_prompt(prompt);
+                    // Grok's UserPromptSubmit often wraps the human text in
+                    // `<user_query>…</user_query>` (harness envelope). That
+                    // raw string would otherwise become the Atomic change
+                    // message (`atomic log` shows the tags). Strip it so
+                    // provenance and the commit message carry the real text.
+                    let prompt = normalize_user_prompt(&prompt);
+                    if !prompt.is_empty() {
+                        event = event.with_prompt(prompt);
+                    }
                 }
             }
             HookType::PreToolUse | HookType::PostToolUse => {
@@ -286,6 +294,37 @@ impl AgentHook for GrokHook {
 }
 
 // Normalization helpers
+
+/// Strip Grok harness wrappers from a user prompt.
+///
+/// Grok's agent runtime delivers the human message inside an XML-ish envelope:
+///
+/// ```text
+/// <user_query>
+/// Make sure this project runs.
+/// </user_query>
+/// ```
+///
+/// Atomic records that string as the turn's change message, so `atomic log`
+/// would show the tags. Extract the inner text when the envelope is present;
+/// leave plain prompts untouched.
+fn normalize_user_prompt(prompt: &str) -> String {
+    let trimmed = prompt.trim();
+
+    // Prefer a complete open/close pair (multiline body supported).
+    const OPEN: &str = "<user_query>";
+    const CLOSE: &str = "</user_query>";
+    if let Some(start) = trimmed.find(OPEN) {
+        let after_open = &trimmed[start + OPEN.len()..];
+        if let Some(end) = after_open.find(CLOSE) {
+            return after_open[..end].trim().to_string();
+        }
+        // Open tag without close — take everything after the open tag.
+        return after_open.trim().to_string();
+    }
+
+    trimmed.to_string()
+}
 
 fn with_xai_provider(mut raw: Value) -> Value {
     if let Some(obj) = raw.as_object_mut() {
@@ -474,6 +513,46 @@ mod tests {
         assert_eq!(
             event.prompt.as_deref(),
             Some("Add retry logic to the client")
+        );
+    }
+
+    #[test]
+    fn test_parse_user_prompt_strips_user_query_envelope() {
+        let hook = make_hook();
+        let input = br#"{
+            "sessionId": "s1",
+            "prompt": "<user_query>\nMake sure this project runs.\n</user_query>"
+        }"#;
+        let event = hook.parse_event(HookType::TurnStart, input).unwrap();
+        assert_eq!(
+            event.prompt.as_deref(),
+            Some("Make sure this project runs.")
+        );
+    }
+
+    #[test]
+    fn test_parse_user_prompt_strips_envelope_short_yes() {
+        // Without stripping, the tags make "yes" long enough to pass
+        // is_meaningful_prompt and pollute `atomic log`.
+        let hook = make_hook();
+        let input = br#"{"sessionId":"s1","prompt":"<user_query>\nyes\n</user_query>"}"#;
+        let event = hook.parse_event(HookType::TurnStart, input).unwrap();
+        assert_eq!(event.prompt.as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn test_normalize_user_prompt_plain_unchanged() {
+        assert_eq!(
+            normalize_user_prompt("  fix the auth bug  "),
+            "fix the auth bug"
+        );
+    }
+
+    #[test]
+    fn test_normalize_user_prompt_unclosed_tag() {
+        assert_eq!(
+            normalize_user_prompt("<user_query>\npartial only"),
+            "partial only"
         );
     }
 
