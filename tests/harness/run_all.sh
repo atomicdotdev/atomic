@@ -17,6 +17,8 @@ set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HARNESS_DIR/../.." && pwd)"
+HARNESS_SKIP_EXIT=77
+export HARNESS_SKIP_EXIT
 
 # ── Colours ─────────────────────────────────────────────────────────────────
 
@@ -109,7 +111,9 @@ echo ""
 
 TOTAL_SUITES=0
 PASSED_SUITES=0
+SKIPPED_SUITES=0
 FAILED_SUITES=0
+SKIPPED_SUITE_NAMES=()
 FAILED_SUITE_NAMES=()
 
 TOTAL_TESTS=0
@@ -142,6 +146,10 @@ for suite in "${SELECTED_SUITES[@]}"; do
     if [[ $suite_exit -eq 0 ]]; then
         PASSED_SUITES=$((PASSED_SUITES + 1))
         echo "  ${GREEN}Suite PASSED${RESET}"
+    elif [[ $suite_exit -eq $HARNESS_SKIP_EXIT ]]; then
+        SKIPPED_SUITES=$((SKIPPED_SUITES + 1))
+        SKIPPED_SUITE_NAMES+=("$suite_name")
+        echo "  ${YELLOW}Suite SKIPPED${RESET}"
     else
         FAILED_SUITES=$((FAILED_SUITES + 1))
         FAILED_SUITE_NAMES+=("$suite_name")
@@ -164,8 +172,16 @@ echo "${BOLD}╔═════════════════════�
 echo "${BOLD}║                   Combined Results                       ║${RESET}"
 echo "${BOLD}╠═══════════════════════════════════════════════════════════╣${RESET}"
 echo "${BOLD}║${RESET}                                                           ${BOLD}║${RESET}"
-echo "${BOLD}║${RESET}  Suites:  ${GREEN}${PASSED_SUITES} passed${RESET}  ${RED}${FAILED_SUITES} failed${RESET}  / ${TOTAL_SUITES} total        ${BOLD}║${RESET}"
+echo "${BOLD}║${RESET}  Suites: ${GREEN}${PASSED_SUITES} passed${RESET}  ${YELLOW}${SKIPPED_SUITES} skipped${RESET}  ${RED}${FAILED_SUITES} failed${RESET} / ${TOTAL_SUITES} total  ${BOLD}║${RESET}"
 echo "${BOLD}║${RESET}                                                           ${BOLD}║${RESET}"
+
+if [[ ${#SKIPPED_SUITE_NAMES[@]} -gt 0 ]]; then
+    echo "${BOLD}║${RESET}  ${YELLOW}Skipped suites:${RESET}                                         ${BOLD}║${RESET}"
+    for name in "${SKIPPED_SUITE_NAMES[@]}"; do
+        printf "${BOLD}║${RESET}    ${YELLOW}• %-51s${RESET} ${BOLD}║${RESET}\n" "$name"
+    done
+    echo "${BOLD}║${RESET}                                                           ${BOLD}║${RESET}"
+fi
 
 if [[ ${#FAILED_SUITE_NAMES[@]} -gt 0 ]]; then
     echo "${BOLD}║${RESET}  ${RED}Failed suites:${RESET}                                          ${BOLD}║${RESET}"
