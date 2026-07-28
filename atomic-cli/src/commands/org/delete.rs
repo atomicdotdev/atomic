@@ -83,8 +83,18 @@ impl Command for OrgDelete {
 
 impl OrgDelete {
     async fn execute(&self) -> CliResult<()> {
-        // Prompt for confirmation unless --force is set.
+        let client = build_client(self.org.as_deref(), None).await?;
+
+        // `--force` skips both the precheck and confirmation.
         if !self.force {
+            // Check that the organization exists before prompting.
+            atomic_teams::org::get_org(&client, &self.slug)
+                .await
+                .map_err(|e| CliError::RemoteError {
+                    message: e.to_string(),
+                    url: None,
+                })?;
+
             print_warning(&format!(
                 "This will permanently delete organization '{}' and all its data.",
                 self.slug
@@ -102,8 +112,6 @@ impl OrgDelete {
                 return Err(CliError::Cancelled);
             }
         }
-
-        let client = build_client(self.org.as_deref(), None).await?;
 
         atomic_teams::org::delete_org(&client, &self.slug)
             .await

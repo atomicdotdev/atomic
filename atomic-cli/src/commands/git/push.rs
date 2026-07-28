@@ -160,10 +160,9 @@ impl Command for Push {
                     print_success(&format!("Pushed to {}/{}", self.remote, current_view));
                 }
                 Err(e) => {
-                    print_warning(&format!(
-                        "Commit created but push failed: {}. Run 'git push' manually.",
-                        e
-                    ));
+                    // Keep the local commit, but report the failed push.
+                    print_warning("Commit created locally. Run 'git push' manually to retry.");
+                    return Err(e);
                 }
             }
         }

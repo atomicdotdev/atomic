@@ -210,10 +210,12 @@ impl Disable {
     /// - `claude-code` → `~/.claude/settings.json`
     /// - `gemini-cli` → `~/.gemini/settings.json`
     /// - `agy` → `~/.gemini/config/plugins/atomic/` (plugin)
+    /// - `codex` → `~/.codex/hooks.json`
     /// - No `--agent` flag → removes from all agents that have global hooks
     fn run_global(&self) -> CliResult<()> {
         use atomic_agent::hooks::agy::AgyHook;
         use atomic_agent::hooks::claude_code::ClaudeCodeHook;
+        use atomic_agent::hooks::codex::CodexHook;
         use atomic_agent::hooks::gemini_cli::GeminiCliHook;
 
         let agents: Vec<&str> = if let Some(ref name) = self.agent {
@@ -229,6 +231,9 @@ impl Disable {
             }
             if AgyHook::new().is_installed_global() {
                 found.push("agy");
+            }
+            if CodexHook::new().is_installed_global() {
+                found.push("codex");
             }
             found
         };
@@ -295,6 +300,21 @@ impl Disable {
                         }
                     }
                 }
+                "codex" => {
+                    let hook = CodexHook::new();
+                    if !hook.is_installed_global() {
+                        continue;
+                    }
+                    match hook.uninstall_global() {
+                        Ok(()) => {
+                            print_success("Removed global hooks from ~/.codex/hooks.json");
+                            total_removed += 1;
+                        }
+                        Err(e) => {
+                            print_error(&format!("Failed to remove Codex global hooks: {}", e));
+                        }
+                    }
+                }
                 "kiro" => {
                     print_success("Kiro hooks are configured through the IDE panel.");
                     println!(
@@ -309,7 +329,7 @@ impl Disable {
                 }
                 other => {
                     print_warning(&format!(
-                        "Global disable is not supported for '{}'. Supported agents: claude-code, gemini-cli, agy, kilo, kiro",
+                        "Global disable is not supported for '{}'. Supported agents: claude-code, gemini-cli, agy, codex, kilo, kiro",
                         other
                     ));
                 }
