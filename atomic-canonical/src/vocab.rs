@@ -178,3 +178,25 @@ pub fn is_known_memory_kind(value: &str) -> bool {
 pub fn is_known_memory_status(value: &str) -> bool {
     MEMORY_STATUS.contains(&value)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_kind_guidance_matches_the_closed_set() {
+        // The guidance table is the single source the CLI/skills surface; it
+        // must cover exactly the closed set, in the same order — no kind may be
+        // addable without a description, and no description may name an unknown
+        // kind.
+        let guided: Vec<&str> = MEMORY_KIND_GUIDANCE.iter().map(|(k, _)| *k).collect();
+        assert_eq!(guided, MEMORY_KIND);
+        for (kind, doc) in MEMORY_KIND_GUIDANCE {
+            assert!(
+                is_known_memory_kind(kind),
+                "guidance names unknown kind {kind}"
+            );
+            assert!(!doc.trim().is_empty(), "kind {kind} has empty guidance");
+        }
+    }
+}
