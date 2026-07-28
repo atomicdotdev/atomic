@@ -46,6 +46,10 @@ view = "release"
 url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-kiro/code"
 view = "release"
 
+[agents.grok]
+url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-grok/code"
+view = "release"
+
 [agents.opencode]
 url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-opencode/code"
 view = "release"

@@ -379,6 +379,7 @@ pub(crate) fn vendor_from_agent_name(agent_name: &str) -> &'static str {
         "codex" => "openai",
         "kiro" => "amazon-bedrock",
         "opencode" => "openai",
+        "grok" => "xai",
         _ => "unknown",
     }
 }

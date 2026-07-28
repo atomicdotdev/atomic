@@ -64,6 +64,7 @@ pub mod copilot;
 pub mod cursor;
 pub mod devin;
 pub mod gemini_cli;
+pub mod grok;
 pub mod hermes;
 pub mod kilo;
 pub mod kiro;
@@ -310,6 +311,7 @@ impl AgentRegistry {
     /// - Cursor (`cursor`)
     /// - Devin Desktop (`devin`)
     /// - Gemini CLI (`gemini-cli`)
+    /// - Grok Build (`grok`)
     /// - Hermes Agent (`hermes`)
     /// - Kilo Code (`kilo`)
     /// - Kiro (`kiro`)
@@ -326,6 +328,7 @@ impl AgentRegistry {
         registry.register(Box::new(cursor::CursorHook::new()));
         registry.register(Box::new(devin::DevinHook::new()));
         registry.register(Box::new(gemini_cli::GeminiCliHook::new()));
+        registry.register(Box::new(grok::GrokHook::new()));
         registry.register(Box::new(hermes::HermesHook::new()));
         registry.register(Box::new(kilo::KiloHook::new()));
         registry.register(Box::new(kiro::KiroHook::new()));

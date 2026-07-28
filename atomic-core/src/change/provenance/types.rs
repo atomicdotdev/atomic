@@ -35,6 +35,8 @@ pub enum AIVendor {
     AmazonBedrock,
     /// Azure OpenAI Service
     AzureOpenAI,
+    /// xAI (Grok models)
+    XAI,
     /// Local/self-hosted model
     Local,
     /// Other/custom provider
@@ -53,6 +55,7 @@ impl AIVendor {
             AIVendor::Cohere => "cohere",
             AIVendor::AmazonBedrock => "amazon-bedrock",
             AIVendor::AzureOpenAI => "azure-openai",
+            AIVendor::XAI => "xai",
             AIVendor::Local => "local",
             AIVendor::Other(name) => name,
         }
@@ -69,6 +72,7 @@ impl AIVendor {
             "cohere" => AIVendor::Cohere,
             "bedrock" | "amazon-bedrock" | "aws" => AIVendor::AmazonBedrock,
             "azure" | "azure-openai" => AIVendor::AzureOpenAI,
+            "xai" | "grok" => AIVendor::XAI,
             "local" | "self-hosted" | "ollama" => AIVendor::Local,
             other => AIVendor::Other(other.to_string()),
         }
