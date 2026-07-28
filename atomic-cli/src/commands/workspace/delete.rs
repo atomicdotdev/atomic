@@ -71,8 +71,13 @@ impl Command for WorkspaceDelete {
             .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
 
         rt.block_on(async {
-            // Confirm unless --force is set.
+            let (client, org_slug) = build_client_with_org(self.org.as_deref(), None).await?;
+
+            // `--force` skips both the precheck and confirmation.
             if !self.force {
+                // Check that the workspace exists before prompting.
+                client.get_workspace(&self.slug).await.map_err(remote_err)?;
+
                 print_warning(&format!(
                     "This will permanently delete workspace '{}' and all its projects.",
                     self.slug
@@ -89,8 +94,6 @@ impl Command for WorkspaceDelete {
                     return Err(CliError::Cancelled);
                 }
             }
-
-            let (client, org_slug) = build_client_with_org(self.org.as_deref(), None).await?;
 
             client
                 .delete_workspace(&self.slug)

@@ -32,7 +32,7 @@
 //! atomic pull [OPTIONS] [REMOTE]
 //!
 //! Arguments:
-//!   [REMOTE]  Remote name or URL (default: "origin")
+//!   [REMOTE]  Remote name or URL (default: the configured default remote, or "origin")
 //!
 //! Options:
 //!       --to-channel <CHANNEL>    Local channel to pull into (default: current)
@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn test_pull_reexported() {
         let pull = Pull::new();
-        assert_eq!(pull.remote, DEFAULT_REMOTE);
+        assert!(pull.remote.is_none());
     }
 
     /// Verify that PullChange is properly re-exported.

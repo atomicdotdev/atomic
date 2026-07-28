@@ -191,11 +191,8 @@ WORK="$REPO_DIR"
 CLONE_DIR="$WORK/repo"
 
 # Clone
-git clone --quiet "$REPO_URL" "$CLONE_DIR" 2>/dev/null
-if [[ $? -ne 0 ]]; then
-    _skip "clone failed (no network?): $REPO_URL"
-    print_summary
-    exit 0
+if ! git clone --quiet "$REPO_URL" "$CLONE_DIR" 2>/dev/null; then
+    skip_suite "failed to clone $REPO_URL (network unavailable?)"
 fi
 
 _pass "cloned $REPO_URL"

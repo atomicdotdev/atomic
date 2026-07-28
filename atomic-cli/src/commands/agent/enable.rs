@@ -138,12 +138,18 @@ impl Command for Enable {
             // Install for all detected agents
             let detected = registry.detect(&repo_root);
             if detected.is_empty() {
-                // If none detected, try all registered agents
-                print_warning("No agents detected — installing hooks for all registered agents.");
-                registry.list()
-            } else {
-                detected
+                // Do not install hooks when no agent is detected.
+                print_error(
+                    "No agents detected in this repository — nothing to enable with --all.",
+                );
+                print_warning(
+                    "Create a .claude/, .gemini/, or .agents/ directory first, or use --agent <name>.",
+                );
+                return Err(crate::error::CliError::InvalidArgument {
+                    message: "no agents detected for --all".to_string(),
+                });
             }
+            detected
         } else if let Some(ref name) = self.agent {
             // Specific agent requested — validate it exists
             registry

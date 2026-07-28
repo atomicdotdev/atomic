@@ -35,6 +35,10 @@ TESTS_FAILED=0
 TESTS_SKIPPED=0
 FAIL_MESSAGES=()
 
+# Exit code used when an entire suite cannot run because a prerequisite is
+# unavailable. The top-level runner recognizes 77 as SKIPPED, not PASSED.
+HARNESS_SKIP_EXIT="${HARNESS_SKIP_EXIT:-77}"
+
 # ── Binary discovery ────────────────────────────────────────────────────────
 
 # Allow overriding via $ATOMIC_BIN; otherwise discover the best available binary.
@@ -213,6 +217,20 @@ _skip() {
     TESTS_RUN=$((TESTS_RUN + 1))
     TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
     echo "  ${YELLOW}⊘${RESET} $name ${YELLOW}(skipped${reason:+: $reason})${RESET}"
+}
+
+# Mark the entire suite as skipped and stop it immediately.
+# If assertions have already failed, the suite FAILS instead — a skip must
+# never mask earlier failures as "skipped" in the runner's summary.
+# Usage: skip_suite "reason"
+skip_suite() {
+    local reason="$1"
+    if [[ ${TESTS_FAILED:-0} -gt 0 ]]; then
+        echo "${RED}NOT skipping ($reason): $TESTS_FAILED assertion(s) already failed${RESET}"
+        exit 1
+    fi
+    echo "${YELLOW}SKIPPING: $reason${RESET}"
+    exit "$HARNESS_SKIP_EXIT"
 }
 
 # Assert that the last command succeeded (exit 0).
@@ -465,16 +483,14 @@ assert_log_count() {
 # Check if git is available
 require_git() {
     if ! command -v git &>/dev/null; then
-        echo "${YELLOW}SKIPPING: git not installed${RESET}"
-        exit 0
+        skip_suite "git not installed"
     fi
 }
 
 # Check if network is available (can reach github.com)
 require_network() {
     if ! curl --silent --head --max-time 5 https://github.com &>/dev/null; then
-        echo "${YELLOW}SKIPPING: network unavailable${RESET}"
-        exit 0
+        skip_suite "network unavailable"
     fi
 }
 
@@ -494,13 +510,11 @@ clone_git_repo() {
     GIT_REPO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/atomic-git-test-XXXXXX")"
     _HARNESS_TMPDIRS+=("$GIT_REPO_DIR")
     if ! git clone --quiet "$url" "$GIT_REPO_DIR"; then
-        echo "${YELLOW}SKIPPING: failed to clone git repo '$url'${RESET}"
-        exit 0
+        skip_suite "failed to clone git repo '$url'"
     fi
     if [[ "$ref" != "HEAD" ]]; then
         if ! (cd "$GIT_REPO_DIR" && git checkout --quiet "$ref"); then
-            echo "${YELLOW}SKIPPING: failed to checkout ref '$ref' in git repo '$url'${RESET}"
-            exit 0
+            skip_suite "failed to checkout ref '$ref' in git repo '$url'"
         fi
     fi
 }
