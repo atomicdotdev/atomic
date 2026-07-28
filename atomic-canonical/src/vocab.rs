@@ -79,7 +79,41 @@ pub fn is_known_inline_directive(name: &str) -> bool {
 }
 
 /// Memory kinds (closed set; mirrors `MemoryShape` `sh:in`). Exactly one.
-pub const MEMORY_KIND: &[&str] = &["constraint", "preference", "lesson", "context"];
+///
+/// `decision` records a durable decision→outcome (an architectural/approach
+/// choice and why it was made), distinct from `lesson` (a corrective learning
+/// from something that went wrong). Agents emit these at turn end via
+/// `atomic memory new --kind decision`.
+pub const MEMORY_KIND: &[&str] = &["constraint", "preference", "lesson", "context", "decision"];
+
+/// One-line guidance for each memory kind, in the same order as [`MEMORY_KIND`].
+///
+/// The single source of truth the CLI (`atomic memory kinds`) and agent skills
+/// surface so a model can read a session ledger and classify each durable
+/// insight into the right kind — emitting several memories when warranted —
+/// instead of being forced into one hardcoded kind.
+pub const MEMORY_KIND_GUIDANCE: &[(&str, &str)] = &[
+    (
+        "constraint",
+        "A hard rule or limit the work must respect — an invariant, boundary, or requirement that constrains future changes.",
+    ),
+    (
+        "preference",
+        "A soft or stylistic default the team leans toward — a convention, not a hard rule.",
+    ),
+    (
+        "lesson",
+        "A corrective learning from something that went wrong or surprised you — the failure and the takeaway.",
+    ),
+    (
+        "context",
+        "Durable background or domain knowledge that explains how or why something is — not a rule, not a decision.",
+    ),
+    (
+        "decision",
+        "A deliberate choice between real options — what was chosen, why, over which alternatives, and the outcome.",
+    ),
+];
 
 /// Memory status value set (closed; mirrors `MemoryShape` `sh:in`). Exactly one.
 pub const MEMORY_STATUS: &[&str] = &["active", "superseded", "retracted"];
