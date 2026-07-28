@@ -113,10 +113,6 @@ pub struct Stash {
     #[arg(short, long, global = true)]
     pub message: Option<String>,
 
-    /// Include untracked files in the stash.
-    #[arg(short = 'u', long, global = true)]
-    pub include_untracked: bool,
-
     /// Keep the changes in the working copy after stashing.
     ///
     /// By default, stash restores the working copy to clean state.
@@ -134,10 +130,6 @@ pub enum StashSubcommand {
         /// Message describing the stashed changes.
         #[arg(short, long)]
         message: Option<String>,
-
-        /// Include untracked files in the stash.
-        #[arg(short = 'u', long)]
-        include_untracked: bool,
 
         /// Keep the changes in the working copy after stashing.
         #[arg(short, long)]
@@ -240,7 +232,6 @@ impl Stash {
         Self {
             command: None,
             message: None,
-            include_untracked: false,
             keep: false,
         }
     }
@@ -251,21 +242,9 @@ impl Stash {
         self
     }
 
-    /// Builder: set the include-untracked flag.
-    pub fn with_include_untracked(mut self, include: bool) -> Self {
-        self.include_untracked = include;
-        self
-    }
-
     /// Builder: set the keep flag.
     pub fn with_keep(mut self, keep: bool) -> Self {
         self.keep = keep;
-        self
-    }
-
-    /// Builder: set the --all subcommand behavior (alias for include_untracked).
-    pub fn with_all(mut self, all: bool) -> Self {
-        self.include_untracked = all;
         self
     }
 
@@ -385,10 +364,9 @@ impl Stash {
         &self,
         repo: &mut Repository,
         message: Option<String>,
-        include_untracked: bool,
         keep: bool,
     ) -> CliResult<()> {
-        self.run_push(repo, message, include_untracked, keep)
+        self.run_push(repo, message, keep)
     }
 
     /// Execute stash push (save changes).
@@ -396,7 +374,6 @@ impl Stash {
         &self,
         repo: &mut Repository,
         message: Option<String>,
-        include_untracked: bool,
         keep: bool,
     ) -> CliResult<()> {
         // Check for uncommitted changes
@@ -481,23 +458,6 @@ impl Stash {
                 let _ = std::fs::create_dir_all(&rel_dir);
                 let _ = std::fs::copy(&abs, stash_dir.join(&p));
                 stashed_paths.push(p);
-            }
-        }
-
-        if include_untracked || self.include_untracked {
-            for entry in status.untracked() {
-                let p = entry.path().to_string_lossy().to_string();
-                let abs = repo.root().join(&p);
-                if abs.is_file() {
-                    let rel_dir = stash_dir.join(
-                        std::path::Path::new(&p)
-                            .parent()
-                            .unwrap_or(std::path::Path::new("")),
-                    );
-                    let _ = std::fs::create_dir_all(&rel_dir);
-                    let _ = std::fs::copy(&abs, stash_dir.join(&p));
-                    stashed_paths.push(p);
-                }
             }
         }
 
@@ -720,13 +680,11 @@ impl Command for Stash {
         match &self.command {
             None => {
                 // Default action: push
-                self.run_push(&mut repo, None, self.include_untracked, self.keep)
+                self.run_push(&mut repo, None, self.keep)
             }
-            Some(StashSubcommand::Push {
-                message,
-                include_untracked,
-                keep,
-            }) => self.run_push(&mut repo, message.clone(), *include_untracked, *keep),
+            Some(StashSubcommand::Push { message, keep }) => {
+                self.run_push(&mut repo, message.clone(), *keep)
+            }
             Some(StashSubcommand::Pop { stash }) => self.run_pop(&mut repo, stash.as_deref()),
             Some(StashSubcommand::Apply { stash }) => self.run_apply(&mut repo, stash.as_deref()),
             Some(StashSubcommand::List) => self.run_list(&repo),
@@ -750,7 +708,6 @@ mod tests {
         let cmd = Stash::new();
         assert!(cmd.command.is_none());
         assert!(cmd.message.is_none());
-        assert!(!cmd.include_untracked);
         assert!(!cmd.keep);
     }
 
@@ -768,12 +725,6 @@ mod tests {
     }
 
     #[test]
-    fn test_stash_with_include_untracked() {
-        let cmd = Stash::new().with_include_untracked(true);
-        assert!(cmd.include_untracked);
-    }
-
-    #[test]
     fn test_stash_with_keep() {
         let cmd = Stash::new().with_keep(true);
         assert!(cmd.keep);
@@ -781,13 +732,9 @@ mod tests {
 
     #[test]
     fn test_stash_builder_chain() {
-        let cmd = Stash::new()
-            .with_message("test")
-            .with_include_untracked(true)
-            .with_keep(true);
+        let cmd = Stash::new().with_message("test").with_keep(true);
 
         assert_eq!(cmd.message, Some("test".to_string()));
-        assert!(cmd.include_untracked);
         assert!(cmd.keep);
     }
 
@@ -851,14 +798,11 @@ mod tests {
 
     #[test]
     fn test_stash_clone() {
-        let cmd = Stash::new()
-            .with_message("test")
-            .with_include_untracked(true);
+        let cmd = Stash::new().with_message("test");
 
         let cloned = cmd.clone();
 
         assert_eq!(cloned.message, cmd.message);
-        assert_eq!(cloned.include_untracked, cmd.include_untracked);
         assert_eq!(cloned.keep, cmd.keep);
     }
 
@@ -868,18 +812,12 @@ mod tests {
     fn test_subcommand_push() {
         let subcmd = StashSubcommand::Push {
             message: Some("test".to_string()),
-            include_untracked: true,
             keep: false,
         };
 
         match subcmd {
-            StashSubcommand::Push {
-                message,
-                include_untracked,
-                keep,
-            } => {
+            StashSubcommand::Push { message, keep } => {
                 assert_eq!(message, Some("test".to_string()));
-                assert!(include_untracked);
                 assert!(!keep);
             }
             _ => panic!("Expected Push"),
