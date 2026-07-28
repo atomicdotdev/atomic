@@ -457,3 +457,77 @@ fn session_show_without_id_handles_empty_repository() {
         serde_json::json!([])
     );
 }
+
+#[test]
+fn session_tables_populate_for_non_sherpa_agent() {
+    // Provenance from any agent — here a generic OpenCode graph with no
+    // `profile` and a `detail`-less Goal node exactly like the real capture
+    // path produces — must populate the session tables, not be skipped.
+    let repo_tmp = TempDir::new().unwrap();
+    let home_tmp = TempDir::new().unwrap();
+    let repo_dir = repo_tmp.path();
+    let home_dir = home_tmp.path();
+
+    assert!(atomic(repo_dir, home_dir, &["init"]).status.success());
+    let change = Hash::of(b"non-sherpa-change");
+
+    let repo = Repository::open(repo_dir).expect("open repo");
+    let todo_node = ProvenanceNode {
+        id: "t-1".into(),
+        kind: ProvenanceNodeKind::Todo,
+        timestamp: 1_735_689_600_000,
+        summary: "Wire up readline".into(),
+        detail: Some(
+            serde_json::json!({
+                "todo_id": "todo-7",
+                "content": "Wire up readline",
+                "status": "completed",
+                "priority": "medium",
+                "record_type": "todo",
+            })
+            .to_string(),
+        ),
+        change_hash: None,
+        tool_name: None,
+        tool_call_id: None,
+        duration_ms: None,
+        classified: false,
+        confidence: None,
+        consolidated_from: Vec::new(),
+    };
+    let graph = ProvenanceGraph::builder("non-sherpa-session", "opencode")
+        .agent_display_name("OpenCode")
+        .agent_vendor("moonshotai")
+        .add_node(goal_node()) // Goal has no detail, like `append_goal`
+        .add_node(todo_node)
+        .add_change_explained(change)
+        .build();
+    assert!(graph.profile.is_none(), "generic graph has no profile");
+    let prov_hash = repo.save_provenance_graph(&graph).expect("save graph");
+
+    // The fast UI gate must recognise this as having session data, even
+    // though the generic Goal node carries no intent `detail`.
+    assert!(
+        repo.has_session_data(&prov_hash),
+        "non-Sherpa provenance must report session data"
+    );
+
+    // Every node is indexed as a session event.
+    let events = repo.get_session_events(&prov_hash).expect("events");
+    assert_eq!(events.len(), 2, "one session event per provenance node");
+
+    // The Todo node populates the todos table with its generic detail.
+    let todos = repo.get_session_todos(&prov_hash).expect("todos");
+    assert_eq!(todos.len(), 1);
+    assert_eq!(todos[0].todo_id, "todo-7");
+    assert_eq!(todos[0].content, "Wire up readline");
+    assert_eq!(todos[0].final_status, "completed");
+
+    // No intent entry: the generic Goal node had no intent `detail`.
+    assert!(
+        repo.get_session_intent(&prov_hash)
+            .expect("intent")
+            .is_none(),
+        "generic Goal without detail yields no intent entry"
+    );
+}
