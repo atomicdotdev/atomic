@@ -266,7 +266,11 @@ impl AgentHook for GrokHook {
         let raw = event.raw_json.as_ref()?;
         let mut paths = Vec::new();
         for key in ["workspaceRoot", "workspace_root", "cwd"] {
-            if let Some(p) = raw.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            if let Some(p) = raw
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
                 let path = PathBuf::from(p);
                 if !paths.contains(&path) {
                     paths.push(path);
@@ -306,7 +310,8 @@ fn normalize_stop_raw(mut raw: Value, reason: Option<&str>) -> Value {
             obj.entry("stop_hook_active".to_string()).or_insert(active);
         }
         if let Some(msg) = obj.get("lastAssistantMessage").cloned() {
-            obj.entry("last_assistant_message".to_string()).or_insert(msg);
+            obj.entry("last_assistant_message".to_string())
+                .or_insert(msg);
         }
     }
     raw
@@ -540,14 +545,8 @@ mod tests {
         assert_eq!(event.tool_name.as_deref(), Some("search_replace"));
         assert_eq!(event.tool_use_id.as_deref(), Some("tu-2"));
         let raw = event.raw_json.unwrap();
-        assert_eq!(
-            raw.get("tool_output").and_then(Value::as_str),
-            Some("ok")
-        );
-        assert_eq!(
-            raw.get("status").and_then(Value::as_str),
-            Some("completed")
-        );
+        assert_eq!(raw.get("tool_output").and_then(Value::as_str), Some("ok"));
+        assert_eq!(raw.get("status").and_then(Value::as_str), Some("completed"));
         assert_eq!(
             raw.get("file_path").and_then(Value::as_str),
             Some("src/main.rs")
