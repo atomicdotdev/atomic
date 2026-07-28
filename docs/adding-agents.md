@@ -154,6 +154,7 @@ Each agent reads its system prompt from a different file convention:
 | `AGENTS.md` at root | Codex, Devin, Gemini |
 | `agents/*.md` | OpenCode, Pi |
 | `rules/*.md` | Cursor, Cline |
+| `~/.grok/rules/*.md` (home rules) / `AGENTS.md` | Grok Build |
 | `steering/*.md` | Kiro |
 | `copilot-instructions.md` | Copilot |
 
