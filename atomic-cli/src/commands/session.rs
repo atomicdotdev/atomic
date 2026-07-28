@@ -190,11 +190,11 @@ fn show_recent_sessions(repo: &Repository, limit: usize, json: bool) -> CliResul
         };
         println!(
             "  {:<sw$} {:<22} {:<8} {:>5}  {:>7}  {}",
-            &record.session_id,
+            record.session_id,
             truncate_column(record.view_name.as_deref().unwrap_or("—"), 22),
             status,
             record.turn_count,
-            &intents_display,
+            intents_display,
             activity,
             sw = ses_width,
         );
