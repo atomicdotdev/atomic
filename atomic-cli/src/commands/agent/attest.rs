@@ -593,6 +593,7 @@ fn pretty_vendor(canonical: &str) -> String {
         "cohere" => "Cohere",
         "amazon-bedrock" => "Amazon Bedrock",
         "azure-openai" => "Azure OpenAI",
+        "xai" => "xAI",
         "local" => "Local",
         other => other,
     }
@@ -622,6 +623,7 @@ fn pretty_tool(description: &str) -> String {
         "sherpa" => "Sherpa",
         "pi" => "Pi",
         "kilo" => "Kilo Code",
+        "grok" => "Grok Build",
         other => other,
     }
     .to_string()
@@ -800,6 +802,7 @@ mod tests {
         assert_eq!(pretty_tool("IDE Plugin: copilot"), "Copilot");
         assert_eq!(pretty_tool("CLI: gemini-cli"), "Gemini CLI");
         assert_eq!(pretty_tool("CLI: kilo"), "Kilo Code");
+        assert_eq!(pretty_tool("CLI: grok"), "Grok Build");
     }
 
     #[test]

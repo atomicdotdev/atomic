@@ -168,6 +168,7 @@ pub(crate) fn vendor_from_agent_name(agent_name: &str) -> AIVendor {
         "copilot" => AIVendor::Other("github".to_string()),
         "cursor" => AIVendor::Anthropic,
         "opencode" => AIVendor::OpenAI,
+        "grok" => AIVendor::XAI,
         _ => AIVendor::Other(agent_name.to_string()),
     }
 }

@@ -206,7 +206,7 @@ impl Repository {
 /// appear in the `<agent>+<short>` author shape. Keep in sync with the agent
 /// registry (atomic-agent/src/hooks/).
 const KNOWN_AGENT_PREFIXES: &[&str] = &[
-    "claude", "codex", "gemini", "cursor", "cline", "opencode", "copilot", "sherpa", "pi",
+    "claude", "codex", "gemini", "cursor", "cline", "opencode", "copilot", "sherpa", "pi", "grok",
 ];
 
 /// Heuristically detect an agent-identity Author produced by
@@ -258,6 +258,8 @@ fn author_is_agent_identity(author: &Author) -> bool {
             | "sherpa"
             | "Pi"
             | "pi"
+            | "Grok Build"
+            | "grok"
     )
 }
 
