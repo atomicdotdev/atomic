@@ -11,8 +11,8 @@ use crate::error::{CliError, CliResult};
 
 /// Show an intent as a rendered read-time projection.
 ///
-/// Distinct from [`crate::commands::vault::intent::IntentShow`], which dumps the
-/// raw stored body. This projects the lifted canonical node.
+/// Projects the lifted canonical node (as opposed to dumping the raw stored
+/// body).
 #[derive(Parser, Debug)]
 #[command(name = "show")]
 pub struct IntentShow {
