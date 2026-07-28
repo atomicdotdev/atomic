@@ -62,19 +62,26 @@ The following git-specific helpers will be added to `helpers.sh`:
 ```bash
 # ── Git Helpers ─────────────────────────────────────────────────────────────
 
+# Exit code recognized by run_all.sh as a suite-level skip.
+HARNESS_SKIP_EXIT="${HARNESS_SKIP_EXIT:-77}"
+
+skip_suite() {
+    local reason="$1"
+    echo "${YELLOW}SKIPPING: $reason${RESET}"
+    exit "$HARNESS_SKIP_EXIT"
+}
+
 # Check if git is available
 require_git() {
     if ! command -v git &>/dev/null; then
-        echo "${YELLOW}SKIPPING: git not installed${RESET}"
-        exit 0
+        skip_suite "git not installed"
     fi
 }
 
 # Check if network is available
 require_network() {
     if ! curl --silent --head --max-time 5 https://github.com &>/dev/null; then
-        echo "${YELLOW}SKIPPING: network unavailable${RESET}"
-        exit 0
+        skip_suite "network unavailable"
     fi
 }
 
@@ -86,9 +93,13 @@ clone_git_repo() {
     local ref="${2:-HEAD}"
     GIT_REPO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/atomic-git-test-XXXXXX")"
     _HARNESS_TMPDIRS+=("$GIT_REPO_DIR")
-    git clone --quiet "$url" "$GIT_REPO_DIR" 2>/dev/null
+    if ! git clone --quiet "$url" "$GIT_REPO_DIR" 2>/dev/null; then
+        skip_suite "failed to clone git repo '$url'"
+    fi
     if [[ "$ref" != "HEAD" ]]; then
-        (cd "$GIT_REPO_DIR" && git checkout --quiet "$ref")
+        if ! (cd "$GIT_REPO_DIR" && git checkout --quiet "$ref"); then
+            skip_suite "failed to checkout ref '$ref' in git repo '$url'"
+        fi
     fi
 }
 
@@ -668,7 +679,9 @@ git clone https://github.com/holman/spark.git
 git clone https://github.com/sharkdp/hyperfine.git
 ```
 
-Tests gracefully skip if network is unavailable using the `require_network` helper.
+Tests gracefully skip if network is unavailable using the `require_network`
+helper. The top-level runner reports exit code 77 as an explicitly skipped
+suite rather than counting the missing prerequisite as a pass.
 
 ---
 
