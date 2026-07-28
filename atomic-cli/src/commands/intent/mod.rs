@@ -1,11 +1,10 @@
 //! `atomic intent` — the canonical "record the why" engine surface.
 //!
-//! This is a NEW top-level command, a sibling of `atomic vault` (see
-//! [`crate::commands::vault`]). It is distinct from the existing vault-scoped
-//! `atomic vault intent ...` tree ([`crate::commands::vault::intent`]): that
-//! tree manages the raw vault entries (create/list/show/update/delete/link),
-//! while this one drives the `atomic-canonical` engine — lifting a stored intent
-//! into a canonical JSON-LD node, gating it, attesting it, and rendering it.
+//! This is the canonical top-level command, a sibling of `atomic vault` (see
+//! [`crate::commands::vault`]). It replaces the retired vault-scoped
+//! `atomic vault intent ...` subtree (now a removed-command shim): this family
+//! drives the `atomic-canonical` engine — lifting a stored intent into a
+//! canonical JSON-LD node, gating it, attesting it, and rendering it.
 //!
 //! # Verbs
 //!

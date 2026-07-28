@@ -1,12 +1,10 @@
 //! `atomic memory` — the canonical "record the why" engine surface for MEMORIES.
 //!
-//! This is a NEW top-level command, a sibling of the raw `atomic vault memory`
-//! tree ([`crate::commands::vault::memory`]): that tree manages the raw/legacy
-//! vault memory entries (the agent stdin `write` flow, plus `list`/`show`),
-//! while this one drives the `atomic-canonical` engine — lifting a stored
-//! memory into a canonical JSON-LD [`MemoryNode`](atomic_canonical::MemoryNode),
-//! gating it, attesting it, and rendering it. It is the memory analogue of the
-//! `atomic intent` family.
+//! This is the canonical top-level command, replacing the retired raw
+//! `atomic vault memory` subtree (now a removed-command shim). It drives the
+//! `atomic-canonical` engine — lifting a stored memory into a canonical JSON-LD
+//! [`MemoryNode`](atomic_canonical::MemoryNode), gating it, attesting it, and
+//! rendering it. It is the memory analogue of the `atomic intent` family.
 //!
 //! # Verbs
 //!

@@ -11,8 +11,8 @@ use crate::error::{CliError, CliResult};
 
 /// Show a memory as a rendered read-time projection.
 ///
-/// Distinct from [`crate::commands::vault::memory::MemoryShow`], which dumps the
-/// raw stored body. This projects the lifted canonical node.
+/// Unlike the retired raw `vault memory show` (which dumped the stored body),
+/// this projects the lifted canonical node.
 #[derive(Parser, Debug)]
 #[command(name = "show")]
 pub struct MemoryShow {
