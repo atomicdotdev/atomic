@@ -36,6 +36,7 @@ use crate::error::CliResult;
 
 pub mod attest;
 pub mod bridge;
+pub mod kinds;
 pub mod list;
 pub mod new;
 pub mod show;
@@ -43,6 +44,7 @@ pub mod validate;
 pub mod verify;
 
 pub use attest::MemoryAttest;
+pub use kinds::MemoryKinds;
 pub use list::MemoryList;
 pub use new::MemoryNew;
 pub use show::MemoryShow;
@@ -147,6 +149,20 @@ pub enum MemoryCommands {
     /// atomic memory list --json
     /// ```
     List(MemoryList),
+
+    /// List the allowed memory kinds and when to use each.
+    ///
+    /// Surfaces the closed `memoryKind` vocabulary so you (or an agent) can
+    /// classify a session ledger into the right kind(s) before calling
+    /// `atomic memory new --kind <kind>`.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic memory kinds
+    /// atomic memory kinds --json
+    /// ```
+    Kinds(MemoryKinds),
 }
 
 /// Record the "why" for durable context: lift, validate, attest, and render
@@ -172,6 +188,7 @@ impl Command for Memory {
             MemoryCommands::Attest(cmd) => cmd.run(),
             MemoryCommands::Verify(cmd) => cmd.run(),
             MemoryCommands::List(cmd) => cmd.run(),
+            MemoryCommands::Kinds(cmd) => cmd.run(),
         }
     }
 }
