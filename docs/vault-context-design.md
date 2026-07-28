@@ -47,7 +47,8 @@ automatically, or distills new memories.
 
 ```text
 atomic vault context [QUERY]... [--intent <id>] [--files <path>]
-                     [--limit 5] [--budget-chars 8000] [--format md|json]
+                     [--limit 5] [--budget-chars 8000]
+                     [--candidates-only] [--format md|json]
 ```
 
 The command is read-only and supports two workflow moments:
@@ -72,6 +73,23 @@ JSON returns the prompt-ready Markdown once and records both identities:
 
 This separation avoids treating a body hash as a full knowledge revision or
 creating RDF links to a canonical ID that the current graph does not yet know.
+
+For compact push + agent pull, `--candidates-only` returns only ranked metadata:
+memory identity, kind, path, exact revision, score, and a short explanation of
+why it matched. It omits memory bodies, previews, and prompt-ready context. An
+agent must treat the candidate fields as untrusted historical data, then pull
+only a selected, unchanged entry:
+
+```text
+atomic vault show memory/auth-decision.md --revision <REVISION> --json
+```
+
+`vault show --json` identifies its generic response as `vault_entry_body`,
+includes the current `revision_hash`, and labels the returned body as
+`untrusted_historical_data`; `--revision` fails closed if the entry changed
+between candidate selection and body retrieval. Revision-gated pulls require
+JSON so the trust marker cannot be silently dropped.
+The existing full `vault context` output remains the default for compatibility.
 
 ## Phase B: derived-index lifecycle (PR #111)
 
@@ -122,9 +140,10 @@ creating RDF links to a canonical ID that the current graph does not yet know.
   from the Intent to the selected source Memories. Candidate retrieval alone
   must not create these links.
 - **Sherpa/noname:** run free-text research while authoring an Intent, then use
-  `--intent` after human acceptance. Inject `context_markdown` at untrusted
-  user/tool-data authority and record exact exposed revisions separately from
-  the smaller set selected as sources.
+  `--intent` after human acceptance. Prefer compact candidates first and pull
+  full bodies only for explicit selections. Inject selected content at
+  untrusted user/tool-data authority and record exact exposed revisions
+  separately from the smaller set selected as sources.
 - **Completion distillation:** after the Intent is complete and synced, create a
   typed learning Memory and link it to the completed Intent and original source
   Memories with RDF. Session transcripts and `agent explain --save` are evidence
@@ -135,6 +154,8 @@ creating RDF links to a canonical ID that the current graph does not yet know.
 - PR #108 covers free-text, Intent, and file seeds; memory-only top-N selection;
   inactive-memory exclusion; exact-token matching; identity/revision fields;
   delimiter integrity; budget allocation; and explicit no-match behavior.
+- Compact retrieval tests cover body-free Markdown/JSON candidate contracts,
+  match explanations, exact revision output, and revision-mismatch rejection.
 - Core KG tests cover reverse-FTS migration, metadata-token replacement, and
   deletion.
 - Repository tests cover target updates preserving incoming links, owned reverse
