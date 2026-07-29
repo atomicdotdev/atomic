@@ -335,9 +335,17 @@ impl Repository {
         Ok(hash)
     }
 
-    /// Build and persist the latest content-addressed manifest for a session.
+    /// Build and persist the latest content-addressed manifest for a session,
+    /// preserving fork lineage from the current head.
     pub fn publish_session_manifest(&self, session_id: &str) -> Result<Hash, RepositoryError> {
-        self.publish_session_manifest_with_fork(session_id, None, None)
+        let (parent_session, fork_turn) = match self.get_session_head(session_id)? {
+            Some(head) => match self.get_session_manifest(&head)? {
+                Some(manifest) => (manifest.parent_session, manifest.fork_turn),
+                None => (None, None),
+            },
+            None => (None, None),
+        };
+        self.publish_session_manifest_with_fork(session_id, parent_session, fork_turn)
     }
 
     /// Load an immutable session manifest by content hash.
@@ -390,8 +398,6 @@ impl Repository {
     /// files are reported in the result rather than aborting the rebuild.
     /// Returns `(indexed_count, skipped_existing, corrupt_count)`.
     pub fn rebuild_session_index(&self) -> Result<(usize, usize, usize), RepositoryError> {
-        use atomic_core::change::session::{encode_session_turn_key, session_turn_namespace};
-
         let mut indexed = 0usize;
         let mut skipped = 0usize;
         let mut corrupt = 0usize;
@@ -408,25 +414,88 @@ impl Repository {
             }
         }
 
-        // Group by session and sort each group by timestamp so turn numbers
-        // are deterministic even for graphs indexed out of order.
+        // Group by session. The core index derives canonical turn order from
+        // the complete set, independent of this ingestion order.
         let mut by_session: std::collections::BTreeMap<
             String,
             Vec<(Hash, atomic_core::change::ProvenanceGraph)>,
         > = std::collections::BTreeMap::new();
+        let mut head_manifests = std::collections::BTreeMap::new();
+        let mut fork_parents = std::collections::BTreeMap::new();
         for (hash, graph) in graphs {
             by_session
                 .entry(graph.session_id.clone())
                 .or_default()
                 .push((hash, graph));
         }
+        // Forked children can contain only inherited turns, whose provenance
+        // files still name the parent session. Include both existing ledgers
+        // and portable manifests so rebuild can create or migrate the child.
+        {
+            let txn = self
+                .pristine
+                .read_txn()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            for record in txn
+                .list_session_records()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                if record.turn_count > 0 {
+                    by_session.entry(record.session_id).or_default();
+                }
+            }
+            for (head_session_id, head) in txn
+                .list_session_heads()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                match txn.get_session_manifest(&head) {
+                    Ok(Some(manifest)) if manifest.session_id == head_session_id => {
+                        if let (Some(parent_hash), Some(fork_turn)) =
+                            (manifest.parent_session, manifest.fork_turn)
+                        {
+                            if let Ok(Some(parent)) = txn.get_session_manifest(&parent_hash) {
+                                fork_parents.insert(
+                                    head_session_id.clone(),
+                                    (parent.session_id, parent_hash, fork_turn),
+                                );
+                            }
+                        }
+                        by_session.entry(head_session_id.clone()).or_default();
+                        head_manifests.insert(head_session_id, manifest);
+                    }
+                    Ok(Some(_)) => {
+                        log::warn!(
+                            "Skipping session head {} because its manifest names another session",
+                            head_session_id
+                        );
+                    }
+                    Ok(None) => {
+                        log::warn!(
+                            "Session head {} points to a missing manifest",
+                            head_session_id
+                        );
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "Skipping unreadable session manifest for {}: {}",
+                            head_session_id,
+                            error
+                        );
+                    }
+                }
+            }
+        }
 
         for (session_id, mut session_graphs) in by_session {
-            session_graphs.sort_by_key(|(_, g)| g.timestamp);
+            session_graphs.sort_by(|(a_hash, a), (b_hash, b)| {
+                a.timestamp
+                    .cmp(&b.timestamp)
+                    .then_with(|| a_hash.as_bytes().cmp(b_hash.as_bytes()))
+            });
 
             // Read existing reverse entries once to detect already-indexed
             // provenance hashes.
-            let existing: std::collections::HashSet<Hash> = {
+            let (mut existing, had_record): (std::collections::HashSet<Hash>, bool) = {
                 let txn = self
                     .pristine
                     .read_txn()
@@ -443,7 +512,7 @@ impl Repository {
                         set.insert(turn.provenance_hash);
                     }
                 }
-                set
+                (set, record.is_some())
             };
 
             let json_path = self
@@ -457,34 +526,49 @@ impl Repository {
                 .pristine
                 .write_txn()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            let mut any_new = false;
             for (hash, graph) in &session_graphs {
                 if existing.contains(hash) {
                     skipped += 1;
                     continue;
                 }
-                // Determine the turn number: existing count if present,
-                // otherwise position in the sorted group.
-                let turn_number = {
-                    let ns = session_turn_namespace(&session_id);
-                    let current = txn
-                        .count_session_turns(&ns)
-                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                    current as u32
-                };
-                let key = encode_session_turn_key(session_turn_namespace(&session_id), turn_number);
-                txn.index_turn_at(&session_id, &json_path, hash, graph, turn_number, &key)
+                txn.index_session_turn(&session_id, &json_path, hash, graph)
                     .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                any_new = true;
+                existing.insert(*hash);
                 indexed += 1;
+            }
+            if let Some(manifest) = head_manifests.get(&session_id) {
+                for turn in &manifest.turns {
+                    if existing.insert(turn.provenance_hash) {
+                        txn.index_inherited_turn(&session_id, &json_path, turn)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        indexed += 1;
+                    }
+                }
+                if manifest.turns.is_empty() && !had_record {
+                    txn.index_empty_session(&session_id, &json_path, None, None)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                }
+            }
+            // Also repairs turn numbers, causal edges, and legacy todo IDs
+            // when every provenance graph was already indexed.
+            txn.normalize_session_turn_order(&session_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            if let Some((parent_session_id, parent_manifest, fork_turn)) =
+                fork_parents.get(&session_id)
+            {
+                txn.emit_session_fork_kg(
+                    &session_id,
+                    parent_session_id,
+                    *fork_turn,
+                    parent_manifest,
+                )
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
             }
             txn.commit()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-            if any_new {
-                if let Err(e) = self.publish_session_manifest(&session_id) {
-                    log::warn!("Manifest publication failed for {}: {}", session_id, e);
-                }
+            if let Err(e) = self.publish_session_manifest(&session_id) {
+                log::warn!("Manifest publication failed for {}: {}", session_id, e);
             }
         }
 

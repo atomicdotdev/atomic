@@ -638,6 +638,20 @@ impl ReadTxn {
             .map(|value| crate::types::Hash::from_bytes(*value.value())))
     }
 
+    /// Read every mutable session head for index rebuilds.
+    pub fn list_session_heads(&self) -> PristineResult<Vec<(String, crate::types::Hash)>> {
+        let table = self.txn.open_table(SESSION_HEADS)?;
+        let mut heads = Vec::new();
+        for result in table.iter()? {
+            let (session_id, hash) = result?;
+            heads.push((
+                session_id.value().to_string(),
+                crate::types::Hash::from_bytes(*hash.value()),
+            ));
+        }
+        Ok(heads)
+    }
+
     /// Get all session events for a provenance graph.
     ///
     /// Returns events in sequence order (one per provenance node, for any

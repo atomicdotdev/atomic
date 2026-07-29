@@ -22,12 +22,15 @@ use crate::types::{
 use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
 use crate::pristine::traits::{
-    FileIndexEntry, FileIndexMetadata, GraphTxnT, MutTxnT, TreeTxnT, ViewScope, ViewState, ViewTxnT,
+    FileIndexEntry, FileIndexMetadata, GraphTxnT, KgMutTxnT, MutTxnT, TreeTxnT, ViewScope,
+    ViewState, ViewTxnT,
 };
 
 use super::helpers::{
     deserialize_edge, deserialize_view_state, serialize_edge, serialize_view_state, AdjIterator,
 };
+
+const SESSION_LEDGER_SCHEMA_VERSION: u32 = 1;
 
 /// Read-write transaction
 ///
@@ -285,6 +288,255 @@ impl<'a> WriteTxn<'a> {
         Ok(())
     }
 
+    fn load_session_record_for_write(
+        &self,
+        session_id: &str,
+    ) -> PristineResult<Option<crate::change::session::SessionRecord>> {
+        use crate::change::session::SessionRecord;
+
+        let sessions = self.txn.open_table(SESSIONS)?;
+        let existing = sessions.get(session_id)?;
+        match existing {
+            Some(value) => SessionRecord::from_bytes(value.value())
+                .map(Some)
+                .map_err(|e| PristineError::Serialization {
+                    message: format!("session record decode: {}", e),
+                }),
+            None => Ok(None),
+        }
+    }
+
+    fn load_session_turns_for_write(
+        &self,
+        session_id: &str,
+    ) -> PristineResult<Vec<crate::change::session::SessionTurn>> {
+        use crate::change::session::{
+            encode_session_turn_key, session_turn_namespace, SessionTurn,
+        };
+
+        let turns = self.txn.open_table(SESSION_TURNS)?;
+        let namespace = session_turn_namespace(session_id);
+        let scan_start = encode_session_turn_key(namespace, 0);
+        let scan_end = encode_session_turn_key(namespace, u32::MAX);
+        let mut result = Vec::new();
+
+        for row in turns.range::<&[u8; 40]>(&scan_start..=&scan_end)? {
+            let (_key, value) = row?;
+            let turn = SessionTurn::from_bytes(value.value()).map_err(|e| {
+                PristineError::Serialization {
+                    message: format!("session turn decode: {}", e),
+                }
+            })?;
+            if turn.session_id == session_id {
+                result.push(turn);
+            }
+        }
+        result.sort_by_key(|turn| turn.turn_number);
+        Ok(result)
+    }
+
+    fn session_ledger_schema_key(session_id: &str) -> String {
+        format!(
+            "session_ledger_schema:{}",
+            blake3::hash(session_id.as_bytes()).to_hex()
+        )
+    }
+
+    fn has_current_session_ledger_schema(&self, session_id: &str) -> PristineResult<bool> {
+        let metadata = self.txn.open_table(KG_INDEX_META)?;
+        let key = Self::session_ledger_schema_key(session_id);
+        let is_current = metadata
+            .get(key.as_str())?
+            .is_some_and(|value| value.value() >= SESSION_LEDGER_SCHEMA_VERSION);
+        Ok(is_current)
+    }
+
+    fn mark_current_session_ledger_schema(&mut self, session_id: &str) -> PristineResult<()> {
+        let mut metadata = self.txn.open_table(KG_INDEX_META)?;
+        let key = Self::session_ledger_schema_key(session_id);
+        metadata.insert(key.as_str(), SESSION_LEDGER_SCHEMA_VERSION)?;
+        Ok(())
+    }
+
+    /// Append a turn without touching prior rows when the existing session was
+    /// already written with the current canonical schema.
+    fn append_session_turn(
+        &mut self,
+        mut record: crate::change::session::SessionRecord,
+        turn: crate::change::session::SessionTurn,
+        existing_turns: &[crate::change::session::SessionTurn],
+    ) -> PristineResult<()> {
+        use crate::change::session::{encode_session_turn_key, session_turn_namespace};
+
+        let key =
+            encode_session_turn_key(session_turn_namespace(&record.session_id), turn.turn_number);
+        {
+            let mut turns = self.txn.open_table(SESSION_TURNS)?;
+            let mut reverse = self.txn.open_table(SESSION_PROVENANCE)?;
+            let bytes = turn.to_bytes();
+            turns.insert(&key, bytes.as_slice())?;
+            reverse.insert(turn.provenance_hash.as_bytes(), &key)?;
+        }
+
+        if record.first_provenance.is_none() {
+            record.first_provenance = Some(turn.provenance_hash);
+        }
+        record.latest_provenance = Some(turn.provenance_hash);
+        record.turn_count = turn.turn_number.saturating_add(1);
+        record.started_at = record.started_at.min(turn.timestamp);
+        {
+            let mut sessions = self.txn.open_table(SESSIONS)?;
+            let bytes = record.to_bytes();
+            sessions.insert(record.session_id.as_str(), bytes.as_slice())?;
+        }
+
+        let previous_turn_number = turn.previous_provenance.and_then(|hash| {
+            existing_turns
+                .iter()
+                .find(|existing| existing.provenance_hash == hash)
+                .map(|existing| existing.turn_number)
+                .or_else(|| (hash == turn.provenance_hash).then_some(turn.turn_number))
+        });
+        self.emit_turn_kg(&record, &turn, previous_turn_number)
+    }
+
+    fn index_session_turn_candidate(
+        &mut self,
+        record: crate::change::session::SessionRecord,
+        existing_turns: Vec<crate::change::session::SessionTurn>,
+        mut candidate: crate::change::session::SessionTurn,
+    ) -> PristineResult<()> {
+        use crate::change::session::canonicalize_session_turns;
+
+        let current_schema = self.has_current_session_ledger_schema(&record.session_id)?;
+        candidate.turn_number = existing_turns.len() as u32;
+
+        // The common chained append cannot sort before an existing turn:
+        // causality keeps it blocked until the current last turn is emitted.
+        let chained_append = existing_turns.is_empty()
+            || candidate.previous_provenance
+                == existing_turns.last().map(|turn| turn.provenance_hash);
+        if current_schema && chained_append {
+            return self.append_session_turn(record, candidate, &existing_turns);
+        }
+
+        let mut all_turns = existing_turns.clone();
+        all_turns.push(candidate);
+        let canonical = canonicalize_session_turns(all_turns);
+
+        // Independent roots may also sort at the end. Keep the append-only
+        // write path when canonicalization leaves every prior row untouched.
+        if current_schema
+            && canonical.get(..existing_turns.len()) == Some(existing_turns.as_slice())
+        {
+            if let Some(last) = canonical.last() {
+                if !existing_turns
+                    .iter()
+                    .any(|turn| turn.provenance_hash == last.provenance_hash)
+                {
+                    return self.append_session_turn(record, last.clone(), &existing_turns);
+                }
+            }
+        }
+
+        self.rewrite_session_turns(record, canonical)
+    }
+
+    /// Rewrite one session's derived index from its complete immutable turn
+    /// set. This keeps local keys, manifest order, lifecycle pointers, and KG
+    /// turn numbers consistent even when provenance arrives out of order.
+    fn rewrite_session_turns(
+        &mut self,
+        mut record: crate::change::session::SessionRecord,
+        turns: Vec<crate::change::session::SessionTurn>,
+    ) -> PristineResult<()> {
+        use crate::change::session::{
+            canonicalize_session_turns, encode_session_turn_key, session_turn_namespace,
+        };
+
+        let old_turns = self.load_session_turns_for_write(&record.session_id)?;
+        let turns = canonicalize_session_turns(turns);
+        let preserved_edges = self.clear_session_turn_kg(&old_turns, &turns)?;
+
+        let namespace = session_turn_namespace(&record.session_id);
+        let scan_start = encode_session_turn_key(namespace, 0);
+        let scan_end = encode_session_turn_key(namespace, u32::MAX);
+        let existing_keys = {
+            let table = self.txn.open_table(SESSION_TURNS)?;
+            let mut keys = Vec::new();
+            for row in table.range::<&[u8; 40]>(&scan_start..=&scan_end)? {
+                let (key, _value) = row?;
+                keys.push(*key.value());
+            }
+            keys
+        };
+        {
+            let mut table = self.txn.open_table(SESSION_TURNS)?;
+            for key in existing_keys {
+                table.remove(&key)?;
+            }
+        }
+        {
+            let mut table = self.txn.open_table(SESSION_TURNS)?;
+            let mut reverse = self.txn.open_table(SESSION_PROVENANCE)?;
+            for turn in &turns {
+                let key = encode_session_turn_key(namespace, turn.turn_number);
+                let bytes = turn.to_bytes();
+                table.insert(&key, bytes.as_slice())?;
+                reverse.insert(turn.provenance_hash.as_bytes(), &key)?;
+            }
+        }
+
+        record.first_provenance = turns.first().map(|turn| turn.provenance_hash);
+        record.latest_provenance = turns.last().map(|turn| turn.provenance_hash);
+        record.turn_count = turns.len() as u32;
+        if let Some(first) = turns.first() {
+            record.started_at = record.started_at.min(first.timestamp);
+        }
+        {
+            let mut sessions = self.txn.open_table(SESSIONS)?;
+            let bytes = record.to_bytes();
+            sessions.insert(record.session_id.as_str(), bytes.as_slice())?;
+        }
+
+        let turn_numbers: std::collections::HashMap<Hash, u32> = turns
+            .iter()
+            .map(|turn| (turn.provenance_hash, turn.turn_number))
+            .collect();
+        if turns.is_empty() {
+            self.emit_session_node(&record)?;
+        }
+        for turn in &turns {
+            let previous_turn_number = turn
+                .previous_provenance
+                .and_then(|hash| turn_numbers.get(&hash).copied());
+            self.emit_turn_kg(&record, turn, previous_turn_number)?;
+        }
+        for edge in preserved_edges {
+            self.upsert_kg_edge(&edge)?;
+        }
+        self.mark_current_session_ledger_schema(&record.session_id)?;
+
+        Ok(())
+    }
+
+    /// Re-derive a stored session's canonical order and KG without adding a
+    /// turn. Used by rebuild to repair indexes created by older versions.
+    pub fn normalize_session_turn_order(&mut self, session_id: &str) -> PristineResult<()> {
+        let Some(record) = self.load_session_record_for_write(session_id)? else {
+            return Ok(());
+        };
+        let turns = self.load_session_turns_for_write(session_id)?;
+        let canonical = crate::change::session::canonicalize_session_turns(turns.clone());
+        if self.has_current_session_ledger_schema(session_id)?
+            && canonical == turns
+            && self.session_turn_kg_is_current(session_id, &turns)?
+        {
+            return Ok(());
+        }
+        self.rewrite_session_turns(record, canonical)
+    }
+
     /// Index an immutable provenance graph as the next turn of its session.
     ///
     /// The session ID is the portable external identity. The turn key uses the
@@ -297,41 +549,21 @@ impl<'a> WriteTxn<'a> {
         provenance_hash: &Hash,
         graph: &crate::change::ProvenanceGraph,
     ) -> PristineResult<()> {
-        use crate::change::session::{
-            encode_session_turn_key, session_turn_namespace, SessionRecord, SessionTurn,
-        };
+        use crate::change::session::{SessionRecord, SessionTurn};
 
-        let mut sessions = self.txn.open_table(SESSIONS)?;
-        let mut turns = self.txn.open_table(SESSION_TURNS)?;
-        let mut reverse = self.txn.open_table(SESSION_PROVENANCE)?;
-
-        // Idempotency guard: the same provenance graph must never index twice
-        // IN THE SAME SESSION. Registration can race or repeat across
-        // ingestion paths (a second `save_provenance_graph` for the same
-        // graph, a geodist listener re-registering after a snapshot restore,
-        // a retried pull). The check is a namespace scan rather than the
-        // reverse index because forked sessions legitimately share provenance
-        // hashes — only same-session duplicates are dropped.
-        let namespace = session_turn_namespace(session_id);
-        let scan_start = encode_session_turn_key(namespace, 0);
-        let scan_end = encode_session_turn_key(namespace, u32::MAX);
-        for result in turns.range::<&[u8; 40]>(&scan_start..=&scan_end)? {
-            let (_key, value) = result?;
-            if let Ok(existing) = SessionTurn::from_bytes(value.value()) {
-                if existing.session_id == session_id && existing.provenance_hash == *provenance_hash
-                {
-                    return Ok(());
-                }
-            }
+        // Idempotency is session-local because forked sessions legitimately
+        // share provenance hashes.
+        let turns = self.load_session_turns_for_write(session_id)?;
+        if turns
+            .iter()
+            .any(|turn| turn.provenance_hash == *provenance_hash)
+        {
+            return Ok(());
         }
 
-        let mut record = match sessions.get(session_id)? {
-            Some(value) => SessionRecord::from_bytes(value.value()).map_err(|e| {
-                PristineError::Serialization {
-                    message: format!("session record decode: {}", e),
-                }
-            })?,
-            None => SessionRecord {
+        let mut record = self
+            .load_session_record_for_write(session_id)?
+            .unwrap_or_else(|| SessionRecord {
                 session_id: session_id.to_string(),
                 json_path: json_path.to_string(),
                 view_name: None,
@@ -341,17 +573,16 @@ impl<'a> WriteTxn<'a> {
                 turn_count: 0,
                 started_at: graph.timestamp,
                 ended_at: None,
-            },
-        };
+            });
 
         if record.json_path.is_empty() {
             record.json_path = json_path.to_string();
         }
 
-        let turn_number = record.turn_count;
-        let turn = SessionTurn {
+        let candidate = SessionTurn {
             session_id: session_id.to_string(),
-            turn_number,
+            // Canonical numbering is assigned from the complete turn set.
+            turn_number: 0,
             goal: graph
                 .nodes
                 .iter()
@@ -369,57 +600,33 @@ impl<'a> WriteTxn<'a> {
             plan_id: graph.plan_id.clone(),
             todos: graph.todos.clone(),
         };
-        let key = encode_session_turn_key(session_turn_namespace(session_id), turn_number);
-        let bytes = turn.to_bytes();
-        turns.insert(&key, bytes.as_slice())?;
-        reverse.insert(provenance_hash.as_bytes(), &key)?;
 
-        if record.first_provenance.is_none() {
-            record.first_provenance = Some(*provenance_hash);
-        }
-        record.latest_provenance = Some(*provenance_hash);
-        record.turn_count = record.turn_count.saturating_add(1);
-        let record_bytes = record.to_bytes();
-        sessions.insert(session_id, record_bytes.as_slice())?;
-
-        // Taxonomy emission (ATOM-16): the ledger row becomes KG triples in
-        // the same transaction — session/turn/provenance nodes, hadMember,
-        // explainedBy, generated, wasInformedBy.
-        drop(sessions);
-        drop(turns);
-        drop(reverse);
-        self.emit_turn_kg(&record, &turn)?;
-
-        Ok(())
+        self.index_session_turn_candidate(record, turns, candidate)
     }
 
     /// Index an inherited turn row for a forked session.
     ///
-    /// Unlike `index_session_turn`, the turn number and provenance hash come
-    /// from the parent's immutable ledger entry. The session record's turn
-    /// count advances to max(current, turn_number + 1) so later turns append
-    /// after the inherited prefix.
+    /// The immutable turn data comes from the parent; the child derives its
+    /// own canonical numbering from the complete inherited prefix.
     pub fn index_inherited_turn(
         &mut self,
         child_session_id: &str,
         json_path: &str,
         turn: &crate::change::session::SessionTurn,
     ) -> PristineResult<()> {
-        use crate::change::session::{
-            encode_session_turn_key, session_turn_namespace, SessionRecord,
-        };
+        use crate::change::session::SessionRecord;
 
-        let mut sessions = self.txn.open_table(SESSIONS)?;
-        let mut turns = self.txn.open_table(SESSION_TURNS)?;
-        let mut reverse = self.txn.open_table(SESSION_PROVENANCE)?;
+        let turns = self.load_session_turns_for_write(child_session_id)?;
+        if turns
+            .iter()
+            .any(|existing| existing.provenance_hash == turn.provenance_hash)
+        {
+            return Ok(());
+        }
 
-        let mut record = match sessions.get(child_session_id)? {
-            Some(value) => SessionRecord::from_bytes(value.value()).map_err(|e| {
-                PristineError::Serialization {
-                    message: format!("session record decode: {}", e),
-                }
-            })?,
-            None => SessionRecord {
+        let mut record = self
+            .load_session_record_for_write(child_session_id)?
+            .unwrap_or_else(|| SessionRecord {
                 session_id: child_session_id.to_string(),
                 json_path: json_path.to_string(),
                 view_name: None,
@@ -429,35 +636,17 @@ impl<'a> WriteTxn<'a> {
                 turn_count: 0,
                 started_at: turn.timestamp,
                 ended_at: None,
-            },
-        };
+            });
 
         if record.json_path.is_empty() {
             record.json_path = json_path.to_string();
         }
 
-        let key =
-            encode_session_turn_key(session_turn_namespace(child_session_id), turn.turn_number);
-        let bytes = turn.to_bytes();
-        turns.insert(&key, bytes.as_slice())?;
-        reverse.insert(turn.provenance_hash.as_bytes(), &key)?;
+        let mut inherited = turn.clone();
+        inherited.session_id = child_session_id.to_string();
+        inherited.turn_number = 0;
 
-        if record.first_provenance.is_none() {
-            record.first_provenance = Some(turn.provenance_hash);
-        }
-        record.latest_provenance = Some(turn.provenance_hash);
-        record.turn_count = record.turn_count.max(turn.turn_number.saturating_add(1));
-        let record_bytes = record.to_bytes();
-        sessions.insert(child_session_id, record_bytes.as_slice())?;
-
-        // Taxonomy emission for the inherited row (ATOM-16): the child's
-        // ledger prefix is semantically identical to natively indexed turns.
-        drop(sessions);
-        drop(turns);
-        drop(reverse);
-        self.emit_turn_kg(&record, turn)?;
-
-        Ok(())
+        self.index_session_turn_candidate(record, turns, inherited)
     }
 
     /// Create an empty session record (e.g., a fork with no inherited turns).
@@ -487,99 +676,8 @@ impl<'a> WriteTxn<'a> {
         };
         let bytes = record.to_bytes();
         sessions.insert(session_id, bytes.as_slice())?;
-        Ok(())
-    }
-
-    /// Count indexed turns under a session namespace (for rebuild assignment).
-    pub fn count_session_turns(&self, namespace: &[u8; 32]) -> PristineResult<usize> {
-        let table = self.txn.open_table(SESSION_TURNS)?;
-        let start = crate::change::session::encode_session_turn_key(*namespace, 0);
-        let end = crate::change::session::encode_session_turn_key(*namespace, u32::MAX);
-        let mut count = 0usize;
-        for result in table.range::<&[u8; 40]>(&start..=&end)? {
-            result?;
-            count += 1;
-        }
-        Ok(count)
-    }
-
-    /// Index a turn at an explicit position (rebuild/backfill path).
-    pub fn index_turn_at(
-        &mut self,
-        session_id: &str,
-        json_path: &str,
-        provenance_hash: &Hash,
-        graph: &crate::change::ProvenanceGraph,
-        turn_number: u32,
-        key: &[u8; 40],
-    ) -> PristineResult<()> {
-        use crate::change::session::{SessionRecord, SessionTurn};
-
-        let mut sessions = self.txn.open_table(SESSIONS)?;
-        let mut turns = self.txn.open_table(SESSION_TURNS)?;
-        let mut reverse = self.txn.open_table(SESSION_PROVENANCE)?;
-
-        let turn = SessionTurn {
-            session_id: session_id.to_string(),
-            turn_number,
-            goal: graph
-                .nodes
-                .iter()
-                .find(|node| {
-                    matches!(
-                        node.kind,
-                        crate::change::provenance_graph::ProvenanceNodeKind::Goal
-                    )
-                })
-                .map(|node| node.summary.clone()),
-            provenance_hash: *provenance_hash,
-            change_hashes: graph.changes_explained.clone(),
-            previous_provenance: graph.previous,
-            timestamp: graph.timestamp,
-            plan_id: graph.plan_id.clone(),
-            todos: graph.todos.clone(),
-        };
-        let bytes = turn.to_bytes();
-        turns.insert(key, bytes.as_slice())?;
-        reverse.insert(provenance_hash.as_bytes(), key)?;
-
-        let mut record = match sessions.get(session_id)? {
-            Some(value) => SessionRecord::from_bytes(value.value()).map_err(|e| {
-                PristineError::Serialization {
-                    message: format!("session record decode: {}", e),
-                }
-            })?,
-            None => SessionRecord {
-                session_id: session_id.to_string(),
-                json_path: json_path.to_string(),
-                view_name: None,
-                parent_view: None,
-                first_provenance: None,
-                latest_provenance: None,
-                turn_count: 0,
-                started_at: graph.timestamp,
-                ended_at: None,
-            },
-        };
-        if record.json_path.is_empty() {
-            record.json_path = json_path.to_string();
-        }
-        if record.first_provenance.is_none() {
-            record.first_provenance = Some(*provenance_hash);
-        }
-        record.latest_provenance = Some(*provenance_hash);
-        record.turn_count = record.turn_count.max(turn_number.saturating_add(1));
-        let record_bytes = record.to_bytes();
-        sessions.insert(session_id, record_bytes.as_slice())?;
-
-        // Taxonomy emission for the rebuilt row (ATOM-16): a rebuild must
-        // reproduce the same KG a native registration would have written.
         drop(sessions);
-        drop(turns);
-        drop(reverse);
-        self.emit_turn_kg(&record, &turn)?;
-
-        Ok(())
+        self.emit_session_node(&record)
     }
 
     /// Reconcile lifecycle metadata for a session record.
