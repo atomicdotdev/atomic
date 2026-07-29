@@ -431,6 +431,50 @@ mod tests {
         );
     }
 
+    /// GUARD 18 — a rejected flag BEFORE a real subcommand must not make the
+    /// renderer name a command that never ran.
+    ///
+    /// `atomic --json memory new` is rejected by clap at the root; `memory` and
+    /// `new` are real commands sitting later in argv. Resolving the scope from
+    /// argv walked straight past the rejected token and reported `cmd: atomic
+    /// memory new`, whose row then contributed `run: … --json` — handing the
+    /// agent back the very flag it had just been told was unknown, alongside a
+    /// `help:` page documenting that flag as valid. Every key must agree with
+    /// the usage line clap itself scoped the error to.
+    #[test]
+    fn leading_flag_does_not_misattribute() {
+        for tail in [
+            vec!["--json", "memory", "new"],
+            vec!["--repository", "status"],
+            vec!["--", "status"],
+        ] {
+            let mut root = apply_agent_help("", Cli::command());
+            let argv: Vec<String> = std::iter::once("atomic")
+                .chain(tail.iter().copied())
+                .map(|s| s.to_string())
+                .collect();
+            let err = root.try_get_matches_from_mut(&argv).unwrap_err();
+            let out = crate::agent_error::render(&err, &root, &argv);
+
+            assert!(
+                out.contains("cmd: atomic\n"),
+                "scope must stay at the root for {argv:?}, got:\n{out}"
+            );
+            assert!(
+                out.contains("help: atomic --help\n"),
+                "help must point at the root for {argv:?}, got:\n{out}"
+            );
+            // No row belongs to the root, so no guidance may leak in — most of
+            // all a `run:` line replaying the rejected token.
+            for leaked in ["when: ", "run: ", "needs: ", "then: ", "instead: "] {
+                assert!(
+                    !out.contains(leaked),
+                    "{leaked:?} leaked from a command that never ran for {argv:?}:\n{out}"
+                );
+            }
+        }
+    }
+
     /// GUARD 16 — the removed-command shim speaks the same dialect as
     /// everything else, because it goes through the same renderer.
     #[test]

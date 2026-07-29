@@ -49,19 +49,59 @@ pub fn kind_slug(kind: ErrorKind) -> &'static str {
     }
 }
 
+/// The command path clap itself scoped the error to, read out of its usage line.
+///
+/// This is the authoritative source when it exists. argv alone cannot answer the
+/// question: in `atomic --json memory new`, clap rejects `--json` at the ROOT and
+/// never reaches `memory`, yet `memory` and `new` are both real subcommands
+/// sitting later in argv. Walking argv names `memory new` — a command that never
+/// ran — and then every downstream key (`verbs`, the [`agent_doc`] row, `help`)
+/// describes the wrong command. Told `--json` is unknown and pointed at a help
+/// page documenting `--json` as valid, an agent concludes the binary is broken,
+/// which is the exact failure this module exists to prevent.
+///
+/// The usage line is `atomic memory new --kind <KIND>` or `atomic [OPTIONS]
+/// <COMMAND>`; the path is its leading run of bare lowercase tokens after the
+/// binary name.
+fn path_from_usage(root: &clap::Command, usage: &str) -> Option<String> {
+    let mut toks = usage.split_whitespace();
+    if toks.next()? != root.get_name() {
+        return None;
+    }
+    let mut node = root;
+    let mut parts: Vec<String> = Vec::new();
+    for tok in toks {
+        if !tok
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '-' || c.is_ascii_digit())
+            || tok.starts_with('-')
+        {
+            break;
+        }
+        match node.find_subcommand(tok) {
+            Some(child) => {
+                parts.push(child.get_name().to_string());
+                node = child;
+            }
+            None => break,
+        }
+    }
+    Some(parts.join(" "))
+}
+
 /// Walk argv against the live command tree to the deepest node that actually
 /// exists.
 ///
-/// Derived from argv rather than from clap's usage string, so it works for every
-/// [`ErrorKind`] including the several that carry no `Usage` context at all.
-///
-/// Returns `(registry key without the binary name, full display path)`.
+/// The fallback for the [`ErrorKind`]s that carry no `Usage` context. Unlike
+/// [`path_from_usage`] this cannot tell an accepted global flag from the one
+/// clap rejected, so the walk STOPS at the first flag rather than stepping over
+/// it: naming the parent is recoverable, naming a command that never ran is not.
 pub fn resolve_invoked(root: &clap::Command, argv: &[String]) -> (String, String) {
     let mut node = root;
     let mut parts: Vec<String> = Vec::new();
     for tok in argv.iter().skip(1) {
         if tok.starts_with('-') {
-            continue;
+            break;
         }
         match node.find_subcommand(tok.as_str()) {
             Some(child) => {
@@ -71,13 +111,16 @@ pub fn resolve_invoked(root: &clap::Command, argv: &[String]) -> (String, String
             None => break,
         }
     }
-    let key = parts.join(" ");
-    let display = if key.is_empty() {
+    (parts.join(" "), display_path(root, &parts.join(" ")))
+}
+
+/// `atomic` for the root, `atomic memory new` for a leaf.
+fn display_path(root: &clap::Command, key: &str) -> String {
+    if key.is_empty() {
         root.get_name().to_string()
     } else {
         format!("{} {}", root.get_name(), key)
-    };
-    (key, display)
+    }
 }
 
 /// Descend to the node named by a registry key, stopping at the first segment
@@ -145,22 +188,37 @@ fn intern(key: &str) -> &'static str {
 /// A pure function returning a `String`, so the whole failure surface is
 /// unit-testable without spawning a process.
 pub fn render(err: &clap::Error, root: &clap::Command, argv: &[String]) -> String {
-    let (key, display) = resolve_invoked(root, argv);
-
-    let mut kv: Vec<(&str, String)> = Vec::new();
-    kv.push(("error", kind_slug(err.kind()).to_string()));
-    kv.push(("cmd", display.clone()));
-
-    // usage: prefer clap's structured context; fall back to re-rendering the
-    // resolved node for the kinds (notably InvalidValue) that attach none.
-    let usage = ctx_str(err, ContextKind::Usage)
+    // Scope first, everything else from it. clap's usage line is authoritative
+    // about WHICH command the error is about; argv is only a fallback for the
+    // kinds that attach no usage context. Deriving `cmd`/`verbs`/the row/`help`
+    // from a different source than `usage` is what let them contradict.
+    let ctx_usage = ctx_str(err, ContextKind::Usage)
         .map(|u| {
             u.trim_start_matches("Usage:")
                 .trim_start_matches("usage:")
                 .trim()
                 .to_string()
         })
-        .filter(|u| !u.is_empty())
+        .filter(|u| !u.is_empty());
+
+    let (key, display) = match ctx_usage
+        .as_deref()
+        .and_then(|u| path_from_usage(root, u))
+    {
+        Some(k) => {
+            let d = display_path(root, &k);
+            (k, d)
+        }
+        None => resolve_invoked(root, argv),
+    };
+
+    let mut kv: Vec<(&str, String)> = Vec::new();
+    kv.push(("error", kind_slug(err.kind()).to_string()));
+    kv.push(("cmd", display.clone()));
+
+    // usage: clap's own line when it attached one; otherwise re-render the
+    // resolved node for the kinds (notably InvalidValue) that attach none.
+    let usage = ctx_usage
         .unwrap_or_else(|| {
             // Walk the FULL path, not just the first segment: rendering the
             // parent's usage would name the wrong command.
