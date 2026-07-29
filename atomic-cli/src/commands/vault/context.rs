@@ -308,8 +308,9 @@ impl Context {
             .intents
             .iter()
             .find(|(id, _)| id.eq_ignore_ascii_case(intent_id))
-            .ok_or_else(|| CliError::InvalidArgument {
-                message: format!("Intent not found: {}", intent_id),
+            .ok_or_else(|| CliError::VaultEntityNotFound {
+                kind: "intent",
+                id: intent_id.to_string(),
             })?;
 
         seed_terms.push(summary.title.clone());
@@ -320,8 +321,9 @@ impl Context {
         let intent_path = repo
             .vault_intent_path(resolved_id)
             .map_err(CliError::Repository)?
-            .ok_or_else(|| CliError::InvalidArgument {
-                message: format!("Intent not found: {}", intent_id),
+            .ok_or_else(|| CliError::VaultEntityNotFound {
+                kind: "intent",
+                id: intent_id.to_string(),
             })?;
 
         if let Some(entry) = repo
