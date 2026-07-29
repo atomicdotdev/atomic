@@ -109,6 +109,7 @@ use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command, DEFAULT_HASH_LENGTH};
 use crate::error::{CliError, CliResult};
+use crate::agent_doc::{Doc, Fail, Ref};
 use crate::output::{
     added, deleted, hash, hint, info, modified, path as style_path, print_blank, print_hint,
     print_info, print_section, print_warning, untracked as style_untracked, view as style_view,
@@ -196,6 +197,66 @@ pub struct Status {
     #[arg(long = "reindex")]
     pub reindex: bool,
 }
+
+/// Agent guidance for `atomic status`.
+///
+/// Both `fails:` rows are silent-wrong-answer paths at exit 0. `status .` is a
+/// PREFIX filter, not a directory, so it prints nothing on a dirty tree; and
+/// the stale-index hint is emitted only by the long format, so `-s` — the form
+/// an agent parses — shows spurious M lines with no signal.
+pub const DOC: Doc = Doc {
+    when: "you do not know which files are dirty or untracked",
+    run: "status -s",
+    needs: &[
+        Ref {
+            cmd: "init",
+            note: "once per repo",
+        },
+    ],
+    then: &[
+        Ref {
+            cmd: "diff --untracked",
+            note: "content behind the M and ?? lines",
+        },
+        Ref {
+            cmd: "add <path>...",
+            note: "for the ?? lines",
+        },
+        Ref {
+            cmd: "record -a -m \"<msg>\"",
+            note: "",
+        },
+    ],
+    instead: &[
+        Ref {
+            cmd: "diff --name-status",
+            note: "same list, tracked changes only",
+        },
+        Ref {
+            cmd: "log -n 1",
+            note: "what was last recorded, not the working copy",
+        },
+    ],
+    fails: &[
+        Fail {
+            cond: "PATH is a prefix filter; `status .` prints nothing",
+            exit: 0,
+            fix: Ref {
+                cmd: "status -s",
+                note: "",
+            },
+        },
+        Fail {
+            cond: "stale index inflates M entries; -s hides the hint",
+            exit: 0,
+            fix: Ref {
+                cmd: "status --reindex",
+                note: "",
+            },
+        },
+    ],
+    ..Doc::EMPTY
+};
 
 impl Status {
     /// Create a new Status command with default settings.

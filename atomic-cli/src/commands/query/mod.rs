@@ -11,6 +11,7 @@ use atomic_repository::Repository;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{create_spinner, finish_error, finish_success};
+use crate::agent_doc::{Doc, Fail, Ref};
 
 /// Subcommands for vault knowledge graph queries.
 #[derive(Subcommand, Debug)]
@@ -1058,6 +1059,66 @@ pub struct QueryNodes {
     pub json: bool,
 }
 
+/// Agent guidance for `atomic query search`.
+///
+/// The first `fails:` row is the highest-value line in the family: FTS covers
+/// node ids, labels and summaries and NEVER memory bodies, so a term that is
+/// literally present in a memory returns `No results.` at exit 0. An agent that
+/// reads that as "the graph is empty" is wrong.
+pub const SEARCH_DOC: Doc = Doc {
+    when: "you need a node's exact KG id before traversing",
+    run: "query search \"<terms>\" --json",
+    needs: &[
+        Ref {
+            cmd: "record",
+            note: "file and change nodes enter the KG on record",
+        },
+        Ref {
+            cmd: "query enrich",
+            note: "if a change was recorded with KG work off",
+        },
+    ],
+    then: &[
+        Ref {
+            cmd: "query neighbors <node-id>",
+            note: "expand the id you found",
+        },
+        Ref {
+            cmd: "query callers <entity-id>",
+            note: "blast radius of an entity",
+        },
+    ],
+    instead: &[
+        Ref {
+            cmd: "vault context \"<terms>\"",
+            note: "searches memory bodies, which FTS skips",
+        },
+        Ref {
+            cmd: "query code \"<pattern>\"",
+            note: "source text; run query index first",
+        },
+    ],
+    fails: &[
+        Fail {
+            cond: "FTS indexes ids/labels/summaries, never bodies",
+            exit: 0,
+            fix: Ref {
+                cmd: "vault context \"<terms>\"",
+                note: "",
+            },
+        },
+        Fail {
+            cond: "-t outside the kind vocabulary matches nothing",
+            exit: 0,
+            fix: Ref {
+                cmd: "query search \"<terms>\"",
+                note: "",
+            },
+        },
+    ],
+    ..Doc::EMPTY
+};
+
 impl Command for QueryNodes {
     fn run(&self) -> CliResult<()> {
         let root = find_repository_root()?;
@@ -1129,6 +1190,56 @@ pub struct QueryNeighbors {
     #[arg(long)]
     pub json: bool,
 }
+
+/// Agent guidance for `atomic query neighbors`.
+///
+/// The node id must be the BARE form (`intent:<ULID>`). The `urn:atomic:...`
+/// form parses fine and returns `No neighbors found.` at exit 0.
+pub const NEIGHBORS_DOC: Doc = Doc {
+    when: "you have a node id and need what it connects to",
+    run: "query neighbors intent:<ULID>",
+    needs: &[
+        Ref {
+            cmd: "query search \"<terms>\"",
+            note: "yields the exact bare node id",
+        },
+    ],
+    then: &[
+        Ref {
+            cmd: "query callers <entity-id>",
+            note: "for entity nodes",
+        },
+        Ref {
+            cmd: "vault context --intent <ID>",
+            note: "memories around that intent",
+        },
+    ],
+    instead: &[
+        Ref {
+            cmd: "query graph \"<terms>\"",
+            note: "multi-seed subgraph, DOT or JSON",
+        },
+    ],
+    fails: &[
+        Fail {
+            cond: "urn:atomic:... form; wants the bare intent:<ULID>",
+            exit: 0,
+            fix: Ref {
+                cmd: "query search \"<terms>\"",
+                note: "",
+            },
+        },
+        Fail {
+            cond: "file or change node not yet enriched into the KG",
+            exit: 0,
+            fix: Ref {
+                cmd: "query enrich",
+                note: "",
+            },
+        },
+    ],
+    ..Doc::EMPTY
+};
 
 impl Command for QueryNeighbors {
     fn run(&self) -> CliResult<()> {

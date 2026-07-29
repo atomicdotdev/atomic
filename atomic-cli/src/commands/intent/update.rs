@@ -12,6 +12,7 @@ use atomic_repository::{IntentUpdateOptions, Repository};
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
+use crate::agent_doc::{Doc, Fail, Ref};
 
 /// Update an intent's fields.
 ///
@@ -61,6 +62,56 @@ pub struct IntentUpdate {
     #[arg(long, short = 'f')]
     pub force: bool,
 }
+
+/// Agent guidance for `atomic intent update`.
+///
+/// `--status` and `--priority` are stored unvalidated while the canonical gate
+/// accepts a closed set, so a plausible-looking `--status doing` exits 0 here
+/// and silently breaks the next validate AND attest. That divergence is the
+/// only `fails:` row worth carrying.
+pub const DOC: Doc = Doc {
+    when: "work started or finished, or the plan text must change",
+    run: "intent update <ID> --status in_progress",
+    then: &[
+        Ref {
+            cmd: "intent attest <ID>",
+            note: "ANY update makes an attestation stale",
+        },
+        Ref {
+            cmd: "intent validate <ID> --json",
+            note: "confirm the gate still passes",
+        },
+    ],
+    instead: &[
+        Ref {
+            cmd: "vault sync",
+            note: "after hand-editing the .vault file",
+        },
+        Ref {
+            cmd: "intent link <ID> --goal <GOAL>",
+            note: "attach a goal, not a field",
+        },
+    ],
+    fails: &[
+        Fail {
+            cond: "--status outside backlog|todo|in_progress|done|icebox",
+            exit: 0,
+            fix: Ref {
+                cmd: "intent validate <ID>",
+                note: "",
+            },
+        },
+        Fail {
+            cond: "--body on a started or goal-linked intent",
+            exit: 3,
+            fix: Ref {
+                cmd: "intent update <ID> --force",
+                note: "",
+            },
+        },
+    ],
+    ..Doc::EMPTY
+};
 
 impl IntentUpdate {
     fn resolve_body(&self) -> CliResult<Option<String>> {

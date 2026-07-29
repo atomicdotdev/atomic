@@ -22,6 +22,7 @@ use atomic_repository::Repository;
 use crate::commands::memory::bridge;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
+use crate::agent_doc::{Doc, Fail, Ref};
 
 /// Write a freeform memory file (reads content from stdin).
 #[derive(Parser, Debug)]
@@ -34,6 +35,57 @@ pub struct MemoryWrite {
     #[arg(long, short = 't', default_value = "project")]
     pub r#type: String,
 }
+
+/// Agent guidance for `atomic memory write`.
+///
+/// The `run:` line carries a `< notes.md` redirect on purpose: content is read
+/// from stdin to EOF, so a bare invocation with stdin on a tty blocks forever.
+/// There is no exit code for that, so it cannot be a `fails:` row.
+pub const DOC: Doc = Doc {
+    when: "storing a document verbatim, not a gradeable fact",
+    run: "memory write notes --type reference < notes.md",
+    needs: &[
+        Ref {
+            cmd: "init",
+            note: "a repository; content is read from stdin to EOF",
+        },
+    ],
+    then: &[
+        Ref {
+            cmd: "vault show memory/<name>.md",
+            note: "the canonical memory verbs cannot read it",
+        },
+        Ref {
+            cmd: "add .vault",
+            note: "the entry starts untracked",
+        },
+    ],
+    instead: &[
+        Ref {
+            cmd: "memory new --kind <k> --text \"...\"",
+            note: "liftable, gateable, attestable",
+        },
+    ],
+    fails: &[
+        Fail {
+            cond: "no uid: show/validate/attest reject it",
+            exit: 2,
+            fix: Ref {
+                cmd: "memory new --kind <k> --text \"...\"",
+                note: "",
+            },
+        },
+        Fail {
+            cond: "a canonical <name> loses its spine",
+            exit: 0,
+            fix: Ref {
+                cmd: "memory new --kind <k> --id <name>",
+                note: "",
+            },
+        },
+    ],
+    ..Doc::EMPTY
+};
 
 impl Command for MemoryWrite {
     fn run(&self) -> CliResult<()> {

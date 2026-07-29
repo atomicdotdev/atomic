@@ -14,6 +14,7 @@ use crate::commands::memory::bridge;
 use crate::commands::memory::validation_failed;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
+use crate::agent_doc::{Doc, Fail, Ref};
 
 /// Attest a memory: gate it, sign it, and write the attested node.
 #[derive(Parser, Debug)]
@@ -30,6 +31,67 @@ pub struct MemoryAttest {
     #[arg(long)]
     pub json: bool,
 }
+
+/// Agent guidance for `atomic memory attest`.
+///
+/// `vault sync` is a prerequisite, not a nicety: attest reads the stored copy,
+/// so a hand-edited `.vault/memory/<id>.md` that was never synced is signed in
+/// its PRE-edit form, and exits 0.
+pub const DOC: Doc = Doc {
+    when: "a memory's text is final and needs an author + proof",
+    run: "memory attest <id>",
+    needs: &[
+        Ref {
+            cmd: "memory new --kind <k> --text \"...\"",
+            note: "the memory must already exist",
+        },
+        Ref {
+            cmd: "vault sync",
+            note: "after hand-editing .vault/memory/<id>.md",
+        },
+    ],
+    then: &[
+        Ref {
+            cmd: "memory validate <id>",
+            note: "now reports conforms: yes",
+        },
+        Ref {
+            cmd: "memory verify <id>",
+            note: "checks hash + Ed25519 proof",
+        },
+        Ref {
+            cmd: "add .vault",
+            note: "the attestation entry starts untracked",
+        },
+    ],
+    fails: &[
+        Fail {
+            cond: "a violation attest cannot fill: bad kind, no text",
+            exit: 2,
+            fix: Ref {
+                cmd: "memory validate <id>",
+                note: "",
+            },
+        },
+        Fail {
+            cond: "id not found: a data error reported with the usage code",
+            exit: 2,
+            fix: Ref {
+                cmd: "memory list",
+                note: "",
+            },
+        },
+        Fail {
+            cond: ".vault edited but not synced: signs the pre-edit bytes",
+            exit: 0,
+            fix: Ref {
+                cmd: "vault sync",
+                note: "",
+            },
+        },
+    ],
+    ..Doc::EMPTY
+};
 
 impl Command for MemoryAttest {
     fn run(&self) -> CliResult<()> {

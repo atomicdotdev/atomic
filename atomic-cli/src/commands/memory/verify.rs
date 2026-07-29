@@ -13,6 +13,7 @@ use atomic_repository::Repository;
 use crate::commands::memory::bridge;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
+use crate::agent_doc::{Doc, Fail, Ref};
 
 /// Verify a memory's attestation (hash + signature) against a public key.
 #[derive(Parser, Debug)]
@@ -26,6 +27,63 @@ pub struct MemoryVerify {
     #[arg(long)]
     pub identity: Option<String>,
 }
+
+/// Agent guidance for `atomic memory verify`.
+pub const DOC: Doc = Doc {
+    when: "checking a signed memory still matches its proof",
+    run: "memory verify <id>",
+    needs: &[
+        Ref {
+            cmd: "memory attest <id>",
+            note: "there must be an attestation to verify",
+        },
+    ],
+    instead: &[
+        Ref {
+            cmd: "memory list",
+            note: "the verifies column for every memory at once",
+        },
+        Ref {
+            cmd: "memory validate <id>",
+            note: "shape gate, not a signature check",
+        },
+    ],
+    fails: &[
+        Fail {
+            cond: "no attestation exists for this memory",
+            exit: 2,
+            fix: Ref {
+                cmd: "memory attest <id>",
+                note: "",
+            },
+        },
+        Fail {
+            cond: "attestation is stale: the memory changed after signing",
+            exit: 2,
+            fix: Ref {
+                cmd: "memory attest <id>",
+                note: "",
+            },
+        },
+        Fail {
+            cond: "signed by a non-default identity",
+            exit: 2,
+            fix: Ref {
+                cmd: "memory verify <id> --identity <name>",
+                note: "",
+            },
+        },
+        Fail {
+            cond: "id not found: a data error reported with the usage code",
+            exit: 2,
+            fix: Ref {
+                cmd: "memory list",
+                note: "",
+            },
+        },
+    ],
+    ..Doc::EMPTY
+};
 
 impl Command for MemoryVerify {
     fn run(&self) -> CliResult<()> {

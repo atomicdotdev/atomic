@@ -7,6 +7,7 @@ use atomic_repository::{IntentCreateOptions, IntentUpdateOptions, Repository};
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
+use crate::agent_doc::{Doc, Ref};
 
 /// The directive scaffold emitted for a new intent.
 ///
@@ -66,6 +67,47 @@ pub struct IntentNew {
     #[arg(long, default_value = "feature")]
     pub template: String,
 }
+
+/// Agent guidance for `atomic intent new`.
+///
+/// `fails:` is deliberately empty. The two candidates both already explain
+/// themselves: `--template epic` is rejected before any repository work, and
+/// the no-vault error itself prints `Run `atomic vault init` first`.
+pub const DOC: Doc = Doc {
+    when: "starting work whose why must outlive this session",
+    run: "intent new \"<title>\"",
+    needs: &[
+        Ref {
+            cmd: "vault init",
+            note: "once per repo; atomic init does it",
+        },
+    ],
+    then: &[
+        Ref {
+            cmd: "vault sync",
+            note: "after editing .vault/intents/<uid>/intent.md",
+        },
+        Ref {
+            cmd: "intent attest <ID>",
+            note: "fills attributedTo + proof",
+        },
+        Ref {
+            cmd: "intent validate <ID> --json",
+            note: "AFTER attest, not before",
+        },
+    ],
+    instead: &[
+        Ref {
+            cmd: "memory new --kind lesson",
+            note: "a durable fact, not a plan",
+        },
+        Ref {
+            cmd: "intent update <ID> --force --body",
+            note: "rewrite an existing intent",
+        },
+    ],
+    ..Doc::EMPTY
+};
 
 impl Command for IntentNew {
     fn run(&self) -> CliResult<()> {

@@ -9,6 +9,7 @@ use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
+use crate::agent_doc::{Doc, Fail, Ref};
 
 #[derive(Debug, Args)]
 #[command(arg_required_else_help = true)]
@@ -61,6 +62,62 @@ pub struct SessionShow {
     #[arg(long)]
     pub json: bool,
 }
+
+/// Agent guidance for `atomic session show`.
+///
+/// An unknown session id is reported as InvalidArgument -> exit 2, i.e. a data
+/// condition wearing the usage code. Without the first `fails:` row an agent
+/// reads 2 as "I typed the command wrong" and re-reads `--help` instead of
+/// listing the ids that do exist.
+pub const SHOW_DOC: Doc = Doc {
+    when: "resuming work: you need what earlier turns did",
+    run: "session show",
+    needs: &[
+        Ref {
+            cmd: "agent enable",
+            note: "hooks write the turn ledger",
+        },
+    ],
+    then: &[
+        Ref {
+            cmd: "session show <id>",
+            note: "detail for one id from the list",
+        },
+        Ref {
+            cmd: "change <hash>",
+            note: "inspect a change a turn recorded",
+        },
+    ],
+    instead: &[
+        Ref {
+            cmd: "log",
+            note: "change history, no turn or intent framing",
+        },
+        Ref {
+            cmd: "provenance trace <hash>",
+            note: "why one change happened",
+        },
+    ],
+    fails: &[
+        Fail {
+            cond: "unknown session id is a usage error, not a data error",
+            exit: 2,
+            fix: Ref {
+                cmd: "session show",
+                note: "",
+            },
+        },
+        Fail {
+            cond: "'No sessions recorded.' though provenance exists",
+            exit: 0,
+            fix: Ref {
+                cmd: "session rebuild",
+                note: "",
+            },
+        },
+    ],
+    ..Doc::EMPTY
+};
 
 impl Command for Session {
     fn run(&self) -> CliResult<()> {

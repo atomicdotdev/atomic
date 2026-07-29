@@ -14,6 +14,7 @@ use crate::commands::intent::bridge;
 use crate::commands::intent::validation_failed;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
+use crate::agent_doc::{Doc, Fail, Ref};
 
 /// Validate an intent against the canonical shapes.
 #[derive(Parser, Debug)]
@@ -26,6 +27,83 @@ pub struct IntentValidate {
     #[arg(long)]
     pub json: bool,
 }
+
+/// Agent guidance for `atomic intent validate`.
+///
+/// The last `fails:` row is deliberately fix-less. A non-conforming report is
+/// reported with exit 2 even though the command parsed and RAN to completion —
+/// the root taxonomy's "2 = usage, did not run" would otherwise send an agent
+/// back to `--help` for a verdict it already has.
+pub const DOC: Doc = Doc {
+    when: "an intent changed and you need the gate's verdict",
+    run: "intent validate <ID> --json",
+    needs: &[
+        Ref {
+            cmd: "intent attest <ID>",
+            note: "fills attributedTo + proof",
+        },
+        Ref {
+            cmd: "vault sync",
+            note: "after editing any .vault file",
+        },
+    ],
+    then: &[
+        Ref {
+            cmd: "intent verify <ID>",
+            note: "check the signature too",
+        },
+    ],
+    instead: &[
+        Ref {
+            cmd: "intent verify <ID>",
+            note: "the signature, not the shapes",
+        },
+        Ref {
+            cmd: "intent list --json",
+            note: "gate state for every intent at once",
+        },
+    ],
+    fails: &[
+        Fail {
+            cond: "un-attested: attributedTo and proof are always missing",
+            exit: 2,
+            fix: Ref {
+                cmd: "intent attest <ID>",
+                note: "",
+            },
+        },
+        Fail {
+            cond: "status=met criterion with no verifiedBy+evidence",
+            exit: 2,
+            fix: Ref {
+                cmd: "vault sync",
+                note: "",
+            },
+        },
+        Fail {
+            cond: ".vault file edited but not synced: stale answer",
+            exit: 0,
+            fix: Ref {
+                cmd: "vault sync",
+                note: "",
+            },
+        },
+        Fail {
+            cond: "path form skips the attestation; proof always missing",
+            exit: 2,
+            fix: Ref {
+                cmd: "intent validate <ID>",
+                note: "",
+            },
+        },
+        Fail {
+            cond: "report says does not conform - the gate DID run",
+            exit: 2,
+            fix: Ref::UNFIXABLE,
+        },
+    ],
+    ..Doc::EMPTY
+};
 
 impl Command for IntentValidate {
     fn run(&self) -> CliResult<()> {

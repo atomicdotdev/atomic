@@ -26,6 +26,7 @@ use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
+use crate::agent_doc::{Doc, Fail, Ref};
 
 /// Sync vault markdown files back to the database.
 ///
@@ -35,6 +36,58 @@ use crate::error::{CliError, CliResult};
 #[derive(Parser, Debug)]
 #[command(name = "sync")]
 pub struct Sync;
+
+/// Agent guidance for `atomic vault sync`.
+///
+/// The `fails:` row is the destructive twin of the round trip: sync propagates
+/// DELETIONS as readily as edits and reports success either way, so an entry
+/// missing from disk is removed from the database and `vault materialize` will
+/// not bring it back. Never sync a partially-materialized tree.
+pub const DOC: Doc = Doc {
+    when: "a .vault file was hand-edited; reads show stale text",
+    run: "vault sync",
+    needs: &[
+        Ref {
+            cmd: "vault init",
+            note: "if the repo has no vault yet",
+        },
+        Ref {
+            cmd: "vault materialize",
+            note: "disk must hold every entry first",
+        },
+    ],
+    then: &[
+        Ref {
+            cmd: "memory show <id>",
+            note: "reads the synced body",
+        },
+        Ref {
+            cmd: "intent validate <id>",
+            note: "",
+        },
+        Ref {
+            cmd: "intent attest <id>",
+            note: "",
+        },
+    ],
+    instead: &[
+        Ref {
+            cmd: "vault materialize",
+            note: "the inverse: db -> disk",
+        },
+    ],
+    fails: &[
+        Fail {
+            cond: "a vault entry missing from disk is deleted, not skipped",
+            exit: 0,
+            fix: Ref {
+                cmd: "vault materialize",
+                note: "",
+            },
+        },
+    ],
+    ..Doc::EMPTY
+};
 
 impl Command for Sync {
     fn run(&self) -> CliResult<()> {

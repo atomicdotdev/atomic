@@ -18,6 +18,7 @@ use atomic_repository::Repository;
 use crate::commands::memory::bridge;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
+use crate::agent_doc::{Doc, Fail, Ref};
 
 /// The directive scaffold emitted for a new memory.
 ///
@@ -72,6 +73,81 @@ pub struct MemoryNew {
     #[arg(long)]
     pub json: bool,
 }
+
+/// Agent guidance for `atomic memory new`.
+///
+/// The `run:` line carries `--text` deliberately: omitting it writes the
+/// `:::memory` stub comment, that comment counts as text, and `memory attest`
+/// will therefore happily sign the unedited placeholder.
+pub const DOC: Doc = Doc {
+    when: "a turn produced a durable fact worth reusing later",
+    run: "memory new --kind lesson --text \"...\" --json",
+    needs: &[
+        Ref {
+            cmd: "init",
+            note: "a repository; the vault is created on demand",
+        },
+        Ref {
+            cmd: "memory kinds",
+            note: "the closed --kind vocabulary",
+        },
+    ],
+    then: &[
+        Ref {
+            cmd: "memory attest <id>",
+            note: "only attest writes attributedTo + proof",
+        },
+        Ref {
+            cmd: "memory validate <id>",
+            note: "conforms only after attest",
+        },
+        Ref {
+            cmd: "add .vault",
+            note: "a new memory starts untracked",
+        },
+        Ref {
+            cmd: "record -m \"...\"",
+            note: "so the memory travels in the change graph",
+        },
+    ],
+    instead: &[
+        Ref {
+            cmd: "memory write <name>",
+            note: "freeform stdin, no spine, never attestable",
+        },
+        Ref {
+            cmd: "intent new",
+            note: "a plan you are about to execute, not a fact",
+        },
+    ],
+    fails: &[
+        Fail {
+            cond: "--kind outside the closed vocabulary",
+            exit: 2,
+            fix: Ref {
+                cmd: "memory kinds",
+                note: "",
+            },
+        },
+        Fail {
+            cond: "--text omitted: attest signs the stub",
+            exit: 0,
+            fix: Ref {
+                cmd: "memory new --kind <k> --text \"...\"",
+                note: "",
+            },
+        },
+        Fail {
+            cond: "--id reuses an existing id: overwritten in place",
+            exit: 0,
+            fix: Ref {
+                cmd: "memory list -n 50",
+                note: "",
+            },
+        },
+    ],
+    ..Doc::EMPTY
+};
 
 impl Command for MemoryNew {
     fn run(&self) -> CliResult<()> {
