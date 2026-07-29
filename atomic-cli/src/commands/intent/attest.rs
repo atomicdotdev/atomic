@@ -13,7 +13,6 @@ use crate::commands::intent::bridge;
 use crate::commands::intent::validation_failed;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::agent_doc::{Doc, Fail, Ref};
 
 /// Attest an intent: gate it, sign it, and write the attested node to a sidecar.
 #[derive(Parser, Debug)]
@@ -30,73 +29,6 @@ pub struct IntentAttest {
     #[arg(long)]
     pub json: bool,
 }
-
-/// Agent guidance for `atomic intent attest`.
-///
-/// attest runs the full gate itself and refuses on any violation outside
-/// {proof, attributedTo} (see `is_fillable_by_attest`), so `intent validate` is
-/// an `instead:` — a gate-only dry run that needs no signing key.
-pub const DOC: Doc = Doc {
-    when: "an intent is settled and needs a signed record",
-    run: "intent attest <ID>",
-    needs: &[
-        Ref {
-            cmd: "identity new <name> --email <e> --set-default",
-            note: "once per machine",
-        },
-        Ref {
-            cmd: "vault sync",
-            note: "after editing .vault/intents/<uid>/intent.md",
-        },
-    ],
-    then: &[
-        Ref {
-            cmd: "intent validate <ID> --json",
-            note: "now conforms",
-        },
-        Ref {
-            cmd: "intent verify <ID>",
-            note: "read the signature back",
-        },
-        Ref {
-            cmd: "add .vault",
-            note: "then atomic record, to travel in the graph",
-        },
-    ],
-    instead: &[
-        Ref {
-            cmd: "intent validate <ID> --json",
-            note: "gate only, no signing key needed",
-        },
-    ],
-    fails: &[
-        Fail {
-            cond: "a violation attest cannot fill (status, why, scope)",
-            exit: 2,
-            fix: Ref {
-                cmd: "intent validate <ID>",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "no default identity",
-            exit: 2,
-            fix: Ref {
-                cmd: "identity new <n> --email <e> --set-default",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "--identity names an unknown identity",
-            exit: 3,
-            fix: Ref {
-                cmd: "identity list",
-                note: "",
-            },
-        },
-    ],
-    ..Doc::EMPTY
-};
 
 impl Command for IntentAttest {
     fn run(&self) -> CliResult<()> {

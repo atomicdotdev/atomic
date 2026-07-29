@@ -48,11 +48,8 @@
     unused_assignments
 )]
 
-mod agent_doc;
 mod agent_error;
-mod agent_guards;
 mod commands;
-mod emit;
 mod error;
 mod output;
 
@@ -134,12 +131,7 @@ usage: {usage}
 /// not in `--help`. We do the same for every argument's long help so clap does
 /// not fall back to its expanded, multi-paragraph layout for one command while
 /// staying compact for another — the whole tree renders the same terse way.
-///
-/// `path` is the command's position in the tree (`""` for the root, then
-/// `"memory"`, `"memory new"`, …). It is threaded through so the failure
-/// renderer can look a node's [`agent_doc`] row up by path; nothing derived
-/// from it reaches `--help`.
-fn apply_agent_help(path: &str, cmd: clap::Command) -> clap::Command {
+fn apply_agent_help(cmd: clap::Command) -> clap::Command {
     let subcommand_names: Vec<String> = cmd
         .get_subcommands()
         .map(|c| c.get_name().to_string())
@@ -150,27 +142,8 @@ fn apply_agent_help(path: &str, cmd: clap::Command) -> clap::Command {
         .long_about(None::<&str>)
         .mut_args(|arg| arg.long_help(None::<&str>));
 
-    // NOTHING is injected into `--help`. The rows in `agent_doc` feed only the
-    // parse-failure renderer.
-    //
-    // The template's own doc comment above states the position: the terse
-    // one-line summary is all an agent needs, and prose belongs on the docs
-    // website. Adding `when:`/`run:` lines here would argue with that — and the
-    // incident that motivated this module argues against it too. The agent had
-    // already read `--help` on three commands before it started dumping
-    // `strings` of the binary. Help was not the channel that failed; the
-    // failure output was.
-    //
-    // So `--help` renders exactly as it did, byte for byte, including
-    // `vault context`'s existing `after_help`.
-
     for name in subcommand_names {
-        let child_path = if path.is_empty() {
-            name.clone()
-        } else {
-            format!("{path} {name}")
-        };
-        cmd = cmd.mut_subcommand(name, move |c| apply_agent_help(&child_path, c));
+        cmd = cmd.mut_subcommand(name, apply_agent_help);
     }
     cmd
 }
@@ -250,12 +223,12 @@ enum Commands {
     /// Displays information about modified, added, deleted, and untracked files.
     Status(Status),
 
-    /// Add files to be tracked (not a staging area; record takes paths)
+    /// Add files to be tracked.
     ///
     /// Adds files to Atomic's internal tree so their changes can be recorded.
     Add(Add),
 
-    /// Untrack files (kept on disk unless --delete)
+    /// Remove files from tracking.
     ///
     /// Stops tracking files in the repository. Files can either be deleted
     /// from disk or kept as untracked files using the `--keep` flag.
@@ -292,7 +265,7 @@ enum Commands {
     #[command(visible_alias = "mv")]
     Move(Move),
 
-    /// Restore the working copy to the last recorded state (discards edits).
+    /// Restore the working copy to the last recorded state.
     ///
     /// Restores the working copy to match the pristine state (last recorded
     /// state in the view). This discards any uncommitted changes. Equivalent
@@ -362,7 +335,7 @@ enum Commands {
     /// Creates a new change from the current state of tracked files.
     Record(Record),
 
-    /// Revise any recorded change in-place (not just the last)
+    /// Revise a change in-place.
     ///
     /// Modifies a previously recorded change without losing its position
     /// in the view. This is useful for fixing typos, updating messages,
@@ -390,7 +363,7 @@ enum Commands {
     /// Displays the log of changes inserted into the current view.
     Log(Log),
 
-    /// Show a change's metadata, deps, AI attestation (content: diff -c)
+    /// Show details for a specific change.
     ///
     /// Displays detailed information about a change by hash, hash prefix,
     /// or sequence number. If no identifier is provided, shows the most
@@ -410,7 +383,7 @@ enum Commands {
     /// ```
     Change(ChangeCmd),
 
-    /// Insert changes into a view (from-view merges views locally)
+    /// Insert changes into a view.
     ///
     /// Inserts changes from change files, other views, or up to tagged states.
     /// Supports single change insertion, cross-view insert, and cherry-picking.
@@ -435,7 +408,7 @@ enum Commands {
     /// ```
     Insert(Insert),
 
-    /// Show the actual changed lines (working copy, or -c <hash>).
+    /// Show differences in the working copy.
     ///
     /// Displays the diff between the working copy and the last recorded state.
     /// Supports multiple output formats and diff algorithms.
@@ -545,7 +518,7 @@ enum Commands {
     /// ```
     Identity(Identity),
 
-    /// Manage per-repo named URLs that push/pull target
+    /// Manage remote repositories.
     ///
     /// Add, remove, list, and modify named remotes that can be used
     /// with push, pull, and clone commands.
@@ -567,7 +540,7 @@ enum Commands {
     /// ```
     Remote(Remote),
 
-    /// Manage global server profiles (used by org/workspace/project/team)
+    /// Manage server profiles (staging, production, etc.).
     ///
     /// Server profiles let you store multiple atomic-storage server
     /// configurations and switch between them easily. Each profile
@@ -842,7 +815,7 @@ enum Commands {
     #[command(name = "provenance")]
     Provenance(Provenance),
 
-    /// Remove the last change from the view (working copy untouched)
+    /// Remove the last change from the current view.
     ///
     /// The change is removed from the view's change log but NOT deleted
     /// from the change store. It can be re-inserted later with `atomic insert`.
@@ -882,24 +855,23 @@ fn main() {
     // Initialize logging
     env_logger::init();
 
-    // Parse command-line arguments through the agent-native help layout. We
-    // build the command tree, stamp the template and each command's guidance
-    // row onto every node, then parse.
+    // Parse command-line arguments through the agent-native help layout.
     //
     // `try_get_matches_from_mut` rather than `get_matches`: clap's own failure
     // output is human prose ending in "For more information, try '--help'",
-    // which costs an agent a second round trip and tells it nothing about WHY
-    // the command exists or what a working invocation looks like. We intercept
-    // and re-render in the same `key: value` dialect the rest of the machine
-    // surface speaks. Help and version still print through clap untouched.
-    let mut cmd = apply_agent_help("", Cli::command());
-    let matches = match cmd.try_get_matches_from_mut(std::env::args_os()) {
+    // which costs an agent a second round trip and may discard the option/value
+    // relationship or the parser's underlying cause. We intercept and re-render
+    // in the same `key: value` dialect the rest of the machine surface speaks.
+    // Help and version still print through clap untouched.
+    let mut cmd = apply_agent_help(Cli::command());
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let matches = match cmd.try_get_matches_from_mut(args.clone()) {
         Ok(matches) => matches,
-        Err(err) => agent_error::render_and_exit(err, &cmd),
+        Err(err) => agent_error::render_and_exit(err, &cmd, &args),
     };
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
-        Err(err) => agent_error::render_and_exit(err, &cmd),
+        Err(err) => agent_error::render_and_exit(err, &cmd, &args),
     };
 
     // Configure color output
@@ -1016,7 +988,7 @@ mod agent_help_tests {
     /// recursively across every command.
     #[test]
     fn agent_help_tree_is_valid() {
-        apply_agent_help("", Cli::command()).debug_assert();
+        apply_agent_help(Cli::command()).debug_assert();
     }
 
     /// Rendered help uses the agent-native template: a lowercase `usage:` line
@@ -1024,7 +996,7 @@ mod agent_help_tests {
     /// line the stock template prints).
     #[test]
     fn agent_help_template_is_applied() {
-        let mut cmd = apply_agent_help("", Cli::command());
+        let mut cmd = apply_agent_help(Cli::command());
         let help = cmd.render_help().to_string();
         assert!(
             help.contains("usage: atomic"),
@@ -1040,7 +1012,7 @@ mod agent_help_tests {
     /// `# Examples` markdown that derives from a command's doc comment.
     #[test]
     fn long_about_is_stripped() {
-        let tree = apply_agent_help("", Cli::command());
+        let tree = apply_agent_help(Cli::command());
         let mut intent = tree
             .find_subcommand("intent")
             .expect("intent command present")

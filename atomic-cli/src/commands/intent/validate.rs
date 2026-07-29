@@ -14,7 +14,6 @@ use crate::commands::intent::bridge;
 use crate::commands::intent::validation_failed;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::agent_doc::{Doc, Fail, Ref};
 
 /// Validate an intent against the canonical shapes.
 #[derive(Parser, Debug)]
@@ -27,82 +26,6 @@ pub struct IntentValidate {
     #[arg(long)]
     pub json: bool,
 }
-
-/// Agent guidance for `atomic intent validate`.
-///
-/// Deliberately does NOT document that a non-conforming report exits 2 even
-/// though the gate parsed and ran to completion. That contradicts the root
-/// taxonomy's "2 = usage, did not run", but it is a defect in `CliError`, not a
-/// contract: writing it down here would teach agents to depend on it and would
-/// silently become a lie the moment it is fixed. File it against `error.rs`
-/// instead — `ChangeNotFound`/`FileNotFound`/`IdentityNotFound` already map to
-/// 3, so these call sites are the outliers.
-pub const DOC: Doc = Doc {
-    when: "an intent changed and you need the gate's verdict",
-    run: "intent validate <ID> --json",
-    needs: &[
-        Ref {
-            cmd: "intent attest <ID>",
-            note: "fills attributedTo + proof",
-        },
-        Ref {
-            cmd: "vault sync",
-            note: "after editing any .vault file",
-        },
-    ],
-    then: &[
-        Ref {
-            cmd: "intent verify <ID>",
-            note: "check the signature too",
-        },
-    ],
-    instead: &[
-        Ref {
-            cmd: "intent verify <ID>",
-            note: "the signature, not the shapes",
-        },
-        Ref {
-            cmd: "intent list --json",
-            note: "gate state for every intent at once",
-        },
-    ],
-    fails: &[
-        Fail {
-            cond: "un-attested: attributedTo and proof are always missing",
-            exit: 2,
-            fix: Ref {
-                cmd: "intent attest <ID>",
-                note: "",
-            },
-        },
-        // No CLI verb sets these — the directive has to be hand-edited to add
-        // `verifiedBy=` and `evidence=` (and the evidence urn must resolve to a
-        // real change). `vault sync` was wrong here: it reports "Vault is up to
-        // date." and leaves validate failing identically.
-        Fail {
-            cond: "status=met criterion also needs verifiedBy= and evidence=; hand-edit, then sync",
-            exit: 2,
-            fix: Ref::UNFIXABLE,
-        },
-        Fail {
-            cond: ".vault file edited but not synced: stale answer",
-            exit: 0,
-            fix: Ref {
-                cmd: "vault sync",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "path form skips the attestation; proof always missing",
-            exit: 2,
-            fix: Ref {
-                cmd: "intent validate <ID>",
-                note: "",
-            },
-        },
-    ],
-    ..Doc::EMPTY
-};
 
 impl Command for IntentValidate {
     fn run(&self) -> CliResult<()> {

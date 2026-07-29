@@ -11,7 +11,6 @@ use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::agent_doc::{Doc, Fail, Ref};
 
 /// Delete an unstarted backlog intent.
 ///
@@ -32,57 +31,6 @@ pub struct IntentDelete {
     #[arg(long)]
     pub json: bool,
 }
-
-/// Agent guidance for `atomic intent delete`.
-///
-/// The first `fails:` row is the one that matters: without `--force` on a
-/// non-tty — every agent invocation — the confirmation prompt fails and is
-/// reported as an INTERNAL error, exit 128, complete with a "please report this
-/// bug" hint. The row exists so an agent passes --force instead of filing an
-/// issue.
-pub const DOC: Doc = Doc {
-    when: "a draft must be discarded before work starts",
-    run: "intent delete <ID> --force",
-    then: &[
-        Ref {
-            cmd: "intent list --json",
-            note: "confirm it is gone",
-        },
-    ],
-    instead: &[
-        Ref {
-            cmd: "intent update <ID> --status icebox",
-            note: "park started work instead",
-        },
-    ],
-    fails: &[
-        Fail {
-            cond: "no --force and no tty (every agent call)",
-            exit: 128,
-            fix: Ref {
-                cmd: "intent delete <ID> --force",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "status is not backlog",
-            exit: 3,
-            fix: Ref {
-                cmd: "intent update <ID> --status backlog",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "the intent is linked to a goal",
-            exit: 3,
-            fix: Ref {
-                cmd: "intent update <ID> --status icebox",
-                note: "",
-            },
-        },
-    ],
-    ..Doc::EMPTY
-};
 
 impl Command for IntentDelete {
     fn run(&self) -> CliResult<()> {

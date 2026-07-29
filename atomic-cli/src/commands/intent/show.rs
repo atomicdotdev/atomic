@@ -8,7 +8,6 @@ use atomic_repository::Repository;
 use crate::commands::intent::bridge;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::agent_doc::{Doc, Fail, Ref};
 
 /// Show an intent as a rendered read-time projection.
 ///
@@ -24,47 +23,6 @@ pub struct IntentShow {
     #[arg(long)]
     pub json: bool,
 }
-
-/// Agent guidance for `atomic intent show`.
-pub const DOC: Doc = Doc {
-    when: "need an intent's why, criteria and scope before acting",
-    run: "intent show <ID> --json",
-    then: &[
-        Ref {
-            cmd: "intent validate <ID> --json",
-            note: "is it still conformant",
-        },
-    ],
-    instead: &[
-        Ref {
-            cmd: "vault show intents/<uid>/intent.md",
-            note: "raw stored markdown, no lift",
-        },
-        Ref {
-            cmd: "query neighbors intent:<ULID>",
-            note: "KG edges; the urn form returns nothing",
-        },
-    ],
-    fails: &[
-        Fail {
-            cond: ".vault file edited but not synced: stale projection",
-            exit: 0,
-            fix: Ref {
-                cmd: "vault sync",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "stale attestation: warns, shows the un-attested node",
-            exit: 0,
-            fix: Ref {
-                cmd: "intent attest <ID>",
-                note: "",
-            },
-        },
-    ],
-    ..Doc::EMPTY
-};
 
 impl Command for IntentShow {
     fn run(&self) -> CliResult<()> {

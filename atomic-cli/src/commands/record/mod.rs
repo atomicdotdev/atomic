@@ -93,7 +93,6 @@ use atomic_repository::Repository;
 use crate::commands::{find_repository_root, Command, DEFAULT_HASH_LENGTH};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_warning};
-use crate::agent_doc::{Doc, Fail, Ref};
 
 // Record Command
 
@@ -258,82 +257,6 @@ pub struct Record {
     #[arg(long = "ai-session-id")]
     pub ai_session_id: Option<String>,
 }
-
-/// Agent guidance for `atomic record`.
-///
-/// The `run:` line carries both `-a` and `-m` for the same reason: without `-m`
-/// record prompts on stdin (the interactive check is `CI`/`ATOMIC_NONINTERACTIVE`
-/// env vars, NOT a tty test, so an agent subprocess hits the prompt), and
-/// without `-a` an untracked-only working copy is reported as "tree is clean".
-pub const DOC: Doc = Doc {
-    when: "a coherent unit of work is done and status is dirty",
-    run: "record -a -m \"<what changed and why>\"",
-    needs: &[
-        Ref {
-            cmd: "status -s",
-            note: "confirm the working copy is dirty",
-        },
-    ],
-    then: &[
-        Ref {
-            cmd: "log -n 1 -f oneline",
-            note: "the hash that landed",
-        },
-        Ref {
-            cmd: "push",
-            note: "",
-        },
-    ],
-    instead: &[
-        Ref {
-            cmd: "record --dry-run",
-            note: "preview, never prompts, writes nothing",
-        },
-        Ref {
-            cmd: "revise",
-            note: "amend the last change in place",
-        },
-        Ref {
-            cmd: "unrecord",
-            note: "remove the last change",
-        },
-    ],
-    fails: &[
-        Fail {
-            cond: "no -m: prompts on stdin, blocks or cancels",
-            exit: 1,
-            fix: Ref {
-                cmd: "record -m \"<msg>\"",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "untracked-only working copy reports 'tree is clean'",
-            exit: 1,
-            fix: Ref {
-                cmd: "record -a -m \"<msg>\"",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "a FILES path matched nothing; same 'clean' message",
-            exit: 1,
-            fix: Ref {
-                cmd: "status -s",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "--ai-assisted alone: no provenance",
-            exit: 0,
-            fix: Ref {
-                cmd: "record --ai-assisted --ai-provider <v>",
-                note: "",
-            },
-        },
-    ],
-    ..Doc::EMPTY
-};
 
 impl Record {
     /// Builder: set the commit message.

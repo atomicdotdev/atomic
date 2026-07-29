@@ -71,7 +71,7 @@ pub enum GoalCommands {
     /// ```
     Start(GoalStart),
 
-    /// Suspend the active goal (--promote to complete it).
+    /// Stop the current goal.
     ///
     /// Stops an active goal, optionally promoting it for team
     /// consumption or discarding it entirely.

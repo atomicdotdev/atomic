@@ -50,7 +50,6 @@ use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::agent_doc::{Doc, Fail, Ref};
 
 // Tuning constants
 
@@ -147,65 +146,6 @@ pub struct Context {
     #[arg(long)]
     pub json: bool,
 }
-
-/// Agent guidance for `atomic vault context`.
-///
-/// This is the real retrieval verb for memories: `query search` covers node
-/// ids, labels and summaries but never memory BODIES, while this command scans
-/// them.
-pub const DOC: Doc = Doc {
-    when: "before coding: recall decisions from earlier turns",
-    run: "vault context \"<task terms>\" --json",
-    needs: &[
-        Ref {
-            cmd: "vault init",
-            note: "if the repo has no vault yet",
-        },
-        Ref {
-            cmd: "vault sync",
-            note: "else hand-edited bodies read stale",
-        },
-    ],
-    then: &[
-        Ref {
-            cmd: "intent new \"<title>\"",
-            note: "seeded by what you just read",
-        },
-        Ref {
-            cmd: "memory new",
-            note: "record what this turn learned",
-        },
-    ],
-    instead: &[
-        Ref {
-            cmd: "query search \"<terms>\"",
-            note: "ids and labels only, never bodies",
-        },
-        Ref {
-            cmd: "memory list",
-            note: "enumerate, unranked",
-        },
-    ],
-    fails: &[
-        Fail {
-            cond: "--intent id is not in the vault manifest",
-            exit: 2,
-            fix: Ref {
-                cmd: "intent list",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "no seed returns recent memories, not relevant ones",
-            exit: 0,
-            fix: Ref {
-                cmd: "vault context \"<terms>\"",
-                note: "",
-            },
-        },
-    ],
-    ..Doc::EMPTY
-};
 
 impl Command for Context {
     fn run(&self) -> CliResult<()> {

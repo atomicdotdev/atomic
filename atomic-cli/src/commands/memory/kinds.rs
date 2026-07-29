@@ -18,7 +18,6 @@ use atomic_canonical::vocab::MEMORY_KIND_GUIDANCE;
 
 use crate::commands::Command;
 use crate::error::CliResult;
-use crate::agent_doc::{Doc, Ref};
 
 /// List the allowed memory kinds and when to use each.
 #[derive(Parser, Debug)]
@@ -28,23 +27,6 @@ pub struct MemoryKinds {
     #[arg(long)]
     pub json: bool,
 }
-
-/// Agent guidance for `atomic memory kinds`.
-///
-/// The only row in the family with an empty `fails:`, and correctly so: it
-/// touches no repository at all and works outside one, where every sibling
-/// exits 3.
-pub const DOC: Doc = Doc {
-    when: "picking --kind for memory new from the vocabulary",
-    run: "memory kinds --json",
-    then: &[
-        Ref {
-            cmd: "memory new --kind <kind> --text \"...\"",
-            note: "one memory per durable insight",
-        },
-    ],
-    ..Doc::EMPTY
-};
 
 impl Command for MemoryKinds {
     fn run(&self) -> CliResult<()> {

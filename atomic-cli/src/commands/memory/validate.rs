@@ -14,7 +14,6 @@ use crate::commands::memory::bridge;
 use crate::commands::memory::validation_failed;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::agent_doc::{Doc, Fail, Ref};
 
 /// Validate a memory against the canonical shapes.
 #[derive(Parser, Debug)]
@@ -27,58 +26,6 @@ pub struct MemoryValidate {
     #[arg(long)]
     pub json: bool,
 }
-
-/// Agent guidance for `atomic memory validate`.
-///
-/// `attest` runs this same gate before signing, which is why it is listed as an
-/// `instead:` rather than as a step after it.
-pub const DOC: Doc = Doc {
-    when: "confirming a memory conforms after attest or an edit",
-    run: "memory validate <id>",
-    needs: &[
-        Ref {
-            cmd: "memory attest <id>",
-            note: "an unattested memory ALWAYS fails on proof",
-        },
-        Ref {
-            cmd: "vault sync",
-            note: "after hand-editing .vault/memory/<id>.md",
-        },
-    ],
-    instead: &[
-        Ref {
-            cmd: "memory attest <id>",
-            note: "runs this gate before signing; validating first is redundant",
-        },
-    ],
-    fails: &[
-        Fail {
-            cond: "never attested: attributedTo + proof missing",
-            exit: 2,
-            fix: Ref {
-                cmd: "memory attest <id>",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "attestation went stale after an edit (warns, then fails)",
-            exit: 2,
-            fix: Ref {
-                cmd: "memory attest <id>",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "argument ends in .md and no such file exists",
-            exit: 3,
-            fix: Ref {
-                cmd: "memory validate <id>",
-                note: "",
-            },
-        },
-    ],
-    ..Doc::EMPTY
-};
 
 impl Command for MemoryValidate {
     fn run(&self) -> CliResult<()> {

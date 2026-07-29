@@ -39,7 +39,6 @@ use atomic_repository::Repository;
 use crate::commands::intent::bridge;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::agent_doc::{Doc, Fail, Ref};
 
 /// The EN DASH used everywhere for a "not applicable" cell.
 const NA: &str = "–";
@@ -58,51 +57,6 @@ pub struct IntentList {
     #[arg(long)]
     pub json: bool,
 }
-
-/// Agent guidance for `atomic intent list`.
-///
-/// Note the asymmetry encoded in the first `fails:` row: with no vault this
-/// prints `No intents found.` and exits 0, while `intent new` in the same repo
-/// exits 3.
-pub const DOC: Doc = Doc {
-    when: "orienting: what intents exist and are they signed",
-    run: "intent list --json",
-    then: &[
-        Ref {
-            cmd: "intent show <ID> --json",
-            note: "read one row's contents",
-        },
-        Ref {
-            cmd: "intent attest <ID>",
-            note: "for rows showing stale or -",
-        },
-    ],
-    instead: &[
-        Ref {
-            cmd: "vault list --type intent",
-            note: "paths and sizes, no attestation columns",
-        },
-    ],
-    fails: &[
-        Fail {
-            cond: "no vault: prints 'No intents found', not an error",
-            exit: 0,
-            fix: Ref {
-                cmd: "vault init",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "--identity unknown (a missing DEFAULT is soft, this is not)",
-            exit: 3,
-            fix: Ref {
-                cmd: "identity list",
-                note: "",
-            },
-        },
-    ],
-    ..Doc::EMPTY
-};
 
 /// The classification of one intent's attestation, for a table/JSON row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

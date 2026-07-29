@@ -1,6 +1,5 @@
 use super::output::*;
 use super::*;
-use crate::agent_doc::{Doc, Fail, Ref};
 
 // Diff Command
 
@@ -79,54 +78,6 @@ pub struct Diff {
     #[arg(long)]
     pub word_diff: bool,
 }
-
-/// Agent guidance for `atomic diff`.
-///
-/// `--view` is parsed and stored but never read by `run()`, so it silently
-/// diffs the CURRENT view — even for a view name that does not exist.
-pub const DOC: Doc = Doc {
-    when: "you must see the exact edits before recording them",
-    run: "diff --untracked",
-    then: &[
-        Ref {
-            cmd: "record -a -m \"<msg>\"",
-            note: "",
-        },
-    ],
-    instead: &[
-        Ref {
-            cmd: "diff --stat",
-            note: "counts only, no content",
-        },
-        Ref {
-            cmd: "diff -c <hash>",
-            note: "a recorded change, not the working copy",
-        },
-        Ref {
-            cmd: "status -s",
-            note: "which files, without the content",
-        },
-    ],
-    fails: &[
-        Fail {
-            cond: "--view is parsed but ignored; diffs the current view",
-            exit: 0,
-            fix: Ref {
-                cmd: "view switch <name>",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "untracked files are omitted from the default output",
-            exit: 0,
-            fix: Ref {
-                cmd: "diff --untracked",
-                note: "",
-            },
-        },
-    ],
-    ..Doc::EMPTY
-};
 
 impl Diff {
     /// Create a new Diff command with default settings.

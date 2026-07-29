@@ -96,7 +96,6 @@ use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::agent_doc::{Doc, Fail, Ref};
 use crate::output::{
     added, hint, info, print_blank, print_hint, print_success, print_warning, warning,
 };
@@ -184,54 +183,6 @@ pub struct Add {
     #[arg(short = 'd', long = "directory")]
     pub directory: bool,
 }
-
-/// Agent guidance for `atomic add`.
-///
-/// The single `fails:` row is a defect worth knowing about rather than a
-/// design: a nonexistent path is collapsed into an INTERNAL error (exit 128,
-/// with a "please report a bug" hint) instead of the accurate FileNotFound,
-/// which would be exit 3.
-pub const DOC: Doc = Doc {
-    when: "status shows ?? for a file that belongs in the record",
-    run: "add <path>...",
-    needs: &[
-        Ref {
-            cmd: "status -s",
-            note: "the ?? lines are the candidates",
-        },
-    ],
-    then: &[
-        Ref {
-            cmd: "record -m \"<msg>\"",
-            note: "add stores no content by itself",
-        },
-    ],
-    instead: &[
-        Ref {
-            cmd: "record -a -m \"<msg>\"",
-            note: "tracks and records in one step",
-        },
-        Ref {
-            cmd: "add -A",
-            note: "every untracked path at once",
-        },
-        Ref {
-            cmd: "add -n <path>",
-            note: "preview only",
-        },
-    ],
-    fails: &[
-        Fail {
-            cond: "a listed path does not exist (reported as a bug)",
-            exit: 128,
-            fix: Ref {
-                cmd: "status -s",
-                note: "",
-            },
-        },
-    ],
-    ..Doc::EMPTY
-};
 
 impl Add {
     /// Create a new Add command with default settings.

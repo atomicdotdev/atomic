@@ -132,7 +132,7 @@ pub enum AgentCommands {
     /// ```
     Disable(Disable),
 
-    /// Show agent integration status (hooks installed + sessions).
+    /// Show agent integration status.
     ///
     /// Displays information about installed hooks, active sessions,
     /// file watcher state, and recent turn history.
@@ -148,7 +148,7 @@ pub enum AgentCommands {
     /// ```
     Status(AgentStatus),
 
-    /// Generate AI reasoning summaries (calls out to Claude CLI).
+    /// Generate AI reasoning summaries for agent turns.
     ///
     /// Reads the condensed transcript from recorded changes and calls
     /// Claude CLI to generate structured reasoning: intent, outcome,
@@ -170,7 +170,7 @@ pub enum AgentCommands {
     /// ```
     Explain(Explain),
 
-    /// List and inspect AI cost/provenance attestations.
+    /// List and inspect attestations.
     ///
     /// Shows graph-level audit nodes that capture AI cost, token usage,
     /// model breakdown, and which changes are covered. Attestations

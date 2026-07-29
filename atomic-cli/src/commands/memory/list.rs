@@ -40,7 +40,6 @@ use atomic_repository::Repository;
 use crate::commands::memory::bridge;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::agent_doc::{Doc, Fail, Ref};
 
 /// The EN DASH used everywhere for a "not applicable" cell.
 const NA: &str = "–";
@@ -63,54 +62,6 @@ pub struct MemoryList {
     #[arg(long)]
     pub json: bool,
 }
-
-/// Agent guidance for `atomic memory list`.
-///
-/// An inventory, NOT retrieval: `vault context` is the verb that ranks memories
-/// by relevance to a task.
-pub const DOC: Doc = Doc {
-    when: "you need the inventory of memories and sign state",
-    run: "memory list -n 20",
-    then: &[
-        Ref {
-            cmd: "memory show <id>",
-            note: "read one row's text",
-        },
-        Ref {
-            cmd: "memory attest <id>",
-            note: "for rows whose attested cell is - or stale",
-        },
-    ],
-    instead: &[
-        Ref {
-            cmd: "vault context \"<terms>\"",
-            note: "relevance retrieval, not an inventory",
-        },
-        Ref {
-            cmd: "vault list --type memory",
-            note: "raw paths and sizes, no lift",
-        },
-    ],
-    fails: &[
-        Fail {
-            cond: "attested fresh, verifies -: different signer",
-            exit: 0,
-            fix: Ref {
-                cmd: "memory list --identity <name>",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "--identity names an unknown identity (hard error)",
-            exit: 3,
-            fix: Ref {
-                cmd: "identity list",
-                note: "",
-            },
-        },
-    ],
-    ..Doc::EMPTY
-};
 
 /// The classification of one memory's attestation, for a table/JSON row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

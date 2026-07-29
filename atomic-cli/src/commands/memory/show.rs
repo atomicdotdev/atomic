@@ -8,7 +8,6 @@ use atomic_repository::Repository;
 use crate::commands::memory::bridge;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::agent_doc::{Doc, Fail, Ref};
 
 /// Show a memory as a rendered read-time projection.
 ///
@@ -24,68 +23,6 @@ pub struct MemoryShow {
     #[arg(long)]
     pub json: bool,
 }
-
-/// Agent guidance for `atomic memory show`.
-pub const DOC: Doc = Doc {
-    when: "you have a memory id and need its text and sign state",
-    // NOT `--json`: the two `then:` refs branch on the `signed: yes|no` line,
-    // and the JSON projection emits `proof`/`attributedTo` with no `signed` key
-    // at all — an agent following the `run:` would never see what they name.
-    run: "memory show <id>",
-    needs: &[
-        Ref {
-            cmd: "vault sync",
-            note: "after hand-editing .vault/memory/<id>.md",
-        },
-    ],
-    then: &[
-        Ref {
-            cmd: "memory verify <id>",
-            note: "when it printed signed: yes",
-        },
-        Ref {
-            cmd: "memory attest <id>",
-            note: "when it printed signed: no",
-        },
-    ],
-    instead: &[
-        Ref {
-            cmd: "vault show memory/<id>.md",
-            note: "raw stored bytes, no lift and no gate",
-        },
-        Ref {
-            cmd: "vault context \"<terms>\"",
-            note: "when you do not have an id yet",
-        },
-    ],
-    fails: &[
-        Fail {
-            cond: "entry came from memory write: no uid, cannot lift",
-            exit: 2,
-            fix: Ref {
-                cmd: "vault show memory/<id>.md",
-                note: "",
-            },
-        },
-        Fail {
-            cond: ".vault edited but not synced: prints the pre-edit text",
-            exit: 0,
-            fix: Ref {
-                cmd: "vault sync",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "stale attestation: warns, prints signed: no",
-            exit: 0,
-            fix: Ref {
-                cmd: "memory attest <id>",
-                note: "",
-            },
-        },
-    ],
-    ..Doc::EMPTY
-};
 
 impl Command for MemoryShow {
     fn run(&self) -> CliResult<()> {

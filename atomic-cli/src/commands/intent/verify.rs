@@ -14,7 +14,6 @@ use atomic_repository::Repository;
 use crate::commands::intent::bridge;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::agent_doc::{Doc, Fail, Ref};
 
 /// Verify an intent's attestation (hash + signature) against a public key.
 #[derive(Parser, Debug)]
@@ -28,61 +27,6 @@ pub struct IntentVerify {
     #[arg(long)]
     pub identity: Option<String>,
 }
-
-/// Agent guidance for `atomic intent verify`.
-pub const DOC: Doc = Doc {
-    when: "need proof an attestation holds and who signed it",
-    run: "intent verify <ID>",
-    needs: &[
-        Ref {
-            cmd: "intent attest <ID>",
-            note: "nothing to verify otherwise",
-        },
-    ],
-    then: &[
-        Ref {
-            cmd: "intent show <ID> --json",
-            note: "the attested projection",
-        },
-    ],
-    instead: &[
-        Ref {
-            cmd: "intent list --json",
-            note: "verify state for every intent at once",
-        },
-        Ref {
-            cmd: "intent validate <ID> --json",
-            note: "the shapes, not the signature",
-        },
-    ],
-    fails: &[
-        Fail {
-            cond: "no attestation for this intent",
-            exit: 2,
-            fix: Ref {
-                cmd: "intent attest <ID>",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "intent changed since signing (stale attestation)",
-            exit: 2,
-            fix: Ref {
-                cmd: "intent attest <ID>",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "attested by a different identity",
-            exit: 2,
-            fix: Ref {
-                cmd: "intent verify <ID> --identity <name>",
-                note: "",
-            },
-        },
-    ],
-    ..Doc::EMPTY
-};
 
 impl Command for IntentVerify {
     fn run(&self) -> CliResult<()> {

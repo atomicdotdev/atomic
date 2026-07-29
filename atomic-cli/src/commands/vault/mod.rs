@@ -117,7 +117,7 @@ pub enum VaultCommands {
     /// ```
     List(List),
 
-    /// Materialize vault entries to disk (clobbers unsynced edits)
+    /// Materialize vault entries to markdown on disk.
     ///
     /// Writes vault entries from the database to the filesystem as
     /// markdown files. Use `--path` to materialize a single entry.
@@ -130,7 +130,7 @@ pub enum VaultCommands {
     /// ```
     Materialize(Materialize),
 
-    /// Sync .vault/ markdown disk -> db (deletions propagate).
+    /// Sync vault markdown files back to the database.
     ///
     /// Reads modified vault markdown files from disk and updates
     /// the database to match.
@@ -142,7 +142,7 @@ pub enum VaultCommands {
     /// ```
     Sync(Sync),
 
-    /// Manage vault goals (work sessions, not objectives).
+    /// Manage vault goals.
     ///
     /// Goals track development activity — start, stop, resume,
     /// list, and inspect goals.
@@ -163,7 +163,7 @@ pub enum VaultCommands {
     /// file paths, and emits prompt-ready Markdown (or JSON).
     Context(Context),
 
-    /// Print the first 200 chars of each tool result, as JSON.
+    /// Get tool result summaries for a goal.
     ///
     /// Retrieves previews of tool results stored in the vault,
     /// optionally filtered to a specific goal.

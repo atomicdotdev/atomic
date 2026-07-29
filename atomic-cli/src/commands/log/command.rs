@@ -1,5 +1,4 @@
 use super::*;
-use crate::agent_doc::{Doc, Fail, Ref};
 
 // Log Command
 
@@ -98,43 +97,6 @@ pub struct Log {
     #[arg(long = "all", hide = true)]
     pub all: bool,
 }
-
-/// Agent guidance for `atomic log`.
-pub const DOC: Doc = Doc {
-    when: "you need a change hash, or what was recorded when",
-    run: "log -n 10 -f oneline",
-    then: &[
-        Ref {
-            cmd: "change <hash>",
-            note: "full detail for one change",
-        },
-        Ref {
-            cmd: "diff -c <hash>",
-            note: "the content that change carries",
-        },
-    ],
-    instead: &[
-        Ref {
-            cmd: "log -f json",
-            note: "machine-parseable, full 52-char hashes",
-        },
-        Ref {
-            cmd: "status -s",
-            note: "uncommitted work, not history",
-        },
-    ],
-    fails: &[
-        Fail {
-            cond: "--path is not implemented; unfiltered log returned",
-            exit: 0,
-            fix: Ref {
-                cmd: "change <hash>",
-                note: "",
-            },
-        },
-    ],
-    ..Doc::EMPTY
-};
 
 impl Log {
     /// Create a new Log command with default settings.
