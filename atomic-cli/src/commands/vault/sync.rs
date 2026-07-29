@@ -77,13 +77,14 @@ pub const DOC: Doc = Doc {
         },
     ],
     fails: &[
+        // `vault materialize` is prevention, NOT recovery: it reports success
+        // and restores nothing, so it must not appear as the `fix`. Verified —
+        // rm an entry, sync ("Synced 1 vault files.", exit 0), materialize
+        // ("Materialized 4 vault entries.", exit 0), show -> not found.
         Fail {
-            cond: "a vault entry missing from disk is deleted, not skipped",
+            cond: "an entry missing from disk is deleted from the db, unrecoverably",
             exit: 0,
-            fix: Ref {
-                cmd: "vault materialize",
-                note: "",
-            },
+            fix: Ref::UNFIXABLE,
         },
     ],
     ..Doc::EMPTY

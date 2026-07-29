@@ -42,6 +42,10 @@ pub const DOC: Doc = Doc {
     run: "memory attest <id>",
     needs: &[
         Ref {
+            cmd: "identity new <name> --email <e> --set-default",
+            note: "once per machine",
+        },
+        Ref {
             cmd: "memory new --kind <k> --text \"...\"",
             note: "the memory must already exist",
         },
@@ -73,11 +77,21 @@ pub const DOC: Doc = Doc {
                 note: "",
             },
         },
+        // Same signing path as `intent attest` (identity resolution is shared),
+        // so it carries the same two identity failures.
         Fail {
-            cond: "id not found: a data error reported with the usage code",
+            cond: "no default identity",
             exit: 2,
             fix: Ref {
-                cmd: "memory list",
+                cmd: "identity new <n> --email <e> --set-default",
+                note: "",
+            },
+        },
+        Fail {
+            cond: "--identity names an unknown identity",
+            exit: 3,
+            fix: Ref {
+                cmd: "identity list",
                 note: "",
             },
         },

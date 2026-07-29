@@ -1216,8 +1216,11 @@ pub const NEIGHBORS_DOC: Doc = Doc {
     ],
     instead: &[
         Ref {
-            cmd: "query graph \"<terms>\"",
-            note: "multi-seed subgraph, DOT or JSON",
+            // `--json` is not optional here: with no output flag `query graph`
+            // writes an HTML file and shells out to `open`, so an agent
+            // following this ref gets a browser window and empty stdout.
+            cmd: "query graph \"<terms>\" --json",
+            note: "multi-seed subgraph",
         },
     ],
     fails: &[

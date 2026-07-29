@@ -30,10 +30,13 @@ pub struct IntentValidate {
 
 /// Agent guidance for `atomic intent validate`.
 ///
-/// The last `fails:` row is deliberately fix-less. A non-conforming report is
-/// reported with exit 2 even though the command parsed and RAN to completion —
-/// the root taxonomy's "2 = usage, did not run" would otherwise send an agent
-/// back to `--help` for a verdict it already has.
+/// Deliberately does NOT document that a non-conforming report exits 2 even
+/// though the gate parsed and ran to completion. That contradicts the root
+/// taxonomy's "2 = usage, did not run", but it is a defect in `CliError`, not a
+/// contract: writing it down here would teach agents to depend on it and would
+/// silently become a lie the moment it is fixed. File it against `error.rs`
+/// instead — `ChangeNotFound`/`FileNotFound`/`IdentityNotFound` already map to
+/// 3, so these call sites are the outliers.
 pub const DOC: Doc = Doc {
     when: "an intent changed and you need the gate's verdict",
     run: "intent validate <ID> --json",
@@ -72,13 +75,14 @@ pub const DOC: Doc = Doc {
                 note: "",
             },
         },
+        // No CLI verb sets these — the directive has to be hand-edited to add
+        // `verifiedBy=` and `evidence=` (and the evidence urn must resolve to a
+        // real change). `vault sync` was wrong here: it reports "Vault is up to
+        // date." and leaves validate failing identically.
         Fail {
-            cond: "status=met criterion with no verifiedBy+evidence",
+            cond: "status=met criterion also needs verifiedBy= and evidence=; hand-edit, then sync",
             exit: 2,
-            fix: Ref {
-                cmd: "vault sync",
-                note: "",
-            },
+            fix: Ref::UNFIXABLE,
         },
         Fail {
             cond: ".vault file edited but not synced: stale answer",
@@ -95,11 +99,6 @@ pub const DOC: Doc = Doc {
                 cmd: "intent validate <ID>",
                 note: "",
             },
-        },
-        Fail {
-            cond: "report says does not conform - the gate DID run",
-            exit: 2,
-            fix: Ref::UNFIXABLE,
         },
     ],
     ..Doc::EMPTY

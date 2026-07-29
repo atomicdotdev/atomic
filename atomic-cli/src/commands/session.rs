@@ -100,14 +100,6 @@ pub const SHOW_DOC: Doc = Doc {
     ],
     fails: &[
         Fail {
-            cond: "unknown session id is a usage error, not a data error",
-            exit: 2,
-            fix: Ref {
-                cmd: "session show",
-                note: "",
-            },
-        },
-        Fail {
             cond: "'No sessions recorded.' though provenance exists",
             exit: 0,
             fix: Ref {

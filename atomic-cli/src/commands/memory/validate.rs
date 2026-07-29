@@ -48,7 +48,7 @@ pub const DOC: Doc = Doc {
     instead: &[
         Ref {
             cmd: "memory attest <id>",
-            note: "runs this same gate, then signs; skip validate",
+            note: "runs this gate before signing; validating first is redundant",
         },
     ],
     fails: &[
@@ -65,14 +65,6 @@ pub const DOC: Doc = Doc {
             exit: 2,
             fix: Ref {
                 cmd: "memory attest <id>",
-                note: "",
-            },
-        },
-        Fail {
-            cond: "id not found: a data error reported with the usage code",
-            exit: 2,
-            fix: Ref {
-                cmd: "memory list",
                 note: "",
             },
         },

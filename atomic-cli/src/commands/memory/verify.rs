@@ -73,14 +73,6 @@ pub const DOC: Doc = Doc {
                 note: "",
             },
         },
-        Fail {
-            cond: "id not found: a data error reported with the usage code",
-            exit: 2,
-            fix: Ref {
-                cmd: "memory list",
-                note: "",
-            },
-        },
     ],
     ..Doc::EMPTY
 };

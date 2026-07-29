@@ -28,7 +28,10 @@ pub struct MemoryShow {
 /// Agent guidance for `atomic memory show`.
 pub const DOC: Doc = Doc {
     when: "you have a memory id and need its text and sign state",
-    run: "memory show <id> --json",
+    // NOT `--json`: the two `then:` refs branch on the `signed: yes|no` line,
+    // and the JSON projection emits `proof`/`attributedTo` with no `signed` key
+    // at all — an agent following the `run:` would never see what they name.
+    run: "memory show <id>",
     needs: &[
         Ref {
             cmd: "vault sync",
@@ -56,14 +59,6 @@ pub const DOC: Doc = Doc {
         },
     ],
     fails: &[
-        Fail {
-            cond: "id not found: a data error reported with the usage code",
-            exit: 2,
-            fix: Ref {
-                cmd: "memory list",
-                note: "",
-            },
-        },
         Fail {
             cond: "entry came from memory write: no uid, cannot lift",
             exit: 2,
