@@ -111,7 +111,7 @@ use crate::error::CliResult;
 /// perspectives on the same underlying graph rather than divergent histories.
 #[derive(Subcommand, Debug)]
 pub enum ViewCommands {
-    /// Promote a view to shared root scope.
+    /// Promote a view to a permanent shared root (moves no changes)
     ///
     /// Changes the view to Shared with no parent, enabling fast status.
     ///
@@ -123,7 +123,7 @@ pub enum ViewCommands {
     /// ```
     Promote(Promote),
 
-    /// Create a new view.
+    /// Create a new view (empty by default, --from to fork)
     ///
     /// Creates a new view, optionally based on the current view's state.
     /// By default, the new view starts with the same changes as the current view.

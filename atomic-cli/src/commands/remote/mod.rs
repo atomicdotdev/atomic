@@ -77,7 +77,7 @@ pub enum RemoteSubcommand {
     #[command(name = "rename")]
     Rename(RemoteRename),
 
-    /// Set the default remote.
+    /// Mark a remote default (push/pull still target origin)
     #[command(name = "default")]
     Default(RemoteDefault),
 }

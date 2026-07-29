@@ -42,7 +42,7 @@ enum LifecycleCommands {
     /// Declare a managed agent run owned by an outer orchestrator.
     Begin(Begin),
 
-    /// Renew a managed run's lease.
+    /// Renew a managed run's lease (once expired, begin again).
     Renew(Renew),
 
     /// End a managed run and print its summary (sessions, changes, views).

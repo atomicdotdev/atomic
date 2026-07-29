@@ -136,16 +136,9 @@ usage: {usage}
 /// staying compact for another — the whole tree renders the same terse way.
 ///
 /// `path` is the command's position in the tree (`""` for the root, then
-/// `"memory"`, `"memory new"`, …). It is what lets each node pick up its own
-/// [`agent_doc`] row: the registry is keyed by path, so a node knows which row
-/// is its own without any node having to name itself.
-///
-/// The row's block is APPENDED to `after_help`, never set.
-/// [`clap::Command::after_help`] is a plain setter (clap_builder-4.6.0
-/// `command.rs:2026`), so an unconditional call would silently delete the one
-/// command in the tree that already ships an `after_help` block
-/// (`atomic vault context`). `agent_guards::existing_after_help_is_preserved`
-/// pins that.
+/// `"memory"`, `"memory new"`, …). It is threaded through so the failure
+/// renderer can look a node's [`agent_doc`] row up by path; nothing derived
+/// from it reaches `--help`.
 fn apply_agent_help(path: &str, cmd: clap::Command) -> clap::Command {
     let subcommand_names: Vec<String> = cmd
         .get_subcommands()
@@ -257,12 +250,12 @@ enum Commands {
     /// Displays information about modified, added, deleted, and untracked files.
     Status(Status),
 
-    /// Add files to be tracked.
+    /// Add files to be tracked (not a staging area; record takes paths)
     ///
     /// Adds files to Atomic's internal tree so their changes can be recorded.
     Add(Add),
 
-    /// Remove files from tracking.
+    /// Untrack files (kept on disk unless --delete)
     ///
     /// Stops tracking files in the repository. Files can either be deleted
     /// from disk or kept as untracked files using the `--keep` flag.
@@ -299,7 +292,7 @@ enum Commands {
     #[command(visible_alias = "mv")]
     Move(Move),
 
-    /// Restore the working copy to the last recorded state.
+    /// Restore the working copy to the last recorded state (discards edits).
     ///
     /// Restores the working copy to match the pristine state (last recorded
     /// state in the view). This discards any uncommitted changes. Equivalent
@@ -369,7 +362,7 @@ enum Commands {
     /// Creates a new change from the current state of tracked files.
     Record(Record),
 
-    /// Revise a change in-place.
+    /// Revise any recorded change in-place (not just the last)
     ///
     /// Modifies a previously recorded change without losing its position
     /// in the view. This is useful for fixing typos, updating messages,
@@ -397,7 +390,7 @@ enum Commands {
     /// Displays the log of changes inserted into the current view.
     Log(Log),
 
-    /// Show details for a specific change.
+    /// Show a change's metadata, deps, AI attestation (content: diff -c)
     ///
     /// Displays detailed information about a change by hash, hash prefix,
     /// or sequence number. If no identifier is provided, shows the most
@@ -417,7 +410,7 @@ enum Commands {
     /// ```
     Change(ChangeCmd),
 
-    /// Insert changes into a view.
+    /// Insert changes into a view (from-view merges views locally)
     ///
     /// Inserts changes from change files, other views, or up to tagged states.
     /// Supports single change insertion, cross-view insert, and cherry-picking.
@@ -442,7 +435,7 @@ enum Commands {
     /// ```
     Insert(Insert),
 
-    /// Show differences in the working copy.
+    /// Show the actual changed lines (working copy, or -c <hash>).
     ///
     /// Displays the diff between the working copy and the last recorded state.
     /// Supports multiple output formats and diff algorithms.
@@ -552,7 +545,7 @@ enum Commands {
     /// ```
     Identity(Identity),
 
-    /// Manage remote repositories.
+    /// Manage per-repo named URLs that push/pull target
     ///
     /// Add, remove, list, and modify named remotes that can be used
     /// with push, pull, and clone commands.
@@ -574,7 +567,7 @@ enum Commands {
     /// ```
     Remote(Remote),
 
-    /// Manage server profiles (staging, production, etc.).
+    /// Manage global server profiles (used by org/workspace/project/team)
     ///
     /// Server profiles let you store multiple atomic-storage server
     /// configurations and switch between them easily. Each profile
@@ -849,7 +842,7 @@ enum Commands {
     #[command(name = "provenance")]
     Provenance(Provenance),
 
-    /// Remove the last change from the current view.
+    /// Remove the last change from the view (working copy untouched)
     ///
     /// The change is removed from the view's change log but NOT deleted
     /// from the change store. It can be re-inserted later with `atomic insert`.

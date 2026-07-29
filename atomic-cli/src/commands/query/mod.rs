@@ -92,7 +92,7 @@ pub enum QueryCommands {
     /// ```
     Index(QueryIndex),
 
-    /// Search source code content using the syntext index.
+    /// Search file contents by regex (file:line hits, not KG nodes).
     ///
     /// Searches the indexed content of all files in the repository.
     /// Requires the content index to be built first via `atomic vault query enrich`.
@@ -107,7 +107,7 @@ pub enum QueryCommands {
     /// ```
     Code(QueryCode),
 
-    /// Build a visual graph from a search query.
+    /// Build a subgraph from a search query (default opens a browser).
     ///
     /// Searches the KG, expands results via neighbor traversal, and emits
     /// the resulting subgraph in DOT (Graphviz) format. Pipe to `dot` to
@@ -177,7 +177,7 @@ pub enum QueryCommands {
     /// ```
     Plan(PlanExec),
 
-    /// Ask a question using the knowledge graph (RAG).
+    /// Ask an LLM sub-agent about the repo (needs an API key).
     ///
     /// Searches the KG for relevant nodes and edges, builds a context
     /// string, and calls an LLM to generate an answer. Falls back to

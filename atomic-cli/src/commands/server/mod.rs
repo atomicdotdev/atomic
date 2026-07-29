@@ -77,7 +77,7 @@ pub enum ServerSubcommand {
     #[command(name = "set")]
     Set(ServerSet),
 
-    /// Show details for a server profile.
+    /// Show one server profile (bare 'atomic server' lists all)
     ///
     /// Without a name, shows the currently active profile.
     #[command(name = "show")]

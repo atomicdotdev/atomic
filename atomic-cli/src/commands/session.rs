@@ -20,7 +20,7 @@ pub struct Session {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommands {
-    /// Show the ordered Atomic ledger for a session.
+    /// List recent sessions (add an id for its ordered ledger)
     Show(SessionShow),
     /// Fork a session at a turn boundary into a new child session.
     Fork(SessionFork),
