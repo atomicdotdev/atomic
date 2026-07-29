@@ -10,6 +10,7 @@
 use clap::Parser;
 
 use crate::commands::Command;
+use crate::emit::emit_stderr;
 use crate::error::CliResult;
 
 /// Removed: `atomic vault intent …` → `atomic intent …`.
@@ -79,16 +80,35 @@ fn first_verb(args: &[String]) -> &str {
         .unwrap_or("")
 }
 
+/// The redirect as `key: value` data, in emission order.
+///
+/// Split out from [`emit_removed`] so the shape is testable without spawning a
+/// process — [`emit_removed`] itself never returns.
+pub fn removed_lines(
+    removed: &str,
+    family: &str,
+    verbs: &str,
+    run: &str,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("removed", removed.to_string()),
+        ("use", family.to_string()),
+        ("verbs", verbs.to_string()),
+        ("run", run.to_string()),
+        ("help", format!("{family} --help")),
+    ]
+}
+
 /// Emit the machine-parseable redirect to stderr and exit non-zero (2).
 ///
 /// Agent-oriented by construction: one `key: value` datum per line, stable
 /// keys (`removed`/`use`/`verbs`/`run`/`help`), no styling. Exiting 2 (a usage
 /// error, distinct from 1) tells the caller the command did not run.
+///
+/// Rendering goes through [`crate::emit`] — the single definition of what a
+/// `key: value` line looks like — so this shim, the injected `--help` block and
+/// the parse-failure renderer cannot drift into three dialects.
 fn emit_removed(removed: &str, family: &str, verbs: &str, run: &str) -> CliResult<()> {
-    eprintln!("removed: {removed}");
-    eprintln!("use: {family}");
-    eprintln!("verbs: {verbs}");
-    eprintln!("run: {run}");
-    eprintln!("help: {family} --help");
+    emit_stderr(&removed_lines(removed, family, verbs, run));
     std::process::exit(2);
 }

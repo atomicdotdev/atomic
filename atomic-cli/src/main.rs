@@ -48,7 +48,11 @@
     unused_assignments
 )]
 
+mod agent_doc;
+mod agent_error;
+mod agent_guards;
 mod commands;
+mod emit;
 mod error;
 mod output;
 
@@ -130,17 +134,56 @@ usage: {usage}
 /// not in `--help`. We do the same for every argument's long help so clap does
 /// not fall back to its expanded, multi-paragraph layout for one command while
 /// staying compact for another — the whole tree renders the same terse way.
-fn apply_agent_help(cmd: clap::Command) -> clap::Command {
+///
+/// `path` is the command's position in the tree (`""` for the root, then
+/// `"memory"`, `"memory new"`, …). It is what lets each node pick up its own
+/// [`agent_doc`] row: the registry is keyed by path, so a node knows which row
+/// is its own without any node having to name itself.
+///
+/// The row's block is APPENDED to `after_help`, never set.
+/// [`clap::Command::after_help`] is a plain setter (clap_builder-4.6.0
+/// `command.rs:2026`), so an unconditional call would silently delete the one
+/// command in the tree that already ships an `after_help` block
+/// (`atomic vault context`). `agent_guards::existing_after_help_is_preserved`
+/// pins that.
+fn apply_agent_help(path: &str, cmd: clap::Command) -> clap::Command {
     let subcommand_names: Vec<String> = cmd
         .get_subcommands()
         .map(|c| c.get_name().to_string())
         .collect();
+
+    let existing = cmd.get_after_help().map(|s| s.to_string());
+
     let mut cmd = cmd
         .help_template(AGENT_HELP_TEMPLATE)
         .long_about(None::<&str>)
         .mut_args(|arg| arg.long_help(None::<&str>));
+
+    // The root carries the exit-code taxonomy once; every other node carries
+    // at most its own two capped lines, and undocumented nodes carry nothing.
+    let injected = if path.is_empty() {
+        Some(agent_doc::root_block())
+    } else {
+        agent_doc::lookup(path)
+            .map(|doc| doc.help_block())
+            .filter(|block| !block.is_empty())
+    };
+
+    if let Some(block) = injected {
+        let combined = match existing {
+            Some(prev) if !prev.is_empty() => format!("{prev}\n\n{block}"),
+            _ => block,
+        };
+        cmd = cmd.after_help(combined);
+    }
+
     for name in subcommand_names {
-        cmd = cmd.mut_subcommand(name, apply_agent_help);
+        let child_path = if path.is_empty() {
+            name.clone()
+        } else {
+            format!("{path} {name}")
+        };
+        cmd = cmd.mut_subcommand(name, move |c| apply_agent_help(&child_path, c));
     }
     cmd
 }
@@ -853,13 +896,23 @@ fn main() {
     env_logger::init();
 
     // Parse command-line arguments through the agent-native help layout. We
-    // build the command tree, stamp the template onto every node, let clap do
-    // its normal validation/help/error handling, then reconstruct the typed
-    // `Cli` from the resulting matches.
-    let matches = apply_agent_help(Cli::command()).get_matches();
+    // build the command tree, stamp the template and each command's guidance
+    // row onto every node, then parse.
+    //
+    // `try_get_matches_from_mut` rather than `get_matches`: clap's own failure
+    // output is human prose ending in "For more information, try '--help'",
+    // which costs an agent a second round trip and tells it nothing about WHY
+    // the command exists or what a working invocation looks like. We intercept
+    // and re-render in the same `key: value` dialect the rest of the machine
+    // surface speaks. Help and version still print through clap untouched.
+    let mut cmd = apply_agent_help("", Cli::command());
+    let matches = match cmd.try_get_matches_from_mut(std::env::args_os()) {
+        Ok(matches) => matches,
+        Err(err) => agent_error::render_and_exit(err, &cmd),
+    };
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
-        Err(err) => err.exit(),
+        Err(err) => agent_error::render_and_exit(err, &cmd),
     };
 
     // Configure color output
@@ -976,7 +1029,7 @@ mod agent_help_tests {
     /// recursively across every command.
     #[test]
     fn agent_help_tree_is_valid() {
-        apply_agent_help(Cli::command()).debug_assert();
+        apply_agent_help("", Cli::command()).debug_assert();
     }
 
     /// Rendered help uses the agent-native template: a lowercase `usage:` line
@@ -984,7 +1037,7 @@ mod agent_help_tests {
     /// line the stock template prints).
     #[test]
     fn agent_help_template_is_applied() {
-        let mut cmd = apply_agent_help(Cli::command());
+        let mut cmd = apply_agent_help("", Cli::command());
         let help = cmd.render_help().to_string();
         assert!(
             help.contains("usage: atomic"),
@@ -1000,7 +1053,7 @@ mod agent_help_tests {
     /// `# Examples` markdown that derives from a command's doc comment.
     #[test]
     fn long_about_is_stripped() {
-        let tree = apply_agent_help(Cli::command());
+        let tree = apply_agent_help("", Cli::command());
         let mut intent = tree
             .find_subcommand("intent")
             .expect("intent command present")
