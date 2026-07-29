@@ -95,10 +95,11 @@ fn path_from_usage(root: &clap::Command, usage: &str) -> Option<String> {
 /// [`path_from_usage`] this has to distinguish an accepted global flag from the
 /// one clap rejected. Known flags are skipped (along with their value); unknown
 /// flags stop the walk so we never attribute a root error to a later command.
-pub fn resolve_invoked(root: &clap::Command, argv: &[OsString]) -> (String, String) {
+fn walk_invoked(root: &clap::Command, argv: &[OsString]) -> (String, usize) {
     let mut node = root;
     let mut parts: Vec<String> = Vec::new();
     let mut index = 1;
+    let mut scope_start = 1;
 
     while index < argv.len() {
         let Some(tok) = argv[index].to_str() else {
@@ -156,11 +157,27 @@ pub fn resolve_invoked(root: &clap::Command, argv: &[OsString]) -> (String, Stri
                 parts.push(child.get_name().to_string());
                 node = child;
                 index += 1;
+                scope_start = index;
             }
             None => break,
         }
     }
-    (parts.join(" "), display_path(root, &parts.join(" ")))
+    (parts.join(" "), scope_start)
+}
+
+pub fn resolve_invoked(root: &clap::Command, argv: &[OsString]) -> (String, String) {
+    let (key, _) = walk_invoked(root, argv);
+    let display = display_path(root, &key);
+    (key, display)
+}
+
+fn command_scope_start(root: &clap::Command, key: &str, argv: &[OsString]) -> usize {
+    let (resolved, start) = walk_invoked(root, argv);
+    if resolved == key {
+        start
+    } else {
+        1
+    }
 }
 
 /// `atomic` for the root, `atomic memory new` for a leaf.
@@ -271,54 +288,249 @@ fn is_invisible_format(ch: char) -> bool {
     )
 }
 
-/// Preserve the exact platform units of the first non-UTF-8 argv entry.
-///
-/// clap's structured context necessarily renders invalid argv lossily. Keeping
-/// the raw units in a separate field makes invalid bytes distinguishable from
-/// a real U+FFFD argument without making ordinary Unicode output unreadable.
+/// Preserve the exact platform units of a non-UTF-8 argv entry.
 #[cfg(unix)]
-fn invalid_argv_units(argv: &[OsString]) -> Option<String> {
+fn encode_invalid_units(arg: &OsStr) -> Option<String> {
     use std::fmt::Write as _;
     use std::os::unix::ffi::OsStrExt as _;
 
-    let arg = argv.iter().skip(1).find(|arg| arg.to_str().is_none())?;
+    if arg.to_str().is_some() {
+        return None;
+    }
     let mut encoded = String::from("unix-hex:");
-    for byte in arg.as_os_str().as_bytes() {
+    for byte in arg.as_bytes() {
         let _ = write!(encoded, "{byte:02x}");
     }
     Some(encoded)
 }
 
 #[cfg(windows)]
-fn invalid_argv_units(argv: &[OsString]) -> Option<String> {
+fn encode_invalid_units(arg: &OsStr) -> Option<String> {
     use std::fmt::Write as _;
     use std::os::windows::ffi::OsStrExt as _;
 
-    let arg = argv.iter().skip(1).find(|arg| arg.to_str().is_none())?;
+    if arg.to_str().is_some() {
+        return None;
+    }
     let mut encoded = String::from("windows-utf16:");
-    for unit in arg.as_os_str().encode_wide() {
+    for unit in arg.encode_wide() {
         let _ = write!(encoded, "{unit:04x}");
     }
     Some(encoded)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn invalid_argv_units(_argv: &[OsString]) -> Option<String> {
+fn encode_invalid_units(_arg: &OsStr) -> Option<String> {
     None
 }
 
-fn has_explicit_empty_value(argv: &[OsString], arg: Option<&str>) -> bool {
-    if argv.iter().skip(1).any(|value| value == OsStr::new("")) {
-        return true;
+/// Find the non-UTF-8 token clap actually rejected.
+///
+/// Some arguments intentionally accept raw platform strings (`PathBuf`,
+/// `OsString`), so choosing the first or last invalid token can report the
+/// wrong bytes. Probe each candidate while replacing only later invalid
+/// tokens; the first candidate that still produces `InvalidUtf8` is the one
+/// that stopped clap.
+fn rejected_non_utf8_arg<'a>(root: &clap::Command, argv: &'a [OsString]) -> Option<&'a OsStr> {
+    let indices = argv
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter_map(|(index, value)| value.to_str().is_none().then_some(index))
+        .collect::<Vec<_>>();
+
+    for (position, index) in indices.iter().copied().enumerate() {
+        let mut probe = argv.to_vec();
+        for later in indices.iter().copied().skip(position + 1) {
+            probe[later] = OsString::from("x");
+        }
+        let mut command = root.clone();
+        if matches!(
+            command.try_get_matches_from_mut(probe),
+            Err(error) if error.kind() == ErrorKind::InvalidUtf8
+        ) {
+            return Some(argv[index].as_os_str());
+        }
     }
 
-    let Some(option) = arg.and_then(|display| display.split_whitespace().next()) else {
-        return false;
+    indices.first().map(|index| argv[*index].as_os_str())
+}
+
+fn option_spellings(root: &clap::Command, key: &str, display: &str) -> Vec<String> {
+    let shown = display.split_whitespace().next().unwrap_or_default();
+    if !shown.starts_with('-') {
+        return Vec::new();
+    }
+
+    let node = walk_to(root, key);
+    let short = shown.strip_prefix('-').and_then(|value| {
+        let mut chars = value.chars();
+        let first = chars.next()?;
+        chars.next().is_none().then_some(first)
+    });
+    let arg = node
+        .get_arguments()
+        .chain(root.get_arguments())
+        .find(|arg| {
+            shown
+                .strip_prefix("--")
+                .is_some_and(|long| arg.get_long() == Some(long))
+                || short.is_some_and(|short| arg.get_short() == Some(short))
+        });
+
+    let Some(arg) = arg else {
+        return vec![shown.to_string()];
     };
-    let with_equals = format!("{option}=");
+
+    let mut spellings = Vec::new();
+    for long in arg.get_long_and_visible_aliases().unwrap_or_default() {
+        spellings.push(format!("--{long}"));
+    }
+    for short in arg.get_short_and_visible_aliases().unwrap_or_default() {
+        spellings.push(format!("-{short}"));
+    }
+    spellings
+}
+
+fn attached_value(value: &OsStr, spelling: &str) -> Option<OsString> {
+    let prefixes = if spelling.starts_with("--") {
+        vec![format!("{spelling}=")]
+    } else {
+        vec![format!("{spelling}="), spelling.to_string()]
+    };
+
+    for prefix in prefixes {
+        if let Some(value) = value.to_str() {
+            if let Some(suffix) = value.strip_prefix(&prefix) {
+                return Some(OsString::from(suffix));
+            }
+        } else if let Some(value) = attached_non_utf8_value(value, &prefix) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn attached_non_utf8_value(value: &OsStr, prefix: &str) -> Option<OsString> {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+    let bytes = value.as_bytes();
+    let prefix = prefix.as_bytes();
+    bytes
+        .strip_prefix(prefix)
+        .map(|suffix| OsString::from_vec(suffix.to_vec()))
+}
+
+#[cfg(windows)]
+fn attached_non_utf8_value(value: &OsStr, prefix: &str) -> Option<OsString> {
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    let units = value.encode_wide().collect::<Vec<_>>();
+    let prefix = OsStr::new(prefix).encode_wide().collect::<Vec<_>>();
+    units
+        .strip_prefix(prefix.as_slice())
+        .map(OsString::from_wide)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn attached_non_utf8_value(_value: &OsStr, _prefix: &str) -> Option<OsString> {
+    None
+}
+
+fn short_cluster_value(
+    root: &clap::Command,
+    key: &str,
+    argv: &[OsString],
+    index: usize,
+    spellings: &[String],
+) -> Option<Option<OsString>> {
+    let token = argv[index].to_str()?;
+    let cluster = token.strip_prefix('-')?;
+    if cluster.is_empty() || cluster.starts_with('-') {
+        return None;
+    }
+
+    let target = spellings.iter().filter_map(|spelling| {
+        let short = spelling.strip_prefix('-')?;
+        let mut chars = short.chars();
+        let value = chars.next()?;
+        chars.next().is_none().then_some(value)
+    });
+    let target = target.collect::<Vec<_>>();
+    let node = walk_to(root, key);
+
+    for (offset, short) in cluster.char_indices() {
+        let arg = node
+            .get_arguments()
+            .chain(root.get_arguments())
+            .find(|arg| {
+                arg.get_short() == Some(short)
+                    || arg
+                        .get_all_short_aliases()
+                        .is_some_and(|aliases| aliases.contains(&short))
+            })?;
+        let suffix = &cluster[offset + short.len_utf8()..];
+        if target.contains(&short) {
+            return Some(match suffix.strip_prefix('=') {
+                Some(value) => Some(OsString::from(value)),
+                None if suffix.is_empty() => argv.get(index + 1).cloned(),
+                None => Some(OsString::from(suffix)),
+            });
+        }
+        if arg.get_action().takes_values() {
+            return None;
+        }
+    }
+    None
+}
+
+fn raw_option_value(
+    root: &clap::Command,
+    key: &str,
+    argv: &[OsString],
+    display: &str,
+) -> Option<OsString> {
+    let spellings = option_spellings(root, key, display);
+    let start = command_scope_start(root, key, argv);
+    for (index, token) in argv.iter().enumerate().skip(start) {
+        for spelling in &spellings {
+            if token == OsStr::new(spelling) {
+                return argv.get(index + 1).cloned();
+            }
+            if let Some(value) = attached_value(token, spelling) {
+                return Some(value);
+            }
+        }
+        if let Some(value) = short_cluster_value(root, key, argv, index, &spellings) {
+            return value;
+        }
+    }
+    None
+}
+
+fn has_explicit_empty_value(
+    root: &clap::Command,
+    key: &str,
+    argv: &[OsString],
+    arg: Option<&str>,
+) -> bool {
+    let Some(arg) = arg else {
+        return argv.iter().skip(1).any(|value| value.is_empty());
+    };
+    if arg.trim_start().starts_with('-') {
+        return raw_option_value(root, key, argv, arg)
+            .is_some_and(|value| value.as_os_str().is_empty());
+    }
+
+    let start = command_scope_start(root, key, argv);
     argv.iter()
-        .skip(1)
-        .any(|value| value == OsStr::new(&with_equals))
+        .skip(start)
+        .any(|value| value.as_os_str().is_empty())
+}
+
+fn write_ignoring_errors(mut writer: impl std::io::Write, output: &str) {
+    let _ = std::io::Write::write_all(&mut writer, output.as_bytes());
 }
 
 fn reason(err: &clap::Error) -> Option<String> {
@@ -414,7 +626,7 @@ pub fn render(err: &clap::Error, root: &clap::Command, argv: &[OsString]) -> Str
         }
         ErrorKind::MissingSubcommand => {}
         ErrorKind::InvalidUtf8 => {
-            if let Some(value) = invalid_argv_units(argv) {
+            if let Some(value) = rejected_non_utf8_arg(root, argv).and_then(encode_invalid_units) {
                 kv.push(("got-raw", value));
             }
         }
@@ -424,7 +636,9 @@ pub fn render(err: &clap::Error, root: &clap::Command, argv: &[OsString]) -> Str
                 kv.push(("arg", arg));
             }
             if let Some(value) = ctx_str(err, ContextKind::InvalidValue) {
-                if !value.is_empty() || has_explicit_empty_value(argv, invalid_arg.as_deref()) {
+                if !value.is_empty()
+                    || has_explicit_empty_value(root, &key, argv, invalid_arg.as_deref())
+                {
                     kv.push(("got", value));
                 }
             }
@@ -515,7 +729,8 @@ pub fn render_and_exit(err: clap::Error, root: &clap::Command, argv: &[OsString]
             std::process::exit(err.exit_code());
         }
         _ => {
-            eprint!("{}", render(&err, root, argv));
+            let output = render(&err, root, argv);
+            write_ignoring_errors(std::io::stderr().lock(), &output);
             std::process::exit(2);
         }
     }
@@ -708,9 +923,85 @@ mod tests {
     fn explicit_empty_value_is_distinct_from_missing_value() {
         let missing = render_for(&["log", "--format"]);
         let empty = render_for(&["log", "--format", ""]);
+        let short_equals = render_for(&["log", "-f="]);
+        let clustered_short_equals = render_for(&["log", "-vf="]);
         assert!(!missing.contains("got: "), "{missing}");
         assert!(empty.contains("got: \"\"\n"), "{empty}");
+        assert!(short_equals.contains("got: \"\"\n"), "{short_equals}");
+        assert!(
+            clustered_short_equals.contains("got: \"\"\n"),
+            "{clustered_short_equals}"
+        );
         assert_ne!(missing, empty);
+    }
+
+    #[test]
+    fn unrelated_empty_value_is_not_attributed_to_a_missing_option() {
+        for args in [
+            &["project", "init", "", "--visibility"][..],
+            &["log", "--view", "", "--format"][..],
+            &["stash", "--message", "", "push", "--message"][..],
+        ] {
+            let out = render_for(args);
+            assert!(out.contains("arg: "), "{args:?}:\n{out}");
+            assert!(!out.contains("got: "), "{args:?}:\n{out}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_utf8_reports_the_rejected_options_value() {
+        use std::os::unix::ffi::OsStringExt;
+
+        for trailing_workdir in [false, true] {
+            let mut argv = vec![
+                OsString::from("atomic"),
+                OsString::from("agent"),
+                OsString::from("lifecycle"),
+                OsString::from("begin"),
+                OsString::from("--owner"),
+                OsString::from("owner"),
+                OsString::from("--session"),
+                OsString::from("session"),
+            ];
+            if !trailing_workdir {
+                argv.extend([OsString::from("--workdir"), OsString::from_vec(vec![0xfe])]);
+            }
+            argv.extend([
+                OsString::from("--ttl-seconds"),
+                OsString::from_vec(vec![0xff]),
+            ]);
+            if trailing_workdir {
+                argv.extend([OsString::from("--workdir"), OsString::from_vec(vec![0xfe])]);
+            }
+
+            let mut root = apply_agent_help(Cli::command());
+            let err = root.try_get_matches_from_mut(argv.clone()).unwrap_err();
+            let out = render(&err, &root, &argv);
+
+            assert!(out.contains("got-raw: unix-hex:ff\n"), "{out}");
+            assert!(!out.contains("got-raw: unix-hex:fe\n"), "{out}");
+        }
+    }
+
+    #[test]
+    fn broken_output_stream_is_ignored() {
+        struct BrokenWriter;
+
+        impl std::io::Write for BrokenWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "reader closed",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        write_ignoring_errors(BrokenWriter, "error: unknown-arg\n");
     }
 
     #[test]
