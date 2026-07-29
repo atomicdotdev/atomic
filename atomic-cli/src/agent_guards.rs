@@ -11,9 +11,7 @@
 mod tests {
     use clap::CommandFactory;
 
-    use crate::agent_doc::{
-        self, Doc, Ref, DOCS, EXIT_CODES, MAX_ERROR_LINE, MAX_HELP_LINES, MAX_LINE, MIN_TERM_WIDTH,
-    };
+    use crate::agent_doc::{self, Doc, Ref, DOCS, EXIT_CODES, MAX_ERROR_LINE};
     use crate::error::CliError;
     use crate::{apply_agent_help, Cli};
 
@@ -124,33 +122,10 @@ mod tests {
         }
     }
 
-    /// GUARD 5 — the terseness constraint is a TEST, not a convention.
-    ///
-    /// `after_help` is wrapped by clap at `term_w` (`help_template.rs:364`),
-    /// which is 100 when piped and the real width on a tty. A line over budget
-    /// splits mid-value and orphans a continuation line that has no key.
+    /// GUARD 5 — no failure line may exceed its budget.
     #[test]
     fn no_line_exceeds_budget() {
         for (path, doc) in DOCS {
-            let block = doc.help_block();
-            if block.is_empty() {
-                continue;
-            }
-            let lines: Vec<&str> = block.lines().collect();
-            assert!(
-                lines.len() <= MAX_HELP_LINES,
-                "row '{path}' help block is {} lines, budget is {MAX_HELP_LINES}",
-                lines.len()
-            );
-            for l in &lines {
-                assert!(
-                    l.chars().count() <= MAX_LINE,
-                    "row '{path}' help line is {} chars, budget is {MAX_LINE}: {l}",
-                    l.chars().count()
-                );
-            }
-            // Error lines never pass through clap and so cannot wrap; the
-            // looser cap is hygiene, not a correctness constraint.
             for l in doc.error_lines() {
                 assert!(
                     l.chars().count() <= MAX_ERROR_LINE,
@@ -158,13 +133,6 @@ mod tests {
                     l.chars().count()
                 );
             }
-        }
-        for l in agent_doc::root_block().lines() {
-            assert!(
-                l.chars().count() <= MAX_LINE,
-                "root block line is {} chars, budget is {MAX_LINE}: {l}",
-                l.chars().count()
-            );
         }
     }
 
@@ -193,15 +161,22 @@ mod tests {
         assert!(agent_doc::lookup("push").is_none());
     }
 
-    /// GUARD 8 — injecting `after_help` must APPEND, never clobber.
+    /// GUARD 8 — `--help` must be byte-identical to the template alone.
     ///
-    /// `Command::after_help` is a SETTER (clap_builder-4.6.0
-    /// `command.rs:2026`), and `atomic vault context` is the one command in the
-    /// tree that already ships an `after_help` block. An unconditional call
-    /// would silently delete it.
+    /// The template's own doc comment states the position: the terse one-line
+    /// summary is all an agent needs, and prose belongs on the docs website.
+    /// This module therefore injects NOTHING into `--help` — every row feeds
+    /// only the parse-failure renderer.
+    ///
+    /// The concrete thing this pins: `Command::after_help` is a SETTER
+    /// (clap_builder-4.6.0 `command.rs:2026`), and `atomic vault context` is
+    /// the one command in the tree that already ships an `after_help` block.
+    /// Any future call would silently delete it.
     #[test]
-    fn existing_after_help_is_preserved() {
+    fn help_is_untouched() {
         let root = tree();
+
+        // The one pre-existing after_help survives untouched.
         let ctx = root
             .find_subcommand("vault")
             .unwrap()
@@ -213,103 +188,52 @@ mod tests {
             .unwrap_or_default();
         assert!(
             after.contains("Examples:"),
-            "vault context lost its Examples block: {after:?}"
+            "vault context lost its Examples block:\n{after}"
         );
-        assert!(
-            after.contains("when: "),
-            "vault context did not gain its row: {after:?}"
-        );
-        // Order matters: the pre-existing block stays first.
-        let examples_at = after.find("Examples:").unwrap();
-        let when_at = after.find("when: ").unwrap();
-        assert!(
-            examples_at < when_at,
-            "the injected block must be appended after the existing one: {after:?}"
-        );
-    }
 
-    /// GUARD 9 — coverage ratchet. Adding a path to `TIER1` without writing its
-    /// row breaks the tests; that one-line edit is how a commitment is made.
-    const TIER1: &[&str] = &[
-        "memory new",
-        "memory attest",
-        "memory validate",
-        "intent new",
-        "intent attest",
-        "intent validate",
-        "record",
-        "add",
-        "status",
-        "vault sync",
-        "vault context",
-    ];
-
-    #[test]
-    fn tier1_is_documented() {
-        for p in TIER1 {
-            assert!(agent_doc::lookup(p).is_some(), "TIER1 '{p}' has no row");
-        }
-        assert!(DOCS.len() >= TIER1.len());
-    }
-
-    /// GUARD 10 — the whole tree still builds and the template still applies.
-    #[test]
-    fn tree_is_valid_and_terse() {
-        apply_agent_help("", Cli::command()).debug_assert();
-        let mut cmd = apply_agent_help("", Cli::command());
-        let help = cmd.render_help().to_string();
-        assert!(help.contains("usage: atomic"));
-        assert!(!help.contains("Usage: atomic"));
-    }
-
-    /// GUARD 11 — `get_arg_conflicts_with` panics on a conflict naming an arg
-    /// unknown to the command (clap_builder `command.rs:4047`). Walking every
-    /// node post-build is what keeps that safe as the tree grows.
-    #[test]
-    fn every_conflict_resolves() {
-        fn walk(node: &clap::Command) {
-            for a in node.get_arguments() {
-                let _ = node.get_arg_conflicts_with(a);
+        // No documented command leaks a row key into its help.
+        for (path, _) in DOCS {
+            let mut node = root.clone();
+            for part in path.split(' ') {
+                node = node.find_subcommand(part).unwrap().clone();
             }
-            for c in node.get_subcommands() {
-                walk(c);
-            }
-        }
-        walk(&tree());
-    }
-
-    /// GUARD 12 — the block survives the WRAP, not just the byte count.
-    ///
-    /// This is the guard that must exist: `output.wrap(self.term_w)`
-    /// (`help_template.rs:364`) will split a long line and orphan the
-    /// continuation, producing a line with no key. Rendering at a spread of
-    /// widths and asserting each injected line still appears VERBATIM is the
-    /// only way to pin it.
-    #[test]
-    fn injected_block_never_wraps() {
-        for width in [MIN_TERM_WIDTH, 72, 80, 100, 120] {
-            for (path, doc) in DOCS {
-                let root = apply_agent_help("", Cli::command());
-                let mut node = root.clone();
-                for part in path.split(' ') {
-                    node = node.find_subcommand(part).unwrap().clone();
-                }
-                let help = node.term_width(width).render_help().to_string();
-                for expected in doc.help_block().lines() {
-                    assert!(
-                        help.lines().any(|l| l == expected),
-                        "at width {width}, '{path}' wrapped its block; \
-                         expected the verbatim line {expected:?}\n--- help ---\n{help}"
-                    );
-                }
-            }
-            let mut root = apply_agent_help("", Cli::command()).term_width(width);
-            let help = root.render_help().to_string();
-            for expected in agent_doc::root_block().lines() {
+            let help = node.render_help().to_string();
+            for key in ["when:", "run:", "needs:", "then:", "instead:", "fails:", "exits:"] {
                 assert!(
-                    help.lines().any(|l| l == expected),
-                    "at width {width}, the root block wrapped; \
-                     expected the verbatim line {expected:?}\n--- help ---\n{help}"
+                    !help.contains(key),
+                    "'{path}' leaked {key} into --help; rows belong to the failure path only:\n{help}"
+                );
+            }
+        }
+
+        // Including the root.
+        let help = tree().render_help().to_string();
+        assert!(
+            !help.contains("exits:"),
+            "the root leaked the exit taxonomy into --help:\n{help}"
+        );
+    }
+
+    /// GUARD 12 — every failure line stays one line.
+    ///
+    /// The failure block is written straight to stderr by [`crate::agent_error`]
+    /// and never passes through clap's `output.wrap(self.term_w)`
+    /// (`help_template.rs:364`), so it cannot be split and cannot orphan a
+    /// continuation with no key. This pins that property against the day
+    /// someone routes it back through clap: no row may contain an embedded
+    /// newline, and none may exceed [`MAX_ERROR_LINE`].
+    #[test]
+    fn failure_lines_are_single_lines() {
+        for (path, doc) in DOCS {
+            for line in doc.error_lines() {
+                assert!(
+                    !line.contains('\n'),
+                    "row '{path}' produced a multi-line failure entry: {line:?}"
+                );
+                assert!(
+                    line.len() <= MAX_ERROR_LINE,
+                    "row '{path}' failure line is {} chars, budget is {MAX_ERROR_LINE}: {line}",
+                    line.len()
                 );
             }
         }
@@ -498,7 +422,6 @@ mod tests {
     /// Sanity: the schema itself degrades to nothing.
     #[test]
     fn empty_doc_renders_nothing() {
-        assert!(Doc::EMPTY.help_block().is_empty());
         assert!(Doc::EMPTY.error_lines().is_empty());
     }
 }

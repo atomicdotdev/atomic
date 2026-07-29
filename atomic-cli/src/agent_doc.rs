@@ -6,46 +6,27 @@
 //! exactly do I type* (`run:`), and — at the moment of failure — *what I must do
 //! first, what to do next, and which sibling I actually wanted*.
 //!
-//! Two consumers read the same rows:
+//! One consumer: [`Doc::error_lines`], rendered by [`crate::agent_error`] onto
+//! the clap parse-failure path.
 //!
-//! 1. [`Doc::help_block`] — appended to `--help`, hard-capped at
-//!    [`MAX_HELP_LINES`] lines of [`MAX_LINE`] characters. `--help` is a budget.
-//! 2. [`Doc::error_lines`] — the full block, rendered by
-//!    [`crate::agent_error`] onto the clap parse-failure path. Unbudgeted:
-//!    at the moment of failure the agent needs the precondition it violated and
-//!    the way out, and that output never passes through clap's wrapper.
+//! Deliberately NOT `--help`. The template's own doc comment states the
+//! position — the terse one-line summary is all an agent needs, and prose
+//! belongs on the docs website — and the incident that motivated this module
+//! agrees: the agent had already read `--help` on three commands before it
+//! resorted to dumping `strings` of the binary. Help was not the channel that
+//! failed.
 //!
 //! The KEY is central ([`DOCS`], one line per command, checked by
 //! `agent_guards::every_key_resolves`); the CONTENT is a `const` declared beside
 //! the command struct it describes, so prose lives where the maintainer editing
 //! that command will see it.
 
-/// Hard wrap budget for anything that reaches `--help`.
+/// Budget for a failure line.
 ///
-/// clap wraps `after_help` at `term_w` (clap_builder-4.6.0
-/// `output/help_template.rs:364`). `term_w` is the real terminal width on a tty
-/// and 100 when piped. A line longer than `term_w` is split, and its
-/// continuation is emitted with NO key — which destroys the `key: value`
-/// contract this module exists to create.
-///
-/// 60 is the narrowest terminal we promise to render cleanly at, and it is a
-/// tested floor, not a convention (`agent_guards::injected_block_never_wraps`).
-pub const MAX_LINE: usize = 60;
-
-/// The narrowest terminal `--help` is asserted to survive.
-pub const MIN_TERM_WIDTH: usize = 60;
-
-/// Budget for lines that only ever reach the parse-failure renderer.
-///
-/// Deliberately looser than [`MAX_LINE`], and the difference is load-bearing:
-/// failure output is written straight to stderr by [`crate::agent_error`],
+/// Failure output is written straight to stderr by [`crate::agent_error`],
 /// never through clap's help pipeline, so it is not wrapped at any width and
 /// cannot produce an orphan continuation. This cap is hygiene, not correctness.
 pub const MAX_ERROR_LINE: usize = 100;
-
-/// Max lines a row may contribute to `--help`. The failure path is unbudgeted;
-/// `--help` is not.
-pub const MAX_HELP_LINES: usize = 2;
 
 /// A typed cross-reference to another command.
 ///
@@ -149,21 +130,6 @@ impl Doc {
         fails: Fail::NONE,
     };
 
-    /// The `--help` block: at most [`MAX_HELP_LINES`] lines.
-    ///
-    /// `when:` answers "should I be running this at all"; `run:` answers "what
-    /// exactly do I type". Everything else is unbudgeted, elsewhere.
-    pub fn help_block(&self) -> String {
-        let mut out: Vec<String> = Vec::new();
-        if !self.when.is_empty() {
-            out.push(format!("when: {}", self.when));
-        }
-        if !self.run.is_empty() {
-            out.push(format!("run: atomic {}", self.run));
-        }
-        out.join("\n")
-    }
-
     /// The failure block: unbudgeted, because at the moment of failure the agent
     /// needs the precondition it violated and the way out, in one round trip.
     pub fn error_lines(&self) -> Vec<String> {
@@ -212,14 +178,6 @@ pub const EXIT_CODES: &[(i32, &str)] = &[
     (4, "remote/network error"),
     (128, "internal error (bug)"),
 ];
-
-/// The root `after_help`. Three lines, all <= [`MAX_LINE`].
-pub fn root_block() -> String {
-    "exits: 0 ok | 1 user-fixable | 2 usage, did not run\n\
-     exits: 3 repo/data | 4 remote/network | 128 internal bug\n\
-     note: per-command overrides appear as `fails:` on failure"
-        .to_string()
-}
 
 /// The registry: command path -> the row declared beside that command.
 ///

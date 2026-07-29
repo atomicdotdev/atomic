@@ -152,30 +152,24 @@ fn apply_agent_help(path: &str, cmd: clap::Command) -> clap::Command {
         .map(|c| c.get_name().to_string())
         .collect();
 
-    let existing = cmd.get_after_help().map(|s| s.to_string());
-
     let mut cmd = cmd
         .help_template(AGENT_HELP_TEMPLATE)
         .long_about(None::<&str>)
         .mut_args(|arg| arg.long_help(None::<&str>));
 
-    // The root carries the exit-code taxonomy once; every other node carries
-    // at most its own two capped lines, and undocumented nodes carry nothing.
-    let injected = if path.is_empty() {
-        Some(agent_doc::root_block())
-    } else {
-        agent_doc::lookup(path)
-            .map(|doc| doc.help_block())
-            .filter(|block| !block.is_empty())
-    };
-
-    if let Some(block) = injected {
-        let combined = match existing {
-            Some(prev) if !prev.is_empty() => format!("{prev}\n\n{block}"),
-            _ => block,
-        };
-        cmd = cmd.after_help(combined);
-    }
+    // NOTHING is injected into `--help`. The rows in `agent_doc` feed only the
+    // parse-failure renderer.
+    //
+    // The template's own doc comment above states the position: the terse
+    // one-line summary is all an agent needs, and prose belongs on the docs
+    // website. Adding `when:`/`run:` lines here would argue with that — and the
+    // incident that motivated this module argues against it too. The agent had
+    // already read `--help` on three commands before it started dumping
+    // `strings` of the binary. Help was not the channel that failed; the
+    // failure output was.
+    //
+    // So `--help` renders exactly as it did, byte for byte, including
+    // `vault context`'s existing `after_help`.
 
     for name in subcommand_names {
         let child_path = if path.is_empty() {
