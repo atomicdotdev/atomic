@@ -78,6 +78,13 @@ pub enum RepositoryError {
         matches: Vec<String>,
     },
 
+    /// Ambiguous intent UID prefix (multiple matches)
+    #[error("Ambiguous intent reference '{prefix}': matches {}", matches.join(", "))]
+    AmbiguousIntent {
+        prefix: String,
+        matches: Vec<String>,
+    },
+
     /// Change already applied
     #[error("Change already applied: {hash}")]
     ChangeAlreadyApplied { hash: String },

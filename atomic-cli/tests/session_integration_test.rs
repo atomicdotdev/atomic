@@ -18,8 +18,10 @@ use atomic_core::change::provenance_graph::{ProvenanceNode, ProvenanceNodeKind};
 use atomic_core::change::session::SessionTodo;
 use atomic_core::change::ProvenanceGraph;
 use atomic_core::pristine::ontology::{edge_kind, entity_type, predicate};
-use atomic_core::pristine::KgTxnT;
+use atomic_core::pristine::vault::{KgEdge, KgNode};
+use atomic_core::pristine::{KgMutTxnT, KgTxnT};
 use atomic_core::types::{Base32, Hash};
+use atomic_core::MutTxnT;
 use atomic_repository::Repository;
 use tempfile::TempDir;
 
@@ -113,6 +115,102 @@ fn session_manifest_is_content_addressed_and_ingestible() {
 }
 
 #[test]
+fn session_order_and_manifest_do_not_depend_on_ingestion_order() {
+    let a_tmp = TempDir::new().unwrap();
+    let b_tmp = TempDir::new().unwrap();
+    let home_tmp = TempDir::new().unwrap();
+    init_repo(a_tmp.path(), home_tmp.path());
+    init_repo(b_tmp.path(), home_tmp.path());
+
+    let parent = ProvenanceGraph::builder("ordered-session", "opencode")
+        .timestamp(100)
+        .add_node(goal_node("parent-goal", "parent"))
+        .build();
+    let parent_hash = Hash::of(&parent.serialize().unwrap());
+    let child = ProvenanceGraph::builder("ordered-session", "opencode")
+        .timestamp(200)
+        .previous(parent_hash)
+        .add_node(goal_node("child-goal", "child"))
+        .build();
+    let child_hash = Hash::of(&child.serialize().unwrap());
+
+    let repo_a = Repository::open(a_tmp.path()).unwrap();
+    repo_a.save_provenance_graph(&parent).unwrap();
+    repo_a.save_provenance_graph(&child).unwrap();
+
+    let repo_b = Repository::open(b_tmp.path()).unwrap();
+    repo_b.save_provenance_graph(&child).unwrap();
+    {
+        let mut txn = repo_b.pristine().write_txn().unwrap();
+        txn.upsert_kg_node(&KgNode::new(
+            "memory:incoming-link",
+            "memory",
+            "incoming",
+            "vault",
+        ))
+        .unwrap();
+        txn.upsert_kg_node(&KgNode::new(
+            "memory:outgoing-link",
+            "memory",
+            "outgoing",
+            "vault",
+        ))
+        .unwrap();
+        txn.upsert_kg_edge(&KgEdge::new(
+            "memory:incoming-link",
+            "session:ordered-session/turn:0",
+            "extension:references",
+        ))
+        .unwrap();
+        txn.upsert_kg_edge(&KgEdge::new(
+            "session:ordered-session/turn:0",
+            "memory:outgoing-link",
+            "extension:produced",
+        ))
+        .unwrap();
+        txn.commit().unwrap();
+    }
+    repo_b.save_provenance_graph(&parent).unwrap();
+
+    let head_a = repo_a.get_session_head("ordered-session").unwrap();
+    let head_b = repo_b.get_session_head("ordered-session").unwrap();
+    assert_eq!(head_a, head_b, "manifest hash changed with ingestion order");
+
+    let (_, turns_b) = repo_b
+        .get_session_ledger("ordered-session")
+        .unwrap()
+        .unwrap();
+    assert_eq!(turns_b[0].provenance_hash, parent_hash);
+    assert_eq!(turns_b[1].provenance_hash, child_hash);
+
+    let txn = repo_b.pristine().read_txn().unwrap();
+    let child_edges = txn
+        .get_kg_edges_from("session:ordered-session/turn:1")
+        .unwrap();
+    assert!(child_edges.iter().any(|edge| {
+        edge.kind == predicate::WAS_INFORMED_BY && edge.to_id == "session:ordered-session/turn:0"
+    }));
+    let parent_edges = txn
+        .get_kg_edges_from("session:ordered-session/turn:0")
+        .unwrap();
+    assert!(!parent_edges
+        .iter()
+        .any(|edge| edge.kind == predicate::WAS_INFORMED_BY));
+    assert!(child_edges
+        .iter()
+        .any(|edge| { edge.kind == "extension:produced" && edge.to_id == "memory:outgoing-link" }));
+    let child_incoming = txn
+        .get_kg_edges_to("session:ordered-session/turn:1")
+        .unwrap();
+    assert!(child_incoming.iter().any(|edge| {
+        edge.kind == "extension:references" && edge.from_id == "memory:incoming-link"
+    }));
+    assert!(!parent_edges
+        .iter()
+        .any(|edge| edge.kind.starts_with("extension:")));
+}
+
+#[test]
 fn session_fork_inherits_prefix_and_links_parent_manifest() {
     let repo_tmp = TempDir::new().unwrap();
     let home_tmp = TempDir::new().unwrap();
@@ -166,6 +264,10 @@ fn session_fork_inherits_prefix_and_links_parent_manifest() {
     assert_eq!(child_turns_after[2].turn_number, 2);
     assert_eq!(child_turns_after[2].provenance_hash, c2);
     assert_eq!(child_turns_after[2].previous_provenance, Some(child_latest));
+    let child_head = repo.get_session_head("child").unwrap().unwrap();
+    let child_head = repo.get_session_manifest(&child_head).unwrap().unwrap();
+    assert_eq!(child_head.parent_session, Some(parent_manifest));
+    assert_eq!(child_head.fork_turn, Some(1));
 
     // Forking beyond the parent's last turn is rejected.
     assert!(repo.fork_session("parent", 42, "child2").is_err());
@@ -195,6 +297,26 @@ fn session_rebuild_is_idempotent_and_tolerates_corruption() {
             .expect("ledger query")
             .expect("ledger exists");
         assert_eq!(turns.len(), 2, "rebuild must not duplicate turns");
+
+        let mut txn = repo.pristine().write_txn().unwrap();
+        txn.del_kg_edge(
+            "session:rebuild/turn:1",
+            "session:rebuild/turn:0",
+            predicate::WAS_INFORMED_BY,
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let (indexed, skipped, corrupt) = repo.rebuild_session_index().expect("repair rebuild");
+        assert_eq!((indexed, skipped, corrupt), (0, 2, 0));
+        let txn = repo.pristine().read_txn().unwrap();
+        assert!(txn
+            .get_kg_edges_from("session:rebuild/turn:1")
+            .unwrap()
+            .iter()
+            .any(|edge| {
+                edge.kind == predicate::WAS_INFORMED_BY && edge.to_id == "session:rebuild/turn:0"
+            }));
     }
 
     // A corrupt provenance file is reported, not fatal.
@@ -314,6 +436,75 @@ fn session_cross_repo_sync_rebuilds_ledger_from_provenance() {
 }
 
 #[test]
+fn session_rebuild_restores_a_fork_from_its_manifest() {
+    let a_tmp = TempDir::new().unwrap();
+    let b_tmp = TempDir::new().unwrap();
+    let home_tmp = TempDir::new().unwrap();
+    init_repo(a_tmp.path(), home_tmp.path());
+    init_repo(b_tmp.path(), home_tmp.path());
+
+    let repo_a = Repository::open(a_tmp.path()).unwrap();
+    let p0 = save_turn_graph(&repo_a, "manifest-parent", "turn zero", 1, None);
+    save_turn_graph(&repo_a, "manifest-parent", "turn one", 2, Some(p0));
+    let (parent_manifest, child_manifest) = repo_a
+        .fork_session("manifest-parent", 1, "manifest-child")
+        .unwrap();
+    let child = repo_a
+        .get_session_manifest(&child_manifest)
+        .unwrap()
+        .unwrap();
+    repo_a
+        .upsert_session_lifecycle("empty-parent", None, None, None)
+        .unwrap();
+    let (empty_parent_manifest, empty_child_manifest) = repo_a
+        .fork_session("empty-parent", 0, "empty-child")
+        .unwrap();
+    let empty_child = repo_a
+        .get_session_manifest(&empty_child_manifest)
+        .unwrap()
+        .unwrap();
+
+    let repo_b = Repository::open(b_tmp.path()).unwrap();
+    repo_b.ingest_session_manifest(&child).unwrap();
+    repo_b.ingest_session_manifest(&empty_child).unwrap();
+    assert!(repo_b
+        .get_session_ledger("manifest-child")
+        .unwrap()
+        .is_none());
+    assert!(repo_b.get_session_ledger("empty-child").unwrap().is_none());
+
+    let (indexed, skipped, corrupt) = repo_b.rebuild_session_index().unwrap();
+    assert_eq!((indexed, skipped, corrupt), (2, 0, 0));
+
+    let (_, turns) = repo_b
+        .get_session_ledger("manifest-child")
+        .unwrap()
+        .expect("child ledger rebuilt from manifest");
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0].provenance_hash, child.turns[0].provenance_hash);
+    assert_eq!(turns[1].provenance_hash, child.turns[1].provenance_hash);
+
+    let rebuilt_head = repo_b.get_session_head("manifest-child").unwrap().unwrap();
+    let rebuilt = repo_b.get_session_manifest(&rebuilt_head).unwrap().unwrap();
+    assert_eq!(rebuilt.parent_session, Some(parent_manifest));
+    assert_eq!(rebuilt.fork_turn, Some(1));
+
+    let (empty_record, empty_turns) = repo_b
+        .get_session_ledger("empty-child")
+        .unwrap()
+        .expect("empty child ledger rebuilt from manifest");
+    assert_eq!(empty_record.turn_count, 0);
+    assert!(empty_turns.is_empty());
+    let txn = repo_b.pristine().read_txn().unwrap();
+    assert!(txn.get_kg_node("session:empty-child").unwrap().is_some());
+    drop(txn);
+    let empty_head = repo_b.get_session_head("empty-child").unwrap().unwrap();
+    let empty_rebuilt = repo_b.get_session_manifest(&empty_head).unwrap().unwrap();
+    assert_eq!(empty_rebuilt.parent_session, Some(empty_parent_manifest));
+    assert_eq!(empty_rebuilt.fork_turn, Some(0));
+}
+
+#[test]
 fn session_reregistration_is_idempotent() {
     let repo_tmp = TempDir::new().unwrap();
     let home_tmp = TempDir::new().unwrap();
@@ -420,12 +611,20 @@ fn session_ledger_emits_rdf_taxonomy() {
         .save_provenance_graph(
             &ProvenanceGraph::builder("kg-session", "opencode")
                 .plan_id("ATOM-20")
-                .todos(vec![SessionTodo {
-                    id: "todo-rdf".into(),
-                    content: "Emit RDF plan and todo links".into(),
-                    status: "completed".into(),
-                    priority: "high".into(),
-                }])
+                .todos(vec![
+                    SessionTodo {
+                        id: "todo-rdf".into(),
+                        content: "Emit RDF plan and todo links".into(),
+                        status: "completed".into(),
+                        priority: "high".into(),
+                    },
+                    SessionTodo {
+                        id: "external-collision".into(),
+                        content: "Keep an unrelated global node".into(),
+                        status: "pending".into(),
+                        priority: "normal".into(),
+                    },
+                ])
                 .add_node(goal_node("kg-goal", "kg turn zero"))
                 .add_change_explained(change0)
                 .build(),
@@ -489,11 +688,11 @@ fn session_ledger_emits_rdf_taxonomy() {
     assert!(turn0_edges
         .iter()
         .any(|e| e.kind == predicate::HAD_PLAN && e.to_id == "intent:ATOM-20"));
-    assert!(turn0_edges
-        .iter()
-        .any(|e| e.kind == predicate::HAS_TODO && e.to_id == "todo:todo-rdf"));
+    assert!(turn0_edges.iter().any(|e| {
+        e.kind == predicate::HAS_TODO && e.to_id == "session:kg-session/todo:todo-rdf"
+    }));
     let todo = txn
-        .get_kg_node("todo:todo-rdf")
+        .get_kg_node("session:kg-session/todo:todo-rdf")
         .expect("kg read")
         .expect("todo node");
     assert_eq!(
@@ -534,6 +733,88 @@ fn session_ledger_emits_rdf_taxonomy() {
         .get_kg_node("session:kg-child/turn:1")
         .expect("kg read")
         .is_some());
+    drop(txn);
+
+    // Simulate the old global todo representation on an inherited-only child.
+    let mut txn = repo.pristine().write_txn().expect("write txn");
+    txn.del_kg_node("session:kg-child/todo:todo-rdf").unwrap();
+    txn.upsert_kg_node(&KgNode::new(
+        "todo:todo-rdf",
+        "todo",
+        "Emit RDF plan and todo links",
+        "session_ledger",
+    ))
+    .unwrap();
+    txn.upsert_kg_edge(&KgEdge::new(
+        "session:kg-child/turn:0",
+        "todo:todo-rdf",
+        predicate::HAS_TODO,
+    ))
+    .unwrap();
+    txn.upsert_kg_node(&KgNode::new(
+        "todo:external-collision",
+        "todo",
+        "Owned by another index",
+        "external_index",
+    ))
+    .unwrap();
+    txn.commit().unwrap();
+
+    repo.rebuild_session_index().expect("rebuild");
+    let txn = repo.pristine().read_txn().expect("read txn");
+    assert!(txn.get_kg_node("todo:todo-rdf").unwrap().is_none());
+    assert!(txn
+        .get_kg_node("session:kg-child/todo:todo-rdf")
+        .unwrap()
+        .is_some());
+    let unrelated = txn
+        .get_kg_node("todo:external-collision")
+        .unwrap()
+        .expect("unrelated colliding node must survive");
+    assert_eq!(unrelated.source, "external_index");
+    drop(txn);
+
+    let child_head = repo.get_session_head("kg-child").unwrap().unwrap();
+    let child_manifest = repo.get_session_manifest(&child_head).unwrap().unwrap();
+    assert_eq!(child_manifest.parent_session, Some(parent_manifest));
+    assert_eq!(child_manifest.fork_turn, Some(1));
+}
+
+#[test]
+fn todo_ids_are_scoped_to_their_session() {
+    let repo_tmp = TempDir::new().unwrap();
+    let home_tmp = TempDir::new().unwrap();
+    init_repo(repo_tmp.path(), home_tmp.path());
+    let repo = Repository::open(repo_tmp.path()).unwrap();
+
+    for (session_id, content) in [("todo-a", "First session"), ("todo-b", "Second session")] {
+        repo.save_provenance_graph(
+            &ProvenanceGraph::builder(session_id, "opencode")
+                .todos(vec![SessionTodo {
+                    id: "t-1".into(),
+                    content: content.into(),
+                    status: "pending".into(),
+                    priority: "normal".into(),
+                }])
+                .build(),
+        )
+        .unwrap();
+    }
+
+    let txn = repo.pristine().read_txn().unwrap();
+    let first = txn
+        .get_kg_node("session:todo-a/todo:t-1")
+        .unwrap()
+        .expect("first session todo");
+    let second = txn
+        .get_kg_node("session:todo-b/todo:t-1")
+        .unwrap()
+        .expect("second session todo");
+    assert_eq!(first.label, "First session");
+    assert_eq!(second.label, "Second session");
+    assert_eq!(first.metadata.unwrap()["session_id"], "todo-a");
+    assert_eq!(second.metadata.unwrap()["session_id"], "todo-b");
+    assert!(txn.get_kg_node("todo:t-1").unwrap().is_none());
 }
 
 #[test]

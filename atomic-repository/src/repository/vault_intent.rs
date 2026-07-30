@@ -820,15 +820,38 @@ impl Repository {
                 Ok(key)
             }
             IntentRef::Uid(uid) => {
-                // Match a stored ULID exactly or by prefix; return its human key.
-                let mut matches = manifest.intents.values().filter(|s| {
-                    s.uid == uid || s.uid.starts_with(&uid) || s.uid.eq_ignore_ascii_case(&uid)
-                });
-                if let Some(summary) = matches.next() {
+                // Prefer an exact UID. A prefix is accepted only when it
+                // identifies exactly one intent.
+                let mut matches: Vec<_> = manifest
+                    .intents
+                    .values()
+                    .filter(|summary| summary.uid.eq_ignore_ascii_case(&uid))
+                    .collect();
+                if matches.is_empty() {
+                    let prefix = uid.to_ascii_uppercase();
+                    matches = manifest
+                        .intents
+                        .values()
+                        .filter(|summary| summary.uid.to_ascii_uppercase().starts_with(&prefix))
+                        .collect();
+                }
+                matches.sort_by(|a, b| a.uid.cmp(&b.uid));
+
+                if matches.len() == 1 {
+                    let summary = matches[0];
                     return Ok(if summary.human_key.is_empty() {
-                        uid
+                        summary.uid.clone()
                     } else {
                         summary.human_key.clone()
+                    });
+                }
+                if matches.len() > 1 {
+                    return Err(RepositoryError::AmbiguousIntent {
+                        prefix: id.to_string(),
+                        matches: matches
+                            .into_iter()
+                            .map(|summary| summary.uid.clone())
+                            .collect(),
                     });
                 }
                 Err(RepositoryError::InvalidOperation {
@@ -1551,6 +1574,36 @@ The authentication module has no rate limiting.
             repo.normalize_intent_id(&created.uid[..8]).unwrap(),
             human_key
         );
+    }
+
+    #[test]
+    fn test_normalize_intent_id_rejects_ambiguous_prefix() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let first = repo.vault_intent_create(create_opts("First")).unwrap();
+        let second = repo.vault_intent_create(create_opts("Second")).unwrap();
+        let first_uid = "01KTEST0000000000000000001";
+        let second_uid = "01KTEST0000000000000000002";
+
+        let mut txn = repo.pristine.write_txn().unwrap();
+        let mut manifest = txn.get_vault_manifest().unwrap();
+        manifest.intents.get_mut(&first.id).unwrap().uid = first_uid.into();
+        manifest.intents.get_mut(&second.id).unwrap().uid = second_uid.into();
+        txn.put_vault_manifest(&manifest).unwrap();
+        txn.commit().unwrap();
+
+        // A complete UID remains exact.
+        assert_eq!(repo.normalize_intent_id(first_uid).unwrap(), first.id);
+
+        // A shared prefix must never pick whichever HashMap entry appears first.
+        let error = repo.normalize_intent_id("01KTEST").unwrap_err();
+        match error {
+            RepositoryError::AmbiguousIntent { prefix, matches } => {
+                assert_eq!(prefix, "01KTEST");
+                assert_eq!(matches, vec![first_uid.to_string(), second_uid.to_string()]);
+            }
+            other => panic!("expected ambiguous intent error, got {other:?}"),
+        }
     }
 
     #[test]
