@@ -20,6 +20,9 @@ fn test_vendor_from_str() {
     assert_eq!(AIVendor::parse("openai"), AIVendor::OpenAI);
     assert_eq!(AIVendor::parse("gpt"), AIVendor::OpenAI);
     assert_eq!(AIVendor::parse("ollama"), AIVendor::Local);
+    assert_eq!(AIVendor::parse("xai"), AIVendor::XAI);
+    assert_eq!(AIVendor::parse("grok"), AIVendor::XAI);
+    assert_eq!(AIVendor::XAI.name(), "xai");
     assert_eq!(
         AIVendor::parse("custom-ai"),
         AIVendor::Other("custom-ai".to_string())

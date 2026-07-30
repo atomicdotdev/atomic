@@ -85,8 +85,19 @@ impl Command for TeamDelete {
 
 impl TeamDelete {
     async fn execute(&self) -> CliResult<()> {
-        // Prompt for confirmation unless --force is set.
+        let client = build_client(self.org.as_deref(), None).await?;
+        let org_slug = client.org_slug().to_string();
+
+        // `--force` skips both the precheck and confirmation.
         if !self.force {
+            // Check that the team exists before prompting.
+            atomic_teams::team::get_team(&client, &org_slug, &self.slug)
+                .await
+                .map_err(|e| CliError::RemoteError {
+                    message: e.to_string(),
+                    url: None,
+                })?;
+
             print_warning(&format!(
                 "This will permanently delete team '{}' and all its memberships and grants.",
                 self.slug
@@ -104,9 +115,6 @@ impl TeamDelete {
                 return Err(CliError::Cancelled);
             }
         }
-
-        let client = build_client(self.org.as_deref(), None).await?;
-        let org_slug = client.org_slug().to_string();
 
         atomic_teams::team::delete_team(&client, &org_slug, &self.slug)
             .await

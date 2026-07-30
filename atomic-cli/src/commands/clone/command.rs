@@ -529,6 +529,7 @@ impl Clone {
         }
 
         // Apply downloaded changes to the local view
+        let mut apply_errors = Vec::new();
         if stats.changes_downloaded > 0 {
             print_blank();
             progress.phase = ClonePhase::Applying;
@@ -536,7 +537,6 @@ impl Clone {
 
             // Insert each downloaded change in order to build the graph
             let insert_options = atomic_repository::InsertOptions::default();
-            let mut apply_errors = Vec::new();
 
             for entry in &remote_entries {
                 let hash = match atomic_core::types::Hash::from_base32(entry.hash.as_bytes()) {
@@ -657,20 +657,38 @@ impl Clone {
 
         progress.phase = ClonePhase::Complete;
 
-        // Final summary
+        // Keep partial output, but return failure when any step failed.
         print_blank();
-        if stats.has_failures() {
+        if stats.has_failures() || !apply_errors.is_empty() {
             print_warning(&format!(
-                "Clone completed with errors: {} downloaded, {} failed",
-                stats.changes_downloaded, stats.changes_failed
+                "Clone completed with errors: {} downloaded, {} failed to download, {} failed to apply",
+                stats.changes_downloaded,
+                stats.changes_failed,
+                apply_errors.len(),
             ));
-        } else {
-            print_success(&format!(
-                "Clone complete: {} downloaded into {}/",
-                format_count(stats.changes_downloaded, "change"),
-                target_path.display()
-            ));
+
+            if self.into_existing {
+                print_hint(
+                    "Next: run 'atomic git import --incremental' to import the Git checkout.",
+                );
+            }
+
+            // Preserve the partial clone before returning the error.
+            if let Some(guard) = guard {
+                guard.disable();
+            }
+            return Err(CliError::Internal(anyhow::anyhow!(
+                "clone completed with errors ({} download, {} apply)",
+                stats.changes_failed,
+                apply_errors.len(),
+            )));
         }
+
+        print_success(&format!(
+            "Clone complete: {} downloaded into {}/",
+            format_count(stats.changes_downloaded, "change"),
+            target_path.display()
+        ));
 
         if self.into_existing {
             print_hint("Next: run 'atomic git import --incremental' to import the Git checkout.");

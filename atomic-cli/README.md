@@ -860,6 +860,13 @@ Global identity configuration is stored in `~/.config/atomic/` (or platform equi
 # Run all CLI tests
 cargo test -p atomic-cli
 
+# Validate that every public command path renders help
+cargo test -p atomic-cli --test cli_surface_integration_test
+
+# Run the black-box CLI harness against a freshly built binary
+cargo build -p atomic-cli
+ATOMIC_BIN="$PWD/target/debug/atomic" bash tests/harness/run_all.sh
+
 # Run tests serially (required for integration tests that change cwd)
 cargo test -p atomic-cli -- --test-threads=1
 

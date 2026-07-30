@@ -585,6 +585,11 @@ fn test_vendor_from_agent_name_codex() {
 }
 
 #[test]
+fn test_vendor_from_agent_name_grok() {
+    assert_eq!(vendor_from_agent_name("grok"), AIVendor::XAI);
+}
+
+#[test]
 fn test_vendor_from_agent_name_kiro() {
     assert_eq!(vendor_from_agent_name("kiro"), AIVendor::AmazonBedrock);
 }

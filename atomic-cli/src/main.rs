@@ -971,6 +971,13 @@ fn main() {
 mod agent_help_tests {
     use super::*;
 
+    /// The raw clap command definition must be structurally valid before the
+    /// agent-native help transformation is applied.
+    #[test]
+    fn clap_command_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
     /// The agent-help walk must produce a structurally valid clap tree.
     /// `debug_assert` catches duplicate flags, bad templates, and the like,
     /// recursively across every command.

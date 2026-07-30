@@ -5,10 +5,16 @@
 #   1. Vault initialization and default content
 #   2. Goal lifecycle (start, stop, resume)
 #   3. Intent lifecycle (create, update, link)
-#   4. Memory storage and retrieval
+#   4. Record + vault integration
 #   5. KG enrichment from VCS data
-#   6. KG queries (search, neighbors)
+#   6. Vault show and query
 #   7. Git import → KG enrichment → queries
+#   8. Memory and materialize
+#   9. Vault behavior in a repo initialized without --vault
+#
+# Every assertion checks both the exit code and the expected output shape.
+# A branch that would pass regardless of the command's outcome is a bug in
+# this suite, not a feature: the point of the harness is trustworthy greens.
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
@@ -18,10 +24,33 @@ echo "${BOLD}══════════════════════�
 echo "${BOLD}  Suite: 14_vault_kg${RESET}"
 echo "${BOLD}══════════════════════════════════════════════════════════════${RESET}"
 
-# ── Local helper ────────────────────────────────────────────────────────────
+# ── Local helpers ───────────────────────────────────────────────────────────
 # Like require_network but returns true/false instead of exiting the script.
 _network_available() {
     curl --silent --head --max-time 5 https://github.com &>/dev/null
+}
+
+# Run a command, capturing combined output and exit code into OUT/RC.
+# The `|| RC=$?` guard keeps a failing command from aborting the suite
+# under `set -e` — failures are asserted on, not fatal.
+# Usage: run_cmd atomic vault list --json
+run_cmd() {
+    RC=0
+    OUT="$("$@" 2>&1)" || RC=$?
+}
+
+# Assert the last run_cmd exited 0 AND its output matches an ERE pattern.
+# Usage: assert_ran "desc" "pattern"
+assert_ran() {
+    local desc="$1"
+    local pattern="$2"
+    if [[ $RC -ne 0 ]]; then
+        _fail "$desc" "exit $RC: $(echo "$OUT" | head -2 | tr '\n' ' ')"
+    elif ! echo "$OUT" | grep -qiE "$pattern"; then
+        _fail "$desc" "output missing /$pattern/: $(echo "$OUT" | head -2 | tr '\n' ' ')"
+    else
+        _pass "$desc"
+    fi
 }
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -47,12 +76,8 @@ assert_file_exists "code intelligence skill installed" ".vault/skills/code-intel
 assert_file_exists "memory index installed" ".vault/memory/MEMORY.md"
 
 # Vault list should show default entries
-out="$(atomic vault list --json 2>/dev/null)" || true
-if echo "$out" | grep -q "skills/atomic-vault.md"; then
-    _pass "vault list shows default skill"
-else
-    _fail "vault list shows default skill" "output: $(echo "$out" | head -3)"
-fi
+run_cmd atomic vault list --json
+assert_ran "vault list shows default skill" "skills/atomic-vault\.md"
 
 # ════════════════════════════════════════════════════════════════════════════
 # Section 2: Goal Lifecycle
@@ -64,40 +89,26 @@ make_temp_repo "vault-goals"
 init_repo --vault
 
 # Start a goal with a custom name
-out="$(atomic vault goal start --name test-goal --developer "alice" 2>&1)"
-if echo "$out" | grep -q "test-goal"; then
-    _pass "goal start succeeds with custom name"
-else
-    _fail "goal start succeeds" "$out"
-fi
+run_cmd atomic vault goal start --name test-goal --developer "alice"
+assert_ran "goal start succeeds with custom name" "Started goal: test-goal"
 
 # Goal should appear in list
-out="$(atomic vault goal list --json 2>/dev/null)" || true
-if echo "$out" | grep -q "test-goal"; then
-    _pass "goal appears in list"
-else
-    _fail "goal appears in list" "$out"
-fi
+run_cmd atomic vault goal list --json
+assert_ran "goal appears in list" "test-goal"
 
 # Goal file should exist on disk
 assert_file_exists "goal file materialized" ".vault/goals/test-goal/_goal.md"
 
 # Stop with promote
-out="$(atomic vault goal stop --promote test-goal 2>&1)"
-if echo "$out" | grep -qiE "completed|promoted|stopped"; then
-    _pass "goal stop --promote succeeds"
-else
-    _pass "goal stop completes" # Accept any successful completion
-fi
+run_cmd atomic vault goal stop --promote test-goal
+assert_ran "goal stop --promote succeeds" "Completed goal: test-goal"
 
 # Start another goal, then discard
-atomic vault goal start --name discard-me >/dev/null 2>&1
-out="$(atomic vault goal stop --discard discard-me 2>&1)"
-if echo "$out" | grep -qiE "discard"; then
-    _pass "goal stop --discard succeeds"
-else
-    _pass "goal discard completes"
-fi
+run_cmd atomic vault goal start --name discard-me
+assert_ran "second goal start succeeds" "Started goal: discard-me"
+
+run_cmd atomic vault goal stop --discard discard-me
+assert_ran "goal stop --discard succeeds" "Discarded goal: discard-me"
 
 # ════════════════════════════════════════════════════════════════════════════
 # Section 3: Intent Lifecycle
@@ -108,70 +119,49 @@ begin_section "Vault: Intent Lifecycle"
 make_temp_repo "vault-intents"
 init_repo --vault
 
-# Create an intent
-out="$(atomic vault intent create --title "Fix authentication" --priority high 2>&1)"
-if echo "$out" | grep -qE "[A-Za-z]+-[0-9]+"; then
-    _pass "intent create returns an ID"
-else
-    # Accept any non-error output as success
-    if [[ $? -eq 0 ]] || [[ -n "$out" ]]; then
-        _pass "intent create succeeds"
-    else
-        _fail "intent create" "$out"
-    fi
-fi
+# Create an intent — must print the assigned ID
+run_cmd atomic vault intent create --title "Fix authentication" --priority high
+assert_ran "intent create returns an ID" "Created intent: [A-Za-z0-9-]+-[0-9]+"
+
+first_id="$(echo "$OUT" | sed -n 's/.*Created intent: \([A-Za-z0-9-]*\).*/\1/p' | head -1)"
 
 # List intents
-out="$(atomic vault intent list --json 2>/dev/null)" || true
-if echo "$out" | grep -qi "fix authentication"; then
-    _pass "intent appears in list with title"
-else
-    _fail "intent appears in list" "output: $(echo "$out" | head -5)"
-fi
+run_cmd atomic vault intent list --json
+assert_ran "intent appears in list with title" "fix authentication"
 
 # Create a second intent
-atomic vault intent create --title "Add logging" >/dev/null 2>&1
+run_cmd atomic vault intent create --title "Add logging"
+assert_ran "second intent create succeeds" "Created intent:"
 
-out="$(atomic vault intent list --json 2>/dev/null)" || true
-intent_count="$(echo "$out" | grep -c '"id"' || true)"
-if [[ "$intent_count" -ge 2 ]]; then
+run_cmd atomic vault intent list --json
+intent_count="$(echo "$OUT" | grep -c '"id"' || true)"
+if [[ $RC -eq 0 && "$intent_count" -ge 2 ]]; then
     _pass "multiple intents created (count: $intent_count)"
 else
-    _fail "multiple intents" "expected >= 2, got $intent_count"
+    _fail "multiple intents" "exit $RC, expected >= 2 ids, got $intent_count"
 fi
 
-# Show a specific intent (grab the first ID from the list)
-first_id="$(echo "$out" | grep -oE '"id"\s*:\s*"[^"]+"' | head -1 | sed 's/.*"id"\s*:\s*"\([^"]*\)".*/\1/')" || true
+# Show the first intent by ID
 if [[ -n "$first_id" ]]; then
-    show_out="$(atomic vault intent show "$first_id" --json 2>/dev/null)" || true
-    if echo "$show_out" | grep -qi "fix authentication\|add logging"; then
-        _pass "intent show returns detail for $first_id"
-    else
-        _pass "intent show completes for $first_id"
-    fi
+    run_cmd atomic vault intent show "$first_id" --json
+    assert_ran "intent show returns detail for $first_id" "fix authentication"
+
+    run_cmd atomic vault intent update "$first_id" --status in-progress
+    assert_ran "intent update sets status" "Updated intent: $first_id"
 else
-    _skip "intent show" "could not extract intent ID from list"
+    _fail "intent show" "could not extract intent ID from create output"
+    _fail "intent update" "could not extract intent ID from create output"
 fi
 
-# Update intent status
-if [[ -n "$first_id" ]]; then
-    update_out="$(atomic vault intent update "$first_id" --status in-progress 2>&1)" || true
-    _pass "intent update status completes"
-else
-    _skip "intent update" "no intent ID available"
-fi
+# Link intent to a goal (the goal must exist first)
+run_cmd atomic vault goal start --name intent-goal
+assert_ran "goal for linking created" "Started goal: intent-goal"
 
-# Link intent to a goal
-atomic vault goal start --name intent-goal >/dev/null 2>&1 || true
 if [[ -n "$first_id" ]]; then
-    link_out="$(atomic vault intent link "$first_id" --goal intent-goal 2>&1)" || true
-    if echo "$link_out" | grep -qiE "link|goal|intent"; then
-        _pass "intent linked to goal"
-    else
-        _pass "intent link completes"
-    fi
+    run_cmd atomic vault intent link "$first_id" --goal intent-goal
+    assert_ran "intent linked to goal" "link|intent-goal"
 else
-    _skip "intent link" "no intent ID available"
+    _fail "intent link" "could not extract intent ID from create output"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -187,17 +177,18 @@ init_repo --vault
 create_file "src/main.rs" 'fn main() { println!("hello"); }'
 add_files "src/main.rs"
 
-# Record should succeed (and auto-enrich KG)
-record_change "Add main.rs" >/dev/null 2>&1
-_pass "record succeeds with vault enabled"
-
-# Verify KG was enriched
-out="$(atomic vault query search "main" --json 2>/dev/null)" || true
-if echo "$out" | grep -qi "main\|change"; then
-    _pass "KG search finds recorded content"
+# Record should succeed (and auto-enrich the KG)
+rc=0
+record_change "Add main.rs" >/dev/null 2>&1 || rc=$?
+if [[ $rc -eq 0 ]]; then
+    _pass "record succeeds with vault enabled"
 else
-    _pass "KG search runs without error"
+    _fail "record succeeds with vault enabled" "exit $rc"
 fi
+
+# Record auto-enriches: search must surface the recorded change or file
+run_cmd atomic vault query search "main" --json
+assert_ran "KG search finds recorded content" "change:|file:src/main\.rs"
 
 # ════════════════════════════════════════════════════════════════════════════
 # Section 5: KG Enrichment
@@ -212,39 +203,23 @@ init_repo --vault
 create_file "src/auth.rs" "pub fn authenticate() { }\npub fn verify() { }"
 create_file "src/main.rs" "fn main() { authenticate(); }"
 add_files "src/auth.rs" "src/main.rs"
-record_change "Add auth module" >/dev/null 2>&1
+record_change "Add auth module" >/dev/null 2>&1 || true
 
-# Run explicit KG enrichment
-out="$(atomic vault query enrich 2>&1)"
-if echo "$out" | grep -qiE "enrich|views|files|changes|complete"; then
-    _pass "KG enrich from VCS data"
-else
-    _pass "KG enrich completes"
-fi
+# Run explicit KG enrichment — reports what was enriched
+run_cmd atomic vault query enrich
+assert_ran "KG enrich from VCS data" "Enriched: .*views.*files.*changes"
 
 # Search for entities
-out="$(atomic vault query search "auth" --json 2>/dev/null)" || true
-if echo "$out" | grep -qi "auth"; then
-    _pass "KG search finds 'auth' content"
-else
-    _pass "KG search completes without error"
-fi
+run_cmd atomic vault query search "auth" --json
+assert_ran "KG search finds 'auth' content" "auth"
 
-# Query neighbors of a view node
-out="$(atomic vault query neighbors "view:dev" --json 2>/dev/null)" || true
-if echo "$out" | grep -qi "view\|node\|edge"; then
-    _pass "KG neighbors query for view node"
-else
-    _pass "KG neighbors query completes"
-fi
+# Query neighbors of a view node — returns a node/edge graph
+run_cmd atomic vault query neighbors "view:dev" --json
+assert_ran "KG neighbors query for view node" '"nodes"'
 
 # Reindex
-out="$(atomic vault query reindex 2>&1)"
-if echo "$out" | grep -qiE "index|reindex|complete"; then
-    _pass "KG reindex succeeds"
-else
-    _pass "KG reindex completes"
-fi
+run_cmd atomic vault query reindex
+assert_ran "KG reindex succeeds" "Indexed [0-9]+ nodes"
 
 # ════════════════════════════════════════════════════════════════════════════
 # Section 6: Vault Show and Query
@@ -254,24 +229,23 @@ begin_section "Vault: Show and Query"
 
 # Reuse vault-kg repo from Section 5 (still in REPO_DIR)
 
-# Show a vault path
-out="$(atomic vault show ".vault/skills/atomic-vault.md" --json 2>/dev/null)" || true
-if echo "$out" | grep -qiE "skill\|vault\|content\|path"; then
-    _pass "vault show returns skill content"
-else
-    _pass "vault show completes"
-fi
+# Show a vault entry (keys are vault-relative, without the .vault/ prefix)
+run_cmd atomic vault show "skills/atomic-vault.md" --json
+assert_ran "vault show returns skill content" "Atomic Vault"
 
-# Embed (may be a no-op without an embedding provider configured)
-out="$(atomic vault query embed 2>&1)" || true
-_pass "vault query embed completes"
+# Embed — the default hash-embed provider needs no external config
+run_cmd atomic vault query embed
+assert_ran "vault query embed runs the embedding provider" "Embedded [0-9]+ total chunks"
 
-# Ask a question (may require LLM config — accept graceful error)
-out="$(atomic vault query ask "What files are in this repo?" --json 2>/dev/null)" || true
-if echo "$out" | grep -qiE "file\|answer\|result\|error\|not configured"; then
-    _pass "vault query ask returns response or config notice"
+# Ask requires an LLM API key: accept either a real answer (exit 0) or the
+# explicit no-key error (non-zero) — anything else is a failure.
+run_cmd atomic vault query ask "What files are in this repo?" --json
+if [[ $RC -eq 0 ]]; then
+    _pass "vault query ask answers with API key configured"
+elif echo "$OUT" | grep -qi "API key"; then
+    _pass "vault query ask fails cleanly without API key"
 else
-    _pass "vault query ask completes"
+    _fail "vault query ask" "exit $RC: $(echo "$OUT" | head -2 | tr '\n' ' ')"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -280,7 +254,8 @@ fi
 
 begin_section "Vault: Git Import → KG"
 
-# Skip if no network or no git
+# Skip only this section (not the whole suite — earlier sections already ran)
+# when git or the network is unavailable.
 if ! command -v git &>/dev/null; then
     _skip "git import KG tests" "git not installed"
 elif ! _network_available; then
@@ -289,44 +264,42 @@ else
     make_temp_repo "vault-git-kg"
 
     echo "  Cloning hashicorp/go-uuid..."
-    clone_git_repo "https://github.com/hashicorp/go-uuid.git"
-    cd "$GIT_REPO_DIR"
-
-    # Import with vault
-    atomic init --vault >/dev/null 2>&1 || true
-    atomic git import >/dev/null 2>&1 || true
-    _pass "git import completes with vault"
-
-    # Enrich KG from imported data
-    out="$(atomic vault query enrich 2>&1)"
-    if echo "$out" | grep -qiE "enrich|view|file|change|complete"; then
-        _pass "KG enrichment after git import"
+    GIT_KG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/atomic-git-kg-XXXXXX")"
+    _HARNESS_TMPDIRS+=("$GIT_KG_DIR")
+    if ! git clone --quiet "https://github.com/hashicorp/go-uuid.git" "$GIT_KG_DIR" 2>/dev/null; then
+        _skip "git import KG tests" "clone failed (transient network?)"
     else
-        _pass "KG enrichment completes"
-    fi
+        cd "$GIT_KG_DIR"
 
-    # Search should find content from the imported repo
-    out="$(atomic vault query search "uuid" --json 2>/dev/null)" || true
-    if echo "$out" | grep -qi "uuid\|node"; then
-        _pass "KG search finds imported content"
-    else
-        _pass "KG search runs after import"
-    fi
+        run_cmd atomic init --vault
+        if [[ $RC -eq 0 ]]; then
+            _pass "init --vault in git checkout"
+        else
+            _fail "init --vault in git checkout" "exit $RC: $(echo "$OUT" | head -2 | tr '\n' ' ')"
+        fi
 
-    # Neighbors query after import
-    out="$(atomic vault query neighbors "view:main" --json 2>/dev/null)" || true
-    if echo "$out" | grep -qi "view\|node\|edge\|change"; then
-        _pass "KG neighbors query after import"
-    else
-        _pass "KG neighbors query runs after import"
-    fi
+        run_cmd atomic git import
+        if [[ $RC -eq 0 ]]; then
+            _pass "git import completes with vault"
+        else
+            _fail "git import completes with vault" "exit $RC: $(echo "$OUT" | tail -2 | tr '\n' ' ')"
+        fi
 
-    # Reindex vault entries
-    out="$(atomic vault query reindex 2>&1)"
-    if echo "$out" | grep -qiE "index|complete"; then
-        _pass "vault reindex after import"
-    else
-        _pass "reindex completes"
+        # Enrich KG from imported data
+        run_cmd atomic vault query enrich
+        assert_ran "KG enrichment after git import" "Enriched: .*views.*files.*changes"
+
+        # Search should find content from the imported repo
+        run_cmd atomic vault query search "uuid" --json
+        assert_ran "KG search finds imported content" "uuid"
+
+        # Neighbors query for the imported default view
+        run_cmd atomic vault query neighbors "view:main" --json
+        assert_ran "KG neighbors query after import" '"nodes"'
+
+        # Reindex vault entries
+        run_cmd atomic vault query reindex
+        assert_ran "vault reindex after import" "Indexed [0-9]+ nodes"
     fi
 fi
 
@@ -340,61 +313,39 @@ make_temp_repo "vault-memory"
 init_repo --vault
 
 # Memory list should show the default MEMORY.md
-out="$(atomic vault memory list --json 2>/dev/null)" || true
-if echo "$out" | grep -qi "MEMORY\|memory"; then
-    _pass "memory list shows default index"
-else
-    _pass "memory list runs"
-fi
+run_cmd atomic vault memory list --json
+assert_ran "memory list shows default index" "memory/MEMORY\.md"
 
 # Materialize all vault entries
-out="$(atomic vault materialize 2>&1)"
-if echo "$out" | grep -qiE "material|complete|written"; then
-    _pass "vault materialize all"
-else
-    _pass "materialize completes"
-fi
+run_cmd atomic vault materialize
+assert_ran "vault materialize all" "Materialized [0-9]+ vault entries"
 
 # Sync (deflate markdown → redb)
-out="$(atomic vault sync 2>&1)"
-if echo "$out" | grep -qiE "sync|up to date|complete"; then
-    _pass "vault sync (no changes)"
-else
-    _pass "vault sync completes"
-fi
+run_cmd atomic vault sync
+assert_ran "vault sync reports status" "Synced [0-9]+ vault files|up to date"
 
 # Materialize then sync round-trip — vault state should be stable
-out2="$(atomic vault sync 2>&1)"
-if echo "$out2" | grep -qiE "sync|up to date|complete|no changes"; then
-    _pass "vault sync idempotent after materialize"
-else
-    _pass "second sync completes"
-fi
+run_cmd atomic vault sync
+assert_ran "vault sync idempotent after materialize" "up to date"
 
 # ════════════════════════════════════════════════════════════════════════════
-# Section 9: Vault in Non-Vault Repo (Negative Tests)
+# Section 9: Vault in a Repo Initialized Without --vault
 # ════════════════════════════════════════════════════════════════════════════
 
-begin_section "Vault: Negative Tests"
+begin_section "Vault: Init Without --vault"
 
 make_temp_repo "vault-negative"
 init_repo  # no --vault
 
-# Vault commands should fail gracefully on a non-vault repo
-out="$(atomic vault list --json 2>&1)" || true
-if echo "$out" | grep -qiE "not.*vault\|no vault\|error\|not initialized"; then
-    _pass "vault list fails gracefully on non-vault repo"
-else
-    # If it returned empty or succeeded with nothing, that's also acceptable
-    _pass "vault list on non-vault repo returns empty or error"
-fi
+# `atomic init` always provisions a minimal vault (memory index), so vault
+# commands are expected to WORK here — pin that behavior rather than
+# accepting anything.
+run_cmd atomic vault list --json
+assert_ran "vault list works after plain init" "memory/MEMORY\.md"
 
-out="$(atomic vault goal list --json 2>&1)" || true
-if echo "$out" | grep -qiE "not.*vault\|no vault\|error\|not initialized"; then
-    _pass "vault goal list fails gracefully on non-vault repo"
-else
-    _pass "vault goal list on non-vault repo handled"
-fi
+# No goals were created, so the list is an empty JSON array
+run_cmd atomic vault goal list --json
+assert_ran "goal list is empty after plain init" '^\[\]$'
 
 # ════════════════════════════════════════════════════════════════════════════
 # Summary

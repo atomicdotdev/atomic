@@ -1027,6 +1027,16 @@ fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> String {
     )
 }
 
+/// Truncate display text on character boundaries and append `...`.
+fn truncate_display(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let kept: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+        format!("{}...", kept)
+    }
+}
+
 /// Search the knowledge graph.
 #[derive(Parser, Debug)]
 pub struct QueryNodes {
@@ -1099,12 +1109,7 @@ impl Command for QueryNodes {
                 let summary_display = if summary.is_empty() {
                     String::new()
                 } else {
-                    let truncated = if summary.len() > 60 {
-                        format!("{}...", &summary[..57])
-                    } else {
-                        summary.to_string()
-                    };
-                    format!("  {}", truncated)
+                    format!("  {}", truncate_display(summary, 60))
                 };
                 println!("  [{}] {}{}", node.kind, node.id, summary_display);
             }
@@ -1150,12 +1155,7 @@ impl Command for QueryNeighbors {
                 let summary_display = if summary.is_empty() {
                     String::new()
                 } else {
-                    let truncated = if summary.len() > 50 {
-                        format!("{}...", &summary[..47])
-                    } else {
-                        summary.to_string()
-                    };
-                    format!("  {}", truncated)
+                    format!("  {}", truncate_display(summary, 50))
                 };
                 println!("  [{}] {}{}", node.kind, node.id, summary_display);
             }
@@ -1811,7 +1811,8 @@ impl Command for PlanExec {
                 for node in &result.nodes {
                     print!("  [{}] {}", node.kind, node.label);
                     if let Some(ref s) = node.summary {
-                        let short = if s.len() > 60 { &s[..60] } else { s };
+                        // Truncate safely for Unicode text.
+                        let short: String = s.chars().take(60).collect();
                         print!(": {}", short);
                     }
                     println!();
@@ -1831,7 +1832,8 @@ impl Command for PlanExec {
             if !result.content.is_empty() {
                 println!("\nContent ({} entries):", result.content.len());
                 for (path, text) in &result.content {
-                    let preview = if text.len() > 100 { &text[..100] } else { text };
+                    // Truncate safely for Unicode text.
+                    let preview: String = text.chars().take(100).collect();
                     println!("  {}: {}...", path, preview.replace('\n', " "));
                 }
             }
@@ -1963,5 +1965,57 @@ impl Command for QueryAsk {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_display;
+
+    #[test]
+    fn test_truncate_display_short_ascii_unchanged() {
+        assert_eq!(truncate_display("hello", 60), "hello");
+    }
+
+    #[test]
+    fn test_truncate_display_long_ascii_truncated() {
+        let s = "a".repeat(80);
+        let out = truncate_display(&s, 60);
+        assert_eq!(out, format!("{}...", "a".repeat(57)));
+    }
+
+    #[test]
+    fn test_truncate_display_exact_limit_unchanged() {
+        let s = "b".repeat(60);
+        assert_eq!(truncate_display(&s, 60), s);
+    }
+
+    #[test]
+    fn test_truncate_display_three_byte_chars_no_panic() {
+        // Regression test for three-byte characters.
+        let s = format!("x{}", "\u{20ac}".repeat(40));
+        assert!(s.len() > 60); // byte length exceeds the old byte-based check
+        assert_eq!(truncate_display(&s, 60), s); // 41 chars: no truncation
+    }
+
+    #[test]
+    fn test_truncate_display_three_byte_chars_truncated() {
+        let s = format!("x{}", "\u{20ac}".repeat(80)); // 81 chars, 241 bytes
+        let out = truncate_display(&s, 60);
+        assert_eq!(out, format!("x{}...", "\u{20ac}".repeat(56)));
+    }
+
+    #[test]
+    fn test_truncate_display_four_byte_chars_within_limit_unchanged() {
+        // Regression test for four-byte characters.
+        let s = "\u{1f680}".repeat(40);
+        assert_eq!(truncate_display(&s, 50), s);
+    }
+
+    #[test]
+    fn test_truncate_display_four_byte_chars_truncated() {
+        let s = "\u{1f680}".repeat(80);
+        let out = truncate_display(&s, 50);
+        assert_eq!(out, format!("{}...", "\u{1f680}".repeat(47)));
     }
 }

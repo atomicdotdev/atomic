@@ -54,6 +54,9 @@ pub mod sync;
 
 use clap::Subcommand;
 
+use atomic_core::pristine::vault::VaultEntry;
+use atomic_core::types::{Base32, Hasher};
+
 pub use context::Context;
 pub use goal::Goal;
 pub use init::Init;
@@ -70,6 +73,22 @@ pub use crate::commands::query::Query;
 
 use crate::commands::Command;
 use crate::error::CliResult;
+
+/// Identify the exact stored Vault revision, including entry type,
+/// frontmatter, and body rather than only the body content hash.
+fn vault_entry_revision_hash(entry: &VaultEntry) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(b"atomic-vault-revision-v1");
+    append_revision_field(&mut hasher, entry.entry_type.as_str().as_bytes());
+    append_revision_field(&mut hasher, entry.frontmatter_json.as_bytes());
+    append_revision_field(&mut hasher, &entry.content_bytes);
+    hasher.finalize().to_base32()
+}
+
+fn append_revision_field(hasher: &mut Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
 
 // Vault Subcommands
 
@@ -100,6 +119,7 @@ pub enum VaultCommands {
     /// ```text
     /// atomic vault show memory/architecture.md
     /// atomic vault show goals/swift-meadow-a3f2/_goal.md --json
+    /// atomic vault show memory/architecture.md --revision ABC123 --json
     /// ```
     Show(Show),
 
@@ -160,7 +180,9 @@ pub enum VaultCommands {
     /// Research Vault memories relevant to a task.
     ///
     /// Ranks vault memories against free-text terms, an intent, or
-    /// file paths, and emits prompt-ready Markdown (or JSON).
+    /// file paths, and emits prompt-ready Markdown (or JSON). Use
+    /// `--candidates-only` for a body-free first pass, then pull a selected
+    /// exact revision with `atomic vault show`.
     Context(Context),
 
     /// Get tool result summaries for a goal.

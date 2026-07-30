@@ -31,7 +31,7 @@
 //! atomic push [OPTIONS] [REMOTE]
 //!
 //! Arguments:
-//!   [REMOTE]  Remote name or URL (default: "origin")
+//!   [REMOTE]  Remote name or URL (default: the configured default remote, or "origin")
 //!
 //! Options:
 //!       --to-channel <CHANNEL>    Remote channel to push to (default: same as local)
@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn test_push_reexported() {
         let push = Push::new();
-        assert_eq!(push.remote, DEFAULT_REMOTE);
+        assert!(push.remote.is_none());
     }
 
     #[test]
