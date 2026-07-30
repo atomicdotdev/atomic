@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! atomic memory new --kind <k>       Scaffold a directive/frontmatter memory
-//! atomic memory show <id>            Render a memory as a read-time projection
+//! atomic memory show <id>            Show a canonical or freeform memory
 //! atomic memory validate <id|path>   Gate a memory against the canonical shapes
 //! atomic memory attest <id>          Sign a memory into a tracked attestation
 //! atomic memory verify <id>          Verify a signed memory's attestation
@@ -61,7 +61,7 @@ pub enum MemoryCommands {
     /// Scaffold a new directive-based memory into the vault.
     New(MemoryNew),
 
-    /// Show a memory as a rendered read-time projection.
+    /// Show a canonical or freeform memory.
     Show(MemoryShow),
 
     /// Validate a memory against the canonical shapes (the authoring gate).

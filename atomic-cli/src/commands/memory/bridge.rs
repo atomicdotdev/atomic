@@ -115,6 +115,17 @@ pub fn lift(inputs: &MemLiftInputs) -> CliResult<MemoryNode> {
     })
 }
 
+/// Whether this is a freeform memory rather than a malformed canonical one.
+///
+/// `memory write` and the default `MEMORY.md` have only simple metadata. Once
+/// any canonical identity/kind field is present, lift errors stay visible
+/// instead of silently falling back to raw output.
+pub fn is_freeform_memory(inputs: &MemLiftInputs) -> bool {
+    ["@id", "uid", "id", "memoryKind", "kind"]
+        .iter()
+        .all(|key| !inputs.frontmatter.contains_key(*key))
+}
+
 /// Sanitize a memory id for use as a directory name in the sidecar/vault path.
 /// Keeps ASCII alphanumerics, `-` and `_`; everything else becomes `_`.
 /// Copied verbatim from `intent/bridge.rs::sanitize_id`.
@@ -290,6 +301,46 @@ mod tests {
             frontmatter,
             body: ":::memory\nThe durable fact.\n:::".to_string(),
         }
+    }
+
+    #[test]
+    fn freeform_memory_detection_does_not_hide_partial_canonical_records() {
+        let freeform = MemLiftInputs {
+            frontmatter: serde_json::json!({
+                "name": "notes",
+                "type": "project",
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            body: "Raw notes".into(),
+        };
+        assert!(is_freeform_memory(&freeform));
+
+        let partial = MemLiftInputs {
+            frontmatter: serde_json::json!({
+                "uid": "01J8ZC4R8T",
+                "type": "project",
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            body: "Missing memoryKind".into(),
+        };
+        assert!(!is_freeform_memory(&partial));
+        assert!(lift(&partial).is_err());
+
+        let partial_at_id = MemLiftInputs {
+            frontmatter: serde_json::json!({
+                "@id": "urn:atomic:memory:01J8ZC4R8T",
+                "type": "project",
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            body: "Missing canonical fields".into(),
+        };
+        assert!(!is_freeform_memory(&partial_at_id));
     }
 
     fn attested_node(inputs: &MemLiftInputs) -> (MemoryNode, KeyPair) {

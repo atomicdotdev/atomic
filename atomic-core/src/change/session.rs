@@ -65,6 +65,76 @@ pub struct SessionTurn {
     pub todos: Vec<SessionTodo>,
 }
 
+/// Return a deterministic, causality-aware ordering for a session's turns.
+///
+/// Stored provenance can arrive in any order (for example during pull). A
+/// timestamp plus full provenance hash provides a stable tie-break, while the
+/// `previous_provenance` link keeps a child after its parent when both are
+/// present. Turn numbers are reassigned from zero after ordering.
+pub fn canonicalize_session_turns(turns: Vec<SessionTurn>) -> Vec<SessionTurn> {
+    type SortKey = (i64, [u8; 32], usize);
+
+    let count = turns.len();
+    let positions: std::collections::HashMap<Hash, usize> = turns
+        .iter()
+        .enumerate()
+        .map(|(index, turn)| (turn.provenance_hash, index))
+        .collect();
+    let sort_keys: Vec<SortKey> = turns
+        .iter()
+        .enumerate()
+        .map(|(index, turn)| (turn.timestamp, *turn.provenance_hash.as_bytes(), index))
+        .collect();
+    let mut children = vec![Vec::new(); count];
+    let mut blocked = vec![false; count];
+
+    for (index, turn) in turns.iter().enumerate() {
+        if let Some(parent) = turn
+            .previous_provenance
+            .and_then(|hash| positions.get(&hash).copied())
+        {
+            blocked[index] = true;
+            children[parent].push(index);
+        }
+    }
+
+    let mut remaining: std::collections::BTreeSet<SortKey> = sort_keys.iter().copied().collect();
+    let mut ready: std::collections::BTreeSet<SortKey> = sort_keys
+        .iter()
+        .copied()
+        .filter(|key| !blocked[key.2])
+        .collect();
+    let mut slots: Vec<Option<SessionTurn>> = turns.into_iter().map(Some).collect();
+    let mut ordered = Vec::with_capacity(count);
+
+    while ordered.len() < count {
+        // If malformed provenance contains a cycle, break it at the same
+        // timestamp/hash point in every repository.
+        let key = ready
+            .pop_first()
+            .or_else(|| remaining.first().copied())
+            .expect("remaining turn while canonicalizing");
+        remaining.remove(&key);
+        let index = key.2;
+        let Some(turn) = slots[index].take() else {
+            continue;
+        };
+        ordered.push(turn);
+
+        for child in &children[index] {
+            if blocked[*child] {
+                blocked[*child] = false;
+                ready.insert(sort_keys[*child]);
+            }
+        }
+    }
+
+    for (turn_number, turn) in ordered.iter_mut().enumerate() {
+        turn.turn_number = turn_number as u32;
+    }
+    ordered
+}
+
 /// Generic todo snapshot carried by provenance and the session ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTodo {
@@ -878,6 +948,78 @@ mod tests {
         let later = encode_session_turn_key(namespace, 2);
         assert!(earlier < later);
         assert_eq!(decode_session_turn_key(&later), (namespace, 2));
+    }
+
+    #[test]
+    fn test_session_turn_order_is_independent_of_ingestion_order() {
+        let parent_hash = Hash::of(b"parent");
+        let child_hash = Hash::of(b"child");
+        let make_turns = || {
+            vec![
+                SessionTurn {
+                    session_id: "sess-1".into(),
+                    turn_number: 0,
+                    goal: None,
+                    provenance_hash: parent_hash,
+                    change_hashes: Vec::new(),
+                    previous_provenance: None,
+                    timestamp: 100,
+                    plan_id: None,
+                    todos: Vec::new(),
+                },
+                SessionTurn {
+                    session_id: "sess-1".into(),
+                    turn_number: 1,
+                    goal: None,
+                    provenance_hash: child_hash,
+                    change_hashes: Vec::new(),
+                    previous_provenance: Some(parent_hash),
+                    // Clock skew must not place a child before its parent.
+                    timestamp: 50,
+                    plan_id: None,
+                    todos: Vec::new(),
+                },
+            ]
+        };
+
+        let forward = canonicalize_session_turns(make_turns());
+        let mut reverse_input = make_turns();
+        reverse_input.reverse();
+        let reverse = canonicalize_session_turns(reverse_input);
+
+        assert_eq!(forward, reverse);
+        assert_eq!(forward[0].provenance_hash, parent_hash);
+        assert_eq!(forward[1].previous_provenance, Some(parent_hash));
+        assert_eq!(
+            forward
+                .iter()
+                .map(|turn| turn.turn_number)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn test_session_turn_order_uses_hash_to_break_timestamp_ties() {
+        let make_turn = |hash: Hash| SessionTurn {
+            session_id: "sess-1".into(),
+            turn_number: 99,
+            goal: None,
+            provenance_hash: hash,
+            change_hashes: Vec::new(),
+            previous_provenance: None,
+            timestamp: 100,
+            plan_id: None,
+            todos: Vec::new(),
+        };
+        let a = make_turn(Hash::of(b"a"));
+        let b = make_turn(Hash::of(b"b"));
+
+        let forward = canonicalize_session_turns(vec![a.clone(), b.clone()]);
+        let reverse = canonicalize_session_turns(vec![b, a]);
+
+        assert_eq!(forward, reverse);
+        assert!(forward[0].provenance_hash.as_bytes() < forward[1].provenance_hash.as_bytes());
     }
 
     #[test]
