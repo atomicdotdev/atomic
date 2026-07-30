@@ -46,6 +46,11 @@ pub const INTENT_STATUS: &[&str] = &["backlog", "todo", "in_progress", "done", "
 /// accepted by [`is_known_ac_status`] so pre-existing intents keep conforming.
 pub const AC_STATUS: &[&str] = &["unmet", "met"];
 
+/// Task status value set (mirrors `TaskShape` `sh:in`). A task is either still
+/// `open` or `done`; the renderer checks the box only on `done`. `unmet`/`met`
+/// belong to acceptance criteria, not tasks, and are rejected here.
+pub const TASK_STATUS: &[&str] = &["open", "done"];
+
 /// Directive names recognized by the parser + lift (closed set).
 /// Container directives wrap prose; leaf directives carry only edges.
 ///
@@ -167,6 +172,11 @@ pub fn is_known_intent_status(value: &str) -> bool {
 /// `unmet`/`met` plus the deprecated legacy `open` (== `unmet`) for back-compat.
 pub fn is_known_ac_status(value: &str) -> bool {
     AC_STATUS.contains(&value) || value == "open"
+}
+
+/// Is this a valid task status value? Unknown ⇒ gate error (closed vocabulary).
+pub fn is_known_task_status(value: &str) -> bool {
+    TASK_STATUS.contains(&value)
 }
 
 /// Is this a valid memory kind? Unknown ⇒ gate error (closed vocabulary).

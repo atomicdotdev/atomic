@@ -452,6 +452,40 @@ Do not touch the global keyboard handler.
     }
 
     #[test]
+    fn lifts_multiple_tasks_and_criteria_with_per_type_autonumbering() {
+        // Interleaved criteria/tasks without explicit `#id`s. Numbering is
+        // per-type and follows document order, so the two criteria become
+        // ac-1/ac-2 and the two tasks become -1/-2 regardless of interleaving.
+        let body = "\
+:::acceptance-criterion{status=met verifiedBy=did:atomic:lee evidence=urn:atomic:change:01J8}\n\
+First criterion.\n:::\n\n\
+:::task{status=done}\nFirst task.\n:::\n\n\
+:::acceptance-criterion{status=unmet}\nSecond criterion.\n:::\n\n\
+:::task{status=open}\nSecond task.\n:::";
+        let node = lift_intent(&fm(), body).unwrap();
+
+        // Two of each, preserved in document order.
+        assert_eq!(node.has_acceptance_criterion.len(), 2);
+        assert_eq!(node.has_task.len(), 2);
+
+        let acs = &node.has_acceptance_criterion;
+        assert_eq!(acs[0].id, "urn:atomic:ac:word-5-ac-1");
+        assert_eq!(acs[0].text, "First criterion.");
+        assert_eq!(acs[0].ac_status, "met");
+        assert_eq!(acs[1].id, "urn:atomic:ac:word-5-ac-2");
+        assert_eq!(acs[1].text, "Second criterion.");
+        assert_eq!(acs[1].ac_status, "unmet");
+
+        let tasks = &node.has_task;
+        assert_eq!(tasks[0].id, "urn:atomic:task:word-5-1");
+        assert_eq!(tasks[0].text, "First task.");
+        assert_eq!(tasks[0].task_status, "done");
+        assert_eq!(tasks[1].id, "urn:atomic:task:word-5-2");
+        assert_eq!(tasks[1].text, "Second task.");
+        assert_eq!(tasks[1].task_status, "open");
+    }
+
+    #[test]
     fn lifts_ref_dependency() {
         let body = ":::ref{to=urn:atomic:intent:xyz edge=blockedBy}\n:::";
         let node = lift_intent(&fm(), body).unwrap();

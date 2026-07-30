@@ -589,6 +589,53 @@ impl Repository {
             None => content_bytes,
         };
 
+        // Gate enforcement: a `done` intent must be internally consistent with
+        // its own checklist — every task `done` and every acceptance criterion
+        // `met` (the rollup rule), with valid task/criterion vocabulary. Enforce
+        // here so `--status done` (or rewriting the body of a done intent)
+        // cannot bypass the gate the way a raw frontmatter write would.
+        //
+        // We validate only when completion is actively asserted — setting `done`
+        // or editing the body of a done intent — so unrelated metadata edits are
+        // never retroactively blocked. We deliberately scope enforcement to the
+        // checklist shapes (TaskShape, AcceptanceCriterionShape) and the rollup
+        // (IntentShape/status): the broader structural gate (why, scope-out,
+        // proof, attributedTo) belongs to `atomic intent attest`/`validate` and
+        // must not force the canonical authoring format onto freeform intents.
+        let resulting_status = fm.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let asserting_done = options.status.as_deref() == Some("done")
+            || (options.content.is_some() && resulting_status == "done");
+        if asserting_done {
+            let body_str = String::from_utf8_lossy(&new_content).into_owned();
+            // A body we cannot lift carries no canonical checklist to grade, so
+            // there is nothing for the rollup to enforce; the full gate at
+            // attest/validate time still surfaces malformed directives.
+            if let Ok(node) = atomic_canonical::lift::lift_intent(&fm, &body_str) {
+                let report = atomic_canonical::validate_intent(&node);
+                let blocking: Vec<_> = report
+                    .results
+                    .iter()
+                    .filter(|v| {
+                        matches!(v.shape.as_str(), "TaskShape" | "AcceptanceCriterionShape")
+                            || (v.shape == "IntentShape" && v.path.as_deref() == Some("status"))
+                    })
+                    .collect();
+                if !blocking.is_empty() {
+                    let details = blocking
+                        .iter()
+                        .map(|v| format!("  - {}", v.message))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "Intent '{}' cannot be marked done: its checklist is not complete.\n{}",
+                            full_id, details
+                        ),
+                    });
+                }
+            }
+        }
+
         self.vault_store(&intent_file, VaultEntryType::Intent, new_content, new_fm)?;
 
         // Update manifest
@@ -1255,6 +1302,71 @@ The authentication module has no rate limiting.
             "redb body should have disk edits. Got:\n{}",
             stored_body
         );
+    }
+
+    #[test]
+    fn test_intent_update_done_rejected_when_task_incomplete() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let result = repo
+            .vault_intent_create(create_opts("Rate limiting"))
+            .unwrap();
+
+        // A canonical body whose task is still open while we assert `done`.
+        let body = "\
+:::why\nNeed rate limiting.\n:::\n\n\
+:::acceptance-criterion{#ac-1 status=met verifiedBy=did:atomic:lee evidence=urn:atomic:change:01J8}\n\
+Login attempts are rate-limited.\n:::\n\n\
+:::task{#t1 status=open satisfies=ac-1}\nAdd rate limiter middleware.\n:::";
+
+        let err = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    status: Some("done".to_string()),
+                    content: Some(body.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("checklist is not complete") && msg.contains("every task must be done"),
+            "unexpected error: {msg}"
+        );
+
+        // The rejected write must not have flipped the manifest status.
+        let manifest = repo.vault_manifest().unwrap();
+        assert_ne!(manifest.intents[&result.id].status, "done");
+    }
+
+    #[test]
+    fn test_intent_update_done_allowed_when_checklist_complete() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let result = repo
+            .vault_intent_create(create_opts("Rate limiting"))
+            .unwrap();
+
+        // Same intent, but every task done and every criterion met.
+        let body = "\
+:::why\nNeed rate limiting.\n:::\n\n\
+:::acceptance-criterion{#ac-1 status=met verifiedBy=did:atomic:lee evidence=urn:atomic:change:01J8}\n\
+Login attempts are rate-limited.\n:::\n\n\
+:::task{#t1 status=done satisfies=ac-1}\nAdd rate limiter middleware.\n:::";
+
+        let updated = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    status: Some("done".to_string()),
+                    content: Some(body.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.status, "done");
     }
 
     #[test]
