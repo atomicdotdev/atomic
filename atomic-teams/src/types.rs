@@ -223,6 +223,43 @@ pub struct OrgInfo {
     pub updated_at: DateTime<Utc>,
 }
 
+/// An organization the caller belongs to, with their membership role.
+///
+/// Returned by the apex `GET /orgs` ("list my orgs") endpoint. Unlike
+/// [`OrgInfo`] (which redacts `email`/`plan` for non-members), the caller is
+/// always a member here, so `email` and `plan` are always present, and the
+/// caller's `role`, `joined_at`, and `invited_by` are included.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MyOrgInfo {
+    /// Unique identifier.
+    pub id: Uuid,
+    /// URL-safe slug (e.g. `"acme"`).
+    pub slug: String,
+    /// Human-readable display name.
+    pub name: String,
+    /// Contact email for the organization.
+    pub email: Option<String>,
+    /// Organization kind (e.g. `"personal"`, `"team"`).
+    pub kind: String,
+    /// Billing plan (e.g. `"free"`, `"team"`, `"enterprise"`).
+    pub plan: String,
+    /// When the organization was created.
+    #[serde(alias = "created_at")]
+    pub created_at: DateTime<Utc>,
+    /// When the organization was last updated.
+    #[serde(alias = "updated_at")]
+    pub updated_at: DateTime<Utc>,
+    /// The caller's role in this org (`"owner"`, `"admin"`, or `"member"`).
+    pub role: String,
+    /// When the caller joined this org.
+    #[serde(alias = "joined_at")]
+    pub joined_at: DateTime<Utc>,
+    /// Identity that invited the caller, if any.
+    #[serde(alias = "invited_by")]
+    pub invited_by: Option<Uuid>,
+}
+
 /// Organization member metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -514,6 +551,59 @@ mod tests {
         let de: OrgInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(de.slug, "acme");
         assert_eq!(de.email.as_deref(), Some("admin@acme.com"));
+    }
+
+    #[test]
+    fn my_org_info_serde_roundtrip() {
+        let now = Utc::now();
+        let info = MyOrgInfo {
+            id: Uuid::new_v4(),
+            slug: "acme".into(),
+            name: "Acme Corp".into(),
+            email: Some("admin@acme.com".into()),
+            kind: "team".into(),
+            plan: "enterprise".into(),
+            created_at: now,
+            updated_at: now,
+            role: "owner".into(),
+            joined_at: now,
+            invited_by: Some(Uuid::new_v4()),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        // camelCase wire format (server returns createdAt/joinedAt/invitedBy).
+        assert!(json.contains("createdAt"));
+        assert!(json.contains("joinedAt"));
+        assert!(json.contains("invitedBy"));
+        assert!(!json.contains("created_at"));
+
+        let de: MyOrgInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.slug, "acme");
+        assert_eq!(de.role, "owner");
+        assert!(de.invited_by.is_some());
+    }
+
+    #[test]
+    fn my_org_info_accepts_snake_case_aliases() {
+        // Server-side `to_string()` emits camelCase, but earlier deployments
+        // may emit snake_case; the aliases keep deserialization lenient.
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "slug": "acme",
+            "name": "Acme",
+            "email": null,
+            "kind": "team",
+            "plan": "free",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "role": "member",
+            "joined_at": "2024-01-02T00:00:00Z",
+            "invited_by": null
+        }"#;
+        let de: MyOrgInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(de.slug, "acme");
+        assert_eq!(de.role, "member");
+        assert!(de.email.is_none());
+        assert!(de.invited_by.is_none());
     }
 
     #[test]

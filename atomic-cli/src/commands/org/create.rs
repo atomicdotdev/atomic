@@ -38,7 +38,7 @@
 
 use clap::Parser;
 
-use crate::commands::client::build_client;
+use crate::commands::client::build_apex_client;
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_next_steps, print_success, KeyValueTable};
@@ -79,9 +79,10 @@ impl Command for OrgCreate {
 
 impl OrgCreate {
     async fn execute(&self) -> CliResult<()> {
-        // Build client using current default org (doesn't matter which org
-        // we're scoped to — the server creates a new org regardless).
-        let client = build_client(None, None).await?;
+        // Build an apex client (no org subdomain). `POST /orgs` is an apex
+        // endpoint that spans orgs, so it must be hit on the bare server host —
+        // and crucially this works even when no default org is configured yet.
+        let client = build_apex_client(None).await?;
 
         let info = atomic_teams::org::create_org(&client, &self.name, self.email.as_deref())
             .await
