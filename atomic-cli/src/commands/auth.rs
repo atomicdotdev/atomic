@@ -17,6 +17,13 @@
 //!    without `--identity`.
 //! 4. Subdomain — `http://alice.localhost:8080/...` → identity "alice" (legacy
 //!    last resort).
+//! 5. Default identity — if none of the above resolves to an identity that
+//!    exists locally, the store's default identity is used. This makes the
+//!    common single-identity case "just work": pushing to
+//!    `https://aaron.atomic.storage/...` with a default identity named
+//!    `aaron-claude` authenticates as `aaron-claude` without `--identity`.
+//!    The default fallback does NOT apply when `--identity` explicitly names an
+//!    identity that doesn't exist (that's a clear error, not a substitution).
 
 use atomic_identity::{Identity, IdentityStore};
 use atomic_remote::HttpRemoteConfig;
@@ -152,6 +159,105 @@ fn load_identity_lenient(store: &IdentityStore, name: &str) -> Option<Identity> 
         .find(|identity| identity.name.to_lowercase() == wanted)
 }
 
+/// Resolve a concrete identity for a remote operation, falling back to the
+/// default identity when the inferred name doesn't match any local identity.
+///
+/// This is the single place that bridges name resolution (URL subdomain,
+/// server binding, `--identity` flag) and the on-disk identity store. The
+/// fallback to the default identity makes the common case "just work": a user
+/// with a single registered identity can push to any tenant under their server
+/// without passing `--identity`, even when the subdomain label (`aaron`) does
+/// not match the local identity name (`aaron-claude`).
+///
+/// Resolution:
+/// 1. If `inferred_name` is `Some` and matches a local identity (lenient
+///    case-insensitive match), use it.
+/// 2. Otherwise, if `explicit` is false, fall back to the store's default
+///    identity.
+/// 3. If `explicit` is true (the name came from `--identity`), return `None`
+///    so the caller reports a clear "identity not found" error — we never
+///    silently substitute the default for an explicit flag.
+/// 4. If neither the inferred name nor the default resolves, return `None`.
+///
+/// `inferred_source` labels the resolution path in debug logs (e.g.
+/// `"subdomain 'aaron'"`, `"--identity 'aaron-claude'"`).
+fn resolve_identity_with_default_fallback(
+    store: &IdentityStore,
+    inferred_name: Option<&str>,
+    explicit: bool,
+    inferred_source: &str,
+) -> Option<Identity> {
+    let resolved_name = decide_identity_with_default_fallback(
+        inferred_name,
+        explicit,
+        |name| load_identity_lenient(store, name).is_some(),
+        store
+            .get_default()
+            .ok()
+            .flatten()
+            .map(|id| id.name.clone()),
+    );
+
+    match resolved_name.as_deref() {
+        Some(name) if inferred_name == Some(name) => {
+            log::debug!("Resolved identity '{name}' via {inferred_source}");
+        }
+        Some(name) => {
+            log::debug!("Falling back to default identity '{name}'");
+        }
+        None => {
+            if explicit {
+                log::debug!(
+                    "Explicit identity {:?} ({inferred_source}) not found; \
+                     not falling back to default",
+                    inferred_name
+                );
+            } else {
+                log::debug!(
+                    "No usable identity for {inferred_source} \
+                     (inferred={inferred_name:?}) and no default set"
+                );
+            }
+        }
+    }
+
+    resolved_name.and_then(|name| load_identity_lenient(store, &name))
+}
+
+/// Pure decision core for identity resolution with a default fallback.
+///
+/// Split from [`resolve_identity_with_default_fallback`] so the fallback logic
+/// can be unit-tested without an on-disk identity store.
+///
+/// * `inferred_name` — the name resolved from the URL/`--identity` (if any).
+/// * `explicit` — whether the name came from `--identity` (vs. URL inference).
+/// * `inferred_exists` — whether an identity with the given name is local.
+/// * `default_name` — the store's default identity name, if one is set.
+///
+/// Returns the identity name to authenticate as, or `None` when nothing usable
+/// resolves (the caller should error).
+fn decide_identity_with_default_fallback(
+    inferred_name: Option<&str>,
+    explicit: bool,
+    inferred_exists: impl Fn(&str) -> bool,
+    default_name: Option<String>,
+) -> Option<String> {
+    if let Some(name) = inferred_name {
+        if inferred_exists(name) {
+            return Some(name.to_string());
+        }
+        // Inferred name not found locally. If it came from --identity, that's
+        // an explicit miss — error, don't silently substitute the default.
+        if explicit {
+            return None;
+        }
+    }
+    // Fall back to the default identity (subdomain-inferred miss, or nothing
+    // inferable at all). The subdomain is the org slug, not the identity name,
+    // so a mismatch here is the expected, common case.
+    default_name
+}
+
 /// Attach a Bearer JWT auth header to the remote config.
 ///
 /// `identity_override` — if provided, this identity name is used directly,
@@ -172,15 +278,12 @@ pub async fn attach_identity(
     }
 
     // Priority 1: explicit override (--identity); 2/3: URL userinfo or subdomain.
-    let identity_name = match resolve_identity_name_with_override(remote_url, identity_override) {
-        Some(name) => name,
-        None => {
-            log::debug!("No identity resolvable from URL: {}", remote_url);
-            return config;
-        }
+    let inferred = resolve_identity_name_with_override(remote_url, identity_override);
+    let source = if identity_override.is_some() {
+        format!("--identity {:?}", identity_override)
+    } else {
+        "URL/config inference".to_string()
     };
-
-    log::debug!("Resolved identity name: {}", identity_name);
 
     let store = match IdentityStore::open_default() {
         Ok(s) => s,
@@ -190,12 +293,25 @@ pub async fn attach_identity(
         }
     };
 
-    // Match by name, tolerating tenant-slug/identity-name case differences
-    // (e.g. the `aaron` subdomain selecting the local `Aaron` identity).
-    let identity = match load_identity_lenient(&store, &identity_name) {
+    // Resolve a concrete identity, falling back to the default when the
+    // inferred name doesn't match any local identity (e.g. the `aaron`
+    // subdomain vs. a local identity named `aaron-claude`). An explicit
+    // --identity that doesn't exist does NOT fall back (returns None → no
+    // auth header, so the server rejects it with a clear 401).
+    let explicit = identity_override.is_some();
+    let identity = match resolve_identity_with_default_fallback(
+        &store,
+        inferred.as_deref(),
+        explicit,
+        &source,
+    ) {
         Some(id) => id,
         None => {
-            log::debug!("Identity '{}' not found in store", identity_name);
+            log::debug!(
+                "No usable identity for {} (inferred={:?}) and no default set",
+                remote_url,
+                inferred
+            );
             return config;
         }
     };
@@ -210,6 +326,7 @@ pub async fn attach_identity(
         }
     };
 
+    let identity_name = identity.name.clone();
     match crate::commands::token::get_token(&server, &identity).await {
         Ok(jwt) => {
             log::debug!("Attaching Bearer JWT for identity '{}'", identity_name);
@@ -234,22 +351,20 @@ pub async fn attach_identity(
 /// use and is valid for its full TTL. So "having usable credentials" reduces to
 /// three local conditions, each a distinct failure with its own remedy:
 ///
-/// 1. an identity is resolvable from the remote URL,
+/// 1. an identity is resolvable (from the URL, `--identity`, or the default),
 /// 2. that identity exists in the local store, and
 /// 3. its keypair can be loaded (so a token can actually be signed).
 #[derive(Debug, PartialEq, Eq)]
 pub enum CredentialIssue {
-    /// No identity could be resolved from the remote URL (no userinfo and no
-    /// subdomain) and `--identity` was not supplied. We can't know who to
-    /// authenticate as.
-    NoIdentityInUrl,
-    /// An identity name was resolved, but no such identity exists locally.
-    /// `from_flag` records whether the name came from the `--identity` flag
-    /// (vs. being inferred from the remote URL), so the message can point the
-    /// user at the right knob.
-    IdentityNotFound { name: String, from_flag: bool },
-    /// The identity exists but its signing keypair could not be loaded, so no
-    /// token can be minted.
+    /// No identity could be resolved from the remote URL or `--identity`, and
+    /// no default identity is set, so there is nothing to authenticate as.
+    NoIdentity,
+    /// `--identity` explicitly named an identity that doesn't exist locally.
+    /// We do not silently fall back to the default for an explicit flag — the
+    /// name itself is the user's input and must be pointed at.
+    ExplicitIdentityNotFound { name: String },
+    /// The resolved identity exists but its signing keypair could not be
+    /// loaded, so no token can be minted.
     KeypairUnavailable { name: String },
 }
 
@@ -260,27 +375,14 @@ impl CredentialIssue {
     /// command that establishes a usable credential for a remote.
     fn message(&self) -> String {
         match self {
-            CredentialIssue::NoIdentityInUrl => format!(
+            CredentialIssue::NoIdentity => format!(
                 "Not authenticated for {REMEDY_PREFIX}: could not determine an \
-                 identity from the remote URL, and no --identity was given. \
-                 Pass --identity <NAME> (see `atomic identity list`). {REMEDY_SUFFIX}"
+                 identity from the remote URL, no --identity was given, and no \
+                 default identity is set. Pass --identity <NAME> (see \
+                 `atomic identity list`) or set a default with \
+                 `atomic identity new <name> --set-default`. {REMEDY_SUFFIX}"
             ),
-            // When the name was inferred from the URL, the fix is usually to
-            // pass --identity explicitly; when it came from --identity, the
-            // name itself is wrong. Tailor the hint to the source.
-            CredentialIssue::IdentityNotFound {
-                name,
-                from_flag: false,
-            } => format!(
-                "Not authenticated for {REMEDY_PREFIX}: identity '{name}' \
-                 (inferred from the remote URL) is not registered on this \
-                 machine. Pass --identity <NAME> to select a local identity \
-                 (see `atomic identity list`). {REMEDY_SUFFIX}"
-            ),
-            CredentialIssue::IdentityNotFound {
-                name,
-                from_flag: true,
-            } => format!(
+            CredentialIssue::ExplicitIdentityNotFound { name } => format!(
                 "Not authenticated for {REMEDY_PREFIX}: --identity '{name}' does \
                  not match any identity on this machine (see `atomic identity \
                  list`). {REMEDY_SUFFIX}"
@@ -302,21 +404,40 @@ const REMEDY_SUFFIX: &str =
 /// push proceed into a confusing 404 (which the server returns for private
 /// projects the caller isn't authorized to see).
 ///
-/// Returns `Ok(())` when an identity is resolvable (from `--identity` or the
-/// URL), exists in the local store, and has a loadable signing keypair.
+/// Returns `Ok(())` when an identity is resolvable (from `--identity`, the
+/// URL, or the default identity), exists in the local store, and has a
+/// loadable signing keypair.
 ///
 /// `identity_override` is the `--identity` flag value; it takes priority over
 /// any identity inferred from the URL, exactly as [`attach_identity`] resolves
 /// it. The two must agree, or the fail-fast check here would reject a push that
 /// `attach_identity` would have authenticated.
+///
+/// # Default-identity fallback
+///
+/// When the inferred identity name (from the subdomain or server binding) does
+/// not match any local identity, or when no identity is inferable at all, the
+/// default identity is used instead. This makes the common single-identity case
+/// "just work" without `--identity`. The fallback does **not** apply when
+/// `--identity` explicitly names an identity that doesn't exist — that is a
+/// clear error, not a silent substitution.
 pub fn check_push_credentials(remote_url: &str, identity_override: Option<&str>) -> CliResult<()> {
     let store = IdentityStore::open_default()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to open identity store: {e}")))?;
 
+    let inferred = resolve_identity_name_with_override(remote_url, identity_override);
+    let explicit = identity_override.is_some();
+
+    // Resolve a concrete identity, falling back to the default when the
+    // inferred name doesn't match (and the name didn't come from --identity).
+    let identity =
+        resolve_identity_with_default_fallback(&store, inferred.as_deref(), explicit, "push");
+    let resolved_name = identity.as_ref().map(|id| id.name.clone());
+
     let issue = evaluate_push_credentials(
-        resolve_identity_name_with_override(remote_url, identity_override),
-        identity_override.is_some(),
-        |name| load_identity_lenient(&store, name).is_some(),
+        explicit,
+        inferred.as_deref(),
+        resolved_name.as_deref(),
         |name| {
             load_identity_lenient(&store, name)
                 .map(|id| store.load_keypair(&id.id, None).is_ok())
@@ -335,33 +456,43 @@ pub fn check_push_credentials(remote_url: &str, identity_override: Option<&str>)
 /// Pure decision core for [`check_push_credentials`], split out so it can be
 /// unit-tested without touching the on-disk identity store.
 ///
-/// * `identity_name` — the resolved identity (override or URL-inferred), if any.
-/// * `from_flag` — whether `identity_name` came from `--identity` (vs. the URL).
-/// * `identity_exists` — whether an identity with the given name is in the store.
+/// * `explicit` — whether `--identity` was passed.
+/// * `inferred` — the name inferred from the URL/flag (before fallback); used
+///   only to name the missing identity in the error message.
+/// * `resolved_name` — the identity name to use **after** the default fallback
+///   (`None` when nothing usable resolved).
 /// * `keypair_loadable` — whether that identity's signing keypair can be loaded.
 ///
 /// Returns `None` when credentials are usable, or `Some(issue)` describing the
-/// first problem encountered.
+/// problem.
 fn evaluate_push_credentials(
-    identity_name: Option<String>,
-    from_flag: bool,
-    identity_exists: impl Fn(&str) -> bool,
+    explicit: bool,
+    inferred: Option<&str>,
+    resolved_name: Option<&str>,
     keypair_loadable: impl Fn(&str) -> bool,
 ) -> Option<CredentialIssue> {
-    let name = match identity_name {
-        Some(n) => n,
-        None => return Some(CredentialIssue::NoIdentityInUrl),
-    };
-
-    if !identity_exists(&name) {
-        return Some(CredentialIssue::IdentityNotFound { name, from_flag });
+    match resolved_name {
+        Some(name) => {
+            if !keypair_loadable(name) {
+                return Some(CredentialIssue::KeypairUnavailable {
+                    name: name.to_string(),
+                });
+            }
+            None
+        }
+        None => {
+            // No usable identity. If --identity was explicit, name the missing
+            // identity so the user knows which input was wrong. Otherwise the
+            // fallback to default also failed (no default) — report that.
+            if explicit {
+                Some(CredentialIssue::ExplicitIdentityNotFound {
+                    name: inferred.unwrap_or_default().to_string(),
+                })
+            } else {
+                Some(CredentialIssue::NoIdentity)
+            }
+        }
     }
-
-    if !keypair_loadable(&name) {
-        return Some(CredentialIssue::KeypairUnavailable { name });
-    }
-
-    None
 }
 
 /// Derive the apex server URL (scheme + host without the leading subdomain
@@ -509,54 +640,40 @@ mod tests {
         assert_eq!(extract_subdomain(".localhost"), None);
     }
 
-    // -- pre-push credential check --
+    // -- pre-push credential check (evaluate_push_credentials) --
 
     #[test]
     fn creds_ok_when_identity_resolves_and_keypair_loads() {
-        let issue = evaluate_push_credentials(
-            Some("alice".to_string()),
-            false,
-            |_| true, // identity exists
-            |_| true, // keypair loadable
-        );
+        // A concrete identity resolved (after any fallback) with a loadable key.
+        let issue = evaluate_push_credentials(false, Some("alice"), Some("alice"), |_| true);
         assert_eq!(issue, None);
     }
 
     #[test]
-    fn creds_fail_when_no_identity_in_url() {
-        // A bare host with no userinfo and no subdomain resolves to no identity.
-        let issue = evaluate_push_credentials(None, false, |_| true, |_| true);
-        assert_eq!(issue, Some(CredentialIssue::NoIdentityInUrl));
+    fn creds_fail_when_no_identity_and_no_default() {
+        // Nothing inferred, nothing resolved → NoIdentity.
+        let issue = evaluate_push_credentials(false, None, None, |_| true);
+        assert_eq!(issue, Some(CredentialIssue::NoIdentity));
     }
 
     #[test]
-    fn creds_fail_when_identity_missing_from_store() {
-        let issue = evaluate_push_credentials(
-            Some("alice".to_string()),
-            false,
-            |_| false, // identity not in store
-            |_| true,
-        );
+    fn creds_fail_when_explicit_identity_not_found() {
+        // --identity foo where foo doesn't exist; explicit so no default fallback.
+        let issue = evaluate_push_credentials(true, Some("foo"), None, |_| true);
         assert_eq!(
             issue,
-            Some(CredentialIssue::IdentityNotFound {
-                name: "alice".to_string(),
-                from_flag: false,
+            Some(CredentialIssue::ExplicitIdentityNotFound {
+                name: "foo".to_string()
             })
         );
     }
 
     #[test]
     fn creds_fail_when_keypair_cannot_load() {
-        // Identity exists but its signing key can't be loaded — no token can be
-        // minted. This stands in for an "expired"/unusable credential, which in
-        // this self-signed-JWT model means "cannot sign right now".
-        let issue = evaluate_push_credentials(
-            Some("alice".to_string()),
-            false,
-            |_| true,  // identity exists
-            |_| false, // keypair unavailable
-        );
+        // Identity resolved but its signing key can't be loaded — no token can
+        // be minted. This stands in for an "expired"/unusable credential, which
+        // in this self-signed-JWT model means "cannot sign right now".
+        let issue = evaluate_push_credentials(false, Some("alice"), Some("alice"), |_| false);
         assert_eq!(
             issue,
             Some(CredentialIssue::KeypairUnavailable {
@@ -569,14 +686,9 @@ mod tests {
     fn credential_issue_messages_are_actionable() {
         // Every issue must name the remedy so the failure is self-explanatory.
         for issue in [
-            CredentialIssue::NoIdentityInUrl,
-            CredentialIssue::IdentityNotFound {
+            CredentialIssue::NoIdentity,
+            CredentialIssue::ExplicitIdentityNotFound {
                 name: "alice".to_string(),
-                from_flag: false,
-            },
-            CredentialIssue::IdentityNotFound {
-                name: "alice".to_string(),
-                from_flag: true,
             },
             CredentialIssue::KeypairUnavailable {
                 name: "alice".to_string(),
@@ -586,6 +698,84 @@ mod tests {
             assert!(msg.contains("Not authenticated"));
             assert!(msg.contains("atomic identity register"));
         }
+    }
+
+    // -- default-identity fallback (decide_identity_with_default_fallback) --
+
+    #[test]
+    fn fallback_uses_inferred_when_it_exists() {
+        // The subdomain name matches a local identity — use it directly.
+        let name = decide_identity_with_default_fallback(
+            Some("aaron"),
+            false,
+            |n| n == "aaron",
+            Some("aaron-claude".to_string()),
+        );
+        assert_eq!(name.as_deref(), Some("aaron"));
+    }
+
+    #[test]
+    fn fallback_to_default_when_subdomain_name_not_local() {
+        // The reported bug: pushing to aaron.atomic.storage infers "aaron", but
+        // the only local identity is "aaron-claude". Fall back to the default.
+        let name = decide_identity_with_default_fallback(
+            Some("aaron"),
+            false,
+            |n| n == "aaron-claude", // "aaron" does NOT exist locally
+            Some("aaron-claude".to_string()),
+        );
+        assert_eq!(name.as_deref(), Some("aaron-claude"));
+    }
+
+    #[test]
+    fn fallback_to_default_when_nothing_inferred() {
+        // A bare host (no subdomain) with no --identity → use the default.
+        let name = decide_identity_with_default_fallback(
+            None,
+            false,
+            |_| false,
+            Some("aaron-claude".to_string()),
+        );
+        assert_eq!(name.as_deref(), Some("aaron-claude"));
+    }
+
+    #[test]
+    fn fallback_returns_none_when_no_default() {
+        // No inference and no default set → nothing to authenticate as.
+        let name = decide_identity_with_default_fallback(None, false, |_| false, None);
+        assert_eq!(name, None);
+    }
+
+    #[test]
+    fn fallback_returns_none_when_subdomain_miss_and_no_default() {
+        let name = decide_identity_with_default_fallback(Some("aaron"), false, |_| false, None);
+        assert_eq!(name, None);
+    }
+
+    #[test]
+    fn fallback_does_not_substitute_default_for_explicit_identity() {
+        // --identity foo where foo doesn't exist must NOT silently use the
+        // default — that's a clear error, not a substitution.
+        let name = decide_identity_with_default_fallback(
+            Some("foo"),
+            true, // explicit
+            |_| false, // "foo" not in store
+            Some("aaron-claude".to_string()),
+        );
+        assert_eq!(name, None);
+    }
+
+    #[test]
+    fn fallback_uses_explicit_identity_when_it_exists() {
+        // --identity aaron-claude where it exists → use it (explicit is fine
+        // when the name actually matches).
+        let name = decide_identity_with_default_fallback(
+            Some("aaron-claude"),
+            true,
+            |_| true,
+            Some("other".to_string()),
+        );
+        assert_eq!(name.as_deref(), Some("aaron-claude"));
     }
 
     // -- identity override resolution --
@@ -699,16 +889,22 @@ mod tests {
     fn override_resolves_when_subdomain_label_is_unregistered() {
         // Regression: the subdomain label ("aaron") is not a local identity
         // name, but the explicit --identity ("Aaron") is — the override must be
-        // what gets evaluated, not the label.
-        let issue = evaluate_push_credentials(
-            resolve_identity_name_with_override(
-                "https://aaron.atomic.storage/workspaces/w/projects/p/code",
-                Some("Aaron"),
-            ),
-            true,
-            |name| name == "Aaron", // only "Aaron" exists locally
-            |name| name == "Aaron",
+        // what gets evaluated, not the label. With the default-fallback logic,
+        // --identity "Aaron" resolves to "Aaron" (it exists) and is usable.
+        let inferred = resolve_identity_name_with_override(
+            "https://aaron.atomic.storage/workspaces/w/projects/p/code",
+            Some("Aaron"),
         );
+        let resolved = decide_identity_with_default_fallback(
+            inferred.as_deref(),
+            true, // explicit
+            |name| name == "Aaron", // only "Aaron" exists locally
+            Some("other".to_string()),
+        );
+        assert_eq!(resolved.as_deref(), Some("Aaron"));
+
+        // And the credential check passes for that resolved identity.
+        let issue = evaluate_push_credentials(true, inferred.as_deref(), Some("Aaron"), |_| true);
         assert_eq!(issue, None);
     }
 }
