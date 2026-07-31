@@ -325,22 +325,52 @@ pub struct TeamMemberInfo {
     pub added_by: Uuid,
 }
 
-/// Permission grant on an organization or workspace.
+/// Permission grant on an organization.
+///
+/// Matches the server's `OrgGrantResponse` (snake_case, no serde renames).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct GrantInfo {
     /// Unique identifier.
     pub id: Uuid,
-    /// Whether the subject is a user or team.
+    /// Whether the subject is a user or team (`"user"` or `"team"`).
     pub subject_type: GrantSubjectType,
-    /// The subject's identity or team ID (may be absent for wildcard grants).
+    /// The subject's identity or team ID (absent for wildcard/everyone grants).
     pub subject_id: Option<Uuid>,
-    /// The permission level.
+    /// The permission level (`"read"`, `"write"`, `"admin"`, or `"owner"`).
     pub relation: GrantRelation,
     /// Identity that created the grant.
     pub granted_by: Option<Uuid>,
     /// When the grant was created.
     pub granted_at: DateTime<Utc>,
+}
+
+/// A workspace permission grant as returned by the server.
+///
+/// Matches the server's `GrantResponse` (snake_case, no serde renames).
+/// Unlike [`GrantInfo`] (org grants), workspace grants carry `subject_relation`,
+/// `object_type`, and `object_id` — the server always includes these for
+/// workspace grants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceGrantInfo {
+    /// Unique identifier of the ReBAC tuple.
+    pub id: Uuid,
+    /// Whether the subject is a user or team (`"user"` or `"team"`).
+    pub subject_type: GrantSubjectType,
+    /// The subject's identity or team UUID (absent for wildcard/everyone grants).
+    pub subject_id: Option<Uuid>,
+    /// The subject's relation within its team, if applicable (typically `None`
+    /// for direct user/team grants).
+    pub subject_relation: Option<String>,
+    /// The permission level (`"read"`, `"write"`, or `"admin"`).
+    pub relation: GrantRelation,
+    /// The resource type (always `"workspace"` for workspace grants).
+    pub object_type: String,
+    /// The workspace UUID the grant applies to.
+    pub object_id: Uuid,
+    /// When the grant was created.
+    pub granted_at: DateTime<Utc>,
+    /// Identity that created the grant.
+    pub granted_by: Option<Uuid>,
 }
 
 /// Domain alias claimed by an organization.
@@ -438,23 +468,15 @@ pub(crate) struct UpdateTeamMemberRoleRequest {
     pub role: TeamRole,
 }
 
-/// Body for adding a grant.
+/// Body for adding a grant (workspace or org).
+///
+/// Serialized as snake_case to match the server's `AddGrantRequest` /
+/// `AddOrgGrantRequest` (no serde renames server-side).
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct AddGrantRequest {
     pub subject_type: GrantSubjectType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subject_id: Option<Uuid>,
+    pub subject_id: Uuid,
     pub relation: GrantRelation,
-}
-
-/// Body for revoking a grant.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RevokeGrantRequest {
-    pub subject_type: GrantSubjectType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subject_id: Option<Uuid>,
 }
 
 /// Body for claiming a domain.
@@ -658,6 +680,47 @@ mod tests {
         let de: GrantInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(de.subject_type, GrantSubjectType::Team);
         assert_eq!(de.relation, GrantRelation::Write);
+    }
+
+    #[test]
+    fn grant_info_deserializes_from_server_snake_case() {
+        // The server sends snake_case JSON (no serde renames). GrantInfo must
+        // accept that, not camelCase.
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "subject_type": "team",
+            "subject_id": "550e8400-e29b-41d4-a716-446655440001",
+            "relation": "admin",
+            "granted_by": null,
+            "granted_at": "2024-01-01T00:00:00Z"
+        }"#;
+        let de: GrantInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(de.subject_type, GrantSubjectType::Team);
+        assert_eq!(de.relation, GrantRelation::Admin);
+        assert!(de.granted_by.is_none());
+    }
+
+    #[test]
+    fn workspace_grant_info_deserializes_from_server_snake_case() {
+        // The server's GrantResponse includes subject_relation, object_type,
+        // and object_id — all snake_case.
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "subject_type": "team",
+            "subject_id": "550e8400-e29b-41d4-a716-446655440001",
+            "subject_relation": null,
+            "relation": "write",
+            "object_type": "workspace",
+            "object_id": "550e8400-e29b-41d4-a716-446655440002",
+            "granted_at": "2024-01-01T00:00:00Z",
+            "granted_by": "550e8400-e29b-41d4-a716-446655440003"
+        }"#;
+        let de: WorkspaceGrantInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(de.subject_type, GrantSubjectType::Team);
+        assert_eq!(de.relation, GrantRelation::Write);
+        assert_eq!(de.object_type, "workspace");
+        assert!(de.subject_relation.is_none());
+        assert!(de.granted_by.is_some());
     }
 
     #[test]

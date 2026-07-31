@@ -45,5 +45,5 @@ pub mod types;
 pub use error::{TeamsError, TeamsResult};
 pub use types::{
     DomainAliasInfo, GrantInfo, GrantRelation, GrantSubjectType, MyOrgInfo, OrgInfo, OrgMemberInfo,
-    OrgRole, TeamInfo, TeamMemberInfo, TeamRole, TeamVisibility,
+    OrgRole, TeamInfo, TeamMemberInfo, TeamRole, TeamVisibility, WorkspaceGrantInfo,
 };
