@@ -79,6 +79,15 @@ pub struct Enable {
     /// are not needed; the manifest is self-describing.
     #[arg(long, value_name = "FILE")]
     hooks: Option<std::path::PathBuf>,
+
+    /// Install the integration package from a local checkout instead of
+    /// syncing it from Atomic storage.
+    ///
+    /// For development of integration packages (e.g. a local atomic-opencode
+    /// clone): installs exactly what the storage path would, per the
+    /// package's atomic-integration.toml, without any network access.
+    #[arg(long, value_name = "PATH")]
+    from: Option<std::path::PathBuf>,
 }
 
 impl Enable {
@@ -91,6 +100,7 @@ impl Enable {
             all: false,
             global: false,
             hooks: None,
+            from: None,
         }
     }
 }
@@ -128,12 +138,18 @@ impl Command for Enable {
             // Install for all detected agents
             let detected = registry.detect(&repo_root);
             if detected.is_empty() {
-                // If none detected, try all registered agents
-                print_warning("No agents detected — installing hooks for all registered agents.");
-                registry.list()
-            } else {
-                detected
+                // Do not install hooks when no agent is detected.
+                print_error(
+                    "No agents detected in this repository — nothing to enable with --all.",
+                );
+                print_warning(
+                    "Create a .claude/, .gemini/, or .agents/ directory first, or use --agent <name>.",
+                );
+                return Err(crate::error::CliError::InvalidArgument {
+                    message: "no agents detected for --all".to_string(),
+                });
             }
+            detected
         } else if let Some(ref name) = self.agent {
             // Specific agent requested — validate it exists
             registry
@@ -193,6 +209,56 @@ impl Command for Enable {
                 }
             };
 
+            // Externally-packaged agents: install the integration package
+            // itself — synced from Atomic storage, or from a local checkout
+            // with --from. This supersedes the adapter's built-in install,
+            // which remains as a fallback if the package can't be fetched.
+            if let Some(spec) = atomic_agent::integrations::resolve(agent_name) {
+                let receipt_exists = atomic_agent::integrations::Receipt::load(agent_name)
+                    .map(|r| r.is_some())
+                    .unwrap_or(false);
+
+                if receipt_exists && !self.force {
+                    println!(
+                        "  ✓ integration already installed for {}. Use --force to refresh.",
+                        agent.display_name(),
+                    );
+                    continue;
+                }
+
+                match self.install_integration(agent_name, &spec) {
+                    Ok(outcome) => {
+                        print_success(&format!(
+                            "Installed {} integration v{} ({} new, {} refreshed, {} skipped)",
+                            agent.display_name(),
+                            outcome.version,
+                            outcome.installed.len(),
+                            outcome.refreshed.len(),
+                            outcome.skipped.len(),
+                        ));
+                        for skipped in &outcome.skipped {
+                            println!("    keep: {} ({})", skipped.dst.display(), skipped.reason);
+                        }
+                        for merged in &outcome.settings {
+                            println!(
+                                "    settings: {} hook command(s) → {}",
+                                merged.added,
+                                merged.target.display()
+                            );
+                        }
+                        total_installed += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        print_warning(&format!(
+                            "Integration install for {} failed: {} — falling back to built-in hooks.",
+                            agent.display_name(),
+                            e
+                        ));
+                    }
+                }
+            }
+
             // Check if already installed (and not forcing)
             if !self.force && agent.is_installed(&repo_root) {
                 println!(
@@ -243,23 +309,11 @@ impl Command for Enable {
 
         // Summary
         if total_installed > 0 {
-            let has_opencode = agents_to_install.contains(&"opencode");
-            let has_kilo = agents_to_install.contains(&"kilo");
             println!();
             println!("Each agent turn will be recorded as an Atomic change with:");
             println!("  • AI provenance (vendor, model, tokens, cost)");
             println!("  • Session metadata (turn number, timing, files)");
             println!("  • Optional transcript (full conversation)");
-            if has_opencode {
-                println!();
-                println!("For the full OpenCode integration (agent, skills, provenance):");
-                println!("  npm install -g atomic-opencode && npx atomic-opencode");
-            }
-            if has_kilo {
-                println!();
-                println!("For the full Kilo Code integration (rules, agent mode, provenance):");
-                println!("  npm install -g atomic-kilo && npx atomic-kilo");
-            }
             println!();
             println!("Use 'atomic agent status' to check integration status.");
             println!("Use 'atomic log' to view recorded turns.");
@@ -269,7 +323,77 @@ impl Command for Enable {
     }
 }
 
+/// Sync an agent's integration package into the CLI-managed cache
+/// (`~/.atomic/integrations/<agent>/repo`) using Atomic's own remote
+/// protocol, and return the package directory (the cache's working copy).
+///
+/// First run clones the package; later runs reuse the cache so enable works
+/// offline. `--force` discards the cache and re-clones.
+fn sync_integration_package(
+    agent_name: &str,
+    spec: &atomic_agent::integrations::IntegrationSpec,
+    force: bool,
+) -> CliResult<std::path::PathBuf> {
+    let cache = atomic_agent::integrations::cache_repo_dir(agent_name)
+        .map_err(|e| crate::error::CliError::Internal(anyhow::anyhow!(e.to_string())))?;
+
+    if force && cache.exists() {
+        std::fs::remove_dir_all(&cache).map_err(crate::error::CliError::Io)?;
+    }
+
+    if cache.exists() {
+        println!(
+            "Using cached package at {} (use --force to refresh).",
+            cache.display()
+        );
+    } else {
+        if let Some(ref tag) = spec.tag {
+            print_warning(&format!(
+                "Tag pinning ({tag}) is not yet implemented — installing the head of view '{}' instead.",
+                spec.view
+            ));
+        }
+        crate::commands::clone::Clone::new(spec.url.clone())
+            .with_path(cache.display().to_string())
+            .with_view(spec.view.clone())
+            .run()?;
+    }
+
+    Ok(cache)
+}
+
 impl Enable {
+    /// Install an externally-packaged integration for an agent.
+    ///
+    /// The package directory comes from `--from` (a local checkout) or from
+    /// syncing the registry's Atomic storage project into the CLI-managed
+    /// cache. Installation itself is done by the integrations engine per the
+    /// package's atomic-integration.toml.
+    fn install_integration(
+        &self,
+        agent_name: &str,
+        spec: &atomic_agent::integrations::IntegrationSpec,
+    ) -> CliResult<atomic_agent::integrations::InstallOutcome> {
+        let source;
+        let pkg_dir = if let Some(ref from) = self.from {
+            source = from.display().to_string();
+            from.clone()
+        } else {
+            source = spec.url.clone();
+            sync_integration_package(agent_name, spec, self.force)?
+        };
+
+        let opts = atomic_agent::integrations::InstallOptions {
+            force: self.force,
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            source,
+            expect_agent: Some(agent_name.to_string()),
+        };
+
+        atomic_agent::integrations::install_from_dir(&pkg_dir, &opts)
+            .map_err(|e| crate::error::CliError::Internal(anyhow::anyhow!(e.to_string())))
+    }
+
     /// Install hooks from an integration-supplied manifest file.
     ///
     /// The manifest names its own target settings file and the hook commands to
@@ -311,10 +435,11 @@ impl Enable {
     /// Supports:
     /// - `claude-code` → `~/.claude/settings.json`
     /// - `gemini-cli` → `~/.gemini/settings.json`
-    /// - `agy` → `~/.gemini/config/plugins/atomic/hooks.json` (plugin)
     /// - `codex` → `~/.codex/hooks.json`
+    ///
+    /// agy is intentionally absent: its plugin is inherently global and is
+    /// installed by the integrations engine via the standard `enable` path.
     fn run_global(&self) -> CliResult<()> {
-        use atomic_agent::hooks::agy::AgyHook;
         use atomic_agent::hooks::claude_code::ClaudeCodeHook;
         use atomic_agent::hooks::codex::CodexHook;
         use atomic_agent::hooks::gemini_cli::GeminiCliHook;
@@ -389,38 +514,14 @@ impl Enable {
             }
 
             "agy" => {
-                let hook = AgyHook::new();
-
-                if !self.force && hook.is_installed_global() {
-                    print_success(
-                        "Hooks already installed via the ~/.gemini/config/plugins/atomic/ plugin.",
-                    );
-                    println!("  Use --force to reinstall.");
-                    return Ok(());
-                }
-
-                match hook.install_global(self.force) {
-                    Ok(count) if count > 0 => {
-                        print_success(&format!(
-                            "Installed {} hook{} for Antigravity CLI as an agy plugin",
-                            count,
-                            if count == 1 { "" } else { "s" },
-                        ));
-                        println!();
-                        println!("Hooks written to: ~/.gemini/config/plugins/atomic/hooks.json");
-                        println!();
-                        println!("Every agy session in a project with .atomic/ will now:");
-                        println!("  • Record each turn as an Atomic change with full provenance");
-                        println!("  • Track session metadata (turn number, timing, files)");
-                        println!("  • Capture tool calls through the post-tool hook");
-                    }
-                    Ok(_) => {
-                        print_success("Hooks already up to date.");
-                    }
-                    Err(e) => {
-                        print_error(&format!("Failed to install hooks: {}", e));
-                    }
-                }
+                // agy's plugin is inherently global — the integration package
+                // install (the standard repo-scoped `enable` path) *is* the
+                // global install.
+                println!("The agy plugin is global by nature — install it with:");
+                println!("  atomic agent enable --agent agy");
+                println!();
+                println!("(No --global needed; the integrations engine stages the plugin");
+                println!(" at ~/.gemini/config/plugins/atomic/ from the atomic-agy package.)");
             }
 
             "codex" => {
@@ -461,18 +562,17 @@ impl Enable {
             "kiro" => {
                 print_success("Kiro hooks are configured through the IDE panel.");
                 println!();
-                println!("Install the atomic-kiro package for skills, steering, and hook scripts:");
-                println!("  npx atomic-kiro");
+                println!("Install the atomic-kiro integration (skills, steering, hook scripts):");
+                println!("  atomic agent enable --agent kiro");
                 println!();
                 println!(
                     "Then configure hooks in Kiro IDE \u{2192} Agent Steering & Skills panel."
                 );
-                println!("See: https://github.com/atomicdotdev/atomic-kiro");
             }
 
             other => {
                 print_warning(&format!(
-                    "Global install is not supported for '{}'. Supported agents: claude-code, gemini-cli, agy, codex, kiro",
+                    "Global install is not supported for '{}'. Supported agents: claude-code, gemini-cli, codex, kiro (agy via plain enable)",
                     other
                 ));
             }
@@ -507,6 +607,7 @@ mod tests {
             all: false,
             global: false,
             hooks: None,
+            from: None,
         };
     }
 
@@ -518,6 +619,7 @@ mod tests {
             all: false,
             global: false,
             hooks: None,
+            from: None,
         };
         assert!(cmd.force);
         assert_eq!(cmd.agent.as_deref(), Some("claude-code"));
@@ -531,6 +633,7 @@ mod tests {
             all: true,
             global: false,
             hooks: None,
+            from: None,
         };
         assert!(cmd.all);
         assert!(cmd.agent.is_none());
@@ -544,6 +647,7 @@ mod tests {
             all: false,
             global: true,
             hooks: None,
+            from: None,
         };
         assert!(cmd.global);
         assert_eq!(cmd.agent.as_deref(), Some("claude-code"));

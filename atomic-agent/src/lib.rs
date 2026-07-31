@@ -89,6 +89,7 @@ pub mod event;
 pub mod export;
 pub mod hooks;
 pub mod identity;
+pub mod integrations;
 pub mod learnings;
 pub mod provenance;
 pub mod record;

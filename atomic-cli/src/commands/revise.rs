@@ -229,10 +229,6 @@ pub struct Revise {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Include all untracked files in the revision.
-    #[arg(short, long)]
-    pub all: bool,
-
     /// Specific files to include in the revision.
     #[arg(last = true)]
     pub files: Vec<PathBuf>,
@@ -248,7 +244,6 @@ impl Revise {
             no_edit: false,
             author: None,
             dry_run: false,
-            all: false,
             files: Vec::new(),
         }
     }

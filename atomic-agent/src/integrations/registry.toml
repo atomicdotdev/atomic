@@ -1,0 +1,59 @@
+# Curated registry of externally-packaged agent integrations.
+#
+# Each entry maps an adapter name (see hooks::AgentRegistry) to the public
+# Atomic storage project that hosts its integration package. `enable` pulls
+# the package with Atomic's own sync and installs it per the package's
+# atomic-integration.toml manifest.
+#
+# Bumping an integration = one-line PR to this file (pin a tag once the
+# package has one). `view` is the view pulled when no tag is pinned.
+
+schema = 1
+
+[agents.agy]
+url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-agy/code"
+view = "release"
+
+[agents.claude-code]
+url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-claude/code"
+view = "release"
+
+[agents.cline]
+url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-cline/code"
+view = "release"
+
+[agents.codex]
+url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-codex/code"
+view = "release"
+
+[agents.copilot]
+url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-copilot/code"
+view = "release"
+
+[agents.cursor]
+url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-cursor/code"
+view = "release"
+
+[agents.devin]
+url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-devin/code"
+view = "release"
+
+[agents.kilo]
+url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-kilo/code"
+view = "release"
+
+[agents.kiro]
+url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-kiro/code"
+view = "release"
+
+[agents.grok]
+url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-grok/code"
+view = "main"
+
+[agents.opencode]
+url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-opencode/code"
+view = "release"
+
+[agents.pi]
+url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-pi/code"
+view = "release"

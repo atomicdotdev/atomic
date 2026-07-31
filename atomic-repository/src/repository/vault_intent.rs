@@ -589,6 +589,53 @@ impl Repository {
             None => content_bytes,
         };
 
+        // Gate enforcement: a `done` intent must be internally consistent with
+        // its own checklist — every task `done` and every acceptance criterion
+        // `met` (the rollup rule), with valid task/criterion vocabulary. Enforce
+        // here so `--status done` (or rewriting the body of a done intent)
+        // cannot bypass the gate the way a raw frontmatter write would.
+        //
+        // We validate only when completion is actively asserted — setting `done`
+        // or editing the body of a done intent — so unrelated metadata edits are
+        // never retroactively blocked. We deliberately scope enforcement to the
+        // checklist shapes (TaskShape, AcceptanceCriterionShape) and the rollup
+        // (IntentShape/status): the broader structural gate (why, scope-out,
+        // proof, attributedTo) belongs to `atomic intent attest`/`validate` and
+        // must not force the canonical authoring format onto freeform intents.
+        let resulting_status = fm.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let asserting_done = options.status.as_deref() == Some("done")
+            || (options.content.is_some() && resulting_status == "done");
+        if asserting_done {
+            let body_str = String::from_utf8_lossy(&new_content).into_owned();
+            // A body we cannot lift carries no canonical checklist to grade, so
+            // there is nothing for the rollup to enforce; the full gate at
+            // attest/validate time still surfaces malformed directives.
+            if let Ok(node) = atomic_canonical::lift::lift_intent(&fm, &body_str) {
+                let report = atomic_canonical::validate_intent(&node);
+                let blocking: Vec<_> = report
+                    .results
+                    .iter()
+                    .filter(|v| {
+                        matches!(v.shape.as_str(), "TaskShape" | "AcceptanceCriterionShape")
+                            || (v.shape == "IntentShape" && v.path.as_deref() == Some("status"))
+                    })
+                    .collect();
+                if !blocking.is_empty() {
+                    let details = blocking
+                        .iter()
+                        .map(|v| format!("  - {}", v.message))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "Intent '{}' cannot be marked done: its checklist is not complete.\n{}",
+                            full_id, details
+                        ),
+                    });
+                }
+            }
+        }
+
         self.vault_store(&intent_file, VaultEntryType::Intent, new_content, new_fm)?;
 
         // Update manifest
@@ -820,15 +867,38 @@ impl Repository {
                 Ok(key)
             }
             IntentRef::Uid(uid) => {
-                // Match a stored ULID exactly or by prefix; return its human key.
-                let mut matches = manifest.intents.values().filter(|s| {
-                    s.uid == uid || s.uid.starts_with(&uid) || s.uid.eq_ignore_ascii_case(&uid)
-                });
-                if let Some(summary) = matches.next() {
+                // Prefer an exact UID. A prefix is accepted only when it
+                // identifies exactly one intent.
+                let mut matches: Vec<_> = manifest
+                    .intents
+                    .values()
+                    .filter(|summary| summary.uid.eq_ignore_ascii_case(&uid))
+                    .collect();
+                if matches.is_empty() {
+                    let prefix = uid.to_ascii_uppercase();
+                    matches = manifest
+                        .intents
+                        .values()
+                        .filter(|summary| summary.uid.to_ascii_uppercase().starts_with(&prefix))
+                        .collect();
+                }
+                matches.sort_by(|a, b| a.uid.cmp(&b.uid));
+
+                if matches.len() == 1 {
+                    let summary = matches[0];
                     return Ok(if summary.human_key.is_empty() {
-                        uid
+                        summary.uid.clone()
                     } else {
                         summary.human_key.clone()
+                    });
+                }
+                if matches.len() > 1 {
+                    return Err(RepositoryError::AmbiguousIntent {
+                        prefix: id.to_string(),
+                        matches: matches
+                            .into_iter()
+                            .map(|summary| summary.uid.clone())
+                            .collect(),
                     });
                 }
                 Err(RepositoryError::InvalidOperation {
@@ -1235,6 +1305,71 @@ The authentication module has no rate limiting.
     }
 
     #[test]
+    fn test_intent_update_done_rejected_when_task_incomplete() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let result = repo
+            .vault_intent_create(create_opts("Rate limiting"))
+            .unwrap();
+
+        // A canonical body whose task is still open while we assert `done`.
+        let body = "\
+:::why\nNeed rate limiting.\n:::\n\n\
+:::acceptance-criterion{#ac-1 status=met verifiedBy=did:atomic:lee evidence=urn:atomic:change:01J8}\n\
+Login attempts are rate-limited.\n:::\n\n\
+:::task{#t1 status=open satisfies=ac-1}\nAdd rate limiter middleware.\n:::";
+
+        let err = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    status: Some("done".to_string()),
+                    content: Some(body.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("checklist is not complete") && msg.contains("every task must be done"),
+            "unexpected error: {msg}"
+        );
+
+        // The rejected write must not have flipped the manifest status.
+        let manifest = repo.vault_manifest().unwrap();
+        assert_ne!(manifest.intents[&result.id].status, "done");
+    }
+
+    #[test]
+    fn test_intent_update_done_allowed_when_checklist_complete() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let result = repo
+            .vault_intent_create(create_opts("Rate limiting"))
+            .unwrap();
+
+        // Same intent, but every task done and every criterion met.
+        let body = "\
+:::why\nNeed rate limiting.\n:::\n\n\
+:::acceptance-criterion{#ac-1 status=met verifiedBy=did:atomic:lee evidence=urn:atomic:change:01J8}\n\
+Login attempts are rate-limited.\n:::\n\n\
+:::task{#t1 status=done satisfies=ac-1}\nAdd rate limiter middleware.\n:::";
+
+        let updated = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    status: Some("done".to_string()),
+                    content: Some(body.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.status, "done");
+    }
+
+    #[test]
     fn test_intent_update_body_content() {
         let dir = tempdir().unwrap();
         let repo = init_repo_with_vault(dir.path());
@@ -1551,6 +1686,36 @@ The authentication module has no rate limiting.
             repo.normalize_intent_id(&created.uid[..8]).unwrap(),
             human_key
         );
+    }
+
+    #[test]
+    fn test_normalize_intent_id_rejects_ambiguous_prefix() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let first = repo.vault_intent_create(create_opts("First")).unwrap();
+        let second = repo.vault_intent_create(create_opts("Second")).unwrap();
+        let first_uid = "01KTEST0000000000000000001";
+        let second_uid = "01KTEST0000000000000000002";
+
+        let mut txn = repo.pristine.write_txn().unwrap();
+        let mut manifest = txn.get_vault_manifest().unwrap();
+        manifest.intents.get_mut(&first.id).unwrap().uid = first_uid.into();
+        manifest.intents.get_mut(&second.id).unwrap().uid = second_uid.into();
+        txn.put_vault_manifest(&manifest).unwrap();
+        txn.commit().unwrap();
+
+        // A complete UID remains exact.
+        assert_eq!(repo.normalize_intent_id(first_uid).unwrap(), first.id);
+
+        // A shared prefix must never pick whichever HashMap entry appears first.
+        let error = repo.normalize_intent_id("01KTEST").unwrap_err();
+        match error {
+            RepositoryError::AmbiguousIntent { prefix, matches } => {
+                assert_eq!(prefix, "01KTEST");
+                assert_eq!(matches, vec![first_uid.to_string(), second_uid.to_string()]);
+            }
+            other => panic!("expected ambiguous intent error, got {other:?}"),
+        }
     }
 
     #[test]

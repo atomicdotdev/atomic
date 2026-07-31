@@ -91,7 +91,7 @@ rarely type the author. Resolution fills in the current project and identity:
 | `3` | `PROJECT::<current-author>::3` |
 | `alice::3` | `PROJECT::alice::3` (a teammate's intent) |
 | `PIMO::lee-faus::3` | exact (project case-normalized) |
-| `01J8ZE…` | the intent whose ULID matches (a **prefix** works too) |
+| `01J8ZE…` | the intent whose ULID matches (a **unique prefix** works too) |
 
 ```bash
 atomic intent show 3                      # my third intent, this project
@@ -99,6 +99,9 @@ atomic intent show alice::3               # alice's third intent
 atomic intent show PIMO::lee-faus::3      # fully qualified
 atomic intent show 01J8ZE7G2W             # by ULID prefix
 ```
+
+If a prefix matches more than one intent, Atomic asks for a longer prefix
+instead of choosing one arbitrarily.
 
 All of these flow through a single resolver
 (`Repository::resolve_intent_key`), shared by the CLI and the attestation

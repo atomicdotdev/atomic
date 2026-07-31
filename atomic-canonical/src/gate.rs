@@ -169,6 +169,20 @@ pub fn validate_intent(node: &CanonicalNode) -> ValidationReport {
         .map(|ac| ac.id.as_str())
         .collect();
     for task in &node.has_task {
+        // taskStatus ∈ closed set. A stray value like `unmet` (acceptance-criterion
+        // vocabulary) would otherwise pass silently and never check the box.
+        if !vocab::is_known_task_status(&task.task_status) {
+            out.push(Violation {
+                focus_node: task.id.clone(),
+                shape: "TaskShape".into(),
+                path: Some("taskStatus".into()),
+                message: format!(
+                    "taskStatus '{}' is not one of {:?}",
+                    task.task_status,
+                    vocab::TASK_STATUS
+                ),
+            });
+        }
         for target in &task.satisfies {
             if !ac_ids.contains(target.as_str()) {
                 out.push(Violation {
@@ -177,6 +191,41 @@ pub fn validate_intent(node: &CanonicalNode) -> ValidationReport {
                     path: Some("satisfies".into()),
                     message: format!(
                         "task satisfies '{target}' which is not an acceptance criterion on this intent"
+                    ),
+                });
+            }
+        }
+    }
+
+    // Rollup: a `done` intent asserts the work is complete, so its headline
+    // status must be honest against its own checklist — every task `done` and
+    // every acceptance criterion `met`. A done intent with an open task or an
+    // unmet criterion is internally contradictory. Only the terminal `done`
+    // status triggers this; in-flight states (todo/in_progress) may carry open
+    // work by definition.
+    if node.status == "done" {
+        for task in &node.has_task {
+            if task.task_status != "done" {
+                out.push(Violation {
+                    focus_node: focus.clone(),
+                    shape: "IntentShape".into(),
+                    path: Some("status".into()),
+                    message: format!(
+                        "intent status is 'done' but task '{}' is '{}' (every task must be done)",
+                        task.id, task.task_status
+                    ),
+                });
+            }
+        }
+        for ac in &node.has_acceptance_criterion {
+            if ac.ac_status != "met" {
+                out.push(Violation {
+                    focus_node: focus.clone(),
+                    shape: "IntentShape".into(),
+                    path: Some("status".into()),
+                    message: format!(
+                        "intent status is 'done' but acceptance criterion '{}' is '{}' (every criterion must be met)",
+                        ac.id, ac.ac_status
                     ),
                 });
             }
@@ -392,6 +441,176 @@ mod tests {
         assert!(report.results.iter().any(|v| v.shape == "TaskShape"
             && v.path.as_deref() == Some("satisfies")
             && v.message.contains("gate-1-ac-9")));
+    }
+
+    #[test]
+    fn gate_accepts_known_task_status() {
+        for status in ["open", "done"] {
+            let mut node = attested_base();
+            let mut t = task("urn:atomic:task:gate-1-1", &[]);
+            t.task_status = status.to_string();
+            node.has_task = vec![t];
+            assert!(
+                validate_intent(&node).conforms,
+                "taskStatus '{status}' should conform"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_rejects_unknown_task_status() {
+        let mut node = attested_base();
+        // `unmet` is acceptance-criterion vocabulary, not a valid task status.
+        let mut t = task("urn:atomic:task:gate-1-1", &[]);
+        t.task_status = "unmet".to_string();
+        node.has_task = vec![t];
+
+        let report = validate_intent(&node);
+        assert!(!report.conforms);
+        assert!(report.results.iter().any(|v| v.shape == "TaskShape"
+            && v.path.as_deref() == Some("taskStatus")
+            && v.message.contains("unmet")));
+    }
+
+    #[test]
+    fn gate_rejects_done_intent_with_open_task() {
+        let mut node = attested_base();
+        node.status = "done".to_string();
+        node.has_acceptance_criterion = vec![{
+            let mut a = ac("urn:atomic:ac:gate-1-ac-1");
+            a.ac_status = "met".to_string();
+            a.verified_by = Some("did:atomic:lee".to_string());
+            a.evidence = Some("urn:atomic:change:01J8".to_string());
+            a
+        }];
+        // Task is still open while the intent claims to be done.
+        node.has_task = vec![task(
+            "urn:atomic:task:gate-1-1",
+            &["urn:atomic:ac:gate-1-ac-1"],
+        )];
+
+        let report = validate_intent(&node);
+        assert!(!report.conforms);
+        assert!(report.results.iter().any(|v| v.shape == "IntentShape"
+            && v.path.as_deref() == Some("status")
+            && v.message.contains("every task must be done")));
+    }
+
+    #[test]
+    fn gate_rejects_done_intent_with_unmet_criterion() {
+        let mut node = attested_base();
+        node.status = "done".to_string();
+        // Criterion is unmet while the intent claims to be done.
+        node.has_acceptance_criterion = vec![ac("urn:atomic:ac:gate-1-ac-1")];
+
+        let report = validate_intent(&node);
+        assert!(!report.conforms);
+        assert!(report.results.iter().any(|v| v.shape == "IntentShape"
+            && v.path.as_deref() == Some("status")
+            && v.message.contains("every criterion must be met")));
+    }
+
+    #[test]
+    fn gate_accepts_done_intent_with_all_work_complete() {
+        let mut node = attested_base();
+        node.status = "done".to_string();
+        node.has_acceptance_criterion = vec![{
+            let mut a = ac("urn:atomic:ac:gate-1-ac-1");
+            a.ac_status = "met".to_string();
+            a.verified_by = Some("did:atomic:lee".to_string());
+            a.evidence = Some("urn:atomic:change:01J8".to_string());
+            a
+        }];
+        node.has_task = vec![{
+            let mut t = task("urn:atomic:task:gate-1-1", &["urn:atomic:ac:gate-1-ac-1"]);
+            t.task_status = "done".to_string();
+            t
+        }];
+
+        assert!(
+            validate_intent(&node).conforms,
+            "{}",
+            validate_intent(&node)
+        );
+    }
+
+    /// A `met` acceptance criterion carrying the required verifier + evidence.
+    fn met_ac(id: &str) -> AcceptanceCriterion {
+        let mut a = ac(id);
+        a.ac_status = "met".to_string();
+        a.verified_by = Some("did:atomic:lee".to_string());
+        a.evidence = Some("urn:atomic:change:01J8".to_string());
+        a
+    }
+
+    /// A `done` task satisfying the given criteria.
+    fn done_task(id: &str, satisfies: &[&str]) -> Task {
+        let mut t = task(id, satisfies);
+        t.task_status = "done".to_string();
+        t
+    }
+
+    #[test]
+    fn gate_accepts_done_intent_with_many_tasks_and_criteria_all_complete() {
+        let mut node = attested_base();
+        node.status = "done".to_string();
+        node.has_acceptance_criterion = vec![
+            met_ac("urn:atomic:ac:gate-1-ac-1"),
+            met_ac("urn:atomic:ac:gate-1-ac-2"),
+            met_ac("urn:atomic:ac:gate-1-ac-3"),
+        ];
+        node.has_task = vec![
+            done_task("urn:atomic:task:gate-1-1", &["urn:atomic:ac:gate-1-ac-1"]),
+            done_task(
+                "urn:atomic:task:gate-1-2",
+                &["urn:atomic:ac:gate-1-ac-2", "urn:atomic:ac:gate-1-ac-3"],
+            ),
+        ];
+
+        assert!(
+            validate_intent(&node).conforms,
+            "{}",
+            validate_intent(&node)
+        );
+    }
+
+    #[test]
+    fn gate_rejects_done_intent_when_any_of_many_children_incomplete() {
+        let mut node = attested_base();
+        node.status = "done".to_string();
+        // Two criteria met, one still unmet.
+        node.has_acceptance_criterion = vec![
+            met_ac("urn:atomic:ac:gate-1-ac-1"),
+            ac("urn:atomic:ac:gate-1-ac-2"), // unmet
+            met_ac("urn:atomic:ac:gate-1-ac-3"),
+        ];
+        // Two tasks done, one still open.
+        node.has_task = vec![
+            done_task("urn:atomic:task:gate-1-1", &["urn:atomic:ac:gate-1-ac-1"]),
+            task("urn:atomic:task:gate-1-2", &["urn:atomic:ac:gate-1-ac-2"]), // open
+            done_task("urn:atomic:task:gate-1-3", &["urn:atomic:ac:gate-1-ac-3"]),
+        ];
+
+        let report = validate_intent(&node);
+        assert!(!report.conforms);
+
+        // Exactly one rollup violation per incomplete child (the open task and
+        // the unmet criterion), and none for the complete ones.
+        let task_violations: Vec<_> = report
+            .results
+            .iter()
+            .filter(|v| v.message.contains("every task must be done"))
+            .collect();
+        assert_eq!(task_violations.len(), 1, "{report}");
+        assert!(task_violations[0].message.contains("gate-1-2"));
+
+        let ac_violations: Vec<_> = report
+            .results
+            .iter()
+            .filter(|v| v.message.contains("every criterion must be met"))
+            .collect();
+        assert_eq!(ac_violations.len(), 1, "{report}");
+        assert!(ac_violations[0].message.contains("gate-1-ac-2"));
     }
 
     /// A minimal, fully attested Memory that conforms — the base for mutation.
