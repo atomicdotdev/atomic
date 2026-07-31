@@ -1095,7 +1095,10 @@ fn project_intent_semantics(
                 .with_metadata(serde_json::json!({ "status": t.task_status })),
         );
         edges.push(KgEdge::new(intent_subject, &id, edge_kind::HAS_TASK));
-        for ac_urn in &t.satisfies {
+        // `as_slice` so a legacy scalar `satisfies` still produces its SATISFIES
+        // edge — otherwise pre-widening intents would silently lose the
+        // task→criterion links in the knowledge graph.
+        for ac_urn in t.satisfies.as_slice() {
             edges.push(KgEdge::new(&id, child_kg_id(ac_urn), edge_kind::SATISFIES));
         }
         for file in &t.touches_file {
