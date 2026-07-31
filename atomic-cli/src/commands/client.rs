@@ -79,9 +79,7 @@ pub async fn build_client(
 /// - Named server profile not found.
 /// - Identity store cannot be opened or no default identity set.
 /// - HTTP client construction failure.
-pub async fn build_apex_client(
-    server_override: Option<&str>,
-) -> CliResult<StorageClient> {
+pub async fn build_apex_client(server_override: Option<&str>) -> CliResult<StorageClient> {
     let config = GlobalConfig::load()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
 

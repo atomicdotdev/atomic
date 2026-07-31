@@ -191,11 +191,7 @@ fn resolve_identity_with_default_fallback(
         inferred_name,
         explicit,
         |name| load_identity_lenient(store, name).is_some(),
-        store
-            .get_default()
-            .ok()
-            .flatten()
-            .map(|id| id.name.clone()),
+        store.get_default().ok().flatten().map(|id| id.name.clone()),
     );
 
     match resolved_name.as_deref() {
@@ -758,7 +754,7 @@ mod tests {
         // default — that's a clear error, not a substitution.
         let name = decide_identity_with_default_fallback(
             Some("foo"),
-            true, // explicit
+            true,      // explicit
             |_| false, // "foo" not in store
             Some("aaron-claude".to_string()),
         );
@@ -897,7 +893,7 @@ mod tests {
         );
         let resolved = decide_identity_with_default_fallback(
             inferred.as_deref(),
-            true, // explicit
+            true,                   // explicit
             |name| name == "Aaron", // only "Aaron" exists locally
             Some("other".to_string()),
         );

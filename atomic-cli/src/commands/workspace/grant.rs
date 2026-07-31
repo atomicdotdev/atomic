@@ -191,14 +191,19 @@ impl Command for GrantAdd {
         rt.block_on(async {
             let client = build_client(self.org.as_deref(), None).await?;
 
-            let (subject_type, subject_id) = resolve_subject(&client, &self.team, &self.user)
-                .await?;
+            let (subject_type, subject_id) =
+                resolve_subject(&client, &self.team, &self.user).await?;
             let relation = parse_permission(&self.permission)?;
 
-            let grant =
-                atomic_teams::grant::add_workspace_grant(&client, &self.workspace, subject_type, subject_id, relation)
-                    .await
-                    .map_err(teams_err)?;
+            let grant = atomic_teams::grant::add_workspace_grant(
+                &client,
+                &self.workspace,
+                subject_type,
+                subject_id,
+                relation,
+            )
+            .await
+            .map_err(teams_err)?;
 
             print_success(&format!(
                 "Granted {} access to {} on workspace '{}'",
@@ -250,8 +255,8 @@ impl Command for GrantRemove {
         rt.block_on(async {
             let client = build_client(self.org.as_deref(), None).await?;
 
-            let (subject_type, subject_id) = resolve_subject(&client, &self.team, &self.user)
-                .await?;
+            let (subject_type, subject_id) =
+                resolve_subject(&client, &self.team, &self.user).await?;
 
             atomic_teams::grant::revoke_workspace_grant(
                 &client,
@@ -292,12 +297,11 @@ async fn resolve_subject(
                     .await
                     .map_err(teams_err)?;
 
-            let team = teams
-                .iter()
-                .find(|t| t.slug == *slug)
-                .ok_or_else(|| CliError::InvalidArgument {
+            let team = teams.iter().find(|t| t.slug == *slug).ok_or_else(|| {
+                CliError::InvalidArgument {
                     message: format!("Team '{}' not found in org '{}'.", slug, client.org_slug()),
-                })?;
+                }
+            })?;
 
             Ok((atomic_teams::GrantSubjectType::Team, team.id))
         }
