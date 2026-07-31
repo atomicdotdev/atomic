@@ -7,7 +7,7 @@ use log::debug;
 
 use atomic_remote::storage::StorageClient;
 
-use crate::error::{map_remote_error, TeamsResult};
+use crate::error::{map_remote_error, TeamsError, TeamsResult};
 use crate::types::{CreateOrgRequest, MyOrgInfo, OrgInfo, UpdateOrgRequest};
 
 /// Create a new organization.
@@ -68,9 +68,8 @@ pub async fn get_org(client: &StorageClient, slug: &str) -> TeamsResult<OrgInfo>
 ///
 /// # Errors
 ///
-/// Returns a [`TeamsError`] derived from the remote response on any failure,
-/// including [`TeamsError::Unauthorized`](crate::error::TeamsError::Unauthorized)
-/// if the caller's token is rejected.
+/// Returns a [`TeamsError`] derived from the remote response on any failure
+/// (e.g. [`TeamsError::PermissionDenied`] if the caller's token is rejected).
 pub async fn list_my_orgs(client: &StorageClient) -> TeamsResult<Vec<MyOrgInfo>> {
     debug!("Listing organizations the caller belongs to");
     let infos: Vec<MyOrgInfo> = client
