@@ -90,6 +90,10 @@ const GRAPH_FILENAME: &str = "graph.json";
 /// Maximum number of characters for a goal node's prompt text.
 const MAX_GOAL_PROMPT_LEN: usize = 500;
 
+/// Maximum number of characters of response text kept in an
+/// `llm_response` node's detail (the summary is truncated separately).
+const MAX_RESPONSE_TEXT_LEN: usize = 8_000;
+
 // =============================================================================
 // ProvenanceAccumulator
 // =============================================================================

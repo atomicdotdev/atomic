@@ -7,6 +7,7 @@ mod tests {
     use atomic_core::change::{Atom, Encoding, Insertion, Local};
     use atomic_core::types::{ChangePosition, Merkle, Position};
     use atomic_core::EdgeFlags;
+    use atomic_core::change::{AITool, AIVendor, PromptContent, Provenance, SuggestionType};
 
     // ChangeFormat Tests
 
@@ -843,5 +844,72 @@ mod tests {
 
         let result2 = truncate_string("Hello 世界!", 8);
         assert!(result2.ends_with("..."));
+    }
+
+    #[test]
+    fn test_json_provenance_surfaces_agent_context_fields() {
+        let prov = Provenance {
+            vendor: AIVendor::Anthropic,
+            model: "claude-sonnet-4".to_string(),
+            tool: AITool::Cli("claude-code".to_string()),
+            suggestion_type: SuggestionType::Complete,
+            prompt: PromptContent::hash_from("fix the bug"),
+            metadata: vec![("turn_number".to_string(), "2".to_string())],
+            agent_mode: Some("build".to_string()),
+            finish_reason: Some("stop".to_string()),
+            step_count: Some(3),
+            session_slug: Some("mighty-rocket".to_string()),
+            reasoning_signature: Some("sig-abc".to_string()),
+            reasoning_text: Some("thought hard about it".to_string()),
+            task_plan: Some("[{\"content\":\"fix\"}]".to_string()),
+            ..Default::default()
+        };
+
+        let json = JsonProvenance::from(&prov);
+
+        assert_eq!(json.agent_mode.as_deref(), Some("build"));
+        assert_eq!(json.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(json.step_count, Some(3));
+        assert_eq!(json.session_slug.as_deref(), Some("mighty-rocket"));
+        assert_eq!(json.reasoning_signature.as_deref(), Some("sig-abc"));
+        assert_eq!(json.reasoning_text.as_deref(), Some("thought hard about it"));
+        assert!(json.prompt_hash.is_some());
+        assert!(json.metadata.is_some());
+
+        // The serialized form carries the keys the gap report measured.
+        let value = serde_json::to_value(&json).unwrap();
+        for key in [
+            "reasoning_text",
+            "reasoning_signature",
+            "agent_mode",
+            "finish_reason",
+            "step_count",
+            "session_slug",
+            "task_plan",
+            "prompt_hash",
+            "metadata",
+        ] {
+            assert!(value.get(key).is_some(), "missing key: {}", key);
+        }
+    }
+
+    #[test]
+    fn test_json_provenance_omits_absent_agent_fields() {
+        let prov = Provenance {
+            vendor: AIVendor::OpenAI,
+            model: "gpt-5".to_string(),
+            tool: AITool::Cli("codex".to_string()),
+            suggestion_type: SuggestionType::Complete,
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(JsonProvenance::from(&prov)).unwrap();
+        let obj = value.as_object().unwrap();
+
+        // Absent fields stay out of the output entirely.
+        for key in ["reasoning_text", "agent_mode", "step_count", "prompt_hash", "metadata"] {
+            assert!(!obj.contains_key(key), "unexpected key: {}", key);
+        }
+        assert_eq!(obj.get("vendor").and_then(|v| v.as_str()), Some("OpenAI"));
     }
 }
