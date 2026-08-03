@@ -1113,6 +1113,19 @@ fn project_intent_semantics(
         let id = child_kg_id(&s.id);
         nodes.push(KgNode::new(&id, "scope", kg_label(&id), "vault").with_summary(s.text.clone()));
         edges.push(KgEdge::new(intent_subject, &id, edge_kind::HAS_SCOPE_OUT));
+        // Additive to the prose scope node above: a scope-out `::file-ref`
+        // projects an owned outgoing edge onto the SHARED `file:<path>` node
+        // (the same convention MODIFIES/TOUCHES use), so a change's MODIFIES
+        // target and this out-of-scope declaration meet on one node and a breach
+        // is a single graph lookup. Owned outgoing from the intent subject, so
+        // the existing re-index/delete GC cleans it like DEPENDS_ON/REMEDIATES.
+        for file in &s.files {
+            edges.push(KgEdge::new(
+                intent_subject,
+                format!("file:{file}"),
+                edge_kind::SCOPE_OUT_FILE,
+            ));
+        }
     }
 
     // Constraints.
@@ -1124,11 +1137,20 @@ fn project_intent_semantics(
         edges.push(KgEdge::new(intent_subject, &id, edge_kind::HAS_CONSTRAINT));
     }
 
-    // Typed dependency refs declared in the body (`:::ref{to= edge=}`).
+    // Typed reference edges declared in the body (`:::ref{to= edge=}`). These
+    // are intent-owned outgoing edges: BLOCKED_BY/DEPENDS_ON on the dependency
+    // chain, plus the forward intent→intent `REMEDIATES` link (a remediation
+    // intent B pointing at the flawed intent A it fixes: B --REMEDIATES--> A) and
+    // the `REVIEWS` link (a review intent pointing at the intent it reviews:
+    // review --REVIEWS--> target). All share the same ownership/GC lifecycle
+    // (outgoing from the intent subject, cleaned on re-index/delete), so no
+    // extra bookkeeping is needed.
     for r in &node.depends_on {
         let target = rdf_target_to_kg_id(&r.to, manifest);
         let kind = match r.edge.as_str() {
             "blockedBy" => edge_kind::BLOCKED_BY,
+            "remediates" => edge_kind::REMEDIATES,
+            "reviews" => edge_kind::REVIEWS,
             _ => edge_kind::DEPENDS_ON,
         };
         edges.push(KgEdge::new(intent_subject, target, kind));
@@ -1367,6 +1389,7 @@ mod tests {
                 labels: Vec::new(),
                 session_id: None,
                 turn_id: None,
+                kind: None,
             })
             .unwrap();
         let intent_subject = entry_subject(&created.intent_file, VaultEntryType::Intent);
@@ -1715,6 +1738,228 @@ first
     }
 
     #[test]
+    fn test_remediates_ref_projects_reverse_queryable_edge() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        // Intent B remediates intent A. The link is authored with the same
+        // `:::ref` leaf `blockedBy` uses, but `edge=remediates`.
+        let fm_b = r#"{"id":"DEMO-B","title":"Fix the escaped defect","status":"in-progress"}"#;
+        let body_b = "\
+:::why\n\
+Remediates a defect delivered by DEMO-A.\n\
+:::\n\n\
+:::ref{to=urn:atomic:intent:demo-a edge=remediates}\n\
+:::";
+        let path_b = "intents/demo-b/intent.md";
+        repo.vault_store(
+            path_b,
+            VaultEntryType::Intent,
+            body_b.as_bytes().to_vec(),
+            fm_b.to_string(),
+        )
+        .unwrap();
+
+        // The projected edge is B --REMEDIATES--> A. With no manifest entry for
+        // A, the target resolves to the uppercased `intent:DEMO-A` convention
+        // (same as any unresolved intent ref).
+        let edge_exists = |from: &str, to: &str| -> bool {
+            let txn = repo.pristine().read_txn().unwrap();
+            txn.get_kg_edges_from(from)
+                .unwrap()
+                .iter()
+                .any(|e| e.to_id == to && e.kind == edge_kind::REMEDIATES)
+        };
+        assert!(
+            edge_exists("intent:DEMO-B", "intent:DEMO-A"),
+            "B --REMEDIATES--> A must project from the :::ref body directive"
+        );
+
+        // Reverse-queryable: neighbors of the remediated intent A surface the
+        // incoming REMEDIATES edge (kg_neighbors returns incoming + outgoing).
+        let sub = repo.vault_kg_neighbors("intent:DEMO-A", 1).unwrap();
+        assert!(
+            sub.edges.iter().any(|e| e.from_id == "intent:DEMO-B"
+                && e.to_id == "intent:DEMO-A"
+                && e.kind == edge_kind::REMEDIATES),
+            "REMEDIATES must be reverse-queryable from the remediated intent"
+        );
+
+        // Re-index B: the edge survives (owned outgoing edge, replaced in place).
+        repo.vault_store(
+            path_b,
+            VaultEntryType::Intent,
+            body_b.as_bytes().to_vec(),
+            fm_b.to_string(),
+        )
+        .unwrap();
+        assert!(
+            edge_exists("intent:DEMO-B", "intent:DEMO-A"),
+            "edge must survive a re-index, not be orphaned or duplicated"
+        );
+
+        // Delete B: its outgoing REMEDIATES edge is cleaned up with the node.
+        repo.vault_delete(path_b).unwrap();
+        assert!(
+            !edge_exists("intent:DEMO-B", "intent:DEMO-A"),
+            "edge must be removed when the remediation intent is deleted"
+        );
+    }
+
+    /// Slice-3 (b): a review intent's `:::ref{edge=reviews}` projects a
+    /// reverse-queryable `REVIEWS` KG edge (mirroring the remediates test).
+    #[test]
+    fn test_reviews_ref_projects_reverse_queryable_edge() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        // Review intent R reviews intent T, authored via `:::ref{edge=reviews}`.
+        let fm_r =
+            r#"{"id":"DEMO-R","title":"Review the work","status":"in-progress","kind":"review"}"#;
+        let body_r = "\
+:::why\n\
+Reviews DEMO-T.\n\
+:::\n\n\
+:::ref{to=urn:atomic:intent:demo-t edge=reviews}\n\
+:::";
+        let path_r = "intents/demo-r/intent.md";
+        repo.vault_store(
+            path_r,
+            VaultEntryType::Intent,
+            body_r.as_bytes().to_vec(),
+            fm_r.to_string(),
+        )
+        .unwrap();
+
+        // The projected edge is R --REVIEWS--> T (T unresolved → intent:DEMO-T).
+        let edge_exists = |from: &str, to: &str| -> bool {
+            let txn = repo.pristine().read_txn().unwrap();
+            txn.get_kg_edges_from(from)
+                .unwrap()
+                .iter()
+                .any(|e| e.to_id == to && e.kind == edge_kind::REVIEWS)
+        };
+        assert!(
+            edge_exists("intent:DEMO-R", "intent:DEMO-T"),
+            "R --REVIEWS--> T must project from the :::ref body directive"
+        );
+
+        // Reverse-queryable: neighbors of the reviewed intent T surface it.
+        let sub = repo.vault_kg_neighbors("intent:DEMO-T", 1).unwrap();
+        assert!(
+            sub.edges.iter().any(|e| e.from_id == "intent:DEMO-R"
+                && e.to_id == "intent:DEMO-T"
+                && e.kind == edge_kind::REVIEWS),
+            "REVIEWS must be reverse-queryable from the reviewed intent"
+        );
+
+        // Re-index R: the edge survives (owned outgoing edge, replaced in place).
+        repo.vault_store(
+            path_r,
+            VaultEntryType::Intent,
+            body_r.as_bytes().to_vec(),
+            fm_r.to_string(),
+        )
+        .unwrap();
+        assert!(
+            edge_exists("intent:DEMO-R", "intent:DEMO-T"),
+            "edge must survive a re-index"
+        );
+
+        // Delete R: its outgoing REVIEWS edge is cleaned up with the node.
+        repo.vault_delete(path_r).unwrap();
+        assert!(
+            !edge_exists("intent:DEMO-R", "intent:DEMO-T"),
+            "edge must be removed when the review intent is deleted"
+        );
+    }
+
+    #[test]
+    fn test_scope_out_file_ref_projects_reverse_queryable_edge() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        // A `:::scope-out` naming a concrete file via `::file-ref` (the same leaf
+        // a `:::task` uses for TOUCHES).
+        let fm = r#"{"id":"DEMO-S","title":"Scope guard","status":"in-progress"}"#;
+        let body = "\
+:::why\n\
+Keep billing untouched.\n\
+:::\n\n\
+:::scope-out\n\
+The billing subsystem is off limits.\n\
+::file-ref{path=src/billing.rs}\n\
+:::";
+        let path = "intents/demo-s/intent.md";
+        repo.vault_store(
+            path,
+            VaultEntryType::Intent,
+            body.as_bytes().to_vec(),
+            fm.to_string(),
+        )
+        .unwrap();
+
+        // intent --SCOPE_OUT_FILE--> file:src/billing.rs (the SHARED file node,
+        // same convention MODIFIES/TOUCHES use, so a change's MODIFIES target
+        // meets this out-of-scope declaration on one node).
+        let edge_exists = |from: &str, to: &str| -> bool {
+            let txn = repo.pristine().read_txn().unwrap();
+            txn.get_kg_edges_from(from)
+                .unwrap()
+                .iter()
+                .any(|e| e.to_id == to && e.kind == edge_kind::SCOPE_OUT_FILE)
+        };
+        assert!(
+            edge_exists("intent:DEMO-S", "file:src/billing.rs"),
+            "SCOPE_OUT_FILE edge must project from the scope-out file-ref"
+        );
+
+        // Additive: the prose HAS_SCOPE_OUT edge is still present alongside it.
+        {
+            let txn = repo.pristine().read_txn().unwrap();
+            assert!(
+                txn.get_kg_edges_from("intent:DEMO-S")
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.kind == edge_kind::HAS_SCOPE_OUT),
+                "the prose HAS_SCOPE_OUT edge must remain (additive, not replaced)"
+            );
+        }
+
+        // Reverse-queryable: neighbors of the file node surface the incoming edge.
+        let sub = repo.vault_kg_neighbors("file:src/billing.rs", 1).unwrap();
+        assert!(
+            sub.edges.iter().any(|e| e.from_id == "intent:DEMO-S"
+                && e.to_id == "file:src/billing.rs"
+                && e.kind == edge_kind::SCOPE_OUT_FILE),
+            "SCOPE_OUT_FILE must be reverse-queryable from the file node"
+        );
+
+        // Re-index: owned outgoing edge is replaced in place, not orphaned.
+        repo.vault_store(
+            path,
+            VaultEntryType::Intent,
+            body.as_bytes().to_vec(),
+            fm.to_string(),
+        )
+        .unwrap();
+        assert!(
+            edge_exists("intent:DEMO-S", "file:src/billing.rs"),
+            "edge must survive a re-index"
+        );
+
+        // Delete: the intent and its owned SCOPE_OUT_FILE edge are cleaned up.
+        repo.vault_delete(path).unwrap();
+        assert!(
+            !edge_exists("intent:DEMO-S", "file:src/billing.rs"),
+            "edge must be removed when the intent is deleted"
+        );
+    }
+
+    #[test]
     fn test_extract_kg_legacy_prose_intent_skips_projection() {
         // A non-directive (legacy) body must not fail extraction; it simply
         // produces no task/criterion nodes.
@@ -1778,6 +2023,7 @@ first
                 labels: Vec::new(),
                 session_id: None,
                 turn_id: None,
+                kind: None,
             })
             .unwrap();
         // The canonical intent URN is keyed by the ULID uid, not the human key.

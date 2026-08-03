@@ -87,6 +87,7 @@ use commands::{
     Stash,
     Status,
     Tag,
+    Triage,
     Unrecord,
     Update,
     Vault,
@@ -844,6 +845,23 @@ enum Commands {
     /// atomic update --check
     /// ```
     Update(Update),
+
+    /// Project the code-review candidate set of a feature view against a target.
+    ///
+    /// Reports the change hashes visible to the feature view but not the
+    /// target, their transitive dependency-closure additions, and which of
+    /// those additions are "baggage" (not covered by any intent).
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Human-readable summary
+    /// atomic triage candidates feature --into dev
+    ///
+    /// # Machine-readable worklist
+    /// atomic triage candidates feature --into dev --json
+    /// ```
+    Triage(Triage),
 }
 
 // Main Entry Point
@@ -948,6 +966,8 @@ fn main() {
         Commands::Memory(memory) => memory.run(),
 
         Commands::Provenance(provenance) => provenance.run(),
+
+        Commands::Triage(triage) => triage.run(),
     };
 
     // Handle errors with user-friendly output

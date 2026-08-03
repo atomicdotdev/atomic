@@ -177,6 +177,7 @@ mod output;
 mod types;
 
 pub use command::*;
+pub(crate) use helpers::change_file_diffs;
 pub(crate) use output::{build_hunks_from_diff, format_stat_graph};
 pub use types::*;
 

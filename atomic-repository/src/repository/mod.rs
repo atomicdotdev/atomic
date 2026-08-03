@@ -108,6 +108,7 @@ mod remotes;
 mod status;
 mod tags;
 mod tracking;
+mod triage;
 mod vault;
 mod vault_defaults;
 mod vault_embeddings;
@@ -123,6 +124,7 @@ pub use insert::{
 pub use provenance_summary::ProvenanceSummary;
 pub use semantic_materialize::{CrdtMaterializeOptions, CrdtMaterializeOutcome};
 pub use tags::{deserialize_tag, serialize_tag};
+pub use triage::{BaggageEntry, CandidateSet, Coverage};
 pub use vault_embeddings::{hash_embed, EmbedConfig, TextChunk};
 pub use vault_goal::{
     GoalInfo, GoalStartOptions, GoalStartResult, GoalStopOptions, GoalStopResult,

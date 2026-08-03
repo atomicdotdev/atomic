@@ -178,6 +178,12 @@ pub mod edge_kind {
     pub const SATISFIES: &str = "SATISFIES";
     /// Task touches a file.
     pub const TOUCHES: &str = "TOUCHES";
+    /// Intent remediates a flaw delivered by another intent.
+    pub const REMEDIATES: &str = "REMEDIATES";
+    /// Review intent reviews another intent.
+    pub const REVIEWS: &str = "REVIEWS";
+    /// Intent declares this file out of scope.
+    pub const SCOPE_OUT_FILE: &str = "SCOPE_OUT_FILE";
 }
 
 /// Check if a predicate string is a known predicate.
@@ -332,6 +338,9 @@ mod tests {
             edge_kind::HAS_LABEL,
             edge_kind::PART_OF,
             edge_kind::INCLUDES,
+            edge_kind::REMEDIATES,
+            edge_kind::REVIEWS,
+            edge_kind::SCOPE_OUT_FILE,
         ];
         for kind in &kinds {
             assert_eq!(

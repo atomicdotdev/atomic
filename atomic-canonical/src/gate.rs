@@ -71,6 +71,12 @@ pub fn validate_intent(node: &CanonicalNode) -> ValidationReport {
     let mut out = Vec::new();
     let focus = &node.id;
 
+    // TODO(T5b): FreshnessShape / CodeFreshnessShape (substance-drift and
+    // code-drift → STALE) are NOT enforced here. They need inputs this pure,
+    // node-only gate does not have — the current intentSubstanceHash vs a pinned
+    // hash, and the pinned candidate change-set — so they belong to the consumer
+    // / write chokepoint, not this validator.
+
     // status ∈ closed set, exactly one (it is a single field, so cardinality holds).
     if !vocab::is_known_intent_status(&node.status) {
         out.push(Violation {
@@ -81,6 +87,46 @@ pub fn validate_intent(node: &CanonicalNode) -> ValidationReport {
                 "status '{}' is not one of {:?}",
                 node.status,
                 vocab::INTENT_STATUS
+            ),
+        });
+    }
+
+    // kind ∈ closed set (the classification discriminator; `feature` by default).
+    if !vocab::is_known_intent_kind(&node.kind) {
+        out.push(Violation {
+            focus_node: focus.clone(),
+            shape: "IntentShape".into(),
+            path: Some("kind".into()),
+            message: format!(
+                "kind '{}' is not one of {:?}",
+                node.kind,
+                vocab::INTENT_KIND
+            ),
+        });
+    }
+
+    // ReviewShape: the `review` kind and the `reviews` edge are coupled. A
+    // review intent must declare what it reviews, and only a review intent may
+    // carry a `reviews` edge (kind and edge cannot contradict each other).
+    let has_reviews_edge = node.depends_on.iter().any(|r| r.edge == "reviews");
+    if node.kind == "review" && !has_reviews_edge {
+        out.push(Violation {
+            focus_node: focus.clone(),
+            shape: "ReviewShape".into(),
+            path: Some("reviews".into()),
+            message: "a review intent (kind='review') must declare at least one 'reviews' ref \
+                     naming what it reviews"
+                .into(),
+        });
+    }
+    if node.kind != "review" && has_reviews_edge {
+        out.push(Violation {
+            focus_node: focus.clone(),
+            shape: "ReviewShape".into(),
+            path: Some("reviews".into()),
+            message: format!(
+                "only a review intent may carry a 'reviews' edge, but kind is '{}'",
+                node.kind
             ),
         });
     }
@@ -146,15 +192,52 @@ pub fn validate_intent(node: &CanonicalNode) -> ValidationReport {
             });
         }
         if ac.ac_status == "met" {
-            let has_verifier = !ac.verified_by.as_deref().unwrap_or("").is_empty();
-            let has_evidence = !ac.evidence.as_deref().unwrap_or("").is_empty();
-            if !has_verifier || !has_evidence {
-                out.push(Violation {
-                    focus_node: ac.id.clone(),
-                    shape: "AcceptanceCriterionShape".into(),
-                    path: Some("acStatus".into()),
-                    message: "a met acceptance criterion must carry verifiedBy and evidence".into(),
-                });
+            if ac.required_kinds.is_empty() {
+                // Back-compat (AcceptanceCriterionShape): no required kinds are
+                // declared, so a met criterion is held to the original presence
+                // check — it must carry a verifier and evidence. Unchanged shape
+                // string and message; every pre-T5a intent takes this path.
+                let has_verifier = !ac.verified_by.as_deref().unwrap_or("").is_empty();
+                let has_evidence = !ac.evidence.as_deref().unwrap_or("").is_empty();
+                if !has_verifier || !has_evidence {
+                    out.push(Violation {
+                        focus_node: ac.id.clone(),
+                        shape: "AcceptanceCriterionShape".into(),
+                        path: Some("acStatus".into()),
+                        message: "a met acceptance criterion must carry verifiedBy and evidence"
+                            .into(),
+                    });
+                }
+            } else {
+                // EvidenceShape: a met criterion that declares required
+                // verification kinds must be *earned* — each required kind needs
+                // a verification record whose LATEST entry (records append in
+                // order) passes. A missing or failing latest record refutes the
+                // met status. This is the conservative, reversible form of
+                // "derived acStatus": acStatus stays a stored field; the gate
+                // only checks a stored `met` is legitimately earned.
+                for kind in &ac.required_kinds {
+                    let latest = ac.verifications.iter().rev().find(|v| &v.kind == kind);
+                    match latest {
+                        Some(rec) if rec.outcome == "pass" => {}
+                        Some(_) => out.push(Violation {
+                            focus_node: ac.id.clone(),
+                            shape: "EvidenceShape".into(),
+                            path: Some("verifications".into()),
+                            message: format!(
+                                "a met acceptance criterion requires a passing '{kind}' verification, but its latest '{kind}' record failed"
+                            ),
+                        }),
+                        None => out.push(Violation {
+                            focus_node: ac.id.clone(),
+                            shape: "EvidenceShape".into(),
+                            path: Some("verifications".into()),
+                            message: format!(
+                                "a met acceptance criterion requires a passing '{kind}' verification, but no '{kind}' record is present"
+                            ),
+                        }),
+                    }
+                }
             }
         }
     }
@@ -318,7 +401,9 @@ pub fn validate_memory(node: &MemoryNode) -> ValidationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::{AcceptanceCriterion, ScopeItem, Task, CONTEXT_URL};
+    use crate::node::{
+        default_kind, AcceptanceCriterion, Ref, ScopeItem, Task, VerificationRecord, CONTEXT_URL,
+    };
     use crate::proof;
     use crate::vocab::NodeType;
     use atomic_identity::identity::Identity;
@@ -329,6 +414,7 @@ mod tests {
             type_: NodeType::ScopeItem.as_str().to_string(),
             id: id.to_string(),
             text: text.to_string(),
+            files: Vec::new(),
         }
     }
 
@@ -340,6 +426,8 @@ mod tests {
             ac_status: "unmet".to_string(),
             verified_by: None,
             evidence: None,
+            verifications: Vec::new(),
+            required_kinds: Vec::new(),
         }
     }
 
@@ -365,6 +453,7 @@ mod tests {
             human_key: "GATE-1".to_string(),
             title: "Gate base".to_string(),
             status: "todo".to_string(),
+            kind: default_kind(),
             priority: None,
             view: None,
             motivated_by: None,
@@ -382,6 +471,91 @@ mod tests {
             proof: None,
         };
         proof::attest(node, &id, &kp)
+    }
+
+    /// A `:::ref{edge=reviews}` targeting another intent.
+    fn reviews_ref(target: &str) -> Ref {
+        Ref {
+            type_: None,
+            id: None,
+            to: target.to_string(),
+            edge: "reviews".to_string(),
+        }
+    }
+
+    #[test]
+    fn gate_accepts_known_kinds_and_rejects_unknown() {
+        // Default kind (feature) conforms.
+        assert!(validate_intent(&attested_base()).conforms);
+
+        // Every non-review kind in the taxonomy conforms (none carry a reviews
+        // edge, so ReviewShape is satisfied).
+        for kind in ["feature", "bug", "chore", "remediation"] {
+            let mut n = attested_base();
+            n.kind = kind.to_string();
+            assert!(validate_intent(&n).conforms, "{kind} must conform");
+        }
+
+        // `review` + a reviews edge conforms.
+        let mut review = attested_base();
+        review.kind = "review".to_string();
+        review
+            .depends_on
+            .push(reviews_ref("urn:atomic:intent:reviewed-1"));
+        assert!(
+            validate_intent(&review).conforms,
+            "a review with a reviews edge must conform"
+        );
+
+        // A kind outside INTENT_KIND is rejected on IntentShape/kind.
+        let mut bogus = attested_base();
+        bogus.kind = "bogus".to_string();
+        let report = validate_intent(&bogus);
+        assert!(!report.conforms);
+        assert!(
+            report
+                .results
+                .iter()
+                .any(|v| v.shape == "IntentShape" && v.path.as_deref() == Some("kind")),
+            "expected an IntentShape/kind violation, got {:?}",
+            report.results
+        );
+    }
+
+    #[test]
+    fn review_shape_requires_a_reviews_edge_on_a_review_intent() {
+        // kind=review with NO reviews edge → ReviewShape violation.
+        let mut review = attested_base();
+        review.kind = "review".to_string();
+        let report = validate_intent(&review);
+        assert!(!report.conforms);
+        assert!(
+            report
+                .results
+                .iter()
+                .any(|v| v.shape == "ReviewShape" && v.path.as_deref() == Some("reviews")),
+            "a review without a reviews edge must violate ReviewShape, got {:?}",
+            report.results
+        );
+    }
+
+    #[test]
+    fn review_shape_rejects_a_reviews_edge_on_a_non_review_intent() {
+        // kind=feature (default) WITH a reviews edge → ReviewShape violation.
+        let mut feature = attested_base();
+        feature
+            .depends_on
+            .push(reviews_ref("urn:atomic:intent:reviewed-1"));
+        let report = validate_intent(&feature);
+        assert!(!report.conforms);
+        assert!(
+            report
+                .results
+                .iter()
+                .any(|v| v.shape == "ReviewShape" && v.path.as_deref() == Some("reviews")),
+            "only a review intent may carry a reviews edge, got {:?}",
+            report.results
+        );
     }
 
     #[test]
@@ -611,6 +785,124 @@ mod tests {
             .collect();
         assert_eq!(ac_violations.len(), 1, "{report}");
         assert!(ac_violations[0].message.contains("gate-1-ac-2"));
+    }
+
+    /// A verification record of the given kind + outcome (other fields fixed;
+    /// only kind/outcome drive EvidenceShape).
+    fn verification(kind: &str, outcome: &str) -> VerificationRecord {
+        VerificationRecord {
+            type_: "VerificationRecord".to_string(),
+            kind: kind.to_string(),
+            outcome: outcome.to_string(),
+            scope: "ac".to_string(),
+            observed_at_merkle: "MERKLE".to_string(),
+            reference: None,
+            observation: None,
+        }
+    }
+
+    /// A met AC that declares `required_kinds` (so it takes the EvidenceShape
+    /// path, not the back-compat verifier/evidence presence check).
+    fn met_ac_requiring(id: &str, required: &[&str]) -> AcceptanceCriterion {
+        let mut a = met_ac(id);
+        a.required_kinds = required.iter().map(|k| k.to_string()).collect();
+        a
+    }
+
+    #[test]
+    fn evidence_shape_rejects_met_ac_with_no_verifications() {
+        let mut node = attested_base();
+        node.has_acceptance_criterion =
+            vec![met_ac_requiring("urn:atomic:ac:gate-1-ac-1", &["e2e"])];
+
+        let report = validate_intent(&node);
+        assert!(!report.conforms, "{report}");
+        let v = report
+            .results
+            .iter()
+            .find(|v| v.shape == "EvidenceShape")
+            .expect("expected an EvidenceShape violation");
+        assert_eq!(v.path.as_deref(), Some("verifications"));
+        assert_eq!(v.focus_node, "urn:atomic:ac:gate-1-ac-1");
+        assert!(v.message.contains("e2e"), "{}", v.message);
+        assert!(
+            v.message.contains("no 'e2e' record is present"),
+            "{}",
+            v.message
+        );
+    }
+
+    #[test]
+    fn evidence_shape_rejects_met_ac_whose_latest_record_failed() {
+        let mut node = attested_base();
+        node.has_acceptance_criterion = vec![{
+            let mut a = met_ac_requiring("urn:atomic:ac:gate-1-ac-1", &["e2e"]);
+            a.verifications = vec![verification("e2e", "fail")];
+            a
+        }];
+
+        let report = validate_intent(&node);
+        assert!(!report.conforms, "{report}");
+        let v = report
+            .results
+            .iter()
+            .find(|v| v.shape == "EvidenceShape")
+            .expect("expected an EvidenceShape violation");
+        assert!(
+            v.message.contains("latest 'e2e' record failed"),
+            "{}",
+            v.message
+        );
+    }
+
+    #[test]
+    fn evidence_shape_accepts_met_ac_whose_latest_record_passes() {
+        // Records append in order: an earlier failure superseded by a later pass
+        // conforms (the latest 'e2e' record is the current one).
+        let mut node = attested_base();
+        node.has_acceptance_criterion = vec![{
+            let mut a = met_ac_requiring("urn:atomic:ac:gate-1-ac-1", &["e2e"]);
+            a.verifications = vec![verification("e2e", "fail"), verification("e2e", "pass")];
+            a
+        }];
+
+        let report = validate_intent(&node);
+        assert!(
+            !report.results.iter().any(|v| v.shape == "EvidenceShape"),
+            "unexpected EvidenceShape violation: {report}"
+        );
+        assert!(report.conforms, "{report}");
+    }
+
+    #[test]
+    fn evidence_shape_names_the_missing_kind_when_one_of_many_is_absent() {
+        let mut node = attested_base();
+        node.has_acceptance_criterion = vec![{
+            let mut a = met_ac_requiring("urn:atomic:ac:gate-1-ac-1", &["unit", "e2e"]);
+            // unit passes, e2e is missing entirely.
+            a.verifications = vec![verification("unit", "pass")];
+            a
+        }];
+
+        let report = validate_intent(&node);
+        assert!(!report.conforms, "{report}");
+        let evidence: Vec<_> = report
+            .results
+            .iter()
+            .filter(|v| v.shape == "EvidenceShape")
+            .collect();
+        // Exactly one EvidenceShape violation, for the missing e2e kind only.
+        assert_eq!(evidence.len(), 1, "{report}");
+        assert!(
+            evidence[0].message.contains("e2e"),
+            "{}",
+            evidence[0].message
+        );
+        assert!(
+            !evidence[0].message.contains("unit"),
+            "the satisfied 'unit' kind must not be reported: {}",
+            evidence[0].message
+        );
     }
 
     /// A minimal, fully attested Memory that conforms — the base for mutation.

@@ -145,7 +145,10 @@ impl Command for ProvenanceShow {
 /// Load a change's provenance graphs: REV_DEPS-backed lookup, with a disk-scan
 /// fallback when REV_DEPS registration missed the change. Errors if no graph
 /// explains the change.
-fn load_graphs(repo: &Repository, change_hash: &Hash) -> CliResult<Vec<(Hash, ProvenanceGraph)>> {
+pub(crate) fn load_graphs(
+    repo: &Repository,
+    change_hash: &Hash,
+) -> CliResult<Vec<(Hash, ProvenanceGraph)>> {
     let mut graphs = repo
         .find_provenance_for_change(change_hash)
         .map_err(CliError::Repository)?;
@@ -170,7 +173,7 @@ fn load_graphs(repo: &Repository, change_hash: &Hash) -> CliResult<Vec<(Hash, Pr
 
 /// Resolve the CLI target (bare hash, hash prefix, or `urn:atomic:change:<b32>`)
 /// to a change `Hash`.
-fn resolve_change_target(repo: &Repository, target: &str) -> CliResult<Hash> {
+pub(crate) fn resolve_change_target(repo: &Repository, target: &str) -> CliResult<Hash> {
     const URN_PREFIX: &str = "urn:atomic:change:";
     if let Some(b32) = target.strip_prefix(URN_PREFIX) {
         return Hash::from_base32(b32.as_bytes()).ok_or_else(|| CliError::InvalidArgument {
@@ -208,7 +211,7 @@ fn resolve_change_target(repo: &Repository, target: &str) -> CliResult<Hash> {
 
 /// Resolve the PERSON's signing identity + keypair, exactly as
 /// `atomic intent attest` does.
-fn resolve_person(
+pub(crate) fn resolve_person(
     identity: Option<&str>,
 ) -> CliResult<(
     atomic_identity::identity::Identity,

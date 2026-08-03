@@ -35,6 +35,10 @@ pub struct IntentCreateOptions {
     pub session_id: Option<String>,
     /// Turn number within the session (if running inside an agent session).
     pub turn_id: Option<u32>,
+    /// Classification (an `INTENT_KIND` member: `feature`/`review`/`bug`/
+    /// `chore`/`remediation`). `None` ⇒ the default `feature`, which is omitted
+    /// from the intent's frontmatter so ordinary intents stay hash-stable.
+    pub kind: Option<String>,
 }
 
 /// Result of creating an intent.
@@ -120,6 +124,13 @@ impl Repository {
         }
 
         let priority = options.priority.unwrap_or_else(|| "medium".to_string());
+        // Classification, defaulting to `feature`. Stored on the summary always;
+        // written to frontmatter only when non-default (so ordinary intents keep
+        // no `kind` key and their canonical hashes are unchanged).
+        let kind = options
+            .kind
+            .clone()
+            .unwrap_or_else(|| "feature".to_string());
         let view_name = self.current_view().to_string();
         let identity = self.resolve_vault_identity();
         let author = slug_author(&identity.name);
@@ -182,6 +193,11 @@ impl Repository {
                     seq,
                     session: options.session_id.clone(),
                     turn: options.turn_id,
+                    done_substance_hash: None,
+                    done_lapsed_reason: None,
+                    // Mirror the intent's classification into the manifest index
+                    // (default `feature`; a `review`/etc. is carried through).
+                    kind: kind.clone(),
                 },
             );
 
@@ -266,6 +282,11 @@ impl Repository {
             "created_by".to_string(),
             serde_json::Value::String(identity.to_string()),
         );
+        // Only a non-default kind is written to frontmatter (an ordinary
+        // `feature` intent omits the key entirely — canonical-hash back-compat).
+        if kind != "feature" {
+            fm.insert("kind".to_string(), serde_json::Value::String(kind.clone()));
+        }
 
         let frontmatter_json = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
 
@@ -509,6 +530,20 @@ impl Repository {
         let mut fm: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(&frontmatter_json).unwrap_or_default();
 
+        // The status as stored on disk BEFORE this update mutates anything. The
+        // T5b lapse check keys off this: a substance edit on an already-`done`
+        // intent (that is not itself re-asserting a status) can lapse the grant.
+        let prior_status = fm
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        // The authoring view is frozen in frontmatter at create time.
+        // TODO(T5b-follow-up): scope-gating uses this frozen authoring `view`
+        // (recon gaps #3/#4). A Draft-authored intent whose changes were already
+        // inserted into a Shared view still reads its original Draft view here;
+        // precise "Shared doneness is immutable" needs the visibility walk.
+        let fm_view_name = fm.get("view").and_then(|v| v.as_str()).map(str::to_string);
+
         if options.content.is_some() && !options.force {
             let manifest = self.vault_manifest()?;
             let summary = manifest.intents.get(&full_id);
@@ -582,8 +617,6 @@ impl Repository {
                 ),
             );
         }
-        let new_fm = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
-
         let new_content = match options.content {
             Some(ref body) => body.clone().into_bytes(),
             None => content_bytes,
@@ -602,16 +635,30 @@ impl Repository {
         // (IntentShape/status): the broader structural gate (why, scope-out,
         // proof, attributedTo) belongs to `atomic intent attest`/`validate` and
         // must not force the canonical authoring format onto freeform intents.
-        let resulting_status = fm.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        let asserting_done = options.status.as_deref() == Some("done")
-            || (options.content.is_some() && resulting_status == "done");
+        let resulting_status = fm
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // An explicit `--status done` is the grant moment (T5b): the only place
+        // we stamp the granted-at substance pin. A content edit that merely
+        // leaves an already-done intent done is NOT a fresh grant — it flows to
+        // the lapse check below instead.
+        let explicit_grant = options.status.as_deref() == Some("done");
+        let asserting_done =
+            explicit_grant || (options.content.is_some() && resulting_status == "done");
+
+        // Lift once from the post-edit frontmatter+body; reused by the rollup
+        // gate, the done-grant stamp, and the lapse check. A body we cannot lift
+        // carries no canonical checklist/substance, so all three become no-ops;
+        // the full gate at attest/validate time still surfaces malformed
+        // directives.
+        let body_str = String::from_utf8_lossy(&new_content).into_owned();
+        let lifted = atomic_canonical::lift::lift_intent(&fm, &body_str).ok();
+
         if asserting_done {
-            let body_str = String::from_utf8_lossy(&new_content).into_owned();
-            // A body we cannot lift carries no canonical checklist to grade, so
-            // there is nothing for the rollup to enforce; the full gate at
-            // attest/validate time still surfaces malformed directives.
-            if let Ok(node) = atomic_canonical::lift::lift_intent(&fm, &body_str) {
-                let report = atomic_canonical::validate_intent(&node);
+            if let Some(ref node) = lifted {
+                let report = atomic_canonical::validate_intent(node);
                 let blocking: Vec<_> = report
                     .results
                     .iter()
@@ -636,6 +683,54 @@ impl Repository {
             }
         }
 
+        // (i) STAMP the granted-at pin. On an explicit done-grant, record the
+        // intent's current `intentSubstanceHash` in frontmatter (and clear any
+        // stale lapse reason). The substance hash excludes review state, so
+        // stamping the pin can never move the hash it pins; and frontmatter is
+        // not lifted into the CanonicalNode, so this touches neither the entry
+        // content_hash nor intentSubstanceHash.
+        if explicit_grant {
+            if let Some(ref node) = lifted {
+                let pin = atomic_canonical::intent_substance_hash(node);
+                fm.insert(
+                    "doneSubstanceHash".to_string(),
+                    serde_json::Value::String(pin),
+                );
+                fm.remove("doneLapsedReason");
+            }
+        }
+
+        // (ii) LAPSE on substance drift. When an update sets no status of its own
+        // (`options.status.is_none()`) and the intent was already `done`, an edit
+        // to the reviewable substance (an AC/task/scope/why edit) lapses the
+        // grant: Draft doneness is derived-and-refutable, so it demotes to
+        // `in_progress` with the drift recorded as the reason. An unrelated
+        // metadata edit leaves the substance hash unchanged and is a no-op (stays
+        // done). Shared with the record-time path via `maybe_lapse_done_intent`
+        // (demote-only, no recursion) so both entry points apply identical rules.
+        if options.status.is_none() && prior_status.as_deref() == Some("done") {
+            if let Some(ref node) = lifted {
+                // Fallback to the manifest mirror when the frontmatter pin is
+                // absent (e.g. a pre-T5b done intent).
+                let fallback_pin = self
+                    .vault_manifest()
+                    .ok()
+                    .and_then(|m| m.intents.get(&full_id).cloned())
+                    .and_then(|s| s.done_substance_hash);
+                self.maybe_lapse_done_intent(
+                    &mut fm,
+                    node,
+                    prior_status.as_deref(),
+                    fm_view_name.as_deref(),
+                    fallback_pin.as_deref(),
+                );
+            }
+        }
+
+        // Serialize AFTER the stamp/lapse mutations so the persisted entry
+        // reflects them.
+        let new_fm = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
+
         self.vault_store(&intent_file, VaultEntryType::Intent, new_content, new_fm)?;
 
         // Update manifest
@@ -648,8 +743,12 @@ impl Repository {
                 .get_vault_manifest()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             if let Some(summary) = manifest.intents.get_mut(&full_id) {
-                if let Some(ref status) = options.status {
-                    summary.status = status.clone();
+                // Mirror the FINAL frontmatter status, not just an explicit
+                // `options.status`: a T5b lapse demotes `done -> in_progress`
+                // without the caller setting a status, and the manifest must
+                // track that.
+                if let Some(status) = fm.get("status").and_then(|v| v.as_str()) {
+                    summary.status = status.to_string();
                 }
                 if let Some(ref assignee) = options.assignee {
                     summary.assignee = Some(assignee.clone());
@@ -660,6 +759,24 @@ impl Repository {
                 if let Some(ref title) = options.title {
                     summary.title = title.clone();
                 }
+                // Mirror the T5b done-pin / lapse-reason so triage and queries
+                // can read them without re-parsing the intent frontmatter.
+                summary.done_substance_hash = fm
+                    .get("doneSubstanceHash")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                summary.done_lapsed_reason = fm
+                    .get("doneLapsedReason")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                // Mirror the (possibly edited) classification. Absent `kind`
+                // frontmatter ⇒ the default `feature`, so the summary never goes
+                // stale or empty when an ordinary intent is edited.
+                summary.kind = fm
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("feature")
+                    .to_string();
             }
             txn.put_vault_manifest(&manifest)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -686,6 +803,70 @@ impl Repository {
             goals: summary.map(|s| s.goals).unwrap_or(0),
             blocked_by: summary.map(|s| s.blocked_by.clone()).unwrap_or_default(),
         })
+    }
+
+    /// T5b grant-lapse, shared by the interactive `vault_intent_update` path and
+    /// the record-time `vault_record_working_copy` path so both apply identical
+    /// rules and cannot diverge.
+    ///
+    /// **DEMOTE-ONLY.** It never promotes, stamps, or otherwise mutates status;
+    /// the only write it performs is `done -> in_progress` on a genuine lapse.
+    /// It never recurses (it mutates the passed frontmatter map in place; the
+    /// caller performs the single store).
+    ///
+    /// Rule: if the intent was `done` (`prior_status`), its authoring
+    /// `view_name` is Draft, and the reviewable substance of `lifted` no longer
+    /// matches the granted-at pin (`fm["doneSubstanceHash"]`, else
+    /// `fallback_pin`), then set `fm["status"] = "in_progress"`, record
+    /// `fm["doneLapsedReason"]`, and clear the stale pin. Returns whether it
+    /// demoted. Any other case is a no-op returning `false` (an unrelated edit,
+    /// a non-done intent, a Shared/unknown view, or a missing pin).
+    //
+    // TODO(T5b-follow-up): Draft-gating uses the frozen authoring `view` (recon
+    // gaps #3/#4). Precise "Shared doneness is immutable" needs the
+    // change-visibility walk; unknown/Shared views conservatively do not lapse.
+    pub(crate) fn maybe_lapse_done_intent(
+        &self,
+        fm: &mut serde_json::Map<String, serde_json::Value>,
+        lifted: &atomic_canonical::node::CanonicalNode,
+        prior_status: Option<&str>,
+        view_name: Option<&str>,
+        fallback_pin: Option<&str>,
+    ) -> bool {
+        if prior_status != Some("done") {
+            return false;
+        }
+        let pin = fm
+            .get("doneSubstanceHash")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| fallback_pin.map(str::to_string));
+        let Some(pin) = pin else {
+            return false;
+        };
+        let is_draft = view_name
+            .and_then(|name| self.get_view_info(name).ok())
+            .map(|vi| vi.scope.is_draft())
+            .unwrap_or(false);
+        if !is_draft {
+            return false;
+        }
+        let current = atomic_canonical::intent_substance_hash(lifted);
+        if pin == current {
+            return false;
+        }
+        fm.insert(
+            "status".to_string(),
+            serde_json::Value::String("in_progress".to_string()),
+        );
+        fm.insert(
+            "doneLapsedReason".to_string(),
+            serde_json::Value::String(format!(
+                "substance drifted from triage pin {pin} (now {current})"
+            )),
+        );
+        fm.remove("doneSubstanceHash");
+        true
     }
 
     /// Link a goal to an intent.
@@ -986,6 +1167,7 @@ mod tests {
             labels: vec![],
             session_id: Some("test-session".to_string()),
             turn_id: Some(1),
+            kind: None,
         }
     }
 
@@ -1002,6 +1184,7 @@ mod tests {
             labels: vec![],
             session_id: Some(session_id.to_string()),
             turn_id: Some(turn_id),
+            kind: None,
         }
     }
 
@@ -1014,7 +1197,59 @@ mod tests {
             labels: vec![],
             session_id: None,
             turn_id: None,
+            kind: None,
         }
+    }
+
+    /// Slice-3 (a): `vault_intent_create` mirrors the classification into the
+    /// manifest `IntentSummary.kind`. An ordinary create is a `feature` (and
+    /// omits the `kind` frontmatter key); a `kind: review` create is a `review`
+    /// (and carries the key).
+    #[test]
+    fn create_mirrors_kind_into_manifest_summary() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+
+        // Ordinary create → feature, no `kind` frontmatter key.
+        let ordinary = repo.vault_intent_create(create_opts("Ordinary")).unwrap();
+        assert_eq!(
+            repo.vault_manifest()
+                .unwrap()
+                .intents
+                .get(&ordinary.id)
+                .unwrap()
+                .kind,
+            "feature"
+        );
+        let ord_fm: serde_json::Value = serde_json::from_str(
+            &repo
+                .vault_intent_show(&ordinary.id)
+                .unwrap()
+                .frontmatter_json,
+        )
+        .unwrap();
+        assert!(
+            ord_fm.get("kind").is_none(),
+            "an ordinary (feature) intent must omit the kind frontmatter key"
+        );
+
+        // Create with kind=review → the summary records `review`, frontmatter has it.
+        let mut opts = create_opts("A review");
+        opts.kind = Some("review".to_string());
+        let review = repo.vault_intent_create(opts).unwrap();
+        assert_eq!(
+            repo.vault_manifest()
+                .unwrap()
+                .intents
+                .get(&review.id)
+                .unwrap()
+                .kind,
+            "review"
+        );
+        let rev_fm: serde_json::Value =
+            serde_json::from_str(&repo.vault_intent_show(&review.id).unwrap().frontmatter_json)
+                .unwrap();
+        assert_eq!(rev_fm["kind"], "review");
     }
 
     #[test]
@@ -1030,6 +1265,7 @@ mod tests {
                 labels: vec!["auth".to_string(), "security".to_string()],
                 session_id: Some("sess-abc".to_string()),
                 turn_id: Some(1),
+                kind: None,
             })
             .unwrap();
 
@@ -1367,6 +1603,182 @@ Login attempts are rate-limited.\n:::\n\n\
             )
             .unwrap();
         assert_eq!(updated.status, "done");
+    }
+
+    /// A canonical intent body whose checklist is complete (every AC met, every
+    /// task done) so the rollup gate admits a `done` grant.
+    const DONE_BODY: &str = "\
+:::why\nNeed rate limiting.\n:::\n\n\
+:::acceptance-criterion{#ac-1 status=met verifiedBy=did:atomic:lee evidence=urn:atomic:change:01J8}\n\
+Login attempts are rate-limited.\n:::\n\n\
+:::task{#t1 status=done satisfies=ac-1}\nAdd rate limiter middleware.\n:::";
+
+    /// (c) Granting `done` stamps the intent's current `intentSubstanceHash`
+    /// into frontmatter (`doneSubstanceHash`) and mirrors it into the manifest.
+    #[test]
+    fn test_done_grant_stamps_substance_pin() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let result = repo.vault_intent_create(create_opts("Pin me")).unwrap();
+
+        let updated = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    status: Some("done".to_string()),
+                    content: Some(DONE_BODY.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.status, "done");
+
+        // Frontmatter carries the granted-at pin, and it is a real content hash.
+        let entry = repo.vault_intent_show(&result.id).unwrap();
+        let fm: serde_json::Value = serde_json::from_str(&entry.frontmatter_json).unwrap();
+        let pin = fm["doneSubstanceHash"]
+            .as_str()
+            .expect("doneSubstanceHash must be stamped on a done grant");
+        assert!(pin.starts_with("blake3:"), "pin is a content hash: {pin}");
+
+        // The pin equals the intent's current substance hash (excludes review
+        // state, so the stamp itself cannot have moved it).
+        let node = atomic_canonical::lift::lift_intent(
+            fm.as_object().unwrap(),
+            &String::from_utf8_lossy(&entry.content_bytes),
+        )
+        .unwrap();
+        assert_eq!(pin, atomic_canonical::intent_substance_hash(&node));
+
+        // The manifest mirror is set too.
+        let manifest = repo.vault_manifest().unwrap();
+        let summary = manifest
+            .intents
+            .get(&result.id)
+            .expect("intent present in manifest");
+        assert_eq!(summary.done_substance_hash.as_deref(), Some(pin));
+    }
+
+    /// (a) A `done` Draft intent whose AC definition is edited lapses back to
+    /// `in_progress`, recording the drift as the reason and clearing the pin.
+    #[test]
+    fn test_done_draft_intent_lapses_on_substance_edit() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let result = repo.vault_intent_create(create_opts("Lapse me")).unwrap();
+
+        // The authoring view must be Draft for the lapse to apply (the default
+        // `dev` view is Shared).
+        let view_name = repo.current_view().to_string();
+        repo.set_view_scope(&view_name, atomic_core::pristine::ViewScope::Draft)
+            .unwrap();
+
+        let granted = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    status: Some("done".to_string()),
+                    content: Some(DONE_BODY.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(granted.status, "done");
+
+        // Edit the AC's definition text — the reviewable substance drifts.
+        // `force` is required because the done-body-edit gate rejects body
+        // rewrites of a started (non-backlog) intent.
+        let edited = "\
+:::why\nNeed rate limiting.\n:::\n\n\
+:::acceptance-criterion{#ac-1 status=met verifiedBy=did:atomic:lee evidence=urn:atomic:change:01J8}\n\
+Login attempts are rate-limited to five per minute, precisely.\n:::\n\n\
+:::task{#t1 status=done satisfies=ac-1}\nAdd rate limiter middleware.\n:::";
+
+        let lapsed = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    content: Some(edited.to_string()),
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            lapsed.status, "in_progress",
+            "a Draft done grant must lapse when its substance drifts"
+        );
+
+        let entry = repo.vault_intent_show(&result.id).unwrap();
+        let fm: serde_json::Value = serde_json::from_str(&entry.frontmatter_json).unwrap();
+        assert_eq!(fm["status"], "in_progress");
+        assert!(
+            fm["doneLapsedReason"]
+                .as_str()
+                .unwrap()
+                .contains("substance drifted"),
+            "lapse reason recorded: {:?}",
+            fm["doneLapsedReason"]
+        );
+        assert!(
+            fm.get("doneSubstanceHash").is_none(),
+            "pin cleared on lapse"
+        );
+
+        let manifest = repo.vault_manifest().unwrap();
+        let summary = manifest.intents.get(&result.id).unwrap();
+        assert_eq!(summary.status, "in_progress");
+        assert!(summary.done_lapsed_reason.is_some());
+        assert!(summary.done_substance_hash.is_none());
+    }
+
+    /// (b) An unrelated metadata edit on a `done` Draft intent does NOT lapse it
+    /// (the substance hash is unchanged) — it stays `done` with its pin intact.
+    #[test]
+    fn test_done_draft_intent_survives_unrelated_metadata_edit() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let result = repo
+            .vault_intent_create(create_opts("Keep me done"))
+            .unwrap();
+
+        let view_name = repo.current_view().to_string();
+        repo.set_view_scope(&view_name, atomic_core::pristine::ViewScope::Draft)
+            .unwrap();
+
+        repo.vault_intent_update(
+            &result.id,
+            IntentUpdateOptions {
+                status: Some("done".to_string()),
+                content: Some(DONE_BODY.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // A metadata-only edit (assignee) leaves the substance untouched.
+        let after = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    assignee: Some("someone-else".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            after.status, "done",
+            "an unrelated metadata edit must not lapse a done grant"
+        );
+
+        let entry = repo.vault_intent_show(&result.id).unwrap();
+        let fm: serde_json::Value = serde_json::from_str(&entry.frontmatter_json).unwrap();
+        assert_eq!(fm["status"], "done");
+        assert!(
+            fm["doneSubstanceHash"].is_string(),
+            "pin retained across an unrelated edit"
+        );
+        assert!(fm.get("doneLapsedReason").is_none());
     }
 
     #[test]
@@ -1763,6 +2175,7 @@ Login attempts are rate-limited.\n:::\n\n\
             labels: vec![],
             session_id: None,
             turn_id: None,
+            kind: None,
         });
         assert!(result.is_err());
     }

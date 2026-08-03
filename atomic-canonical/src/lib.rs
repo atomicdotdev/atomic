@@ -41,14 +41,19 @@ pub mod node;
 pub mod proof;
 pub mod prov;
 pub mod render;
+pub mod triage_ref;
 pub mod vocab;
 
 pub use error::{CanonicalError, Result};
 pub use gate::{validate_intent, validate_memory, ValidationReport, Violation};
 pub use memory::MemoryNode;
-pub use node::{AcceptanceCriterion, CanonicalNode, Constraint, Proof, Ref, ScopeItem, Task};
+pub use node::{
+    intent_substance_hash, AcceptanceCriterion, CanonicalNode, Constraint, Proof, Ref, ScopeItem,
+    Task,
+};
 pub use prov::{attest_prov, project, verify_prov, ProvActivityInput};
 pub use render::{render, render_memory, Target};
+pub use triage_ref::{triage_reference, verify_triage_reference, TriagePins};
 
 use atomic_identity::identity::Identity;
 use atomic_identity::keypair::KeyPair;

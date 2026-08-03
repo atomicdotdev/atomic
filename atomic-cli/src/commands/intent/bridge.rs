@@ -337,6 +337,7 @@ mod tests {
                 labels: Vec::new(),
                 session_id: None,
                 turn_id: None,
+                kind: None,
             })
             .unwrap();
         let id = result.id;
