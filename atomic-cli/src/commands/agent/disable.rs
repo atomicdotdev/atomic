@@ -380,8 +380,7 @@ impl Disable {
                 }
                 "kilo" => {
                     print_success("Kilo Code hooks are configured through kilo.jsonc.");
-                    println!("  Remove rules/agent from .kilo/ directory manually.");
-                    println!("  Uninstall: npx atomic-kilo --uninstall");
+                    println!("  Uninstall the integration: atomic agent disable --agent kilo");
                 }
                 other => {
                     print_warning(&format!(
