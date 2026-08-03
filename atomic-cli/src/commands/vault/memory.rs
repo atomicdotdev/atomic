@@ -177,8 +177,9 @@ impl Command for MemoryShow {
         let entry = repo
             .vault_retrieve(&path)
             .map_err(CliError::Repository)?
-            .ok_or_else(|| CliError::InvalidArgument {
-                message: format!("Memory file not found: {}", self.name),
+            .ok_or_else(|| CliError::VaultEntityNotFound {
+                kind: "memory",
+                id: self.name.clone(),
             })?;
 
         if self.json {
