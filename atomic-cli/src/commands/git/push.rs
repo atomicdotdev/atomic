@@ -7,7 +7,7 @@
 use clap::Args;
 use git2::Repository as GitRepository;
 
-use atomic_core::types::Base32;
+use atomic_core::types::{Base32, Merkle};
 use atomic_repository::{HistoryEntry, HistoryOptions, Repository};
 
 use crate::commands::{find_repository_root, Command};
@@ -82,6 +82,22 @@ impl Command for Push {
             return Ok(());
         }
 
+        // Determine which changes are new since the last `atomic git push`.
+        // We walk git history to find the most recent commit whose
+        // Atomic-View trailer matches the current view, then use its
+        // Atomic-State to locate our position in the view's history.
+        let last_pushed_state = self.find_last_pushed_state(&git_repo, &current_view);
+        let start_idx = match &last_pushed_state {
+            Some(state) => history
+                .iter()
+                .position(|e| &e.state == state)
+                .map(|i| i + 1)
+                .unwrap_or(0),
+            None => 0,
+        };
+        let new_history = &history[start_idx..];
+        let new_count = new_history.len();
+
         // Stage everything: git add -A (add_all + update_all handles new files and deletions)
         let mut index = git_repo.index().map_err(|e| CliError::GitError {
             message: format!("Failed to open git index: {}", e),
@@ -128,8 +144,13 @@ impl Command for Push {
             }
         }
 
-        // Build commit message with Atomic provenance trailers
-        let commit_message = self.build_commit_message(&repo, &history, &current_view)?;
+        // Build commit message with Atomic provenance trailers.
+        // Only the changes new since the last push are included in the body
+        // and the Atomic-Changes trailer. The Atomic-State trailer always
+        // reflects the latest view state so the next push can find this point.
+        let latest_state = history.last().map(|e| e.state).unwrap_or_default();
+        let commit_message =
+            self.build_commit_message(new_history, &latest_state, &current_view)?;
 
         // Get git signature
         let sig = git_repo.signature().map_err(|e| CliError::GitError {
@@ -148,10 +169,20 @@ impl Command for Push {
             })?;
 
         let short_oid = &commit_oid.to_string()[..8];
-        print_success(&format!(
-            "Created git commit {} on view '{}'",
-            short_oid, current_view
-        ));
+        if new_count > 0 {
+            print_success(&format!(
+                "Created git commit {} on view '{}' ({} new change{})",
+                short_oid,
+                current_view,
+                new_count,
+                if new_count == 1 { "" } else { "s" },
+            ));
+        } else {
+            print_success(&format!(
+                "Created git commit {} on view '{}' (working copy changes)",
+                short_oid, current_view,
+            ));
+        }
 
         // Push to remote unless --no-push
         if !self.no_push {
@@ -173,59 +204,53 @@ impl Command for Push {
 
 impl Push {
     /// Build a commit message with Atomic provenance trailers.
+    ///
+    /// Only the changes in `new_history` (those new since the last push) are
+    /// referenced in the body and the `Atomic-Changes` trailer. The
+    /// `Atomic-State` trailer always carries the latest view state so the
+    /// next push can find this commit as its starting point.
     fn build_commit_message(
         &self,
-        repo: &Repository,
-        history: &[HistoryEntry],
+        new_history: &[HistoryEntry],
+        latest_state: &Merkle,
         view: &str,
     ) -> CliResult<String> {
-        // Use custom message or synthesize from change messages
+        // Use custom message, synthesize from new change messages, or fall
+        // back to a generic label when there are no new atomic changes (e.g.
+        // manual working-copy edits).
         let body = if let Some(ref msg) = self.message {
             msg.clone()
+        } else if new_history.is_empty() {
+            "Working copy changes".to_string()
         } else {
-            self.synthesize_message(repo, history)
+            self.synthesize_message(new_history)
         };
 
-        // Collect change hashes for trailers
-        let change_hashes: Vec<String> = history.iter().map(|e| e.hash.to_base32()).collect();
-
-        let merkle_state = history
-            .last()
-            .map(|e| e.state.to_base32())
-            .unwrap_or_default();
-
-        // Format: message + blank line + trailers
         let mut msg = body;
         msg.push_str("\n\n");
         msg.push_str(&format!("Atomic-View: {}\n", view));
-        msg.push_str(&format!("Atomic-State: {}\n", merkle_state));
+        msg.push_str(&format!("Atomic-State: {}\n", latest_state.to_base32()));
 
-        // For large change sets, only include the last 10 hashes inline
-        if change_hashes.len() <= 10 {
+        let change_hashes: Vec<String> = new_history.iter().map(|e| e.hash.to_base32()).collect();
+
+        if !change_hashes.is_empty() {
             msg.push_str(&format!("Atomic-Changes: {}\n", change_hashes.join(", ")));
-        } else {
-            let last_10: Vec<&str> = change_hashes[change_hashes.len() - 10..]
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-            msg.push_str(&format!(
-                "Atomic-Changes: {} (+{} earlier)\n",
-                last_10.join(", "),
-                change_hashes.len() - 10
-            ));
         }
 
         Ok(msg)
     }
 
-    /// Synthesize a commit message from Atomic change messages.
-    fn synthesize_message(&self, repo: &Repository, history: &[HistoryEntry]) -> String {
+    /// Synthesize a commit message from the new Atomic change messages.
+    ///
+    /// The change headers are already loaded (via `load_headers(true)` in
+    /// `run`), so we read the message directly from the entry without
+    /// redundant `load_change` calls.
+    fn synthesize_message(&self, new_history: &[HistoryEntry]) -> String {
         let mut messages: Vec<String> = Vec::new();
-        for entry in history.iter().rev().take(20) {
-            if let Ok(change) = repo.load_change(&entry.hash) {
-                let msg = change.hashed.header.message.clone();
+        for entry in new_history.iter().rev() {
+            if let Some(msg) = entry.message() {
                 if !msg.is_empty() {
-                    messages.push(msg);
+                    messages.push(msg.to_string());
                 }
             }
         }
@@ -238,13 +263,37 @@ impl Push {
             return messages.into_iter().next().unwrap();
         }
 
-        // Multiple messages: bullet list
+        // Multiple messages: bullet list, newest first
         let mut result = format!("{} Atomic changes", messages.len());
         for msg in &messages {
             let first_line = msg.lines().next().unwrap_or(msg);
             result.push_str(&format!("\n\n* {}", first_line));
         }
         result
+    }
+
+    /// Walk git history (first-parent mainline) to find the most recent
+    /// commit whose `Atomic-View` trailer matches `view` and return its
+    /// `Atomic-State`. This lets us determine which atomic changes were
+    /// already pushed.
+    fn find_last_pushed_state(&self, git_repo: &GitRepository, view: &str) -> Option<Merkle> {
+        let mut commit = git_repo.head().ok()?.peel_to_commit().ok()?;
+        for _ in 0..1000 {
+            let message = commit.message().unwrap_or("");
+            let commit_view = parse_trailer(message, "Atomic-View");
+            if commit_view.as_deref() == Some(view) {
+                if let Some(state) = parse_trailer(message, "Atomic-State")
+                    .and_then(|s| Merkle::from_base32(s.as_bytes()))
+                {
+                    return Some(state);
+                }
+            }
+            commit = match commit.parent(0) {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+        }
+        None
     }
 
     /// Push the current branch to the remote.
@@ -285,6 +334,21 @@ impl Push {
     }
 }
 
+/// Parse a `Key: Value` trailer line from a commit message.
+fn parse_trailer(message: &str, key: &str) -> Option<String> {
+    let prefix = format!("{}:", key);
+    for line in message.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(&prefix) {
+            let value = rest.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,5 +371,35 @@ mod tests {
         assert_eq!(push.message.as_deref(), Some("custom message"));
         assert!(push.no_push);
         assert_eq!(push.remote, "upstream");
+    }
+
+    #[test]
+    fn test_parse_trailer() {
+        let msg = "feat: add auth\n\nAtomic-View: dev\nAtomic-State: ABC123\nAtomic-Changes: HASH1, HASH2\n";
+        assert_eq!(parse_trailer(msg, "Atomic-View"), Some("dev".to_string()));
+        assert_eq!(
+            parse_trailer(msg, "Atomic-State"),
+            Some("ABC123".to_string())
+        );
+        assert_eq!(
+            parse_trailer(msg, "Atomic-Changes"),
+            Some("HASH1, HASH2".to_string())
+        );
+        assert_eq!(parse_trailer(msg, "Atomic-Unknown"), None);
+    }
+
+    #[test]
+    fn test_parse_trailer_whitespace() {
+        let msg = "msg\n\nAtomic-View:   spaced  \n";
+        assert_eq!(
+            parse_trailer(msg, "Atomic-View"),
+            Some("spaced".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_trailer_empty() {
+        let msg = "msg\n\nAtomic-State:\n";
+        assert_eq!(parse_trailer(msg, "Atomic-State"), None);
     }
 }
