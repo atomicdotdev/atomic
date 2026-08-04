@@ -236,6 +236,12 @@ pub struct JsonChange {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<JsonProvenance>,
 
+    /// Data stored outside the content hash — the agent turn transcript
+    /// (`agent_turn`) and anything else attached unhashed — when the change
+    /// carries it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unhashed: Option<serde_json::Value>,
+
     /// Sequence number in the current view (if known).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<u64>,
@@ -271,6 +277,7 @@ impl JsonChange {
             hunks: change.hashed.hunks.iter().map(hunk_to_summary).collect(),
             has_provenance: change.has_provenance(),
             provenance: None,
+            unhashed: change.unhashed.clone(),
             sequence,
         }
     }

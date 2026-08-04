@@ -408,6 +408,36 @@ mod tests {
         assert!(json.contains("\"description\": \"This is a description\""));
     }
 
+    #[test]
+    fn test_json_change_omits_unhashed_when_absent() {
+        let change = create_test_change();
+        let hash = Hash::of(b"test change");
+        let json_change = JsonChange::from_change(&change, &hash, None);
+
+        assert!(json_change.unhashed.is_none());
+        let json = serde_json::to_string(&json_change).unwrap();
+        assert!(!json.contains("unhashed"));
+    }
+
+    #[test]
+    fn test_json_change_surfaces_unhashed_agent_turn() {
+        let mut change = create_test_change();
+        change.unhashed = Some(serde_json::json!({
+            "agent_turn": {
+                "session_id": "sess-1",
+                "turn_number": 3,
+                "condensed_text": "[User] fix it\n[Assistant] fixed",
+            }
+        }));
+        let hash = Hash::of(b"test change");
+        let json_change = JsonChange::from_change(&change, &hash, None);
+
+        let value = serde_json::to_value(&json_change).unwrap();
+        let turn = &value["unhashed"]["agent_turn"];
+        assert_eq!(turn["session_id"], "sess-1");
+        assert_eq!(turn["turn_number"], 3);
+    }
+
     // Helper Function Tests
 
     #[test]
