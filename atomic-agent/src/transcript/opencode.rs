@@ -42,8 +42,20 @@ pub(crate) struct ReasoningBlock {
     pub duration_ms: Option<u64>,
 }
 
+/// A tool part recovered from the store, keyed by the same call id the
+/// plugin puts in the hook payload (`tool_call_id` on graph nodes).
+#[derive(Debug)]
+pub(crate) struct ToolPart {
+    pub call_id: String,
+    pub tool: String,
+    pub input: Option<Value>,
+    pub output: Option<String>,
+    pub status: Option<String>,
+}
+
 /// Turn data recovered from OpenCode's SQLite store.
 #[derive(Debug)]
+
 pub(crate) struct TurnData {
     /// JSONL transcript of the whole session, one line per content part.
     pub transcript_jsonl: String,
@@ -64,6 +76,9 @@ pub(crate) struct TurnData {
     pub finish_reason: Option<String>,
     /// Number of model steps in the current turn.
     pub step_count: u32,
+    /// Tool parts for the session, so graph tool nodes recorded from thin
+    /// payloads can be enriched with their commands, files and outputs.
+    pub tool_parts: Vec<ToolPart>,
 }
 
 /// Locate the OpenCode database, if present.
@@ -247,6 +262,7 @@ fn assemble(messages: &[(String, String)], parts: &[(String, Value)]) -> TurnDat
         cost_usd: 0.0,
         finish_reason: None,
         step_count: 0,
+        tool_parts: Vec::new(),
     };
 
     let push_line = |line: Value, out: &mut TurnData| {
@@ -313,6 +329,21 @@ fn assemble(messages: &[(String, String)], parts: &[(String, Value)]) -> TurnDat
                     line["status"] = serde_json::Value::from(status.to_string());
                 }
                 push_line(line, &mut data);
+                // Recover the full tool record so graph nodes recorded from
+                // thin payloads can be enriched with commands/files/outputs.
+                if let Some(call_id) = part.get("callID").and_then(Value::as_str) {
+                    let output = state
+                        .and_then(|s| s.get("output"))
+                        .and_then(Value::as_str)
+                        .map(|o| o.chars().take(2_000).collect());
+                    data.tool_parts.push(ToolPart {
+                        call_id: call_id.to_string(),
+                        tool: tool.to_string(),
+                        input: state.and_then(|s| s.get("input")).cloned(),
+                        output,
+                        status: status.map(|s| s.to_string()),
+                    });
+                }
             }
             "step-start" => {
                 if in_turn {

@@ -70,6 +70,8 @@ mod append;
 mod convert;
 mod helpers;
 
+pub(crate) use helpers::build_tool_detail;
+
 #[cfg(test)]
 mod tests;
 

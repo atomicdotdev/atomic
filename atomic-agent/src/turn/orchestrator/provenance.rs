@@ -15,10 +15,12 @@
 //! load → mutate → save cycles are serialized through an advisory file
 //! lock (`{session_dir}/graph.lock`) to prevent corruption.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::event::TurnEvent;
-use crate::provenance::accumulator::ProvenanceAccumulator;
+use crate::provenance::accumulator::{build_tool_detail, ProvenanceAccumulator};
+use crate::provenance::classify::summarize_tool_call;
 use crate::record::TurnRecordOutcome;
 use crate::transcript;
 use crate::turn::session::AgentSession;
@@ -420,6 +422,49 @@ impl TurnOrchestrator {
         }
         if !obj.contains_key("step_count") && data.step_count > 0 {
             obj.insert("step_count".to_string(), serde_json::json!(data.step_count));
+        }
+
+        // 3. Enrich the session graph's tool nodes. Thin plugin payloads carry
+        //    no tool input/output, so nodes recorded at hook time hold bare
+        //    summaries ("Execute bash"). The store's tool parts carry the
+        //    command, file and output under the same call id — rewrite the
+        //    summary and detail so the graph reads as rich as the rich-plugin
+        //    path. Runs over ALL nodes, so one enriched turn repairs earlier
+        //    thin turns of the same session.
+        if !data.tool_parts.is_empty() {
+            let by_call: HashMap<&str, &transcript::opencode::ToolPart> = data
+                .tool_parts
+                .iter()
+                .map(|tp| (tp.call_id.as_str(), tp))
+                .collect();
+
+            self.with_accumulator(&session.session_id, |acc| {
+                let mut changed = false;
+                for node in acc.nodes.iter_mut() {
+                    let Some(call_id) = node.tool_call_id.as_deref() else {
+                        continue;
+                    };
+                    let Some(tp) = by_call.get(call_id) else {
+                        continue;
+                    };
+                    let tool_name = node.tool_name.as_deref().unwrap_or(tp.tool.as_str());
+                    let input = tp.input.as_ref();
+                    let output = tp.output.as_deref();
+                    let status = tp.status.as_deref();
+
+                    let summary =
+                        summarize_tool_call(tool_name, node.kind, input, output, status);
+                    if summary != node.summary {
+                        node.summary = summary;
+                        changed = true;
+                    }
+                    if let Some(detail) = build_tool_detail(node.kind, tool_name, input, output) {
+                        node.detail = Some(detail);
+                        changed = true;
+                    }
+                }
+                changed
+            });
         }
 
         log::info!(

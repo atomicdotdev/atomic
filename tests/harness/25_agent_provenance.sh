@@ -87,7 +87,9 @@ INSERT INTO part VALUES
   '{"type":"step-finish","reason":"stop","cost":0.02,"tokens":{"input":40,"output":50,"reasoning":10,"cache":{"write":5,"read":20}}}'),
  ('p5','msg_a','ses_harness',$((ASST_MS+400)),$((ASST_MS+400)),
   '{"type":"tool","tool":"bash","state":{"title":"ran tests","status":"completed"}}'),
- ('p6','msg_a','ses_harness',$((ASST_MS+500)),$((ASST_MS+500)),
+ ('p6','msg_a','ses_harness',$((ASST_MS+450)),$((ASST_MS+450)),
+  '{"type":"tool","tool":"bash","callID":"call_h1","state":{"status":"completed","input":{"command":"cargo test"},"output":"test result: ok. 12 passed","title":"cargo test"}}'),
+ ('p7','msg_a','ses_harness',$((ASST_MS+500)),$((ASST_MS+500)),
   '{"type":"text","text":"The widget is fixed."}');
 EOF
 
@@ -99,6 +101,10 @@ echo '{"session_id":"ses_harness","prompt":"harness: fix the widget","cwd":"'"$R
     | OPENCODE_HOME="$OC_HOME" atomic agent hooks opencode user-prompt >/dev/null 2>&1
 
 create_file "widget.txt" "widget v1"
+# A tool hook carrying the same call id as the store's tool part — the join
+# key the enrichment uses to graft commands/outputs onto graph nodes.
+echo '{"session_id":"ses_harness","tool_name":"bash","tool_call_id":"call_h1","status":"completed","cwd":"'"$REPO_DIR"'"}' \
+    | OPENCODE_HOME="$OC_HOME" atomic agent hooks opencode after-tool >/dev/null 2>&1
 
 echo '{"session_id":"ses_harness","turn_number":1,"model":"test/model","provider":"testprovider","cwd":"'"$REPO_DIR"'"}' \
     | OPENCODE_HOME="$OC_HOME" atomic agent hooks opencode stop >/dev/null 2>&1
@@ -150,6 +156,7 @@ if echo "$prov_json" | python3 -c "
 import json, sys
 p = json.load(sys.stdin)['provenance']
 assert p.get('reasoning_text') == 'widget reasoning', p.get('reasoning_text')
+
 assert p.get('finish_reason') == 'stop'
 assert p.get('step_count') == 1
 assert (p.get('tokens') or {}).get('input') == 40
@@ -159,6 +166,22 @@ assert (p.get('cost') or {}).get('amount_micros') == 20000
 else
     _fail "change provenance carries reasoning_text/tokens/cost/steps" \
         "$(echo "$prov_json" | head -3)"
+fi
+
+# Tool nodes recorded from the thin payload get their command and output back
+# from the store, matched on the tool call id.
+if python3 - "$graph" <<'EOF'
+import json, sys
+nodes = json.load(open(sys.argv[1]))["nodes"]
+node = next(n for n in nodes if n.get("tool_call_id") == "call_h1")
+assert "cargo test" in node["summary"], node["summary"]
+assert node["detail"]["command"] == "cargo test", node["detail"]
+assert "12 passed" in node["detail"]["output_summary"], node["detail"]
+EOF
+then
+    _pass "tool node enriched from the store (command + output)"
+else
+    _fail "tool node enriched from the store (command + output)"
 fi
 
 # #2 — agent_turn persisted inside the change file (unhashed section).
