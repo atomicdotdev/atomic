@@ -179,8 +179,7 @@ impl ProvenanceAccumulator {
     /// Returns the new node's ID.
     pub fn append_llm_response(&mut self, text: &str, timestamp: i64) -> String {
         let summary = truncate_prompt(text, 200);
-        let mut node =
-            GraphNode::new(self.next_id(), NodeKind::LlmResponse, timestamp, &summary);
+        let mut node = GraphNode::new(self.next_id(), NodeKind::LlmResponse, timestamp, &summary);
 
         let stored: String = text.chars().take(MAX_RESPONSE_TEXT_LEN).collect();
         node.detail = Some(serde_json::json!({

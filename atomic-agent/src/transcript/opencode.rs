@@ -275,7 +275,10 @@ fn assemble(messages: &[(String, String)], parts: &[(String, Value)]) -> TurnDat
     for (message_id, part) in parts {
         let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
         let in_turn = in_turn.get(message_id.as_str()).copied().unwrap_or(false);
-        let role = role_of.get(message_id.as_str()).copied().unwrap_or("assistant");
+        let role = role_of
+            .get(message_id.as_str())
+            .copied()
+            .unwrap_or("assistant");
 
         match part_type {
             "text" => {
@@ -302,7 +305,11 @@ fn assemble(messages: &[(String, String)], parts: &[(String, Value)]) -> TurnDat
                     .get("time")
                     .and_then(|t| t.get("start"))
                     .and_then(Value::as_u64)
-                    .zip(part.get("time").and_then(|t| t.get("end")).and_then(Value::as_u64))
+                    .zip(
+                        part.get("time")
+                            .and_then(|t| t.get("end"))
+                            .and_then(Value::as_u64),
+                    )
                     .map(|(start, end)| end.saturating_sub(start));
                 let mut line = serde_json::json!({ "type": "reasoning", "text": text });
                 if let Some(ms) = duration_ms {
@@ -356,12 +363,9 @@ fn assemble(messages: &[(String, String)], parts: &[(String, Value)]) -> TurnDat
                 }
                 if let Some(tokens) = part.get("tokens") {
                     data.input_tokens += tokens.get("input").and_then(Value::as_u64).unwrap_or(0);
-                    data.output_tokens +=
-                        tokens.get("output").and_then(Value::as_u64).unwrap_or(0);
-                    data.reasoning_tokens += tokens
-                        .get("reasoning")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
+                    data.output_tokens += tokens.get("output").and_then(Value::as_u64).unwrap_or(0);
+                    data.reasoning_tokens +=
+                        tokens.get("reasoning").and_then(Value::as_u64).unwrap_or(0);
                     if let Some(cache) = tokens.get("cache") {
                         data.cache_read_tokens +=
                             cache.get("read").and_then(Value::as_u64).unwrap_or(0);
@@ -395,14 +399,37 @@ mod tests {
 
     #[test]
     fn turn_window_scopes_reasoning_and_response() {
-        let messages = vec![msg("m1", "user"), msg("m2", "assistant"), msg("m3", "user"), msg("m4", "assistant")];
+        let messages = vec![
+            msg("m1", "user"),
+            msg("m2", "assistant"),
+            msg("m3", "user"),
+            msg("m4", "assistant"),
+        ];
         let parts = vec![
-            part("m1", serde_json::json!({"type": "text", "text": "first question"})),
-            part("m2", serde_json::json!({"type": "reasoning", "text": "old thinking"})),
-            part("m2", serde_json::json!({"type": "text", "text": "old answer"})),
-            part("m3", serde_json::json!({"type": "text", "text": "second question"})),
-            part("m4", serde_json::json!({"type": "reasoning", "text": "new thinking", "time": {"start": 10, "end": 52}})),
-            part("m4", serde_json::json!({"type": "text", "text": "new answer"})),
+            part(
+                "m1",
+                serde_json::json!({"type": "text", "text": "first question"}),
+            ),
+            part(
+                "m2",
+                serde_json::json!({"type": "reasoning", "text": "old thinking"}),
+            ),
+            part(
+                "m2",
+                serde_json::json!({"type": "text", "text": "old answer"}),
+            ),
+            part(
+                "m3",
+                serde_json::json!({"type": "text", "text": "second question"}),
+            ),
+            part(
+                "m4",
+                serde_json::json!({"type": "reasoning", "text": "new thinking", "time": {"start": 10, "end": 52}}),
+            ),
+            part(
+                "m4",
+                serde_json::json!({"type": "text", "text": "new answer"}),
+            ),
         ];
 
         let data = assemble(&messages, &parts);

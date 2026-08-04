@@ -4,10 +4,10 @@ use super::*;
 mod tests {
     use super::*;
     use atomic_core::change::ChangeHeader;
+    use atomic_core::change::{AITool, AIVendor, PromptContent, Provenance, SuggestionType};
     use atomic_core::change::{Atom, Encoding, Insertion, Local};
     use atomic_core::types::{ChangePosition, Merkle, Position};
     use atomic_core::EdgeFlags;
-    use atomic_core::change::{AITool, AIVendor, PromptContent, Provenance, SuggestionType};
 
     // ChangeFormat Tests
 
@@ -902,7 +902,10 @@ mod tests {
         assert_eq!(json.step_count, Some(3));
         assert_eq!(json.session_slug.as_deref(), Some("mighty-rocket"));
         assert_eq!(json.reasoning_signature.as_deref(), Some("sig-abc"));
-        assert_eq!(json.reasoning_text.as_deref(), Some("thought hard about it"));
+        assert_eq!(
+            json.reasoning_text.as_deref(),
+            Some("thought hard about it")
+        );
         assert!(json.prompt_hash.is_some());
         assert!(json.metadata.is_some());
 
@@ -937,7 +940,13 @@ mod tests {
         let obj = value.as_object().unwrap();
 
         // Absent fields stay out of the output entirely.
-        for key in ["reasoning_text", "agent_mode", "step_count", "prompt_hash", "metadata"] {
+        for key in [
+            "reasoning_text",
+            "agent_mode",
+            "step_count",
+            "prompt_hash",
+            "metadata",
+        ] {
             assert!(!obj.contains_key(key), "unexpected key: {}", key);
         }
         assert_eq!(obj.get("vendor").and_then(|v| v.as_str()), Some("OpenAI"));

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use super::types::{AssistantMessage, CondensedEntry, EntryType, ToolInput, ToolUseSummary, TranscriptLine};
+use super::types::{
+    AssistantMessage, CondensedEntry, EntryType, ToolInput, ToolUseSummary, TranscriptLine,
+};
 
 // Transcript Parsing (Claude Code JSONL)
 
@@ -121,7 +123,10 @@ pub fn condense_opencode_transcript(raw: &[u8]) -> Vec<CondensedEntry> {
                 }
             }
             Some("tool") => {
-                let name = parsed.get("tool").and_then(|v| v.as_str()).unwrap_or("tool");
+                let name = parsed
+                    .get("tool")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("tool");
                 let title = parsed
                     .get("title")
                     .and_then(|v| v.as_str())

@@ -452,8 +452,7 @@ impl TurnOrchestrator {
                     let output = tp.output.as_deref();
                     let status = tp.status.as_deref();
 
-                    let summary =
-                        summarize_tool_call(tool_name, node.kind, input, output, status);
+                    let summary = summarize_tool_call(tool_name, node.kind, input, output, status);
                     if summary != node.summary {
                         node.summary = summary;
                         changed = true;
@@ -472,7 +471,11 @@ impl TurnOrchestrator {
              ({} reasoning block{}, response: {}, {} step{})",
             session.session_id,
             data.reasoning_blocks.len(),
-            if data.reasoning_blocks.len() == 1 { "" } else { "s" },
+            if data.reasoning_blocks.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
             data.response.is_some(),
             data.step_count,
             if data.step_count == 1 { "" } else { "s" },

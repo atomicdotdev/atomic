@@ -411,9 +411,7 @@ impl From<&Provenance> for JsonProvenance {
             Some(serde_json::Value::Array(
                 prov.metadata
                     .iter()
-                    .map(|(k, v)| {
-                        serde_json::json!({ "key": k, "value": v })
-                    })
+                    .map(|(k, v)| serde_json::json!({ "key": k, "value": v }))
                     .collect(),
             ))
         };
