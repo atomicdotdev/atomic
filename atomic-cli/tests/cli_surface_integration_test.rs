@@ -145,6 +145,7 @@ fn every_public_command_renders_help() {
     for expected in [
         ["agent", "enable"].as_slice(),
         ["project", "delete"].as_slice(),
+        ["intent", "new"].as_slice(),
         ["vault", "goal", "start"].as_slice(),
     ] {
         let expected = expected

@@ -48,6 +48,7 @@
     unused_assignments
 )]
 
+mod agent_error;
 mod commands;
 mod error;
 mod output;
@@ -135,10 +136,12 @@ fn apply_agent_help(cmd: clap::Command) -> clap::Command {
         .get_subcommands()
         .map(|c| c.get_name().to_string())
         .collect();
+
     let mut cmd = cmd
         .help_template(AGENT_HELP_TEMPLATE)
         .long_about(None::<&str>)
         .mut_args(|arg| arg.long_help(None::<&str>));
+
     for name in subcommand_names {
         cmd = cmd.mut_subcommand(name, apply_agent_help);
     }
@@ -852,14 +855,23 @@ fn main() {
     // Initialize logging
     env_logger::init();
 
-    // Parse command-line arguments through the agent-native help layout. We
-    // build the command tree, stamp the template onto every node, let clap do
-    // its normal validation/help/error handling, then reconstruct the typed
-    // `Cli` from the resulting matches.
-    let matches = apply_agent_help(Cli::command()).get_matches();
+    // Parse command-line arguments through the agent-native help layout.
+    //
+    // `try_get_matches_from_mut` rather than `get_matches`: clap's own failure
+    // output is human prose ending in "For more information, try '--help'",
+    // which costs an agent a second round trip and may discard the option/value
+    // relationship or the parser's underlying cause. We intercept and re-render
+    // in the same `key: value` dialect the rest of the machine surface speaks.
+    // Help and version still print through clap untouched.
+    let mut cmd = apply_agent_help(Cli::command());
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let matches = match cmd.try_get_matches_from_mut(args.clone()) {
+        Ok(matches) => matches,
+        Err(err) => agent_error::render_and_exit(err, &cmd, &args),
+    };
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
-        Err(err) => err.exit(),
+        Err(err) => agent_error::render_and_exit(err, &cmd, &args),
     };
 
     // Configure color output
@@ -970,6 +982,13 @@ fn main() {
 #[cfg(test)]
 mod agent_help_tests {
     use super::*;
+
+    /// The raw clap command definition must be structurally valid before the
+    /// agent-native help transformation is applied.
+    #[test]
+    fn clap_command_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
 
     /// The agent-help walk must produce a structurally valid clap tree.
     /// `debug_assert` catches duplicate flags, bad templates, and the like,
