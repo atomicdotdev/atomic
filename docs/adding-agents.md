@@ -79,11 +79,16 @@ The vault is Atomic's built-in project-management and context layer. It tracks
 This skill teaches the agent the intent lifecycle:
 
 ```bash
-atomic vault intent list                          # always check first
-atomic vault intent create --title "Implement JWT signing"
-atomic vault intent update <ID> --status planned  # after the user accepts the plan
-atomic vault sync                                 # persist .vault/ file edits to the DB
+atomic intent list                                      # always check first
+atomic intent new "Implement JWT signing"              # directive-based scaffold
+atomic intent show <ID>                                 # inspect the stored intent
+atomic intent update <ID> --status in_progress          # after execution starts
+atomic intent link <ID> --goal <GOAL>                   # connect work to its why
 ```
+
+The body uses the canonical directive vocabulary (`:::why`,
+`:::acceptance-criterion`, `:::task`, and `::file-ref`) so it can be lifted,
+validated, and attested without losing structure.
 
 Why it matters: the prompt alone is not enough. The intent is where the agent
 writes the **problem statement**, the **testable success criteria**, and the
@@ -204,7 +209,9 @@ echo '<json payload>' | atomic agent hooks <agent> <verb>
 ```
 
 Session state is persisted between calls under `.atomic/sessions/` — each hook
-invocation is a fresh, stateless CLI process keyed by `session_id`.
+invocation starts as a fresh CLI process keyed by `session_id`. An adapter may
+hand bounded terminal work to a short-lived worker when the agent imposes a
+hard hook deadline, as Codex does for `SessionEnd`.
 
 | Event (`HookType`) | Typical verb(s) | Fires when | What Atomic does |
 |--------------------|-----------------|------------|------------------|
@@ -264,7 +271,7 @@ Every hook invocation should be guarded so it only fires inside an Atomic repo
 and never breaks the agent if something fails:
 
 ```bash
-test -d .atomic && atomic agent hooks <agent> <verb> || true
+test -d .atomic || test -f .atomic-sandbox && atomic agent hooks <agent> <verb> || true
 ```
 
 ---
@@ -800,6 +807,7 @@ atomic agent disable --agent <agent>
 echo '{"session_id":"t1","cwd":"'"$PWD"'"}' | atomic agent hooks <agent> session-start
 echo '{"session_id":"t1","prompt":"hi","model":"...","provider":"..."}' | atomic agent hooks <agent> user-prompt
 echo '{"session_id":"t1","turn_number":1}' | atomic agent hooks <agent> stop
+echo '{"session_id":"t1","reason":"completed"}' | atomic agent hooks <agent> session-end
 atomic agent attest                 # confirm a provenance/attestation record appeared
 
 # 4. Harness: install verification from storage (all agents, ~20s).

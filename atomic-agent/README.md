@@ -56,7 +56,7 @@ When you run `atomic agent enable`, hooks are installed in the agent's configura
 | **Session Start** | Session created, tracking message returned to agent |
 | **User Prompt Submit** | Turn timer started, prompt captured |
 | **Agent Stop** | `status → add untracked → record all` — change created with provenance |
-| **Session End** | Session marked as ended |
+| **Session End** | Flush pending work, write the session attestation, mark the session ended, and restore the user's parent view |
 | **Tool Use** | Tool invocations logged (sub-turn recording planned) |
 
 The recording workflow on each turn end:
@@ -65,7 +65,7 @@ The recording workflow on each turn end:
 2. **Add** — track any new files the agent created (filtering out `node_modules`, `target`, etc.)
 3. **Record** — create an Atomic change with AI provenance metadata
 
-No daemon. No Watchman required. No git. Each hook invocation is a standalone process that opens the repo, does its work, and exits.
+No daemon. No Watchman required. No git. Each hook invocation is a standalone process that opens the repo, does its work, and exits. Codex is the one lifecycle-specific exception: because Codex caps `SessionEnd` hooks at three seconds, the hook hands finalization to a short-lived background worker after safely forwarding the event payload.
 
 ## Agent Identity
 
@@ -262,7 +262,7 @@ No separate session API. No metadata branch. One `push` sends everything. One `p
 |---|---|
 | `error` | `AgentError` enum — Watchman, hook parse, session, turn, recording errors with classification and suggestions |
 | `event` | `HookType`, `TurnEvent`, `TurnChanges` — normalized lifecycle events from any agent |
-| `hooks` | `AgentHook` trait, `AgentRegistry`, Claude Code adapter (Gemini/Codex/OpenCode planned) |
+| `hooks` | `AgentHook` trait, `AgentRegistry`, and the built-in agent adapters (Claude Code, Codex, OpenCode, Gemini, and others) |
 | `hooks::claude_code` | Parse Claude Code JSON, install/uninstall hooks in `.claude/settings.json` |
 | `watcher` | `FileWatcher` trait, `FallbackWatcher` (walkdir snapshots), Watchman backend (planned) |
 | `turn::phase` | Phase/Event/Action state machine — `transition()` pure function, 20 transitions |
@@ -305,7 +305,7 @@ atomic agent hooks <agent> <verb>              # internal, called by agent hooks
 | **Antigravity CLI (`agy`)** | ✅ Implemented | Plugin (`~/.gemini/config/plugins/atomic/hooks.json`), 3 hooks |
 | **Claude Code** | ✅ Implemented | `.claude/settings.json`, 7 hooks |
 | **Cline** | ✅ Implemented | `.cline/settings.json` |
-| **Codex** | ✅ Implemented | `.codex/hooks.json` |
+| **Codex** | ✅ Implemented | `~/.codex/hooks.json`, 6 hooks including `SessionEnd` |
 | **Copilot** | ✅ Implemented | `.github/copilot-hooks.yml` |
 | **Cursor** | ✅ Implemented | `.cursor/hooks.json` |
 | **Gemini CLI** (deprecated) | ✅ Implemented | `.gemini/settings.json` |

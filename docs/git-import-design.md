@@ -505,7 +505,16 @@ atomic git import --branch main
 atomic git import --branch main --incremental
 ```
 
-Implementation:
+The current importer derives deduplication from Git SHAs embedded in the
+explicit target view's history, including inherited changes. It repairs the
+Git-SHA acceleration index in one batch, so a no-op sync does not create a
+write transaction per historical commit. In an existing Atomic repository,
+incremental import selects the target only on its repository handle and
+preserves the active view and working copy. Any commit-write error, or a
+parsed-versus-written count mismatch, aborts the import instead of reporting a
+partial history as successful.
+
+Historical design sketch (not used by the current importer):
 
 ```rust
 pub struct IncrementalState {
