@@ -51,9 +51,13 @@
 //!
 //! # Installation
 //!
-//! Plugin installation is handled by the standalone `atomic-opencode` package,
-//! which places the `atomic-hooks.ts` plugin file in `.opencode/plugins/`.
-//! This adapter only handles parsing hook events from the installed plugin.
+//! Installation is handled by the `atomic-opencode` package via the
+//! integrations engine (`crate::integrations`): `atomic agent enable
+//! --agent opencode` syncs the package from Atomic storage, stages
+//! `atomic-hooks.ts` at `~/.config/opencode/plugins/` (plus agent and
+//! skills files), and registers the plugin in `opencode.json` via the
+//! settings manifest. This adapter only parses hook events from the
+//! installed plugin.
 
 use std::path::Path;
 
@@ -325,7 +329,8 @@ struct AfterToolInput {
 /// OpenCode agent hook adapter.
 ///
 /// Handles hook JSON parsing from the OpenCode hooks plugin.
-/// Plugin installation is managed by the standalone `atomic-opencode` package.
+/// Plugin installation is handled by the `atomic-opencode` package via the
+/// integrations engine.
 ///
 /// # Differences from Claude Code / Gemini CLI
 ///
@@ -577,9 +582,9 @@ impl AgentHook for OpenCodeHook {
     }
 
     fn install(&self, _repo_root: &Path) -> AgentResult<usize> {
-        // OpenCode hooks are managed by the atomic-opencode package, not
-        // by writing files into the repo.  Report 1 if the plugin is
-        // already present so that `enable` shows a success message.
+        // Installation is owned by the integrations engine (the
+        // atomic-opencode package on Atomic storage). Report 1 when the
+        // plugin is already staged so `enable` shows a success message.
         if Self::is_plugin_installed() {
             Ok(1)
         } else {
@@ -588,7 +593,7 @@ impl AgentHook for OpenCodeHook {
     }
 
     fn uninstall(&self, _repo_root: &Path) -> AgentResult<()> {
-        Ok(()) // Uninstallation handled by atomic-opencode package
+        Ok(()) // Uninstallation is receipt-driven via the integrations engine.
     }
 
     fn is_installed(&self, _repo_root: &Path) -> bool {
@@ -608,7 +613,7 @@ impl AgentHook for OpenCodeHook {
 
     fn detect_presence(&self, repo_root: &Path) -> bool {
         // OpenCode is present if the repo has a .opencode directory OR if
-        // the atomic-opencode plugin is installed globally.
+        // the atomic-hooks.ts plugin is staged under ~/.config/opencode/.
         repo_root.join(OPENCODE_DIR).is_dir() || Self::is_plugin_installed()
     }
 

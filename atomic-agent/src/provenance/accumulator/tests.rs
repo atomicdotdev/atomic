@@ -929,3 +929,55 @@ fn test_stats_match_nodes() {
     assert_eq!(stats.total_nodes(), acc.node_count() as u32);
     assert_eq!(stats.edge_count, acc.edge_count() as u32);
 }
+
+// ---- append_llm_response ----
+
+#[test]
+fn test_append_llm_response_links_goal_and_last_node() {
+    let mut acc = ProvenanceAccumulator::new("s1");
+    let goal = acc.append_goal("Fix bug", 1000);
+    let read_id = acc.append_tool_call("read", Some("c1"), None, None, None, None, 1001);
+    let resp = acc.append_llm_response("Fixed it — tests pass.", 1002);
+
+    let node = acc.nodes().iter().find(|n| n.id == resp).unwrap();
+    assert_eq!(node.kind, NodeKind::LlmResponse);
+    assert_eq!(node.summary, "Fixed it — tests pass.");
+    assert!(node.classified);
+    let detail = node.detail.as_ref().unwrap();
+    assert_eq!(detail["response_text"], "Fixed it — tests pass.");
+    assert_eq!(detail["text_length"], "Fixed it — tests pass.".len());
+
+    // goal --led_to-→ response and last_node --led_to-→ response
+    assert!(acc
+        .edges()
+        .iter()
+        .any(|e| e.from == goal && e.to == resp && e.kind == EdgeKind::LedTo));
+    assert!(acc
+        .edges()
+        .iter()
+        .any(|e| e.from == read_id && e.to == resp && e.kind == EdgeKind::LedTo));
+    assert_eq!(acc.stats().llm_response_count, 1);
+}
+
+#[test]
+fn test_append_llm_response_without_goal_or_history() {
+    let mut acc = ProvenanceAccumulator::new("s1");
+    let resp = acc.append_llm_response("Done.", 1000);
+
+    assert_eq!(acc.node_count(), 1);
+    assert_eq!(acc.nodes()[0].id, resp);
+    assert!(acc.edges().is_empty());
+    assert_eq!(acc.stats().llm_response_count, 1);
+}
+
+#[test]
+fn test_append_llm_response_truncates_stored_text() {
+    let mut acc = ProvenanceAccumulator::new("s1");
+    let long = "x".repeat(20_000);
+    let resp = acc.append_llm_response(&long, 1000);
+
+    let node = acc.nodes().iter().find(|n| n.id == resp).unwrap();
+    let detail = node.detail.as_ref().unwrap();
+    assert_eq!(detail["response_text"].as_str().unwrap().len(), 8_000);
+    assert_eq!(detail["text_length"], 20_000);
+}

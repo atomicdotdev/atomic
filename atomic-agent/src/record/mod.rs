@@ -65,6 +65,7 @@ mod tests;
 use std::path::Path;
 
 use atomic_core::change::ChangeHeader;
+use atomic_core::types::Base32;
 
 use atomic_repository::status::RepositoryStatus;
 
@@ -414,6 +415,47 @@ pub fn record_turn(
                     if has_reasoning { " + reasoning" } else { "" },
                     options.turn_number,
                 );
+
+                // The store wrote the change file during record(), before
+                // this unhashed data existed. Re-save so the file on disk
+                // carries the transcript. The unhashed section is outside
+                // the hash, so the content hash is unchanged and the file
+                match atomic_repository::Repository::canonical_dot_dir(repo_root)
+                    .map(|dot| dot.join("changes"))
+                    .map_err(|e| e.to_string())
+                    .and_then(|dir| {
+                        atomic_repository::ChangeStore::new(
+                            dir,
+                            atomic_repository::DEFAULT_CACHE_CAPACITY,
+                        )
+                        .map_err(|e| e.to_string())
+                    }) {
+                    Ok(store) => match store.save_change(outcome.change()) {
+                        Ok(saved) if saved == *outcome.hash() => {}
+                        Ok(saved) => {
+                            log::warn!(
+                                "Re-saved change hash {} differs from recorded {} — \
+                                 unhashed data may be orphaned",
+                                saved.to_base32(),
+                                outcome.hash().to_base32(),
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to persist transcript on change {} (non-fatal): {}",
+                                outcome.hash().to_base32(),
+                                e
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        log::warn!(
+                            "Could not open change store to persist transcript \
+                             (non-fatal): {}",
+                            e
+                        );
+                    }
+                }
             }
             Err(e) => {
                 log::warn!(
