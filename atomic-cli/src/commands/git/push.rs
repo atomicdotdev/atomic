@@ -139,7 +139,33 @@ impl Command for Push {
                     message: format!("Failed to diff: {}", e),
                 })?;
             if diff.deltas().count() == 0 {
-                print_info("Working copy matches Git HEAD. Nothing to commit.");
+                // Nothing to commit — but a previous push may have failed
+                // after the commit was created, leaving unpushed commits.
+                let branch_name = git_repo
+                    .head()
+                    .ok()
+                    .and_then(|h| h.shorthand().map(str::to_owned))
+                    .unwrap_or_else(|| "HEAD".to_string());
+                let ahead = self.unpushed_commit_count(&git_repo, &branch_name);
+                if ahead == 0 {
+                    print_info("Working copy matches Git HEAD. Nothing to commit.");
+                    return Ok(());
+                }
+                if self.no_push {
+                    print_info(&format!(
+                        "Nothing to commit, but {} unpushed commit{} (--no-push set).",
+                        ahead,
+                        if ahead == 1 { "" } else { "s" }
+                    ));
+                    return Ok(());
+                }
+                print_info(&format!(
+                    "Nothing to commit, but {} unpushed commit{}. Pushing...",
+                    ahead,
+                    if ahead == 1 { "" } else { "s" }
+                ));
+                self.push_to_remote(&git_repo)?;
+                print_success(&format!("Pushed to {}/{}", self.remote, branch_name));
                 return Ok(());
             }
         }
@@ -296,39 +322,67 @@ impl Push {
         None
     }
 
+    /// Count commits on `branch_name` that haven't been pushed to its
+    /// upstream. Returns 0 when the branch has no configured upstream.
+    fn unpushed_commit_count(&self, git_repo: &GitRepository, branch_name: &str) -> usize {
+        let local_ref = format!("refs/heads/{}", branch_name);
+
+        // branch_upstream_name returns the full upstream refname
+        // (e.g. "refs/remotes/origin/main"), which resolves directly.
+        let upstream_oid = git_repo
+            .branch_upstream_name(&local_ref)
+            .ok()
+            .and_then(|buf| buf.as_str().map(str::to_owned))
+            .and_then(|name| git_repo.refname_to_id(&name).ok());
+
+        let local_oid = git_repo.refname_to_id(&local_ref).ok();
+
+        match (local_oid, upstream_oid) {
+            (Some(local), Some(upstream)) => git_repo
+                .graph_ahead_behind(local, upstream)
+                .map(|(ahead, _)| ahead)
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
     /// Push the current branch to the remote.
+    ///
+    /// Delegates the network operation to the `git` CLI so authentication
+    /// behaves exactly like a plain `git push`: OpenSSH client config
+    /// (`Host`/`IdentityFile`/`IdentitiesOnly`), ssh-agents, askpass
+    /// prompts, and HTTPS credential helpers all work as the user expects.
+    ///
+    /// Do not "simplify" this back to libgit2's transport: its credential
+    /// callback can only consult the ssh-agent, which fails for anyone
+    /// whose keys live in `~/.ssh/config` (a common setup, e.g.
+    /// `IdentityFile ~/.ssh_keys/github` with an empty agent).
     fn push_to_remote(&self, git_repo: &GitRepository) -> CliResult<()> {
         let head = git_repo.head().map_err(|e| CliError::GitError {
             message: format!("Failed to get HEAD: {}", e),
         })?;
         let branch_name = head.shorthand().unwrap_or("HEAD");
-        let refspec = format!("refs/heads/{}:refs/heads/{}", branch_name, branch_name);
+        let refspec = format!("refs/heads/{0}:refs/heads/{0}", branch_name);
 
-        let mut remote = git_repo
-            .find_remote(&self.remote)
+        let workdir = git_repo.workdir().ok_or_else(|| CliError::GitError {
+            message: "Git repository has no working directory (bare repository?)".to_string(),
+        })?;
+
+        // Inherit stdio so the user sees git's native output and any
+        // interactive auth prompts (ssh passphrase, askpass) work.
+        let status = std::process::Command::new("git")
+            .args(["push", &self.remote, &refspec])
+            .current_dir(workdir)
+            .status()
             .map_err(|e| CliError::GitError {
-                message: format!("Remote '{}' not found: {}", self.remote, e),
+                message: format!("Failed to run git push: {}", e),
             })?;
 
-        let mut push_options = git2::PushOptions::new();
-        let mut callbacks = git2::RemoteCallbacks::new();
-        callbacks.credentials(|_url, username_from_url, allowed_types| {
-            if allowed_types.contains(git2::CredentialType::SSH_KEY) {
-                let user = username_from_url.unwrap_or("git");
-                git2::Cred::ssh_key_from_agent(user)
-            } else if allowed_types.contains(git2::CredentialType::DEFAULT) {
-                git2::Cred::default()
-            } else {
-                Err(git2::Error::from_str("no suitable credential type"))
-            }
-        });
-        push_options.remote_callbacks(callbacks);
-
-        remote
-            .push(&[&refspec], Some(&mut push_options))
-            .map_err(|e| CliError::GitError {
-                message: format!("Push failed: {}", e),
-            })?;
+        if !status.success() {
+            return Err(CliError::GitError {
+                message: format!("git push exited with {}", status),
+            });
+        }
 
         Ok(())
     }
@@ -401,5 +455,62 @@ mod tests {
     fn test_parse_trailer_empty() {
         let msg = "msg\n\nAtomic-State:\n";
         assert_eq!(parse_trailer(msg, "Atomic-State"), None);
+    }
+
+    #[test]
+    fn test_unpushed_commit_count_no_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = GitRepository::init(dir.path()).unwrap();
+
+        // One commit so HEAD resolves.
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_oid = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+
+        let push = Push::default();
+        // No upstream configured → nothing counted as unpushed.
+        assert_eq!(push.unpushed_commit_count(&repo, "main"), 0);
+        // Unknown branch → 0, not an error.
+        assert_eq!(push.unpushed_commit_count(&repo, "nonexistent"), 0);
+    }
+
+    #[test]
+    fn test_unpushed_commit_count_ahead_of_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_opts(
+            dir.path(),
+            git2::RepositoryInitOptions::new()
+                .initial_head("main")
+                .mkdir(false),
+        )
+        .unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+
+        // First commit — this is what "origin/main" points at.
+        let tree_oid = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let first = repo
+            .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+        repo.remote("origin", "https://example.com/rocket.git")
+            .unwrap();
+        repo.reference("refs/remotes/origin/main", first, true, "remote")
+            .unwrap();
+
+        // Upstream tracking config for main → origin/main.
+        let mut config = repo.config().unwrap();
+        config.set_str("branch.main.remote", "origin").unwrap();
+        config.set_str("branch.main.merge", "refs/heads/main").unwrap();
+
+        let push = Push::default();
+        assert_eq!(push.unpushed_commit_count(&repo, "main"), 0);
+
+        // A second local commit puts us one ahead of the upstream.
+        let parent = repo.find_commit(first).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "work", &tree, &[&parent])
+            .unwrap();
+        assert_eq!(push.unpushed_commit_count(&repo, "main"), 1);
     }
 }
