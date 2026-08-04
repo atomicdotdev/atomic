@@ -205,6 +205,7 @@ impl Import {
         branch_name: &str,
         repo: &mut Repository,
         imported_shas: &HashSet<String>,
+        known_states: &HashSet<atomic_core::types::Merkle>,
         mainline_only: bool,
     ) -> CliResult<usize> {
         // Get repository name from remote URL or working directory
@@ -221,6 +222,8 @@ impl Import {
             ),
             mainline_only,
             graph_only: !self.with_crdt,
+            target_view: branch_name.to_string(),
+            known_states: known_states.clone(),
         };
 
         let importer = ParallelImporter::new(git_repo, options);
@@ -258,8 +261,16 @@ impl Import {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
-    /// Get the set of already imported Git SHAs from existing changes.
-    fn get_imported_shas(&self, repo: &Repository) -> HashSet<String> {
+    /// Get the set of already imported Git SHAs from existing changes,
+    /// plus the Merkle states already present in the current view.
+    ///
+    /// The states let the importer skip commits created by `atomic git
+    /// push`: such a commit trailers the view state it represents, and if
+    /// that state is already known the commit adds nothing.
+    fn get_incremental_markers(
+        &self,
+        repo: &Repository,
+    ) -> (HashSet<String>, HashSet<atomic_core::types::Merkle>) {
         use atomic_repository::HistoryOptions;
 
         // Ensure the GIT_SHA_INDEX is populated for repos imported before
@@ -268,11 +279,13 @@ impl Import {
         let _ = repo.backfill_git_sha_index();
 
         let mut shas = HashSet::new();
+        let mut states = HashSet::new();
 
         // Iterate through all changes on the current view via log
         let options = HistoryOptions::default();
         if let Ok(entries) = repo.log(options) {
             for entry in entries {
+                states.insert(entry.state);
                 if let Ok(change) = repo.load_change(&entry.hash) {
                     if let Some(ref unhashed) = change.unhashed {
                         if let Some(git) = unhashed.get("git") {
@@ -285,7 +298,7 @@ impl Import {
             }
         }
 
-        shas
+        (shas, states)
     }
 
     /// Get all local branch names.
@@ -432,11 +445,11 @@ impl Command for Import {
             Repository::init(workdir).map_err(|e| CliError::Internal(e.into()))?
         };
 
-        // Get already imported SHAs for incremental mode
-        let imported_shas = if self.incremental {
-            self.get_imported_shas(&repo)
+        // Get already imported SHAs and known view states for incremental mode
+        let (imported_shas, known_states) = if self.incremental {
+            self.get_incremental_markers(&repo)
         } else {
-            HashSet::new()
+            (HashSet::new(), HashSet::new())
         };
 
         if self.with_crdt {
@@ -473,8 +486,14 @@ impl Command for Import {
                     .map_err(|e| CliError::Internal(e.into()))?;
 
                 // Import the branch
-                let count =
-                    self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas, false)?;
+                let count = self.import_branch(
+                    &git_repo,
+                    &branch_name,
+                    &mut repo,
+                    &imported_shas,
+                    &known_states,
+                    false,
+                )?;
                 total_imported += count;
             }
 
@@ -536,8 +555,14 @@ impl Command for Import {
                 .map_err(|e| CliError::Internal(e.into()))?;
 
             // Import
-            let count =
-                self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas, true)?;
+            let count = self.import_branch(
+                &git_repo,
+                &branch_name,
+                &mut repo,
+                &imported_shas,
+                &known_states,
+                true,
+            )?;
 
             if current_git_branch(&git_repo).as_deref() == Some(branch_name.as_str()) {
                 print_info("Using Git working copy as imported materialization.");
