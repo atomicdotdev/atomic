@@ -487,7 +487,9 @@ mod tests {
             .unwrap();
         assert_eq!(push.branch.as_deref(), Some("pr-42"));
 
-        let push = Push::try_parse_from(["push"]).map_err(|e| e.to_string()).unwrap();
+        let push = Push::try_parse_from(["push"])
+            .map_err(|e| e.to_string())
+            .unwrap();
         assert!(push.branch.is_none());
     }
 
@@ -566,7 +568,9 @@ mod tests {
         // Upstream tracking config for main → origin/main.
         let mut config = repo.config().unwrap();
         config.set_str("branch.main.remote", "origin").unwrap();
-        config.set_str("branch.main.merge", "refs/heads/main").unwrap();
+        config
+            .set_str("branch.main.merge", "refs/heads/main")
+            .unwrap();
 
         let push = Push::default();
         assert_eq!(push.unpushed_commit_count(&repo, "main"), 0);
