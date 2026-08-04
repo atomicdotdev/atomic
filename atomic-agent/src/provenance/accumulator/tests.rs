@@ -195,6 +195,47 @@ fn test_verification_without_commitment_links_to_goal() {
         .any(|e| e.from == goal && e.to == test && e.kind == EdgeKind::LedTo));
 }
 
+#[test]
+fn test_node_tap_zero_failures_is_passed_in_summary_and_detail() {
+    let mut acc = ProvenanceAccumulator::new("s1");
+    let input = serde_json::json!({"command": "npm test"});
+    let output = "TAP version 13\nℹ tests 3\nℹ pass 3\nℹ fail 0";
+
+    let node_id = acc.append_tool_call(
+        "bash",
+        Some("tap-1"),
+        Some(&input),
+        Some(output),
+        None,
+        None,
+        1000,
+    );
+    let node = acc.nodes().iter().find(|node| node.id == node_id).unwrap();
+
+    assert_eq!(node.summary, "npm test (passed)");
+    assert_eq!(node.detail.as_ref().unwrap()["passed"], true);
+}
+
+#[test]
+fn test_completed_tool_status_does_not_hide_failed_verification() {
+    let mut acc = ProvenanceAccumulator::new("s1");
+    let input = serde_json::json!({"command": "npm test"});
+
+    let node_id = acc.append_tool_call(
+        "bash",
+        Some("tap-failed"),
+        Some(&input),
+        Some("test auth flow ... FAILED"),
+        Some("completed"),
+        None,
+        1000,
+    );
+    let node = acc.nodes().iter().find(|node| node.id == node_id).unwrap();
+
+    assert_eq!(node.summary, "npm test (failed)");
+    assert_eq!(node.detail.as_ref().unwrap()["passed"], false);
+}
+
 // ---- append_tool_call: execution ----
 
 #[test]
