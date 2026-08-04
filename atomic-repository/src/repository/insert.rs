@@ -725,6 +725,7 @@ impl Repository {
         recorded_files: &[atomic_core::record::workflow::RecordedFile],
         unhashed: serde_json::Value,
         deleted_paths: &[String],
+        preserve_tree_deletions: bool,
         options: InsertOptions,
     ) -> Result<ImportWriteOutcome, RepositoryError> {
         use atomic_core::record::workflow::assemble_change;
@@ -812,21 +813,25 @@ impl Repository {
                         .map_err(|e| RepositoryError::Database(e.to_string()))?;
                 }
                 GraphOp::FileDel { path, .. } => {
-                    if let Ok(Some(inode)) = txn.get_inode(path) {
-                        let dominated = is_file_only_on_view(&txn, inode, view_name);
-                        if dominated {
-                            let _ = txn.del_tree(path);
-                            let _ = txn.del_inode(inode);
+                    if !preserve_tree_deletions {
+                        if let Ok(Some(inode)) = txn.get_inode(path) {
+                            let dominated = is_file_only_on_view(&txn, inode, view_name);
+                            if dominated {
+                                let _ = txn.del_tree(path);
+                                let _ = txn.del_inode(inode);
+                            }
                         }
                     }
                 }
                 GraphOp::DirDel { path, .. } => {
-                    if let Ok(Some(inode)) = txn.get_inode(path) {
-                        let dominated = is_file_only_on_view(&txn, inode, view_name);
-                        if dominated {
-                            let _ = txn.del_tree(path);
-                            let _ = txn.del_inode(inode);
-                            let _ = txn.del_directory(inode);
+                    if !preserve_tree_deletions {
+                        if let Ok(Some(inode)) = txn.get_inode(path) {
+                            let dominated = is_file_only_on_view(&txn, inode, view_name);
+                            if dominated {
+                                let _ = txn.del_tree(path);
+                                let _ = txn.del_inode(inode);
+                                let _ = txn.del_directory(inode);
+                            }
                         }
                     }
                 }
@@ -851,12 +856,14 @@ impl Repository {
             }
         }
 
-        for deleted_path in deleted_paths {
-            if let Ok(Some(inode)) = txn.get_inode(deleted_path) {
-                let dominated = is_file_only_on_view(&txn, inode, view_name);
-                if dominated {
-                    let _ = txn.del_tree(deleted_path);
-                    let _ = txn.del_inode(inode);
+        if !preserve_tree_deletions {
+            for deleted_path in deleted_paths {
+                if let Ok(Some(inode)) = txn.get_inode(deleted_path) {
+                    let dominated = is_file_only_on_view(&txn, inode, view_name);
+                    if dominated {
+                        let _ = txn.del_tree(deleted_path);
+                        let _ = txn.del_inode(inode);
+                    }
                 }
             }
         }
@@ -2604,6 +2611,55 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Record missing Git SHA → Atomic change mappings in one transaction.
+    ///
+    /// Existing mappings are skipped. If every mapping is already indexed the
+    /// write transaction is dropped without committing, keeping incremental
+    /// no-op imports free of per-change database writes.
+    pub fn index_git_shas(&self, mappings: &[(String, Hash)]) -> Result<usize, RepositoryError> {
+        use atomic_core::pristine::{GitShaIndexMutTxnT, GitShaIndexTxnT};
+
+        if mappings.is_empty() {
+            return Ok(0);
+        }
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let mut inserted = 0;
+
+        for (git_sha, change_hash) in mappings {
+            if txn
+                .has_git_sha(git_sha)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                continue;
+            }
+
+            let entity_id = txn
+                .get_internal(change_hash)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| {
+                    RepositoryError::Database(format!(
+                        "Change hash not found in INTERNAL: {}",
+                        change_hash.to_base32()
+                    ))
+                })?;
+            txn.put_git_sha(git_sha, entity_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            inserted += 1;
+        }
+
+        if inserted == 0 {
+            return Ok(0);
+        }
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(inserted)
     }
 
     /// Check if a Git SHA has been indexed.

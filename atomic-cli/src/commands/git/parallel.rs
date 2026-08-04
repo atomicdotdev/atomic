@@ -203,6 +203,13 @@ pub struct ParallelImportOptions {
     /// duplicate file content are omitted, which significantly reduces change
     /// size and import time for large repositories.
     pub graph_only: bool,
+    /// Keep a foreign Atomic view's working copy untouched while importing.
+    ///
+    /// When an agent draft is current, the files on disk describe that draft,
+    /// not the Git branch view being updated. In that mode the importer must
+    /// not reconcile target tracking or target-driven FILE_INDEX deletions
+    /// against the draft working copy.
+    pub preserve_working_copy: bool,
 }
 
 impl Default for ParallelImportOptions {
@@ -214,6 +221,7 @@ impl Default for ParallelImportOptions {
             ignored_path_patterns: Vec::new(),
             mainline_only: true,
             graph_only: false,
+            preserve_working_copy: false,
         }
     }
 }
@@ -2268,6 +2276,22 @@ impl ParallelImporter {
             }
         }
 
+        if self.options.preserve_working_copy {
+            // FILE_INDEX describes the physical working copy, even while this
+            // handle imports into another view. Drop stale cache entries for
+            // draft-deleted files without removing their global TREE entries;
+            // a later view switch must still be able to materialize them from
+            // the target graph.
+            let repo_root = repo.root().to_path_buf();
+            for file in repo.list_tracked_files().unwrap_or_default() {
+                if !repo_root.join(&file.path).exists() {
+                    let _ = repo.del_file_index(&file.path.to_string_lossy());
+                }
+            }
+            self.phase3_finalize(&stats)?;
+            return Ok(stats);
+        }
+
         // Phase 3: Reconciliation — remove TREE entries for files that
         // don't exist on disk.
         //
@@ -2356,7 +2380,6 @@ impl ParallelImporter {
                 reconcile_start.elapsed().as_secs_f64()
             ));
         }
-
         // Phase 4: Finalization (verification)
         self.phase3_finalize(&stats)?;
 
@@ -2526,23 +2549,19 @@ impl ParallelImporter {
                 batch_start = Instant::now();
             }
 
-            // Write the change
-            match self.write_commit(repo, parsed, line_index) {
-                Ok(info) => {
-                    if parsed.is_empty {
-                        stats.empty_commits += 1;
-                    } else if parsed.is_merge {
-                        stats.merge_commits += 1;
-                    } else {
-                        stats.changes_written += 1;
-                    }
-                    stats.files_processed += parsed.files.len();
-                    imported_commits.push(info);
-                }
-                Err(e) => {
-                    print_warning(&format!("Failed to write {}: {}", parsed.short_sha, e));
-                }
+            // Fail closed on a partial import. Earlier successfully written
+            // commits remain indexed, so an incremental retry resumes from
+            // them instead of publishing a silent hole in the Git history.
+            let info = self.write_commit(repo, parsed, line_index)?;
+            if parsed.is_empty {
+                stats.empty_commits += 1;
+            } else if parsed.is_merge {
+                stats.merge_commits += 1;
+            } else {
+                stats.changes_written += 1;
             }
+            stats.files_processed += parsed.files.len();
+            imported_commits.push(info);
         }
 
         // Populate the file index for all files written during this batch.
@@ -2663,9 +2682,18 @@ impl ParallelImporter {
                 },
             );
             let write_start = Instant::now();
+            // TREE is global across views. During background import, deletion
+            // cleanup for the target must not remove a path still owned by the
+            // active draft; the graph deletion itself remains authoritative
+            // for the target view.
+            let tree_cleanup_paths = if self.options.preserve_working_copy {
+                &[][..]
+            } else {
+                graph_deleted_paths.as_slice()
+            };
             let write_result = repo.write_import_graph_change(
                 graph_change,
-                &graph_deleted_paths,
+                tree_cleanup_paths,
                 Default::default(),
             );
             let write_ms = write_start.elapsed().as_millis();
@@ -2716,7 +2744,7 @@ impl ParallelImporter {
             ));
             // Index git SHA → Atomic change in GIT_SHA_INDEX
             let _ = repo.index_git_sha(&parsed.git_sha, &write_outcome.hash);
-            if !graph_deleted_paths.is_empty() {
+            if !self.options.preserve_working_copy && !graph_deleted_paths.is_empty() {
                 let del_refs: Vec<&str> = graph_deleted_paths.iter().map(|s| s.as_str()).collect();
                 let _ = repo.del_file_index_batch(&del_refs);
             }
@@ -3118,6 +3146,7 @@ impl ParallelImporter {
                 &recorded_files,
                 metadata,
                 &deleted_paths,
+                self.options.preserve_working_copy,
                 Default::default(),
             )
             .map_err(|e| CliError::Internal(e.into()))?;
@@ -3154,7 +3183,7 @@ impl ParallelImporter {
         // `atomic status` after import matches the git working copy.
         // Also remove from FILE_INDEX so status doesn't show them as deleted.
         // Batch-remove deleted files from TREE and FILE_INDEX in single write txns.
-        if !deleted_paths.is_empty() {
+        if !self.options.preserve_working_copy && !deleted_paths.is_empty() {
             let cleanup_start = Instant::now();
             let del_refs: Vec<&str> = deleted_paths.iter().map(|s| s.as_str()).collect();
             let _ = repo.del_file_index_batch(&del_refs);
@@ -3214,7 +3243,14 @@ impl ParallelImporter {
         let commit_start = Instant::now();
         let metadata = self.build_git_metadata(parsed, true, false);
         let write_outcome = repo
-            .write_import_recorded(header, &[], metadata, &[], Default::default())
+            .write_import_recorded(
+                header,
+                &[],
+                metadata,
+                &[],
+                self.options.preserve_working_copy,
+                Default::default(),
+            )
             .map_err(|e| CliError::Internal(e.into()))?;
         // Index git SHA → Atomic change in GIT_SHA_INDEX
         let _ = repo.index_git_sha(&parsed.git_sha, &write_outcome.hash);
@@ -3386,10 +3422,12 @@ impl ParallelImporter {
         let actual = stats.changes_written + stats.empty_commits + stats.merge_commits;
 
         if actual != expected {
-            print_warning(&format!(
-                "Verification: {} commits parsed but {} changes created",
-                expected, actual
-            ));
+            return Err(CliError::GitError {
+                message: format!(
+                    "Import verification failed: {} commits parsed but {} changes created",
+                    expected, actual
+                ),
+            });
         }
 
         Ok(())
@@ -4086,6 +4124,23 @@ mod tests {
         let stats = ImportStats::default();
         assert_eq!(stats.commits_found, 0);
         assert_eq!(stats.changes_written, 0);
+    }
+
+    #[test]
+    fn test_finalize_rejects_partial_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_repo = GitRepository::init(dir.path()).unwrap();
+        let importer = ParallelImporter::new(&git_repo, ParallelImportOptions::default());
+        let stats = ImportStats {
+            commits_parsed: 2,
+            changes_written: 1,
+            ..ImportStats::default()
+        };
+
+        assert!(matches!(
+            importer.phase3_finalize(&stats),
+            Err(CliError::GitError { .. })
+        ));
     }
 
     #[test]

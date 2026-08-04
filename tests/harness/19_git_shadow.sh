@@ -307,6 +307,97 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════════════════
+# Section 8b: Incremental import while an inherited draft is current
+# ════════════════════════════════════════════════════════════════════════
+
+begin_section "Incremental import: preserves an active draft"
+
+make_temp_repo "idempotent-active-draft"
+init_git_repo
+git_commit "First" "a.txt" "alpha"
+git_commit "Second" "b.txt" "beta"
+git_commit "Shared draft baseline" "shared.txt" "parent shared"
+PRIMARY_BRANCH=$(git_default_branch)
+
+assert_success "initial import for draft regression" atomic git import --no-vault
+PRIMARY_COUNT_BEFORE=$(atomic log --view "$PRIMARY_BRANCH" 2>/dev/null | grep -c '^#' || true)
+
+# Draft logs hide inherited parent changes by default. Incremental import must
+# still deduplicate against the explicit target view, and it must not leave the
+# user's current draft merely because Git's branch was checked for new commits.
+assert_success "create and switch to inherited draft" \
+    atomic view create agent-draft --draft --parent "$PRIMARY_BRANCH" --switch
+assert_success "incremental no-op while draft is current" \
+    atomic git import --incremental --branch "$PRIMARY_BRANCH" --no-vault
+
+PRIMARY_COUNT_AFTER=$(atomic log --view "$PRIMARY_BRANCH" 2>/dev/null | grep -c '^#' || true)
+if [ "$PRIMARY_COUNT_AFTER" -eq "$PRIMARY_COUNT_BEFORE" ]; then
+    _pass "active draft no-op: target count unchanged ($PRIMARY_COUNT_AFTER)"
+else
+    _fail "active draft no-op duplicated target history" \
+        "expected $PRIMARY_COUNT_BEFORE, got $PRIMARY_COUNT_AFTER"
+fi
+
+CURRENT_ATOMIC_VIEW=$(tr -d '[:space:]' < .atomic/current_view)
+if [ "$CURRENT_ATOMIC_VIEW" = "agent-draft" ]; then
+    _pass "incremental import preserves current draft"
+else
+    _fail "incremental import preserves current draft" \
+        "expected agent-draft, got $CURRENT_ATOMIC_VIEW"
+fi
+
+# A real incremental sync can arrive while the draft has diverged from its
+# parent. The import target must not be reconciled against that foreign working
+# copy: doing so would remove b.txt from the primary TREE just because the
+# draft currently has an unrecorded deletion.
+printf '%s' "draft alpha" > a.txt
+printf '%s' "draft shared" > shared.txt
+assert_success "record divergent draft modification" \
+    atomic record --all -m "Draft modifies an inherited file"
+rm b.txt
+
+printf '%s' "gamma" > c.txt
+git add c.txt
+git rm --cached --quiet --force shared.txt
+git commit --quiet -m "Third: add c and delete shared path"
+assert_success "incremental new commit while draft is current" \
+    atomic git import --incremental --branch "$PRIMARY_BRANCH" --no-vault
+
+PRIMARY_COUNT_WITH_NEW_COMMIT=$(atomic log --view "$PRIMARY_BRANCH" 2>/dev/null | grep -c '^#' || true)
+EXPECTED_PRIMARY_COUNT=$((PRIMARY_COUNT_BEFORE + 1))
+if [ "$PRIMARY_COUNT_WITH_NEW_COMMIT" -eq "$EXPECTED_PRIMARY_COUNT" ]; then
+    _pass "active draft import adds exactly one target change"
+else
+    _fail "active draft import adds exactly one target change" \
+        "expected $EXPECTED_PRIMARY_COUNT, got $PRIMARY_COUNT_WITH_NEW_COMMIT"
+fi
+
+CURRENT_ATOMIC_VIEW=$(tr -d '[:space:]' < .atomic/current_view)
+if [ "$CURRENT_ATOMIC_VIEW" = "agent-draft" ]; then
+    _pass "new-commit import preserves current draft"
+else
+    _fail "new-commit import preserves current draft" \
+        "expected agent-draft, got $CURRENT_ATOMIC_VIEW"
+fi
+assert_file_content "draft modification remains materialized" "a.txt" "draft alpha"
+assert_file_not_exists "draft deletion remains materialized" "b.txt"
+assert_file_content "draft-owned target deletion remains materialized" \
+    "shared.txt" "draft shared"
+DRAFT_STATUS=$(atomic status --short 2>/dev/null || true)
+if echo "$DRAFT_STATUS" | grep -qE '^\?+ +shared\.txt$'; then
+    _fail "target deletion keeps draft path tracked" "$DRAFT_STATUS"
+else
+    _pass "target deletion keeps draft path tracked"
+fi
+
+assert_success "force switch to imported primary after draft sync" \
+    atomic view switch --force "$PRIMARY_BRANCH"
+assert_file_content "primary modification is not taken from draft" "a.txt" "alpha"
+assert_output_contains "primary graph retains the draft-deleted path" "D  b.txt" \
+    atomic status --short
+assert_file_content "primary receives the new Git commit" "c.txt" "gamma"
+
+# ════════════════════════════════════════════════════════════════════════
 # Section 9: Git-owned materialization after importing all local branches
 # ════════════════════════════════════════════════════════════════════════
 

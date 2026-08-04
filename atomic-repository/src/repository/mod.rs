@@ -665,7 +665,9 @@ default = "{}"
     /// Set the current view on this handle only.
     ///
     /// This does not validate the view or persist `.atomic/current_view`. It is
-    /// intended for read-only handles that need `status()` to read another view.
+    /// intended for scoped handles that must read or write another validated
+    /// view without publishing a process-global working-copy switch (for
+    /// example agent recording or background Git import).
     #[inline]
     pub fn set_current_view_in_memory(&mut self, view: &str) {
         self.current_view = view.to_string();
