@@ -32,7 +32,7 @@ use crate::output::{print_info, print_success, print_warning};
 /// # Commit without pushing to remote
 /// atomic git push --no-push
 /// ```
-#[derive(Debug, Args)]
+#[derive(Debug, clap::Parser)]
 pub struct Push {
     /// Custom commit message. If not provided, synthesizes from
     /// Atomic change messages.
@@ -46,6 +46,13 @@ pub struct Push {
     /// Remote name to push to.
     #[arg(long, default_value = "origin")]
     pub remote: String,
+
+    /// Target branch to push to on the remote. Defaults to the current
+    /// branch. The commit is still created on the current branch; this
+    /// only changes the remote destination (useful for pushing the
+    /// current view's state to a PR branch).
+    #[arg(long, short = 'b', value_name = "BRANCH")]
+    pub branch: Option<String>,
 }
 
 impl Default for Push {
@@ -54,6 +61,7 @@ impl Default for Push {
             message: None,
             no_push: false,
             remote: "origin".to_string(),
+            branch: None,
         }
     }
 }
@@ -146,26 +154,40 @@ impl Command for Push {
                     .ok()
                     .and_then(|h| h.shorthand().map(str::to_owned))
                     .unwrap_or_else(|| "HEAD".to_string());
+                let target = self.branch.as_deref().unwrap_or(&branch_name);
                 let ahead = self.unpushed_commit_count(&git_repo, &branch_name);
-                if ahead == 0 {
+                if ahead == 0 && self.branch.is_none() {
                     print_info("Working copy matches Git HEAD. Nothing to commit.");
                     return Ok(());
                 }
                 if self.no_push {
+                    if ahead > 0 {
+                        print_info(&format!(
+                            "Nothing to commit, but {} unpushed commit{} (--no-push set).",
+                            ahead,
+                            if ahead == 1 { "" } else { "s" }
+                        ));
+                    } else {
+                        print_info("Nothing to commit (--no-push set).");
+                    }
+                    return Ok(());
+                }
+                if ahead > 0 {
                     print_info(&format!(
-                        "Nothing to commit, but {} unpushed commit{} (--no-push set).",
+                        "Nothing to commit, but {} unpushed commit{}. Pushing...",
                         ahead,
                         if ahead == 1 { "" } else { "s" }
                     ));
-                    return Ok(());
+                } else {
+                    // Explicit --branch with nothing new: push the current
+                    // state to the target (may create the remote branch).
+                    print_info(&format!(
+                        "Nothing to commit. Pushing current state to {}/{}...",
+                        self.remote, target
+                    ));
                 }
-                print_info(&format!(
-                    "Nothing to commit, but {} unpushed commit{}. Pushing...",
-                    ahead,
-                    if ahead == 1 { "" } else { "s" }
-                ));
                 self.push_to_remote(&git_repo)?;
-                print_success(&format!("Pushed to {}/{}", self.remote, branch_name));
+                print_success(&format!("Pushed to {}/{}", self.remote, target));
                 return Ok(());
             }
         }
@@ -214,7 +236,8 @@ impl Command for Push {
         if !self.no_push {
             match self.push_to_remote(&git_repo) {
                 Ok(()) => {
-                    print_success(&format!("Pushed to {}/{}", self.remote, current_view));
+                    let target = self.target_branch(&git_repo);
+                    print_success(&format!("Pushed to {}/{}", self.remote, target));
                 }
                 Err(e) => {
                     // Keep the local commit, but report the failed push.
@@ -322,18 +345,39 @@ impl Push {
         None
     }
 
-    /// Count commits on `branch_name` that haven't been pushed to its
-    /// upstream. Returns 0 when the branch has no configured upstream.
+    /// The git branch the push will land on: `--branch` if given, else
+    /// the currently checked-out branch.
+    fn target_branch(&self, git_repo: &GitRepository) -> String {
+        if let Some(ref branch) = self.branch {
+            return branch.clone();
+        }
+        git_repo
+            .head()
+            .ok()
+            .and_then(|h| h.shorthand().map(str::to_owned))
+            .unwrap_or_else(|| "HEAD".to_string())
+    }
+
+    /// Count commits on `branch_name` that haven't been pushed to the push
+    /// target. The comparison point is the branch's configured upstream,
+    /// or `refs/remotes/<remote>/<branch>` when `--branch` overrides the
+    /// target. Returns 0 when there is no remote ref to compare against.
     fn unpushed_commit_count(&self, git_repo: &GitRepository, branch_name: &str) -> usize {
         let local_ref = format!("refs/heads/{}", branch_name);
 
-        // branch_upstream_name returns the full upstream refname
-        // (e.g. "refs/remotes/origin/main"), which resolves directly.
-        let upstream_oid = git_repo
-            .branch_upstream_name(&local_ref)
-            .ok()
-            .and_then(|buf| buf.as_str().map(str::to_owned))
-            .and_then(|name| git_repo.refname_to_id(&name).ok());
+        let upstream_oid = match &self.branch {
+            // Explicit target: compare against the remote-tracking ref.
+            Some(target) => git_repo
+                .refname_to_id(&format!("refs/remotes/{}/{}", self.remote, target))
+                .ok(),
+            // branch_upstream_name returns the full upstream refname
+            // (e.g. "refs/remotes/origin/main"), which resolves directly.
+            None => git_repo
+                .branch_upstream_name(&local_ref)
+                .ok()
+                .and_then(|buf| buf.as_str().map(str::to_owned))
+                .and_then(|name| git_repo.refname_to_id(&name).ok()),
+        };
 
         let local_oid = git_repo.refname_to_id(&local_ref).ok();
 
@@ -361,8 +405,9 @@ impl Push {
         let head = git_repo.head().map_err(|e| CliError::GitError {
             message: format!("Failed to get HEAD: {}", e),
         })?;
-        let branch_name = head.shorthand().unwrap_or("HEAD");
-        let refspec = format!("refs/heads/{0}:refs/heads/{0}", branch_name);
+        let current = head.shorthand().unwrap_or("HEAD");
+        let target = self.branch.as_deref().unwrap_or(current);
+        let refspec = format!("HEAD:refs/heads/{}", target);
 
         let workdir = git_repo.workdir().ok_or_else(|| CliError::GitError {
             message: "Git repository has no working directory (bare repository?)".to_string(),
@@ -406,6 +451,7 @@ fn parse_trailer(message: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn test_push_default() {
@@ -421,10 +467,28 @@ mod tests {
             message: Some("custom message".to_string()),
             no_push: true,
             remote: "upstream".to_string(),
+            branch: Some("pr-branch".to_string()),
         };
         assert_eq!(push.message.as_deref(), Some("custom message"));
         assert!(push.no_push);
         assert_eq!(push.remote, "upstream");
+        assert_eq!(push.branch.as_deref(), Some("pr-branch"));
+    }
+
+    #[test]
+    fn test_push_branch_flag() {
+        let push = Push::try_parse_from(["push", "--branch", "pr-42"])
+            .map_err(|e| e.to_string())
+            .unwrap();
+        assert_eq!(push.branch.as_deref(), Some("pr-42"));
+
+        let push = Push::try_parse_from(["push", "-b", "pr-42"])
+            .map_err(|e| e.to_string())
+            .unwrap();
+        assert_eq!(push.branch.as_deref(), Some("pr-42"));
+
+        let push = Push::try_parse_from(["push"]).map_err(|e| e.to_string()).unwrap();
+        assert!(push.branch.is_none());
     }
 
     #[test]
@@ -512,5 +576,44 @@ mod tests {
         repo.commit(Some("HEAD"), &sig, &sig, "work", &tree, &[&parent])
             .unwrap();
         assert_eq!(push.unpushed_commit_count(&repo, "main"), 1);
+
+        // With --branch pointing at a remote branch that has nothing, the
+        // same local state counts differently: refs/remotes/origin/feature
+        // doesn't exist → 0; after creating it at the first commit → 1.
+        let push_feature = Push {
+            branch: Some("feature".to_string()),
+            ..Push::default()
+        };
+        assert_eq!(push_feature.unpushed_commit_count(&repo, "main"), 0);
+        repo.reference("refs/remotes/origin/feature", first, true, "remote")
+            .unwrap();
+        assert_eq!(push_feature.unpushed_commit_count(&repo, "main"), 1);
+    }
+
+    #[test]
+    fn test_target_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_opts(
+            dir.path(),
+            git2::RepositoryInitOptions::new()
+                .initial_head("main")
+                .mkdir(false),
+        )
+        .unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_oid = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+
+        // Default: the checked-out branch.
+        assert_eq!(Push::default().target_branch(&repo), "main");
+
+        // --branch wins.
+        let push = Push {
+            branch: Some("pr-42".to_string()),
+            ..Push::default()
+        };
+        assert_eq!(push.target_branch(&repo), "pr-42");
     }
 }
