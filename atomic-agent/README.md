@@ -56,7 +56,7 @@ When you run `atomic agent enable`, hooks are installed in the agent's configura
 | **Session Start** | Session created, tracking message returned to agent |
 | **User Prompt Submit** | Turn timer started, prompt captured |
 | **Agent Stop** | `status → add untracked → record all` — change created with provenance |
-| **Session End** | Flush pending work, write the session attestation, mark the session ended, and restore the user's parent view |
+| **Session End** | Flush pending work, write the session attestation, mark the session ended, and leave the working copy on the agent view for review |
 | **Tool Use** | Tool invocations logged (sub-turn recording planned) |
 
 The recording workflow on each turn end:

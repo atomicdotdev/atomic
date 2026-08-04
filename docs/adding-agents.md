@@ -220,7 +220,7 @@ hard hook deadline, as Codex does for `SessionEnd`.
 | `PreToolUse` | `before-tool`, `pre-tool` | before a tool runs | Bookkeeping only (no output yet) |
 | `PostToolUse` | `after-tool`, `post-tool` | after a tool runs | Appends a classified node (`Exploration` / `Commitment` / `Verification` / `Execution` / `Error`) plus inferred causal edges to the session's **decision graph** |
 | `TurnEnd` | `stop`, `after-agent`, `turn-end` | agent finishes a turn | **Records a change** on the draft view with full AI provenance embedded |
-| `SessionEnd` | `session-end` | agent session closes | Flushes any unrecorded work, writes the **AI attestation**, restores the parent view |
+| `SessionEnd` | `session-end` | agent session closes | Flushes any unrecorded work, writes the **AI attestation**; the working copy stays on the session's view so the user lands where the work happened |
 
 **The golden rule of responsibility:** the agent side (plugin or hook command)
 only does two things — fire the event at the right moment, and attach a JSON
@@ -263,7 +263,8 @@ echo '{"session_id":"my-sess-1","prompt":"add retry logic",
 ```
 
 Add `user-prompt` (captures the prompt/Goal), `before-tool`/`after-tool`
-(builds the decision graph), and `session-end` (attestation + view restore) as
+(builds the decision graph), and `session-end` (attestation + keep the agent
+view active for review) as
 your agent is able to signal them. Every field beyond `session_id` is optional
 and simply enriches the recorded provenance.
 

@@ -8,8 +8,8 @@
 //!
 //! Kilo Code hooks are configured through kilo.jsonc or agent definitions.
 //! Each hook uses a shell command that invokes the Atomic CLI.
-//! The `atomic-kilo` npm package provides the shell scripts that bridge
-//! Kilo's hook triggers to `atomic agent hooks kilo <verb>`.
+//! The `atomic-kilo` package provides the shell scripts that bridge Kilo's
+//! hook triggers to `atomic agent hooks kilo <verb>`.
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────────────┐
@@ -46,9 +46,9 @@
 //!
 //! # Installation
 //!
-//! Kilo hook configuration is managed through `kilo.jsonc` and the
-//! `atomic-kilo` npm package. This adapter only parses hook events —
-//! `install()` and `uninstall()` are no-ops.
+//! Kilo hook configuration is managed through `kilo.jsonc` and installed by
+//! the `atomic-kilo` package via the integrations engine. This adapter only
+//! parses hook events — `install()` and `uninstall()` are no-ops.
 //!
 //! # Detection
 //!
@@ -151,7 +151,8 @@ struct ToolUseInput {
 /// Kilo Code agent hook adapter.
 ///
 /// Parses hook JSON from Kilo Code's shell command hooks. Hook configuration
-/// is managed through `kilo.jsonc` and the `atomic-kilo` npm package.
+/// is managed through `kilo.jsonc` and the `atomic-kilo` package via the
+/// integrations engine.
 #[derive(Debug)]
 pub struct KiloHook {
     _private: (),
@@ -335,15 +336,17 @@ impl AgentHook for KiloHook {
     }
 
     fn install(&self, _repo_root: &Path) -> AgentResult<usize> {
-        Ok(0) // Installation handled by atomic-kilo package
+        // Installation is owned by the integrations engine (the atomic-kilo
+        // package on Atomic storage); this adapter installs nothing.
+        Ok(0)
     }
 
     fn uninstall(&self, _repo_root: &Path) -> AgentResult<()> {
-        Ok(()) // Uninstallation handled by atomic-kilo package
+        Ok(()) // Uninstallation is receipt-driven via the integrations engine.
     }
 
     fn is_installed(&self, _repo_root: &Path) -> bool {
-        false // Managed by atomic-kilo npm package
+        false // Managed by the integrations engine (atomic-kilo package)
     }
 
     fn supported_hooks(&self) -> Vec<HookType> {

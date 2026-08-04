@@ -54,6 +54,10 @@ pub struct MemoryList {
     #[arg(long)]
     pub identity: Option<String>,
 
+    /// Maximum number of memories to show (most recent first). Shows all when omitted.
+    #[arg(short = 'n', long)]
+    pub limit: Option<usize>,
+
     /// Output as JSON (an array of {id,kind,status,about,attested,verifies}).
     #[arg(long)]
     pub json: bool,
@@ -274,21 +278,25 @@ impl Command for MemoryList {
         let entries = repo
             .vault_list("memory/", None)
             .map_err(CliError::Repository)?;
-        let mut ids: Vec<String> = entries
+        let mut items: Vec<(String, String)> = entries
             .iter()
             .filter(|e| !e.path.starts_with("attestations/"))
             // The default `memory/MEMORY.md` index scaffold is NOT a canonical
             // memory (no `uid`/`memoryKind`; its frontmatter is `type:index`).
             // Skip it so the attestation-aware list only shows real memories.
             .filter(|e| !is_index_scaffold(&repo, &e.path))
-            .map(|e| bridge::memory_id(&e.path))
+            .map(|e| (bridge::memory_id(&e.path), e.updated_at.clone()))
             .collect();
-        // vault_list is prefix-scan order, not sorted: sort by id for stability.
-        ids.sort();
+        // Most-recent first (`updated_at` is RFC 3339, so lexical == chronological);
+        // id as a stable tiebreaker.
+        items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        if let Some(limit) = self.limit {
+            items.truncate(limit);
+        }
 
-        let rows: Vec<Row> = ids
+        let rows: Vec<Row> = items
             .iter()
-            .map(|id| compute_row(&repo, id, verifier.as_ref()))
+            .map(|(id, _)| compute_row(&repo, id, verifier.as_ref()))
             .collect();
 
         if self.json {

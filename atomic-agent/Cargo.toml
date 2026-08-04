@@ -53,6 +53,9 @@ fs2 = "0.4"
 # Home directory resolution (for ~/.atomic/identities/)
 dirs = { workspace = true }
 
+# Read-only access to OpenCode's session store (transcript recovery)
+rusqlite = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 serial_test = { workspace = true }

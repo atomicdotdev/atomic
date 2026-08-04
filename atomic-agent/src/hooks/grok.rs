@@ -1,9 +1,9 @@
 //! Grok Build hook adapter for Atomic Agent.
 //!
 //! Grok fires Claude-compatible lifecycle hooks with a camelCase JSON
-//! envelope on stdin. Installation is handled by the standalone
-//! `atomic-grok` package (hooks file + skills + rules); this adapter only
-//! parses events from the installed hooks.
+//! envelope on stdin. Installation is handled by the `atomic-grok` package
+//! via the integrations engine (hooks file + skills + rules); this adapter
+//! only parses events from the installed hooks.
 //!
 //! # Hook Events
 //!

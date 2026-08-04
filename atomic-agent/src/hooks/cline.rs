@@ -178,8 +178,9 @@ struct ClineInput {
 /// Cline hook adapter.
 ///
 /// Cline uses executable script files for hooks rather than a JSON config file.
-/// Installation and uninstallation are managed by the `atomic-cline` sub-project,
-/// so the Rust adapter only handles JSON parsing from stdin and presence detection.
+/// Installation and uninstallation are managed by the `atomic-cline` package
+/// via the integrations engine, so the Rust adapter only handles JSON parsing
+/// from stdin and presence detection.
 ///
 /// # Differences from Other Adapters
 ///
@@ -418,15 +419,17 @@ impl AgentHook for ClineHook {
     }
 
     fn install(&self, _repo_root: &Path) -> AgentResult<usize> {
-        Ok(0) // Installation handled by atomic-cline project
+        // Installation is owned by the integrations engine (the atomic-cline
+        // package on Atomic storage); this adapter installs nothing.
+        Ok(0)
     }
 
     fn uninstall(&self, _repo_root: &Path) -> AgentResult<()> {
-        Ok(()) // Uninstallation handled by atomic-cline project
+        Ok(()) // Uninstallation is receipt-driven via the integrations engine.
     }
 
     fn is_installed(&self, _repo_root: &Path) -> bool {
-        false // Managed by atomic-cline project
+        false // Managed by the integrations engine (atomic-cline package)
     }
 
     fn supported_hooks(&self) -> Vec<HookType> {
@@ -982,7 +985,7 @@ mod tests {
         assert!(!hook.detect_presence(tmp.path()));
     }
 
-    // ── Installation is a no-op (managed by atomic-cline project) ───
+    // ── Installation is a no-op (owned by the integrations engine) ──
 
     #[test]
     fn test_install_is_noop() {

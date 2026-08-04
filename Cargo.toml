@@ -58,6 +58,9 @@ zstd = "0.13"
 
 # Database
 redb = "2.1"
+# Read-only access to OpenCode's session store (transcript recovery);
+# bundled so no system SQLite is required.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
@@ -79,6 +82,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # IDs
 uuid = { version = "1.0", features = ["serde", "v4"] }
+ulid = "1"
 
 # Utilities
 thiserror = "1.0"

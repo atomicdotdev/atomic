@@ -411,15 +411,17 @@ impl AgentHook for CopilotHook {
     }
 
     fn install(&self, _repo_root: &Path) -> AgentResult<usize> {
-        Ok(0) // Installation handled by atomic-copilot package
+        // Installation is owned by the integrations engine (the atomic-copilot
+        // package on Atomic storage); this adapter installs nothing.
+        Ok(0)
     }
 
     fn uninstall(&self, _repo_root: &Path) -> AgentResult<()> {
-        Ok(()) // Uninstallation handled by atomic-copilot package
+        Ok(()) // Uninstallation is receipt-driven via the integrations engine.
     }
 
     fn is_installed(&self, _repo_root: &Path) -> bool {
-        false // Managed by atomic-copilot package
+        false // Managed by the integrations engine (atomic-copilot package)
     }
 
     fn supported_hooks(&self) -> Vec<HookType> {
@@ -829,7 +831,7 @@ mod tests {
         assert!(!hook.detect_presence(tmp.path()));
     }
 
-    // ── Installation is a no-op (managed by atomic-copilot package) ──
+    // ── Installation is a no-op (owned by the integrations engine) ──
 
     #[test]
     fn test_install_is_noop() {

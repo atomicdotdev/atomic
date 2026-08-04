@@ -544,10 +544,118 @@ impl TreeTxnT for ReadTxn {
 // Session data queries
 
 impl ReadTxn {
+    /// Read the indexed metadata for an external session ID.
+    pub fn get_session_record(
+        &self,
+        session_id: &str,
+    ) -> PristineResult<Option<crate::change::session::SessionRecord>> {
+        use crate::change::session::SessionRecord;
+
+        let table = self.txn.open_table(SESSIONS)?;
+        match table.get(session_id)? {
+            Some(value) => SessionRecord::from_bytes(value.value())
+                .map(Some)
+                .map_err(|e| PristineError::Serialization {
+                    message: format!("session record decode: {}", e),
+                }),
+            None => Ok(None),
+        }
+    }
+
+    /// Read every indexed session record. Ordering is left to callers because
+    /// recency depends on turn timestamps, not the session-id table key.
+    pub fn list_session_records(
+        &self,
+    ) -> PristineResult<Vec<crate::change::session::SessionRecord>> {
+        use crate::change::session::SessionRecord;
+
+        let table = self.txn.open_table(SESSIONS)?;
+        let mut records = Vec::new();
+        for result in table.iter()? {
+            let (_key, value) = result?;
+            let record = SessionRecord::from_bytes(value.value()).map_err(|e| {
+                PristineError::Serialization {
+                    message: format!("session record decode: {}", e),
+                }
+            })?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    /// Read all indexed turns for an external session ID in turn order.
+    pub fn get_session_turns(
+        &self,
+        session_id: &str,
+    ) -> PristineResult<Vec<crate::change::session::SessionTurn>> {
+        use crate::change::session::{session_turn_namespace, SessionTurn};
+
+        let table = self.txn.open_table(SESSION_TURNS)?;
+        let namespace = session_turn_namespace(session_id);
+        let start = crate::change::session::encode_session_turn_key(namespace, 0);
+        let end = crate::change::session::encode_session_turn_key(namespace, u32::MAX);
+        let mut turns = Vec::new();
+
+        for result in table.range::<&[u8; 40]>(&start..=&end)? {
+            let (_key, value) = result?;
+            let turn = SessionTurn::from_bytes(value.value()).map_err(|e| {
+                PristineError::Serialization {
+                    message: format!("session turn decode: {}", e),
+                }
+            })?;
+            if turn.session_id == session_id {
+                turns.push(turn);
+            }
+        }
+
+        turns.sort_by_key(|turn| turn.turn_number);
+        Ok(turns)
+    }
+
+    /// Load an immutable session manifest by content hash.
+    pub fn get_session_manifest(
+        &self,
+        hash: &crate::types::Hash,
+    ) -> PristineResult<Option<crate::change::session::SessionManifest>> {
+        use crate::change::session::SessionManifest;
+
+        let table = self.txn.open_table(SESSION_MANIFESTS)?;
+        match table.get(hash.as_bytes())? {
+            Some(value) => SessionManifest::from_bytes(value.value())
+                .map(Some)
+                .map_err(|e| PristineError::Serialization {
+                    message: format!("session manifest decode: {}", e),
+                }),
+            None => Ok(None),
+        }
+    }
+
+    /// Resolve the latest manifest hash for an external session ID.
+    pub fn get_session_head(&self, session_id: &str) -> PristineResult<Option<crate::types::Hash>> {
+        let table = self.txn.open_table(SESSION_HEADS)?;
+        Ok(table
+            .get(session_id)?
+            .map(|value| crate::types::Hash::from_bytes(*value.value())))
+    }
+
+    /// Read every mutable session head for index rebuilds.
+    pub fn list_session_heads(&self) -> PristineResult<Vec<(String, crate::types::Hash)>> {
+        let table = self.txn.open_table(SESSION_HEADS)?;
+        let mut heads = Vec::new();
+        for result in table.iter()? {
+            let (session_id, hash) = result?;
+            heads.push((
+                session_id.value().to_string(),
+                crate::types::Hash::from_bytes(*hash.value()),
+            ));
+        }
+        Ok(heads)
+    }
+
     /// Get all session events for a provenance graph.
     ///
-    /// Returns events in sequence order. Empty if the provenance is not Sherpa
-    /// or has no session data.
+    /// Returns events in sequence order (one per provenance node, for any
+    /// agent). Empty only if the provenance has no nodes / no session data.
     pub fn get_session_events(
         &self,
         provenance_id: u64,
@@ -579,8 +687,8 @@ impl ReadTxn {
 
     /// Get all todos for a provenance graph.
     ///
-    /// Returns snapshots of all todo items from the turn.
-    /// Empty if the provenance is not Sherpa or has no session data.
+    /// Returns snapshots of all todo items from the turn, for any agent.
+    /// Empty if the provenance recorded no todos / no session data.
     pub fn get_session_todos(
         &self,
         provenance_id: u64,
@@ -609,8 +717,9 @@ impl ReadTxn {
 
     /// Get phase timing breakdown for a provenance graph.
     ///
-    /// Returns timing data for each phase in the turn.
-    /// Empty if the provenance is not Sherpa or has no session data.
+    /// Returns timing data for each phase in the turn. Populated from the
+    /// per-phase token breakdown that Sherpa graphs carry; empty for agents
+    /// that do not emit phase timing.
     pub fn get_session_phases(
         &self,
         provenance_id: u64,
@@ -639,7 +748,9 @@ impl ReadTxn {
 
     /// Get intent metadata for a provenance graph.
     ///
-    /// Returns the intent entry if this is a Sherpa provenance, `None` otherwise.
+    /// Returns the intent entry when the graph carries a Goal node with intent
+    /// `detail` (Sherpa graphs always do; other agents when available),
+    /// `None` otherwise.
     pub fn get_session_intent(
         &self,
         provenance_id: u64,

@@ -87,6 +87,13 @@ fn render_cli(node: &CanonicalNode) -> String {
         for t in &node.has_task {
             let mark = if t.task_status == "done" { "x" } else { " " };
             s.push_str(&format!("  [{mark}] {}\n", t.text));
+            if !t.satisfies.is_empty() {
+                // `as_slice` so a legacy scalar renders identically to a list.
+                s.push_str(&format!(
+                    "        satisfies: {}\n",
+                    t.satisfies.as_slice().join(", ")
+                ));
+            }
             if !t.touches_file.is_empty() {
                 s.push_str(&format!("        touches: {}\n", t.touches_file.join(", ")));
             }

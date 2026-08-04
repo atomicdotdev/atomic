@@ -1,18 +1,16 @@
 //! `atomic memory` — the canonical "record the why" engine surface for MEMORIES.
 //!
-//! This is a NEW top-level command, a sibling of the raw `atomic vault memory`
-//! tree ([`crate::commands::vault::memory`]): that tree manages the raw/legacy
-//! vault memory entries (the agent stdin `write` flow, plus `list`/`show`),
-//! while this one drives the `atomic-canonical` engine — lifting a stored
-//! memory into a canonical JSON-LD [`MemoryNode`](atomic_canonical::MemoryNode),
-//! gating it, attesting it, and rendering it. It is the memory analogue of the
-//! `atomic intent` family.
+//! This is the canonical top-level command, replacing the retired raw
+//! `atomic vault memory` subtree (now a removed-command shim). It drives the
+//! `atomic-canonical` engine — lifting a stored memory into a canonical JSON-LD
+//! [`MemoryNode`](atomic_canonical::MemoryNode), gating it, attesting it, and
+//! rendering it. It is the memory analogue of the `atomic intent` family.
 //!
 //! # Verbs
 //!
 //! ```text
 //! atomic memory new --kind <k>       Scaffold a directive/frontmatter memory
-//! atomic memory show <id>            Render a memory as a read-time projection
+//! atomic memory show <id>            Show a canonical or freeform memory
 //! atomic memory validate <id|path>   Gate a memory against the canonical shapes
 //! atomic memory attest <id>          Sign a memory into a tracked attestation
 //! atomic memory verify <id>          Verify a signed memory's attestation
@@ -36,126 +34,62 @@ use crate::error::CliResult;
 
 pub mod attest;
 pub mod bridge;
+pub mod kinds;
 pub mod list;
 pub mod new;
 pub mod show;
 pub mod validate;
 pub mod verify;
+pub mod write;
 
 pub use attest::MemoryAttest;
+pub use kinds::MemoryKinds;
 pub use list::MemoryList;
 pub use new::MemoryNew;
 pub use show::MemoryShow;
 pub use validate::MemoryValidate;
 pub use verify::MemoryVerify;
+pub use write::MemoryWrite;
 
 /// Subcommands for the canonical memory engine.
+///
+/// Doc comments here are the terse `--help` `about` lines (agent-native).
+/// Kinds, the new-vs-write distinction, `--derived-from` linking, and worked
+/// examples live in the docs site: <https://docs.atomic.dev/commands/memory>.
 #[derive(Subcommand, Debug)]
 pub enum MemoryCommands {
     /// Scaffold a new directive-based memory into the vault.
-    ///
-    /// Writes a `memory/<id>.md` entry with a frontmatter spine
-    /// (`uid`/`memoryKind`/`status`/`createdAt`/`about`) and a `:::memory`
-    /// container body so it round-trips cleanly through
-    /// lift → validate → attest.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// atomic memory new --kind constraint
-    /// atomic memory new --kind lesson --about urn:atomic:module:storage
-    /// ```
     New(MemoryNew),
 
-    /// Show a memory as a rendered read-time projection.
-    ///
-    /// Lifts the memory and renders it via the canonical projection. This is a
-    /// pure read: it does not gate and does not require a proof, so it works on
-    /// a plain (un-attested) memory.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// atomic memory show 01j8zc4r8t
-    /// atomic memory show 01j8zc4r8t --json
-    /// ```
+    /// Show a canonical or freeform memory.
     Show(MemoryShow),
 
     /// Validate a memory against the canonical shapes (the authoring gate).
-    ///
-    /// Lifts the memory (by id from the vault, or from a markdown file path)
-    /// into a canonical node and runs the SHACL-style gate. An un-attested
-    /// memory reports violations for the missing proof and author
-    /// (`attributedTo`) — this is correct: `validate` is the authoring check,
-    /// `attest` is what makes it conform. Exits nonzero if the report does not
-    /// conform.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// atomic memory validate 01j8zc4r8t
-    /// atomic memory validate ./note.md
-    /// atomic memory validate 01j8zc4r8t --json
-    /// ```
     Validate(MemoryValidate),
 
     /// Attest a memory: sign it into a tracked attestation entry.
-    ///
-    /// Gates the memory first (refusing to sign a node that fails for a reason
-    /// signing cannot fix), fills `attributedTo` from the signing identity,
-    /// signs the canonical node, re-gates the attested result, and writes the
-    /// node (with embedded contentHash + proof) to a tracked vault entry at
-    /// `attestations/memory/<id>/attested.md` (dual-written to a legacy sidecar).
-    /// The source memory is unchanged and the vault's hashing scheme is
-    /// untouched — a new attestation entry is simply added.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// atomic memory attest 01j8zc4r8t
-    /// atomic memory attest 01j8zc4r8t --identity alice-work
-    /// ```
     Attest(MemoryAttest),
 
     /// Verify a signed memory's attestation.
-    ///
-    /// Reads the attestation written by `attest`, confirms it is still fresh
-    /// (the memory hasn't changed since it was signed), and verifies its content
-    /// hash + Ed25519 Data Integrity proof. Exits nonzero if there is no
-    /// attestation, it is stale, or the signature does not verify.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// atomic memory verify 01j8zc4r8t
-    /// atomic memory verify 01j8zc4r8t --identity alice-work
-    /// ```
     Verify(MemoryVerify),
 
     /// List the vault's memories, attestation-aware.
-    ///
-    /// The canonical-family analogue of `atomic vault memory list`: alongside the
-    /// id it adds the memory's kind/status/about-count (lifted, never graded), an
-    /// `attested` column (fresh / stale / –) and a `verifies` column (✓ / ✗ / –)
-    /// with the same DID-match-then-verify rule as `atomic intent list`.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// atomic memory list
-    /// atomic memory list --identity alice-work
-    /// atomic memory list --json
-    /// ```
     List(MemoryList),
+
+    /// List the allowed memory kinds and when to use each.
+    Kinds(MemoryKinds),
+
+    /// Write a freeform memory from stdin (the raw escape hatch).
+    Write(MemoryWrite),
 }
 
 /// Record the "why" for durable context: lift, validate, attest, and render
 /// canonical memories.
 ///
-/// A sibling of the raw `atomic vault memory` tree. The verbs operate on real
-/// vault memories through the `atomic-canonical` engine, persisting attestations
-/// additively as tracked vault entries — the stored memory entries are never
-/// mutated.
+/// A sibling of the raw `atomic vault memory` tree, driving the
+/// `atomic-canonical` engine for MEMORIES. Attestations are persisted
+/// additively as tracked vault entries. Kinds and examples:
+/// <https://docs.atomic.dev/commands/memory>.
 #[derive(Debug, clap::Args)]
 #[command(name = "memory")]
 pub struct Memory {
@@ -172,6 +106,8 @@ impl Command for Memory {
             MemoryCommands::Attest(cmd) => cmd.run(),
             MemoryCommands::Verify(cmd) => cmd.run(),
             MemoryCommands::List(cmd) => cmd.run(),
+            MemoryCommands::Kinds(cmd) => cmd.run(),
+            MemoryCommands::Write(cmd) => cmd.run(),
         }
     }
 }

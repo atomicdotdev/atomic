@@ -108,6 +108,7 @@ pub enum GitCommands {
     /// atomic git push
     /// atomic git push -m "feat: add auth"
     /// atomic git push --no-push
+    /// atomic git push --branch pr-42
     /// ```
     Push(Push),
 

@@ -51,8 +51,8 @@
 //!
 //! # Installation
 //!
-//! Pi extension installation is handled by the standalone `atomic-pi`
-//! package. This adapter only parses hook events.
+//! Pi extension installation is handled by the `atomic-pi` package via the
+//! integrations engine. This adapter only parses hook events.
 
 use std::path::Path;
 
@@ -282,7 +282,7 @@ struct AfterToolInput {
 /// Pi agent hook adapter.
 ///
 /// Parses hook JSON from the Pi extensions system. Extension installation
-/// is handled by the standalone `atomic-pi` package.
+/// is handled by the `atomic-pi` package via the integrations engine.
 #[derive(Debug)]
 pub struct PiHook {
     _private: (),

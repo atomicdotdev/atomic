@@ -205,6 +205,7 @@ impl Import {
         branch_name: &str,
         repo: &mut Repository,
         imported_shas: &HashSet<String>,
+        known_states: &HashSet<atomic_core::types::Merkle>,
         mainline_only: bool,
         preserve_working_copy: bool,
     ) -> CliResult<usize> {
@@ -223,6 +224,8 @@ impl Import {
             mainline_only,
             graph_only: !self.with_crdt,
             preserve_working_copy,
+            target_view: branch_name.to_string(),
+            known_states: known_states.clone(),
         };
 
         let importer = ParallelImporter::new(git_repo, options);
@@ -260,11 +263,21 @@ impl Import {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
-    /// Get Git SHAs already present on the import target view.
-    fn get_imported_shas(&self, repo: &Repository, view_name: &str) -> CliResult<HashSet<String>> {
+    /// Get the set of already imported Git SHAs from existing changes,
+    /// plus the Merkle states already present in the import target view.
+    ///
+    /// The states let the importer skip commits created by `atomic git
+    /// push`: such a commit trailers the view state it represents, and if
+    /// that state is already known the commit adds nothing.
+    fn get_incremental_markers(
+        &self,
+        repo: &Repository,
+        view_name: &str,
+    ) -> CliResult<(HashSet<String>, HashSet<atomic_core::types::Merkle>)> {
         use atomic_repository::HistoryOptions;
 
         let mut shas = HashSet::new();
+        let mut states = HashSet::new();
         let mut index_repairs = Vec::new();
 
         // Query the explicit target instead of the current view. Agent drafts
@@ -278,6 +291,7 @@ impl Import {
             .log(options)
             .map_err(|error| CliError::Internal(error.into()))?;
         for entry in entries {
+            states.insert(entry.state);
             let change = repo
                 .load_change(&entry.hash)
                 .map_err(|error| CliError::Internal(error.into()))?;
@@ -304,7 +318,7 @@ impl Import {
             );
         }
 
-        Ok(shas)
+        Ok((shas, states))
     }
 
     /// Get all local branch names.
@@ -483,10 +497,10 @@ impl Command for Import {
                         .map_err(|e| CliError::Internal(e.into()))?;
                 }
 
-                let imported_shas = if self.incremental {
-                    self.get_imported_shas(&repo, &branch_name)?
+                let (imported_shas, known_states) = if self.incremental {
+                    self.get_incremental_markers(&repo, &branch_name)?
                 } else {
-                    HashSet::new()
+                    (HashSet::new(), HashSet::new())
                 };
 
                 // Existing incremental imports are background bookkeeping.
@@ -505,6 +519,7 @@ impl Command for Import {
                     &branch_name,
                     &mut repo,
                     &imported_shas,
+                    &known_states,
                     false,
                     preserve_current_view,
                 )?;
@@ -577,10 +592,10 @@ impl Command for Import {
                     .map_err(|e| CliError::Internal(e.into()))?;
             }
 
-            let imported_shas = if self.incremental {
-                self.get_imported_shas(&repo, &branch_name)?
+            let (imported_shas, known_states) = if self.incremental {
+                self.get_incremental_markers(&repo, &branch_name)?
             } else {
-                HashSet::new()
+                (HashSet::new(), HashSet::new())
             };
 
             let restore_original_view = preserve_current_view && original_view != branch_name;
@@ -600,6 +615,7 @@ impl Command for Import {
                 &branch_name,
                 &mut repo,
                 &imported_shas,
+                &known_states,
                 true,
                 restore_original_view,
             )?;

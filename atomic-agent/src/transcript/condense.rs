@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use super::types::{AssistantMessage, CondensedEntry, ToolInput, ToolUseSummary, TranscriptLine};
+use super::types::{
+    AssistantMessage, CondensedEntry, EntryType, ToolInput, ToolUseSummary, TranscriptLine,
+};
 
 // Transcript Parsing (Claude Code JSONL)
 
@@ -79,11 +81,93 @@ pub fn condense_claude_transcript(raw: &[u8]) -> Vec<CondensedEntry> {
 pub fn condense_transcript(raw: &[u8], format: &str) -> Vec<CondensedEntry> {
     match format {
         "jsonl" => condense_claude_transcript(raw),
+        "opencode" => condense_opencode_transcript(raw),
         // Future: "json" => condense_gemini_transcript(raw),
         _ => {
             log::warn!("Unknown transcript format '{}', returning empty", format);
             Vec::new()
         }
+    }
+}
+
+/// Parse a synthesized OpenCode JSONL transcript into condensed entries.
+///
+/// The line shape is produced by [`crate::transcript::opencode`] from
+/// OpenCode's SQLite store: `user`/`assistant` lines carry `text`, `tool`
+/// lines carry the tool name and an optional title. `reasoning` lines are
+/// skipped — reasoning is carried separately by the change provenance and
+/// the session graph's Decision nodes.
+pub fn condense_opencode_transcript(raw: &[u8]) -> Vec<CondensedEntry> {
+    let mut entries = Vec::new();
+
+    for line in raw.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+
+        match parsed.get("type").and_then(|v| v.as_str()) {
+            Some("user") | Some("assistant") => {
+                let Some(text) = parsed.get("text").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if text.trim().is_empty() {
+                    continue;
+                }
+                if parsed["type"] == "user" {
+                    entries.push(CondensedEntry::user(text));
+                } else {
+                    entries.push(CondensedEntry::assistant(text));
+                }
+            }
+            Some("tool") => {
+                let name = parsed
+                    .get("tool")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("tool");
+                let title = parsed
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                entries.push(CondensedEntry::tool(name, title));
+            }
+            _ => {}
+        }
+    }
+
+    entries
+}
+
+/// Extract the agent's final response text from a transcript.
+///
+/// Condenses the transcript and returns the text of the last assistant
+/// entry — what the agent said last. This is the fallback source for the
+/// session graph's `llm_response` node when the agent's stop payload does
+/// not carry the response itself.
+///
+/// Returns `None` when the transcript has no assistant text.
+pub fn last_assistant_text(raw: &[u8], format: &str) -> Option<String> {
+    condense_transcript(raw, format)
+        .into_iter()
+        .rev()
+        .find(|e| matches!(e.entry_type, EntryType::Assistant))
+        .and_then(|e| e.content)
+        .filter(|t| !t.trim().is_empty())
+}
+
+/// The transcript format produced by an agent's transcript file.
+///
+/// Used both when condensing a transcript for `agent_turn` data and when
+/// deriving the agent's final response from it.
+pub fn format_for_agent(agent_name: &str) -> &'static str {
+    if agent_name.contains("gemini") {
+        "json"
+    } else if agent_name == "opencode" {
+        "opencode"
+    } else {
+        "jsonl"
     }
 }
 

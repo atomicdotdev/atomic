@@ -75,6 +75,82 @@ pub struct Ref {
     pub edge: String,
 }
 
+/// The acceptance criteria a task fulfills, in whichever JSON shape it was read.
+///
+/// # Why this is not just `Vec<String>`
+///
+/// `satisfies` was a scalar `Option<String>` until it was widened to a list (a
+/// task may satisfy more than one criterion). Attestations signed before that
+/// change therefore carry a bare string:
+///
+/// ```json
+/// { "@id": "urn:atomic:task:t-1", "satisfies": "urn:atomic:ac:t-1-ac-1" }
+/// ```
+///
+/// A plain `Vec<String>` cannot deserialize that, so every pre-widening
+/// attestation was rejected outright and its intent silently fell back to
+/// "unattested" — discarding signatures that are in fact perfectly valid.
+///
+/// The tempting fix — normalize `"x"` into `vec!["x"]` on read — is **wrong, and
+/// worse than the bug**. Signatures here cover *re-serialized* bytes, not the
+/// bytes on disk: [`crate::proof::verify`] calls `to_value()`, recomputes the
+/// content hash over `hashing_view`, and checks the signature over
+/// `jcs(signing_view)`. Rewriting a scalar into a one-element array changes those
+/// bytes, so the hash stops matching. And because a verification error surfaces
+/// as "signature invalid" rather than "unreadable", normalizing would convert an
+/// honest *unknown* into a **false accusation of tampering** against
+/// cryptographically sound data.
+///
+/// So this type is deliberately *representation-preserving*: it remembers which
+/// shape it was read in and serializes back into that same shape, leaving the
+/// signed bytes byte-for-byte intact. Readers use [`Satisfies::as_slice`] and
+/// never learn which variant they hold.
+///
+/// Newly lifted tasks are always [`Satisfies::Many`] — see the
+/// `From<Vec<String>>` impl, the only construction path in the codebase. Do not
+/// construct [`Satisfies::One`] elsewhere: it exists solely to round-trip
+/// history, and minting a fresh scalar would propagate the old shape forward.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Satisfies {
+    /// A single criterion, as pre-widening attestations stored it. Effectively
+    /// read-only: preserved across a round-trip, never newly minted.
+    One(String),
+    /// Zero or more criteria — the current shape, used by every new task.
+    Many(Vec<String>),
+}
+
+impl Satisfies {
+    /// The criteria as a slice, whatever the shape on disk. Callers use this
+    /// instead of matching, so the legacy variant stays invisible to them.
+    pub fn as_slice(&self) -> &[String] {
+        match self {
+            // `from_ref` lets a scalar masquerade as a one-element slice without
+            // allocating — and, crucially, without rewriting the stored form.
+            Self::One(one) => std::slice::from_ref(one),
+            Self::Many(many) => many,
+        }
+    }
+
+    /// True when no criteria are referenced. Drives `skip_serializing_if`, so an
+    /// empty list is omitted exactly as it was under the plain `Vec`.
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+}
+
+impl Default for Satisfies {
+    fn default() -> Self {
+        Self::Many(Vec::new())
+    }
+}
+
+impl From<Vec<String>> for Satisfies {
+    fn from(many: Vec<String>) -> Self {
+        Self::Many(many)
+    }
+}
+
 /// A decomposed task, lifted from a `:::task` directive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,8 +164,11 @@ pub struct Task {
     pub task_status: String,
     #[serde(rename = "touchesFile", default, skip_serializing_if = "Vec::is_empty")]
     pub touches_file: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub satisfies: Option<String>,
+    /// The acceptance criteria this task fulfills — a list on new tasks, but
+    /// possibly a bare string on attestations signed before the field was
+    /// widened. See [`Satisfies`] for why the shape is preserved, not normalized.
+    #[serde(default, skip_serializing_if = "Satisfies::is_empty")]
+    pub satisfies: Satisfies,
 }
 
 /// A Data Integrity proof (`eddsa-jcs-2022`).

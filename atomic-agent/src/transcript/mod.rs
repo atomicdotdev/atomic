@@ -84,6 +84,7 @@
 
 mod condense;
 mod generator;
+pub(crate) mod opencode;
 mod reasoning;
 mod storage;
 mod types;
@@ -92,10 +93,9 @@ mod types;
 mod tests;
 
 // Re-export all public types and functions
-
 pub use condense::{
-    aggregate_tool_usage, condense_claude_transcript, condense_transcript, extract_prompts,
-    format_condensed,
+    aggregate_tool_usage, condense_claude_transcript, condense_opencode_transcript,
+    condense_transcript, extract_prompts, format_condensed, format_for_agent, last_assistant_text,
 };
 pub use generator::{
     generate_reasoning, truncate_for_display, try_generate_reasoning, ClaudeCliGenerator,

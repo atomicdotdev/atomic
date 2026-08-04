@@ -48,8 +48,8 @@
 //!
 //! # Installation
 //!
-//! Devin Desktop hook installation is handled by the standalone `atomic-devin`
-//! package. This adapter only parses hook events.
+//! Devin Desktop hook installation is handled by the `atomic-devin` package
+//! via the integrations engine. This adapter only parses hook events.
 
 use std::path::Path;
 
@@ -170,7 +170,8 @@ struct PostToolInput {
 /// Devin Desktop agent hook adapter.
 ///
 /// Parses hook JSON from the Devin Desktop (Cascade) bridge scripts.
-/// Hook installation is handled by the standalone `atomic-devin` package.
+/// Hook installation is handled by the `atomic-devin` package via the
+/// integrations engine.
 #[derive(Debug)]
 pub struct DevinHook {
     _private: (),

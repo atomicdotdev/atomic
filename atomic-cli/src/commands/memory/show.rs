@@ -1,4 +1,4 @@
-//! `atomic memory show <ID>` — render a memory as a read-time projection.
+//! `atomic memory show <ID>` — show canonical and freeform memories.
 
 use clap::Parser;
 
@@ -9,17 +9,15 @@ use crate::commands::memory::bridge;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 
-/// Show a memory as a rendered read-time projection.
-///
-/// Distinct from [`crate::commands::vault::memory::MemoryShow`], which dumps the
-/// raw stored body. This projects the lifted canonical node.
+/// Show a canonical memory as a rendered projection, or a freeform memory as
+/// its stored body.
 #[derive(Parser, Debug)]
 #[command(name = "show")]
 pub struct MemoryShow {
     /// Memory id (or `memory/<id>.md` path).
     pub id: String,
 
-    /// Output the canonical node as JSON-LD instead of the rendered view.
+    /// Output JSON instead of the rendered view or raw body.
     #[arg(long)]
     pub json: bool,
 }
@@ -35,6 +33,23 @@ impl Command for MemoryShow {
         // attested author/proof); a stale one warns and falls back to the raw
         // node.
         let inputs = bridge::read_memory(&repo, &self.id)?;
+        if bridge::is_freeform_memory(&inputs) {
+            if self.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "path": bridge::normalize_memory_path(&self.id),
+                        "content": inputs.body,
+                        "frontmatter": inputs.frontmatter,
+                    }))
+                    .unwrap()
+                );
+            } else {
+                print!("{}", inputs.body);
+            }
+            return Ok(());
+        }
+
         let node = match bridge::load_attestation(&repo, &self.id, &inputs)? {
             bridge::Attestation::Fresh(node) => *node,
             bridge::Attestation::Stale(_) => {

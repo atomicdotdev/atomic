@@ -375,6 +375,66 @@ impl HttpRemote {
         }
     }
 
+    /// List all provenance graph hashes the remote holds.
+    ///
+    /// This mirrors the `.change` sync model: the server advertises a flat
+    /// inventory of content-addressed objects, the client computes the delta
+    /// by presence (`has_provenance_graph`), and pulls missing objects by
+    /// hash via [`download_provenance`](Self::download_provenance).
+    ///
+    /// Deliberately NOT a per-change relationship query ("which provenance
+    /// explains change X?"): that would require the server to maintain a
+    /// live reverse-dependency index, coupling provenance registration to
+    /// change arrival order. With a flat inventory, provenance graphs are
+    /// self-certifying objects — relationship resolution (DEPS) happens
+    /// locally, best-effort, exactly as with changes.
+    ///
+    /// Servers that do not support the extension return an error status —
+    /// callers should treat that as "provenance sync unsupported" and
+    /// degrade gracefully, not fail.
+    ///
+    /// # Returns
+    ///
+    /// Base32-encoded provenance graph hashes, one per line, in server order.
+    pub async fn get_provenance_list(&self) -> RemoteResult<Vec<String>> {
+        let url = format!("{}?provenance-list", self.base_url);
+        debug!("GET provenance-list: {}", url);
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| RemoteError::connection_failed(&url, e))?;
+
+        crate::check_min_version_header(response.headers());
+        let status = response.status();
+
+        match status {
+            StatusCode::OK => {
+                let text = response
+                    .text()
+                    .await
+                    .map_err(|e| RemoteError::connection_failed(&url, e))?;
+                Ok(text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(|line| line.to_string())
+                    .collect())
+            }
+            StatusCode::NOT_FOUND => Ok(Vec::new()),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::auth_failed(&url, msg))
+            }
+            _ => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::http(status.as_u16(), msg))
+            }
+        }
+    }
+
     /// Download a provenance graph from the remote server.
     ///
     /// # Arguments

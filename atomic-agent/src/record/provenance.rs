@@ -101,14 +101,38 @@ pub(crate) fn build_turn_provenance(options: &TurnRecordOptions<'_>) -> Provenan
     // Reasoning signature — Anthropic cryptographic proof
     let reasoning_signature = raw_str("reasoning_signature");
 
-    // Reasoning text — concatenated chain-of-thought, truncated to 10KB
-    let reasoning_text = raw_str("reasoning_text").map(|t| {
-        if t.len() > 10_240 {
-            format!("{}...[truncated, {} chars total]", &t[..10_240], t.len())
-        } else {
-            t
-        }
-    });
+    // Reasoning text — concatenated chain-of-thought, truncated to 10KB.
+    // Stop payloads carry either the concatenated `reasoning_text`
+    // (claude-style plugins) or structured `reasoning_blocks` (opencode);
+    // join the latter with the documented separator when the former is
+    // absent.
+    let reasoning_text = raw_str("reasoning_text")
+        .or_else(|| {
+            raw.and_then(|r| r.get("reasoning_blocks"))
+                .and_then(|v| v.as_array())
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+                        .map(|t| t.trim())
+                        .filter(|t| !t.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n---\n")
+                })
+                .filter(|s| !s.is_empty())
+        })
+        .map(|t| {
+            if t.len() > 10_240 {
+                // Never slice mid-codepoint.
+                let mut end = 10_240;
+                while !t.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}...[truncated, {} chars total]", &t[..end], t.len())
+            } else {
+                t
+            }
+        });
 
     // Task plan — agent's todo list serialized as JSON string
     let task_plan = raw
@@ -259,11 +283,7 @@ pub(crate) fn build_unhashed_turn_data(
     }
 
     // Determine format from agent name
-    let format = if options.session.agent_name.contains("gemini") {
-        "json"
-    } else {
-        "jsonl"
-    };
+    let format = transcript::format_for_agent(&options.session.agent_name);
 
     // Condense into structured entries
     let entries = transcript::condense_transcript(&raw, format);

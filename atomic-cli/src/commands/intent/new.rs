@@ -99,7 +99,14 @@ impl Command for IntentNew {
         // scaffold, again through the existing update path. `force` is set
         // because this runs immediately after create; the intent is a fresh
         // backlog draft with no linked goal, so force is a no-op guard-skip.
-        let scaffold = FEATURE_SCAFFOLD.replace("{id}", &created.id.to_lowercase());
+        //
+        // Child ids (acceptance criteria, tasks) are namespaced under the
+        // intent's ULID — not the human key — so they are globally unique and
+        // never carry the human key's `::`/`-` separators. Use the ULID as-is
+        // (ULIDs are uppercase) so the child ids share the intent's case; the
+        // KG canonicalizes these to an uppercase local regardless, but keeping
+        // the on-disk ids uppercase avoids an upper/lower split in the file.
+        let scaffold = FEATURE_SCAFFOLD.replace("{id}", &created.uid);
         repo.vault_intent_update(
             &created.id,
             IntentUpdateOptions {
