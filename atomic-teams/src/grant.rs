@@ -3,15 +3,28 @@
 //! Grants express fine-grained access control by binding a subject (user or
 //! team) to a relation (read, write, admin, owner) on a resource. This module
 //! provides async helpers that call the remote storage API to manage grants.
+//!
+//! # Workspace grants
+//!
+//! Workspace grants use `read`, `write`, and `admin` relations. The server
+//! exposes:
+//!   `GET    /workspaces/{slug}/grants`                          — list
+//!   `POST   /workspaces/{slug}/grants`                          — add
+//!   `DELETE /workspaces/{slug}/grants/{subject_type}/{subject_id}` — revoke
+//!
+//! # Organization grants
+//!
+//! Org grants additionally support the `owner` relation. The server exposes:
+//!   `GET    /orgs/{slug}/grants`                          — list
+//!   `POST   /orgs/{slug}/grants`                          — add
+//!   `DELETE /orgs/{slug}/grants/{subject_type}/{subject_id}` — revoke
 
 use uuid::Uuid;
 
 use atomic_remote::storage::StorageClient;
 
 use crate::error::{map_remote_error, TeamsResult};
-use crate::types::{
-    AddGrantRequest, GrantInfo, GrantRelation, GrantSubjectType, RevokeGrantRequest,
-};
+use crate::types::{AddGrantRequest, GrantInfo, GrantRelation, GrantSubjectType};
 
 // ---------------------------------------------------------------------------
 // Organization grants
@@ -38,7 +51,7 @@ pub async fn list_org_grants(
 
 /// Add a permission grant to an organization.
 ///
-/// Binds `subject_id` (a user or team identity) with the given `relation` on
+/// Binds `subject_id` (a user or team UUID) with the given `relation` on
 /// the organization identified by `org_slug`.
 ///
 /// # Errors
@@ -46,12 +59,12 @@ pub async fn list_org_grants(
 /// Returns [`TeamsError::AlreadyExists`](crate::error::TeamsError::AlreadyExists)
 /// if the grant already exists, or
 /// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
-/// if the caller is not an org admin/owner.
+/// if the caller is not an org owner.
 pub async fn add_org_grant(
     client: &StorageClient,
     org_slug: &str,
     subject_type: GrantSubjectType,
-    subject_id: Option<Uuid>,
+    subject_id: Uuid,
     relation: GrantRelation,
 ) -> TeamsResult<GrantInfo> {
     let path = format!("/orgs/{org_slug}/grants");
@@ -66,30 +79,28 @@ pub async fn add_org_grant(
         .map_err(|e| map_remote_error(e, format!("org {org_slug}")))
 }
 
-/// Revoke a permission grant from an organization.
+/// Revoke all grants for a subject on an organization.
 ///
-/// Removes the grant that matches the given `subject_type` and `subject_id`.
+/// Calls `DELETE /orgs/{slug}/grants/{subject_type}/{subject_id}`. The server
+/// removes **all** relations (read, write, admin, owner) for that subject in
+/// a single call.
 ///
 /// # Errors
 ///
 /// Returns [`TeamsError::OrgNotFound`](crate::error::TeamsError::OrgNotFound)
 /// if the org does not exist, or
 /// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
-/// if the caller is not an org admin/owner.
+/// if the caller is not an org owner.
 pub async fn revoke_org_grant(
     client: &StorageClient,
     org_slug: &str,
     subject_type: GrantSubjectType,
-    subject_id: Option<Uuid>,
+    subject_id: Uuid,
 ) -> TeamsResult<()> {
-    let path = format!("/orgs/{org_slug}/grants/revoke");
-    let body = RevokeGrantRequest {
-        subject_type,
-        subject_id,
-    };
-    // Use post for the revoke action (it carries a body).
+    let st = subject_type.to_string();
+    let path = format!("/orgs/{org_slug}/grants/{st}/{subject_id}");
     client
-        .post::<_, ()>(&path, &body)
+        .delete(&path)
         .await
         .map_err(|e| map_remote_error(e, format!("org {org_slug}")))
 }
@@ -102,14 +113,13 @@ pub async fn revoke_org_grant(
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::OrgNotFound`](crate::error::TeamsError::OrgNotFound)
-/// if the workspace does not exist, or
-/// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
-/// if the caller lacks access.
+/// Returns [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// if the caller lacks read access, or a not-found error if the workspace
+/// doesn't exist.
 pub async fn list_workspace_grants(
     client: &StorageClient,
     workspace_slug: &str,
-) -> TeamsResult<Vec<GrantInfo>> {
+) -> TeamsResult<Vec<crate::types::WorkspaceGrantInfo>> {
     let path = format!("/workspaces/{workspace_slug}/grants");
     client
         .get(&path)
@@ -119,7 +129,7 @@ pub async fn list_workspace_grants(
 
 /// Add a permission grant to a workspace.
 ///
-/// Binds `subject_id` (a user or team identity) with the given `relation` on
+/// Binds `subject_id` (a user or team UUID) with the given `relation` on
 /// the workspace identified by `workspace_slug`.
 ///
 /// # Errors
@@ -127,14 +137,14 @@ pub async fn list_workspace_grants(
 /// Returns [`TeamsError::AlreadyExists`](crate::error::TeamsError::AlreadyExists)
 /// if the grant already exists, or
 /// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
-/// if the caller is not an admin/owner of the workspace's parent organization.
+/// if the caller is not a workspace admin.
 pub async fn add_workspace_grant(
     client: &StorageClient,
     workspace_slug: &str,
     subject_type: GrantSubjectType,
-    subject_id: Option<Uuid>,
+    subject_id: Uuid,
     relation: GrantRelation,
-) -> TeamsResult<GrantInfo> {
+) -> TeamsResult<crate::types::WorkspaceGrantInfo> {
     let path = format!("/workspaces/{workspace_slug}/grants");
     let body = AddGrantRequest {
         subject_type,
@@ -147,29 +157,27 @@ pub async fn add_workspace_grant(
         .map_err(|e| map_remote_error(e, format!("workspace {workspace_slug}")))
 }
 
-/// Revoke a permission grant from a workspace.
+/// Revoke all grants for a subject on a workspace.
 ///
-/// Removes the grant that matches the given `subject_type` and `subject_id`.
+/// Calls `DELETE /workspaces/{slug}/grants/{subject_type}/{subject_id}`. The
+/// server removes **all** relations (read, write, admin) for that subject in
+/// a single call — no need to specify which relation to revoke.
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::OrgNotFound`](crate::error::TeamsError::OrgNotFound)
-/// if the workspace does not exist, or
-/// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
-/// if the caller is not an admin/owner of the workspace's parent organization.
+/// Returns [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// if the caller is not a workspace admin, or a not-found error if the
+/// workspace doesn't exist.
 pub async fn revoke_workspace_grant(
     client: &StorageClient,
     workspace_slug: &str,
     subject_type: GrantSubjectType,
-    subject_id: Option<Uuid>,
+    subject_id: Uuid,
 ) -> TeamsResult<()> {
-    let path = format!("/workspaces/{workspace_slug}/grants/revoke");
-    let body = RevokeGrantRequest {
-        subject_type,
-        subject_id,
-    };
+    let st = subject_type.to_string();
+    let path = format!("/workspaces/{workspace_slug}/grants/{st}/{subject_id}");
     client
-        .post::<_, ()>(&path, &body)
+        .delete(&path)
         .await
         .map_err(|e| map_remote_error(e, format!("workspace {workspace_slug}")))
 }
@@ -181,73 +189,52 @@ pub async fn revoke_workspace_grant(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AddGrantRequest, RevokeGrantRequest};
+    use crate::types::AddGrantRequest;
 
     #[test]
-    fn add_grant_request_serializes_with_subject() {
+    fn add_grant_request_serializes_snake_case() {
         let req = AddGrantRequest {
-            subject_type: GrantSubjectType::User,
-            subject_id: Some(Uuid::nil()),
+            subject_type: GrantSubjectType::Team,
+            subject_id: Uuid::nil(),
             relation: GrantRelation::Write,
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"subjectType\":\"user\""));
-        assert!(json.contains("\"relation\":\"write\""));
-        assert!(json.contains("\"subjectId\""));
+        assert!(json.contains("\"subject_type\""), "got: {json}");
+        assert!(json.contains("\"subject_id\""), "got: {json}");
+        assert!(json.contains("\"relation\":\"write\""), "got: {json}");
     }
 
     #[test]
-    fn add_grant_request_skips_none_subject_id() {
+    fn add_grant_request_user_relation_read() {
         let req = AddGrantRequest {
-            subject_type: GrantSubjectType::Team,
-            subject_id: None,
+            subject_type: GrantSubjectType::User,
+            subject_id: Uuid::nil(),
             relation: GrantRelation::Read,
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(!json.contains("subjectId"));
+        assert!(json.contains("\"subject_type\":\"user\""), "got: {json}");
+        assert!(json.contains("\"relation\":\"read\""), "got: {json}");
     }
 
     #[test]
-    fn revoke_grant_request_serializes() {
-        let req = RevokeGrantRequest {
-            subject_type: GrantSubjectType::User,
-            subject_id: Some(Uuid::nil()),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"subjectType\":\"user\""));
-        assert!(json.contains("\"subjectId\""));
-    }
-
-    #[test]
-    fn revoke_grant_request_skips_none_subject_id() {
-        let req = RevokeGrantRequest {
-            subject_type: GrantSubjectType::Team,
-            subject_id: None,
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(!json.contains("subjectId"));
-    }
-
-    #[test]
-    fn org_grant_path_format() {
+    fn org_revoke_path_format() {
         let slug = "acme";
-        assert_eq!(format!("/orgs/{slug}/grants"), "/orgs/acme/grants");
+        let st = "team";
+        let id = Uuid::nil();
         assert_eq!(
-            format!("/orgs/{slug}/grants/revoke"),
-            "/orgs/acme/grants/revoke"
+            format!("/orgs/{slug}/grants/{st}/{id}"),
+            format!("/orgs/acme/grants/team/{id}")
         );
     }
 
     #[test]
-    fn workspace_grant_path_format() {
+    fn workspace_revoke_path_format() {
         let slug = "my-ws";
+        let st = "user";
+        let id = Uuid::nil();
         assert_eq!(
-            format!("/workspaces/{slug}/grants"),
-            "/workspaces/my-ws/grants"
-        );
-        assert_eq!(
-            format!("/workspaces/{slug}/grants/revoke"),
-            "/workspaces/my-ws/grants/revoke"
+            format!("/workspaces/{slug}/grants/{st}/{id}"),
+            format!("/workspaces/my-ws/grants/user/{id}")
         );
     }
 }

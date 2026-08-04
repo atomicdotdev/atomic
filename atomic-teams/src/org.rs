@@ -8,13 +8,15 @@ use log::debug;
 use atomic_remote::storage::StorageClient;
 
 use crate::error::{map_remote_error, TeamsResult};
-use crate::types::{CreateOrgRequest, OrgInfo, UpdateOrgRequest};
+use crate::types::{CreateOrgRequest, MyOrgInfo, OrgInfo, UpdateOrgRequest};
 
 /// Create a new organization.
 ///
 /// # Arguments
 ///
-/// * `client` — Authenticated storage client.
+/// * `client` — Authenticated storage client. Must target the server apex
+///   (not an org subdomain): this endpoint spans orgs and is served on the
+///   bare host. See `atomic_cli::commands::client::build_apex_client`.
 /// * `name` — Human-readable display name for the organization.
 /// * `email` — Optional contact email.
 ///
@@ -56,6 +58,25 @@ pub async fn get_org(client: &StorageClient, slug: &str) -> TeamsResult<OrgInfo>
         .await
         .map_err(|e| map_remote_error(e, format!("org {slug}")))?;
     Ok(info)
+}
+
+/// List every organization the caller belongs to, with the caller's role.
+///
+/// This hits the apex `GET /orgs` endpoint, so `client` must target the
+/// server apex (the bare host), not an org subdomain. Use
+/// `atomic_cli::commands::client::build_apex_client` to build such a client.
+///
+/// # Errors
+///
+/// Returns a `TeamsError` derived from the remote response on any failure
+/// (e.g. `TeamsError::PermissionDenied` if the caller's token is rejected).
+pub async fn list_my_orgs(client: &StorageClient) -> TeamsResult<Vec<MyOrgInfo>> {
+    debug!("Listing organizations the caller belongs to");
+    let infos: Vec<MyOrgInfo> = client
+        .get("/orgs")
+        .await
+        .map_err(|e| map_remote_error(e, "list my orgs".to_string()))?;
+    Ok(infos)
 }
 
 /// Update an existing organization.

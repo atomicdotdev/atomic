@@ -16,6 +16,7 @@
 //!   update  Update a workspace
 //!   delete  Delete a workspace
 //!   set     Set the default workspace for an org
+//!   grant   Manage workspace permission grants
 //!
 //! Options:
 //!   -h, --help  Print help information
@@ -53,6 +54,7 @@
 
 pub mod create;
 pub mod delete;
+pub mod grant;
 pub mod list;
 pub mod set;
 pub mod show;
@@ -62,6 +64,7 @@ use clap::Subcommand;
 
 pub use create::WorkspaceCreate;
 pub use delete::WorkspaceDelete;
+pub use grant::GrantCmd;
 pub use list::WorkspaceList;
 pub use set::WorkspaceSet;
 pub use show::WorkspaceShow;
@@ -152,6 +155,19 @@ pub enum WorkspaceCommands {
     /// atomic workspace set personal --org alice
     /// ```
     Set(WorkspaceSet),
+
+    /// Manage workspace permission grants.
+    ///
+    /// Grant or revoke access to a workspace for a team or user.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic workspace grant list my-team
+    /// atomic workspace grant add my-team --team engineering --permission write
+    /// atomic workspace grant remove my-team --team engineering
+    /// ```
+    Grant(GrantCmd),
 }
 
 /// Workspace management command.
@@ -174,6 +190,7 @@ impl Command for WorkspaceCmd {
             WorkspaceCommands::Update(cmd) => cmd.run(),
             WorkspaceCommands::Delete(cmd) => cmd.run(),
             WorkspaceCommands::Set(cmd) => cmd.run(),
+            WorkspaceCommands::Grant(cmd) => cmd.run(),
         }
     }
 }
@@ -192,6 +209,7 @@ mod tests {
                 WorkspaceCommands::Update(_) => "update",
                 WorkspaceCommands::Delete(_) => "delete",
                 WorkspaceCommands::Set(_) => "set",
+                WorkspaceCommands::Grant(_) => "grant",
             }
         }
 
