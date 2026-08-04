@@ -191,7 +191,10 @@ fn lift_task(d: &Directive, id_base: &str, n: usize) -> Task {
         text: d.body.clone(),
         task_status: d.attr("status").unwrap_or("open").to_string(),
         touches_file: touches,
-        satisfies,
+        // `.into()` yields `Satisfies::Many`, so freshly lifted tasks always
+        // serialize as a list. The scalar variant is reachable only by
+        // deserializing a pre-widening attestation; nothing here mints one.
+        satisfies: satisfies.into(),
     }
 }
 
@@ -407,7 +410,7 @@ Do not touch the global keyboard handler.
         let node = lift_intent(&fm(), body).unwrap();
         assert_eq!(node.has_task.len(), 1);
         assert_eq!(
-            node.has_task[0].satisfies,
+            node.has_task[0].satisfies.as_slice(),
             vec!["urn:atomic:ac:WORD-5-ac-1".to_string()]
         );
     }
@@ -419,7 +422,7 @@ Do not touch the global keyboard handler.
         let body = ":::task{#demo-2-1 status=met criteria=demo-2-ac-1,demo-2-ac-2,demo-2-ac-3}\nDo the thing.\n:::";
         let node = lift_intent(&fm(), body).unwrap();
         assert_eq!(
-            node.has_task[0].satisfies,
+            node.has_task[0].satisfies.as_slice(),
             vec![
                 "urn:atomic:ac:demo-2-ac-1".to_string(),
                 "urn:atomic:ac:demo-2-ac-2".to_string(),
@@ -436,7 +439,7 @@ Do not touch the global keyboard handler.
         let body = ":::task{#t1 status=open criteria=\"WORD-5-ac-1, WORD-5-ac-2 ,\"}\nWork.\n:::";
         let node = lift_intent(&fm(), body).unwrap();
         assert_eq!(
-            node.has_task[0].satisfies,
+            node.has_task[0].satisfies.as_slice(),
             vec![
                 "urn:atomic:ac:WORD-5-ac-1".to_string(),
                 "urn:atomic:ac:WORD-5-ac-2".to_string(),

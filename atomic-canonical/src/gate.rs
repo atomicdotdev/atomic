@@ -183,7 +183,9 @@ pub fn validate_intent(node: &CanonicalNode) -> ValidationReport {
                 ),
             });
         }
-        for target in &task.satisfies {
+        // `as_slice` so the gate holds a legacy scalar `satisfies` to the same
+        // rule as a list — a dangling criterion reference is a violation either way.
+        for target in task.satisfies.as_slice() {
             if !ac_ids.contains(target.as_str()) {
                 out.push(Violation {
                     focus_node: task.id.clone(),
@@ -350,7 +352,11 @@ mod tests {
             text: "a work item".to_string(),
             task_status: "open".to_string(),
             touches_file: Vec::new(),
-            satisfies: satisfies.iter().map(|s| s.to_string()).collect(),
+            satisfies: satisfies
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .into(),
         }
     }
 
