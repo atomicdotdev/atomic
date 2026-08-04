@@ -240,8 +240,9 @@ impl TurnOrchestrator {
                     // Switch to the agent view so that all file writes during
                     // the session (tool calls, npm install, builds, etc.) happen
                     // while current_view points to the agent view. This ensures
-                    // status/add/record see the right view. session-end will
-                    // switch back to the user's view.
+                    // status/add/record see the right view. The working copy
+                    // stays on the agent view after session-end so the user
+                    // lands where the agent's work happened.
                     if let Err(e) = repo.align_to_view(&session.view_name) {
                         log::warn!(
                             "Could not align to agent view '{}': {} (non-fatal)",
