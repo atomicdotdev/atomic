@@ -842,6 +842,11 @@ impl Repository {
     /// - `PIMO::alice::3`  -> exact (project uppercased)
     /// - a ULID or prefix  -> resolved to the matching intent's human key
     /// - a legacy `PIMO-1` -> matched case-insensitively against manifest keys
+    ///
+    /// Note that a legacy dash-style id reaches the manifest-key match through
+    /// the `Uid` arm, not the `HumanKey` arm: `parse_intent_reference` only
+    /// produces a `HumanKey` for `::`-separated or all-digit input, so anything
+    /// else — including `PIMO-1` — arrives here classified as a ULID.
     fn normalize_intent_id(&self, id: &str) -> Result<String, RepositoryError> {
         use atomic_core::pristine::vault::{parse_intent_reference, IntentRef};
 
@@ -901,6 +906,36 @@ impl Repository {
                             .collect(),
                     });
                 }
+
+                // Legacy fallback: a pre-ULID intent is keyed in the manifest by
+                // its dash-style id (`TEST-1`), which `parse_intent_reference`
+                // classifies as a Uid because it has neither `::` nor an
+                // all-digit form. Such summaries carry no ULID (`uid` is
+                // documented as empty on legacy entries), so neither lookup
+                // above can match and the intent would be unaddressable even
+                // though `vault_intent_list` still reports it.
+                //
+                // Fall back to the manifest key itself — the same
+                // case-insensitive match the `HumanKey` arm performs — so
+                // intents created before the ULID migration stay resolvable by
+                // `show` / `update` / `attest` / `link`. Ambiguity is reported
+                // rather than silently picking one, matching how a colliding
+                // ULID prefix is handled.
+                let legacy: Vec<&String> = manifest
+                    .intents
+                    .keys()
+                    .filter(|key| key.eq_ignore_ascii_case(id))
+                    .collect();
+                if legacy.len() == 1 {
+                    return Ok(legacy[0].clone());
+                }
+                if legacy.len() > 1 {
+                    return Err(RepositoryError::AmbiguousIntent {
+                        prefix: id.to_string(),
+                        matches: legacy.into_iter().cloned().collect(),
+                    });
+                }
+
                 Err(RepositoryError::InvalidOperation {
                     message: format!("No intent matches reference '{}'", id),
                 })
@@ -1749,6 +1784,57 @@ Login attempts are rate-limited.\n:::\n\n\
             repo.vault_intent_path(&intent.id).unwrap(),
             Some(intent.intent_file)
         );
+    }
+
+    /// A pre-ULID intent is keyed in the manifest by its dash-style id and has
+    /// no `uid`. `parse_intent_reference` classifies such a reference as a ULID
+    /// (no `::`, not all digits), so resolution must fall back to the manifest
+    /// key or the intent becomes unaddressable while still being listed.
+    #[test]
+    fn test_resolve_legacy_dash_id_without_uid() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let intent = repo
+            .vault_intent_create(create_opts("Legacy dash id"))
+            .unwrap();
+
+        // Rewrite the manifest to look like a pre-ULID entry: keyed `TEST-1`,
+        // with no uid and no human key.
+        let mut txn = repo.pristine.write_txn().unwrap();
+        let mut manifest = txn.get_vault_manifest().unwrap();
+        let mut summary = manifest.intents.remove(&intent.id).unwrap();
+        summary.uid.clear();
+        summary.human_key.clear();
+        manifest.intents.insert("TEST-1".to_string(), summary);
+        txn.put_vault_manifest(&manifest).unwrap();
+        txn.commit().unwrap();
+
+        assert_eq!(repo.resolve_intent_key("TEST-1").unwrap(), "TEST-1");
+        // Case-insensitively too, matching the `HumanKey` arm's behavior.
+        assert_eq!(repo.resolve_intent_key("test-1").unwrap(), "TEST-1");
+        // A genuinely absent reference must still fail rather than resolve.
+        assert!(repo.resolve_intent_key("NOPE-9").is_err());
+    }
+
+    /// The legacy fallback must not shadow ULID resolution: a modern intent is
+    /// still resolvable by full key, bare sequence, and ULID prefix.
+    #[test]
+    fn test_resolve_modern_intent_unaffected_by_legacy_fallback() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let intent = repo
+            .vault_intent_create(create_opts("Modern identity"))
+            .unwrap();
+
+        let uid = {
+            let manifest = repo.vault_manifest().unwrap();
+            manifest.intents[&intent.id].uid.clone()
+        };
+        assert!(!uid.is_empty(), "a new intent must have a ULID");
+
+        assert_eq!(repo.resolve_intent_key(&intent.id).unwrap(), intent.id);
+        assert_eq!(repo.resolve_intent_key(&uid).unwrap(), intent.id);
+        assert_eq!(repo.resolve_intent_key(&uid[..10]).unwrap(), intent.id);
     }
 
     #[test]
