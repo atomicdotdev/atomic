@@ -58,6 +58,9 @@ zstd = "0.13"
 
 # Database
 redb = "2.1"
+# Read-only access to OpenCode's session store (transcript recovery);
+# bundled so no system SQLite is required.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
