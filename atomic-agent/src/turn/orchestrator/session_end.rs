@@ -125,6 +125,13 @@ impl TurnOrchestrator {
                         session_id,
                         e
                     );
+                    // Never restore a real repository's parent view after a
+                    // failed flush: that would materialize over the agent's
+                    // still-unrecorded work. Repo-less orchestrator tests and
+                    // integrations have no parent/worktree to protect.
+                    if session.parent_view.is_some() {
+                        return Err(e);
+                    }
                 }
             }
         }

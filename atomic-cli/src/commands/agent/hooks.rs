@@ -122,8 +122,8 @@ impl Command for Hooks {
             ))
         })?;
 
-        if self.should_handoff_codex_stop() {
-            return self.handoff_codex_stop(&input);
+        if self.should_handoff_codex_lifecycle() {
+            return self.handoff_codex_lifecycle(&input);
         }
 
         // Look up the agent adapter
@@ -309,12 +309,18 @@ impl Command for Hooks {
 }
 
 impl Hooks {
-    fn should_handoff_codex_stop(&self) -> bool {
-        // Codex stop handoff drops stdout, so `--json` must stay in-process.
-        !self.foreground && !self.json && self.agent_name == "codex" && self.verb == "stop"
+    fn should_handoff_codex_lifecycle(&self) -> bool {
+        // Codex clamps SessionEnd hooks to three seconds. Hand terminal
+        // lifecycle work to a child so recording/attestation/view restoration
+        // can finish after the hook process returns. `--json` must remain
+        // in-process because handoff deliberately drops stdout.
+        !self.foreground
+            && !self.json
+            && self.agent_name == "codex"
+            && matches!(self.verb.as_str(), "stop" | "session-end")
     }
 
-    fn handoff_codex_stop(&self, input: &[u8]) -> CliResult<()> {
+    fn handoff_codex_lifecycle(&self, input: &[u8]) -> CliResult<()> {
         let exe = std::env::current_exe().map_err(|e| {
             CliError::Internal(anyhow!("Failed to resolve atomic executable: {}", e))
         })?;
@@ -331,8 +337,9 @@ impl Hooks {
             .spawn()
             .map_err(|e| {
                 CliError::Internal(anyhow!(
-                    "Failed to start background Codex Stop recorder: {}",
-                    e
+                    "Failed to start background Codex {} worker: {}",
+                    self.verb,
+                    e,
                 ))
             })?;
 
@@ -341,8 +348,8 @@ impl Hooks {
                 CliError::Io(std::io::Error::new(
                     e.kind(),
                     format!(
-                        "Failed to pass Codex Stop input to background recorder: {}",
-                        e
+                        "Failed to pass Codex {} input to background worker: {}",
+                        self.verb, e,
                     ),
                 ))
             })?;
@@ -489,7 +496,7 @@ mod tests {
             json: false,
         };
 
-        assert!(hooks.should_handoff_codex_stop());
+        assert!(hooks.should_handoff_codex_lifecycle());
     }
 
     #[test]
@@ -501,7 +508,7 @@ mod tests {
             json: true,
         };
 
-        assert!(!hooks.should_handoff_codex_stop());
+        assert!(!hooks.should_handoff_codex_lifecycle());
     }
 
     #[test]
@@ -513,7 +520,7 @@ mod tests {
             json: false,
         };
 
-        assert!(!hooks.should_handoff_codex_stop());
+        assert!(!hooks.should_handoff_codex_lifecycle());
     }
 
     #[test]
@@ -525,7 +532,19 @@ mod tests {
             json: false,
         };
 
-        assert!(!hooks.should_handoff_codex_stop());
+        assert!(!hooks.should_handoff_codex_lifecycle());
+    }
+
+    #[test]
+    fn test_codex_session_end_handoffs_by_default() {
+        let hooks = Hooks {
+            agent_name: "codex".to_string(),
+            verb: "session-end".to_string(),
+            foreground: false,
+            json: false,
+        };
+
+        assert!(hooks.should_handoff_codex_lifecycle());
     }
 
     #[test]
