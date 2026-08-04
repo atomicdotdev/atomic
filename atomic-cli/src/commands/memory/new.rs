@@ -38,7 +38,9 @@ const MEMORY_SCAFFOLD: &str = "\
 #[derive(Parser, Debug)]
 #[command(name = "new")]
 pub struct MemoryNew {
-    /// Memory kind: one of `constraint`, `preference`, `lesson`, `context`.
+    /// Memory kind: one of `constraint`, `preference`, `lesson`, `context`,
+    /// `decision`. Use `decision` for a durable decision→outcome record
+    /// (chosen approach + why), typically emitted at turn end.
     #[arg(long)]
     pub kind: String,
 
@@ -64,6 +66,11 @@ pub struct MemoryNew {
     /// Lifecycle status. One of `active`, `superseded`, `retracted`.
     #[arg(long, default_value = "active")]
     pub status: String,
+
+    /// Emit the created memory as JSON (`{"id":…,"file":…,"kind":…}`) instead of
+    /// the human summary — for scripting, e.g. `… --json | jq -r .id`.
+    #[arg(long)]
+    pub json: bool,
 }
 
 impl Command for MemoryNew {
@@ -157,6 +164,19 @@ impl Command for MemoryNew {
         .map_err(CliError::Repository)?;
         repo.vault_materialize(&vault_path)
             .map_err(CliError::Repository)?;
+
+        if self.json {
+            let out = serde_json::json!({
+                "id": id,
+                "file": format!(".vault/{vault_path}"),
+                "kind": self.kind,
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&out).expect("json is infallible")
+            );
+            return Ok(());
+        }
 
         println!("Created memory: {id}");
         println!("  file: .vault/{vault_path}");

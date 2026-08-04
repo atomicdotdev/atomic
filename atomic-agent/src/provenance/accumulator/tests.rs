@@ -1,6 +1,7 @@
 use super::helpers::{make_session_prefix, short_hash, truncate_prompt};
 use super::*;
 use crate::provenance::types::{EdgeKind, NodeKind, SerializedGraph};
+use atomic_core::change::session::SessionTodo;
 
 // ---- Construction ----
 
@@ -16,6 +17,27 @@ fn test_new_accumulator_is_empty() {
 }
 
 // ---- append_goal ----
+
+#[test]
+fn test_append_generic_todo_snapshot_links_goal() {
+    let mut acc = ProvenanceAccumulator::new("sess-todo");
+    let goal = acc.append_goal("Execute the plan", 1000);
+    let todo = SessionTodo {
+        id: "todo-1".into(),
+        content: "Implement hasTodo".into(),
+        status: "in_progress".into(),
+        priority: "high".into(),
+    };
+    let todo_node = acc.append_todo_snapshot(&todo, 1001);
+
+    let node = acc.nodes().iter().find(|n| n.id == todo_node).unwrap();
+    assert_eq!(node.kind, NodeKind::Todo);
+    assert_eq!(node.detail.as_ref().unwrap()["todo_id"], "todo-1");
+    assert!(acc
+        .edges()
+        .iter()
+        .any(|edge| edge.from == goal && edge.to == todo_node && edge.kind == EdgeKind::LedTo));
+}
 
 #[test]
 fn test_append_goal() {

@@ -76,23 +76,23 @@ pub fn lift_intent(frontmatter: &Map<String, Value>, body: &str) -> Result<Canon
             }
             "acceptance-criterion" => {
                 ac_n += 1;
-                acs.push(lift_ac(d, &human_key, ac_n)?);
+                acs.push(lift_ac(d, &uid, ac_n)?);
             }
             "task" => {
                 task_n += 1;
-                tasks.push(lift_task(d, &human_key, task_n));
+                tasks.push(lift_task(d, &uid, task_n));
             }
             "scope-in" => {
                 scope_in_n += 1;
-                scope_in.push(lift_scope(d, &human_key, "scope-in", scope_in_n));
+                scope_in.push(lift_scope(d, &uid, "scope-in", scope_in_n));
             }
             "scope-out" => {
                 scope_out_n += 1;
-                scope_out.push(lift_scope(d, &human_key, "scope-out", scope_out_n));
+                scope_out.push(lift_scope(d, &uid, "scope-out", scope_out_n));
             }
             "constraint" => {
                 constraint_n += 1;
-                constraints.push(lift_constraint(d, &human_key, constraint_n));
+                constraints.push(lift_constraint(d, &uid, constraint_n));
             }
             "ref" => {
                 deps.push(lift_ref(d)?);
@@ -138,10 +138,13 @@ pub fn lift_intent(frontmatter: &Map<String, Value>, body: &str) -> Result<Canon
     })
 }
 
-fn lift_ac(d: &Directive, human_key: &str, n: usize) -> Result<AcceptanceCriterion> {
+fn lift_ac(d: &Directive, id_base: &str, n: usize) -> Result<AcceptanceCriterion> {
+    // Child ids are namespaced under the intent's stable id base (its ULID for
+    // intents created via `atomic intent new`) so they are globally unique and
+    // do not inherit the human key's `::`/`-` separators.
     let local =
         d.id.clone()
-            .unwrap_or_else(|| format!("{}-ac-{n}", slug(human_key)));
+            .unwrap_or_else(|| format!("{}-ac-{n}", slug(id_base)));
     Ok(AcceptanceCriterion {
         type_: NodeType::AcceptanceCriterion.as_str().to_string(),
         id: as_urn("ac", &local),
@@ -152,10 +155,10 @@ fn lift_ac(d: &Directive, human_key: &str, n: usize) -> Result<AcceptanceCriteri
     })
 }
 
-fn lift_task(d: &Directive, human_key: &str, n: usize) -> Task {
+fn lift_task(d: &Directive, id_base: &str, n: usize) -> Task {
     let local =
         d.id.clone()
-            .unwrap_or_else(|| format!("{}-{n}", slug(human_key)));
+            .unwrap_or_else(|| format!("{}-{n}", slug(id_base)));
     let mut touches: Vec<String> = Vec::new();
     if let Some(f) = d.attr("touchesFile") {
         touches.push(f.to_string());
@@ -167,10 +170,21 @@ fn lift_task(d: &Directive, human_key: &str, n: usize) -> Task {
             }
         }
     }
+    // A task may fulfill more than one acceptance criterion. Both `satisfies`
+    // and the `criteria` alias accept a comma-separated list; each entry becomes
+    // its own `urn:atomic:ac:*` edge rather than being collapsed into a single
+    // malformed URN.
     let satisfies = d
         .attr("satisfies")
         .or_else(|| d.attr("criteria"))
-        .map(|v| as_urn("ac", v));
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| as_urn("ac", s))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     Task {
         type_: NodeType::Task.as_str().to_string(),
         id: as_urn("task", &local),
@@ -184,10 +198,10 @@ fn lift_task(d: &Directive, human_key: &str, n: usize) -> Task {
 /// Lift a `:::scope-in` / `:::scope-out` container into a `ScopeItem`.
 /// `kind` is "scope-in" or "scope-out" and drives the generated id slug.
 /// Prose body is the unconstrained narrative (never graded).
-fn lift_scope(d: &Directive, human_key: &str, kind: &str, n: usize) -> ScopeItem {
+fn lift_scope(d: &Directive, id_base: &str, kind: &str, n: usize) -> ScopeItem {
     let local =
         d.id.clone()
-            .unwrap_or_else(|| format!("{}-{kind}-{n}", slug(human_key)));
+            .unwrap_or_else(|| format!("{}-{kind}-{n}", slug(id_base)));
     ScopeItem {
         type_: NodeType::ScopeItem.as_str().to_string(),
         id: as_urn("scope", &local),
@@ -196,10 +210,10 @@ fn lift_scope(d: &Directive, human_key: &str, kind: &str, n: usize) -> ScopeItem
 }
 
 /// Lift a `:::constraint` container into a `Constraint`.
-fn lift_constraint(d: &Directive, human_key: &str, n: usize) -> Constraint {
+fn lift_constraint(d: &Directive, id_base: &str, n: usize) -> Constraint {
     let local =
         d.id.clone()
-            .unwrap_or_else(|| format!("{}-constraint-{n}", slug(human_key)));
+            .unwrap_or_else(|| format!("{}-constraint-{n}", slug(id_base)));
     Constraint {
         type_: NodeType::Constraint.as_str().to_string(),
         id: as_urn("constraint", &local),
@@ -385,6 +399,90 @@ Do not touch the global keyboard handler.
             "urn:atomic:constraint:word-5-constraint-2"
         );
         assert!(node.has_scope_in[0].text.contains("src/App.tsx"));
+    }
+
+    #[test]
+    fn task_satisfies_single_criterion() {
+        let body = ":::task{#WORD-5-1 status=done satisfies=WORD-5-ac-1}\nDo the thing.\n:::";
+        let node = lift_intent(&fm(), body).unwrap();
+        assert_eq!(node.has_task.len(), 1);
+        assert_eq!(
+            node.has_task[0].satisfies,
+            vec!["urn:atomic:ac:WORD-5-ac-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn task_satisfies_multiple_criteria_via_criteria_alias() {
+        // A task fulfilling several criteria: the comma-separated list must
+        // become one urn per entry, not a single malformed comma-joined urn.
+        let body = ":::task{#demo-2-1 status=met criteria=demo-2-ac-1,demo-2-ac-2,demo-2-ac-3}\nDo the thing.\n:::";
+        let node = lift_intent(&fm(), body).unwrap();
+        assert_eq!(
+            node.has_task[0].satisfies,
+            vec![
+                "urn:atomic:ac:demo-2-ac-1".to_string(),
+                "urn:atomic:ac:demo-2-ac-2".to_string(),
+                "urn:atomic:ac:demo-2-ac-3".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn task_satisfies_tolerates_whitespace_and_empty_entries() {
+        // Values with spaces must be quoted (the attr tokenizer is
+        // space-delimited). Interior whitespace and a trailing empty entry are
+        // both trimmed away.
+        let body = ":::task{#t1 status=open criteria=\"WORD-5-ac-1, WORD-5-ac-2 ,\"}\nWork.\n:::";
+        let node = lift_intent(&fm(), body).unwrap();
+        assert_eq!(
+            node.has_task[0].satisfies,
+            vec![
+                "urn:atomic:ac:WORD-5-ac-1".to_string(),
+                "urn:atomic:ac:WORD-5-ac-2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn task_without_criteria_has_empty_satisfies() {
+        let body = ":::task{#t1 status=open}\nWork.\n:::";
+        let node = lift_intent(&fm(), body).unwrap();
+        assert!(node.has_task[0].satisfies.is_empty());
+    }
+
+    #[test]
+    fn lifts_multiple_tasks_and_criteria_with_per_type_autonumbering() {
+        // Interleaved criteria/tasks without explicit `#id`s. Numbering is
+        // per-type and follows document order, so the two criteria become
+        // ac-1/ac-2 and the two tasks become -1/-2 regardless of interleaving.
+        let body = "\
+:::acceptance-criterion{status=met verifiedBy=did:atomic:lee evidence=urn:atomic:change:01J8}\n\
+First criterion.\n:::\n\n\
+:::task{status=done}\nFirst task.\n:::\n\n\
+:::acceptance-criterion{status=unmet}\nSecond criterion.\n:::\n\n\
+:::task{status=open}\nSecond task.\n:::";
+        let node = lift_intent(&fm(), body).unwrap();
+
+        // Two of each, preserved in document order.
+        assert_eq!(node.has_acceptance_criterion.len(), 2);
+        assert_eq!(node.has_task.len(), 2);
+
+        let acs = &node.has_acceptance_criterion;
+        assert_eq!(acs[0].id, "urn:atomic:ac:word-5-ac-1");
+        assert_eq!(acs[0].text, "First criterion.");
+        assert_eq!(acs[0].ac_status, "met");
+        assert_eq!(acs[1].id, "urn:atomic:ac:word-5-ac-2");
+        assert_eq!(acs[1].text, "Second criterion.");
+        assert_eq!(acs[1].ac_status, "unmet");
+
+        let tasks = &node.has_task;
+        assert_eq!(tasks[0].id, "urn:atomic:task:word-5-1");
+        assert_eq!(tasks[0].text, "First task.");
+        assert_eq!(tasks[0].task_status, "done");
+        assert_eq!(tasks[1].id, "urn:atomic:task:word-5-2");
+        assert_eq!(tasks[1].text, "Second task.");
+        assert_eq!(tasks[1].task_status, "open");
     }
 
     #[test]

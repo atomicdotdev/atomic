@@ -141,6 +141,11 @@ impl TurnOrchestrator {
 
         self.session_store.save(&session)?;
 
+        // Reconcile the Atomic session ledger: the session is now ended.
+        // Best-effort — the JSON file remains the runtime fallback.
+        let ended_at = session.ended_at.map(|t| t.timestamp());
+        self.sync_session_lifecycle(&session, ended_at);
+
         log::info!(
             "Session {} ended after {} turn{}",
             session_id,

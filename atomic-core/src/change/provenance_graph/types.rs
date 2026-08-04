@@ -139,10 +139,11 @@ pub enum ProvenanceNodeKind {
     PatchProposal,
     /// Tool failure or session error.
     Error,
-    /// A single todo item in the checklist (Sherpa only).
+    /// A single todo snapshot in the turn checklist.
     ///
-    /// Emitted during Proposing when the LLM registers todos via the tool.
-    /// Carries content, priority, dependencies in `detail`.
+    /// Generic hooks emit this from their end-of-turn todo snapshot; Sherpa
+    /// emits it during Proposing. Carries ID, content, status, and priority in
+    /// `detail`.
     Todo,
     /// A todo item's status changed (Sherpa only).
     ///

@@ -345,6 +345,7 @@ impl Context {
             .ok_or_else(|| CliError::VaultEntityNotFound {
                 kind: "intent",
                 id: intent_id.to_string(),
+                hint: None,
             })?;
 
         seed_terms.push(summary.title.clone());
@@ -358,6 +359,7 @@ impl Context {
             .ok_or_else(|| CliError::VaultEntityNotFound {
                 kind: "intent",
                 id: intent_id.to_string(),
+                hint: None,
             })?;
 
         if let Some(entry) = repo

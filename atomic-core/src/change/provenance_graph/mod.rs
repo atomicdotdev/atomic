@@ -120,7 +120,7 @@ pub use types::{
 };
 
 // Re-export the V1 shim for internal use only
-pub(crate) use builder::ProvenanceGraphV1;
+pub(crate) use builder::{ProvenanceGraphV1, ProvenanceGraphV2};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -140,7 +140,7 @@ pub(crate) const MAGIC: &[u8; 4] = b"PRVG";
 /// v1 → v2: added `profile: Option<String>` as the last field.
 /// The `deserialize` method handles v1 payloads by deserializing into
 /// `ProvenanceGraphV1` and upgrading to `ProvenanceGraph` in-memory.
-pub(crate) const SCHEMA_VERSION: u8 = 2;
+pub(crate) const SCHEMA_VERSION: u8 = 3;
 
 /// File extension for provenance graph files.
 pub const PROVENANCE_GRAPH_EXTENSION: &str = "provenance";
@@ -224,16 +224,19 @@ pub struct ProvenanceGraph {
     /// rendering. If present it renders the full intent/todo/verification
     /// panels and applies the versioned detail schema.
     ///
-    /// Must remain the LAST field in this struct. Postcard uses a positional
-    /// binary format — appending here ensures old serialized graphs (which
-    /// have no profile bytes) still deserialize correctly with `profile: None`.
-    ///
-    /// Note: do NOT add `skip_serializing_if` here. Postcard is a positional
-    /// format — every field must always be present in the byte stream.
-    /// Skipping would cause deserialization to read the wrong bytes for this
-    /// field and corrupt the payload. `None` encodes as a single `0x00` byte.
+    /// Postcard uses a positional format: compatibility fields are appended
+    /// after existing fields and use `serde(default)`. Never reorder fields or
+    /// use `skip_serializing_if` here.
     #[serde(default)]
     pub profile: Option<String>,
+
+    /// Stable vault work-item/intent ID governing this turn, when known.
+    #[serde(default)]
+    pub plan_id: Option<String>,
+
+    /// Generic todo snapshot captured at turn end.
+    #[serde(default)]
+    pub todos: Vec<crate::change::session::SessionTodo>,
 }
 
 impl ProvenanceGraph {
@@ -313,6 +316,29 @@ impl ProvenanceGraph {
                 previous: v1.previous,
                 stats: v1.stats,
                 profile: None,
+                plan_id: None,
+                todos: Vec::new(),
+            }
+        } else if version_byte == 2 {
+            let v2: ProvenanceGraphV2 =
+                postcard::from_bytes(&data[4..]).map_err(|e| ProvenanceGraphError::Codec {
+                    reason: format!("postcard deserialize failed (v2): {}", e),
+                })?;
+            ProvenanceGraph {
+                version: SCHEMA_VERSION,
+                timestamp: v2.timestamp,
+                session_id: v2.session_id,
+                agent_name: v2.agent_name,
+                agent_display_name: v2.agent_display_name,
+                agent_vendor: v2.agent_vendor,
+                nodes: v2.nodes,
+                edges: v2.edges,
+                changes_explained: v2.changes_explained,
+                previous: v2.previous,
+                stats: v2.stats,
+                profile: v2.profile,
+                plan_id: None,
+                todos: Vec::new(),
             }
         } else {
             postcard::from_bytes(&data[4..]).map_err(|e| ProvenanceGraphError::Codec {

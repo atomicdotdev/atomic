@@ -77,7 +77,7 @@ pub enum NodeKind {
     /// Tool failure or session error.
     Error,
 
-    /// A single todo item in the checklist (Sherpa only).
+    /// A single todo snapshot in the turn checklist (generic agents and Sherpa).
     Todo,
 
     /// A todo item's status changed (Sherpa only).

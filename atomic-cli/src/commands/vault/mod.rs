@@ -45,10 +45,9 @@
 pub mod context;
 pub mod goal;
 pub mod init;
-pub mod intent;
 pub mod list;
 pub mod materialize;
-pub mod memory;
+pub mod removed;
 pub mod show;
 pub mod summaries;
 pub mod sync;
@@ -61,10 +60,9 @@ use atomic_core::types::{Base32, Hasher};
 pub use context::Context;
 pub use goal::Goal;
 pub use init::Init;
-pub use intent::Intent;
 pub use list::List;
 pub use materialize::Materialize;
-pub use memory::Memory;
+pub use removed::{RemovedVaultIntent, RemovedVaultMemory};
 pub use show::Show;
 pub use summaries::Summaries;
 pub use sync::Sync;
@@ -179,38 +177,6 @@ pub enum VaultCommands {
     /// ```
     Goal(Goal),
 
-    /// [DEPRECATED: use `atomic intent`] Manage vault intents (tasks).
-    ///
-    /// Deprecated in favor of the canonical `atomic intent` family
-    /// (`atomic intent new/show/list/validate/attest/verify`), which
-    /// scaffolds the full acceptance-criteria / why / tasks template.
-    ///
-    /// Intents are lightweight task descriptions that can be linked
-    /// to goals.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// atomic vault intent create --title "Fix auth"
-    /// atomic vault intent list
-    /// atomic vault intent show PIMO-1
-    /// ```
-    Intent(Intent),
-
-    /// Manage vault memory (shared knowledge).
-    ///
-    /// Memory files store persistent project knowledge such as
-    /// architecture decisions, conventions, and reference material.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// atomic vault memory list
-    /// atomic vault memory show architecture
-    /// echo "# Notes" | atomic vault memory write notes
-    /// ```
-    Memory(Memory),
-
     /// Research Vault memories relevant to a task.
     ///
     /// Ranks vault memories against free-text terms, an intent, or
@@ -240,6 +206,20 @@ pub enum VaultCommands {
     /// atomic vault query search "authentication"
     /// ```
     Query(Query),
+
+    /// [REMOVED — use `atomic intent`] Agent-facing redirect shim.
+    ///
+    /// The intent family moved to the root `atomic intent` command. This
+    /// captures old `atomic vault intent …` invocations and prints a
+    /// machine-parseable redirect, then exits non-zero.
+    Intent(RemovedVaultIntent),
+
+    /// [REMOVED — use `atomic memory`] Agent-facing redirect shim.
+    ///
+    /// The memory family moved to the root `atomic memory` command. This
+    /// captures old `atomic vault memory …` invocations and prints a
+    /// machine-parseable redirect, then exits non-zero.
+    Memory(RemovedVaultMemory),
 }
 
 // Vault Command
@@ -305,11 +285,11 @@ mod tests {
             "materialize",
             "sync",
             "goal",
-            "intent",
-            "memory",
             "context",
             "summaries",
             "query",
+            "intent",
+            "memory",
         ];
         assert_eq!(names.len(), 11);
     }

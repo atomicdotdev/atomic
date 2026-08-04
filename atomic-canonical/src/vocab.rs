@@ -46,6 +46,11 @@ pub const INTENT_STATUS: &[&str] = &["backlog", "todo", "in_progress", "done", "
 /// accepted by [`is_known_ac_status`] so pre-existing intents keep conforming.
 pub const AC_STATUS: &[&str] = &["unmet", "met"];
 
+/// Task status value set (mirrors `TaskShape` `sh:in`). A task is either still
+/// `open` or `done`; the renderer checks the box only on `done`. `unmet`/`met`
+/// belong to acceptance criteria, not tasks, and are rejected here.
+pub const TASK_STATUS: &[&str] = &["open", "done"];
+
 /// Directive names recognized by the parser + lift (closed set).
 /// Container directives wrap prose; leaf directives carry only edges.
 ///
@@ -79,7 +84,41 @@ pub fn is_known_inline_directive(name: &str) -> bool {
 }
 
 /// Memory kinds (closed set; mirrors `MemoryShape` `sh:in`). Exactly one.
-pub const MEMORY_KIND: &[&str] = &["constraint", "preference", "lesson", "context"];
+///
+/// `decision` records a durable decision→outcome (an architectural/approach
+/// choice and why it was made), distinct from `lesson` (a corrective learning
+/// from something that went wrong). Agents emit these at turn end via
+/// `atomic memory new --kind decision`.
+pub const MEMORY_KIND: &[&str] = &["constraint", "preference", "lesson", "context", "decision"];
+
+/// One-line guidance for each memory kind, in the same order as [`MEMORY_KIND`].
+///
+/// The single source of truth the CLI (`atomic memory kinds`) and agent skills
+/// surface so a model can read a session ledger and classify each durable
+/// insight into the right kind — emitting several memories when warranted —
+/// instead of being forced into one hardcoded kind.
+pub const MEMORY_KIND_GUIDANCE: &[(&str, &str)] = &[
+    (
+        "constraint",
+        "A hard rule or limit the work must respect — an invariant, boundary, or requirement that constrains future changes.",
+    ),
+    (
+        "preference",
+        "A soft or stylistic default the team leans toward — a convention, not a hard rule.",
+    ),
+    (
+        "lesson",
+        "A corrective learning from something that went wrong or surprised you — the failure and the takeaway.",
+    ),
+    (
+        "context",
+        "Durable background or domain knowledge that explains how or why something is — not a rule, not a decision.",
+    ),
+    (
+        "decision",
+        "A deliberate choice between real options — what was chosen, why, over which alternatives, and the outcome.",
+    ),
+];
 
 /// Memory status value set (closed; mirrors `MemoryShape` `sh:in`). Exactly one.
 pub const MEMORY_STATUS: &[&str] = &["active", "superseded", "retracted"];
@@ -135,6 +174,11 @@ pub fn is_known_ac_status(value: &str) -> bool {
     AC_STATUS.contains(&value) || value == "open"
 }
 
+/// Is this a valid task status value? Unknown ⇒ gate error (closed vocabulary).
+pub fn is_known_task_status(value: &str) -> bool {
+    TASK_STATUS.contains(&value)
+}
+
 /// Is this a valid memory kind? Unknown ⇒ gate error (closed vocabulary).
 pub fn is_known_memory_kind(value: &str) -> bool {
     MEMORY_KIND.contains(&value)
@@ -143,4 +187,26 @@ pub fn is_known_memory_kind(value: &str) -> bool {
 /// Is this a valid memory status value? Unknown ⇒ gate error.
 pub fn is_known_memory_status(value: &str) -> bool {
     MEMORY_STATUS.contains(&value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_kind_guidance_matches_the_closed_set() {
+        // The guidance table is the single source the CLI/skills surface; it
+        // must cover exactly the closed set, in the same order — no kind may be
+        // addable without a description, and no description may name an unknown
+        // kind.
+        let guided: Vec<&str> = MEMORY_KIND_GUIDANCE.iter().map(|(k, _)| *k).collect();
+        assert_eq!(guided, MEMORY_KIND);
+        for (kind, doc) in MEMORY_KIND_GUIDANCE {
+            assert!(
+                is_known_memory_kind(kind),
+                "guidance names unknown kind {kind}"
+            );
+            assert!(!doc.trim().is_empty(), "kind {kind} has empty guidance");
+        }
+    }
 }
