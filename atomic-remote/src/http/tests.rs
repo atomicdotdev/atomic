@@ -53,6 +53,15 @@ fn test_chunk_manifest_url_format() {
 }
 
 #[test]
+fn test_provenance_list_url_format() {
+    // Flat inventory endpoint — mirrors the .change sync model (advertise
+    // hashes, client computes presence delta, pulls missing by hash).
+    let url = format!("{}?provenance-list", "https://api.example.com/code");
+    assert!(url.contains("provenance-list"));
+    assert!(!url.contains("change="));
+}
+
+#[test]
 fn test_user_agent_format() {
     assert!(ATOMIC_USER_AGENT.starts_with("atomic-"));
 }

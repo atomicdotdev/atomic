@@ -30,6 +30,7 @@ use std::process::{Command, Output};
 use atomic_canonical::did::did_for_public_key;
 use atomic_canonical::prov::verify_prov;
 use atomic_core::change::provenance_graph::{ProvenanceNode, ProvenanceNodeKind};
+use atomic_core::change::session::SessionTodo;
 use atomic_core::change::ProvenanceGraph;
 use atomic_core::types::{Base32, Hash};
 use atomic_identity::IdentityStore;
@@ -333,5 +334,200 @@ fn provenance_trace_uses_scan_fallback_when_rev_deps_missing() {
     assert!(
         out.contains(&format!("urn:atomic:change:{}", phantom_change.to_base32())),
         "fallback trace shows the generated change urn"
+    );
+}
+
+#[test]
+fn session_show_reads_ordered_atomic_ledger() {
+    let repo_tmp = TempDir::new().unwrap();
+    let home_tmp = TempDir::new().unwrap();
+    let repo_dir = repo_tmp.path();
+    let home_dir = home_tmp.path();
+    let session_id = "ledger-session";
+
+    assert!(atomic(repo_dir, home_dir, &["init"]).status.success());
+    let first_change = Hash::of(b"ledger-change-0");
+    let second_change = Hash::of(b"ledger-change-1");
+    {
+        let repo = Repository::open(repo_dir).expect("open repo");
+        let first = repo
+            .save_provenance_graph(
+                &ProvenanceGraph::builder(session_id, "opencode")
+                    .plan_id("ATOM-25")
+                    .todos(vec![
+                        SessionTodo {
+                            id: "todo-1".into(),
+                            content: "Render session\noutput".into(),
+                            status: "completed".into(),
+                            priority: "high".into(),
+                        },
+                        SessionTodo {
+                            id: "todo-2".into(),
+                            content: "Keep output readable".into(),
+                            status: "in_progress".into(),
+                            priority: "medium".into(),
+                        },
+                    ])
+                    .add_node(goal_node())
+                    .add_change_explained(first_change)
+                    .build(),
+            )
+            .expect("save first graph");
+        repo.save_provenance_graph(
+            &ProvenanceGraph::builder(session_id, "opencode")
+                .previous(first)
+                .add_change_explained(second_change)
+                .build(),
+        )
+        .expect("save second graph");
+
+        let ledger = repo
+            .get_session_ledger(session_id)
+            .expect("read ledger")
+            .expect("ledger exists");
+        assert_eq!(ledger.0.session_id, session_id);
+        assert_eq!(ledger.0.turn_count, 2);
+        assert_eq!(ledger.1.len(), 2);
+        assert_eq!(ledger.1[0].turn_number, 0);
+        assert_eq!(ledger.1[1].turn_number, 1);
+        assert_eq!(ledger.1[1].previous_provenance, Some(first));
+        repo.upsert_session_lifecycle(
+            session_id,
+            Some("agent-ledger".into()),
+            Some("dev".into()),
+            None,
+        )
+        .expect("lifecycle metadata");
+    }
+
+    let show = atomic(repo_dir, home_dir, &["session", "show", session_id]);
+    assert!(
+        show.status.success(),
+        "session show failed: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let output = String::from_utf8(show.stdout).unwrap();
+    assert!(output.contains("Session ledger-session"));
+    assert!(output.contains("Turn 0"));
+    assert!(output.contains("Goal marker: Fix the auth bug"));
+    assert!(output.contains("Intent: ATOM-25"));
+    assert!(output.contains("Todos (2):"));
+    assert!(output.contains("[x] [high] Render session output"));
+    assert!(output.contains("[~] [medium] Keep output readable"));
+    assert!(output.contains("Turn 1"));
+
+    let recent = atomic(repo_dir, home_dir, &["session", "show", "-n", "1"]);
+    assert!(recent.status.success());
+    let recent_output = String::from_utf8(recent.stdout).unwrap();
+    assert!(recent_output.contains("Recent sessions (1):"));
+    assert!(recent_output.contains("ledger-session"));
+    assert!(recent_output.contains("agent-ledger"));
+    // The list view shows intent count; detail view shows individual IDs.
+    assert!(recent_output.contains("INTENTS"));
+
+    let recent_json = atomic(repo_dir, home_dir, &["session", "show", "--json"]);
+    assert!(recent_json.status.success());
+    let value: Value = serde_json::from_slice(&recent_json.stdout).unwrap();
+    assert_eq!(value.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn session_show_without_id_handles_empty_repository() {
+    let repo_tmp = TempDir::new().unwrap();
+    let home_tmp = TempDir::new().unwrap();
+    assert!(atomic(repo_tmp.path(), home_tmp.path(), &["init"])
+        .status
+        .success());
+
+    let show = atomic(repo_tmp.path(), home_tmp.path(), &["session", "show"]);
+    assert!(show.status.success());
+    assert_eq!(
+        String::from_utf8(show.stdout).unwrap().trim(),
+        "No sessions recorded."
+    );
+
+    let json = atomic(
+        repo_tmp.path(),
+        home_tmp.path(),
+        &["session", "show", "--json"],
+    );
+    assert!(json.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&json.stdout).unwrap(),
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn session_tables_populate_for_non_sherpa_agent() {
+    // Provenance from any agent — here a generic OpenCode graph with no
+    // `profile` and a `detail`-less Goal node exactly like the real capture
+    // path produces — must populate the session tables, not be skipped.
+    let repo_tmp = TempDir::new().unwrap();
+    let home_tmp = TempDir::new().unwrap();
+    let repo_dir = repo_tmp.path();
+    let home_dir = home_tmp.path();
+
+    assert!(atomic(repo_dir, home_dir, &["init"]).status.success());
+    let change = Hash::of(b"non-sherpa-change");
+
+    let repo = Repository::open(repo_dir).expect("open repo");
+    let todo_node = ProvenanceNode {
+        id: "t-1".into(),
+        kind: ProvenanceNodeKind::Todo,
+        timestamp: 1_735_689_600_000,
+        summary: "Wire up readline".into(),
+        detail: Some(
+            serde_json::json!({
+                "todo_id": "todo-7",
+                "content": "Wire up readline",
+                "status": "completed",
+                "priority": "medium",
+                "record_type": "todo",
+            })
+            .to_string(),
+        ),
+        change_hash: None,
+        tool_name: None,
+        tool_call_id: None,
+        duration_ms: None,
+        classified: false,
+        confidence: None,
+        consolidated_from: Vec::new(),
+    };
+    let graph = ProvenanceGraph::builder("non-sherpa-session", "opencode")
+        .agent_display_name("OpenCode")
+        .agent_vendor("moonshotai")
+        .add_node(goal_node()) // Goal has no detail, like `append_goal`
+        .add_node(todo_node)
+        .add_change_explained(change)
+        .build();
+    assert!(graph.profile.is_none(), "generic graph has no profile");
+    let prov_hash = repo.save_provenance_graph(&graph).expect("save graph");
+
+    // The fast UI gate must recognise this as having session data, even
+    // though the generic Goal node carries no intent `detail`.
+    assert!(
+        repo.has_session_data(&prov_hash),
+        "non-Sherpa provenance must report session data"
+    );
+
+    // Every node is indexed as a session event.
+    let events = repo.get_session_events(&prov_hash).expect("events");
+    assert_eq!(events.len(), 2, "one session event per provenance node");
+
+    // The Todo node populates the todos table with its generic detail.
+    let todos = repo.get_session_todos(&prov_hash).expect("todos");
+    assert_eq!(todos.len(), 1);
+    assert_eq!(todos[0].todo_id, "todo-7");
+    assert_eq!(todos[0].content, "Wire up readline");
+    assert_eq!(todos[0].final_status, "completed");
+
+    // No intent entry: the generic Goal node had no intent `detail`.
+    assert!(
+        repo.get_session_intent(&prov_hash)
+            .expect("intent")
+            .is_none(),
+        "generic Goal without detail yields no intent entry"
     );
 }

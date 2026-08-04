@@ -52,7 +52,7 @@ mod commands;
 mod error;
 mod output;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use commands::{
     Add,
@@ -82,6 +82,7 @@ use commands::{
     Revise,
     Sandbox,
     ServerCmd,
+    Session,
     Split,
     Stash,
     Status,
@@ -99,6 +100,51 @@ use commands::{
 use commands::{OrgCmd, TeamCmd};
 use output::{hint, print_error};
 
+// Agent-native help
+
+/// Help layout applied to every command in the tree.
+///
+/// Atomic is agent-native, not human-native: `--help` is consumed far more
+/// often by an orchestrating agent than read by a person (human guidance lives
+/// on the docs website). This template keeps the output terse and deterministic
+/// — the command's `about`, an explicit lowercase `usage:` line, then clap's
+/// argument/option/subcommand sections — and drops the version/author banner
+/// the default template prints, so an agent can parse it without wading through
+/// a marketing header.
+const AGENT_HELP_TEMPLATE: &str = "\
+{about-with-newline}
+usage: {usage}
+
+{all-args}{after-help}";
+
+/// Recursively apply the agent-native help layout to a command and every one of
+/// its (transitive) subcommands.
+///
+/// clap does not propagate `help_template` to subcommands, so we walk the tree
+/// once at startup and set it everywhere. This makes the whole CLI render help
+/// the same agent-native way for free — any command added later is covered
+/// without touching its definition. In the same pass we drop each command's
+/// long description (`long_about`): the terse one-line summary is all an agent
+/// needs, and the multi-paragraph prose / `# Examples` markdown that derives
+/// from doc comments renders as mangled text and belongs on the docs website,
+/// not in `--help`. We do the same for every argument's long help so clap does
+/// not fall back to its expanded, multi-paragraph layout for one command while
+/// staying compact for another — the whole tree renders the same terse way.
+fn apply_agent_help(cmd: clap::Command) -> clap::Command {
+    let subcommand_names: Vec<String> = cmd
+        .get_subcommands()
+        .map(|c| c.get_name().to_string())
+        .collect();
+    let mut cmd = cmd
+        .help_template(AGENT_HELP_TEMPLATE)
+        .long_about(None::<&str>)
+        .mut_args(|arg| arg.long_help(None::<&str>));
+    for name in subcommand_names {
+        cmd = cmd.mut_subcommand(name, apply_agent_help);
+    }
+    cmd
+}
+
 // CLI Argument Definitions
 
 /// Atomic - A mathematically sound distributed version control system.
@@ -112,17 +158,11 @@ use output::{hint, print_error};
 #[command(propagate_version = true)]
 #[command(arg_required_else_help = true)]
 struct Cli {
-    /// Enable verbose output for debugging.
-    ///
-    /// When enabled, shows additional information about what Atomic is doing.
-    /// Useful for troubleshooting or understanding the internal operations.
+    /// Emit extra diagnostic output.
     #[arg(short, long, global = true)]
     verbose: bool,
 
-    /// Disable colored output.
-    ///
-    /// By default, Atomic uses colors when outputting to a terminal.
-    /// Use this flag to disable colors (useful for piping output).
+    /// Disable ANSI color in output.
     #[arg(long, global = true)]
     no_color: bool,
 
@@ -256,6 +296,15 @@ enum Commands {
     /// atomic sandbox create agent-2 --dest /tmp/agent-2
     /// ```
     Sandbox(Sandbox),
+
+    /// Inspect the Atomic-native agent session ledger.
+    ///
+    /// ```text
+    /// atomic session show <session-id>
+    /// atomic session show <session-id> --json
+    /// ```
+    #[command(name = "session")]
+    Session(Session),
 
     /// Split a view (create a new view from an existing one).
     ///
@@ -803,8 +852,15 @@ fn main() {
     // Initialize logging
     env_logger::init();
 
-    // Parse command-line arguments
-    let cli = Cli::parse();
+    // Parse command-line arguments through the agent-native help layout. We
+    // build the command tree, stamp the template onto every node, let clap do
+    // its normal validation/help/error handling, then reconstruct the typed
+    // `Cli` from the resulting matches.
+    let matches = apply_agent_help(Cli::command()).get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(err) => err.exit(),
+    };
 
     // Configure color output
     if cli.no_color {
@@ -830,6 +886,8 @@ fn main() {
         Commands::Restore(restore) => restore.run(),
 
         Commands::Sandbox(sandbox) => sandbox.run(),
+
+        Commands::Session(session) => session.run(),
 
         Commands::Split(split) => split.run(),
 
@@ -910,12 +968,47 @@ fn main() {
 }
 
 #[cfg(test)]
-mod cli_definition_tests {
-    use super::Cli;
-    use clap::CommandFactory;
+mod agent_help_tests {
+    use super::*;
 
+    /// The agent-help walk must produce a structurally valid clap tree.
+    /// `debug_assert` catches duplicate flags, bad templates, and the like,
+    /// recursively across every command.
     #[test]
-    fn clap_command_definition_is_valid() {
-        Cli::command().debug_assert();
+    fn agent_help_tree_is_valid() {
+        apply_agent_help(Cli::command()).debug_assert();
+    }
+
+    /// Rendered help uses the agent-native template: a lowercase `usage:` line
+    /// and none of the default banner (`Usage:` heading or the version/author
+    /// line the stock template prints).
+    #[test]
+    fn agent_help_template_is_applied() {
+        let mut cmd = apply_agent_help(Cli::command());
+        let help = cmd.render_help().to_string();
+        assert!(
+            help.contains("usage: atomic"),
+            "lowercase usage line: {help}"
+        );
+        assert!(
+            !help.contains("Usage: atomic"),
+            "default capitalized usage heading must be gone: {help}"
+        );
+    }
+
+    /// Long descriptions are dropped tree-wide, so `--help` never leaks the
+    /// `# Examples` markdown that derives from a command's doc comment.
+    #[test]
+    fn long_about_is_stripped() {
+        let tree = apply_agent_help(Cli::command());
+        let mut intent = tree
+            .find_subcommand("intent")
+            .expect("intent command present")
+            .clone();
+        let help = intent.render_help().to_string();
+        assert!(
+            !help.contains("# Examples"),
+            "long_about markdown must not appear in help: {help}"
+        );
     }
 }

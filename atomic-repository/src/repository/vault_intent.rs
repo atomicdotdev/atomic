@@ -40,8 +40,10 @@ pub struct IntentCreateOptions {
 /// Result of creating an intent.
 #[derive(Debug, Clone)]
 pub struct IntentCreateResult {
-    /// The generated JIRA-style ID (e.g., "PIMO-1").
+    /// The human display key (e.g., "PIMO::lee-faus::3").
     pub id: String,
+    /// The stable primary identity (ULID).
+    pub uid: String,
     /// Vault-relative path to the intent directory.
     pub intent_dir: String,
     /// Vault-relative path to the intent.md file.
@@ -119,13 +121,20 @@ impl Repository {
 
         let priority = options.priority.unwrap_or_else(|| "medium".to_string());
         let view_name = self.current_view().to_string();
+        let identity = self.resolve_vault_identity();
+        let author = slug_author(&identity.name);
 
-        // Compute the session-scoped directory and file paths
-        let intent_dir = self.intent_dir_for(options.session_id.as_deref(), options.turn_id);
-        let intent_file = self.intent_file_for(options.session_id.as_deref(), options.turn_id);
+        // Stable primary identity: a ULID. The path, URN, and KG node all key
+        // off this, so it never collides regardless of team size or offline
+        // work. The human key is a per-author display alias.
+        let uid = ulid::Ulid::new().to_string();
+        let intent_dir = self.intent_dir_for(&uid);
+        let intent_file = self.intent_file_for(&uid);
 
-        // Allocate ID inside a write transaction
-        let intent_id;
+        // Allocate the human key inside a write transaction.
+        let human_key;
+        let project;
+        let seq;
         {
             let mut txn = self
                 .pristine
@@ -135,7 +144,7 @@ impl Repository {
                 .get_vault_manifest()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-            // Set prefix on first use, derived from project directory name
+            // Set the project code on first use, derived from the project dir.
             if manifest.intent_prefix.is_empty() {
                 let project_name = self
                     .root
@@ -143,17 +152,21 @@ impl Repository {
                     .and_then(|n| n.to_str())
                     .unwrap_or("vault");
                 manifest.intent_prefix = VaultManifest::derive_intent_prefix(project_name);
-                // Fallback if project name yields empty prefix
                 if manifest.intent_prefix.is_empty() {
                     manifest.intent_prefix = "VAULT".to_string();
                 }
             }
 
-            intent_id = manifest.allocate_intent_id();
+            project = manifest.project_code().to_string();
+            seq = manifest.allocate_author_seq(&author);
+            human_key = VaultManifest::compose_human_key(&project, &author, seq);
 
-            // Add to manifest intents index
+            // The manifest is keyed by the human key; the ULID is stored on the
+            // summary as the stable identity. Per-author keys never collide
+            // across teammates, and the ULID disambiguates the rare
+            // same-author-two-clones case.
             manifest.intents.insert(
-                intent_id.clone(),
+                human_key.clone(),
                 IntentSummary {
                     status: "backlog".to_string(),
                     priority: priority.clone(),
@@ -162,6 +175,13 @@ impl Repository {
                     blocked_by: Vec::new(),
                     title: options.title.clone(),
                     vault_path: intent_file.clone(),
+                    uid: uid.clone(),
+                    human_key: human_key.clone(),
+                    project: project.clone(),
+                    author: author.clone(),
+                    seq,
+                    session: options.session_id.clone(),
+                    turn: options.turn_id,
                 },
             );
 
@@ -173,11 +193,27 @@ impl Repository {
 
         let now = chrono::Utc::now().to_rfc3339();
 
-        // Build frontmatter
+        // Build frontmatter. `uid` is the primary identity (lifted to the
+        // canonical URN); `id` is the human display key. `project`/`author`/
+        // `seq` are the human-key components; `session`/`turn` are provenance,
+        // no longer encoded in the path.
         let mut fm = serde_json::Map::new();
+        fm.insert("uid".to_string(), serde_json::Value::String(uid.clone()));
         fm.insert(
             "id".to_string(),
-            serde_json::Value::String(intent_id.clone()),
+            serde_json::Value::String(human_key.clone()),
+        );
+        fm.insert(
+            "project".to_string(),
+            serde_json::Value::String(project.clone()),
+        );
+        fm.insert(
+            "author".to_string(),
+            serde_json::Value::String(author.clone()),
+        );
+        fm.insert(
+            "seq".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(seq)),
         );
         fm.insert(
             "title".to_string(),
@@ -195,6 +231,18 @@ impl Repository {
             "view".to_string(),
             serde_json::Value::String(view_name.clone()),
         );
+        if let Some(ref session_id) = options.session_id {
+            fm.insert(
+                "session".to_string(),
+                serde_json::Value::String(session_id.clone()),
+            );
+        }
+        if let Some(turn_id) = options.turn_id {
+            fm.insert(
+                "turn".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(turn_id)),
+            );
+        }
         if let Some(ref assignee) = options.assignee {
             fm.insert(
                 "assignee".to_string(),
@@ -214,9 +262,6 @@ impl Repository {
             fm.insert("labels".to_string(), serde_json::Value::Array(labels));
         }
         fm.insert("goals".to_string(), serde_json::Value::Array(Vec::new()));
-
-        // Add identity provenance
-        let identity = self.resolve_vault_identity();
         fm.insert(
             "created_by".to_string(),
             serde_json::Value::String(identity.to_string()),
@@ -224,10 +269,12 @@ impl Repository {
 
         let frontmatter_json = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
 
-        // Build scaffold content from template — fill in all placeholders
+        // Build scaffold content from template. The legacy template shows the
+        // human key; the directive scaffold (via `atomic intent new`) uses the
+        // ULID for child-id namespacing.
         let content = INTENT_TEMPLATE
             .replace("{{title}}", &options.title)
-            .replace("{{id}}", &intent_id)
+            .replace("{{id}}", &human_key)
             .replace("{{priority}}", &priority)
             .replace("{{created_by}}", &identity.to_string())
             .replace("{{created_at}}", &now);
@@ -244,7 +291,8 @@ impl Repository {
         self.vault_materialize(&intent_file)?;
 
         Ok(IntentCreateResult {
-            id: intent_id,
+            id: human_key,
+            uid,
             intent_dir,
             intent_file,
             view_name,
@@ -541,6 +589,53 @@ impl Repository {
             None => content_bytes,
         };
 
+        // Gate enforcement: a `done` intent must be internally consistent with
+        // its own checklist — every task `done` and every acceptance criterion
+        // `met` (the rollup rule), with valid task/criterion vocabulary. Enforce
+        // here so `--status done` (or rewriting the body of a done intent)
+        // cannot bypass the gate the way a raw frontmatter write would.
+        //
+        // We validate only when completion is actively asserted — setting `done`
+        // or editing the body of a done intent — so unrelated metadata edits are
+        // never retroactively blocked. We deliberately scope enforcement to the
+        // checklist shapes (TaskShape, AcceptanceCriterionShape) and the rollup
+        // (IntentShape/status): the broader structural gate (why, scope-out,
+        // proof, attributedTo) belongs to `atomic intent attest`/`validate` and
+        // must not force the canonical authoring format onto freeform intents.
+        let resulting_status = fm.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let asserting_done = options.status.as_deref() == Some("done")
+            || (options.content.is_some() && resulting_status == "done");
+        if asserting_done {
+            let body_str = String::from_utf8_lossy(&new_content).into_owned();
+            // A body we cannot lift carries no canonical checklist to grade, so
+            // there is nothing for the rollup to enforce; the full gate at
+            // attest/validate time still surfaces malformed directives.
+            if let Ok(node) = atomic_canonical::lift::lift_intent(&fm, &body_str) {
+                let report = atomic_canonical::validate_intent(&node);
+                let blocking: Vec<_> = report
+                    .results
+                    .iter()
+                    .filter(|v| {
+                        matches!(v.shape.as_str(), "TaskShape" | "AcceptanceCriterionShape")
+                            || (v.shape == "IntentShape" && v.path.as_deref() == Some("status"))
+                    })
+                    .collect();
+                if !blocking.is_empty() {
+                    let details = blocking
+                        .iter()
+                        .map(|v| format!("  - {}", v.message))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "Intent '{}' cannot be marked done: its checklist is not complete.\n{}",
+                            full_id, details
+                        ),
+                    });
+                }
+            }
+        }
+
         self.vault_store(&intent_file, VaultEntryType::Intent, new_content, new_fm)?;
 
         // Update manifest
@@ -677,36 +772,25 @@ impl Repository {
         Ok(())
     }
 
-    /// Build the vault-relative directory for an intent.
+    /// Build the vault-relative directory for an intent: `intents/<ulid>/`.
     ///
-    /// Agent mode:  `intents/<view>/<session>/<turn>/`
-    /// Manual mode: `intents/manual/<identity>/<N>/`
-    fn intent_dir_for(&self, session_id: Option<&str>, turn_id: Option<u32>) -> String {
-        let view = self.current_view();
-        match (session_id, turn_id) {
-            (Some(sid), Some(tid)) => format!("intents/{}/{}/{}", view, sid, tid),
-            _ => {
-                // Manual usage — scope under the user's identity name
-                let identity = self.resolve_vault_identity();
-                let manifest = self.vault_manifest().unwrap_or_default();
-                format!(
-                    "intents/manual/{}/{}",
-                    identity.name, manifest.next_intent_id
-                )
-            }
-        }
+    /// The ULID alone guarantees a unique, collision-free path — no view,
+    /// session, or turn nesting is needed (those are recorded as provenance
+    /// metadata on the intent instead).
+    fn intent_dir_for(&self, uid: &str) -> String {
+        format!("intents/{}", uid)
     }
 
-    /// Build the vault-relative path for an intent file.
-    fn intent_file_for(&self, session_id: Option<&str>, turn_id: Option<u32>) -> String {
-        format!("{}/intent.md", self.intent_dir_for(session_id, turn_id))
+    /// Build the vault-relative path for an intent file: `intents/<ulid>/intent.md`.
+    fn intent_file_for(&self, uid: &str) -> String {
+        format!("{}/intent.md", self.intent_dir_for(uid))
     }
 
-    /// Find the vault path for an intent by its display ID.
+    /// Find the vault path for an intent by its resolved manifest key.
     ///
     /// First checks the manifest's `vault_path` field (fast path), then
-    /// falls back to scanning vault entries under `intents/<current_view>/`
-    /// for a file whose frontmatter `id` field matches the normalized intent ID.
+    /// falls back to scanning `intents/` for a file whose frontmatter `id`
+    /// (human key) matches.
     fn find_intent_path(&self, full_id: &str) -> Result<Option<String>, RepositoryError> {
         // Fast path: check the manifest for a stored vault_path
         let manifest = self.vault_manifest()?;
@@ -719,11 +803,8 @@ impl Repository {
             }
         }
 
-        // Slow path: scan vault entries under the current view + manual/
-        let prefixes = [
-            format!("intents/{}/", self.current_view()),
-            "intents/manual/".to_string(),
-        ];
+        // Slow path: scan all intents (paths are now flat `intents/<ulid>/`).
+        let prefixes = ["intents/".to_string(), "intents/manual/".to_string()];
         for prefix in &prefixes {
             let entries = self.vault_list(prefix, None)?;
             for meta in entries {
@@ -744,31 +825,117 @@ impl Repository {
         Ok(None)
     }
 
-    /// Normalize an intent ID — accept "PIMO-1", "pimo-1", or just "1".
+    /// Resolve a user-supplied intent reference to its manifest key (human
+    /// key). Public entry point so callers outside the repository (e.g. the
+    /// CLI attestation bridge) share a single resolution implementation.
+    pub fn resolve_intent_key(&self, id: &str) -> Result<String, RepositoryError> {
+        self.normalize_intent_id(id)
+    }
+
+    /// Normalize a user-supplied intent reference to its manifest key (the
+    /// human key `PROJECT::author::seq`).
+    ///
+    /// Accepts, filling in the current project and author so the common case
+    /// is just a number:
+    /// - `3`               -> `PROJECT::<current-author>::3`
+    /// - `alice::3`        -> `PROJECT::alice::3`
+    /// - `PIMO::alice::3`  -> exact (project uppercased)
+    /// - a ULID or prefix  -> resolved to the matching intent's human key
+    /// - a legacy `PIMO-1` -> matched case-insensitively against manifest keys
     fn normalize_intent_id(&self, id: &str) -> Result<String, RepositoryError> {
-        // If it already looks like PREFIX-N, uppercase it
-        if id.contains('-') {
-            return Ok(id.to_uppercase());
-        }
+        use atomic_core::pristine::vault::{parse_intent_reference, IntentRef};
 
-        // Just a number — prepend the prefix
-        if id.parse::<u32>().is_ok() {
-            let manifest = self.vault_manifest()?;
-            let prefix = if manifest.intent_prefix.is_empty() {
-                "VAULT".to_string()
-            } else {
-                manifest.intent_prefix.clone()
-            };
-            return Ok(format!("{}-{}", prefix, id));
-        }
+        let manifest = self.vault_manifest()?;
+        let project = manifest.project_code().to_string();
+        let author = slug_author(&self.resolve_vault_identity().name);
 
-        // Unknown format
-        Err(RepositoryError::InvalidOperation {
-            message: format!(
-                "Invalid intent ID: '{}'. Expected format: PREFIX-N or N",
-                id
-            ),
-        })
+        match parse_intent_reference(id, &project, &author) {
+            IntentRef::HumanKey(key) => {
+                // Exact manifest key, or a case-insensitive / legacy match.
+                if manifest.intents.contains_key(&key) {
+                    return Ok(key);
+                }
+                if let Some(k) = manifest
+                    .intents
+                    .keys()
+                    .find(|k| k.eq_ignore_ascii_case(&key) || k.eq_ignore_ascii_case(id))
+                {
+                    return Ok(k.clone());
+                }
+                // No entry yet (e.g. freshly composed key): return the composed
+                // form so callers can still address it.
+                Ok(key)
+            }
+            IntentRef::Uid(uid) => {
+                // Prefer an exact UID. A prefix is accepted only when it
+                // identifies exactly one intent.
+                let mut matches: Vec<_> = manifest
+                    .intents
+                    .values()
+                    .filter(|summary| summary.uid.eq_ignore_ascii_case(&uid))
+                    .collect();
+                if matches.is_empty() {
+                    let prefix = uid.to_ascii_uppercase();
+                    matches = manifest
+                        .intents
+                        .values()
+                        .filter(|summary| summary.uid.to_ascii_uppercase().starts_with(&prefix))
+                        .collect();
+                }
+                matches.sort_by(|a, b| a.uid.cmp(&b.uid));
+
+                if matches.len() == 1 {
+                    let summary = matches[0];
+                    return Ok(if summary.human_key.is_empty() {
+                        summary.uid.clone()
+                    } else {
+                        summary.human_key.clone()
+                    });
+                }
+                if matches.len() > 1 {
+                    return Err(RepositoryError::AmbiguousIntent {
+                        prefix: id.to_string(),
+                        matches: matches
+                            .into_iter()
+                            .map(|summary| summary.uid.clone())
+                            .collect(),
+                    });
+                }
+                Err(RepositoryError::InvalidOperation {
+                    message: format!("No intent matches reference '{}'", id),
+                })
+            }
+        }
+    }
+}
+
+/// Slug an identity display name into a human-key author handle.
+///
+/// Lowercases, converts whitespace runs to single `-`, drops characters other
+/// than `[a-z0-9-]`, and collapses/trims hyphens. Interior hyphens are kept —
+/// the human key separates fields with `::`, so `lee-faus` stays unambiguous.
+/// Falls back to `unknown` when the result would be empty.
+pub(crate) fn slug_author(name: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in name.trim().chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            last_dash = false;
+        } else if (c.is_whitespace() || c == '-' || c == '_') && !out.is_empty() && !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+        // any other char is dropped
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
     }
 }
 
@@ -866,23 +1033,26 @@ mod tests {
             })
             .unwrap();
 
-        // ID should be PREFIX-1
-        assert!(result.id.ends_with("-1"), "ID was: {}", result.id);
-        // Path should be view-scoped and session-scoped
-        assert!(
-            result.intent_file.contains("/sess-abc/1/intent.md"),
+        // Human key ends with the per-author seq (`::1`); the ULID is the id.
+        assert!(result.id.ends_with("::1"), "human key was: {}", result.id);
+        assert_eq!(result.uid.len(), 26, "uid should be a 26-char ULID");
+        // Path is flat and ULID-scoped.
+        assert_eq!(
+            result.intent_file,
+            format!("intents/{}/intent.md", result.uid),
             "Path was: {}",
             result.intent_file
         );
         assert_eq!(result.view_name, repo.current_view());
 
-        // Should be in manifest
+        // Should be in manifest, keyed by the human key.
         let manifest = repo.vault_manifest().unwrap();
         assert!(manifest.intents.contains_key(&result.id));
         assert_eq!(manifest.intents[&result.id].priority, "high");
         assert_eq!(manifest.intents[&result.id].title, "Fix authentication");
         assert_eq!(manifest.intents[&result.id].vault_path, result.intent_file);
-        assert_eq!(manifest.next_intent_id, 2);
+        assert_eq!(manifest.intents[&result.id].uid, result.uid);
+        assert_eq!(manifest.intents[&result.id].seq, 1);
 
         // File should exist on disk
         assert!(repo.vault_dir().join(&result.intent_file).exists());
@@ -901,9 +1071,11 @@ mod tests {
             .vault_intent_create(create_opts_with_session("Second", "sess-1", 2))
             .unwrap();
 
-        assert!(r1.id.ends_with("-1"));
-        assert!(r2.id.ends_with("-2"));
-        // Different turns → different paths
+        // Same author → per-author sequence increments.
+        assert!(r1.id.ends_with("::1"), "first key: {}", r1.id);
+        assert!(r2.id.ends_with("::2"), "second key: {}", r2.id);
+        // Distinct ULIDs → distinct flat paths.
+        assert_ne!(r1.uid, r2.uid);
         assert_ne!(r1.intent_file, r2.intent_file);
     }
 
@@ -1130,6 +1302,71 @@ The authentication module has no rate limiting.
             "redb body should have disk edits. Got:\n{}",
             stored_body
         );
+    }
+
+    #[test]
+    fn test_intent_update_done_rejected_when_task_incomplete() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let result = repo
+            .vault_intent_create(create_opts("Rate limiting"))
+            .unwrap();
+
+        // A canonical body whose task is still open while we assert `done`.
+        let body = "\
+:::why\nNeed rate limiting.\n:::\n\n\
+:::acceptance-criterion{#ac-1 status=met verifiedBy=did:atomic:lee evidence=urn:atomic:change:01J8}\n\
+Login attempts are rate-limited.\n:::\n\n\
+:::task{#t1 status=open satisfies=ac-1}\nAdd rate limiter middleware.\n:::";
+
+        let err = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    status: Some("done".to_string()),
+                    content: Some(body.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("checklist is not complete") && msg.contains("every task must be done"),
+            "unexpected error: {msg}"
+        );
+
+        // The rejected write must not have flipped the manifest status.
+        let manifest = repo.vault_manifest().unwrap();
+        assert_ne!(manifest.intents[&result.id].status, "done");
+    }
+
+    #[test]
+    fn test_intent_update_done_allowed_when_checklist_complete() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let result = repo
+            .vault_intent_create(create_opts("Rate limiting"))
+            .unwrap();
+
+        // Same intent, but every task done and every criterion met.
+        let body = "\
+:::why\nNeed rate limiting.\n:::\n\n\
+:::acceptance-criterion{#ac-1 status=met verifiedBy=did:atomic:lee evidence=urn:atomic:change:01J8}\n\
+Login attempts are rate-limited.\n:::\n\n\
+:::task{#t1 status=done satisfies=ac-1}\nAdd rate limiter middleware.\n:::";
+
+        let updated = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    status: Some("done".to_string()),
+                    content: Some(body.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.status, "done");
     }
 
     #[test]
@@ -1429,25 +1666,56 @@ The authentication module has no rate limiting.
         let dir = tempdir().unwrap();
         let repo = init_repo_with_vault(dir.path());
 
-        // Create one intent to set the prefix
-        repo.vault_intent_create(create_opts("Test")).unwrap();
+        // Create one intent; capture its human key + ULID.
+        let created = repo.vault_intent_create(create_opts("Test")).unwrap();
+        let human_key = created.id.clone();
 
-        let manifest = repo.vault_manifest().unwrap();
-        let prefix = manifest.intent_prefix.clone();
+        // A bare number resolves to the current project + author + seq.
+        assert_eq!(repo.normalize_intent_id("1").unwrap(), human_key);
 
-        // Full ID
-        let normalized = repo.normalize_intent_id(&format!("{}-1", prefix)).unwrap();
-        assert_eq!(normalized, format!("{}-1", prefix));
+        // The full human key resolves to itself (project case-normalized).
+        assert_eq!(repo.normalize_intent_id(&human_key).unwrap(), human_key);
+        assert_eq!(
+            repo.normalize_intent_id(&human_key.to_lowercase()).unwrap(),
+            human_key
+        );
 
-        // Lowercase
-        let normalized = repo
-            .normalize_intent_id(&format!("{}-1", prefix.to_lowercase()))
-            .unwrap();
-        assert_eq!(normalized, format!("{}-1", prefix));
+        // A ULID (and a prefix of it) resolves to the same intent's human key.
+        assert_eq!(repo.normalize_intent_id(&created.uid).unwrap(), human_key);
+        assert_eq!(
+            repo.normalize_intent_id(&created.uid[..8]).unwrap(),
+            human_key
+        );
+    }
 
-        // Just number
-        let normalized = repo.normalize_intent_id("1").unwrap();
-        assert_eq!(normalized, format!("{}-1", prefix));
+    #[test]
+    fn test_normalize_intent_id_rejects_ambiguous_prefix() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let first = repo.vault_intent_create(create_opts("First")).unwrap();
+        let second = repo.vault_intent_create(create_opts("Second")).unwrap();
+        let first_uid = "01KTEST0000000000000000001";
+        let second_uid = "01KTEST0000000000000000002";
+
+        let mut txn = repo.pristine.write_txn().unwrap();
+        let mut manifest = txn.get_vault_manifest().unwrap();
+        manifest.intents.get_mut(&first.id).unwrap().uid = first_uid.into();
+        manifest.intents.get_mut(&second.id).unwrap().uid = second_uid.into();
+        txn.put_vault_manifest(&manifest).unwrap();
+        txn.commit().unwrap();
+
+        // A complete UID remains exact.
+        assert_eq!(repo.normalize_intent_id(first_uid).unwrap(), first.id);
+
+        // A shared prefix must never pick whichever HashMap entry appears first.
+        let error = repo.normalize_intent_id("01KTEST").unwrap_err();
+        match error {
+            RepositoryError::AmbiguousIntent { prefix, matches } => {
+                assert_eq!(prefix, "01KTEST");
+                assert_eq!(matches, vec![first_uid.to_string(), second_uid.to_string()]);
+            }
+            other => panic!("expected ambiguous intent error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1560,29 +1828,18 @@ The authentication module has no rate limiting.
         let dir = tempdir().unwrap();
         let repo = init_repo_with_vault(dir.path());
 
+        // "Manual" (no session/turn) intents use the same flat ULID path;
+        // session/turn are provenance metadata, not a path namespace.
         let result = repo
             .vault_intent_create(create_opts_manual("Manual intent"))
             .unwrap();
 
-        // Path should use manual/<identity>/ fallback
-        assert!(
-            result.intent_file.starts_with("intents/manual/"),
-            "Expected manual path, got: {}",
-            result.intent_file
-        );
-        assert!(result.intent_file.ends_with("/intent.md"));
-        // Should contain the identity name as a path segment
-        let identity = repo.resolve_vault_identity();
-        assert!(
-            result
-                .intent_file
-                .contains(&format!("manual/{}/", identity.name)),
-            "Expected identity '{}' in path: {}",
-            identity.name,
-            result.intent_file
+        assert_eq!(
+            result.intent_file,
+            format!("intents/{}/intent.md", result.uid)
         );
 
-        // Should still be retrievable
+        // Should still be retrievable by its human key.
         let entry = repo.vault_intent_show(&result.id).unwrap();
         let content = String::from_utf8_lossy(&entry.content_bytes);
         assert!(content.contains("# Manual intent"));
@@ -1595,15 +1852,12 @@ The authentication module has no rate limiting.
 
         let result = repo.vault_intent_create(create_opts("View check")).unwrap();
 
-        // The view_name should match the repo's current view
+        // The view_name should match the repo's current view.
         assert_eq!(result.view_name, repo.current_view());
-        // The path should contain the view name
-        assert!(
-            result
-                .intent_file
-                .starts_with(&format!("intents/{}/", repo.current_view())),
-            "Path was: {}",
-            result.intent_file
+        // The path is flat and ULID-scoped (the view lives in frontmatter now).
+        assert_eq!(
+            result.intent_file,
+            format!("intents/{}/intent.md", result.uid)
         );
     }
 

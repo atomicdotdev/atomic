@@ -292,6 +292,42 @@ impl ProvenanceAccumulator {
         node_id
     }
 
+    /// Append a generic todo snapshot and link it to the active turn goal.
+    pub fn append_todo_snapshot(
+        &mut self,
+        todo: &atomic_core::change::session::SessionTodo,
+        timestamp: i64,
+    ) -> String {
+        let node = GraphNode {
+            id: self.next_id(),
+            kind: NodeKind::Todo,
+            timestamp,
+            summary: todo.content.clone(),
+            detail: Some(serde_json::json!({
+                "todo_id": todo.id,
+                "content": todo.content,
+                "status": todo.status,
+                "priority": todo.priority,
+                "record_type": "todo",
+            })),
+            change_hash: None,
+            tool_name: None,
+            tool_call_id: None,
+            duration_ms: None,
+            classified: false,
+            confidence: None,
+            consolidated_from: Vec::new(),
+        };
+        let node_id = node.id.clone();
+        if let Some(goal) = self.current_goal.clone() {
+            self.edges
+                .push(GraphEdge::new(goal, &node_id, EdgeKind::LedTo));
+            self.stats.edge_count += 1;
+        }
+        self.push_node(node);
+        node_id
+    }
+
     /// Mark a human gate as resolved.
     ///
     /// Updates the gate node's detail and clears the pending gate state.

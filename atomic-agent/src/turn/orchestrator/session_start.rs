@@ -265,12 +265,52 @@ impl TurnOrchestrator {
         // Save the new session
         self.session_store.save(&session)?;
 
+        // Reconcile the Atomic session ledger with lifecycle metadata.
+        // Best-effort: the JSON file remains the runtime fallback, and
+        // `atomic session rebuild` can reconcile the index later.
+        self.sync_session_lifecycle(&session, None);
+
         let message = format!(
             "Atomic is tracking this session. Each turn will be recorded as a change on view '{}'.",
             session.view_name,
         );
 
         Ok(DispatchResult::new(session_id, session.phase).with_message(message))
+    }
+
+    /// Best-effort lifecycle reconciliation into the Atomic session ledger.
+    ///
+    /// `ended_at: None` marks the session active (clearing a stale end
+    /// marker when a session is re-entered); `Some(ts)` marks it ended.
+    /// Failures are logged and never block the hook — the JSON session
+    /// file remains the runtime fallback.
+    pub(crate) fn sync_session_lifecycle(
+        &self,
+        session: &crate::turn::session::AgentSession,
+        ended_at: Option<i64>,
+    ) {
+        match atomic_repository::Repository::open_existing(&self.repo_root) {
+            Ok(repo) => {
+                if let Err(e) = repo.upsert_session_lifecycle(
+                    &session.session_id,
+                    Some(session.view_name.clone()),
+                    session.parent_view.clone(),
+                    ended_at,
+                ) {
+                    log::warn!(
+                        "Session {} lifecycle reconciliation failed (recoverable): {}",
+                        session.session_id,
+                        e
+                    );
+                }
+            }
+            Err(e) => {
+                log::debug!(
+                    "Could not open repository for session lifecycle sync: {} (non-fatal)",
+                    e
+                );
+            }
+        }
     }
 
     /// Load an existing session or create a new one.

@@ -220,8 +220,9 @@ pub struct Revise {
 
     /// Author for the revised change (format: `"Name <email>"`).
     ///
-    /// If not provided, uses the original author.
-    #[arg(short, long)]
+    /// If not provided, uses the original author. No short flag: `-a` is
+    /// `--all` here, matching `atomic record`.
+    #[arg(long)]
     pub author: Option<String>,
 
     /// Show what would be done without making changes.

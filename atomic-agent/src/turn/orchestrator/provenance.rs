@@ -21,6 +21,7 @@ use crate::event::TurnEvent;
 use crate::provenance::accumulator::ProvenanceAccumulator;
 use crate::record::TurnRecordOutcome;
 use crate::turn::session::AgentSession;
+use atomic_core::change::session::SessionTodo;
 
 use super::{truncate_prompt, TurnOrchestrator};
 
@@ -401,7 +402,18 @@ impl TurnOrchestrator {
     ) {
         use atomic_core::types::Base32;
 
+        let plan_id = session
+            .managed_run
+            .as_ref()
+            .and_then(|run| run.work_item_id.clone());
+        let ledger_turn = session.turn_count.saturating_sub(1);
+        let todos = extract_turn_todos(event, session_id, ledger_turn);
+
         self.with_accumulator(session_id, |acc| {
+            for todo in &todos {
+                acc.append_todo_snapshot(todo, event.timestamp.timestamp());
+            }
+
             // Append a patch proposal node for the recorded change
             let change_hash_base32 = outcome.hash.to_base32();
             acc.append_patch_proposal(
@@ -423,6 +435,8 @@ impl TurnOrchestrator {
             if session.agent_name == "sherpa" {
                 graph.profile = Some("sherpa-trace/1.0.0".to_string());
             }
+            graph.plan_id = plan_id.clone();
+            graph.todos = todos.clone();
 
             // Save the provenance graph in two phases:
             //
@@ -532,5 +546,71 @@ impl TurnOrchestrator {
 
             true // always save — we appended the patch proposal node
         });
+    }
+}
+
+/// Extract the generic end-of-turn todo snapshot supplied by current agent
+/// hooks. Preserve an upstream stable `id` when present. Agents that omit IDs
+/// get a turn-local snapshot identity; this preserves the ledger faithfully
+/// without falsely claiming cross-turn lifecycle continuity.
+fn extract_turn_todos(event: &TurnEvent, session_id: &str, turn_number: u32) -> Vec<SessionTodo> {
+    event
+        .raw_json
+        .as_ref()
+        .and_then(|raw| raw.get("todos"))
+        .and_then(serde_json::Value::as_array)
+        .map(|todos| {
+            todos
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| {
+                    let content = value.get("content")?.as_str()?.to_string();
+                    let id = value
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            format!("session:{}/turn:{}/todo:{}", session_id, turn_number, index)
+                        });
+                    Some(SessionTodo {
+                        id,
+                        content,
+                        status: value
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("pending")
+                            .to_string(),
+                        priority: value
+                            .get("priority")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("medium")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod generic_context_tests {
+    use super::*;
+    use crate::event::HookType;
+
+    #[test]
+    fn extracts_explicit_and_turn_local_todo_ids() {
+        let event = TurnEvent::new("sess-1", HookType::TurnEnd).with_raw_json(serde_json::json!({
+            "todos": [
+                {"id": "todo-7", "content": "Keep ID", "status": "in_progress", "priority": "high"},
+                {"content": "Snapshot only", "status": "pending", "priority": "medium"}
+            ]
+        }));
+
+        let todos = extract_turn_todos(&event, "sess-1", 3);
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0].id, "todo-7");
+        assert_eq!(todos[1].id, "session:sess-1/turn:3/todo:1");
+        assert_eq!(todos[0].status, "in_progress");
     }
 }
