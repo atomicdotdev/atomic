@@ -206,12 +206,17 @@ pub enum CliError {
     /// run". The command parses fine and runs; the id simply is not there, and
     /// the two cases call for opposite recoveries: fix the command line, versus
     /// create the entity or look up the right id.
-    #[error("{kind} not found: {id}")]
+    #[error("{kind} not found: {id}{}", .hint.as_deref().map(|h| format!(" ({h})")).unwrap_or_default())]
     VaultEntityNotFound {
         /// The kind of entity, lowercase and singular: `memory`, `intent`, …
         kind: &'static str,
         /// The id (or partial id) that did not resolve
         id: String,
+        /// Optional recovery hint, rendered parenthesized after the id — e.g.
+        /// `create with \`atomic memory new\``. The exit code already tells an
+        /// agent *what* went wrong; this tells a caller what to do about it,
+        /// for the sites that have a single obvious next step.
+        hint: Option<String>,
     },
 
     /// The change hash is ambiguous (matches multiple changes).

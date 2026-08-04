@@ -57,6 +57,7 @@ impl Command for Show {
             .ok_or_else(|| CliError::VaultEntityNotFound {
                 kind: "vault entry",
                 id: self.path.clone(),
+                hint: None,
             })?;
         let revision_hash =
             (self.json || self.revision.is_some()).then(|| vault_entry_revision_hash(&entry));
