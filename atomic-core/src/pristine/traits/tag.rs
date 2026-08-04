@@ -42,7 +42,40 @@ pub struct TagRecord {
     pub kind: TagKind,
     /// Extensible metadata (not included in content hash).
     /// Carries Git provenance, CI status, review approvals, etc.
+    ///
+    /// Stored as JSON text because postcard (the TAG_RECORDS codec) is not
+    /// self-describing and cannot round-trip `serde_json::Value` directly.
+    #[serde(with = "json_metadata")]
     pub metadata: Option<serde_json::Value>,
+}
+
+/// Serde adapter that stores `Option<serde_json::Value>` as an
+/// `Option<String>` of JSON text. Postcard handles the string fine;
+/// `None` records (the pre-metadata format) decode unchanged.
+mod json_metadata {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<serde_json::Value>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(v) => serializer.serialize_some(&v.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<serde_json::Value>, D::Error> {
+        let opt: Option<String> = Option::deserialize(deserializer)?;
+        match opt {
+            Some(s) => serde_json::from_str(&s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
 }
 
 /// What the tag represents.
@@ -181,4 +214,48 @@ pub trait GitShaIndexMutTxnT: GitShaIndexTxnT {
 
     /// Remove a Git SHA mapping.
     fn del_git_sha(&mut self, sha: &str) -> Result<bool, PristineError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_tag(metadata: Option<serde_json::Value>) -> TagRecord {
+        TagRecord {
+            name: "pr-99".to_string(),
+            view: "main".to_string(),
+            sequence: 42,
+            state: Merkle::of(b"state"),
+            change_hash: Hash::of(b"change"),
+            timestamp: Utc::now(),
+            author: None,
+            message: Some("Squash merge abc123".to_string()),
+            kind: TagKind::ReviewGate,
+            metadata,
+        }
+    }
+
+    #[test]
+    fn test_tag_record_postcard_roundtrip_with_metadata() {
+        let metadata = serde_json::json!({
+            "git": { "sha": "abc123", "merge_strategy": "squash", "pr_number": 99 },
+            "changes": { "original_hashes": ["AAA", "BBB"] }
+        });
+        let tag = test_tag(Some(metadata.clone()));
+
+        let bytes = postcard::to_allocvec(&tag).unwrap();
+        let decoded: TagRecord = postcard::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded, tag);
+        assert_eq!(decoded.metadata, Some(metadata));
+    }
+
+    #[test]
+    fn test_tag_record_postcard_roundtrip_without_metadata() {
+        let tag = test_tag(None);
+        let bytes = postcard::to_allocvec(&tag).unwrap();
+        let decoded: TagRecord = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, tag);
+        assert!(decoded.metadata.is_none());
+    }
 }

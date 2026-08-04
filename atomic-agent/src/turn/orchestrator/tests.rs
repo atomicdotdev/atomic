@@ -961,7 +961,7 @@ async fn test_session_start_adopts_declared_managed_view() {
     assert_eq!(
         session.parent_view.as_deref(),
         Some("dev"),
-        "parent view is remembered so session-end can restore it"
+        "parent view is remembered as the fork/insert baseline"
     );
     let stamp = session
         .managed_run
@@ -987,15 +987,16 @@ async fn test_session_start_adopts_declared_managed_view() {
     );
     assert_eq!(result.view.as_deref(), Some("sherpa-run-view"));
 
-    // Session end restores the parent view.
+    // Session end leaves the working copy on the agent's view: the user
+    // lands where the work happened and can review/insert from there.
     orch.dispatch(session_end_event("sess-managed"))
         .await
         .unwrap();
     let repo = Repository::open_existing(dir.path()).unwrap();
     assert_eq!(
         repo.current_view(),
-        "dev",
-        "session-end restores the user's view"
+        "sherpa-run-view",
+        "session-end leaves the working copy on the agent's view"
     );
 }
 

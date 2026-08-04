@@ -213,7 +213,7 @@ invocation is a fresh, stateless CLI process keyed by `session_id`.
 | `PreToolUse` | `before-tool`, `pre-tool` | before a tool runs | Bookkeeping only (no output yet) |
 | `PostToolUse` | `after-tool`, `post-tool` | after a tool runs | Appends a classified node (`Exploration` / `Commitment` / `Verification` / `Execution` / `Error`) plus inferred causal edges to the session's **decision graph** |
 | `TurnEnd` | `stop`, `after-agent`, `turn-end` | agent finishes a turn | **Records a change** on the draft view with full AI provenance embedded |
-| `SessionEnd` | `session-end` | agent session closes | Flushes any unrecorded work, writes the **AI attestation**, restores the parent view |
+| `SessionEnd` | `session-end` | agent session closes | Flushes any unrecorded work, writes the **AI attestation**; the working copy stays on the session's view so the user lands where the work happened |
 
 **The golden rule of responsibility:** the agent side (plugin or hook command)
 only does two things — fire the event at the right moment, and attach a JSON

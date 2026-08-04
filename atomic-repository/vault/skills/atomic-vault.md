@@ -141,7 +141,8 @@ workflow orchestrator own all of that:
   view — depending on how you were launched).
 - **Turn end** records automatically with full AI provenance (model,
   session, decision graph).
-- **Session end** restores the original view.
+- **Session end** leaves the working copy on the session's view, where
+  the recorded work lives — review it there.
 - **Merging into a shared view** (`atomic insert`) is a human/orchestrator
   decision made at review time — never run it yourself.
 

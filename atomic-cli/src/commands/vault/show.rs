@@ -54,8 +54,9 @@ impl Command for Show {
         let entry = repo
             .vault_retrieve(&self.path)
             .map_err(CliError::Repository)?
-            .ok_or_else(|| CliError::InvalidArgument {
-                message: format!("Vault entry not found: {}", self.path),
+            .ok_or_else(|| CliError::VaultEntityNotFound {
+                kind: "vault entry",
+                id: self.path.clone(),
             })?;
         let revision_hash =
             (self.json || self.revision.is_some()).then(|| vault_entry_revision_hash(&entry));
