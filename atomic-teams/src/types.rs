@@ -278,6 +278,26 @@ pub struct OrgMemberInfo {
     /// Identity that sent the invitation, if applicable.
     #[serde(alias = "invited_by")]
     pub invited_by: Option<Uuid>,
+
+    // The fields below describe the member's *identity* rather than the
+    // membership. Every one is `#[serde(default)]` because a server older than
+    // the release that added them omits it entirely — without the defaults the
+    // whole response would fail to deserialize and `member list` would break
+    // against an un-upgraded deployment. `None` therefore means "this server
+    // did not say", not "this member has none".
+    /// Display name of the member's identity.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Ed25519 public key, base32 no-pad — the same encoding used elsewhere in
+    /// Atomic, and the value a caller's token is keyed by.
+    #[serde(default, alias = "public_key")]
+    pub public_key: Option<String>,
+    /// Identity lifecycle status: `active`, `suspended`, or `deleted`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Preferred email — verified if available, otherwise the oldest on file.
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 /// Team metadata.
@@ -748,11 +768,62 @@ mod tests {
             role: OrgRole::Admin,
             joined_at: now,
             invited_by: Some(Uuid::new_v4()),
+            name: Some("ada".to_string()),
+            public_key: Some("MFRGGZDFMZTWQ2LK".to_string()),
+            status: Some("active".to_string()),
+            email: Some("ada@example.com".to_string()),
         };
         let json = serde_json::to_string(&info).unwrap();
         let de: OrgMemberInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(de.role, OrgRole::Admin);
         assert!(de.invited_by.is_some());
+        assert_eq!(de.name.as_deref(), Some("ada"));
+        assert_eq!(de.public_key.as_deref(), Some("MFRGGZDFMZTWQ2LK"));
+        assert_eq!(de.status.as_deref(), Some("active"));
+        assert_eq!(de.email.as_deref(), Some("ada@example.com"));
+    }
+
+    /// A server predating the identity-detail fields omits them entirely.
+    ///
+    /// Without `#[serde(default)]` on each, the whole response would fail to
+    /// parse and `org member list` would break against an un-upgraded
+    /// deployment rather than degrading to the columns it does know.
+    #[test]
+    fn org_member_info_tolerates_server_without_identity_details() {
+        let json = r#"{
+            "org_id": "00000000-0000-0000-0000-000000000001",
+            "identity_id": "00000000-0000-0000-0000-000000000002",
+            "role": "member",
+            "joined_at": "2026-01-01T00:00:00Z",
+            "invited_by": null
+        }"#;
+
+        let de: OrgMemberInfo = serde_json::from_str(json).expect("legacy payload must parse");
+        assert_eq!(de.role, OrgRole::Member);
+        assert_eq!(de.name, None);
+        assert_eq!(de.public_key, None);
+        assert_eq!(de.status, None);
+        assert_eq!(de.email, None);
+    }
+
+    /// The server serializes these as snake_case; the struct is camelCase.
+    #[test]
+    fn org_member_info_accepts_snake_case_public_key() {
+        let json = r#"{
+            "org_id": "00000000-0000-0000-0000-000000000001",
+            "identity_id": "00000000-0000-0000-0000-000000000002",
+            "role": "owner",
+            "joined_at": "2026-01-01T00:00:00Z",
+            "invited_by": null,
+            "name": "ada",
+            "public_key": "MFRGGZDFMZTWQ2LK",
+            "status": "active",
+            "email": "ada@example.com"
+        }"#;
+
+        let de: OrgMemberInfo = serde_json::from_str(json).expect("snake_case payload must parse");
+        assert_eq!(de.public_key.as_deref(), Some("MFRGGZDFMZTWQ2LK"));
+        assert_eq!(de.name.as_deref(), Some("ada"));
     }
 
     #[test]
