@@ -13,6 +13,10 @@ impl TurnOrchestrator {
     /// Transitions the session to Ended, saves it, and creates an
     /// attestation covering all changes recorded during the session.
     ///
+    /// The working copy stays on the session's agent view so the user
+    /// lands where the work happened and can review it before inserting
+    /// it into a shared view.
+    ///
     /// The attestation is a graph-level audit node — it captures agent
     /// identity, timing, and which changes were recorded. Cost and token
     /// data are left at zero (they're not available from the hook) and
@@ -46,9 +50,7 @@ impl TurnOrchestrator {
         // Flush any unrecorded turn BEFORE finalizing. Headless agents such as
         // Cursor's CLI fire sessionStart/postToolUse/sessionEnd but no per-turn
         // `stop` (TurnEnd), so the turn's file changes are still uncommitted at
-        // session end. Record them now — crucially *before* switching back to
-        // the parent view below, which restores the working copy and would
-        // otherwise discard the agent's work. Idempotent: agents that already
+        // session end. Record them now. Idempotent: agents that already
         // recorded each turn on `stop` leave a clean working copy here, so
         // `record_turn` returns `EmptyTurn` and this is a no-op for them.
         {
@@ -139,6 +141,11 @@ impl TurnOrchestrator {
 
         self.session_store.save(&session)?;
 
+        // Reconcile the Atomic session ledger: the session is now ended.
+        // Best-effort — the JSON file remains the runtime fallback.
+        let ended_at = session.ended_at.map(|t| t.timestamp());
+        self.sync_session_lifecycle(&session, ended_at);
+
         log::info!(
             "Session {} ended after {} turn{}",
             session_id,
@@ -157,30 +164,12 @@ impl TurnOrchestrator {
             self.create_session_attestation(&session);
         }
 
-        // Switch back to the user's original view. session-start switched
-        // to the agent view so that all file writes happened there. Now
-        // that the session is over, restore the user's view.
-        if let Some(ref parent) = session.parent_view {
-            match atomic_repository::Repository::open_existing(&self.repo_root) {
-                Ok(mut repo) => {
-                    if let Err(e) = repo.switch_view(parent) {
-                        log::warn!(
-                            "Could not switch back to user view '{}': {} (non-fatal)",
-                            parent,
-                            e,
-                        );
-                    } else {
-                        log::info!("Restored user view '{}'", parent);
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Could not open repository to restore user view: {} (non-fatal)",
-                        e,
-                    );
-                }
-            }
-        }
+        // Deliberately do NOT switch back to `session.parent_view`: the
+        // working copy stays on the session's agent view so the user lands
+        // where the work happened and can review it (`atomic log`/`diff`)
+        // before deciding to insert it into a shared view. Switching back
+        // forced users to hunt through `atomic view list` for the view
+        // holding their agent's changes.
 
         Ok(DispatchResult::new(session_id, session.phase))
     }

@@ -15,12 +15,16 @@
 //! load → mutate → save cycles are serialized through an advisory file
 //! lock (`{session_dir}/graph.lock`) to prevent corruption.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::event::TurnEvent;
-use crate::provenance::accumulator::ProvenanceAccumulator;
+use crate::provenance::accumulator::{build_tool_detail, ProvenanceAccumulator};
+use crate::provenance::classify::summarize_tool_call;
 use crate::record::TurnRecordOutcome;
+use crate::transcript;
 use crate::turn::session::AgentSession;
+use atomic_core::change::session::SessionTodo;
 
 use super::{truncate_prompt, TurnOrchestrator};
 
@@ -245,6 +249,239 @@ impl TurnOrchestrator {
         });
     }
 
+    /// Inject an LLM response node into the ProvenanceAccumulator.
+    ///
+    /// The agent's closing message for the turn — what it *concluded*, as
+    /// opposed to the tool-derived nodes that capture what it *did*.
+    /// Sources, in priority order:
+    ///
+    /// 1. The stop payload, when the agent sends the response there
+    ///    (`last_assistant_message` for codex/grok, `prompt_response` for
+    ///    gemini-cli, `response` for plugins that supply it).
+    /// 2. The last assistant entry of the session transcript (claude-code:
+    ///    the Stop hook carries `transcript_path`, applied to the session
+    ///    before recording).
+    ///
+    /// Agents with neither source available get no node.
+    pub(crate) fn inject_response_node(
+        &mut self,
+        session_id: &str,
+        session: &AgentSession,
+        event: &TurnEvent,
+    ) {
+        let raw = event.raw_json.as_ref();
+        let from_payload = |key: &str| -> Option<String> {
+            raw.and_then(|r| r.get(key))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+
+        let response = from_payload("last_assistant_message")
+            .or_else(|| from_payload("prompt_response"))
+            .or_else(|| from_payload("response"))
+            .or_else(|| {
+                let path = session.transcript_path.as_ref()?;
+                let data = std::fs::read(path).ok()?;
+                transcript::last_assistant_text(
+                    &data,
+                    transcript::format_for_agent(&session.agent_name),
+                )
+            });
+
+        let Some(response) = response else {
+            return;
+        };
+
+        let timestamp = event.timestamp.timestamp();
+        self.with_accumulator(session_id, |acc| {
+            acc.append_llm_response(&response, timestamp);
+            true
+        });
+    }
+
+    /// OpenCode: recover transcript, reasoning, and response from
+    /// OpenCode's local SQLite store and fold them into the session and
+    /// the stop payload before recording.
+    ///
+    /// OpenCode writes no transcript file, so its sessions never carry a
+    /// `transcript_path`, and thin plugin versions forward only
+    /// session/model metadata. Without this step an OpenCode turn could
+    /// never carry `agent_turn` data, reasoning, or an `llm_response`
+    /// node. The recovered data lands exactly where the existing pipeline
+    /// reads it:
+    ///
+    /// - the transcript is synthesized into the session directory and set
+    ///   as `session.transcript_path` (consumed by
+    ///   `build_unhashed_turn_data` via the `opencode` condense format);
+    /// - the turn's reasoning/response/token/cost fields are injected
+    ///   into `event.raw_json` only when the plugin didn't send them
+    ///   (consumed by `build_turn_provenance`, `inject_reasoning_nodes`,
+    ///   and `inject_response_node`).
+    ///
+    /// Best-effort: any failure leaves the turn recording what the plugin
+    /// sent.
+    pub(crate) fn enrich_opencode_turn(&self, session: &mut AgentSession, event: &mut TurnEvent) {
+        if session.agent_name != "opencode" {
+            return;
+        }
+
+        let Some(data) = transcript::opencode::read_turn(&session.session_id, &self.repo_root)
+        else {
+            return;
+        };
+
+        // 1. Transcript file → transcript_path (unblocks agent_turn).
+        // Rewritten on every turn (whole-session record); a plugin-supplied
+        // transcript path is never clobbered.
+        if !data.transcript_jsonl.is_empty() {
+            let dir = self.session_graph_dir(&session.session_id);
+            let synthesized = dir.join("opencode-transcript.jsonl");
+            let ours = session.transcript_path.is_none()
+                || session.transcript_path.as_deref() == Some(synthesized.as_path());
+            if ours {
+                let _ = std::fs::create_dir_all(&dir);
+                match std::fs::write(&synthesized, &data.transcript_jsonl) {
+                    Ok(()) => session.set_transcript_path(&synthesized),
+                    Err(e) => log::warn!(
+                        "Failed to write opencode transcript for session {}: {}",
+                        session.session_id,
+                        e
+                    ),
+                }
+            }
+        }
+
+        // 2. Stop-payload fields the plugin didn't send.
+        let Some(raw) = event.raw_json.as_mut() else {
+            return;
+        };
+        let Some(obj) = raw.as_object_mut() else {
+            return;
+        };
+
+        if !obj.contains_key("reasoning_blocks")
+            && !obj.contains_key("reasoning_text")
+            && !data.reasoning_blocks.is_empty()
+        {
+            let blocks: Vec<serde_json::Value> = data
+                .reasoning_blocks
+                .iter()
+                .map(|b| {
+                    serde_json::json!({
+                        "text": b.text,
+                        "duration_ms": b.duration_ms,
+                    })
+                })
+                .collect();
+            obj.insert(
+                "reasoning_blocks".to_string(),
+                serde_json::Value::Array(blocks),
+            );
+        }
+
+        if let Some(response) = &data.response {
+            if !obj.contains_key("last_assistant_message") && !obj.contains_key("response") {
+                obj.insert("response".to_string(), serde_json::json!(response));
+            }
+        }
+
+        let have_tokens = obj.contains_key("input_tokens") || obj.contains_key("output_tokens");
+        if !have_tokens
+            && (data.input_tokens > 0 || data.output_tokens > 0 || data.reasoning_tokens > 0)
+        {
+            obj.insert(
+                "input_tokens".to_string(),
+                serde_json::json!(data.input_tokens),
+            );
+            obj.insert(
+                "output_tokens".to_string(),
+                serde_json::json!(data.output_tokens),
+            );
+            obj.insert(
+                "reasoning_tokens".to_string(),
+                serde_json::json!(data.reasoning_tokens),
+            );
+            obj.insert(
+                "cache_read_tokens".to_string(),
+                serde_json::json!(data.cache_read_tokens),
+            );
+            obj.insert(
+                "cache_write_tokens".to_string(),
+                serde_json::json!(data.cache_write_tokens),
+            );
+        }
+
+        if !obj.contains_key("cost_usd") && data.cost_usd > 0.0 {
+            obj.insert("cost_usd".to_string(), serde_json::json!(data.cost_usd));
+        }
+        if !obj.contains_key("finish_reason") {
+            if let Some(reason) = &data.finish_reason {
+                obj.insert("finish_reason".to_string(), serde_json::json!(reason));
+            }
+        }
+        if !obj.contains_key("step_count") && data.step_count > 0 {
+            obj.insert("step_count".to_string(), serde_json::json!(data.step_count));
+        }
+
+        // 3. Enrich the session graph's tool nodes. Thin plugin payloads carry
+        //    no tool input/output, so nodes recorded at hook time hold bare
+        //    summaries ("Execute bash"). The store's tool parts carry the
+        //    command, file and output under the same call id — rewrite the
+        //    summary and detail so the graph reads as rich as the rich-plugin
+        //    path. Runs over ALL nodes, so one enriched turn repairs earlier
+        //    thin turns of the same session.
+        if !data.tool_parts.is_empty() {
+            let by_call: HashMap<&str, &transcript::opencode::ToolPart> = data
+                .tool_parts
+                .iter()
+                .map(|tp| (tp.call_id.as_str(), tp))
+                .collect();
+
+            self.with_accumulator(&session.session_id, |acc| {
+                let mut changed = false;
+                for node in acc.nodes.iter_mut() {
+                    let Some(call_id) = node.tool_call_id.as_deref() else {
+                        continue;
+                    };
+                    let Some(tp) = by_call.get(call_id) else {
+                        continue;
+                    };
+                    let tool_name = node.tool_name.as_deref().unwrap_or(tp.tool.as_str());
+                    let input = tp.input.as_ref();
+                    let output = tp.output.as_deref();
+                    let status = tp.status.as_deref();
+
+                    let summary = summarize_tool_call(tool_name, node.kind, input, output, status);
+                    if summary != node.summary {
+                        node.summary = summary;
+                        changed = true;
+                    }
+                    if let Some(detail) = build_tool_detail(node.kind, tool_name, input, output) {
+                        node.detail = Some(detail);
+                        changed = true;
+                    }
+                }
+                changed
+            });
+        }
+
+        log::info!(
+            "Recovered opencode turn data from local store for session {} \
+             ({} reasoning block{}, response: {}, {} step{})",
+            session.session_id,
+            data.reasoning_blocks.len(),
+            if data.reasoning_blocks.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            data.response.is_some(),
+            data.step_count,
+            if data.step_count == 1 { "" } else { "s" },
+        );
+    }
+
     /// Read a Sherpa JSONL trace file and create provenance nodes for
     /// every record, preserving the full agent-trace + Sherpa extension data.
     ///
@@ -401,7 +638,18 @@ impl TurnOrchestrator {
     ) {
         use atomic_core::types::Base32;
 
+        let plan_id = session
+            .managed_run
+            .as_ref()
+            .and_then(|run| run.work_item_id.clone());
+        let ledger_turn = session.turn_count.saturating_sub(1);
+        let todos = extract_turn_todos(event, session_id, ledger_turn);
+
         self.with_accumulator(session_id, |acc| {
+            for todo in &todos {
+                acc.append_todo_snapshot(todo, event.timestamp.timestamp());
+            }
+
             // Append a patch proposal node for the recorded change
             let change_hash_base32 = outcome.hash.to_base32();
             acc.append_patch_proposal(
@@ -423,6 +671,8 @@ impl TurnOrchestrator {
             if session.agent_name == "sherpa" {
                 graph.profile = Some("sherpa-trace/1.0.0".to_string());
             }
+            graph.plan_id = plan_id.clone();
+            graph.todos = todos.clone();
 
             // Save the provenance graph in two phases:
             //
@@ -532,5 +782,71 @@ impl TurnOrchestrator {
 
             true // always save — we appended the patch proposal node
         });
+    }
+}
+
+/// Extract the generic end-of-turn todo snapshot supplied by current agent
+/// hooks. Preserve an upstream stable `id` when present. Agents that omit IDs
+/// get a turn-local snapshot identity; this preserves the ledger faithfully
+/// without falsely claiming cross-turn lifecycle continuity.
+fn extract_turn_todos(event: &TurnEvent, session_id: &str, turn_number: u32) -> Vec<SessionTodo> {
+    event
+        .raw_json
+        .as_ref()
+        .and_then(|raw| raw.get("todos"))
+        .and_then(serde_json::Value::as_array)
+        .map(|todos| {
+            todos
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| {
+                    let content = value.get("content")?.as_str()?.to_string();
+                    let id = value
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            format!("session:{}/turn:{}/todo:{}", session_id, turn_number, index)
+                        });
+                    Some(SessionTodo {
+                        id,
+                        content,
+                        status: value
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("pending")
+                            .to_string(),
+                        priority: value
+                            .get("priority")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("medium")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod generic_context_tests {
+    use super::*;
+    use crate::event::HookType;
+
+    #[test]
+    fn extracts_explicit_and_turn_local_todo_ids() {
+        let event = TurnEvent::new("sess-1", HookType::TurnEnd).with_raw_json(serde_json::json!({
+            "todos": [
+                {"id": "todo-7", "content": "Keep ID", "status": "in_progress", "priority": "high"},
+                {"content": "Snapshot only", "status": "pending", "priority": "medium"}
+            ]
+        }));
+
+        let todos = extract_turn_todos(&event, "sess-1", 3);
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0].id, "todo-7");
+        assert_eq!(todos[1].id, "session:sess-1/turn:3/todo:1");
+        assert_eq!(todos[0].status, "in_progress");
     }
 }

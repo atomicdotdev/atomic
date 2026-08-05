@@ -35,6 +35,27 @@ pub(crate) struct ProvenanceGraphV1 {
     pub stats: ProvenanceStats,
 }
 
+/// Schema v2 layout — adds `profile`, but predates generic plan/todo context.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ProvenanceGraphV2 {
+    pub version: u8,
+    pub timestamp: i64,
+    pub session_id: String,
+    pub agent_name: String,
+    #[serde(default)]
+    pub agent_display_name: String,
+    #[serde(default)]
+    pub agent_vendor: String,
+    pub nodes: Vec<ProvenanceNode>,
+    pub edges: Vec<ProvenanceEdge>,
+    pub changes_explained: Vec<Hash>,
+    #[serde(default)]
+    pub previous: Option<Hash>,
+    pub stats: ProvenanceStats,
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
 // =============================================================================
 // ProvenanceGraphBuilder
 // =============================================================================
@@ -51,6 +72,8 @@ pub struct ProvenanceGraphBuilder {
     changes_explained: Vec<Hash>,
     previous: Option<Hash>,
     timestamp: Option<i64>,
+    plan_id: Option<String>,
+    todos: Vec<crate::change::session::SessionTodo>,
 }
 
 impl ProvenanceGraphBuilder {
@@ -67,6 +90,8 @@ impl ProvenanceGraphBuilder {
             changes_explained: Vec::new(),
             previous: None,
             timestamp: None,
+            plan_id: None,
+            todos: Vec::new(),
         }
     }
 
@@ -139,6 +164,18 @@ impl ProvenanceGraphBuilder {
         self
     }
 
+    /// Set the vault work-item/intent governing this turn.
+    pub fn plan_id(mut self, plan_id: impl Into<String>) -> Self {
+        self.plan_id = Some(plan_id.into());
+        self
+    }
+
+    /// Set the generic todo snapshot captured at turn end.
+    pub fn todos(mut self, todos: Vec<crate::change::session::SessionTodo>) -> Self {
+        self.todos = todos;
+        self
+    }
+
     /// Build the provenance graph.
     pub fn build(self) -> ProvenanceGraph {
         let timestamp = self.timestamp.unwrap_or_else(|| {
@@ -163,6 +200,8 @@ impl ProvenanceGraphBuilder {
             previous: self.previous,
             stats,
             profile: self.profile,
+            plan_id: self.plan_id,
+            todos: self.todos,
         }
     }
 }

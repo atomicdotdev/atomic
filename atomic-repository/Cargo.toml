@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 atomic-core = { workspace = true }
+atomic-canonical = { workspace = true }
 atomic-config = { workspace = true }
 atomic-identity = { workspace = true }
 atomic-semantic = { workspace = true }
@@ -24,6 +25,7 @@ rayon = { workspace = true }
 redb = { workspace = true }
 zstd = { workspace = true }
 dirs = "5.0"
+ulid = { workspace = true }
 walkdir = { workspace = true }
 reflink-copy = "0.1"
 ignore = { workspace = true }

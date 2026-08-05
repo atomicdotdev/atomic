@@ -5,6 +5,8 @@
 
 use super::*;
 use crate::content_search::{has_content_index, search_content, ContentSearchOptions};
+use atomic_canonical::lift::lift_intent;
+use atomic_canonical::CanonicalNode;
 use atomic_core::pristine::ontology::{edge_kind, predicate};
 use atomic_core::pristine::tables::tokenize_for_fts;
 use atomic_core::pristine::vault::{
@@ -60,6 +62,14 @@ impl Repository {
         let mut node = KgNode::new(&subject, kind, label, "vault")
             .with_metadata(serde_json::json!({ "vault_path": path }));
 
+        // Canonical RDF ids and today's path-keyed KG ids are not always the
+        // same. In particular, a canonical `urn:atomic:intent:atom-1` may live
+        // at `intents/manual/<identity>/1/intent.md`. Resolve lineage targets
+        // through the manifest so edges reach the actual indexed node while
+        // their metadata retains the exact RDF target. Computed up front so the
+        // frontmatter extraction below resolves intent links in a single pass.
+        let manifest = self.vault_manifest().ok();
+
         // Extract from frontmatter
         if let Ok(fm) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
             &entry.frontmatter_json,
@@ -68,6 +78,7 @@ impl Repository {
                 &subject,
                 entry.entry_type,
                 &fm,
+                manifest.as_ref(),
                 &mut node,
                 &mut nodes,
                 &mut edges,
@@ -78,12 +89,27 @@ impl Repository {
         let content = String::from_utf8_lossy(&entry.content_bytes);
         extract_content_edges(&subject, entry.entry_type, &content, &mut edges);
 
-        // Canonical RDF ids and today's path-keyed KG ids are not always the
-        // same. In particular, a canonical `urn:atomic:intent:atom-1` may live
-        // at `intents/manual/<identity>/1/intent.md`. Resolve through the
-        // manifest so lineage edges reach the actual indexed node while their
-        // metadata retains the exact RDF target.
-        let manifest = self.vault_manifest().ok();
+        // Intent bodies carry a directive-based decomposition (acceptance
+        // criteria, tasks, scope, constraints, and typed dependency refs). Lift
+        // it and project the structure into the graph so the semantic web is
+        // queryable: intent→task→criterion, task→file, etc. A body that does not
+        // lift (legacy prose intents, malformed directives, or a missing `id`)
+        // is skipped rather than failing KG extraction.
+        if entry.entry_type == VaultEntryType::Intent {
+            if let Ok(fm) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                &entry.frontmatter_json,
+            ) {
+                if let Ok(lifted) = lift_intent(&fm, content.as_ref()) {
+                    project_intent_semantics(
+                        &subject,
+                        &lifted,
+                        manifest.as_ref(),
+                        &mut nodes,
+                        &mut edges,
+                    );
+                }
+            }
+        }
 
         // Edge direction is not enough to determine ownership. In particular,
         // an Intent's symmetric `BLOCKS` edge points *into* the Intent node.
@@ -188,6 +214,12 @@ impl Repository {
 
         txn.init_kg()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Remove any child nodes this intent previously projected (tasks,
+        // acceptance criteria, scope, constraints) before re-projecting, so a
+        // removed task/criterion does not orphan its node and stale
+        // SATISFIES/TOUCHES edges. No-op for non-intent subjects.
+        delete_intent_child_nodes(&mut txn, &subject)?;
 
         if nodes.iter().any(|node| node.id == subject) {
             // This is an in-place replacement of the same resource. Remove
@@ -816,6 +848,7 @@ fn extract_frontmatter_kg(
     subject: &str,
     entry_type: VaultEntryType,
     fm: &serde_json::Map<String, serde_json::Value>,
+    manifest: Option<&VaultManifest>,
     node: &mut KgNode,
     nodes: &mut Vec<KgNode>,
     edges: &mut Vec<KgEdge>,
@@ -928,7 +961,12 @@ fn extract_frontmatter_kg(
                 }
             }
             for source in frontmatter_links(fm, "informedBy") {
-                edges.push(rdf_link_edge(subject, source, predicate::INFORMED_BY));
+                edges.push(rdf_link_edge(
+                    subject,
+                    source,
+                    predicate::INFORMED_BY,
+                    manifest,
+                ));
             }
         }
         VaultEntryType::Memory => {
@@ -938,7 +976,12 @@ fn extract_frontmatter_kg(
                 }
             }
             for source in frontmatter_links(fm, "derivedFrom") {
-                edges.push(rdf_link_edge(subject, source, predicate::WAS_DERIVED_FROM));
+                edges.push(rdf_link_edge(
+                    subject,
+                    source,
+                    predicate::WAS_DERIVED_FROM,
+                    manifest,
+                ));
             }
         }
         VaultEntryType::Skill => {
@@ -990,9 +1033,171 @@ fn frontmatter_links<'a>(
 /// Project a canonical RDF id onto the path-keyed KG id used by today's
 /// derived index. The original RDF target remains in edge metadata, so the KG
 /// can traverse current nodes without losing the exact lineage identifier.
-fn rdf_link_edge(subject: &str, rdf_target: &str, predicate: &str) -> KgEdge {
-    KgEdge::new(subject, rdf_target_to_kg_id(rdf_target, None), predicate)
-        .with_metadata(serde_json::json!({ "rdf_target": rdf_target }))
+fn rdf_link_edge(
+    subject: &str,
+    rdf_target: &str,
+    predicate: &str,
+    manifest: Option<&VaultManifest>,
+) -> KgEdge {
+    KgEdge::new(
+        subject,
+        rdf_target_to_kg_id(rdf_target, manifest),
+        predicate,
+    )
+    .with_metadata(serde_json::json!({ "rdf_target": rdf_target }))
+}
+
+/// Project the lifted directive structure of an Intent into KG nodes and edges.
+///
+/// Emits a node per acceptance criterion, task, scope item, and constraint,
+/// plus the edges that link them: `intent -HAS_TASK-> task`,
+/// `intent -HAS_ACCEPTANCE_CRITERION-> ac`, `task -SATISFIES-> ac`,
+/// `task -TOUCHES-> file:<path>`, and the body's `:::ref` dependency edges.
+/// File targets reuse the shared `file:<path>` node convention so intent tasks
+/// link into the same file nodes that changes reference via `MODIFIES`.
+fn project_intent_semantics(
+    intent_subject: &str,
+    node: &CanonicalNode,
+    manifest: Option<&VaultManifest>,
+    nodes: &mut Vec<KgNode>,
+    edges: &mut Vec<KgEdge>,
+) {
+    // Acceptance criteria.
+    for ac in &node.has_acceptance_criterion {
+        let id = child_kg_id(&ac.id);
+        let mut meta = serde_json::json!({ "status": ac.ac_status });
+        if let Some(obj) = meta.as_object_mut() {
+            if let Some(v) = &ac.verified_by {
+                obj.insert("verifiedBy".to_string(), serde_json::json!(v));
+            }
+            if let Some(e) = &ac.evidence {
+                obj.insert("evidence".to_string(), serde_json::json!(e));
+            }
+        }
+        nodes.push(
+            KgNode::new(&id, "acceptance_criterion", kg_label(&id), "vault")
+                .with_summary(ac.text.clone())
+                .with_metadata(meta),
+        );
+        edges.push(KgEdge::new(
+            intent_subject,
+            &id,
+            edge_kind::HAS_ACCEPTANCE_CRITERION,
+        ));
+    }
+
+    // Tasks, with their satisfies (task→criterion) and touches (task→file) edges.
+    for t in &node.has_task {
+        let id = child_kg_id(&t.id);
+        nodes.push(
+            KgNode::new(&id, "task", kg_label(&id), "vault")
+                .with_summary(t.text.clone())
+                .with_metadata(serde_json::json!({ "status": t.task_status })),
+        );
+        edges.push(KgEdge::new(intent_subject, &id, edge_kind::HAS_TASK));
+        // `as_slice` so a legacy scalar `satisfies` still produces its SATISFIES
+        // edge — otherwise pre-widening intents would silently lose the
+        // task→criterion links in the knowledge graph.
+        for ac_urn in t.satisfies.as_slice() {
+            edges.push(KgEdge::new(&id, child_kg_id(ac_urn), edge_kind::SATISFIES));
+        }
+        for file in &t.touches_file {
+            edges.push(KgEdge::new(&id, format!("file:{file}"), edge_kind::TOUCHES));
+        }
+    }
+
+    // Scope boundaries.
+    for s in &node.has_scope_in {
+        let id = child_kg_id(&s.id);
+        nodes.push(KgNode::new(&id, "scope", kg_label(&id), "vault").with_summary(s.text.clone()));
+        edges.push(KgEdge::new(intent_subject, &id, edge_kind::HAS_SCOPE_IN));
+    }
+    for s in &node.has_scope_out {
+        let id = child_kg_id(&s.id);
+        nodes.push(KgNode::new(&id, "scope", kg_label(&id), "vault").with_summary(s.text.clone()));
+        edges.push(KgEdge::new(intent_subject, &id, edge_kind::HAS_SCOPE_OUT));
+    }
+
+    // Constraints.
+    for c in &node.has_constraint {
+        let id = child_kg_id(&c.id);
+        nodes.push(
+            KgNode::new(&id, "constraint", kg_label(&id), "vault").with_summary(c.text.clone()),
+        );
+        edges.push(KgEdge::new(intent_subject, &id, edge_kind::HAS_CONSTRAINT));
+    }
+
+    // Typed dependency refs declared in the body (`:::ref{to= edge=}`).
+    for r in &node.depends_on {
+        let target = rdf_target_to_kg_id(&r.to, manifest);
+        let kind = match r.edge.as_str() {
+            "blockedBy" => edge_kind::BLOCKED_BY,
+            _ => edge_kind::DEPENDS_ON,
+        };
+        edges.push(KgEdge::new(intent_subject, target, kind));
+    }
+}
+
+/// The structural edges that connect an intent to the child nodes it projects.
+pub(super) const INTENT_CHILD_EDGE_KINDS: &[&str] = &[
+    edge_kind::HAS_TASK,
+    edge_kind::HAS_ACCEPTANCE_CRITERION,
+    edge_kind::HAS_SCOPE_IN,
+    edge_kind::HAS_SCOPE_OUT,
+    edge_kind::HAS_CONSTRAINT,
+];
+
+/// Delete the child nodes an intent projected (tasks, acceptance criteria,
+/// scope items, constraints), reachable from `subject` via the structural
+/// `HAS_*` edges. Deleting each child node also removes its own edges
+/// (`SATISFIES`, `TOUCHES`) and full-text terms. Shared `file:` nodes are never
+/// children, so a task's `TOUCHES` target survives.
+///
+/// A no-op for non-intent subjects (they have no `HAS_*` edges), so callers may
+/// invoke it unconditionally before deleting or re-projecting a subject. This
+/// keeps the graph from orphaning child nodes when an intent is edited (a task
+/// removed) or deleted.
+pub(super) fn delete_intent_child_nodes(
+    txn: &mut atomic_core::pristine::WriteTxn<'_>,
+    subject: &str,
+) -> Result<(), RepositoryError> {
+    let outgoing = txn
+        .get_kg_edges_from(subject)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    for edge in outgoing {
+        if INTENT_CHILD_EDGE_KINDS.contains(&edge.kind.as_str()) {
+            txn.del_kg_node(&edge.to_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Map a canonical `urn:atomic:<kind>:<local>` id to the KG `<kind>:<local>`
+/// node-id convention. Non-URN inputs pass through unchanged.
+fn urn_to_kg_id(urn: &str) -> String {
+    urn.strip_prefix("urn:atomic:").unwrap_or(urn).to_string()
+}
+
+/// Canonical KG id for an intent-decomposition child (`ac`, `task`, `scope`,
+/// `constraint`). The kind stays lowercase; the local part is UPPERCASED so
+/// children always share the intent node's case (intents are uppercase ULIDs).
+/// Applied identically on the mint side (`project_intent_semantics`) and the
+/// resolve side (`rdf_target_to_kg_id`), so a `derivedFrom` link lands on the
+/// real node regardless of the case the id was copied in.
+fn child_kg_id(urn: &str) -> String {
+    match urn.strip_prefix("urn:atomic:") {
+        Some(rest) => match rest.split_once(':') {
+            Some((kind, local)) => format!("{kind}:{}", local.to_uppercase()),
+            None => rest.to_uppercase(),
+        },
+        None => urn.to_string(),
+    }
+}
+
+/// The label for a `<kind>:<local>` KG id is the part after the first colon.
+fn kg_label(id: &str) -> &str {
+    id.split_once(':').map(|(_, l)| l).unwrap_or(id)
 }
 
 fn rdf_target_to_kg_id(target: &str, manifest: Option<&VaultManifest>) -> String {
@@ -1000,11 +1205,19 @@ fn rdf_target_to_kg_id(target: &str, manifest: Option<&VaultManifest>) -> String
         return format!("memory:{id}");
     }
     if let Some(id) = target.strip_prefix("urn:atomic:intent:") {
-        if let Some(summary) =
-            manifest.and_then(|manifest| manifest.intents.get(&id.to_uppercase()))
-        {
-            if !summary.vault_path.is_empty() {
-                return entry_subject(&summary.vault_path, VaultEntryType::Intent);
+        if let Some(manifest) = manifest {
+            // The canonical intent URN carries the ULID `uid`; match on it
+            // first, then fall back to a direct/legacy human-key match.
+            let summary = manifest
+                .intents
+                .values()
+                .find(|s| s.uid.eq_ignore_ascii_case(id))
+                .or_else(|| manifest.intents.get(id))
+                .or_else(|| manifest.intents.get(&id.to_uppercase()));
+            if let Some(summary) = summary {
+                if !summary.vault_path.is_empty() {
+                    return entry_subject(&summary.vault_path, VaultEntryType::Intent);
+                }
             }
         }
         return format!("intent:{}", id.to_uppercase());
@@ -1012,7 +1225,20 @@ fn rdf_target_to_kg_id(target: &str, manifest: Option<&VaultManifest>) -> String
     if let Some(hash) = target.strip_prefix("urn:atomic:change:") {
         return format!("change:{}", hash.chars().take(12).collect::<String>());
     }
-    target.to_string()
+    // Intent-decomposition children (`ac`, `task`, `scope`, `constraint`) are
+    // ULID-derived and canonicalized to an UPPERCASE local so they always share
+    // the intent node's case (intents are uppercase ULIDs). This makes a
+    // memory's `derivedFrom` link land on the real node regardless of the case
+    // the id was copied in — `project_intent_semantics` mints the same way.
+    for kind in ["ac", "task", "scope", "constraint"] {
+        if target.starts_with(&format!("urn:atomic:{kind}:")) {
+            return child_kg_id(target);
+        }
+    }
+    // Other canonical urns (e.g. `todo`, whose ids are author-chosen, not
+    // ULID-derived) keep their authored case. Non-urn targets pass through
+    // unchanged (`urn_to_kg_id` only strips the `urn:atomic:` prefix).
+    urn_to_kg_id(target)
 }
 
 /// Extract edges from content text (wiki-links, file paths).
@@ -1086,6 +1312,104 @@ fn looks_like_file_path(s: &str) -> bool {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn rdf_target_canonicalizes_child_urns_to_uppercase_kg_ids() {
+        // Intent-decomposition children are uppercased on the local part, so a
+        // `derivedFrom` link connects to the minted node regardless of the case
+        // the id was copied in (the uid may be UPPER, as ULIDs are, or lower).
+        assert_eq!(
+            rdf_target_to_kg_id("urn:atomic:ac:demo-2-ac-1", None),
+            "ac:DEMO-2-AC-1"
+        );
+        assert_eq!(
+            rdf_target_to_kg_id("urn:atomic:ac:DEMO-2-ac-1", None),
+            "ac:DEMO-2-AC-1"
+        );
+        assert_eq!(
+            rdf_target_to_kg_id("urn:atomic:task:demo-2-1", None),
+            "task:DEMO-2-1"
+        );
+        assert_eq!(
+            rdf_target_to_kg_id("urn:atomic:scope:demo-2-scope-in-1", None),
+            "scope:DEMO-2-SCOPE-IN-1"
+        );
+        // Todos are author-chosen ids, not ULID-derived — case is preserved.
+        assert_eq!(rdf_target_to_kg_id("urn:atomic:todo:t2", None), "todo:t2");
+        // Existing special cases are unchanged.
+        assert_eq!(
+            rdf_target_to_kg_id("urn:atomic:memory:abc", None),
+            "memory:abc"
+        );
+        assert_eq!(
+            rdf_target_to_kg_id("urn:atomic:change:0123456789abcdef", None),
+            "change:0123456789ab",
+        );
+        // Non-urn targets pass through untouched.
+        assert_eq!(
+            rdf_target_to_kg_id("file:src/main.rs", None),
+            "file:src/main.rs"
+        );
+    }
+
+    #[test]
+    fn memory_derived_from_intent_link_resolves_to_intent_kg_subject() {
+        // A decision memory that links to an intent by canonical urn must, once
+        // extracted, carry a `wasDerivedFrom` edge to the intent's real
+        // path-keyed KG subject (resolved through the manifest) — not the bare
+        // `intent:<UID>` fallback — so the lineage edge actually connects.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        let created = repo
+            .vault_intent_create(crate::IntentCreateOptions {
+                title: "Linkable intent".to_string(),
+                priority: None,
+                assignee: None,
+                labels: Vec::new(),
+                session_id: None,
+                turn_id: None,
+            })
+            .unwrap();
+        let intent_subject = entry_subject(&created.intent_file, VaultEntryType::Intent);
+
+        let mem_path = "memory/decisions/dtest.md";
+        let fm = serde_json::json!({
+            "type": "decision",
+            "derivedFrom": [format!("urn:atomic:intent:{}", created.uid)],
+        })
+        .to_string();
+        repo.vault_store(
+            mem_path,
+            VaultEntryType::Memory,
+            b"# Decision\nChose X over Y.\n".to_vec(),
+            fm,
+        )
+        .unwrap();
+        let entry = repo.vault_retrieve(mem_path).unwrap().unwrap();
+
+        let (_nodes, edges) = repo.vault_extract_kg(mem_path, &entry).unwrap();
+        let derived = edges
+            .iter()
+            .find(|e| e.kind == predicate::WAS_DERIVED_FROM)
+            .expect("derivedFrom edge present");
+
+        // The lineage edge lands on the intent's real path-keyed KG subject
+        // (resolved through the manifest), so `criterion/intent → decision`
+        // traversal connects. In the uid-based layout this coincides with the
+        // bare fallback; in the `manual/<identity>/<n>` layout the manifest
+        // resolution is what makes them agree.
+        assert_eq!(derived.to_id, intent_subject);
+        assert_eq!(
+            derived
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("rdf_target"))
+                .and_then(|v| v.as_str()),
+            Some(format!("urn:atomic:intent:{}", created.uid).as_str())
+        );
+    }
 
     #[test]
     fn test_extract_kg_from_goal() {
@@ -1197,6 +1521,227 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_kg_projects_directive_body_semantics() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        // A directive-based intent body: two acceptance criteria, one task that
+        // satisfies both and touches two files, plus scope and a constraint.
+        let body = "\
+:::why
+Because it matters.
+:::
+
+:::acceptance-criterion{#demo-2-ac-1 status=unmet}
+Build succeeds.
+:::
+
+:::acceptance-criterion{#demo-2-ac-2 status=unmet}
+Types are strict.
+:::
+
+:::task{#demo-2-1 status=unmet criteria=demo-2-ac-1,demo-2-ac-2}
+Do the work.
+::file-ref{path=package.json}
+::file-ref{path=src/index.ts}
+:::
+
+:::scope-in
+The entry point.
+:::
+
+:::scope-out
+The build system.
+:::
+
+:::constraint
+No new dependencies.
+:::";
+        let entry = VaultEntry::new(
+            VaultEntryType::Intent,
+            body.as_bytes().to_vec(),
+            r#"{"id":"DEMO-2","title":"Interactive CLI","status":"in-progress"}"#.to_string(),
+            "2025-01-01T00:00:00Z".to_string(),
+        );
+
+        let (nodes, edges) = repo
+            .vault_extract_kg("intents/demo-2/intent.md", &entry)
+            .unwrap();
+
+        let has_node = |id: &str, kind: &str| nodes.iter().any(|n| n.id == id && n.kind == kind);
+        let has_edge = |from: &str, to: &str, kind: &str| {
+            edges
+                .iter()
+                .any(|e| e.from_id == from && e.to_id == to && e.kind == kind)
+        };
+
+        // Acceptance criteria and tasks are their own nodes (uppercase local,
+        // matching the intent node's case).
+        assert!(has_node("ac:DEMO-2-AC-1", "acceptance_criterion"));
+        assert!(has_node("ac:DEMO-2-AC-2", "acceptance_criterion"));
+        assert!(has_node("task:DEMO-2-1", "task"));
+
+        // Intent → task / criterion structure.
+        assert!(has_edge(
+            "intent:DEMO-2",
+            "task:DEMO-2-1",
+            edge_kind::HAS_TASK
+        ));
+        assert!(has_edge(
+            "intent:DEMO-2",
+            "ac:DEMO-2-AC-1",
+            edge_kind::HAS_ACCEPTANCE_CRITERION
+        ));
+
+        // The task satisfies BOTH criteria (the multi-criteria fix) …
+        assert!(has_edge(
+            "task:DEMO-2-1",
+            "ac:DEMO-2-AC-1",
+            edge_kind::SATISFIES
+        ));
+        assert!(has_edge(
+            "task:DEMO-2-1",
+            "ac:DEMO-2-AC-2",
+            edge_kind::SATISFIES
+        ));
+
+        // … and touches both files, reusing the shared file:<path> node id
+        // (file ids are paths, not ULID-derived, so they stay case-preserving).
+        assert!(has_edge(
+            "task:DEMO-2-1",
+            "file:package.json",
+            edge_kind::TOUCHES
+        ));
+        assert!(has_edge(
+            "task:DEMO-2-1",
+            "file:src/index.ts",
+            edge_kind::TOUCHES
+        ));
+
+        // Scope and constraint project too.
+        assert!(edges
+            .iter()
+            .any(|e| e.from_id == "intent:DEMO-2" && e.kind == edge_kind::HAS_SCOPE_IN));
+        assert!(edges
+            .iter()
+            .any(|e| e.from_id == "intent:DEMO-2" && e.kind == edge_kind::HAS_SCOPE_OUT));
+        assert!(edges
+            .iter()
+            .any(|e| e.from_id == "intent:DEMO-2" && e.kind == edge_kind::HAS_CONSTRAINT));
+
+        // Every projected edge carries the source path for replace-on-update.
+        for e in &edges {
+            assert_eq!(
+                e.metadata.as_ref().unwrap()["derived_from_vault_path"],
+                "intents/demo-2/intent.md"
+            );
+        }
+    }
+
+    #[test]
+    fn test_intent_child_nodes_are_cleaned_on_edit_and_delete() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        let fm = r#"{"id":"DEMO-2","title":"Demo","status":"in-progress"}"#;
+        let path = "intents/demo-2/intent.md";
+
+        let body_v1 = "\
+:::why
+r
+:::
+
+:::acceptance-criterion{#demo-2-ac-1 status=unmet}
+crit
+:::
+
+:::task{#demo-2-1 status=unmet criteria=demo-2-ac-1}
+first
+:::
+
+:::task{#demo-2-2 status=unmet criteria=demo-2-ac-1}
+second
+:::";
+        repo.vault_store(
+            path,
+            VaultEntryType::Intent,
+            body_v1.as_bytes().to_vec(),
+            fm.to_string(),
+        )
+        .unwrap();
+
+        let node_exists = |id: &str| -> bool {
+            let txn = repo.pristine().read_txn().unwrap();
+            txn.get_kg_node(id).unwrap().is_some()
+        };
+
+        // Both tasks and the criterion are projected (uppercase local).
+        assert!(node_exists("task:DEMO-2-1"));
+        assert!(node_exists("task:DEMO-2-2"));
+        assert!(node_exists("ac:DEMO-2-AC-1"));
+
+        // Edit: drop the second task. Its node must be garbage-collected.
+        let body_v2 = "\
+:::why
+r
+:::
+
+:::acceptance-criterion{#demo-2-ac-1 status=unmet}
+crit
+:::
+
+:::task{#demo-2-1 status=unmet criteria=demo-2-ac-1}
+first
+:::";
+        repo.vault_store(
+            path,
+            VaultEntryType::Intent,
+            body_v2.as_bytes().to_vec(),
+            fm.to_string(),
+        )
+        .unwrap();
+
+        assert!(node_exists("task:DEMO-2-1"), "surviving task must remain");
+        assert!(
+            !node_exists("task:DEMO-2-2"),
+            "removed task must be cleaned up, not orphaned"
+        );
+        assert!(node_exists("ac:DEMO-2-AC-1"));
+
+        // Delete: every projected child node must be gone.
+        repo.vault_delete(path).unwrap();
+        assert!(!node_exists("intent:DEMO-2"));
+        assert!(!node_exists("task:DEMO-2-1"));
+        assert!(!node_exists("ac:DEMO-2-AC-1"));
+    }
+
+    #[test]
+    fn test_extract_kg_legacy_prose_intent_skips_projection() {
+        // A non-directive (legacy) body must not fail extraction; it simply
+        // produces no task/criterion nodes.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        let entry = VaultEntry::new(
+            VaultEntryType::Intent,
+            b"# Legacy\n\n## Acceptance Criteria\n- [ ] a thing\n".to_vec(),
+            r#"{"id":"DEMO-3","title":"Legacy","status":"backlog"}"#.to_string(),
+            "2025-01-01T00:00:00Z".to_string(),
+        );
+
+        let (nodes, _edges) = repo
+            .vault_extract_kg("intents/demo-3/intent.md", &entry)
+            .unwrap();
+
+        assert!(nodes
+            .iter()
+            .all(|n| n.kind != "task" && n.kind != "acceptance_criterion"));
+    }
+
+    #[test]
     fn test_extract_learning_memory_lineage() {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
@@ -1238,7 +1783,8 @@ mod tests {
                 turn_id: None,
             })
             .unwrap();
-        let canonical_intent = format!("urn:atomic:intent:{}", intent.id.to_lowercase());
+        // The canonical intent URN is keyed by the ULID uid, not the human key.
+        let canonical_intent = format!("urn:atomic:intent:{}", intent.uid.to_lowercase());
         let frontmatter = serde_json::json!({
             "uid": "learning-path-resolution",
             "memoryKind": "lesson",
@@ -1727,6 +2273,7 @@ mod tests {
             "intent:PIMO-1",
             VaultEntryType::Intent,
             &fm,
+            None,
             &mut node,
             &mut nodes,
             &mut edges,
@@ -1766,6 +2313,7 @@ mod tests {
             "intent:PIMO-1",
             VaultEntryType::Intent,
             &fm,
+            None,
             &mut node,
             &mut nodes,
             &mut edges,

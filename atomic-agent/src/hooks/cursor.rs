@@ -705,15 +705,17 @@ impl AgentHook for CursorHook {
     }
 
     fn install(&self, _repo_root: &Path) -> AgentResult<usize> {
-        Ok(0) // Installation handled by atomic-cursor package
+        // Installation is owned by the integrations engine (the atomic-cursor
+        // package on Atomic storage); this adapter installs nothing.
+        Ok(0)
     }
 
     fn uninstall(&self, _repo_root: &Path) -> AgentResult<()> {
-        Ok(()) // Uninstallation handled by atomic-cursor package
+        Ok(()) // Uninstallation is receipt-driven via the integrations engine.
     }
 
     fn is_installed(&self, _repo_root: &Path) -> bool {
-        false // Managed by atomic-cursor package
+        false // Managed by the integrations engine (atomic-cursor package)
     }
 
     fn supported_hooks(&self) -> Vec<HookType> {
@@ -1145,7 +1147,7 @@ mod tests {
         assert!(!hook.detect_presence(tmp.path()));
     }
 
-    // install / uninstall / is_installed are no-ops (managed by atomic-cursor package)
+    // install / uninstall / is_installed are no-ops (owned by the integrations engine)
 
     #[test]
     fn test_install_is_noop() {

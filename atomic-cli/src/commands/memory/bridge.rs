@@ -101,8 +101,10 @@ pub fn read_memory(repo: &Repository, id_or_path: &str) -> CliResult<MemLiftInpu
     let entry = repo
         .vault_retrieve(&path)
         .map_err(CliError::Repository)?
-        .ok_or_else(|| CliError::InvalidArgument {
-            message: format!("memory not found: {id_or_path} (create with `atomic memory new`)"),
+        .ok_or_else(|| CliError::VaultEntityNotFound {
+            kind: "memory",
+            id: id_or_path.to_string(),
+            hint: Some("create with `atomic memory new`".to_string()),
         })?;
     inputs_from_entry(&entry)
 }
@@ -113,6 +115,17 @@ pub fn lift(inputs: &MemLiftInputs) -> CliResult<MemoryNode> {
     lift_memory(&inputs.frontmatter, &inputs.body).map_err(|e| CliError::InvalidArgument {
         message: format!("could not lift memory: {e}"),
     })
+}
+
+/// Whether this is a freeform memory rather than a malformed canonical one.
+///
+/// `memory write` and the default `MEMORY.md` have only simple metadata. Once
+/// any canonical identity/kind field is present, lift errors stay visible
+/// instead of silently falling back to raw output.
+pub fn is_freeform_memory(inputs: &MemLiftInputs) -> bool {
+    ["@id", "uid", "id", "memoryKind", "kind"]
+        .iter()
+        .all(|key| !inputs.frontmatter.contains_key(*key))
 }
 
 /// Sanitize a memory id for use as a directory name in the sidecar/vault path.
@@ -290,6 +303,46 @@ mod tests {
             frontmatter,
             body: ":::memory\nThe durable fact.\n:::".to_string(),
         }
+    }
+
+    #[test]
+    fn freeform_memory_detection_does_not_hide_partial_canonical_records() {
+        let freeform = MemLiftInputs {
+            frontmatter: serde_json::json!({
+                "name": "notes",
+                "type": "project",
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            body: "Raw notes".into(),
+        };
+        assert!(is_freeform_memory(&freeform));
+
+        let partial = MemLiftInputs {
+            frontmatter: serde_json::json!({
+                "uid": "01J8ZC4R8T",
+                "type": "project",
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            body: "Missing memoryKind".into(),
+        };
+        assert!(!is_freeform_memory(&partial));
+        assert!(lift(&partial).is_err());
+
+        let partial_at_id = MemLiftInputs {
+            frontmatter: serde_json::json!({
+                "@id": "urn:atomic:memory:01J8ZC4R8T",
+                "type": "project",
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            body: "Missing canonical fields".into(),
+        };
+        assert!(!is_freeform_memory(&partial_at_id));
     }
 
     fn attested_node(inputs: &MemLiftInputs) -> (MemoryNode, KeyPair) {

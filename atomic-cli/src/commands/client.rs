@@ -58,6 +58,58 @@ pub async fn build_client(
     Ok(client)
 }
 
+/// Build a [`StorageClient`] targeting the server **apex** (no org subdomain).
+///
+/// Apex-scoped endpoints — notably `GET /orgs` ("list my orgs") and
+/// `POST /orgs` ("create org") — span orgs, so they must be hit on the bare
+/// server host rather than an `<org>.<host>` subdomain. This helper resolves
+/// the active server profile, mints a self-signed EdDSA JWT against the apex
+/// URL, and constructs a `StorageClient` whose `base_url` is the apex.
+///
+/// Unlike [`build_client`], this does **not** require a default org to be
+/// configured — which is essential for `atomic org list`, whose entire
+/// purpose is to discover the orgs you belong to before any default is set.
+///
+/// `server_override` selects a named profile from `[servers.*]` in
+/// `~/.atomic/config.toml`, exactly as in [`build_client`].
+///
+/// # Errors
+///
+/// - Config not loaded or server not configured (no `url`).
+/// - Named server profile not found.
+/// - Identity store cannot be opened or no default identity set.
+/// - HTTP client construction failure.
+pub async fn build_apex_client(server_override: Option<&str>) -> CliResult<StorageClient> {
+    let config = GlobalConfig::load()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
+
+    let server = config
+        .resolve_server(server_override)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?
+        .0;
+
+    let apex_url = server.url.clone().ok_or_else(|| {
+        let hint = if let Some(name) = server_override {
+            format!("Server profile '{}' has no URL configured.", name)
+        } else {
+            "Server not configured. Run 'atomic identity register <server-url>' first.".to_string()
+        };
+        CliError::Internal(anyhow::anyhow!("{}", hint))
+    })?;
+
+    let identity = resolve_identity_for_server(server)?;
+
+    // Self-signed EdDSA JWT keyed by the identity's own public key; minted
+    // against the apex URL (the token is portable across the deployment).
+    let bearer_token = crate::commands::token::get_token(&apex_url, &identity).await?;
+
+    let client = StorageClient::new(&apex_url, "", &bearer_token).map_err(|e| {
+        CliError::Internal(anyhow::anyhow!("Failed to create storage client: {}", e))
+    })?;
+
+    Ok(client)
+}
+
 /// Build a [`StorageClient`] and return the resolved org slug alongside it.
 ///
 /// Useful for commands that also need to resolve org-scoped state (e.g.
@@ -93,10 +145,40 @@ pub async fn build_client_with_org(
     })?;
 
     // Resolve identity: per-server override → global default.
+    let identity = resolve_identity_for_server(server)?;
+
+    // Log in against the server apex for a JWT bearer token.
+    let bearer_token = crate::commands::token::get_token(&server_url, &identity).await?;
+
+    let client = StorageClient::new(&base_url, &org_slug, &bearer_token).map_err(|e| {
+        CliError::Internal(anyhow::anyhow!("Failed to create storage client: {}", e))
+    })?;
+
+    Ok((client, org_slug))
+}
+
+/// Resolve the identity to authenticate as for a given server profile.
+///
+/// Resolution order:
+/// 1. `server.identity` — a per-server identity override (set when
+///    `atomic identity register --identity <name>` is used).
+/// 2. Global default identity from the identity store.
+///
+/// Shared by [`build_client_with_org`] and [`build_apex_client`] so the
+/// org-scoped and apex-scoped code paths pick the same identity.
+///
+/// # Errors
+///
+/// - Identity store cannot be opened.
+/// - Per-server identity name not found in the store.
+/// - No default identity set.
+pub fn resolve_identity_for_server(
+    server: &atomic_config::ServerConfig,
+) -> CliResult<atomic_identity::Identity> {
     let store = IdentityStore::open_default()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to open identity store: {}", e)))?;
 
-    let identity = if let Some(ref identity_name) = server.identity {
+    if let Some(ref identity_name) = server.identity {
         // Server profile specifies an identity — use it.
         store.load_by_name(identity_name).map_err(|e| {
             CliError::Internal(anyhow::anyhow!(
@@ -104,7 +186,7 @@ pub async fn build_client_with_org(
                 identity_name,
                 e
             ))
-        })?
+        })
     } else {
         // Fall back to global default identity.
         store
@@ -117,17 +199,8 @@ pub async fn build_client_with_org(
                     "No default identity set. Create one first:\n  \
                      atomic identity new <name> --email <email> --set-default"
                 ))
-            })?
-    };
-
-    // Log in against the server apex for a JWT bearer token.
-    let bearer_token = crate::commands::token::get_token(&server_url, &identity).await?;
-
-    let client = StorageClient::new(&base_url, &org_slug, &bearer_token).map_err(|e| {
-        CliError::Internal(anyhow::anyhow!("Failed to create storage client: {}", e))
-    })?;
-
-    Ok((client, org_slug))
+            })
+    }
 }
 
 /// Convenience: map a [`atomic_remote::RemoteError`] to a [`CliError`].

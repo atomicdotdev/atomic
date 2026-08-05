@@ -197,6 +197,28 @@ pub enum CliError {
         hash: String,
     },
 
+    /// A vault entity (memory, intent, session, …) with the given id wasn't
+    /// found.
+    ///
+    /// The sibling of [`Self::ChangeNotFound`] for the vault's own entities.
+    /// Before this existed these sites reached for [`Self::InvalidArgument`],
+    /// which exits 2 — the code reserved for "usage error, the command did not
+    /// run". The command parses fine and runs; the id simply is not there, and
+    /// the two cases call for opposite recoveries: fix the command line, versus
+    /// create the entity or look up the right id.
+    #[error("{kind} not found: {id}{}", .hint.as_deref().map(|h| format!(" ({h})")).unwrap_or_default())]
+    VaultEntityNotFound {
+        /// The kind of entity, lowercase and singular: `memory`, `intent`, …
+        kind: &'static str,
+        /// The id (or partial id) that did not resolve
+        id: String,
+        /// Optional recovery hint, rendered parenthesized after the id — e.g.
+        /// `create with \`atomic memory new\``. The exit code already tells an
+        /// agent *what* went wrong; this tells a caller what to do about it,
+        /// for the sites that have a single obvious next step.
+        hint: Option<String>,
+    },
+
     /// The change hash is ambiguous (matches multiple changes).
     ///
     /// This occurs when a partial hash matches more than one change.
@@ -391,6 +413,7 @@ impl CliError {
                 | Self::ViewNotFound { .. }
                 | Self::FileNotFound { .. }
                 | Self::ChangeNotFound { .. }
+                | Self::VaultEntityNotFound { .. }
                 | Self::RemoteNotFound { .. }
         )
     }
@@ -590,6 +613,7 @@ impl CliError {
             | Self::PathOutsideRepository { .. }
             | Self::PathIgnored { .. }
             | Self::ChangeNotFound { .. }
+            | Self::VaultEntityNotFound { .. }
             | Self::AmbiguousHash { .. }
             | Self::MissingDependency { .. }
             | Self::Conflict { .. }
