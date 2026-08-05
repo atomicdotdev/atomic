@@ -21,9 +21,12 @@
 //! ```text
 //! # List all members of the current org
 //! $ atomic org member list
-//! IDENTITY_ID                           ROLE     JOINED
-//! 550e8400-e29b-41d4-a716-446655440000  owner    2025-01-15T10:30:00Z
-//! 6ba7b810-9dad-11d1-80b4-00c04fd430c8  admin    2025-02-20T14:00:00Z
+//! NAME    EMAIL              ROLE    STATUS   KEY                   JOINED
+//! ada     ada@example.com    owner   active   MFRGGZDFMZTWQ2LK...   2025-01-15T10:30:00Z
+//! grace   grace@example.com  admin   active   NBSWY3DPEB3W64TM...   2025-02-20T14:00:00Z
+//!
+//! # The identity UUID and full public key are in the JSON form
+//! $ atomic org member list --format json
 //!
 //! # Add a member
 //! $ atomic org member add 6ba7b810-9dad-11d1-80b4-00c04fd430c8 --role admin
@@ -185,17 +188,31 @@ impl MemberList {
         } else if members.is_empty() {
             print_hint("No members found in this organization.");
         } else {
+            // The identity UUID is deliberately not a column: it is 36
+            // characters that identify nobody, and `member update`/`remove`
+            // accept a name or email just as well. It stays in `--format json`
+            // for callers that want it.
             let mut table = Table::new();
             table.set_columns(vec![
-                Column::new("IDENTITY_ID").min_width(36),
+                Column::new("NAME").min_width(14),
+                Column::new("EMAIL").min_width(22),
                 Column::new("ROLE").min_width(8),
+                Column::new("STATUS").min_width(9),
+                Column::new("KEY").min_width(19),
                 Column::new("JOINED").min_width(20),
             ]);
 
             for member in &members {
                 table.add_row(vec![
-                    member.identity_id.to_string(),
+                    member.name.clone().unwrap_or_else(unknown),
+                    member.email.clone().unwrap_or_else(unknown),
                     member.role.to_string(),
+                    member.status.clone().unwrap_or_else(unknown),
+                    member
+                        .public_key
+                        .as_deref()
+                        .map(short_key)
+                        .unwrap_or_else(unknown),
                     member.joined_at.to_rfc3339(),
                 ]);
             }
@@ -206,6 +223,28 @@ impl MemberList {
         }
 
         Ok(())
+    }
+}
+
+/// Placeholder for a field the server did not return.
+///
+/// A server older than the release that added identity details to
+/// `GET /orgs/{slug}/members` omits these, so the column is unknown rather
+/// than empty. Distinguishing the two matters: an empty `EMAIL` would suggest
+/// the member has no address on file.
+fn unknown() -> String {
+    "—".to_string()
+}
+
+/// Abbreviate a base32 public key for table display.
+///
+/// Matches `identity list --verbose`, which prints the first 16 base32
+/// characters followed by an ellipsis, so the same key is recognisable in
+/// both places. The full value stays in `--format json`.
+fn short_key(key: &str) -> String {
+    match key.char_indices().nth(16) {
+        Some((cut, _)) => format!("{}...", &key[..cut]),
+        None => key.to_string(),
     }
 }
 
@@ -654,5 +693,31 @@ mod tests {
             force: false,
         };
         assert_eq!(check_variant(&MemberCommands::Remove(remove)), "remove");
+    }
+
+    // -- Display helpers --
+
+    /// Keys are abbreviated the same way `identity list --verbose` does, so the
+    /// same key is recognisable in both listings.
+    #[test]
+    fn short_key_truncates_to_sixteen_chars_with_ellipsis() {
+        let key = "MFRGGZDFMZTWQ2LKNNWG23TPOBYXE43UOV3HO6DZPI";
+        assert_eq!(short_key(key), "MFRGGZDFMZTWQ2LK...");
+    }
+
+    /// A key at or under the cut is shown whole rather than gaining a
+    /// misleading ellipsis.
+    #[test]
+    fn short_key_leaves_short_input_untouched() {
+        assert_eq!(short_key("MFRGGZDFMZTWQ2LK"), "MFRGGZDFMZTWQ2LK");
+        assert_eq!(short_key("MFRG"), "MFRG");
+    }
+
+    /// A missing field reads as unknown, not as an empty value — an empty
+    /// EMAIL column would wrongly suggest the member has no address on file.
+    #[test]
+    fn unknown_is_a_visible_placeholder() {
+        assert_eq!(unknown(), "—");
+        assert!(!unknown().is_empty());
     }
 }
