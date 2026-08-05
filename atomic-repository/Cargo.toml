@@ -39,6 +39,7 @@ tokio = { workspace = true }
 tar = "0.4"
 flate2 = "1.0"
 sha2 = "0.10"
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = { workspace = true }

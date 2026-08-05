@@ -30,7 +30,7 @@ Now AI agents write most of the code. They work in sessions and turns, use multi
 Enable agent hooks once. Every turn is recorded automatically.
 
 ```bash
-# Enable for your agent (auto-detects Claude Code, Antigravity CLI, Gemini CLI, OpenCode)
+# Enable for your agent (auto-detects Claude Code, Codex, Antigravity CLI, Gemini CLI, OpenCode)
 atomic agent enable
 
 # That's it. Every agent turn now produces an Atomic change with:
@@ -355,6 +355,7 @@ Every change stores two parallel representations:
 | Agent | Config | Hook System |
 |-------|--------|-------------|
 | Claude Code | `.claude/settings.json` | Native hooks |
+| Codex | `~/.codex/hooks.json` | Native hooks, including terminal `SessionEnd` |
 | Antigravity CLI (`agy`) | `~/.gemini/config/plugins/atomic/` | Plugin hooks |
 | Gemini CLI (deprecated) | `.gemini/settings.json` | Native hooks |
 | OpenCode | `.opencode/plugins/atomic/` | Plugin-based |

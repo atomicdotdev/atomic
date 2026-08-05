@@ -352,10 +352,8 @@ fn assemble(messages: &[(String, String)], parts: &[(String, Value)]) -> TurnDat
                     });
                 }
             }
-            "step-start" => {
-                if in_turn {
-                    data.step_count += 1;
-                }
+            "step-start" if in_turn => {
+                data.step_count += 1;
             }
             "step-finish" => {
                 if !in_turn {

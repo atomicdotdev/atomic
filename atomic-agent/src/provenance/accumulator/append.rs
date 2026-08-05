@@ -76,7 +76,7 @@ impl ProvenanceAccumulator {
         }
 
         // Attach detail based on kind
-        node.detail = build_tool_detail(kind, tool_name, tool_input, tool_output);
+        node.detail = build_tool_detail(kind, tool_name, tool_input, tool_output, status);
 
         let node_id = node.id.clone();
 

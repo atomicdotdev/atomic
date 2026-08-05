@@ -313,6 +313,7 @@ dependencies = [
  "chrono",
  "dirs",
  "flate2",
+ "fs2",
  "ignore",
  "log",
  "postcard",

@@ -8,6 +8,7 @@
 //! | Codex hook       | CLI verb              | HookType       |
 //! |------------------|-----------------------|----------------|
 //! | `SessionStart`   | `session-start`       | SessionStart   |
+//! | `SessionEnd`     | `session-end`         | SessionEnd     |
 //! | `UserPromptSubmit` | `user-prompt-submit` | TurnStart      |
 //! | `Stop`           | `stop`                | TurnEnd        |
 //! | `PreToolUse`     | `pre-tool`            | PreToolUse     |
@@ -40,6 +41,21 @@ struct SessionStartInput {
     model: Option<String>,
     #[serde(default)]
     source: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct SessionEndInput {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    transcript_path: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
 }
@@ -131,7 +147,16 @@ impl CodexHook {
             path: PathBuf::from("~/.codex/hooks.json"),
             reason: "Could not determine home directory for Codex hooks".to_string(),
         })?;
-        install_hooks_at(&path, force)
+        self.install_at(&path, force)
+    }
+
+    /// Install or migrate Atomic hooks at an explicit Codex hooks file.
+    ///
+    /// Integration receipts record the exact settings target they manage.
+    /// Using that path during upgrades avoids accidentally creating a
+    /// repository-local hook file while leaving stale global hooks active.
+    pub fn install_at(&self, path: &Path, force: bool) -> AgentResult<usize> {
+        install_hooks_at(path, force)
     }
 
     pub fn uninstall_global(&self) -> AgentResult<()> {
@@ -142,7 +167,13 @@ impl CodexHook {
     }
 
     pub fn is_installed_global(&self) -> bool {
-        Self::global_hooks_path().is_some_and(|path| hooks_file_has_atomic_hooks(&path))
+        Self::global_hooks_path().is_some_and(|path| self.is_installed_at(&path))
+    }
+
+    /// Return whether an explicit Codex hooks file contains the complete,
+    /// current Atomic hook set.
+    pub fn is_installed_at(&self, path: &Path) -> bool {
+        hooks_file_has_current_atomic_hooks(path)
     }
 
     fn local_hooks_path(repo_root: &Path) -> PathBuf {
@@ -278,16 +309,23 @@ impl AgentHook for CodexHook {
                 }
                 Ok(event)
             }
-            HookType::SessionEnd => Err(AgentError::HookParseFailed {
-                agent: self.name().to_string(),
-                hook_type: hook_type.as_str().to_string(),
-                reason: "Codex does not currently emit SessionEnd hooks".to_string(),
-            }),
+            HookType::SessionEnd => {
+                let parsed: SessionEndInput = self.parse_value(hook_type, raw_json.clone())?;
+                let mut event = TurnEvent::new(
+                    Self::extract_session_id(parsed.session_id, parsed.thread_id, &raw_json),
+                    hook_type,
+                )
+                .with_raw_json(with_openai_provider(raw_json));
+                if let Some(path) = parsed.transcript_path {
+                    event = event.with_transcript_path(path);
+                }
+                Ok(event)
+            }
         }
     }
 
     fn install(&self, repo_root: &Path) -> AgentResult<usize> {
-        install_hooks_at(&Self::local_hooks_path(repo_root), false)
+        self.install_at(&Self::local_hooks_path(repo_root), false)
     }
 
     fn uninstall(&self, repo_root: &Path) -> AgentResult<()> {
@@ -295,13 +333,13 @@ impl AgentHook for CodexHook {
     }
 
     fn is_installed(&self, repo_root: &Path) -> bool {
-        hooks_file_has_atomic_hooks(&Self::local_hooks_path(repo_root))
-            || self.is_installed_global()
+        self.is_installed_at(&Self::local_hooks_path(repo_root)) || self.is_installed_global()
     }
 
     fn supported_hooks(&self) -> Vec<HookType> {
         vec![
             HookType::SessionStart,
+            HookType::SessionEnd,
             HookType::TurnStart,
             HookType::TurnEnd,
             HookType::PreToolUse,
@@ -317,6 +355,7 @@ impl AgentHook for CodexHook {
     fn hook_verbs(&self) -> Vec<&str> {
         vec![
             "session-start",
+            "session-end",
             "user-prompt-submit",
             "stop",
             "pre-tool",
@@ -328,6 +367,7 @@ impl AgentHook for CodexHook {
 pub fn verb_to_hook_type(verb: &str) -> Option<HookType> {
     match verb {
         "session-start" => Some(HookType::SessionStart),
+        "session-end" => Some(HookType::SessionEnd),
         "user-prompt-submit" => Some(HookType::TurnStart),
         "stop" => Some(HookType::TurnEnd),
         "pre-tool" => Some(HookType::PreToolUse),
@@ -345,7 +385,20 @@ fn install_hooks_at(path: &Path, force: bool) -> AgentResult<usize> {
     let mut installed = 0;
     for spec in CODEX_HOOK_DEFS {
         let command = crate::hooks::guarded_hook_command(spec.command);
-        if add_hook(&mut config.hooks, spec.event, &command, spec.status_message) {
+        remove_stale_atomic_hooks_for_event(
+            &mut config.hooks,
+            spec.event,
+            &command,
+            spec.status_message,
+            spec.timeout_sec,
+        );
+        if add_hook(
+            &mut config.hooks,
+            spec.event,
+            &command,
+            spec.status_message,
+            spec.timeout_sec,
+        ) {
             installed += 1;
         }
     }
@@ -399,10 +452,23 @@ fn write_hooks_file(path: &Path, config: &CodexHooksFile) -> AgentResult<()> {
     })
 }
 
-fn hooks_file_has_atomic_hooks(path: &Path) -> bool {
-    std::fs::read_to_string(path)
-        .map(|content| content.contains(ATOMIC_HOOK_PREFIX))
-        .unwrap_or(false)
+fn hooks_file_has_current_atomic_hooks(path: &Path) -> bool {
+    let Ok(config) = read_hooks_file(path) else {
+        return false;
+    };
+
+    CODEX_HOOK_DEFS.iter().all(|spec| {
+        let command = crate::hooks::guarded_hook_command(spec.command);
+        config
+            .hooks
+            .get(spec.event)
+            .and_then(Value::as_array)
+            .is_some_and(|groups| {
+                groups.iter().any(|group| {
+                    group_has_hook_spec(group, &command, spec.status_message, spec.timeout_sec)
+                })
+            })
+    })
 }
 
 fn add_hook(
@@ -410,6 +476,7 @@ fn add_hook(
     event: &str,
     command: &str,
     status_message: Option<&str>,
+    timeout_sec: Option<u64>,
 ) -> bool {
     let groups = hooks
         .entry(event.to_string())
@@ -419,15 +486,16 @@ fn add_hook(
         let Some(groups) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
             return false;
         };
-        return add_hook_to_groups(groups, command, status_message);
+        return add_hook_to_groups(groups, command, status_message, timeout_sec);
     };
-    add_hook_to_groups(groups, command, status_message)
+    add_hook_to_groups(groups, command, status_message, timeout_sec)
 }
 
 fn add_hook_to_groups(
     groups: &mut Vec<Value>,
     command: &str,
     status_message: Option<&str>,
+    timeout_sec: Option<u64>,
 ) -> bool {
     if groups.iter().any(|group| group_has_command(group, command)) {
         return false;
@@ -441,6 +509,9 @@ fn add_hook_to_groups(
             "statusMessage".to_string(),
             Value::String(message.to_string()),
         );
+    }
+    if let Some(timeout) = timeout_sec {
+        entry.insert("timeout".to_string(), Value::Number(timeout.into()));
     }
 
     let mut group = Map::new();
@@ -463,6 +534,76 @@ fn group_has_command(group: &Value, command: &str) -> bool {
                     .is_some_and(|cmd| cmd == command)
             })
         })
+}
+
+fn group_has_hook_spec(
+    group: &Value,
+    command: &str,
+    status_message: Option<&str>,
+    timeout_sec: Option<u64>,
+) -> bool {
+    group
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(|hooks| {
+            hooks
+                .iter()
+                .any(|hook| hook_matches_spec(hook, command, status_message, timeout_sec))
+        })
+}
+
+fn hook_matches_spec(
+    hook: &Value,
+    command: &str,
+    status_message: Option<&str>,
+    timeout_sec: Option<u64>,
+) -> bool {
+    if hook.get("command").and_then(Value::as_str) != Some(command) {
+        return false;
+    }
+    if let Some(message) = status_message {
+        if hook.get("statusMessage").and_then(Value::as_str) != Some(message) {
+            return false;
+        }
+    }
+    if let Some(timeout) = timeout_sec {
+        if hook.get("timeout").and_then(Value::as_u64) != Some(timeout) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Remove only obsolete Atomic hooks for one event, preserving custom hooks
+/// and the exact current Atomic definition. This lets a normal `enable`
+/// migrate older installations without requiring users to discover `--force`.
+fn remove_stale_atomic_hooks_for_event(
+    hooks: &mut Map<String, Value>,
+    event: &str,
+    command: &str,
+    status_message: Option<&str>,
+    timeout_sec: Option<u64>,
+) {
+    let Some(groups) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    groups.retain_mut(|group| {
+        let Some(group_obj) = group.as_object_mut() else {
+            return true;
+        };
+        let Some(group_hooks) = group_obj.get_mut("hooks").and_then(Value::as_array_mut) else {
+            return true;
+        };
+        group_hooks.retain(|hook| {
+            let is_atomic = hook
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(is_atomic_hook);
+            !is_atomic || hook_matches_spec(hook, command, status_message, timeout_sec)
+        });
+        !group_hooks.is_empty()
+    });
 }
 
 fn remove_atomic_hooks(hooks: &mut Map<String, Value>) {
@@ -501,13 +642,13 @@ fn with_openai_provider(mut raw: Value) -> Value {
 }
 
 fn normalize_stop_raw(mut raw: Value) -> Value {
-    let stop_hook_active = raw.get("stop_hook_active").and_then(Value::as_bool);
-    if let Some(active) = stop_hook_active {
-        if let Some(obj) = raw.as_object_mut() {
-            obj.entry("finish_reason".to_string()).or_insert_with(|| {
-                Value::String(if active { "tool-calls" } else { "stop" }.to_string())
-            });
-        }
+    if let Some(obj) = raw.as_object_mut() {
+        // `stop_hook_active` means a previous Stop hook requested a
+        // continuation; it is not a model finish reason. Codex emits a real
+        // SessionEnd event for terminal lifecycle work, so Stop only closes
+        // the current response/turn.
+        obj.entry("finish_reason".to_string())
+            .or_insert_with(|| Value::String("stop".to_string()));
     }
     raw
 }
@@ -609,6 +750,7 @@ struct HookDef {
     event: &'static str,
     command: &'static str,
     status_message: Option<&'static str>,
+    timeout_sec: Option<u64>,
 }
 
 /// Codex hook definitions. `command` holds the bare `atomic agent hooks …`
@@ -619,26 +761,43 @@ const CODEX_HOOK_DEFS: &[HookDef] = &[
         event: "SessionStart",
         command: "atomic agent hooks codex session-start",
         status_message: Some("Atomic: tracking session"),
+        timeout_sec: None,
+    },
+    HookDef {
+        event: "SessionEnd",
+        // Codex clamps this timeout to three seconds. The CLI hook process
+        // hands finalization to a background worker, so the deadline covers
+        // only spawning the worker and forwarding the event payload.
+        command: "atomic agent hooks codex session-end",
+        status_message: None,
+        timeout_sec: Some(3),
     },
     HookDef {
         event: "UserPromptSubmit",
         command: "atomic agent hooks codex user-prompt-submit",
         status_message: None,
+        timeout_sec: None,
     },
     HookDef {
         event: "Stop",
-        command: "atomic agent hooks codex stop",
+        // Keep Stop in-process so Codex cannot emit SessionEnd before the turn
+        // record finishes. The detached handoff predates Codex SessionEnd and
+        // races finalization at process shutdown.
+        command: "atomic agent hooks codex stop --foreground",
         status_message: None,
+        timeout_sec: None,
     },
     HookDef {
         event: "PreToolUse",
         command: "atomic agent hooks codex pre-tool",
         status_message: None,
+        timeout_sec: None,
     },
     HookDef {
         event: "PostToolUse",
         command: "atomic agent hooks codex post-tool",
         status_message: None,
+        timeout_sec: None,
     },
 ];
 
@@ -670,13 +829,13 @@ mod tests {
     #[test]
     fn test_supported_hooks() {
         let hooks = make_hook().supported_hooks();
-        assert_eq!(hooks.len(), 5);
+        assert_eq!(hooks.len(), 6);
         assert!(hooks.contains(&HookType::SessionStart));
+        assert!(hooks.contains(&HookType::SessionEnd));
         assert!(hooks.contains(&HookType::TurnStart));
         assert!(hooks.contains(&HookType::TurnEnd));
         assert!(hooks.contains(&HookType::PreToolUse));
         assert!(hooks.contains(&HookType::PostToolUse));
-        assert!(!hooks.contains(&HookType::SessionEnd));
     }
 
     #[test]
@@ -687,6 +846,7 @@ mod tests {
             verbs,
             vec![
                 "session-start",
+                "session-end",
                 "user-prompt-submit",
                 "stop",
                 "pre-tool",
@@ -701,6 +861,7 @@ mod tests {
             verb_to_hook_type("session-start"),
             Some(HookType::SessionStart)
         );
+        assert_eq!(verb_to_hook_type("session-end"), Some(HookType::SessionEnd));
         assert_eq!(
             verb_to_hook_type("user-prompt-submit"),
             Some(HookType::TurnStart)
@@ -708,7 +869,6 @@ mod tests {
         assert_eq!(verb_to_hook_type("stop"), Some(HookType::TurnEnd));
         assert_eq!(verb_to_hook_type("pre-tool"), Some(HookType::PreToolUse));
         assert_eq!(verb_to_hook_type("post-tool"), Some(HookType::PostToolUse));
-        assert_eq!(verb_to_hook_type("session-end"), None);
         assert_eq!(verb_to_hook_type("unknown"), None);
     }
 
@@ -791,13 +951,25 @@ mod tests {
             "Updated the parser and tests."
         );
         assert_eq!(raw["finish_reason"], "stop");
+        assert!(raw.get("fullyIdle").is_none());
     }
 
     #[test]
-    fn test_parse_stop_active_infers_tool_calls_finish_reason() {
+    fn test_parse_stop_active_is_not_treated_as_a_finish_reason() {
         let input = br#"{"session_id": "sess-123", "stop_hook_active": true}"#;
         let event = make_hook().parse_event(HookType::TurnEnd, input).unwrap();
-        assert_eq!(event.raw_json.unwrap()["finish_reason"], "tool-calls");
+        assert_eq!(event.raw_json.unwrap()["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn test_parse_stop_preserves_explicit_not_idle_signal() {
+        let input = br#"{
+            "session_id": "sess-123",
+            "stop_hook_active": true,
+            "fullyIdle": false
+        }"#;
+        let event = make_hook().parse_event(HookType::TurnEnd, input).unwrap();
+        assert_eq!(event.raw_json.unwrap()["fullyIdle"], false);
     }
 
     #[test]
@@ -868,9 +1040,26 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_session_end_is_unsupported() {
-        let result = make_hook().parse_event(HookType::SessionEnd, br#"{"session_id":"s"}"#);
-        assert!(matches!(result, Err(AgentError::HookParseFailed { .. })));
+    fn test_parse_session_end() {
+        let input = br#"{
+            "session_id": "sess-123",
+            "transcript_path": "/tmp/codex.jsonl",
+            "cwd": "/repo",
+            "hook_event_name": "SessionEnd",
+            "reason": "other"
+        }"#;
+        let event = make_hook()
+            .parse_event(HookType::SessionEnd, input)
+            .unwrap();
+        assert_eq!(event.session_id, "sess-123");
+        assert_eq!(event.event_type, HookType::SessionEnd);
+        assert_eq!(
+            event.transcript_path.as_deref(),
+            Some(Path::new("/tmp/codex.jsonl"))
+        );
+        let raw = event.raw_json.unwrap();
+        assert_eq!(raw["reason"], "other");
+        assert_eq!(raw["provider"], "openai");
     }
 
     #[test]
@@ -904,18 +1093,78 @@ mod tests {
         .unwrap();
 
         let hook = make_hook();
-        assert_eq!(hook.install(dir.path()).unwrap(), 5);
+        assert_eq!(hook.install(dir.path()).unwrap(), 6);
         assert!(hook.is_installed(dir.path()));
         assert_eq!(hook.install(dir.path()).unwrap(), 0);
 
         let content = std::fs::read_to_string(&hooks_path).unwrap();
         assert!(content.contains("custom stop"));
         assert!(content.contains("atomic agent hooks codex session-start"));
+        assert!(content.contains("atomic agent hooks codex session-end"));
         assert!(content.contains("atomic agent hooks codex user-prompt-submit"));
         assert!(content.contains("atomic agent hooks codex stop"));
         assert!(content.contains("atomic agent hooks codex pre-tool"));
         assert!(content.contains("atomic agent hooks codex post-tool"));
+        let installed: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            installed["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"],
+            3
+        );
         assert!(content.contains("\"other\": true"));
+    }
+
+    #[test]
+    fn test_install_migrates_incomplete_legacy_hooks() {
+        let dir = TempDir::new().unwrap();
+        let hooks_path = dir.path().join(CODEX_DIR).join(HOOKS_FILE);
+        install_hooks_at(&hooks_path, false).unwrap();
+
+        let mut config = read_hooks_file(&hooks_path).unwrap();
+        config.hooks.remove("SessionEnd");
+        let stop_hooks = config.hooks["Stop"].as_array_mut().unwrap()[0]["hooks"]
+            .as_array_mut()
+            .unwrap();
+        stop_hooks[0]["command"] = Value::String(crate::hooks::guarded_hook_command(
+            "atomic agent hooks codex stop",
+        ));
+        write_hooks_file(&hooks_path, &config).unwrap();
+
+        assert!(!hooks_file_has_current_atomic_hooks(&hooks_path));
+        assert_eq!(install_hooks_at(&hooks_path, false).unwrap(), 2);
+        assert!(hooks_file_has_current_atomic_hooks(&hooks_path));
+
+        let repaired = read_hooks_file(&hooks_path).unwrap();
+        let stop_commands: Vec<&str> = repaired.hooks["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["hooks"].as_array().unwrap())
+            .filter_map(|hook| hook["command"].as_str())
+            .collect();
+        assert_eq!(stop_commands.len(), 1);
+        assert!(stop_commands[0].contains("stop --foreground"));
+    }
+
+    #[test]
+    fn test_install_repairs_session_end_timeout() {
+        let dir = TempDir::new().unwrap();
+        let hooks_path = dir.path().join(CODEX_DIR).join(HOOKS_FILE);
+        install_hooks_at(&hooks_path, false).unwrap();
+
+        let mut config = read_hooks_file(&hooks_path).unwrap();
+        config.hooks["SessionEnd"].as_array_mut().unwrap()[0]["hooks"]
+            .as_array_mut()
+            .unwrap()[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("timeout");
+        write_hooks_file(&hooks_path, &config).unwrap();
+
+        assert!(!hooks_file_has_current_atomic_hooks(&hooks_path));
+        assert_eq!(install_hooks_at(&hooks_path, false).unwrap(), 1);
+        assert!(hooks_file_has_current_atomic_hooks(&hooks_path));
+        let repaired = read_hooks_file(&hooks_path).unwrap();
+        assert_eq!(repaired.hooks["SessionEnd"][0]["hooks"][0]["timeout"], 3);
     }
 
     #[test]
@@ -932,6 +1181,7 @@ mod tests {
                 .and_then(Value::as_array_mut)
                 .unwrap(),
             "custom stop",
+            None,
             None,
         );
         write_hooks_file(&hooks_path, &config).unwrap();
@@ -953,6 +1203,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let hooks_path = dir.path().join(CODEX_DIR).join(HOOKS_FILE);
         install_hooks_at(&hooks_path, false).unwrap();
-        assert_eq!(install_hooks_at(&hooks_path, true).unwrap(), 5);
+        assert_eq!(install_hooks_at(&hooks_path, true).unwrap(), 6);
     }
 }

@@ -457,7 +457,9 @@ impl TurnOrchestrator {
                         node.summary = summary;
                         changed = true;
                     }
-                    if let Some(detail) = build_tool_detail(node.kind, tool_name, input, output) {
+                    if let Some(detail) =
+                        build_tool_detail(node.kind, tool_name, input, output, status)
+                    {
                         node.detail = Some(detail);
                         changed = true;
                     }
