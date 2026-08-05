@@ -69,6 +69,7 @@ use crate::error::{CliError, CliResult};
 // Phase 2: Core Local Commands
 pub mod add;
 pub mod change;
+pub mod complete;
 pub mod completions;
 pub mod diff;
 pub mod doctor;

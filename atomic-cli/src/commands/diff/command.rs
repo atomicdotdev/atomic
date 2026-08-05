@@ -1,3 +1,7 @@
+use clap_complete::engine::ArgValueCompleter;
+
+use crate::commands::complete::{complete_change_hashes, complete_view_names};
+
 use super::output::*;
 use super::*;
 
@@ -28,7 +32,7 @@ pub struct Diff {
     pub files: Vec<String>,
 
     /// Compare against a specific change hash or prefix.
-    #[arg(short = 'c', long = "change")]
+    #[arg(short = 'c', long = "change", add = ArgValueCompleter::new(complete_change_hashes))]
     pub change: Option<String>,
 
     /// Diff algorithm: myers or patience.
@@ -68,7 +72,7 @@ pub struct Diff {
     pub cached: bool,
 
     /// View to compare against.
-    #[arg(long)]
+    #[arg(long, add = ArgValueCompleter::new(complete_view_names))]
     pub view: Option<String>,
 
     /// Enable token-level diff highlighting (CRDT-powered).

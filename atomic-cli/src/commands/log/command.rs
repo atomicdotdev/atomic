@@ -1,3 +1,7 @@
+use clap_complete::engine::ArgValueCompleter;
+
+use crate::commands::complete::complete_view_names;
+
 use super::*;
 
 // Log Command
@@ -41,7 +45,7 @@ pub struct Log {
     ///
     /// By default, shows history for the current view. Use this
     /// option to view another view's history without switching.
-    #[arg(long = "view", value_name = "NAME")]
+    #[arg(long = "view", value_name = "NAME", add = ArgValueCompleter::new(complete_view_names))]
     pub view: Option<String>,
 
     /// Only show tagged changes.
