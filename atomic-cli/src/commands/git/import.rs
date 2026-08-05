@@ -488,6 +488,9 @@ impl Command for Import {
 
             let mut total_imported = 0;
             for branch_name in branches {
+                let preserve_branch_working_copy =
+                    preserve_current_view && original_view != branch_name;
+
                 // Ensure the view exists
                 if !repo
                     .view_exists(&branch_name)
@@ -506,23 +509,31 @@ impl Command for Import {
                 // Existing incremental imports are background bookkeeping.
                 // Select the target only on this handle so concurrent hooks
                 // and crashes never observe a temporary global view pointer.
-                if preserve_current_view {
+                if preserve_branch_working_copy {
                     repo.set_current_view_in_memory(&branch_name);
                 } else {
                     repo.align_to_view(&branch_name)
                         .map_err(|e| CliError::Internal(e.into()))?;
                 }
 
-                // Import the branch
-                let count = self.import_branch(
+                // Import the branch. A foreign target is selected only on
+                // this handle; restore the handle to the persisted working
+                // copy view before processing the next branch (including on
+                // error) so no later transition mistakes the scoped target
+                // for the recovery source.
+                let import_result = self.import_branch(
                     &git_repo,
                     &branch_name,
                     &mut repo,
                     &imported_shas,
                     &known_states,
                     false,
-                    preserve_current_view,
-                )?;
+                    preserve_branch_working_copy,
+                );
+                if preserve_branch_working_copy {
+                    repo.set_current_view_in_memory(&original_view);
+                }
+                let count = import_result?;
                 total_imported += count;
             }
 

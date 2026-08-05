@@ -5,6 +5,7 @@ use crate::apply::{
     write_change_to_graph, CrossViewInsertOptions, CrossViewInsertOutcome, InsertOptions,
     InsertOutcome, InsertStats,
 };
+use crate::repository::deferred_tree::collect_tree_ops;
 use atomic_core::change::Insertion;
 use atomic_core::pristine::InodeGraphOps;
 use atomic_core::types::{ChangePosition, EdgeFlags, GraphNode, SerializedGraphEdge};
@@ -19,10 +20,9 @@ use std::collections::{HashMap, HashSet};
 ///
 /// # Complexity
 ///
-/// O(S × log C) where S is the number of views and C is the number of
-/// changes per view.  Each view is checked with a single B-tree lookup
-/// on `REV_STACK_CHANGES` via [`ViewTxnT::get_change_seq`], rather than
-/// linearly scanning the entire change log.
+/// O(S × C) in the worst case, where S is the number of views and C is the
+/// number of visible changes per view. Path deletion is uncommon, and using
+/// the canonical inherited-view filter is required for correctness on drafts.
 fn is_file_only_on_view<T: GraphTxnT + ViewTxnT + TreeTxnT>(
     txn: &T,
     inode: Inode,
@@ -55,9 +55,10 @@ fn is_file_only_on_view<T: GraphTxnT + ViewTxnT + TreeTxnT>(
             Ok(Some(s)) => s,
             _ => continue,
         };
-        // O(log C) B-tree lookup on REV_STACK_CHANGES instead of
-        // iterating the entire change log.
-        if let Ok(Some(_seq)) = txn.get_change_seq(&view, creating_change) {
+        if collect_visible_change_ids(txn, &view)
+            .map(|ids| ids.contains(&creating_change))
+            .unwrap_or(false)
+        {
             // Another view still references this file — not safe to remove.
             return false;
         }
@@ -718,14 +719,17 @@ impl Repository {
     /// This preserves the normal graph writer and CRDT table application, but
     /// avoids reloading the just-saved change and avoids the `has_change_in_graph`
     /// probe. The write transaction is opened before assembly, so globalization
-    /// and application share one consistent transaction view.
+    /// and application share one consistent transaction view. When
+    /// `preserve_existing_tree_paths` is set, deletions and renames remain
+    /// graph-only so importing into a foreign view cannot rewrite the active
+    /// view's global TREE mappings.
     pub fn write_import_recorded(
         &self,
         header: ChangeHeader,
         recorded_files: &[atomic_core::record::workflow::RecordedFile],
         unhashed: serde_json::Value,
         deleted_paths: &[String],
-        preserve_tree_deletions: bool,
+        preserve_existing_tree_paths: bool,
         options: InsertOptions,
     ) -> Result<ImportWriteOutcome, RepositoryError> {
         use atomic_core::record::workflow::assemble_change;
@@ -782,6 +786,8 @@ impl Repository {
         txn.put_change_deps(change_id, final_change.dependencies())
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        let tree_ops = collect_tree_ops(&txn, hash, &final_change, deleted_paths)?;
+
         for graph_op in final_change.hunks() {
             match graph_op {
                 GraphOp::FileAdd {
@@ -791,8 +797,10 @@ impl Repository {
                         .alloc_inode()
                         .map_err(|e| RepositoryError::Database(e.to_string()))?;
                     let inode_position = Position::new(change_id, add_inode.start);
-                    txn.put_tree(path, new_inode)
-                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    if !preserve_existing_tree_paths {
+                        txn.put_tree(path, new_inode)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    }
                     txn.put_inode(new_inode, inode_position)
                         .map_err(|e| RepositoryError::Database(e.to_string()))?;
                 }
@@ -805,15 +813,17 @@ impl Repository {
                         .alloc_inode()
                         .map_err(|e| RepositoryError::Database(e.to_string()))?;
                     let inode_position = Position::new(change_id, add_inode.start);
-                    txn.put_tree(path, new_inode)
-                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    if !preserve_existing_tree_paths {
+                        txn.put_tree(path, new_inode)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    }
                     txn.put_inode(new_inode, inode_position)
                         .map_err(|e| RepositoryError::Database(e.to_string()))?;
                     txn.put_directory(new_inode, directory_flags::explicit_empty())
                         .map_err(|e| RepositoryError::Database(e.to_string()))?;
                 }
                 GraphOp::FileDel { path, .. } => {
-                    if !preserve_tree_deletions {
+                    if !preserve_existing_tree_paths {
                         if let Ok(Some(inode)) = txn.get_inode(path) {
                             let dominated = is_file_only_on_view(&txn, inode, view_name);
                             if dominated {
@@ -824,7 +834,7 @@ impl Repository {
                     }
                 }
                 GraphOp::DirDel { path, .. } => {
-                    if !preserve_tree_deletions {
+                    if !preserve_existing_tree_paths {
                         if let Ok(Some(inode)) = txn.get_inode(path) {
                             let dominated = is_file_only_on_view(&txn, inode, view_name);
                             if dominated {
@@ -836,27 +846,29 @@ impl Repository {
                     }
                 }
                 GraphOp::FileMove { add, path, .. } => {
-                    let inode_change_id = match &add.inode.change {
-                        None => change_id,
-                        Some(h) if *h == Hash::NONE => NodeId::ROOT,
-                        Some(h) => txn.get_internal(h).unwrap_or(None).unwrap_or(NodeId::ROOT),
-                    };
-                    let inode_pos = Position::new(inode_change_id, add.inode.pos);
+                    if !preserve_existing_tree_paths {
+                        let inode_change_id = match &add.inode.change {
+                            None => change_id,
+                            Some(h) if *h == Hash::NONE => NodeId::ROOT,
+                            Some(h) => txn.get_internal(h).unwrap_or(None).unwrap_or(NodeId::ROOT),
+                        };
+                        let inode_pos = Position::new(inode_change_id, add.inode.pos);
 
-                    if let Ok(Some(inode)) = txn.position_inode(inode_pos) {
-                        if let Ok(Some(old_path)) = txn.get_path(inode) {
-                            if old_path != *path {
-                                let _ = txn.del_tree(&old_path);
+                        if let Ok(Some(inode)) = txn.position_inode(inode_pos) {
+                            if let Ok(Some(old_path)) = txn.get_path(inode) {
+                                if old_path != *path {
+                                    let _ = txn.del_tree(&old_path);
+                                }
                             }
+                            let _ = txn.put_tree(path, inode);
                         }
-                        let _ = txn.put_tree(path, inode);
                     }
                 }
                 _ => {}
             }
         }
 
-        if !preserve_tree_deletions {
+        if !preserve_existing_tree_paths {
             for deleted_path in deleted_paths {
                 if let Ok(Some(inode)) = txn.get_inode(deleted_path) {
                     let dominated = is_file_only_on_view(&txn, inode, view_name);
@@ -897,6 +909,7 @@ impl Repository {
         timings.direct_crdt_ms = direct_crdt_ms;
 
         let commit_start = std::time::Instant::now();
+        self.append_deferred_tree_ops(&txn, &tree_ops, view_name, preserve_existing_tree_paths)?;
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         timings.commit_ms = commit_start.elapsed().as_millis();
@@ -912,10 +925,13 @@ impl Repository {
     ///
     /// This bypasses record/globalize and eager CRDT table writes. The caller
     /// has already compiled Git's snapshot delta into line-level graph ops.
+    /// `preserve_existing_tree_paths` keeps deletions and renames graph-only
+    /// while a different view owns the materialized working copy.
     pub fn write_import_graph_change(
         &self,
         change: Change,
         deleted_paths: &[String],
+        preserve_existing_tree_paths: bool,
         options: InsertOptions,
     ) -> Result<ImportWriteOutcome, RepositoryError> {
         let mut timings = ImportWriteTimings::default();
@@ -946,6 +962,8 @@ impl Repository {
         txn.put_change_deps(change_id, final_change.dependencies())
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        let tree_ops = collect_tree_ops(&txn, hash, &final_change, deleted_paths)?;
+
         let apply_start = std::time::Instant::now();
         let insert = if import_graph_first_can_apply(&final_change) {
             let (insert, graph_ms, crdt_ms) = self.write_import_graph_first_direct(
@@ -954,6 +972,7 @@ impl Repository {
                 change_id,
                 &hash,
                 &final_change,
+                preserve_existing_tree_paths,
                 &options,
             )?;
             timings.direct_graph_ms = graph_ms;
@@ -973,14 +992,19 @@ impl Repository {
         };
         timings.apply_ms = apply_start.elapsed().as_millis();
 
-        for deleted_path in deleted_paths {
-            if let Ok(Some(inode)) = txn.get_inode(deleted_path) {
-                let _ = txn.del_tree(deleted_path);
-                let _ = txn.del_inode(inode);
+        if !preserve_existing_tree_paths {
+            for deleted_path in deleted_paths {
+                if let Ok(Some(inode)) = txn.get_inode(deleted_path) {
+                    let _ = txn.del_tree(deleted_path);
+                    if is_file_only_on_view(&txn, inode, view_name) {
+                        let _ = txn.del_inode(inode);
+                    }
+                }
             }
         }
 
         let commit_start = std::time::Instant::now();
+        self.append_deferred_tree_ops(&txn, &tree_ops, view_name, preserve_existing_tree_paths)?;
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         timings.commit_ms = commit_start.elapsed().as_millis();
@@ -999,6 +1023,7 @@ impl Repository {
         change_id: NodeId,
         hash: &Hash,
         change: &Change,
+        preserve_existing_tree_paths: bool,
         _options: &InsertOptions,
     ) -> Result<(InsertOutcome, u128, u128), RepositoryError> {
         use atomic_core::apply::compute_new_state;
@@ -1025,8 +1050,10 @@ impl Repository {
                         let inode = txn
                             .alloc_inode()
                             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                        txn.put_tree(path, inode)
-                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        if !preserve_existing_tree_paths {
+                            txn.put_tree(path, inode)
+                                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        }
                         txn.put_inode(inode, inode_position)
                             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
@@ -1245,14 +1272,16 @@ impl Repository {
                             ));
                         }
 
-                        if let Some(inode) = resolved_inode {
-                            if let Ok(Some(old_path)) = txn.get_path(inode) {
-                                if old_path != *path {
-                                    let _ = txn.del_tree(&old_path);
+                        if !preserve_existing_tree_paths {
+                            if let Some(inode) = resolved_inode {
+                                if let Ok(Some(old_path)) = txn.get_path(inode) {
+                                    if old_path != *path {
+                                        let _ = txn.del_tree(&old_path);
+                                    }
                                 }
+                                txn.put_tree(path, inode)
+                                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
                             }
-                            txn.put_tree(path, inode)
-                                .map_err(|e| RepositoryError::Database(e.to_string()))?;
                         }
 
                         current_by_end.insert(node.end_pos(), node);
@@ -1650,6 +1679,7 @@ impl Repository {
 
         // Determine which view to use
         let view_name = options.view.as_deref().unwrap_or(&self.current_view);
+        let preserve_existing_tree_paths = view_name != self.current_view;
         log::debug!(
             "insert_change: change_id={:?} view={} already_in_graph={} hunks={}",
             change_id,
@@ -1657,6 +1687,7 @@ impl Repository {
             already_in_graph,
             change.hunks().len()
         );
+        let tree_ops = collect_tree_ops(&txn, *hash, &change, &[])?;
 
         // Populate tree tables for FileAdd/DirAdd/FileDel hunks.
         // This creates the path→inode→position mappings that materialize
@@ -1673,8 +1704,10 @@ impl Repository {
                             .alloc_inode()
                             .map_err(|e| RepositoryError::Database(e.to_string()))?;
                         let inode_position = Position::new(change_id, add_inode.start);
-                        txn.put_tree(path, new_inode)
-                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        if !preserve_existing_tree_paths {
+                            txn.put_tree(path, new_inode)
+                                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        }
                         txn.put_inode(new_inode, inode_position)
                             .map_err(|e| RepositoryError::Database(e.to_string()))?;
                     }
@@ -1686,8 +1719,10 @@ impl Repository {
                             .alloc_inode()
                             .map_err(|e| RepositoryError::Database(e.to_string()))?;
                         let inode_position = Position::new(change_id, add_inode.start);
-                        txn.put_tree(path, new_inode)
-                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        if !preserve_existing_tree_paths {
+                            txn.put_tree(path, new_inode)
+                                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        }
                         txn.put_inode(new_inode, inode_position)
                             .map_err(|e| RepositoryError::Database(e.to_string()))?;
                         txn.put_directory(new_inode, directory_flags::explicit_empty())
@@ -1696,10 +1731,12 @@ impl Repository {
                     GraphOp::FileDel { path, .. } => {
                         // View-aware: only remove TREE entry when no other
                         // view still references the file's creating change.
-                        if let Ok(Some(inode)) = txn.get_inode(path) {
-                            let dominated = is_file_only_on_view(&txn, inode, view_name);
-                            if dominated {
-                                let _ = txn.del_tree(path);
+                        if !preserve_existing_tree_paths {
+                            if let Ok(Some(inode)) = txn.get_inode(path) {
+                                let dominated = is_file_only_on_view(&txn, inode, view_name);
+                                if dominated {
+                                    let _ = txn.del_tree(path);
+                                }
                             }
                         }
                     }
@@ -1710,29 +1747,33 @@ impl Repository {
                         //
                         // add.inode is Position<Option<Hash>>; resolve it to
                         // Position<NodeId> so we can call position_inode().
-                        let inode_change_id = match &add.inode.change {
-                            None => change_id, // self-reference (shouldn't happen for FileMove)
-                            Some(h) if *h == Hash::NONE => NodeId::ROOT,
-                            Some(h) => txn.get_internal(h).unwrap_or(None).unwrap_or(NodeId::ROOT),
-                        };
-                        let inode_pos = Position::new(inode_change_id, add.inode.pos);
-
-                        if let Ok(Some(inode)) = txn.position_inode(inode_pos) {
-                            // Remove the old TREE entry (old path → inode)
-                            if let Ok(Some(old_path)) = txn.get_path(inode) {
-                                // Guard: only delete the old path if it differs
-                                // from the new path.  When multiple files share
-                                // the same inode position (a rare data-integrity
-                                // edge case), position_inode may resolve to an
-                                // inode whose current path was already updated
-                                // by a prior FileMove in this same change.
-                                // Deleting it would undo that earlier rename.
-                                if old_path != *path {
-                                    let _ = txn.del_tree(&old_path);
+                        if !preserve_existing_tree_paths {
+                            let inode_change_id = match &add.inode.change {
+                                None => change_id, // self-reference (shouldn't happen for FileMove)
+                                Some(h) if *h == Hash::NONE => NodeId::ROOT,
+                                Some(h) => {
+                                    txn.get_internal(h).unwrap_or(None).unwrap_or(NodeId::ROOT)
                                 }
+                            };
+                            let inode_pos = Position::new(inode_change_id, add.inode.pos);
+
+                            if let Ok(Some(inode)) = txn.position_inode(inode_pos) {
+                                // Remove the old TREE entry (old path → inode)
+                                if let Ok(Some(old_path)) = txn.get_path(inode) {
+                                    // Guard: only delete the old path if it differs
+                                    // from the new path.  When multiple files share
+                                    // the same inode position (a rare data-integrity
+                                    // edge case), position_inode may resolve to an
+                                    // inode whose current path was already updated
+                                    // by a prior FileMove in this same change.
+                                    // Deleting it would undo that earlier rename.
+                                    if old_path != *path {
+                                        let _ = txn.del_tree(&old_path);
+                                    }
+                                }
+                                // Insert the new TREE entry (new path → inode)
+                                let _ = txn.put_tree(path, inode);
                             }
-                            // Insert the new TREE entry (new path → inode)
-                            let _ = txn.put_tree(path, inode);
                         }
                     }
                     _ => {}
@@ -1773,6 +1814,7 @@ impl Repository {
         // Commit the transaction
         log::debug!("insert_change: committing transaction...");
         let commit_start = std::time::Instant::now();
+        self.append_deferred_tree_ops(&txn, &tree_ops, view_name, preserve_existing_tree_paths)?;
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         let commit_ms = commit_start.elapsed().as_millis();
@@ -2019,6 +2061,8 @@ impl Repository {
 
         // Determine which view to use
         let view_name = options.view.as_deref().unwrap_or(&self.current_view);
+        let preserve_existing_tree_paths = view_name != self.current_view;
+        let tree_ops = collect_tree_ops(&txn, *hash, change, outcome.deleted_files())?;
 
         // Before applying atoms, set up tree entries for FileAdd hunks.
         // This creates the inode→position and path→inode mappings needed
@@ -2044,8 +2088,10 @@ impl Repository {
                     // Add to tree tables:
                     // - put_tree: path ↔ inode (TREE and REV_TREE)
                     // - put_inode: inode ↔ position (INODES and REV_INODES)
-                    txn.put_tree(path, new_inode)
-                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    if !preserve_existing_tree_paths {
+                        txn.put_tree(path, new_inode)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    }
                     txn.put_inode(new_inode, inode_position)
                         .map_err(|e| RepositoryError::Database(e.to_string()))?;
                 }
@@ -2066,8 +2112,10 @@ impl Repository {
                     // - put_tree: path ↔ inode (TREE and REV_TREE)
                     // - put_inode: inode ↔ position (INODES and REV_INODES)
                     // - put_directory: mark inode as directory (DIRECTORIES)
-                    txn.put_tree(path, new_inode)
-                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    if !preserve_existing_tree_paths {
+                        txn.put_tree(path, new_inode)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    }
                     txn.put_inode(new_inode, inode_position)
                         .map_err(|e| RepositoryError::Database(e.to_string()))?;
                     txn.put_directory(new_inode, directory_flags::explicit_empty())
@@ -2079,11 +2127,13 @@ impl Repository {
                     // change.  The TREE and INODES tables are global — removing
                     // an entry here would make the file invisible on every
                     // view, not just the one where the deletion was recorded.
-                    if let Ok(Some(inode)) = txn.get_inode(path) {
-                        let dominated = is_file_only_on_view(&txn, inode, view_name);
-                        if dominated {
-                            let _ = txn.del_tree(path);
-                            let _ = txn.del_inode(inode);
+                    if !preserve_existing_tree_paths {
+                        if let Ok(Some(inode)) = txn.get_inode(path) {
+                            let dominated = is_file_only_on_view(&txn, inode, view_name);
+                            if dominated {
+                                let _ = txn.del_tree(path);
+                                let _ = txn.del_inode(inode);
+                            }
                         }
                         // When other views still reference the file we leave
                         // TREE/INODES intact.  The deletion is represented in
@@ -2093,12 +2143,14 @@ impl Repository {
                 }
                 GraphOp::DirDel { path, .. } => {
                     // Same view-aware logic as FileDel above.
-                    if let Ok(Some(inode)) = txn.get_inode(path) {
-                        let dominated = is_file_only_on_view(&txn, inode, view_name);
-                        if dominated {
-                            let _ = txn.del_tree(path);
-                            let _ = txn.del_inode(inode);
-                            let _ = txn.del_directory(inode);
+                    if !preserve_existing_tree_paths {
+                        if let Ok(Some(inode)) = txn.get_inode(path) {
+                            let dominated = is_file_only_on_view(&txn, inode, view_name);
+                            if dominated {
+                                let _ = txn.del_tree(path);
+                                let _ = txn.del_inode(inode);
+                                let _ = txn.del_directory(inode);
+                            }
                         }
                     }
                 }
@@ -2106,20 +2158,22 @@ impl Repository {
                     // A FileMove reuses the existing inode — look it up via
                     // the inode position stored in add.inode, then update
                     // TREE: remove the old path mapping and insert the new one.
-                    let inode_change_id = match &add.inode.change {
-                        None => change_id,
-                        Some(h) if *h == Hash::NONE => NodeId::ROOT,
-                        Some(h) => txn.get_internal(h).unwrap_or(None).unwrap_or(NodeId::ROOT),
-                    };
-                    let inode_pos = Position::new(inode_change_id, add.inode.pos);
+                    if !preserve_existing_tree_paths {
+                        let inode_change_id = match &add.inode.change {
+                            None => change_id,
+                            Some(h) if *h == Hash::NONE => NodeId::ROOT,
+                            Some(h) => txn.get_internal(h).unwrap_or(None).unwrap_or(NodeId::ROOT),
+                        };
+                        let inode_pos = Position::new(inode_change_id, add.inode.pos);
 
-                    if let Ok(Some(inode)) = txn.position_inode(inode_pos) {
-                        if let Ok(Some(old_path)) = txn.get_path(inode) {
-                            if old_path != *path {
-                                let _ = txn.del_tree(&old_path);
+                        if let Ok(Some(inode)) = txn.position_inode(inode_pos) {
+                            if let Ok(Some(old_path)) = txn.get_path(inode) {
+                                if old_path != *path {
+                                    let _ = txn.del_tree(&old_path);
+                                }
                             }
+                            let _ = txn.put_tree(path, inode);
                         }
-                        let _ = txn.put_tree(path, inode);
                     }
                 }
                 _ => {}
@@ -2130,12 +2184,14 @@ impl Repository {
         // Since we use GraphOp::Edit with EdgeUpdate for deletions (not GraphOp::FileDel),
         // we need to explicitly remove deleted files from the tree tables.
         // View-aware: only remove if no other view still references the file.
-        for deleted_path in outcome.deleted_files() {
-            if let Ok(Some(inode)) = txn.get_inode(deleted_path) {
-                let dominated = is_file_only_on_view(&txn, inode, view_name);
-                if dominated {
-                    let _ = txn.del_tree(deleted_path);
-                    let _ = txn.del_inode(inode);
+        if !preserve_existing_tree_paths {
+            for deleted_path in outcome.deleted_files() {
+                if let Ok(Some(inode)) = txn.get_inode(deleted_path) {
+                    let dominated = is_file_only_on_view(&txn, inode, view_name);
+                    if dominated {
+                        let _ = txn.del_tree(deleted_path);
+                        let _ = txn.del_inode(inode);
+                    }
                 }
             }
         }
@@ -2151,6 +2207,7 @@ impl Repository {
 
         // Commit the transaction
         let commit_start = std::time::Instant::now();
+        self.append_deferred_tree_ops(&txn, &tree_ops, view_name, preserve_existing_tree_paths)?;
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         if trace_record {

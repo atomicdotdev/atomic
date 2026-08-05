@@ -2763,18 +2763,10 @@ impl ParallelImporter {
                 },
             );
             let write_start = Instant::now();
-            // TREE is global across views. During background import, deletion
-            // cleanup for the target must not remove a path still owned by the
-            // active draft; the graph deletion itself remains authoritative
-            // for the target view.
-            let tree_cleanup_paths = if self.options.preserve_working_copy {
-                &[][..]
-            } else {
-                graph_deleted_paths.as_slice()
-            };
             let write_result = repo.write_import_graph_change(
                 graph_change,
-                tree_cleanup_paths,
+                &graph_deleted_paths,
+                self.options.preserve_working_copy,
                 Default::default(),
             );
             let write_ms = write_start.elapsed().as_millis();
@@ -2852,7 +2844,7 @@ impl ParallelImporter {
             }
         }
         let step = std::time::Instant::now();
-        if !added_paths.is_empty() {
+        if !self.options.preserve_working_copy && !added_paths.is_empty() {
             let _ = repo.add_batch(&added_paths);
         }
         let add_batch_ms = step.elapsed().as_millis();

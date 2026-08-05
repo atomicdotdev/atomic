@@ -317,6 +317,7 @@ init_git_repo
 git_commit "First" "a.txt" "alpha"
 git_commit "Second" "b.txt" "beta"
 git_commit "Shared draft baseline" "shared.txt" "parent shared"
+git_commit "Rename baseline" "rename-me.txt" "rename baseline"
 PRIMARY_BRANCH=$(git_default_branch)
 
 assert_success "initial import for draft regression" atomic git import --no-vault
@@ -352,6 +353,7 @@ fi
 # draft currently has an unrecorded deletion.
 printf '%s' "draft alpha" > a.txt
 printf '%s' "draft shared" > shared.txt
+printf '%s' "draft rename" > rename-me.txt
 assert_success "record divergent draft modification" \
     atomic record --all -m "Draft modifies an inherited file"
 rm b.txt
@@ -359,7 +361,15 @@ rm b.txt
 printf '%s' "gamma" > c.txt
 git add c.txt
 git rm --cached --quiet --force shared.txt
-git commit --quiet -m "Third: add c and delete shared path"
+git mv rename-me.txt renamed.txt
+printf '%s' "rename baseline" > renamed.txt
+git add renamed.txt
+git commit --quiet -m "Third: add c, delete shared path, and rename a file"
+# Restore the active draft's physical path after creating the Git commit. The
+# import must not rewrite its global TREE mapping while updating the parent.
+mv renamed.txt rename-me.txt
+rm c.txt
+printf '%s' "draft rename" > rename-me.txt
 assert_success "incremental new commit while draft is current" \
     atomic git import --incremental --branch "$PRIMARY_BRANCH" --no-vault
 
@@ -383,12 +393,45 @@ assert_file_content "draft modification remains materialized" "a.txt" "draft alp
 assert_file_not_exists "draft deletion remains materialized" "b.txt"
 assert_file_content "draft-owned target deletion remains materialized" \
     "shared.txt" "draft shared"
+assert_file_content "draft-owned target rename remains materialized" \
+    "rename-me.txt" "draft rename"
+assert_file_not_exists "target rename does not leak into active draft" "renamed.txt"
+assert_file_not_exists "target addition does not leak into active draft" "c.txt"
 DRAFT_STATUS=$(atomic status --short 2>/dev/null || true)
 if echo "$DRAFT_STATUS" | grep -qE '^\?+ +shared\.txt$'; then
     _fail "target deletion keeps draft path tracked" "$DRAFT_STATUS"
 else
     _pass "target deletion keeps draft path tracked"
 fi
+if echo "$DRAFT_STATUS" | grep -qE '^\?+ +rename-me\.txt$'; then
+    _fail "target rename keeps draft path tracked" "$DRAFT_STATUS"
+else
+    _pass "target rename keeps draft path tracked"
+fi
+
+# The source view may independently add the exact path that the target added
+# while it was in the background. Both inodes must join the same deferred path
+# lifecycle so switching can remove one occupant before installing the other.
+printf '%s' "beta" > b.txt
+printf '%s' "draft gamma" > c.txt
+assert_success "record foreground add at deferred target path" \
+    atomic record --all -m "Draft independently adds target path"
+rm b.txt
+assert_file_content "foreground same-path add remains materialized" \
+    "c.txt" "draft gamma"
+
+# A normal foreground rename after the deferred import must become the source
+# view's new path baseline. Switching to the target and back may not resurrect
+# the stale pre-rename path from the first journal event.
+printf '%s' "beta" > b.txt
+assert_success "foreground draft rename after background import" \
+    mv rename-me.txt draft-renamed.txt
+assert_success "record foreground draft rename" \
+    atomic record --all -m "Draft renames after background import"
+rm b.txt
+assert_file_content "foreground draft rename is materialized" \
+    "draft-renamed.txt" "draft rename"
+assert_file_not_exists "foreground draft rename removes old path" "rename-me.txt"
 
 assert_success "force switch to imported primary after draft sync" \
     atomic view switch --force "$PRIMARY_BRANCH"
@@ -396,6 +439,47 @@ assert_file_content "primary modification is not taken from draft" "a.txt" "alph
 assert_output_contains "primary graph retains the draft-deleted path" "D  b.txt" \
     atomic status --short
 assert_file_content "primary receives the new Git commit" "c.txt" "gamma"
+assert_file_not_exists "primary receives the target deletion" "shared.txt"
+assert_file_not_exists "primary removes the old renamed path" "rename-me.txt"
+assert_file_content "primary receives the renamed path" "renamed.txt" "rename baseline"
+
+assert_success "switch back to source with same-path add" \
+    atomic view switch --force agent-draft
+assert_file_content "source restores its own same-path inode" \
+    "c.txt" "draft gamma"
+assert_file_content "source restores its foreground rename" \
+    "draft-renamed.txt" "draft rename"
+assert_file_not_exists "source removes the target rename again" "renamed.txt"
+
+# Return TREE to the target state used by the interrupted-switch recovery
+# fixture below.
+assert_success "switch target again before recovery fixture" \
+    atomic view switch --force "$PRIMARY_BRANCH"
+assert_file_content "target restores its own same-path inode" "c.txt" "gamma"
+
+# Simulate a process exit after TREE committed for the target but before the
+# target pointer was published. At that point the working copy and persisted
+# pointer still belong to the source draft, while TREE contains the target's
+# paths. A writable reopen must align TREE back to the persisted source and
+# clear the marker before the command proceeds.
+printf '%s' "draft alpha" > a.txt
+printf '%s' "draft shared" > shared.txt
+printf '%s' "draft rename" > draft-renamed.txt
+printf '%s' "draft gamma" > c.txt
+rm -f renamed.txt
+printf '%s\n' "agent-draft" > .atomic/current_view
+printf '{"version":1,"source_view":"agent-draft","target_view":"%s"}\n' \
+    "$PRIMARY_BRANCH" > .atomic/deferred-tree-alignment.pending
+assert_success "recover interrupted TREE/view alignment" \
+    atomic view switch --force agent-draft
+assert_file_not_exists "recovery clears the pending alignment marker" \
+    ".atomic/deferred-tree-alignment.pending"
+assert_file_content "draft keeps its later foreground rename" \
+    "draft-renamed.txt" "draft rename"
+assert_file_content "recovery restores the source same-path inode" \
+    "c.txt" "draft gamma"
+assert_file_not_exists "draft does not resurrect the stale rename baseline" "rename-me.txt"
+assert_file_not_exists "draft does not retain the target rename" "renamed.txt"
 
 # ════════════════════════════════════════════════════════════════════════
 # Section 9: Git-owned materialization after importing all local branches
