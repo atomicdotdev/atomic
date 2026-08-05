@@ -62,6 +62,8 @@ struct DesiredTreePath {
     last_set_order: Option<usize>,
 }
 
+type DeferredPathClaim = (Position<Hash>, Option<usize>);
+
 fn desired_tree_paths(
     ops: &[DeferredTreeOp],
     visible_changes: &HashSet<Hash>,
@@ -94,7 +96,7 @@ fn desired_tree_paths(
     // established when those changes were recorded/imported: the latest
     // visible Set owns the path. Baseline-only duplicates remain untouched so
     // apply_deferred_tree_ops_in_txn still fails closed on corrupt TREE state.
-    let mut claims: HashMap<String, Vec<(Position<Hash>, Option<usize>)>> = HashMap::new();
+    let mut claims: HashMap<String, Vec<DeferredPathClaim>> = HashMap::new();
     for (inode, state) in &desired {
         if let Some(path) = &state.desired_path {
             claims
@@ -554,6 +556,7 @@ impl Repository {
 
         let lock = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(self.dot_dir.join(DEFERRED_TREE_ALIGNMENT_LOCK))?;

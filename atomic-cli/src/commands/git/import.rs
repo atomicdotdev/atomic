@@ -160,6 +160,12 @@ fn current_git_branch(git_repo: &GitRepository) -> Option<String> {
 
 const GIT_SHADOW_EXCLUDE_PATTERNS: &[&str] = &["/.atomic/", "/.vault/", "/.atomicignore"];
 
+#[derive(Debug, Clone, Copy)]
+struct BranchImportMode {
+    mainline_only: bool,
+    preserve_working_copy: bool,
+}
+
 fn ensure_git_shadow_excludes(git_dir: &Path) -> CliResult<bool> {
     let info_dir = git_dir.join("info");
     std::fs::create_dir_all(&info_dir)?;
@@ -206,8 +212,7 @@ impl Import {
         repo: &mut Repository,
         imported_shas: &HashSet<String>,
         known_states: &HashSet<atomic_core::types::Merkle>,
-        mainline_only: bool,
-        preserve_working_copy: bool,
+        mode: BranchImportMode,
     ) -> CliResult<usize> {
         // Get repository name from remote URL or working directory
         let repo_name = self.get_repo_name(git_repo);
@@ -221,9 +226,9 @@ impl Import {
                 git_repo.workdir().unwrap_or_else(|| repo.root()),
                 self.kind.as_deref(),
             ),
-            mainline_only,
+            mainline_only: mode.mainline_only,
             graph_only: !self.with_crdt,
-            preserve_working_copy,
+            preserve_working_copy: mode.preserve_working_copy,
             target_view: branch_name.to_string(),
             known_states: known_states.clone(),
         };
@@ -232,7 +237,6 @@ impl Import {
 
         // Run the three-phase parallel import
         let stats = importer.import_branch(branch_name, repo)?;
-
         // Return total changes created (written + empty + merge)
         Ok(stats.changes_written + stats.empty_commits + stats.merge_commits)
     }
@@ -527,8 +531,10 @@ impl Command for Import {
                     &mut repo,
                     &imported_shas,
                     &known_states,
-                    false,
-                    preserve_branch_working_copy,
+                    BranchImportMode {
+                        mainline_only: false,
+                        preserve_working_copy: preserve_branch_working_copy,
+                    },
                 );
                 if preserve_branch_working_copy {
                     repo.set_current_view_in_memory(&original_view);
@@ -627,8 +633,10 @@ impl Command for Import {
                 &mut repo,
                 &imported_shas,
                 &known_states,
-                true,
-                restore_original_view,
+                BranchImportMode {
+                    mainline_only: true,
+                    preserve_working_copy: restore_original_view,
+                },
             )?;
 
             if restore_original_view {
