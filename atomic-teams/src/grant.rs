@@ -47,9 +47,9 @@ fn validate_mutation_subject(subject_type: GrantSubjectType) -> TeamsResult<()> 
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::OrgNotFound`](crate::error::TeamsError::OrgNotFound)
+/// Returns [`TeamsError::OrgNotFound`]
 /// if the org does not exist, or
-/// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// [`TeamsError::PermissionDenied`]
 /// if the caller lacks access.
 pub async fn list_org_grants(
     client: &StorageClient,
@@ -69,11 +69,11 @@ pub async fn list_org_grants(
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::AlreadyExists`](crate::error::TeamsError::AlreadyExists)
+/// Returns [`TeamsError::AlreadyExists`]
 /// if the grant already exists, or
-/// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// [`TeamsError::PermissionDenied`]
 /// if the caller is not an org owner. Returns
-/// [`TeamsError::InvalidInput`](crate::error::TeamsError::InvalidInput) when
+/// [`TeamsError::InvalidInput`] when
 /// `subject_type` is [`GrantSubjectType::Everyone`].
 pub async fn add_org_grant(
     client: &StorageClient,
@@ -103,11 +103,11 @@ pub async fn add_org_grant(
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::OrgNotFound`](crate::error::TeamsError::OrgNotFound)
+/// Returns [`TeamsError::OrgNotFound`]
 /// if the org does not exist, or
-/// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// [`TeamsError::PermissionDenied`]
 /// if the caller is not an org owner. Returns
-/// [`TeamsError::InvalidInput`](crate::error::TeamsError::InvalidInput) when
+/// [`TeamsError::InvalidInput`] when
 /// `subject_type` is [`GrantSubjectType::Everyone`].
 pub async fn revoke_org_grant(
     client: &StorageClient,
@@ -132,7 +132,7 @@ pub async fn revoke_org_grant(
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// Returns [`TeamsError::PermissionDenied`]
 /// if the caller lacks read access, or a not-found error if the workspace
 /// doesn't exist.
 pub async fn list_workspace_grants(
@@ -153,11 +153,11 @@ pub async fn list_workspace_grants(
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::AlreadyExists`](crate::error::TeamsError::AlreadyExists)
+/// Returns [`TeamsError::AlreadyExists`]
 /// if the grant already exists, or
-/// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// [`TeamsError::PermissionDenied`]
 /// if the caller is not a workspace admin. Returns
-/// [`TeamsError::InvalidInput`](crate::error::TeamsError::InvalidInput) when
+/// [`TeamsError::InvalidInput`] when
 /// `subject_type` is [`GrantSubjectType::Everyone`].
 pub async fn add_workspace_grant(
     client: &StorageClient,
@@ -187,10 +187,10 @@ pub async fn add_workspace_grant(
 ///
 /// # Errors
 ///
-/// Returns [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
+/// Returns [`TeamsError::PermissionDenied`]
 /// if the caller is not a workspace admin, or a not-found error if the
 /// workspace doesn't exist. Returns
-/// [`TeamsError::InvalidInput`](crate::error::TeamsError::InvalidInput) when
+/// [`TeamsError::InvalidInput`] when
 /// `subject_type` is [`GrantSubjectType::Everyone`].
 pub async fn revoke_workspace_grant(
     client: &StorageClient,
