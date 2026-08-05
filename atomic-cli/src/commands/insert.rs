@@ -6,7 +6,10 @@
 //! - Inserting changes up to a specific tag
 //! - Cherry-picking specific changes
 
+use std::ffi::OsStr;
+
 use clap::{Args, Subcommand};
+use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::{
@@ -24,21 +27,31 @@ use crate::output;
 /// This command inserts changes into the repository graph. It supports several
 /// modes of operation:
 ///
+/// - **Bare `atomic insert`** (no arguments): promote the current view's
+///   changes into its parent view. This is the "I'm done with this draft,
+///   land it" gesture.
 /// - Insert a single change by hash
-/// - Insert all changes from one view to another
-/// - Insert changes up to a specific tag
-/// - Cherry-pick specific changes
+/// - Insert all changes from one view to another (`from-view`)
+/// - Insert changes up to a specific tag (`tag`)
+/// - Cherry-pick specific changes (`pick`)
 #[derive(Debug, Args)]
 pub struct Insert {
     #[command(subcommand)]
     command: Option<InsertSubcommand>,
 
     /// Hash of the change to insert (when not using subcommands).
-    #[arg(value_name = "CHANGE")]
+    ///
+    /// Omit entirely to promote the current view's changes into its parent
+    /// view (see the command-level docs).
+    #[arg(value_name = "CHANGE", add = ArgValueCompleter::new(complete_change_hashes))]
     change: Option<String>,
 
-    /// View to insert the change into (default: current view).
-    #[arg(long)]
+    /// Target view.
+    ///
+    /// For `atomic insert <hash>` this is the view the change is inserted
+    /// into (default: current view). For the bare `atomic insert` promotion
+    /// it overrides the target (default: the current view's parent).
+    #[arg(long, visible_alias = "to", add = ArgValueCompleter::new(complete_view_names))]
     view: Option<String>,
 
     /// Insert dependencies automatically.
@@ -49,6 +62,14 @@ pub struct Insert {
     #[arg(long)]
     allow_conflicts: bool,
 
+    /// Preview the promotion without inserting anything.
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+
+    /// Skip the confirmation prompt when promoting between two shared views.
+    #[arg(long)]
+    confirm: bool,
+
     /// Repository path.
     #[arg(short = 'R', long)]
     repository: Option<String>,
@@ -57,32 +78,36 @@ pub struct Insert {
 /// Insert subcommands for cross-view operations.
 #[derive(Debug, Subcommand)]
 pub enum InsertSubcommand {
-    /// Insert changes from one view to another.
-    #[command(name = "from-view")]
-    FromView(FromViewArgs),
+    /// Insert all changes from another view.
+    ///
+    /// `from-view` is kept as an alias for backward compatibility.
+    #[command(name = "view", alias = "from-view")]
+    View(ViewArgs),
 
     /// Insert changes up to a specific tag.
     #[command(name = "tag")]
     Tag(TagArgs),
 
-    /// Cherry-pick specific changes.
-    #[command(name = "pick")]
-    Pick(PickArgs),
+    /// Insert specific change(s) by hash.
+    ///
+    /// `pick` is kept as an alias for backward compatibility.
+    #[command(name = "change", alias = "pick")]
+    Change(ChangeArgs),
 
     /// Show what would be inserted (dry run).
     #[command(name = "preview")]
     Preview(PreviewArgs),
 }
 
-/// Arguments for inserting from one view to another.
+/// Arguments for inserting all changes from another view.
 #[derive(Debug, Args)]
-pub struct FromViewArgs {
+pub struct ViewArgs {
     /// Source view to copy changes from.
-    #[arg(value_name = "SOURCE")]
+    #[arg(value_name = "SOURCE", add = ArgValueCompleter::new(complete_view_names))]
     from_view: String,
 
     /// Target view to insert changes into (default: current view).
-    #[arg(long)]
+    #[arg(long, visible_alias = "to", add = ArgValueCompleter::new(complete_view_names))]
     to_view: Option<String>,
 
     /// Insert dependencies automatically.
@@ -94,7 +119,7 @@ pub struct FromViewArgs {
     allow_conflicts: bool,
 
     /// Perform a dry run (don't actually insert).
-    #[arg(long)]
+    #[arg(short = 'n', long)]
     dry_run: bool,
 }
 
@@ -106,11 +131,11 @@ pub struct TagArgs {
     tag_name: String,
 
     /// Source view containing the tag.
-    #[arg(long)]
+    #[arg(long, add = ArgValueCompleter::new(complete_view_names))]
     from_view: Option<String>,
 
     /// Target view to insert changes into (default: current view).
-    #[arg(long)]
+    #[arg(long, visible_alias = "to", add = ArgValueCompleter::new(complete_view_names))]
     to_view: Option<String>,
 
     /// Insert dependencies automatically.
@@ -122,19 +147,19 @@ pub struct TagArgs {
     allow_conflicts: bool,
 
     /// Perform a dry run (don't actually insert).
-    #[arg(long)]
+    #[arg(short = 'n', long)]
     dry_run: bool,
 }
 
-/// Arguments for cherry-picking specific changes.
+/// Arguments for inserting specific change(s) by hash.
 #[derive(Debug, Args)]
-pub struct PickArgs {
-    /// Hashes of changes to cherry-pick.
-    #[arg(value_name = "CHANGES", required = true)]
+pub struct ChangeArgs {
+    /// Hashes of changes to insert.
+    #[arg(value_name = "CHANGES", required = true, add = ArgValueCompleter::new(complete_change_hashes))]
     changes: Vec<String>,
 
     /// Target view to insert changes into (default: current view).
-    #[arg(long)]
+    #[arg(long, visible_alias = "to", add = ArgValueCompleter::new(complete_view_names))]
     to_view: Option<String>,
 
     /// Insert dependencies automatically.
@@ -150,11 +175,11 @@ pub struct PickArgs {
 #[derive(Debug, Args)]
 pub struct PreviewArgs {
     /// Source view to preview changes from.
-    #[arg(value_name = "SOURCE")]
+    #[arg(value_name = "SOURCE", add = ArgValueCompleter::new(complete_view_names))]
     from_view: String,
 
     /// Target view (default: current view).
-    #[arg(long)]
+    #[arg(long, visible_alias = "to", add = ArgValueCompleter::new(complete_view_names))]
     to_view: Option<String>,
 
     /// Optional tag to limit preview up to.
@@ -170,18 +195,18 @@ impl crate::commands::Command for Insert {
         let repo = require_repository(repo_path)?;
 
         match &self.command {
-            Some(InsertSubcommand::FromView(args)) => run_from_view(&repo, args),
+            Some(InsertSubcommand::View(args)) => run_view_insert(&repo, args),
             Some(InsertSubcommand::Tag(args)) => run_tag(&repo, args),
-            Some(InsertSubcommand::Pick(args)) => run_pick(&repo, args),
+            Some(InsertSubcommand::Change(args)) => run_change_insert(&repo, args),
             Some(InsertSubcommand::Preview(args)) => run_preview(&repo, args),
             None => {
-                // Insert a single change
                 if let Some(ref change_str) = self.change {
+                    // Insert a single change into the current (or --view) view.
                     run_single_insert(&repo, change_str, self)
                 } else {
-                    Err(CliError::InvalidArgument {
-                        message: "Missing CHANGE argument. Provide a change hash or use a subcommand (from-view, tag, pick)".to_string(),
-                    })
+                    // No change and no subcommand: promote the current view's
+                    // changes into its parent view.
+                    run_promote_to_parent(&repo, self)
                 }
             }
         }
@@ -236,8 +261,128 @@ fn run_single_insert(repo: &Repository, change_str: &str, args: &Insert) -> CliR
     Ok(())
 }
 
-/// Insert changes from one view to another.
-fn run_from_view(repo: &Repository, args: &FromViewArgs) -> CliResult<()> {
+/// Promote the current view's changes into its parent view.
+///
+/// This is the behavior of a bare `atomic insert` (no change hash and no
+/// subcommand). The source is always the current view; the target defaults to
+/// the current view's parent but can be overridden with `--to`/`--view`.
+///
+/// The working copy is intentionally NOT rematerialized: the target view is
+/// not checked out, so the current view's on-disk state is unchanged.
+fn run_promote_to_parent(repo: &Repository, args: &Insert) -> CliResult<()> {
+    let source = repo.current_view().to_string();
+    let source_info = repo
+        .get_view_info(&source)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
+
+    // Resolve the target: explicit --to/--view, else the current view's parent.
+    let target = match args.view.as_deref() {
+        Some(v) => v.to_string(),
+        None => source_info
+            .parent_name
+            .clone()
+            .ok_or_else(|| CliError::InvalidArgument {
+                message: format!(
+                    "'{source}' is a root view — there is no parent to insert into.\n  \
+                     Use 'atomic insert from-view <source>' or pass --to <view> \
+                     to choose a target."
+                ),
+            })?,
+    };
+
+    if target == source {
+        return Err(CliError::InvalidArgument {
+            message: format!(
+                "Source and target are the same view ('{source}'). \
+                 Pass --to <view> to insert somewhere else."
+            ),
+        });
+    }
+
+    // Figure out what would move so we can show a count and short-circuit.
+    let missing = repo
+        .get_missing_changes_between(&source, Some(&target))
+        .map_err(|e| CliError::Conflict {
+            description: e.to_string(),
+        })?;
+
+    if missing.is_empty() {
+        output::print_success(&format!(
+            "Already even with '{target}' — nothing to insert."
+        ));
+        return Ok(());
+    }
+
+    output::print_info(&format!(
+        "Inserting {} change(s): {source} → {target}",
+        missing.len()
+    ));
+
+    // Dry run: list the changes and stop before mutating.
+    if args.dry_run {
+        println!();
+        for (i, hash) in missing.iter().enumerate() {
+            if let Ok(change) = repo.load_change(hash) {
+                let message = &change.hashed.header.message;
+                let short_msg = if message.len() > 50 {
+                    format!("{}...", &message[..47])
+                } else {
+                    message.to_string()
+                };
+                println!("  {}. {} {}", i + 1, format_hash(hash, true), short_msg);
+            } else {
+                println!("  {}. {}", i + 1, format_hash(hash, true));
+            }
+        }
+        println!();
+        output::print_info("Dry run: no changes inserted. Re-run without --dry-run to insert.");
+        return Ok(());
+    }
+
+    // Guard: promoting between two shared views is a bigger deal than landing
+    // a draft, so require confirmation unless --confirm was passed.
+    let target_info = repo
+        .get_view_info(&target)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
+    let both_shared = source_info.scope.is_shared() && target_info.scope.is_shared();
+    if both_shared && !args.confirm {
+        let prompt = format!(
+            "Insert {} change(s) from shared view '{source}' into shared view '{target}'?",
+            missing.len()
+        );
+        let confirmed = dialoguer::Confirm::new()
+            .with_prompt(&prompt)
+            .default(false)
+            .interact()
+            .map_err(|_| CliError::InvalidArgument {
+                message: "Refusing to insert between two shared views without \
+                          confirmation. Re-run with --confirm to proceed \
+                          non-interactively."
+                    .to_string(),
+            })?;
+        if !confirmed {
+            output::print_info("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let options = CrossViewInsertOptions::new(&source, &target)
+        .with_dependencies(args.deps)
+        .allow_conflicts(args.allow_conflicts);
+
+    let outcome = repo
+        .insert_from_view(options)
+        .map_err(|e| CliError::Conflict {
+            description: e.to_string(),
+        })?;
+
+    print_cross_view_outcome(&outcome, false);
+
+    Ok(())
+}
+
+/// Insert all changes from another view (the `insert view` subcommand).
+fn run_view_insert(repo: &Repository, args: &ViewArgs) -> CliResult<()> {
     let to_view = args
         .to_view
         .clone()
@@ -372,8 +517,8 @@ fn run_tag(repo: &Repository, args: &TagArgs) -> CliResult<()> {
     Ok(())
 }
 
-/// Cherry-pick specific changes.
-fn run_pick(repo: &Repository, args: &PickArgs) -> CliResult<()> {
+/// Insert specific change(s) by hash (the `insert change` subcommand).
+fn run_change_insert(repo: &Repository, args: &ChangeArgs) -> CliResult<()> {
     let to_view = args
         .to_view
         .clone()
@@ -473,12 +618,99 @@ fn run_preview(repo: &Repository, args: &PreviewArgs) -> CliResult<()> {
         }
         println!();
         output::print_info(&format!(
-            "Run 'atomic insert from-view {}' to insert these changes.",
+            "Run 'atomic insert view {}' to insert these changes.",
             args.from_view
         ));
     }
 
     Ok(())
+}
+
+// Shell Completion Helpers
+
+/// View-name completion candidates matching `prefix`, sorted.
+///
+/// Pure over the repository so it can be unit-tested without the shell
+/// completion machinery.
+pub(crate) fn view_name_candidates(repo: &Repository, prefix: &str) -> Vec<String> {
+    let mut names = match repo.list_views() {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    names.retain(|n| n.starts_with(prefix));
+    names.sort();
+    names
+}
+
+/// Maximum number of change-hash completion candidates to return.
+///
+/// Bounds the per-keystroke cost (we load a header per candidate) on repos
+/// with large histories. Users typically type a hash prefix, which filters
+/// the set down well before this cap.
+const MAX_CHANGE_CANDIDATES: usize = 50;
+
+/// Change-hash completion candidates drawn from the change store.
+///
+/// `insert change <hash>` can insert *any* change that exists in the repo
+/// (not just ones already in the current view), so the candidate source is the
+/// change store rather than a single view's log. Returns `(base32_hash,
+/// optional_message)` pairs filtered by `prefix` and capped at
+/// [`MAX_CHANGE_CANDIDATES`]. Pure over the repository for unit testing.
+pub(crate) fn change_hash_candidates(
+    repo: &Repository,
+    prefix: &str,
+) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    for result in repo.iter_changes() {
+        let Ok(hash) = result else { continue };
+        let b32 = hash.to_base32();
+        if !prefix.is_empty() && !b32.starts_with(prefix) {
+            continue;
+        }
+        let message = repo
+            .load_change(&hash)
+            .ok()
+            .map(|c| c.hashed.header.message.clone());
+        out.push((b32, message));
+        if out.len() >= MAX_CHANGE_CANDIDATES {
+            break;
+        }
+    }
+    out
+}
+
+/// Dynamic completer for view-name arguments.
+///
+/// Runs in the user's CWD during completion; if there is no repository there
+/// it returns no candidates rather than erroring.
+fn complete_view_names(current: &OsStr) -> Vec<CompletionCandidate> {
+    let prefix = current.to_string_lossy();
+    let Ok(repo) = require_repository(None) else {
+        return Vec::new();
+    };
+    view_name_candidates(&repo, &prefix)
+        .into_iter()
+        .map(CompletionCandidate::new)
+        .collect()
+}
+
+/// Dynamic completer for change-hash arguments, annotating each hash with its
+/// commit message as the completion description.
+fn complete_change_hashes(current: &OsStr) -> Vec<CompletionCandidate> {
+    let prefix = current.to_string_lossy();
+    let Ok(repo) = require_repository(None) else {
+        return Vec::new();
+    };
+    change_hash_candidates(&repo, &prefix)
+        .into_iter()
+        .map(|(hash, msg)| {
+            let cand = CompletionCandidate::new(hash);
+            match msg {
+                Some(m) => cand.help(Some(m.into())),
+                None => cand,
+            }
+        })
+        .collect()
 }
 
 // Helper Functions
@@ -584,7 +816,7 @@ mod tests {
     #[test]
     fn test_insert_subcommand_variants() {
         // Just verify the enums compile correctly
-        let _ = InsertSubcommand::FromView(FromViewArgs {
+        let _ = InsertSubcommand::View(ViewArgs {
             from_view: "feature".to_string(),
             to_view: Some("main".to_string()),
             deps: true,
@@ -601,7 +833,7 @@ mod tests {
             dry_run: false,
         });
 
-        let _ = InsertSubcommand::Pick(PickArgs {
+        let _ = InsertSubcommand::Change(ChangeArgs {
             changes: vec!["abc123".to_string()],
             to_view: None,
             deps: true,
@@ -616,8 +848,8 @@ mod tests {
     }
 
     #[test]
-    fn test_from_view_args_defaults() {
-        let args = FromViewArgs {
+    fn test_view_args_defaults() {
+        let args = ViewArgs {
             from_view: "feature".to_string(),
             to_view: None,
             deps: true,
@@ -652,8 +884,8 @@ mod tests {
     }
 
     #[test]
-    fn test_pick_args_multiple_changes() {
-        let args = PickArgs {
+    fn test_change_args_multiple_changes() {
+        let args = ChangeArgs {
             changes: vec![
                 "abc123".to_string(),
                 "def456".to_string(),
@@ -690,5 +922,36 @@ mod tests {
         };
 
         assert_eq!(args.up_to_tag, Some("v1.0.0".to_string()));
+    }
+
+    // -- Completion candidate helpers (pure over a repository) --
+
+    #[test]
+    fn view_name_candidates_filter_and_sort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+
+        // A freshly initialised repo has the default `dev` view.
+        let all = view_name_candidates(&repo, "");
+        assert!(
+            all.iter().any(|v| v == "dev"),
+            "expected default view: {all:?}"
+        );
+
+        // Prefix filtering.
+        let d = view_name_candidates(&repo, "d");
+        assert!(d.iter().all(|v| v.starts_with('d')));
+        assert!(d.iter().any(|v| v == "dev"));
+
+        // Non-matching prefix yields nothing.
+        assert!(view_name_candidates(&repo, "zzz").is_empty());
+    }
+
+    #[test]
+    fn change_hash_candidates_empty_repo_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        // No changes recorded yet -> no candidates, and no error/panic.
+        assert!(change_hash_candidates(&repo, "").is_empty());
     }
 }

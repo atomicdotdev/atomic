@@ -109,13 +109,28 @@ impl OrgSet {
             CliError::Internal(anyhow::anyhow!("Failed to load global config: {e}"))
         })?;
 
-        let previous = config.server.default_org.clone();
-        config.server.default_org = Some(self.slug.clone());
+        // Write to the *active* server profile (named profile when one is
+        // active, else the legacy `[server]` block) so the new default is
+        // read back by org/workspace/project commands, which resolve the
+        // same profile.
+        let (server, profile_name) = config
+            .resolve_server_mut(None)
+            .map_err(|e| CliError::Internal(anyhow::anyhow!("{e}")))?;
+
+        let previous = server.default_org.clone();
+        server.default_org = Some(self.slug.clone());
+
         config.save().map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to save global config: {e}"))
         })?;
 
-        print_success(&format!("Default organization set to: {}", self.slug));
+        match &profile_name {
+            Some(name) => print_success(&format!(
+                "Default organization for server '{name}' set to: {}",
+                self.slug
+            )),
+            None => print_success(&format!("Default organization set to: {}", self.slug)),
+        }
 
         if let Some(prev) = &previous {
             if prev != &self.slug {
@@ -296,6 +311,48 @@ mod tests {
             after.server.default_org.as_deref(),
             Some("old-org"),
             "default_org must not change when verification fails"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn writes_to_active_named_profile_not_legacy_block() {
+        // Regression for the "org set doesn't pass through" bug: when a named
+        // profile is active (default_server set), `org set` must mutate that
+        // profile's default_org, not the legacy [server] block — otherwise
+        // read commands (which resolve the named profile) never see it.
+        let _guard = HomeGuard::new();
+
+        let mut cfg = GlobalConfig::load().unwrap();
+        cfg.default_server = Some("prod".to_string());
+        cfg.servers.insert(
+            "prod".to_string(),
+            atomic_config::ServerConfig {
+                url: Some("https://atomic.storage".to_string()),
+                default_org: None,
+                default_workspaces: std::collections::BTreeMap::new(),
+                identity: Some("continuouslee".to_string()),
+                single_tenant: false,
+            },
+        );
+        cfg.save().unwrap();
+
+        let cmd = OrgSet {
+            slug: "atomic".to_string(),
+            no_verify: false,
+        };
+        let result = cmd.run_with_verifier(|_| Ok(()));
+        assert!(result.is_ok());
+
+        let after = GlobalConfig::load().unwrap();
+        assert_eq!(
+            after.servers["prod"].default_org.as_deref(),
+            Some("atomic"),
+            "org set must write to the active named profile"
+        );
+        assert!(
+            after.server.default_org.is_none(),
+            "org set must not touch the legacy [server] block when a named profile is active"
         );
     }
 

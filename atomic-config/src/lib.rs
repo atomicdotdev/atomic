@@ -296,6 +296,47 @@ impl GlobalConfig {
         // 3. Legacy [server] block
         Ok((&self.server, None))
     }
+
+    /// Resolve the effective server config mutably, honouring the optional
+    /// name override.
+    ///
+    /// Mirrors the resolution order of [`resolve_server`](Self::resolve_server)
+    /// so that writes (e.g. `atomic org set`, `atomic workspace set`) land on
+    /// the same profile that reads resolve to:
+    ///
+    /// 1. `server_override` (from `--server <name>` CLI flag)
+    /// 2. `default_server` (from `~/.atomic/config.toml`)
+    /// 3. Legacy `server` block
+    ///
+    /// Returns the mutable profile plus its name (`Some` for a named profile,
+    /// `None` for the legacy block).
+    pub fn resolve_server_mut(
+        &mut self,
+        server_override: Option<&str>,
+    ) -> Result<(&mut ServerConfig, Option<String>), String> {
+        // Determine which profile name to target, if any. We resolve the name
+        // first (immutable borrow) so the mutable borrow below is unambiguous.
+        let name = if let Some(name) = server_override {
+            Some(name.to_string())
+        } else {
+            self.default_server.clone()
+        };
+
+        match name {
+            Some(name) => {
+                let profile = self.servers.get_mut(&name).ok_or_else(|| {
+                    format!(
+                        "Server profile '{}' not found. \
+                         Use 'atomic server list' to see available profiles, \
+                         or 'atomic server add {0} <url>' to create it.",
+                        name
+                    )
+                })?;
+                Ok((profile, Some(name)))
+            }
+            None => Ok((&mut self.server, None)),
+        }
+    }
 }
 
 /// Color output preference
@@ -661,6 +702,81 @@ mod tests {
             parsed.default_workspaces.get("acme"),
             Some(&"backend".to_string())
         );
+    }
+
+    #[test]
+    fn test_resolve_server_mut_targets_named_profile() {
+        // default_server points at a named profile → mutation must land there,
+        // not on the legacy [server] block.
+        let mut config = GlobalConfig {
+            default_server: Some("prod".to_string()),
+            ..GlobalConfig::default()
+        };
+        config.servers.insert(
+            "prod".to_string(),
+            ServerConfig {
+                url: Some("https://atomic.storage".to_string()),
+                default_org: None,
+                default_workspaces: BTreeMap::new(),
+                identity: Some("continuouslee".to_string()),
+                single_tenant: false,
+            },
+        );
+
+        let (server, name) = config.resolve_server_mut(None).unwrap();
+        assert_eq!(name.as_deref(), Some("prod"));
+        server.default_org = Some("atomic".to_string());
+
+        assert_eq!(
+            config.servers["prod"].default_org.as_deref(),
+            Some("atomic")
+        );
+        assert!(config.server.default_org.is_none());
+    }
+
+    #[test]
+    fn test_resolve_server_mut_falls_back_to_legacy_block() {
+        // No default_server and no override → legacy [server] block.
+        let mut config = GlobalConfig::default();
+
+        let (server, name) = config.resolve_server_mut(None).unwrap();
+        assert!(name.is_none());
+        server.default_org = Some("alice".to_string());
+
+        assert_eq!(config.server.default_org.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn test_resolve_server_mut_override_wins() {
+        let mut config = GlobalConfig {
+            default_server: Some("prod".to_string()),
+            ..GlobalConfig::default()
+        };
+        config
+            .servers
+            .insert("prod".to_string(), ServerConfig::default());
+        config
+            .servers
+            .insert("staging".to_string(), ServerConfig::default());
+
+        let (server, name) = config.resolve_server_mut(Some("staging")).unwrap();
+        assert_eq!(name.as_deref(), Some("staging"));
+        server.default_org = Some("staging-org".to_string());
+
+        assert_eq!(
+            config.servers["staging"].default_org.as_deref(),
+            Some("staging-org")
+        );
+        assert!(config.servers["prod"].default_org.is_none());
+    }
+
+    #[test]
+    fn test_resolve_server_mut_missing_profile_errors() {
+        let mut config = GlobalConfig {
+            default_server: Some("ghost".to_string()),
+            ..GlobalConfig::default()
+        };
+        assert!(config.resolve_server_mut(None).is_err());
     }
 
     #[test]

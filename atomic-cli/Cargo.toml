@@ -34,6 +34,7 @@ atomic-teams = { workspace = true, optional = true }
 
 # CLI
 clap = { workspace = true }
+clap_complete = { workspace = true }
 indicatif = { workspace = true }
 dialoguer = { workspace = true }
 console = { workspace = true }

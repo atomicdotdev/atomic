@@ -61,6 +61,7 @@ use commands::{
     ChangeCmd,
     Clone,
     Command,
+    Completions,
     Diff,
     Doctor,
     Git,
@@ -847,6 +848,19 @@ enum Commands {
     /// atomic update --check
     /// ```
     Update(Update),
+
+    /// Generate a shell completion script.
+    ///
+    /// Emits a static completion script for the given shell. For live
+    /// completion of view names and change hashes, enable the dynamic engine
+    /// instead with `source <(COMPLETE=zsh atomic)`.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic completions zsh > ~/.zfunc/_atomic
+    /// ```
+    Completions(Completions),
 }
 
 // Main Entry Point
@@ -854,6 +868,14 @@ enum Commands {
 fn main() {
     // Initialize logging
     env_logger::init();
+
+    // Dynamic shell completion. When invoked in completion mode (the `COMPLETE`
+    // env var is set by the installed shell hook), this emits candidates —
+    // including live view names and change hashes registered on the insert
+    // args — and exits before normal argument parsing. In normal invocations
+    // it is a no-op. The factory mirrors the real command tree so completion
+    // matches actual subcommands and aliases.
+    clap_complete::CompleteEnv::with_factory(|| apply_agent_help(Cli::command())).complete();
 
     // Parse command-line arguments through the agent-native help layout.
     //
@@ -950,6 +972,8 @@ fn main() {
         Commands::Unrecord(unrecord) => unrecord.run(),
 
         Commands::Update(update) => update.run(),
+
+        Commands::Completions(completions) => completions.generate(Cli::command()),
 
         Commands::Query(query) => query.run(),
 
