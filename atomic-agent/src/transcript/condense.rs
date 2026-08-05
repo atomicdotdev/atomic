@@ -92,7 +92,7 @@ pub fn condense_transcript(raw: &[u8], format: &str) -> Vec<CondensedEntry> {
 
 /// Parse a synthesized OpenCode JSONL transcript into condensed entries.
 ///
-/// The line shape is produced by [`crate::transcript::opencode`] from
+/// The line shape is produced by `crate::transcript::opencode` from
 /// OpenCode's SQLite store: `user`/`assistant` lines carry `text`, `tool`
 /// lines carry the tool name and an optional title. `reasoning` lines are
 /// skipped — reasoning is carried separately by the change provenance and
