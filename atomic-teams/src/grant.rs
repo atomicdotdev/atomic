@@ -23,8 +23,21 @@ use uuid::Uuid;
 
 use atomic_remote::storage::StorageClient;
 
-use crate::error::{map_remote_error, TeamsResult};
+use crate::error::{map_remote_error, TeamsError, TeamsResult};
 use crate::types::{AddGrantRequest, GrantInfo, GrantRelation, GrantSubjectType};
+
+/// Ensure a grant mutation targets a concrete user or team.
+///
+/// `Everyone` is emitted by Storage when listing public grants, but the
+/// mutation endpoints require a non-null user or team UUID.
+fn validate_mutation_subject(subject_type: GrantSubjectType) -> TeamsResult<()> {
+    match subject_type {
+        GrantSubjectType::User | GrantSubjectType::Team => Ok(()),
+        GrantSubjectType::Everyone => Err(TeamsError::InvalidInput(
+            "grant mutations require a user or team subject".to_string(),
+        )),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Organization grants
@@ -59,7 +72,9 @@ pub async fn list_org_grants(
 /// Returns [`TeamsError::AlreadyExists`](crate::error::TeamsError::AlreadyExists)
 /// if the grant already exists, or
 /// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
-/// if the caller is not an org owner.
+/// if the caller is not an org owner. Returns
+/// [`TeamsError::InvalidInput`](crate::error::TeamsError::InvalidInput) when
+/// `subject_type` is [`GrantSubjectType::Everyone`].
 pub async fn add_org_grant(
     client: &StorageClient,
     org_slug: &str,
@@ -67,6 +82,7 @@ pub async fn add_org_grant(
     subject_id: Uuid,
     relation: GrantRelation,
 ) -> TeamsResult<GrantInfo> {
+    validate_mutation_subject(subject_type)?;
     let path = format!("/orgs/{org_slug}/grants");
     let body = AddGrantRequest {
         subject_type,
@@ -90,13 +106,16 @@ pub async fn add_org_grant(
 /// Returns [`TeamsError::OrgNotFound`](crate::error::TeamsError::OrgNotFound)
 /// if the org does not exist, or
 /// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
-/// if the caller is not an org owner.
+/// if the caller is not an org owner. Returns
+/// [`TeamsError::InvalidInput`](crate::error::TeamsError::InvalidInput) when
+/// `subject_type` is [`GrantSubjectType::Everyone`].
 pub async fn revoke_org_grant(
     client: &StorageClient,
     org_slug: &str,
     subject_type: GrantSubjectType,
     subject_id: Uuid,
 ) -> TeamsResult<()> {
+    validate_mutation_subject(subject_type)?;
     let st = subject_type.to_string();
     let path = format!("/orgs/{org_slug}/grants/{st}/{subject_id}");
     client
@@ -137,7 +156,9 @@ pub async fn list_workspace_grants(
 /// Returns [`TeamsError::AlreadyExists`](crate::error::TeamsError::AlreadyExists)
 /// if the grant already exists, or
 /// [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
-/// if the caller is not a workspace admin.
+/// if the caller is not a workspace admin. Returns
+/// [`TeamsError::InvalidInput`](crate::error::TeamsError::InvalidInput) when
+/// `subject_type` is [`GrantSubjectType::Everyone`].
 pub async fn add_workspace_grant(
     client: &StorageClient,
     workspace_slug: &str,
@@ -145,6 +166,7 @@ pub async fn add_workspace_grant(
     subject_id: Uuid,
     relation: GrantRelation,
 ) -> TeamsResult<crate::types::WorkspaceGrantInfo> {
+    validate_mutation_subject(subject_type)?;
     let path = format!("/workspaces/{workspace_slug}/grants");
     let body = AddGrantRequest {
         subject_type,
@@ -167,13 +189,16 @@ pub async fn add_workspace_grant(
 ///
 /// Returns [`TeamsError::PermissionDenied`](crate::error::TeamsError::PermissionDenied)
 /// if the caller is not a workspace admin, or a not-found error if the
-/// workspace doesn't exist.
+/// workspace doesn't exist. Returns
+/// [`TeamsError::InvalidInput`](crate::error::TeamsError::InvalidInput) when
+/// `subject_type` is [`GrantSubjectType::Everyone`].
 pub async fn revoke_workspace_grant(
     client: &StorageClient,
     workspace_slug: &str,
     subject_type: GrantSubjectType,
     subject_id: Uuid,
 ) -> TeamsResult<()> {
+    validate_mutation_subject(subject_type)?;
     let st = subject_type.to_string();
     let path = format!("/workspaces/{workspace_slug}/grants/{st}/{subject_id}");
     client
@@ -214,6 +239,22 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"subject_type\":\"user\""), "got: {json}");
         assert!(json.contains("\"relation\":\"read\""), "got: {json}");
+    }
+
+    #[test]
+    fn mutation_subject_rejects_everyone() {
+        let error = validate_mutation_subject(GrantSubjectType::Everyone).unwrap_err();
+        assert!(matches!(error, TeamsError::InvalidInput(_)));
+        assert_eq!(
+            error.to_string(),
+            "Invalid input: grant mutations require a user or team subject"
+        );
+    }
+
+    #[test]
+    fn mutation_subject_accepts_users_and_teams() {
+        assert!(validate_mutation_subject(GrantSubjectType::User).is_ok());
+        assert!(validate_mutation_subject(GrantSubjectType::Team).is_ok());
     }
 
     #[test]
