@@ -257,12 +257,16 @@ mod tests {
     // mutated. Protects against accidentally reordering verify / save in
     // future refactors.
     //
-    // Tests touch HOME to redirect `GlobalConfig::{load,save}` at an
-    // isolated config dir, so `#[serial]` is required.
+    // Tests redirect `ATOMIC_CONFIG_DIR` to isolate `GlobalConfig::{load,save}`
+    // at a tempdir, so `#[serial]` is required.
     // -----------------------------------------------------------------
 
     use serial_test::serial;
 
+    /// Redirect `ATOMIC_CONFIG_DIR` to a tempdir for the lifetime of the guard,
+    /// isolating `GlobalConfig` from the real user config. `ATOMIC_CONFIG_DIR`
+    /// (not `HOME`) is used because `atomic_config` resolves its path via that
+    /// override — `HOME` alone does not isolate on Windows.
     struct HomeGuard {
         _tmp: tempfile::TempDir,
         original: Option<std::ffi::OsString>,
@@ -271,18 +275,12 @@ mod tests {
     impl HomeGuard {
         fn new() -> Self {
             let tmp = tempfile::tempdir().unwrap();
-            let original = std::env::var_os("HOME");
-            // SAFETY: env mutation is technically UB if accessed
-            // concurrently from another thread. `#[serial]` serializes
-            // these tests against each other but does NOT prevent
-            // unmarked tests elsewhere in the workspace from reading
-            // HOME concurrently. No other test in this crate currently
-            // mutates or reads HOME outside its own `#[serial]` block,
-            // so the race window is empty today. A path-aware
-            // GlobalConfig API would eliminate this — tracked as a
-            // follow-up.
+            let original = std::env::var_os("ATOMIC_CONFIG_DIR");
+            // SAFETY: env mutation is technically UB under concurrent access.
+            // `#[serial]` serializes these tests, and no other test reads
+            // ATOMIC_CONFIG_DIR outside its own `#[serial]` block.
             unsafe {
-                std::env::set_var("HOME", tmp.path());
+                std::env::set_var("ATOMIC_CONFIG_DIR", tmp.path());
             }
             Self {
                 _tmp: tmp,
@@ -296,8 +294,8 @@ mod tests {
             // SAFETY: see HomeGuard::new.
             unsafe {
                 match &self.original {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
+                    Some(v) => std::env::set_var("ATOMIC_CONFIG_DIR", v),
+                    None => std::env::remove_var("ATOMIC_CONFIG_DIR"),
                 }
             }
         }

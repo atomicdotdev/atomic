@@ -407,8 +407,29 @@ pub struct RemoteConfig {
     pub default_channel: Option<String>,
 }
 
-/// Get the global configuration directory
+/// Get the global configuration directory.
+///
+/// Resolution order:
+/// 1. The `ATOMIC_CONFIG_DIR` environment variable, if set — used verbatim as
+///    the config directory (the one containing `config.toml`). This lets tests
+///    isolate the global config on every platform, and lets users relocate it.
+/// 2. `dirs::home_dir()/.atomic` (the default).
+///
+/// The variable is read at call time so it can be set and restored per test
+/// (`dirs::home_dir()` on Windows resolves the profile known-folder, not
+/// `HOME`, so an env override is the only reliable cross-platform isolation).
 pub fn global_config_dir() -> Option<PathBuf> {
+    global_config_dir_from(std::env::var_os("ATOMIC_CONFIG_DIR"))
+}
+
+/// Resolve the global config directory from an explicit override value.
+///
+/// Split out so the override precedence is unit-testable without mutating
+/// process environment (which is racy and platform-sensitive).
+fn global_config_dir_from(env_override: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    if let Some(dir) = env_override {
+        return Some(PathBuf::from(dir));
+    }
     dirs::home_dir().map(|p| p.join(".atomic"))
 }
 
@@ -864,5 +885,28 @@ default_org = "alice"
             config.org_base_url("alice").as_deref(),
             Some("https://alice.atomic.storage")
         );
+    }
+
+    #[test]
+    fn global_config_dir_uses_env_override_verbatim() {
+        // With the override set, the directory is used exactly as given.
+        let override_dir = std::ffi::OsString::from("/some/test/config/dir");
+        assert_eq!(
+            global_config_dir_from(Some(override_dir)),
+            Some(PathBuf::from("/some/test/config/dir"))
+        );
+    }
+
+    #[test]
+    fn global_config_dir_falls_back_to_home_when_unset() {
+        // Without the override, it falls back to <home>/.atomic (matching the
+        // pre-existing behavior). We only assert the `.atomic` suffix so the
+        // test is host-independent.
+        if let Some(dir) = global_config_dir_from(None) {
+            assert!(
+                dir.ends_with(".atomic"),
+                "expected <home>/.atomic, got {dir:?}"
+            );
+        }
     }
 }
