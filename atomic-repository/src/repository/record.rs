@@ -836,11 +836,19 @@ impl Repository {
             }
         }
 
-        // Auto-enrich KG with the new change (best-effort)
+        // Auto-update the enrich database (KG + content search index) with the
+        // new change (best-effort). The content index step is a no-op unless an
+        // index already exists, so this maintains — never builds — it.
         if options.get_enrich_kg() && outcome.was_saved() {
             let hash = *outcome.hash();
             if let Err(e) = self.kg_enrich_change(&hash) {
                 log::debug!("KG enrich for change: {}", e);
+            }
+            if let Err(e) = crate::content_search::update_content_index_paths(
+                self.root(),
+                outcome.recorded_files(),
+            ) {
+                log::debug!("content index update for change: {}", e);
             }
         }
 

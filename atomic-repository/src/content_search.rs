@@ -6,16 +6,43 @@
 
 use std::path::Path;
 
-use syntext::index::Index;
+use syntext::index::{ExternalFileRecord, Index};
 use syntext::{Config, IndexError, SearchOptions};
 
 /// Build (or rebuild) the content search index for the repository.
 ///
-/// Indexes all files in the working copy, respecting `.gitignore` and
-/// `.atomicignore` patterns. The index is stored at `.atomic/content-index/`.
+/// Indexes files in the working copy while respecting `.gitignore`, `.ignore`,
+/// `.atomicignore` (and the global ignore file), and skipping Atomic-internal
+/// directories (`.atomic`, `.git`, `.vault`). The index is stored at
+/// `.atomic/content-index/`.
+///
+/// Discovery is owned here rather than delegated to syntext's `Index::build`:
+/// syntext's walker respects `.gitignore`/`.ignore` but NOT `.atomicignore`,
+/// and it descends into hidden dirs like `.atomic`/`.vault`, so it would index
+/// build artifacts, dependencies, and Atomic internals. We reuse syntext's
+/// walker (for its symlink resolution and size handling), then drop the paths
+/// Atomic excludes before handing the corpus to `build_from_file_records`.
 pub fn build_content_index(repo_root: &Path) -> Result<(), ContentSearchError> {
     let config = content_config(repo_root);
-    let _index = Index::build(config)?;
+
+    let (files, _skips) = syntext::index::walk::enumerate_files(&config)?;
+    let ignore_rules = crate::ignore::IgnoreRules::load_for_enrichment(repo_root);
+    let records: Vec<ExternalFileRecord> = files
+        .into_iter()
+        .filter(|(_absolute, relative, _size)| {
+            !crate::ignore::is_enrichment_internal(relative)
+                && !ignore_rules.is_ignored(relative, false)
+        })
+        .map(
+            |(absolute_path, relative_path, size_bytes)| ExternalFileRecord {
+                absolute_path,
+                relative_path,
+                size_bytes,
+            },
+        )
+        .collect();
+
+    let _index = Index::build_from_file_records(config, records)?;
     Ok(())
 }
 
@@ -42,6 +69,73 @@ pub fn notify_and_commit(repo_root: &Path, changed_path: &Path) -> Result<(), Co
     let index = Index::open(config)?;
     index.notify_change_immediate(changed_path)?;
     Ok(())
+}
+
+/// Incrementally refresh the content index for a set of repo-relative paths
+/// that changed (e.g. the files touched by a recorded change) and persist the
+/// result to disk.
+///
+/// Each path is re-read from disk: added/modified files are re-indexed and
+/// deleted files are removed, keeping the index in sync with the working copy
+/// without re-walking the whole tree. Ignored and Atomic-internal paths are
+/// skipped so build artifacts, dependencies, and internals never enter the
+/// index.
+///
+/// syntext's per-file edits land in an in-memory overlay that is not visible to
+/// a later `Index::open` (e.g. the next `search` in a fresh process). To make
+/// the update durable we `compact()` afterward, folding the overlay into fresh
+/// on-disk base segments — cheaper than [`build_content_index`] because
+/// unchanged files are reused from existing segments rather than re-read.
+///
+/// No-op when the content index does not yet exist — building it is the job of
+/// [`build_content_index`]; this only maintains an existing index.
+pub fn update_content_index_paths<I, P>(
+    repo_root: &Path,
+    paths: I,
+) -> Result<(), ContentSearchError>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    if !has_content_index(repo_root) {
+        return Ok(());
+    }
+
+    let ignore_rules = crate::ignore::IgnoreRules::load_for_enrichment(repo_root);
+    let config = content_config(repo_root);
+    let index = Index::open(config)?;
+
+    let mut any = false;
+    for path in paths {
+        let rel = path.as_ref();
+        if crate::ignore::is_enrichment_internal(rel) || ignore_rules.is_ignored(rel, false) {
+            continue;
+        }
+        // syntext strips `repo_root` to derive the relative path, so hand it an
+        // absolute path. The file need not exist — a missing file is treated as
+        // a deletion and removed from the index.
+        let absolute = repo_root.join(rel);
+        index.notify_change(&absolute)?;
+        any = true;
+    }
+
+    if !any {
+        return Ok(());
+    }
+
+    // Commit the pending overlay and fold it into on-disk base segments so the
+    // change survives to the next `Index::open`. When the changed set is large
+    // relative to the index (syntext caps the overlay at 50% of base docs),
+    // `compact` reports `OverlayFull`; the sanctioned recovery is a full
+    // (filtered) rebuild.
+    match index.compact() {
+        Ok(()) => Ok(()),
+        Err(IndexError::OverlayFull { .. }) => {
+            drop(index);
+            build_content_index(repo_root)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Search the content index.
@@ -80,6 +174,23 @@ pub fn search_content(
     };
 
     let raw_matches = index.search(pattern, &search_opts)?;
+
+    // Drop matches in ignored or Atomic-internal paths. syntext's index walk
+    // respects `.gitignore`/`.ignore` but NOT `.atomicignore`, and it descends
+    // into hidden dirs like `.atomic`/`.vault`, so build artifacts and
+    // dependencies excluded only by `.atomicignore` (plus Atomic internals)
+    // would otherwise surface here and, via the KG search's content-only file
+    // promotion, as `file:` results. Filter at this shared consumption point
+    // so both `query search` and `query code` stay clean regardless of what
+    // the index contains.
+    let ignore_rules = crate::ignore::IgnoreRules::load_for_enrichment(repo_root);
+    let raw_matches: Vec<syntext::SearchMatch> = raw_matches
+        .into_iter()
+        .filter(|m| {
+            !crate::ignore::is_enrichment_internal(&m.path)
+                && !ignore_rules.is_ignored(&m.path, false)
+        })
+        .collect();
     let total_matches = raw_matches.len();
 
     // Build per-directory match counts for the facets summary.
@@ -349,5 +460,91 @@ impl From<IndexError> for ContentSearchError {
             IndexError::LockConflict(_) => ContentSearchError::LockConflict,
             other => ContentSearchError::Index(other.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_content_excludes_ignored_and_internal_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // A distinctive token present in a source file plus in files that
+        // must be excluded: a `.atomicignore`'d build dir, a `.atomicignore`'d
+        // dependency dir (with many files), and `.atomic`/`.vault` internals.
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/dep")).unwrap();
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        std::fs::create_dir_all(root.join(".vault")).unwrap();
+        std::fs::write(root.join("src/index.ts"), b"const marker = wombatxyz;\n").unwrap();
+        for i in 0..20 {
+            std::fs::write(
+                root.join(format!("node_modules/dep/lib{i}.js")),
+                b"var wombatxyz = 1;\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(root.join("dist/index.js"), b"var wombatxyz = 1;\n").unwrap();
+        std::fs::write(root.join(".vault/note.md"), b"wombatxyz in vault\n").unwrap();
+        std::fs::write(root.join(".atomicignore"), b"node_modules/\ndist/\n").unwrap();
+
+        build_content_index(root).unwrap();
+
+        // The index itself must exclude the ignored/internal files: with 20
+        // node_modules files plus dist/.vault, an unfiltered build would index
+        // 20+ docs. A filtered build indexes only the handful of real sources.
+        let stats = content_index_stats(root).expect("index stats");
+        assert!(
+            stats.total_documents < 10,
+            "index should exclude ignored/internal files, but indexed {} documents",
+            stats.total_documents
+        );
+
+        let result = search_content(root, "wombatxyz", ContentSearchOptions::default()).unwrap();
+        let paths: Vec<&str> = result.matches.iter().map(|m| m.path.as_str()).collect();
+
+        assert!(
+            paths.contains(&"src/index.ts"),
+            "source file should match, got: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("node_modules/")),
+            ".atomicignore'd dependency must be excluded, got: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("dist/")),
+            ".atomicignore'd build artifact must be excluded, got: {paths:?}"
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.starts_with(".vault/") || p.starts_with(".atomic/")),
+            "Atomic-internal paths must be excluded, got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn update_content_index_paths_persists_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.ts"), b"const alpha = 1;\n").unwrap();
+
+        build_content_index(root).unwrap();
+
+        // Add a new file on disk and incrementally update the index.
+        std::fs::write(root.join("src/b.ts"), b"const betamarker = 2;\n").unwrap();
+        update_content_index_paths(root, ["src/b.ts"]).unwrap();
+
+        // A fresh search (new Index::open) must see the persisted addition.
+        let result = search_content(root, "betamarker", ContentSearchOptions::default()).unwrap();
+        let paths: Vec<&str> = result.matches.iter().map(|m| m.path.as_str()).collect();
+        assert!(
+            paths.contains(&"src/b.ts"),
+            "incrementally indexed file must be searchable after reopen, got: {paths:?}"
+        );
     }
 }
