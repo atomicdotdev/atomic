@@ -402,9 +402,11 @@ atomic/
 
 | Project | Location | Description |
 |---------|----------|-------------|
-| **atomic-api** | `atomic-enterprise/atomic-api` | HTTP API for remote operations and multi-tenant hosting |
-| **atomic-remote-client** | `atomic-enterprise/atomic-remote` | HTTP client library for push/pull/clone |
+| **atomic-storage** | `atomicdotdev/atomic-storage` | The live multi-tenant storage server (Axum + PostgreSQL). Primarily transport — push/pull/clone protocol plus provenance and attestation storage. Everything a client needs lives locally; be deliberate before adding server-side read surface. |
+| **atomic-remote** | `atomic-remote/` (this repo) | HTTP client library for push/pull/clone and the storage management API |
 | **atomic-docs** | `atomic-docs/` | Documentation site ([docs.atomic.dev](https://docs.atomic.dev/)) |
+
+> `atomic-enterprise` is the **legacy** server and is no longer in use — do not build against it.
 
 ## Atomic + smolvm: Concurrent Agent Sandboxes
 
