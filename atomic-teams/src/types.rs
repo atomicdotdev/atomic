@@ -172,6 +172,11 @@ pub enum GrantSubjectType {
     User,
     /// A team within the organization.
     Team,
+    /// Every caller, returned by the server for public/wildcard grants.
+    ///
+    /// Grant mutation helpers reject this response-only subject because the
+    /// Storage API only accepts concrete user or team UUIDs.
+    Everyone,
 }
 
 impl fmt::Display for GrantSubjectType {
@@ -179,6 +184,7 @@ impl fmt::Display for GrantSubjectType {
         match self {
             Self::User => write!(f, "user"),
             Self::Team => write!(f, "team"),
+            Self::Everyone => write!(f, "everyone"),
         }
     }
 }
@@ -190,6 +196,7 @@ impl FromStr for GrantSubjectType {
         match s.to_lowercase().as_str() {
             "user" => Ok(Self::User),
             "team" => Ok(Self::Team),
+            "everyone" => Ok(Self::Everyone),
             other => Err(format!("unknown grant subject type: {other}")),
         }
     }
@@ -352,7 +359,7 @@ pub struct TeamMemberInfo {
 pub struct GrantInfo {
     /// Unique identifier.
     pub id: Uuid,
-    /// Whether the subject is a user or team (`"user"` or `"team"`).
+    /// Whether the subject is a user, team, or everyone.
     pub subject_type: GrantSubjectType,
     /// The subject's identity or team ID (absent for wildcard/everyone grants).
     pub subject_id: Option<Uuid>,
@@ -374,7 +381,7 @@ pub struct GrantInfo {
 pub struct WorkspaceGrantInfo {
     /// Unique identifier of the ReBAC tuple.
     pub id: Uuid,
-    /// Whether the subject is a user or team (`"user"` or `"team"`).
+    /// Whether the subject is a user, team, or everyone.
     pub subject_type: GrantSubjectType,
     /// The subject's identity or team UUID (absent for wildcard/everyone grants).
     pub subject_id: Option<Uuid>,
@@ -569,7 +576,11 @@ mod tests {
 
     #[test]
     fn grant_subject_type_display_roundtrip() {
-        for st in [GrantSubjectType::User, GrantSubjectType::Team] {
+        for st in [
+            GrantSubjectType::User,
+            GrantSubjectType::Team,
+            GrantSubjectType::Everyone,
+        ] {
             let s = st.to_string();
             let parsed: GrantSubjectType = s.parse().unwrap();
             assert_eq!(parsed, st);
@@ -744,6 +755,29 @@ mod tests {
     }
 
     #[test]
+    fn workspace_grant_info_deserializes_public_everyone_grant() {
+        // Public workspaces use a wildcard grant. Its subject has no UUID,
+        // and Storage reports the subject type explicitly as `everyone`.
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "subject_type": "everyone",
+            "subject_id": null,
+            "subject_relation": null,
+            "relation": "read",
+            "object_type": "workspace",
+            "object_id": "550e8400-e29b-41d4-a716-446655440002",
+            "granted_at": "2024-01-01T00:00:00Z",
+            "granted_by": null
+        }"#;
+
+        let grant: WorkspaceGrantInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(grant.subject_type, GrantSubjectType::Everyone);
+        assert!(grant.subject_id.is_none());
+        assert_eq!(grant.relation, GrantRelation::Read);
+        assert_eq!(grant.subject_type.to_string(), "everyone");
+    }
+
+    #[test]
     fn domain_alias_info_serde_roundtrip() {
         let info = DomainAliasInfo {
             id: Uuid::new_v4(),
@@ -892,6 +926,9 @@ mod tests {
 
         let json = serde_json::to_string(&GrantSubjectType::Team).unwrap();
         assert_eq!(json, "\"team\"");
+
+        let json = serde_json::to_string(&GrantSubjectType::Everyone).unwrap();
+        assert_eq!(json, "\"everyone\"");
     }
 
     #[test]
@@ -904,5 +941,8 @@ mod tests {
 
         let rel: GrantRelation = serde_json::from_str("\"write\"").unwrap();
         assert_eq!(rel, GrantRelation::Write);
+
+        let subject: GrantSubjectType = serde_json::from_str("\"everyone\"").unwrap();
+        assert_eq!(subject, GrantSubjectType::Everyone);
     }
 }

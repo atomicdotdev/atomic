@@ -450,10 +450,11 @@ async fn team_member_example(client: &StorageClient) -> TeamsResult<()> {
 
 ### Grants API
 
-Grants bind a subject (user or team) to a relation (read, write, admin,
-owner) on a resource (org or workspace). The server uses a Zanzibar-style
-ReBAC engine with structural inheritance — an org owner automatically has
-admin access to all workspaces within the org.
+Grants bind a subject to a relation (read, write, admin, owner) on a resource
+(org or workspace). Grant mutations target a concrete user or team; list
+responses can also contain `Everyone` for public/wildcard grants. The server
+uses a Zanzibar-style ReBAC engine with structural inheritance — an org owner
+automatically has admin access to all workspaces within the org.
 
 ```rust
 use atomic_teams::{grant, GrantInfo, GrantRelation, GrantSubjectType, TeamsResult};
@@ -809,7 +810,7 @@ async fn handle_errors(client: &atomic_remote::StorageClient) {
 | `TeamRole` | `Maintainer`, `Contributor`, `Collaborator`, `Consumer` | Team membership |
 | `TeamVisibility` | `Visible`, `Secret` | Team creation/update |
 | `GrantRelation` | `Read`, `Write`, `Admin`, `Owner` | Grant operations |
-| `GrantSubjectType` | `User`, `Team` | Grant operations |
+| `GrantSubjectType` | `User`, `Team`, `Everyone` | Grant operations and responses |
 
 All enums implement `Display`, `FromStr`, `Serialize`, and `Deserialize`.
 String representations are lowercase (`"owner"`, `"admin"`, `"maintainer"`, `"contributor"`, etc.).
