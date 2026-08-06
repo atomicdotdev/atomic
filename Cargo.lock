@@ -250,6 +250,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomic-facade"
+version = "0.13.0"
+dependencies = [
+ "atomic-canonical",
+ "atomic-core",
+ "atomic-repository",
+ "blake3",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "atomic-identity"
 version = "0.13.0"
 dependencies = [

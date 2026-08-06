@@ -1,0 +1,24 @@
+[package]
+name = "atomic-facade"
+description = "Native API layer over Atomic's command-level read operations — call them as library functions instead of shelling out to the CLI"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+atomic-canonical = { workspace = true }
+atomic-core = { workspace = true }
+atomic-repository = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

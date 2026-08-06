@@ -6,6 +6,7 @@ members = [
     "atomic-cli",
     "atomic-core",
     "atomic-config",
+    "atomic-facade",
     "atomic-identity",
     "atomic-remote",
     "atomic-repository",
@@ -28,6 +29,7 @@ atomic-agent = { path = "atomic-agent" }
 atomic-canonical = { path = "atomic-canonical" }
 atomic-core = { path = "atomic-core" }
 atomic-config = { path = "atomic-config" }
+atomic-facade = { path = "atomic-facade" }
 atomic-identity = { path = "atomic-identity" }
 atomic-remote = { path = "atomic-remote" }
 atomic-repository = { path = "atomic-repository" }
