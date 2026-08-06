@@ -402,14 +402,11 @@ atomic/
 
 | Project | Location | Description |
 |---------|----------|-------------|
-| **atomic-remote** | `atomic-remote/` (this repo) | HTTP client library for push/pull/clone and the storage management API |
+| **atomic-remote** | `atomic-remote/` | HTTP client for push/pull/clone |
 | **atomic-docs** | `atomic-docs/` | Documentation site ([docs.atomic.dev](https://docs.atomic.dev/)) |
 
-This repository contains everything needed to run Atomic locally — repositories,
-views, the vault, provenance, and the knowledge graph all live on your machine.
-The hosted storage server is a separate product and is primarily **transport**:
-it moves changes, attestations, and provenance between machines. See
-[atomic.dev](https://atomic.dev) for hosted offerings.
+Everything runs locally. The hosted server is a separate product and is
+primarily transport — see [atomic.dev](https://atomic.dev).
 
 ## Atomic + smolvm: Concurrent Agent Sandboxes
 

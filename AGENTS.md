@@ -28,13 +28,10 @@ atomic/
 
 ### Related Projects
 
-- **atomic-remote** (`atomic-remote/`, this repo) - HTTP client for the Atomic storage server (wire protocol + management API)
+- **atomic-remote** (`atomic-remote/`) - HTTP client for the storage server
 
-The storage server itself is a separate, closed-source product and is
-**primarily transport** — clients keep everything they need locally, so
-nothing in this repo should assume server-side read surface. Internal
-contributors: the server lives as a sibling checkout in the team workspace;
-its own README/AGENTS.md are authoritative for server work.
+The server is a separate closed-source product, primarily transport —
+clients have everything locally. Server work happens in its own repo.
 
 ## Core Concepts
 
