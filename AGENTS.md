@@ -28,10 +28,7 @@ atomic/
 
 ### Related Projects
 
-- **atomic-remote** (`atomic-remote/`) - HTTP client for the storage server
-
-The server is a separate closed-source product, primarily transport —
-clients have everything locally. Server work happens in its own repo.
+- **atomic-remote** (`atomic-remote/`) - HTTP client for push/pull/clone
 
 ## Core Concepts
 

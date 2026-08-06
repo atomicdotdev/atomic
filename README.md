@@ -405,9 +405,6 @@ atomic/
 | **atomic-remote** | `atomic-remote/` | HTTP client for push/pull/clone |
 | **atomic-docs** | `atomic-docs/` | Documentation site ([docs.atomic.dev](https://docs.atomic.dev/)) |
 
-Everything runs locally. The hosted server is a separate product and is
-primarily transport — see [atomic.dev](https://atomic.dev).
-
 ## Atomic + smolvm: Concurrent Agent Sandboxes
 
 When several agents work a repository at once, each needs an isolated build
