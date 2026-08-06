@@ -16,6 +16,31 @@ use crate::storage_types::{
     UpdateProjectRequest, UpdateWorkspaceRequest, WorkspaceInfo,
 };
 
+/// How much of an undeserializable response body to quote in the error.
+///
+/// Deliberately generous. The previous 200 bytes routinely cut off before the
+/// offending field, leaving an error that named a problem the reader could not
+/// see; the full body is available at debug level regardless.
+const BODY_PREVIEW_BYTES: usize = 2000;
+
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 character.
+///
+/// Slicing a `String` at an arbitrary byte offset panics when the index lands
+/// inside a multi-byte character, so the naive `&body[..200]` this replaces
+/// could take down the CLI on any error body containing non-ASCII text — an
+/// accented name or a smart quote in a server message was enough. Walk back to
+/// a character boundary instead.
+fn preview(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({} bytes total)", &s[..end], s.len())
+}
+
 /// HTTP client for atomic-storage management operations.
 ///
 /// Handles authentication, URL construction, and API response unwrapping.
@@ -198,11 +223,13 @@ impl StorageClient {
         }
 
         let api_resp: ApiResponse<T> = serde_json::from_str(&body).map_err(|e| {
-            let preview_len = body.len().min(200);
+            // The whole body goes to the log; the error message carries a
+            // bounded preview so a large payload cannot flood the terminal.
+            log::debug!("Undeserializable response body: {}", body);
             RemoteError::other(format!(
                 "invalid response JSON: {} (body: {})",
                 e,
-                &body[..preview_len]
+                preview(&body, BODY_PREVIEW_BYTES)
             ))
         })?;
 
@@ -409,5 +436,46 @@ mod tests {
         let client = StorageClient::new("https://example.com", "acme", "tok").unwrap();
         let err = client.parse_error_body(502, "Bad Gateway");
         assert!(err.to_string().contains("502"));
+    }
+
+    #[test]
+    fn preview_returns_short_input_verbatim() {
+        assert_eq!(preview("short", BODY_PREVIEW_BYTES), "short");
+    }
+
+    #[test]
+    fn preview_truncates_long_input_and_reports_full_length() {
+        let body = "a".repeat(BODY_PREVIEW_BYTES + 500);
+        let out = preview(&body, BODY_PREVIEW_BYTES);
+        assert!(out.starts_with(&"a".repeat(BODY_PREVIEW_BYTES)));
+        assert!(out.contains(&format!("({} bytes total)", body.len())));
+    }
+
+    /// The predecessor of `preview` sliced with `&body[..200]`, which panics
+    /// when the cut lands inside a multi-byte character. A server message
+    /// containing an accented name or a smart quote was enough to abort the
+    /// CLI while it was in the middle of reporting a different error.
+    ///
+    /// Every offset across a multi-byte boundary must be safe.
+    #[test]
+    fn preview_never_splits_a_utf8_character() {
+        // "é" is two bytes, "→" three, "🔒" four — so every truncation length
+        // walks through the middle of some character.
+        let body = "é→🔒".repeat(200);
+        for max in 0..64 {
+            let out = preview(&body, max);
+            assert!(
+                out.len() <= body.len() + 32,
+                "preview should not grow the input"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_handles_multibyte_at_exact_limit() {
+        // Limit falls exactly between the two bytes of "é".
+        let body = "aé".repeat(10);
+        let out = preview(&body, 2);
+        assert!(out.starts_with('a'), "got {out:?}");
     }
 }
