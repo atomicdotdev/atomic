@@ -180,6 +180,11 @@ pub fn resolve_identity_for_server(
 
     if let Some(ref identity_name) = server.identity {
         // Server profile specifies an identity — use it.
+        log::debug!(
+            "Authenticating as '{}' (bound to server profile {})",
+            identity_name,
+            server.url.as_deref().unwrap_or("<no url>")
+        );
         store.load_by_name(identity_name).map_err(|e| {
             CliError::Internal(anyhow::anyhow!(
                 "Identity '{}' specified by server profile not found: {}",
@@ -189,7 +194,13 @@ pub fn resolve_identity_for_server(
         })
     } else {
         // Fall back to global default identity.
-        store
+        //
+        // Worth logging loudly: the fallback is silent on the wire, so when
+        // the default identity is not the one registered with this server the
+        // only symptom is a 401 from the far end that names no identity at
+        // all. Saying which identity was chosen, and that it was a fallback,
+        // is the difference between a one-line fix and a blind hunt.
+        let identity = store
             .get_default()
             .map_err(|e| {
                 CliError::Internal(anyhow::anyhow!("Failed to load default identity: {}", e))
@@ -199,7 +210,14 @@ pub fn resolve_identity_for_server(
                     "No default identity set. Create one first:\n  \
                      atomic identity new <name> --email <email> --set-default"
                 ))
-            })
+            })?;
+        log::debug!(
+            "Server profile {} declares no identity; falling back to the default identity '{}'. \
+             Bind one with 'atomic server set-identity <profile> <identity>'.",
+            server.url.as_deref().unwrap_or("<no url>"),
+            identity.name
+        );
+        Ok(identity)
     }
 }
 
