@@ -28,9 +28,13 @@ atomic/
 
 ### Related Projects
 
-- **atomic-storage** (`atomicdotdev/atomic-storage`) - The live multi-tenant storage server. Primarily transport (push/pull/clone protocol, provenance/attestation storage); clients keep everything they need locally, so server-side read surface is added only deliberately.
-- **atomic-remote** (`atomic-remote/`, this repo) - HTTP client for the storage server (wire protocol + management API)
-- **atomic-enterprise** - LEGACY server, no longer in use. Do not build against it.
+- **atomic-remote** (`atomic-remote/`, this repo) - HTTP client for the Atomic storage server (wire protocol + management API)
+
+The storage server itself is a separate, closed-source product and is
+**primarily transport** — clients keep everything they need locally, so
+nothing in this repo should assume server-side read surface. Internal
+contributors: the server lives as a sibling checkout in the team workspace;
+its own README/AGENTS.md are authoritative for server work.
 
 ## Core Concepts
 
