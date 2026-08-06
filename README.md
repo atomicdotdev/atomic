@@ -402,8 +402,7 @@ atomic/
 
 | Project | Location | Description |
 |---------|----------|-------------|
-| **atomic-api** | `atomic-enterprise/atomic-api` | HTTP API for remote operations and multi-tenant hosting |
-| **atomic-remote-client** | `atomic-enterprise/atomic-remote` | HTTP client library for push/pull/clone |
+| **atomic-remote** | `atomic-remote/` | HTTP client for push/pull/clone |
 | **atomic-docs** | `atomic-docs/` | Documentation site ([docs.atomic.dev](https://docs.atomic.dev/)) |
 
 ## Atomic + smolvm: Concurrent Agent Sandboxes
