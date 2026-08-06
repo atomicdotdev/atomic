@@ -1,6 +1,6 @@
 [package]
 name = "atomic-facade"
-description = "Native API layer over Atomic's command-level read operations — call them as library functions instead of shelling out to the CLI"
+description = "Native API layer over Atomic's command-level read operations — embed the CLI's reads in local UIs, tools, and agent harnesses instead of shelling out"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

@@ -2,22 +2,29 @@
 //!
 //! The native API layer over Atomic's command-level read operations.
 //!
-//! Every function here is what a CLI command does *minus* the terminal:
-//! it takes an open [`atomic_repository::Repository`], returns
-//! serde-serializable DTOs, and never prints, prompts, or exits. A server
-//! (e.g. `atomic-enterprise/atomic-api`) links this crate and calls the
-//! operations in-process instead of shelling out to the `atomic` binary.
+//! Everything an integration needs is already on the laptop, inside the
+//! repository. This crate lets **local embedders** — UIs, tools, agent
+//! harnesses — read that data in-process as typed values: every function
+//! is what a CLI command does *minus* the terminal. It takes an open
+//! [`atomic_repository::Repository`], returns serde-serializable DTOs,
+//! and never prints, prompts, or exits — no shelling out to the `atomic`
+//! binary, no parsing its output.
+//!
+//! This is deliberately **not** a server contract. Atomic is local-first;
+//! the storage server is primarily transport, and any server-side read
+//! surface is a separate, intentional decision — not something this crate
+//! implies or requires.
 //!
 //! For changes and log, JSON field names and skip rules deliberately mirror
-//! the CLI's `-f json` output, so responses served over HTTP and output
-//! printed by the CLI stay interchangeable. The view/intent/memory DTOs are
-//! richer shapes than the CLI's terse `--json` rows — new surface, not a
-//! CLI contract.
+//! the CLI's `-f json` output, so serialized responses and CLI output stay
+//! interchangeable. The view/intent/memory DTOs are richer shapes than the
+//! CLI's terse `--json` rows — new surface, not a CLI contract.
 //!
-//! All reads are synchronous (redb + filesystem). In an async server, wrap
-//! calls in `spawn_blocking`, open repositories with
-//! `Repository::open_readonly`, and share one `Pristine` per project via
-//! `Repository::open_with_pristine`.
+//! All reads are synchronous (redb + filesystem). When embedding in an
+//! async runtime, wrap calls in `spawn_blocking`, open repositories with
+//! `Repository::open_readonly`, and share one `Pristine` per repository
+//! via `Repository::open_with_pristine` — redb allows only one open
+//! `Database` per file.
 //!
 //! | Module | CLI equivalent |
 //! |---|---|
