@@ -90,8 +90,8 @@ pub fn memory_detail(repo: &Repository, id_or_path: &str) -> FacadeResult<Memory
     Ok(MemoryDetail {
         id: memory_id(id_or_path),
         path,
-        frontmatter: Value::Object(inputs.frontmatter.clone()),
-        body: inputs.body.clone(),
+        frontmatter: Value::Object(inputs.frontmatter),
+        body: inputs.body,
         freeform,
         attestation: attested.status(),
         attested_node: attested

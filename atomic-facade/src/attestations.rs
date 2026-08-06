@@ -244,13 +244,10 @@ fn load_legacy_sidecar<N: DeserializeOwned>(
         return Ok(Attested::None);
     };
 
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(e) => {
-            log::warn!("ignoring unreadable attestation sidecar {}: {e}", path.display());
-            return Ok(Attested::None);
-        }
-    };
+    // An existing-but-unreadable sidecar (e.g. permissions) is a real IO
+    // failure, not "no attestation" — same hard error as the CLI bridge.
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| FacadeError::Repository(atomic_repository::RepositoryError::Io(e)))?;
     let artifact: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {

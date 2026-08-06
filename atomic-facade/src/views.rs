@@ -45,13 +45,14 @@ pub fn view_summary(repo: &Repository, name: &str) -> FacadeResult<ViewSummary> 
 
 fn view_summary_inner(repo: &Repository, name: &str, current: &str) -> FacadeResult<ViewSummary> {
     let info = repo.get_view_info(name)?;
+    let state = info.state_base32();
     Ok(ViewSummary {
-        name: info.name.clone(),
-        state: info.state_base32(),
+        name: info.name,
+        state,
         change_count: info.change_count,
         own_change_count: info.own_change_count,
         scope: scope_label(info.scope).to_string(),
-        parent: info.parent_name.clone(),
+        parent: info.parent_name,
         is_current: name == current,
     })
 }

@@ -8,9 +8,11 @@
 //! (e.g. `atomic-enterprise/atomic-api`) links this crate and calls the
 //! operations in-process instead of shelling out to the `atomic` binary.
 //!
-//! JSON field names and skip rules deliberately mirror the CLI's `-f json`
-//! output, so responses served over HTTP and output printed by the CLI stay
-//! interchangeable.
+//! For changes and log, JSON field names and skip rules deliberately mirror
+//! the CLI's `-f json` output, so responses served over HTTP and output
+//! printed by the CLI stay interchangeable. The view/intent/memory DTOs are
+//! richer shapes than the CLI's terse `--json` rows — new surface, not a
+//! CLI contract.
 //!
 //! All reads are synchronous (redb + filesystem). In an async server, wrap
 //! calls in `spawn_blocking`, open repositories with

@@ -76,14 +76,20 @@ pub fn list_intents(
 /// `id` accepts the same forms as the CLI: `PIMO-1`, `pimo-1`, a bare
 /// number, a ULID, or a unique prefix.
 pub fn intent_detail(repo: &Repository, id: &str) -> FacadeResult<IntentDetail> {
-    // An id that fails resolution means no such intent — surface it as a
-    // client-facing NotFound rather than the resolver's internal error.
-    let normalized = repo
-        .resolve_intent_key(id)
-        .map_err(|_| FacadeError::NotFound {
+    // An id the resolver rejects means no such intent — surface it as a
+    // client-facing NotFound. Infrastructure failures (database, IO) must
+    // stay server errors, not 404s.
+    let normalized = repo.resolve_intent_key(id).map_err(|e| match &e {
+        atomic_repository::RepositoryError::InvalidOperation { .. } => FacadeError::NotFound {
             kind: "intent",
             id: id.to_string(),
-        })?;
+        },
+        _ if e.is_not_found() => FacadeError::NotFound {
+            kind: "intent",
+            id: id.to_string(),
+        },
+        _ => FacadeError::Repository(e),
+    })?;
     let entry = repo.vault_intent_show(&normalized)?;
     let inputs = inputs_from_entry("intent", &entry)?;
     let attested = load_intent_attestation(repo, &normalized, &inputs)?;
@@ -92,8 +98,8 @@ pub fn intent_detail(repo: &Repository, id: &str) -> FacadeResult<IntentDetail> 
 
     Ok(IntentDetail {
         id: normalized,
-        frontmatter: Value::Object(inputs.frontmatter.clone()),
-        body: inputs.body.clone(),
+        frontmatter: Value::Object(inputs.frontmatter),
+        body: inputs.body,
         vault_path,
         attestation: attested.status(),
         attested_node: attested

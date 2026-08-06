@@ -41,6 +41,12 @@ impl ChangeIdentifier {
             return Ok(Self::Latest);
         }
 
+        if s.starts_with("@~") {
+            return Err(FacadeError::InvalidIdentifier {
+                message: format!("relative reference '@~N' is not yet supported: {s}"),
+            });
+        }
+
         if let Some(num) = s.strip_prefix('#') {
             return num.parse::<u64>().map(Self::Sequence).map_err(|_| {
                 FacadeError::InvalidIdentifier {
