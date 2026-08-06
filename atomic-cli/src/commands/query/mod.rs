@@ -1081,7 +1081,13 @@ impl Command for QueryNodes {
             // fetch_limit = pool so all pool candidates become results
             (pool_val, Some(pool_val))
         } else {
-            (self.limit, self.pool)
+            // Without a kind filter, request a generous candidate pool so the
+            // diversity-aware selection in `vault_kg_search` engages. Otherwise
+            // (pool == limit) it falls back to plain top-N by score, and once a
+            // content index exists, high-scoring `file`/`module` nodes crowd
+            // out lower-scored vault nodes (intents, todos, sessions,
+            // memories), so an enriched repo would only ever return files.
+            (self.limit, Some(self.pool.unwrap_or(5000)))
         };
 
         let all_nodes = repo
