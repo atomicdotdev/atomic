@@ -10,8 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::attestations::{
-    inputs_from_entry, load_memory_attestation, memory_id, normalize_memory_path,
-    AttestationStatus,
+    inputs_from_entry, load_memory_attestation, memory_id, normalize_memory_path, AttestationStatus,
 };
 use crate::error::{FacadeError, FacadeResult};
 
@@ -63,7 +62,11 @@ pub fn list_memories(repo: &Repository, limit: Option<usize>) -> FacadeResult<Ve
 
     // updated_at is RFC 3339, so lexical order == chronological order;
     // id is a stable tiebreaker.
-    items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.id.cmp(&b.id)));
+    items.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     if let Some(limit) = limit {
         items.truncate(limit);
     }

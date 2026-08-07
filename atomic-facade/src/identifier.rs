@@ -69,9 +69,7 @@ impl ChangeIdentifier {
             .all(|c| "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".contains(c))
         {
             return Err(FacadeError::InvalidIdentifier {
-                message: format!(
-                    "invalid hash characters in '{s}' — hashes use base32 (A-Z, 2-7)"
-                ),
+                message: format!("invalid hash characters in '{s}' — hashes use base32 (A-Z, 2-7)"),
             });
         }
 
@@ -124,17 +122,10 @@ pub fn resolve_change(
     }
 }
 
-fn sequence_for_hash(
-    repo: &Repository,
-    view_name: &str,
-    hash: &Hash,
-) -> FacadeResult<Option<u64>> {
-    let txn = repo
-        .pristine()
-        .read_txn()
-        .map_err(|e| FacadeError::Repository(atomic_repository::RepositoryError::Database(
-            e.to_string(),
-        )))?;
+fn sequence_for_hash(repo: &Repository, view_name: &str, hash: &Hash) -> FacadeResult<Option<u64>> {
+    let txn = repo.pristine().read_txn().map_err(|e| {
+        FacadeError::Repository(atomic_repository::RepositoryError::Database(e.to_string()))
+    })?;
     let view = get_view(&txn, view_name)?;
     find_change_sequence(&txn, &view, hash).map_err(history_error)
 }
@@ -168,12 +159,9 @@ fn resolve_prefix(
 }
 
 fn resolve_sequence(repo: &Repository, view_name: &str, seq: u64) -> FacadeResult<Hash> {
-    let txn = repo
-        .pristine()
-        .read_txn()
-        .map_err(|e| FacadeError::Repository(atomic_repository::RepositoryError::Database(
-            e.to_string(),
-        )))?;
+    let txn = repo.pristine().read_txn().map_err(|e| {
+        FacadeError::Repository(atomic_repository::RepositoryError::Database(e.to_string()))
+    })?;
     let view = get_view(&txn, view_name)?;
     let entry = get_change_at_sequence(&txn, &view, seq).map_err(|e| match e {
         HistoryError::SequenceOutOfRange { sequence, max } => FacadeError::InvalidIdentifier {
@@ -188,12 +176,9 @@ fn resolve_sequence(repo: &Repository, view_name: &str, seq: u64) -> FacadeResul
 }
 
 fn latest_change(repo: &Repository, view_name: &str) -> FacadeResult<(Hash, Option<u64>)> {
-    let txn = repo
-        .pristine()
-        .read_txn()
-        .map_err(|e| FacadeError::Repository(atomic_repository::RepositoryError::Database(
-            e.to_string(),
-        )))?;
+    let txn = repo.pristine().read_txn().map_err(|e| {
+        FacadeError::Repository(atomic_repository::RepositoryError::Database(e.to_string()))
+    })?;
     let view = get_view(&txn, view_name)?;
 
     if view.change_count == 0 {
@@ -228,7 +213,10 @@ mod tests {
     #[test]
     fn parse_latest_forms() {
         for spec in [None, Some(""), Some("@")] {
-            assert_eq!(ChangeIdentifier::parse(spec).unwrap(), ChangeIdentifier::Latest);
+            assert_eq!(
+                ChangeIdentifier::parse(spec).unwrap(),
+                ChangeIdentifier::Latest
+            );
         }
     }
 

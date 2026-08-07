@@ -63,10 +63,7 @@ pub struct IntentDetail {
 
 /// Intents from the vault manifest, optionally filtered by status
 /// (`None` or `Some("all")` lists everything).
-pub fn list_intents(
-    repo: &Repository,
-    status: Option<&str>,
-) -> FacadeResult<Vec<IntentSummary>> {
+pub fn list_intents(repo: &Repository, status: Option<&str>) -> FacadeResult<Vec<IntentSummary>> {
     let infos = repo.vault_intent_list(status)?;
     Ok(infos.iter().map(IntentSummary::from).collect())
 }

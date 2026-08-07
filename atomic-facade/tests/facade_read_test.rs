@@ -1,9 +1,7 @@
 //! End-to-end reads over a real repository: record a change, then resolve
 //! and serialize it through every facade entry point a server would call.
 
-use atomic_facade::{
-    change_detail, list_log, list_memories, list_views, resolve_change, LogQuery,
-};
+use atomic_facade::{change_detail, list_log, list_memories, list_views, resolve_change, LogQuery};
 use atomic_repository::{Repository, TrackingOptions};
 
 fn repo_with_change() -> (Repository, String, tempfile::TempDir) {

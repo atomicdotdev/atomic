@@ -44,7 +44,7 @@ pub mod memories;
 pub mod provenance;
 pub mod views;
 
-pub use attestations::{Attested, AttestationStatus, LiftInputs};
+pub use attestations::{AttestationStatus, Attested, LiftInputs};
 pub use changes::{change_detail, list_log, ChangeDetail, LogEntry, LogQuery};
 pub use error::{FacadeError, FacadeResult};
 pub use identifier::{resolve_change, ChangeIdentifier};

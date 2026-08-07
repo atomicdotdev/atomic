@@ -199,7 +199,9 @@ fn hunk_summary<H>(op: &GraphOp<H>) -> HunkSummaryDto {
         GraphOp::Replacement { local, .. } => ("Replacement", Some(local.path.clone())),
         GraphOp::SolveNameConflict { path, .. } => ("SolveNameConflict", Some(path.clone())),
         GraphOp::UnsolveNameConflict { path, .. } => ("UnsolveNameConflict", Some(path.clone())),
-        GraphOp::SolveOrderConflict { local, .. } => ("SolveOrderConflict", Some(local.path.clone())),
+        GraphOp::SolveOrderConflict { local, .. } => {
+            ("SolveOrderConflict", Some(local.path.clone()))
+        }
         GraphOp::UnsolveOrderConflict { local, .. } => {
             ("UnsolveOrderConflict", Some(local.path.clone()))
         }

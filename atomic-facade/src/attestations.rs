@@ -251,18 +251,27 @@ fn load_legacy_sidecar<N: DeserializeOwned>(
     let artifact: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
-            log::warn!("ignoring unparsable attestation sidecar {}: {e}", path.display());
+            log::warn!(
+                "ignoring unparsable attestation sidecar {}: {e}",
+                path.display()
+            );
             return Ok(Attested::None);
         }
     };
     let Some(node_val) = artifact.get("node").cloned() else {
-        log::warn!("attestation sidecar {} has no 'node' — ignoring", path.display());
+        log::warn!(
+            "attestation sidecar {} has no 'node' — ignoring",
+            path.display()
+        );
         return Ok(Attested::None);
     };
     let node: N = match serde_json::from_value(node_val) {
         Ok(n) => n,
         Err(e) => {
-            log::warn!("ignoring malformed attestation node in {}: {e}", path.display());
+            log::warn!(
+                "ignoring malformed attestation node in {}: {e}",
+                path.display()
+            );
             return Ok(Attested::None);
         }
     };
