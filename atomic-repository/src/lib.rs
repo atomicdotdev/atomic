@@ -128,8 +128,8 @@ pub mod query_plan;
 // Content search re-exports
 pub use content_search::{
     build_content_index, content_index_stats, has_content_index, search_content,
-    update_content_index, ContentIndexStats, ContentMatch, ContentSearchError,
-    ContentSearchOptions, ContentSearchResult,
+    update_content_index, update_content_index_paths, ContentIndexStats, ContentMatch,
+    ContentSearchError, ContentSearchOptions, ContentSearchResult,
 };
 
 // Re-export main types at crate root for convenience

@@ -299,6 +299,133 @@ impl Repository {
         })
     }
 
+    /// Rebuild missing `manifest.intents` summaries from stored intent entries.
+    ///
+    /// Intent entries can reach the vault without `vault_intent_create` ever
+    /// running: clone bootstrap and `vault sync` deflate inherited
+    /// `.vault/intents/**` files straight into redb, and
+    /// `update_manifest_for_store` deliberately leaves intent summaries to
+    /// "higher-level methods". This is that higher-level method for the
+    /// ingestion path. Existing summaries are never overwritten — the
+    /// authoring path stays the source of truth for intents it created.
+    ///
+    /// Also adopts the authoring repo's intent prefix when the local one is
+    /// unset, and advances the per-author sequence allocator past inherited
+    /// keys so a later `vault_intent_create` cannot re-issue one.
+    ///
+    /// Returns the number of summaries added.
+    pub fn vault_reconcile_intent_manifest(&self) -> Result<usize, RepositoryError> {
+        if !self.has_vault()? {
+            return Ok(0);
+        }
+
+        let entries = self.vault_list("intents/", Some(VaultEntryType::Intent))?;
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let mut manifest = txn
+            .get_vault_manifest()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let mut added = 0usize;
+
+        for meta in &entries {
+            // Already indexed (the authoring path stores vault_path on every
+            // summary) — leave it alone.
+            if manifest
+                .intents
+                .values()
+                .any(|summary| summary.vault_path == meta.path)
+            {
+                continue;
+            }
+
+            let Some(entry) = txn
+                .get_vault_entry(&meta.path)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            else {
+                continue;
+            };
+            let Ok(fm) = serde_json::from_str::<serde_json::Value>(&entry.frontmatter_json) else {
+                log::warn!(
+                    "vault reconcile: skipping intent entry {} with unparsable frontmatter",
+                    meta.path
+                );
+                continue;
+            };
+            // `id` is the human key; an entry without one is not a canonical
+            // intent scaffold and has nothing to index.
+            let Some(human_key) = fm.get("id").and_then(|v| v.as_str()).map(str::to_owned) else {
+                continue;
+            };
+            if manifest.intents.contains_key(&human_key) {
+                continue;
+            }
+
+            let text = |key: &str| fm.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+            let seq = fm.get("seq").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let author = text("author").unwrap_or_default();
+
+            if manifest.intent_prefix.is_empty() {
+                if let Some(project) = text("project").filter(|p| !p.is_empty()) {
+                    manifest.intent_prefix = project;
+                }
+            }
+            if !author.is_empty() && seq > 0 {
+                let next = manifest.intent_seq.entry(author.clone()).or_insert(1);
+                if *next <= seq {
+                    *next = seq + 1;
+                }
+            }
+
+            manifest.intents.insert(
+                human_key.clone(),
+                IntentSummary {
+                    status: text("status").unwrap_or_else(|| "backlog".to_string()),
+                    priority: text("priority").unwrap_or_else(|| "medium".to_string()),
+                    assignee: text("assignee"),
+                    goals: fm
+                        .get("goals")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len() as u32)
+                        .unwrap_or(0),
+                    blocked_by: fm
+                        .get("blocked_by")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|b| b.as_str().map(str::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    title: text("title").unwrap_or_default(),
+                    vault_path: meta.path.clone(),
+                    uid: text("uid").unwrap_or_default(),
+                    human_key: human_key.clone(),
+                    project: text("project").unwrap_or_default(),
+                    author,
+                    seq,
+                    session: text("session"),
+                    turn: fm.get("turn").and_then(|v| v.as_u64()).map(|t| t as u32),
+                },
+            );
+            added += 1;
+        }
+
+        if added > 0 {
+            manifest.updated_at = chrono::Utc::now().to_rfc3339();
+            txn.put_vault_manifest(&manifest)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            txn.commit()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
+        Ok(added)
+    }
+
     /// List vault intents.
     ///
     /// Optionally filtered by status. Pass `Some("all")` or `None` for all intents.
@@ -1050,6 +1177,70 @@ mod tests {
             session_id: None,
             turn_id: None,
         }
+    }
+
+    /// Reproduces the clone-inheritance gap: an intent file that arrives as
+    /// bytes (clone materializes it; `vault sync` deflates it) must become
+    /// listable and resolvable — `vault_intent_create` never runs on the
+    /// receiving side, so the sync path itself must index the entry.
+    #[test]
+    fn ingested_intent_is_indexed_by_vault_sync() {
+        // Author repo: create an intent the normal way.
+        let author_dir = tempdir().unwrap();
+        let author = init_repo_with_vault(author_dir.path());
+        let created = author
+            .vault_intent_create(create_opts_manual("Inherited intent"))
+            .unwrap();
+
+        // Receiver repo: inherit only the materialized intent file — exactly
+        // what clone delivers.
+        let receiver_dir = tempdir().unwrap();
+        let receiver = init_repo_with_vault(receiver_dir.path());
+        let src = author_dir.path().join(".vault").join(&created.intent_file);
+        let dst = receiver_dir
+            .path()
+            .join(".vault")
+            .join(&created.intent_file);
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::copy(&src, &dst).unwrap();
+
+        // Sync deflates the inherited file into redb…
+        let synced = receiver.vault_record_working_copy().unwrap();
+        assert!(
+            synced.iter().any(|p| p == &created.intent_file),
+            "sync should ingest the inherited file, got: {synced:?}"
+        );
+
+        // …and must also index it: the list shows it and the human key
+        // resolves.
+        let intents = receiver.vault_intent_list(None).unwrap();
+        assert_eq!(intents.len(), 1, "inherited intent must appear in the list");
+        assert_eq!(intents[0].id, created.id);
+        assert_eq!(intents[0].title, "Inherited intent");
+        assert_eq!(
+            receiver.resolve_intent_key(&created.id).unwrap(),
+            created.id
+        );
+
+        // The allocator must not re-issue the inherited seq for the same
+        // author — a later local create gets a fresh human key.
+        let second = receiver
+            .vault_intent_create(create_opts_manual("New local intent"))
+            .unwrap();
+        assert_ne!(
+            second.id, created.id,
+            "allocator must not collide with inherited human keys"
+        );
+        assert_eq!(
+            receiver.vault_intent_list(None).unwrap().len(),
+            2,
+            "both intents must be listed"
+        );
+
+        // Reconciliation is idempotent: a second sync with nothing to do
+        // leaves the index intact.
+        receiver.vault_record_working_copy().unwrap();
+        assert_eq!(receiver.vault_intent_list(None).unwrap().len(), 2);
     }
 
     #[test]

@@ -1,3 +1,7 @@
+use clap_complete::engine::ArgValueCompleter;
+
+use crate::commands::complete::{complete_change_hashes, complete_view_names};
+
 use super::*;
 
 // Change Command
@@ -35,14 +39,14 @@ pub struct ChangeCmd {
     ///
     /// If omitted, shows the most recent change on the current view.
     /// Sequence numbers can be prefixed with `#` (e.g., `#42`).
-    #[arg(value_name = "HASH_OR_SEQ")]
+    #[arg(value_name = "HASH_OR_SEQ", add = ArgValueCompleter::new(complete_change_hashes))]
     pub identifier: Option<String>,
 
     /// View to use for sequence lookup.
     ///
     /// When looking up by sequence number, use this view instead
     /// of the current view.
-    #[arg(long = "view", value_name = "NAME")]
+    #[arg(long = "view", value_name = "NAME", add = ArgValueCompleter::new(complete_view_names))]
     pub view: Option<String>,
 
     /// Output format.

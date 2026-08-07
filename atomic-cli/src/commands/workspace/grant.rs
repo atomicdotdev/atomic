@@ -351,6 +351,7 @@ fn subject_label(
         atomic_teams::GrantSubjectType::User => {
             format!("user {}", user_id.as_deref().unwrap_or("?"))
         }
+        atomic_teams::GrantSubjectType::Everyone => "everyone".to_string(),
     }
 }
 
@@ -487,5 +488,11 @@ mod tests {
             &Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
         );
         assert_eq!(label, "user 550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    #[test]
+    fn subject_label_everyone() {
+        let label = subject_label(atomic_teams::GrantSubjectType::Everyone, &None, &None);
+        assert_eq!(label, "everyone");
     }
 }

@@ -170,7 +170,7 @@ pub fn summarize_tool_call(
     match kind {
         NodeKind::Exploration => summarize_exploration(tool_name, tool_input),
         NodeKind::Commitment => summarize_commitment(tool_name, tool_input),
-        NodeKind::Verification => summarize_verification(tool_input, tool_output),
+        NodeKind::Verification => summarize_verification(tool_input, tool_output, status),
         NodeKind::Execution => summarize_execution(tool_name, tool_input),
         _ => tool_name.to_string(),
     }
@@ -552,28 +552,12 @@ fn summarize_commitment(tool_name: &str, tool_input: Option<&serde_json::Value>)
 fn summarize_verification(
     tool_input: Option<&serde_json::Value>,
     tool_output: Option<&str>,
+    status: Option<&str>,
 ) -> String {
     let cmd = extract_command(tool_input);
     let cmd = cmd.trim();
 
-    let passed = tool_output.and_then(|o| {
-        let lower = o.to_lowercase();
-        // Heuristic: look for common pass/fail signals.
-        // Order matters: "0 failed" is a PASS signal, so check it before
-        // the generic "fail" pattern.
-        if lower.contains("0 failed")
-            || lower.contains("test result: ok")
-            || lower.contains("tests passed")
-        {
-            Some(true)
-        } else if lower.contains("fail") || lower.contains("failed") || lower.contains("error") {
-            Some(false)
-        } else if lower.contains("pass") || lower.contains("ok") || lower.contains("success") {
-            Some(true)
-        } else {
-            None
-        }
-    });
+    let passed = infer_verification_passed(tool_input, tool_output, status);
 
     let result_suffix = match passed {
         Some(true) => " (passed)",
@@ -586,6 +570,181 @@ fn summarize_verification(
     } else {
         format!("{}{}", truncate_for_summary(cmd, 300), result_suffix)
     }
+}
+
+/// Infer whether a verification command passed.
+///
+/// Exit status and normalized tool status are authoritative. Text output is a
+/// fallback for hook payloads that expose only display output. Zero-failure
+/// summaries must be recognized before generic `fail` / `error` tokens.
+pub(crate) fn infer_verification_passed(
+    tool_input: Option<&serde_json::Value>,
+    tool_output: Option<&str>,
+    status: Option<&str>,
+) -> Option<bool> {
+    if let Some(exit_code) = tool_input
+        .and_then(|value| value.get("exit_code"))
+        .and_then(|value| value.as_i64())
+    {
+        return Some(exit_code == 0);
+    }
+
+    match status.map(str::to_ascii_lowercase).as_deref() {
+        Some("error" | "failed" | "failure") => return Some(false),
+        // `completed` commonly means only that the tool call returned. Its
+        // command may still have failed, so let output inference decide.
+        Some("success" | "succeeded" | "passed" | "ok") => return Some(true),
+        _ => {}
+    }
+
+    tool_output.and_then(|output| {
+        let lower = output.to_ascii_lowercase();
+        let mut has_zero_failure_count = false;
+        let mut has_nonzero_failure_count = false;
+        let mut has_unquantified_failure = false;
+        let mut has_negative_tap_result = false;
+        let mut has_success_token = false;
+
+        for line in lower.lines() {
+            // Reporters decorate summary lines differently (`# fail 0`,
+            // `ℹ fail 0`, `0 failures`, etc.). Tokenize away decoration and
+            // inspect nearby count/label pairs in either order.
+            let tokens: Vec<&str> = line
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|token| !token.is_empty())
+                .collect();
+            let line_has_negative_tap_result = tokens
+                .windows(2)
+                .any(|pair| pair[0] == "not" && pair[1] == "ok");
+            has_negative_tap_result |= line_has_negative_tap_result;
+            has_success_token |= tokens.iter().any(|token| {
+                matches!(
+                    *token,
+                    "ok" | "pass" | "passed" | "success" | "succeeded" | "successful"
+                )
+            });
+            let trimmed = line.trim_start();
+            let line_is_successful_test = !line_has_negative_tap_result
+                && ((tokens.first() == Some(&"test")
+                    && matches!(tokens.last(), Some(&("ok" | "pass" | "passed"))))
+                    || matches!(tokens.first(), Some(&("ok" | "pass" | "passed")))
+                    || trimmed.starts_with('✓')
+                    || trimmed.starts_with('✔'));
+            for (index, token) in tokens.iter().enumerate() {
+                if !matches!(
+                    *token,
+                    "fail" | "failed" | "failing" | "failure" | "failures" | "error" | "errors"
+                ) {
+                    continue;
+                }
+
+                let before_count = index
+                    .checked_sub(1)
+                    .and_then(|position| tokens.get(position))
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .or_else(|| {
+                        let unit = index
+                            .checked_sub(1)
+                            .and_then(|position| tokens.get(position));
+                        if matches!(unit, Some(&("test" | "tests" | "case" | "cases"))) {
+                            index
+                                .checked_sub(2)
+                                .and_then(|position| tokens.get(position))
+                                .and_then(|value| value.parse::<u64>().ok())
+                        } else {
+                            None
+                        }
+                    });
+                let after_count = tokens
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .or_else(|| {
+                        if matches!(
+                            tokens.get(index + 1),
+                            Some(&("test" | "tests" | "case" | "cases"))
+                        ) {
+                            tokens
+                                .get(index + 2)
+                                .and_then(|value| value.parse::<u64>().ok())
+                        } else {
+                            None
+                        }
+                    });
+
+                // Reporters use both `1 failed, 0 passed` (count-label) and
+                // `failed 1, passed 0` (label-count). If a metric has numbers
+                // on both sides, infer the line's direction from its first
+                // metric/count pair instead of borrowing the neighbouring
+                // metric's count.
+                let nearby_count = match (before_count, after_count) {
+                    (Some(before), Some(after)) => {
+                        let label_before_count = tokens.windows(2).find_map(|pair| {
+                            let first_is_metric = matches!(
+                                pair[0],
+                                "pass"
+                                    | "passed"
+                                    | "fail"
+                                    | "failed"
+                                    | "failing"
+                                    | "failure"
+                                    | "failures"
+                                    | "error"
+                                    | "errors"
+                                    | "skip"
+                                    | "skipped"
+                                    | "ignored"
+                            );
+                            if first_is_metric && pair[1].parse::<u64>().is_ok() {
+                                Some(true)
+                            } else if pair[0].parse::<u64>().is_ok()
+                                && matches!(
+                                    pair[1],
+                                    "pass"
+                                        | "passed"
+                                        | "fail"
+                                        | "failed"
+                                        | "failing"
+                                        | "failure"
+                                        | "failures"
+                                        | "error"
+                                        | "errors"
+                                        | "skip"
+                                        | "skipped"
+                                        | "ignored"
+                                )
+                            {
+                                Some(false)
+                            } else {
+                                None
+                            }
+                        });
+                        Some(if label_before_count.unwrap_or(false) {
+                            after
+                        } else {
+                            before
+                        })
+                    }
+                    (Some(count), None) | (None, Some(count)) => Some(count),
+                    (None, None) => None,
+                };
+
+                match nearby_count {
+                    Some(0) => has_zero_failure_count = true,
+                    Some(_) => has_nonzero_failure_count = true,
+                    None if !line_is_successful_test => has_unquantified_failure = true,
+                    None => {}
+                }
+            }
+        }
+
+        if has_negative_tap_result || has_nonzero_failure_count || has_unquantified_failure {
+            Some(false)
+        } else if has_zero_failure_count || has_success_token {
+            Some(true)
+        } else {
+            None
+        }
+    })
 }
 
 fn summarize_execution(tool_name: &str, tool_input: Option<&serde_json::Value>) -> String {
@@ -1153,6 +1312,118 @@ mod tests {
             None,
         );
         assert_eq!(summary, "cargo test (failed)");
+    }
+
+    #[test]
+    fn test_summarize_verification_node_tap_zero_failures() {
+        let input = serde_json::json!({"command": "npm test"});
+        let output = "TAP version 13\nℹ tests 3\nℹ pass 3\nℹ fail 0";
+        let summary = summarize_tool_call(
+            "bash",
+            NodeKind::Verification,
+            Some(&input),
+            Some(output),
+            None,
+        );
+        assert_eq!(summary, "npm test (passed)");
+    }
+
+    #[test]
+    fn test_summarize_verification_completed_status_uses_failed_output() {
+        let input = serde_json::json!({"command": "npm test"});
+        let summary = summarize_tool_call(
+            "bash",
+            NodeKind::Verification,
+            Some(&input),
+            Some("test auth flow ... FAILED"),
+            Some("completed"),
+        );
+        assert_eq!(summary, "npm test (failed)");
+    }
+
+    #[test]
+    fn test_summarize_verification_nonzero_failure_count_wins() {
+        let input = serde_json::json!({"command": "npm test"});
+        let output = "worker 1: fail 1\nworker 2: fail 0";
+        let summary = summarize_tool_call(
+            "bash",
+            NodeKind::Verification,
+            Some(&input),
+            Some(output),
+            None,
+        );
+        assert_eq!(summary, "npm test (failed)");
+    }
+
+    #[test]
+    fn test_verification_tap_not_ok_is_failed() {
+        assert_eq!(
+            infer_verification_passed(None, Some("not ok 1 - auth rejects invalid token"), None),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_verification_success_tokens_are_whole_words() {
+        assert_eq!(
+            infer_verification_passed(None, Some("BROKEN build artifact"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_verification_double_digit_failure_is_not_zero() {
+        assert_eq!(
+            infer_verification_passed(None, Some("10 failed"), None),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_verification_count_label_summary_does_not_borrow_next_count() {
+        assert_eq!(
+            infer_verification_passed(None, Some("1 failed, 0 passed"), None),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_verification_label_count_summary_uses_own_count() {
+        assert_eq!(
+            infer_verification_passed(None, Some("passed 1, failed 0"), None),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_verification_zero_failed_tests_is_passed() {
+        assert_eq!(
+            infer_verification_passed(None, Some("0 tests failed"), None),
+            Some(true)
+        );
+        assert_eq!(
+            infer_verification_passed(None, Some("failed tests: 0"), None),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_verification_error_overrides_zero_failure_summary() {
+        let output = "ℹ fail 0\nError: teardown failed";
+        assert_eq!(
+            infer_verification_passed(None, Some(output), None),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_verification_error_in_successful_test_name_is_not_a_failure() {
+        let output =
+            "test error::tests::handles_timeout ... ok\ntest result: ok. 1 passed; 0 failed";
+        assert_eq!(
+            infer_verification_passed(None, Some(output), None),
+            Some(true)
+        );
     }
 
     #[test]

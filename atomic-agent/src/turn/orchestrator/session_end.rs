@@ -127,6 +127,14 @@ impl TurnOrchestrator {
                         session_id,
                         e
                     );
+                    // Never finalize or attest a real repository after a
+                    // failed flush. Keep the session active and leave the
+                    // working copy on the agent view so its unrecorded work
+                    // remains visible and recoverable. Repo-less orchestrator
+                    // tests and integrations have no worktree to protect.
+                    if session.parent_view.is_some() {
+                        return Err(e);
+                    }
                 }
             }
         }

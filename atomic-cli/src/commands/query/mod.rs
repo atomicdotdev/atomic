@@ -1081,7 +1081,13 @@ impl Command for QueryNodes {
             // fetch_limit = pool so all pool candidates become results
             (pool_val, Some(pool_val))
         } else {
-            (self.limit, self.pool)
+            // Without a kind filter, request a generous candidate pool so the
+            // diversity-aware selection in `vault_kg_search` engages. Otherwise
+            // (pool == limit) it falls back to plain top-N by score, and once a
+            // content index exists, high-scoring `file`/`module` nodes crowd
+            // out lower-scored vault nodes (intents, todos, sessions,
+            // memories), so an enriched repo would only ever return files.
+            (self.limit, Some(self.pool.unwrap_or(5000)))
         };
 
         let all_nodes = repo
@@ -1476,6 +1482,17 @@ pub struct QueryEnrich {
     /// Without this option, all VCS-derived KG data is rebuilt.
     #[arg(long = "change", value_name = "FULL_HASH")]
     pub changes: Vec<String>,
+
+    /// Force a clean rebuild: drop all previously enriched VCS/AST-derived
+    /// KG nodes (files, modules, views, changes, entities) before
+    /// re-deriving them.
+    ///
+    /// A plain enrich only upserts, so nodes that no longer apply — files
+    /// that became ignored or were deleted — linger as stale entries. Pass
+    /// `--rebuild` to reconcile. Vault and session nodes are never affected.
+    /// Cannot be combined with `--change`.
+    #[arg(long, conflicts_with = "changes")]
+    pub rebuild: bool,
 }
 
 fn parse_change_hash(value: &str) -> CliResult<Hash> {
@@ -1558,6 +1575,7 @@ mod enrich_tests {
         std::env::set_current_dir(temp.path()).unwrap();
         QueryEnrich {
             changes: vec![full_hash],
+            rebuild: false,
         }
         .run()
         .unwrap();
@@ -1584,11 +1602,21 @@ impl Command for QueryEnrich {
                 .collect::<CliResult<Vec<_>>>()?;
 
             for hash in &hashes {
-                repo.kg_enrich_change(hash).map_err(CliError::Repository)?;
+                repo.enrich_change(hash).map_err(CliError::Repository)?;
             }
 
             println!("Enriched {} change(s).", hashes.len());
             return Ok(());
+        }
+
+        // Clean rebuild: drop stale VCS/AST-derived nodes so files that became
+        // ignored or were deleted don't linger. Vault/session nodes are kept.
+        if self.rebuild {
+            let spinner = create_spinner("Clearing stale KG entries...");
+            match repo.kg_clear_derived() {
+                Ok(n) => finish_success(&spinner, &format!("{} stale node(s) removed", n)),
+                Err(e) => finish_error(&spinner, &format!("clear failed: {}", e)),
+            }
         }
 
         let mut total = atomic_repository::KgEnrichStats::default();

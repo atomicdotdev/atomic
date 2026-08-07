@@ -94,8 +94,10 @@ impl Repository {
         // Compute files visible on the OLD view.
         let old_files = self.visible_file_paths(&old_view_name)?;
 
-        // Set the current view (validates it exists)
-        self.set_current_view(view)?;
+        // Apply only the small set of view-scoped TREE operations and publish
+        // the new pointer while holding the same database write lock. A marker
+        // makes the transition recoverable if the process exits mid-switch.
+        let deferred_paths = self.align_deferred_tree_and_publish_view(view)?;
 
         // Compute files visible on the NEW view.
         let new_files = self.visible_file_paths(view)?;
@@ -228,6 +230,7 @@ impl Repository {
         // Files shared between views with identical content are untouched.
         let result = {
             let mut affected_paths: HashSet<String> = HashSet::new();
+            affected_paths.extend(deferred_paths);
 
             // Files only on the new view must always be materialized.
             for path in new_files.difference(&old_files) {

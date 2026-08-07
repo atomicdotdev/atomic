@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-agent"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "atomic-core",
@@ -158,7 +158,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-canonical"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "atomic-identity",
  "blake3",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-cli"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "atomic-agent",
@@ -188,6 +188,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "clap_complete",
  "console",
  "data-encoding",
  "dialoguer",
@@ -211,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-config"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -225,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
@@ -251,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-identity"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "atomic-config",
@@ -281,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-remote"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -302,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-repository"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "atomic-canonical",
@@ -313,6 +314,7 @@ dependencies = [
  "chrono",
  "dirs",
  "flate2",
+ "fs2",
  "ignore",
  "log",
  "postcard",
@@ -337,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-semantic"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -354,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-teams"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "atomic-remote",
  "chrono",
@@ -544,6 +546,18 @@ dependencies = [
  "clap_lex",
  "strsim",
  "terminal_size",
+]
+
+[[package]]
+name = "clap_complete"
+version = "4.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f84a88507dbd05c695f2cb5e8558e747179134005e9893882dec964190ed89"
+dependencies = [
+ "clap",
+ "clap_lex",
+ "is_executable",
+ "shlex",
 ]
 
 [[package]]
@@ -1588,6 +1602,15 @@ checksum = "173609498df190136aa7dea1a91db051746d339e18476eed5ca40521f02d7aa5"
 dependencies = [
  "is-docker",
  "once_cell",
+]
+
+[[package]]
+name = "is_executable"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82cb6a9f675da968c63b6208c641b9dca58fc0133ae53375736b1767b0cab8bd"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

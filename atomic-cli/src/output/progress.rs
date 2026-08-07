@@ -217,6 +217,24 @@ pub fn suspend<R>(mp: &MultiProgress, f: impl FnOnce() -> R) -> R {
 
 // Progress Bar Completion
 
+/// Write a completion message directly to stderr when the progress bar is
+/// hidden.
+///
+/// `indicatif` defaults to a stderr draw target that suppresses itself when
+/// stderr is not a terminal. That is the right call for the *animation* — a
+/// spinner in a log file is noise — but `finish_with_message` goes through the
+/// same draw target, so the final outcome line disappeared along with it. A
+/// piped `atomic view switch` printed nothing at all: no confirmation, and no
+/// "N conflicts detected" warning either.
+///
+/// So when the bar is hidden, emit the message ourselves. Plain text, no ANSI:
+/// the consumer is a pipe, a CI log, or an agent.
+fn emit_if_hidden(pb: &ProgressBar, prefix: &str, message: &str) {
+    if pb.is_hidden() {
+        eprintln!("{} {}", prefix, message);
+    }
+}
+
 /// Finish a progress bar with a success message.
 ///
 /// This clears the progress bar and displays a success message in green.
@@ -236,6 +254,7 @@ pub fn suspend<R>(mp: &MultiProgress, f: impl FnOnce() -> R) -> R {
 pub fn finish_success(pb: &ProgressBar, message: &str) {
     pb.set_style(success_style());
     pb.finish_with_message(message.to_string());
+    emit_if_hidden(pb, "✓", message);
 }
 
 /// Finish a progress bar with a warning message.
@@ -249,6 +268,7 @@ pub fn finish_success(pb: &ProgressBar, message: &str) {
 pub fn finish_warning(pb: &ProgressBar, message: &str) {
     pb.set_style(warning_style());
     pb.finish_with_message(message.to_string());
+    emit_if_hidden(pb, "⚠", message);
 }
 
 /// Finish and completely clear a progress bar from the terminal.
@@ -283,6 +303,7 @@ pub fn finish_and_clear(pb: &ProgressBar) {
 pub fn finish_error(pb: &ProgressBar, message: &str) {
     pb.set_style(error_style());
     pb.finish_with_message(message.to_string());
+    emit_if_hidden(pb, "✗", message);
 }
 
 // Progress Styles

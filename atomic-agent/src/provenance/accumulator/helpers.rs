@@ -1,5 +1,6 @@
 use atomic_core::change::provenance_graph as pg;
 
+use crate::provenance::classify::infer_verification_passed;
 use crate::provenance::types::{EdgeKind, NodeKind};
 
 // =============================================================================
@@ -97,6 +98,7 @@ pub(crate) fn build_tool_detail(
     tool_name: &str,
     tool_input: Option<&serde_json::Value>,
     tool_output: Option<&str>,
+    status: Option<&str>,
 ) -> Option<serde_json::Value> {
     match kind {
         NodeKind::Exploration => {
@@ -204,19 +206,8 @@ pub(crate) fn build_tool_detail(
             if let Some(code) = exit_code {
                 detail["exit_code"] = serde_json::Value::Number(code.into());
             }
-            // Try to determine pass/fail from exit code first, then output heuristics
-            if let Some(code) = exit_code {
-                detail["passed"] = serde_json::Value::Bool(code == 0);
-            } else if let Some(output) = tool_output {
-                let lower = output.to_lowercase();
-                if lower.contains("fail") || lower.contains("error") || lower.contains("failed") {
-                    detail["passed"] = serde_json::Value::Bool(false);
-                } else if lower.contains("pass")
-                    || lower.contains("ok")
-                    || lower.contains("success")
-                {
-                    detail["passed"] = serde_json::Value::Bool(true);
-                }
+            if let Some(passed) = infer_verification_passed(tool_input, tool_output, status) {
+                detail["passed"] = serde_json::Value::Bool(passed);
             }
             // Pull in diagnostics if present
             if let Some(diag) = tool_input.and_then(|v| v.get("diagnostics")).cloned() {
