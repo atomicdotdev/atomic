@@ -350,8 +350,7 @@ impl Repository {
             else {
                 continue;
             };
-            let Ok(fm) = serde_json::from_str::<serde_json::Value>(&entry.frontmatter_json)
-            else {
+            let Ok(fm) = serde_json::from_str::<serde_json::Value>(&entry.frontmatter_json) else {
                 log::warn!(
                     "vault reconcile: skipping intent entry {} with unparsable frontmatter",
                     meta.path
@@ -360,8 +359,7 @@ impl Repository {
             };
             // `id` is the human key; an entry without one is not a canonical
             // intent scaffold and has nothing to index.
-            let Some(human_key) = fm.get("id").and_then(|v| v.as_str()).map(str::to_owned)
-            else {
+            let Some(human_key) = fm.get("id").and_then(|v| v.as_str()).map(str::to_owned) else {
                 continue;
             };
             if manifest.intents.contains_key(&human_key) {
@@ -1199,7 +1197,10 @@ mod tests {
         let receiver_dir = tempdir().unwrap();
         let receiver = init_repo_with_vault(receiver_dir.path());
         let src = author_dir.path().join(".vault").join(&created.intent_file);
-        let dst = receiver_dir.path().join(".vault").join(&created.intent_file);
+        let dst = receiver_dir
+            .path()
+            .join(".vault")
+            .join(&created.intent_file);
         fs::create_dir_all(dst.parent().unwrap()).unwrap();
         fs::copy(&src, &dst).unwrap();
 
