@@ -495,11 +495,11 @@ fn walk_through_dead<T: GraphTxnT>(
                                     Ok(v) => v,
                                     Err(_) => return false,
                                 };
-                                let source_alive =
-                                    match options.is_vertex_alive(txn, source_vertex) {
-                                        Ok(alive) => alive,
-                                        Err(_) => return false,
-                                    };
+                                let source_alive = match options.is_vertex_alive(txn, source_vertex)
+                                {
+                                    Ok(alive) => alive,
+                                    Err(_) => return false,
+                                };
                                 if !source_alive {
                                     return false;
                                 }
