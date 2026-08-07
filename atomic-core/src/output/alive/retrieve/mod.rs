@@ -237,11 +237,7 @@ pub fn retrieve_graph<T: GraphTxnT>(
                 // additive model).  If the destination vertex is alive
                 // through some OTHER edge, the normal traversal will
                 // pick it up via that path.
-                let dest_alive = if options.has_filter() {
-                    options.is_vertex_alive(txn, resolved_vertex)?
-                } else {
-                    classify::is_vertex_alive(txn, &resolved_vertex)?
-                };
+                let dest_alive = options.is_vertex_alive(txn, resolved_vertex)?;
 
                 if !dest_alive {
                     let successors = walk_through_dead(
@@ -270,11 +266,12 @@ pub fn retrieve_graph<T: GraphTxnT>(
             } else {
                 result.positions_visited += 1;
 
-                // When we have a change filter and are doing state-based retrieval,
-                // we need to check if the vertex is alive at the target state by
-                // examining all its parent edges (not just the edge we followed).
+                // When we have a change filter (or deletions are final) and are
+                // doing state-based retrieval, we need to check if the vertex is
+                // alive at the target state by examining all its parent edges
+                // (not just the edge we followed).
                 // Otherwise, use the normal create_alive_vertex check.
-                let alive_vertex = if options.has_filter() {
+                let alive_vertex = if options.deletion_aware() {
                     // Full vertex aliveness check using typed parent iteration
                     if !options.is_vertex_alive(txn, resolved_vertex)? {
                         // Vertex was deleted at the target state.  Skip
@@ -477,11 +474,7 @@ fn walk_through_dead<T: GraphTxnT>(
             }
 
             // Is this vertex alive in our view?
-            let alive = if options.has_filter() {
-                options.is_vertex_alive(txn, next_vertex)?
-            } else {
-                classify::is_vertex_alive(txn, &next_vertex)?
-            };
+            let alive = options.is_vertex_alive(txn, next_vertex)?;
 
             if alive {
                 // Live successor. Only surface it as a bypass child when
@@ -502,17 +495,11 @@ fn walk_through_dead<T: GraphTxnT>(
                                     Ok(v) => v,
                                     Err(_) => return false,
                                 };
-                                let source_alive = if options.has_filter() {
+                                let source_alive =
                                     match options.is_vertex_alive(txn, source_vertex) {
                                         Ok(alive) => alive,
                                         Err(_) => return false,
-                                    }
-                                } else {
-                                    match classify::is_vertex_alive(txn, &source_vertex) {
-                                        Ok(alive) => alive,
-                                        Err(_) => return false,
-                                    }
-                                };
+                                    };
                                 if !source_alive {
                                     return false;
                                 }

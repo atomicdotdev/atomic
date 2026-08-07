@@ -80,6 +80,24 @@ pub struct RetrieveOptions {
     ///
     /// The filter is wrapped in `Arc` for efficient cloning and sharing.
     pub change_filter: Option<Arc<HashSet<NodeId>>>,
+
+    /// Treat every visible deletion as authoritative, without a change set.
+    ///
+    /// This applies the same aliveness semantics as a change filter that
+    /// contains every visible change: any `BLOCK|DELETED` parent edge the
+    /// transaction can see marks the vertex dead, and retrieval walks
+    /// through it to its live successors instead of surfacing it as a
+    /// zombie.  Use this when the transaction itself already scopes edge
+    /// visibility (e.g. a `ViewGraph`) or when all changes are visible by
+    /// construction (e.g. git import on a bare transaction), and the
+    /// caller needs the graph to match what a filtered materialization
+    /// renders.
+    ///
+    /// Without this (and without a `change_filter`), the additive edge
+    /// model keeps a deleted vertex "alive": its original parent edge
+    /// remains next to the deletion marker, so it is retrieved as a
+    /// zombie and occupies a position in the output order.
+    pub deletions_final: bool,
 }
 
 impl RetrieveOptions {
@@ -137,6 +155,18 @@ impl RetrieveOptions {
         self
     }
 
+    /// Treat every visible deletion as authoritative (see
+    /// [`RetrieveOptions::deletions_final`]).
+    pub fn deletions_final(mut self, value: bool) -> Self {
+        self.deletions_final = value;
+        self
+    }
+
+    /// Whether vertex aliveness uses the deletion-aware (filtered) logic.
+    pub(crate) fn deletion_aware(&self) -> bool {
+        self.change_filter.is_some() || self.deletions_final
+    }
+
     /// Check if a change ID passes the filter.
     ///
     /// Returns true if:
@@ -169,7 +199,7 @@ impl RetrieveOptions {
     /// alive at the target state). Same when `include_deleted` is
     /// explicitly set.
     pub(crate) fn include_deleted_edges(&self) -> bool {
-        self.include_deleted || self.change_filter.is_some()
+        self.include_deleted || self.change_filter.is_some() || self.deletions_final
     }
 
     // ------------------------------------------------------------------
@@ -221,8 +251,11 @@ impl RetrieveOptions {
         txn: &T,
         vertex: GraphNode<NodeId>,
     ) -> Result<bool, PristineError> {
-        // If no filter, delegate to the unfiltered classifier
-        if self.change_filter.is_none() {
+        // Without a filter (and without deletions_final), delegate to the
+        // unfiltered classifier. With deletions_final set, the logic below
+        // applies with every visible change "in the filter" — passes_filter
+        // returns true for everything when no set is present.
+        if !self.deletion_aware() {
             return super::classify::is_vertex_alive(txn, &vertex);
         }
 
@@ -279,6 +312,7 @@ impl PartialEq for RetrieveOptions {
     fn eq(&self, other: &Self) -> bool {
         self.include_deleted == other.include_deleted
             && self.max_vertices == other.max_vertices
+            && self.deletions_final == other.deletions_final
             && match (&self.change_filter, &other.change_filter) {
                 (None, None) => true,
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b) || *a == *b,

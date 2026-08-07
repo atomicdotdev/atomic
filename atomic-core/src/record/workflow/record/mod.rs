@@ -156,7 +156,7 @@ pub use types::{RecordedFile, RecordingResult, RecordingStats};
 
 use crate::change::{Encoding, FileOps, Local};
 use crate::crdt::{BranchId, TrunkId};
-use crate::diff::{DiffOp, Line};
+use crate::diff::Line;
 use crate::output::WorkingCopyRead;
 use crate::types::NodeId;
 
@@ -495,9 +495,7 @@ where
     let hunk_options = options.to_hunk_options().encoding(encoding);
     let mut builder = HunkBuilder::with_options(&detected.path, hunk_options);
 
-    let graph_diff_ops = rewrite_shifted_equals_for_graph(&comparison.diff_ops);
-
-    for op in &graph_diff_ops {
+    for op in &comparison.diff_ops {
         builder.process_diff_op(op);
     }
 
@@ -580,30 +578,6 @@ where
     recorded.set_content(new_content);
 
     Ok(recorded)
-}
-
-fn rewrite_shifted_equals_for_graph(diff_ops: &[DiffOp]) -> Vec<DiffOp> {
-    diff_ops
-        .iter()
-        .map(|op| match *op {
-            DiffOp::Equal {
-                old_pos,
-                new_pos,
-                len,
-                // Only rewrite unchanged lines that were pushed *down* by
-                // inserted content above them. When lines shift *up* due to
-                // deletions above, the delete path should reconnect the old
-                // suffix in place; forcing a Replace there duplicates the
-                // suffix as fresh content.
-            } if new_pos > old_pos && len > 0 => DiffOp::Replace {
-                old_pos,
-                old_len: len,
-                new_pos,
-                new_len: len,
-            },
-            _ => op.clone(),
-        })
-        .collect()
 }
 
 /// Build CRDT FileOps directly from git diff lines.
