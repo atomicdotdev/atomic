@@ -865,9 +865,50 @@ enum Commands {
 
 // Main Entry Point
 
+/// The log filter `--verbose` turns on.
+///
+/// Scoped to the Atomic crates on purpose: a bare `debug` also unleashes
+/// `reqwest`/`hyper` wire logging, which buries the one line the user wanted.
+///
+/// `atomic` is a prefix match, so it covers this binary (whose module paths
+/// are `atomic::…`, after the `[[bin]]` name rather than the `atomic-cli`
+/// package) along with every `atomic_*` library crate. `atomic_core` is pegged
+/// back to `info`: its per-vertex graph logging is far below the level anyone
+/// reaching for `--verbose` is asking about.
+const VERBOSE_FILTER: &str = "atomic=debug,atomic_core=info";
+
+/// Detect the global `--verbose` flag straight from `argv`.
+///
+/// Logging has to be live before clap runs, because argument parsing itself
+/// can fail and we want the debug trail for that too. `--verbose` is a global
+/// flag, so its position is unconstrained — scanning argv is both simpler and
+/// more faithful than trying to parse twice.
+fn verbose_requested() -> bool {
+    std::env::args_os().any(|a| a == "-v" || a == "--verbose")
+}
+
+/// Install the logger, honouring `--verbose`.
+///
+/// Every command advertises `-v, --verbose  Emit extra diagnostic output`, but
+/// the flag was parsed into a field nothing ever read: logging was initialised
+/// before parsing and only `RUST_LOG` could raise the level. The debug lines
+/// that explain *which identity a request authenticated as* already existed —
+/// they were simply unreachable through the documented flag, which turned an
+/// identity misconfiguration into an opaque server-side 401.
+///
+/// `RUST_LOG` still wins when set, so existing workflows are untouched.
+fn init_logging() {
+    let default = if verbose_requested() {
+        VERBOSE_FILTER
+    } else {
+        "warn"
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default)).init();
+}
+
 fn main() {
     // Initialize logging
-    env_logger::init();
+    init_logging();
 
     // Dynamic shell completion. When invoked in completion mode (the `COMPLETE`
     // env var is set by the installed shell hook), this emits candidates —
