@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# chmod +x tests/harness/26_merge_ordering_duplication.sh
+# chmod +x tests/harness/27_merge_ordering_duplication.sh
 #
-# 26_merge_ordering_duplication.sh — Merge ordering and content duplication.
+# 27_merge_ordering_duplication.sh — Merge ordering and content duplication.
 #
 # Regression coverage for two defects in the graph-to-file output path, both
 # of which corrupt a file while reporting complete success.
