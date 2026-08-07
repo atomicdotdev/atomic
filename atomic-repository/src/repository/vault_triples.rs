@@ -2447,6 +2447,56 @@ first
     }
 
     #[test]
+    fn test_kg_search_generous_pool_surfaces_mixed_kinds() {
+        // Regression test: with a generous candidate pool the diversity-aware
+        // selection must surface lower-scored vault kinds (e.g. memory)
+        // alongside high-scored files, instead of returning only files. This
+        // mirrors the CLI default search path, which passes a large pool so an
+        // enriched repo does not collapse to file-only results.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        let files: Vec<KgNode> = (0..20)
+            .map(|index| {
+                KgNode::new(
+                    format!("file:src/authentication-{index}.rs"),
+                    "file",
+                    format!("authentication-{index}.rs"),
+                    "test",
+                )
+            })
+            .collect();
+        let mut txn = repo.pristine.write_txn().unwrap();
+        txn.init_kg().unwrap();
+        for node in &files {
+            txn.upsert_kg_node(node).unwrap();
+        }
+        txn.commit().unwrap();
+        repo.vault_store(
+            "memory/authentication.md",
+            VaultEntryType::Memory,
+            b"Current authentication decision".to_vec(),
+            r#"{"name":"authentication","status":"active"}"#.to_string(),
+        )
+        .unwrap();
+
+        // pool > limit engages diversity-aware selection.
+        let mixed = repo
+            .vault_kg_search("authentication", 5, Some(5000))
+            .unwrap();
+        assert!(
+            mixed.iter().any(|node| node.kind == "memory"),
+            "a generous pool should surface the memory node alongside files, got: {:?}",
+            mixed.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+        assert!(
+            mixed.iter().any(|node| node.kind == "file"),
+            "file nodes should still appear in the mixed results"
+        );
+    }
+
+    #[test]
     fn test_kg_search_by_kind_rejects_legacy_stale_postings() {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();

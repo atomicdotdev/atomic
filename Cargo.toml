@@ -64,6 +64,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+clap_complete = { version = "4.5", features = ["unstable-dynamic"] }
 indicatif = "0.17"
 dialoguer = "0.11"
 console = "0.15"

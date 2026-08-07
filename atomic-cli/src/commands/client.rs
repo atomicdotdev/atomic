@@ -219,7 +219,9 @@ pub fn remote_err(e: atomic_remote::RemoteError) -> CliError {
 /// Resolution order:
 /// 1. `--org` override (if `Some(non-empty)`)
 /// 2. `server.default_org` from the resolved server profile
-/// 3. Error with a hint to run `atomic org set`
+/// 3. The default identity's personal org (the identity name), so commands
+///    always target the tenant associated with the active identity even
+///    before any `atomic org set`
 ///
 /// An explicit empty string (`--org ""`) is an error: the user asked for "no
 /// org" which never makes sense.
@@ -236,19 +238,27 @@ pub fn resolve_org_with_server(
         return Ok(s.to_string());
     }
 
-    server
-        .default_org
-        .clone()
-        .ok_or_else(|| CliError::InvalidArgument {
-            message: "No organization specified.\n  \
-                      Use --org or set a default with: atomic org set <slug>"
-                .to_string(),
-        })
+    if let Some(org) = &server.default_org {
+        return Ok(org.clone());
+    }
+
+    // Fall back to the personal org of the identity this server authenticates
+    // as. Registration seeds the personal org slug from the identity name, so
+    // the identity name is the correct default until the user runs
+    // `atomic org set` to switch to a team org.
+    let identity = resolve_identity_for_server(server).map_err(|_| CliError::InvalidArgument {
+        message: "No organization specified.\n  \
+                  Use --org or set a default with: atomic org set <slug>"
+            .to_string(),
+    })?;
+    Ok(identity.name)
 }
 
-/// Resolve the org slug using the legacy (single-server) config path.
+/// Resolve the org slug for callers that don't already hold a server config.
 ///
-/// Kept for callers that don't yet pass a server override.
+/// Loads global config, resolves the active server profile, and delegates to
+/// [`resolve_org_with_server`] so the identity-personal-org fallback applies
+/// consistently.
 pub fn resolve_org(org_override: Option<&str>) -> CliResult<String> {
     if let Some(s) = org_override {
         if s.is_empty() {
@@ -262,14 +272,11 @@ pub fn resolve_org(org_override: Option<&str>) -> CliResult<String> {
     let config = GlobalConfig::load()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
 
-    config
-        .server
-        .default_org
-        .ok_or_else(|| CliError::InvalidArgument {
-            message: "No organization specified.\n  \
-                      Use --org or set a default with: atomic org set <slug>"
-                .to_string(),
-        })
+    let (server, _name) = config
+        .resolve_server(None)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
+
+    resolve_org_with_server(None, server)
 }
 
 /// Resolve the workspace slug for a command, with fallback to the
@@ -310,22 +317,28 @@ pub fn resolve_workspace_with_server(
 }
 
 /// Resolve the workspace slug for a command, with fallback to the
-/// org-scoped default workspace from global config.
+/// org-scoped default workspace from the **active** server profile.
 ///
-/// Uses the legacy (single-server) config path. Prefer
-/// [`resolve_workspace_with_server`] when you have already resolved the
-/// active server.
+/// Loads global config, resolves the active server profile (honouring
+/// `server_override` → `default_server` → legacy `[server]`), and delegates
+/// to [`resolve_workspace_with_server`]. This keeps reads aligned with
+/// `atomic workspace set`, which writes into that same active profile —
+/// otherwise a default set on a named profile would be invisible here.
 ///
 /// Resolution order:
 /// 1. `--workspace` override (if `Some(non-empty)`)
-/// 2. `server.default_workspaces[org_slug]` from global config
+/// 2. `server.default_workspaces[org_slug]` from the active server profile
 /// 3. Error with a hint to run `atomic workspace set`
 ///
 /// An explicit empty string (`--workspace ""`) is an error: the user
 /// explicitly asked for "no workspace", which is meaningless. Distinguishing
 /// `None` (not provided → fall back to default) from `Some("")` (provided
 /// empty → error) prevents a class of confusing bugs.
-pub fn resolve_workspace(org_slug: &str, workspace_override: Option<&str>) -> CliResult<String> {
+pub fn resolve_workspace(
+    org_slug: &str,
+    workspace_override: Option<&str>,
+    server_override: Option<&str>,
+) -> CliResult<String> {
     if let Some(s) = workspace_override {
         if s.is_empty() {
             return Err(CliError::InvalidArgument {
@@ -338,17 +351,11 @@ pub fn resolve_workspace(org_slug: &str, workspace_override: Option<&str>) -> Cl
     let config = GlobalConfig::load()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
 
-    config
-        .server
-        .default_workspaces
-        .get(org_slug)
-        .cloned()
-        .ok_or_else(|| CliError::InvalidArgument {
-            message: format!(
-                "No workspace specified for org '{org_slug}'.\n  \
-                 Use --workspace or set a default with: atomic workspace set <slug>"
-            ),
-        })
+    let (server, _name) = config
+        .resolve_server(server_override)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
+
+    resolve_workspace_with_server(org_slug, None, server)
 }
 
 /// Resolve a flexible identity reference to a UUID.
@@ -487,13 +494,13 @@ mod tests {
 
     #[test]
     fn resolve_workspace_passes_through_explicit_override() {
-        let result = resolve_workspace("acme", Some("backend")).unwrap();
+        let result = resolve_workspace("acme", Some("backend"), None).unwrap();
         assert_eq!(result, "backend");
     }
 
     #[test]
     fn resolve_workspace_rejects_explicit_empty_override() {
-        let err = resolve_workspace("acme", Some("")).unwrap_err();
+        let err = resolve_workspace("acme", Some(""), None).unwrap_err();
         match err {
             CliError::InvalidArgument { message } => {
                 assert!(message.contains("cannot be empty"));

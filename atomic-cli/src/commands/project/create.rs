@@ -133,7 +133,8 @@ impl Command for ProjectCreate {
         rt.block_on(async {
             let (client, org_slug) =
                 build_client_with_org(self.org.as_deref(), self.server.as_deref()).await?;
-            let workspace = resolve_workspace(&org_slug, self.workspace.as_deref())?;
+            let workspace =
+                resolve_workspace(&org_slug, self.workspace.as_deref(), self.server.as_deref())?;
             let visibility = self.parse_visibility()?;
 
             let req = CreateProjectRequest {

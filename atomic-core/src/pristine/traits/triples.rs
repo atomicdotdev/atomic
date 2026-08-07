@@ -80,6 +80,14 @@ pub trait KgTxnT {
     /// Count total nodes in the KG.
     fn count_kg_nodes(&self) -> Result<usize, PristineError>;
 
+    /// Return the IDs of all KG nodes whose `source` field matches one of
+    /// `sources`.
+    ///
+    /// Used to select derived nodes (e.g. `"vcs"` and `"ast"` for the
+    /// VCS/tree-sitter enrichment pipeline) so a rebuild can drop them before
+    /// re-deriving, without touching vault- or session-sourced nodes.
+    fn kg_node_ids_by_source(&self, sources: &[&str]) -> Result<Vec<String>, PristineError>;
+
     /// Count total edges in the KG.
     fn count_kg_edges(&self) -> Result<usize, PristineError>;
 }

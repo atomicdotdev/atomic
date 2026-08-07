@@ -115,7 +115,7 @@ impl ProjectInit {
 
         // 2. Build the storage client and resolve the workspace.
         let (client, org_slug) = build_client_with_org(self.org.as_deref(), None).await?;
-        let workspace = resolve_workspace(&org_slug, self.workspace.as_deref())?;
+        let workspace = resolve_workspace(&org_slug, self.workspace.as_deref(), None)?;
 
         // 3. Ensure the workspace exists — create it if necessary.
         //    A 409 (Conflict) means it already exists, which is fine.
