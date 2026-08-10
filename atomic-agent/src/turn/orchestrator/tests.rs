@@ -165,9 +165,15 @@ async fn test_session_start_in_sandbox_adopts_view_without_forking() {
     // The session records on the sandbox's own view — not a freshly forked one.
     let session = orch.session_store.load("sess-sbx").unwrap().unwrap();
     assert_eq!(session.view_name, "agent-sbx");
-    assert!(
-        session.parent_view.is_none(),
-        "sandbox session must not fork a child view"
+    // And it says where that view came from. This used to assert `is_none()`
+    // under the heading "must not fork a child view", which conflated two
+    // different things: not forking, and having nothing to say about the fork
+    // that already happened. Only the first is an invariant, and the canonical
+    // -graph assertions below are what actually enforce it.
+    assert_eq!(
+        session.parent_view.as_deref(),
+        Some(user_view.as_str()),
+        "a sandboxed session should record the view its sandbox forked from"
     );
 
     // The canonical graph is untouched: no spurious agent view was forked and
@@ -181,6 +187,66 @@ async fn test_session_start_in_sandbox_adopts_view_without_forking() {
         "sandbox session must not fork a new view into the canonical graph"
     );
     assert_eq!(canonical_after.current_view(), user_view);
+}
+
+#[tokio::test]
+async fn test_sandbox_session_records_the_draft_it_forked_from() {
+    // A sandbox forked from another DRAFT, not from the trunk. The parent is
+    // the view it actually came from — the immediate one, matching what the
+    // non-sandbox path records — rather than the nearest shared ancestor.
+    let canonical = TempDir::new().unwrap();
+    let mut repo = Repository::init(canonical.path()).unwrap();
+    let trunk = repo.current_view().to_string(); // "dev"
+    repo.create_view_from("feature-x", &trunk).unwrap();
+    repo.create_view_from("agent-sbx", "feature-x").unwrap();
+
+    let sandbox_dir = TempDir::new().unwrap();
+    repo.provision_sandbox(sandbox_dir.path(), "agent-sbx")
+        .unwrap();
+    drop(repo);
+
+    let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
+    let watcher = FallbackWatcher::new(WatcherConfig::new(sandbox_dir.path()));
+    let mut orch =
+        TurnOrchestrator::with_watcher(sandbox_dir.path(), session_store, Box::new(watcher));
+
+    orch.dispatch(session_start_event("sess-draft-parent"))
+        .await
+        .unwrap();
+
+    let session = orch
+        .session_store
+        .load("sess-draft-parent")
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.view_name, "agent-sbx");
+    assert_eq!(session.parent_view.as_deref(), Some("feature-x"));
+}
+
+#[tokio::test]
+async fn test_sandbox_session_on_a_root_view_records_no_parent() {
+    // Nothing to report, and saying so is the honest answer: a root view has
+    // no fork behind it. The point is that this does not error or invent one.
+    let canonical = TempDir::new().unwrap();
+    let mut repo = Repository::init(canonical.path()).unwrap();
+    let root = repo.current_view().to_string(); // "dev", created with no parent
+
+    let sandbox_dir = TempDir::new().unwrap();
+    repo.provision_sandbox(sandbox_dir.path(), &root).unwrap();
+    drop(repo);
+
+    let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
+    let watcher = FallbackWatcher::new(WatcherConfig::new(sandbox_dir.path()));
+    let mut orch =
+        TurnOrchestrator::with_watcher(sandbox_dir.path(), session_store, Box::new(watcher));
+
+    orch.dispatch(session_start_event("sess-root"))
+        .await
+        .unwrap();
+
+    let session = orch.session_store.load("sess-root").unwrap().unwrap();
+    assert_eq!(session.view_name, root);
+    assert!(session.parent_view.is_none());
 }
 
 #[tokio::test]
