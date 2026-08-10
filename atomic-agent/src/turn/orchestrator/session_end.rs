@@ -60,7 +60,10 @@ impl TurnOrchestrator {
             // makes `record_turn` see a view mismatch and record nothing. Align
             // explicitly so the agent's uncommitted files are recorded on the
             // agent view. Best-effort — non-fatal if it can't switch.
-            match atomic_repository::Repository::open_existing(&self.repo_root) {
+            // Doubles as the "is there a worktree to protect?" answer for the
+            // failed-flush guard below, which is why it is captured rather
+            // than discarded. See there.
+            let has_worktree = match atomic_repository::Repository::open_existing(&self.repo_root) {
                 Ok(mut repo) => {
                     if repo.current_view() != session.view_name {
                         if let Err(e) = repo.align_to_view(&session.view_name) {
@@ -76,12 +79,16 @@ impl TurnOrchestrator {
                             );
                         }
                     }
+                    true
                 }
-                Err(e) => log::warn!(
-                    "SessionEnd: could not open repo to align view: {} (non-fatal)",
-                    e
-                ),
-            }
+                Err(e) => {
+                    log::warn!(
+                        "SessionEnd: could not open repo to align view: {} (non-fatal)",
+                        e
+                    );
+                    false
+                }
+            };
 
             let prompt = event
                 .prompt
@@ -132,7 +139,16 @@ impl TurnOrchestrator {
                     // working copy on the agent view so its unrecorded work
                     // remains visible and recoverable. Repo-less orchestrator
                     // tests and integrations have no worktree to protect.
-                    if session.parent_view.is_some() {
+                    //
+                    // This asks the question directly. It used to ask whether
+                    // the session had a `parent_view`, which was a stand-in
+                    // for the same thing — only the branch that opens a real
+                    // repository set one — and a stand-in that quietly
+                    // excluded sandboxes, whose unrecorded work is exactly
+                    // what most needs protecting. It would also have changed
+                    // meaning under anything that recorded a parent more
+                    // often, which is a trap for the next reader.
+                    if has_worktree {
                         return Err(e);
                     }
                 }
