@@ -37,6 +37,32 @@ impl<'a> ViewTxnT for WriteTxn<'a> {
         Ok(names)
     }
 
+    fn get_conflicts(&self, view_id: u64, inode: u64) -> PristineResult<Vec<StoredConflict>> {
+        let table = self.txn.open_table(CONFLICTS)?;
+        let key = encode_view_seq(view_id, inode);
+        let result = table.get(&key)?;
+        match result {
+            Some(value) => deserialize_conflicts(value.value()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn iter_conflicts(&self, view_id: u64) -> PristineResult<Vec<(u64, Vec<StoredConflict>)>> {
+        let table = self.txn.open_table(CONFLICTS)?;
+        let start = encode_view_seq(view_id, 0);
+        let end = encode_view_seq(view_id, u64::MAX);
+        let mut out = Vec::new();
+        for entry in table.range::<&[u8; 16]>(&start..=&end)? {
+            let (key, value) = entry?;
+            let (_vid, inode) = decode_view_seq(key.value());
+            let conflicts = deserialize_conflicts(value.value())?;
+            if !conflicts.is_empty() {
+                out.push((inode, conflicts));
+            }
+        }
+        Ok(out)
+    }
+
     fn get_change_seq(&self, view: &ViewState, change_id: NodeId) -> PristineResult<Option<u64>> {
         let table = self.txn.open_table(REV_VIEW_CHANGES)?;
         let key = encode_view_seq(view.id, change_id.get());

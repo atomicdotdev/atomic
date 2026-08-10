@@ -25,63 +25,10 @@
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
 
-# ── Conflict marker helpers ─────────────────────────────────────────────────
-
-# Check for conflict markers in a file.
-# Returns 0 if markers found, 1 if clean.
-has_conflict_markers() {
-    local path="$1"
-    grep -qE '>>>>>>|<<<<<<|=======' "$path" 2>/dev/null
-}
-
-# Assert that a file has NO conflict markers.
-assert_no_conflict_markers() {
-    local desc="$1"
-    local path="$2"
-    if [[ ! -f "$path" ]]; then
-        _fail "$desc" "file does not exist: $path"
-        return
-    fi
-    if has_conflict_markers "$path"; then
-        local content
-        content="$(cat "$path")"
-        _fail "$desc" "conflict markers found in $path. Content: $(echo "$content" | head -20)"
-    else
-        _pass "$desc"
-    fi
-}
-
-# Assert that a file contains a specific substring.
-assert_file_contains() {
-    local desc="$1"
-    local path="$2"
-    local needle="$3"
-    if [[ ! -f "$path" ]]; then
-        _fail "$desc" "file does not exist: $path"
-        return
-    fi
-    if grep -qF "$needle" "$path"; then
-        _pass "$desc"
-    else
-        _fail "$desc" "'$needle' not found in $path. Content: $(cat "$path" | head -10)"
-    fi
-}
-
-# Assert that a file does NOT contain a specific substring.
-assert_file_not_contains() {
-    local desc="$1"
-    local path="$2"
-    local needle="$3"
-    if [[ ! -f "$path" ]]; then
-        _pass "$desc"
-        return
-    fi
-    if grep -qF "$needle" "$path"; then
-        _fail "$desc" "'$needle' should not be in $path but was found"
-    else
-        _pass "$desc"
-    fi
-}
+# Conflict-marker + content helpers now live in merge_helpers.sh:
+#   has_conflict_markers, assert_no_conflict_markers,
+#   assert_file_contains, assert_file_not_contains
+source "$HARNESS_DIR/merge_helpers.sh"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Case 1: Simple view switch — single-line file, complete overwrite"

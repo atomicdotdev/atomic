@@ -322,7 +322,107 @@ impl OrderResult {
     pub fn num_sccs(&self) -> usize {
         self.sccs.len()
     }
+
+    /// Verify that the SCCs form an exact partition of the graph's alive
+    /// vertices.
+    ///
+    /// After [`compute_order`], every non-DUMMY vertex
+    /// (`VertexId(1)..VertexId(vertex_count)`) must appear in exactly one
+    /// SCC exactly once. A violation means the ordering stage has lost or
+    /// duplicated a vertex, which downstream corrupts the emitted file
+    /// (duplicated tail, relocated line) while reporting success. This is
+    /// the structural guard for that entire class of bugs.
+    ///
+    /// `vertex_count` is the graph's [`AliveGraph::len_vertices`], i.e. the
+    /// DUMMY sentinel at index 0 plus all alive vertices.
+    ///
+    /// Cheap (O(total vertices) with a single bitmap), so property tests and
+    /// release builds can call it explicitly; [`compute_order`] runs it under
+    /// `debug_assert!`.
+    pub fn validate_partition(&self, vertex_count: usize) -> Result<(), OrderInvariantError> {
+        // Index 0 is the DUMMY sentinel and must never appear in an SCC.
+        // Alive vertices are 1..vertex_count.
+        let mut seen = vec![false; vertex_count];
+        for scc in &self.sccs {
+            for &vid in scc {
+                let idx = vid.index();
+                if idx == 0 {
+                    return Err(OrderInvariantError::DummyInScc);
+                }
+                if idx >= vertex_count {
+                    return Err(OrderInvariantError::OutOfRange {
+                        vertex: vid,
+                        vertex_count,
+                    });
+                }
+                if seen[idx] {
+                    return Err(OrderInvariantError::Duplicate { vertex: vid });
+                }
+                seen[idx] = true;
+            }
+        }
+        // Every alive vertex must have been covered.
+        for (idx, covered) in seen.iter().enumerate().skip(1) {
+            if !*covered {
+                return Err(OrderInvariantError::Missing {
+                    vertex: VertexId::new(idx),
+                });
+            }
+        }
+        Ok(())
+    }
 }
+
+/// A violation of the SCC-partition invariant detected by
+/// [`OrderResult::validate_partition`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderInvariantError {
+    /// The DUMMY sentinel (index 0) appeared in an SCC.
+    DummyInScc,
+    /// A vertex index was outside `1..vertex_count`.
+    OutOfRange {
+        /// The offending vertex.
+        vertex: VertexId,
+        /// The graph's vertex count.
+        vertex_count: usize,
+    },
+    /// A vertex appeared in more than one SCC (or twice in one).
+    Duplicate {
+        /// The vertex emitted more than once.
+        vertex: VertexId,
+    },
+    /// An alive vertex never appeared in any SCC.
+    Missing {
+        /// The vertex that was dropped from the ordering.
+        vertex: VertexId,
+    },
+}
+
+impl std::fmt::Display for OrderInvariantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OrderInvariantError::DummyInScc => {
+                write!(f, "DUMMY sentinel (VertexId(0)) appeared in an SCC")
+            }
+            OrderInvariantError::OutOfRange {
+                vertex,
+                vertex_count,
+            } => write!(
+                f,
+                "{:?} is out of range for a graph with {} vertices",
+                vertex, vertex_count
+            ),
+            OrderInvariantError::Duplicate { vertex } => {
+                write!(f, "{:?} appeared in the ordering more than once", vertex)
+            }
+            OrderInvariantError::Missing { vertex } => {
+                write!(f, "{:?} was dropped from the ordering", vertex)
+            }
+        }
+    }
+}
+
+impl std::error::Error for OrderInvariantError {}
 
 // TARJAN'S ALGORITHM
 
@@ -374,6 +474,16 @@ pub fn compute_order(graph: &mut AliveGraph) -> OrderResult {
 
     // Build a simple conflict tree (can be enhanced later for nested conflicts)
     build_conflict_tree(graph, &mut result);
+
+    // Structural invariant: the SCCs must partition the alive vertices. A
+    // violation here is the root of the silent duplication/omission class of
+    // bugs, so fail loudly (in debug/test builds) at the point of origin
+    // rather than letting corruption reach disk.
+    debug_assert!(
+        result.validate_partition(graph.len_vertices()).is_ok(),
+        "compute_order did not produce a vertex partition: {:?}",
+        result.validate_partition(graph.len_vertices())
+    );
 
     result
 }
@@ -776,6 +886,114 @@ mod tests {
         let result = OrderResult::new();
         let debug = format!("{:?}", result);
         assert!(debug.contains("OrderResult"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Partition-invariant Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_partition_accepts_exact_cover() {
+        // 3 alive vertices (indices 1..=3) in a graph of size 4 (DUMMY + 3),
+        // spread across a cyclic SCC and a trivial SCC — still a partition.
+        let result = OrderResult {
+            sccs: vec![vec![VertexId(1), VertexId(2)], vec![VertexId(3)]],
+            conflict_tree: ConflictTree::new(),
+            cyclic_conflicts: 1,
+            forward_edges: Vec::new(),
+        };
+        assert_eq!(result.validate_partition(4), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_partition_rejects_duplicate() {
+        // VertexId(1) appears in two SCCs — the duplication signature.
+        let result = OrderResult {
+            sccs: vec![vec![VertexId(1)], vec![VertexId(1), VertexId(2)]],
+            conflict_tree: ConflictTree::new(),
+            cyclic_conflicts: 1,
+            forward_edges: Vec::new(),
+        };
+        assert_eq!(
+            result.validate_partition(3),
+            Err(OrderInvariantError::Duplicate {
+                vertex: VertexId(1)
+            })
+        );
+    }
+
+    #[test]
+    fn test_validate_partition_rejects_missing() {
+        // VertexId(2) is alive (graph size 3) but never appears — dropped.
+        let result = OrderResult {
+            sccs: vec![vec![VertexId(1)]],
+            conflict_tree: ConflictTree::new(),
+            cyclic_conflicts: 0,
+            forward_edges: Vec::new(),
+        };
+        assert_eq!(
+            result.validate_partition(3),
+            Err(OrderInvariantError::Missing {
+                vertex: VertexId(2)
+            })
+        );
+    }
+
+    #[test]
+    fn test_validate_partition_rejects_dummy() {
+        let result = OrderResult {
+            sccs: vec![vec![VertexId(0)]],
+            conflict_tree: ConflictTree::new(),
+            cyclic_conflicts: 0,
+            forward_edges: Vec::new(),
+        };
+        assert_eq!(
+            result.validate_partition(1),
+            Err(OrderInvariantError::DummyInScc)
+        );
+    }
+
+    #[test]
+    fn test_validate_partition_rejects_out_of_range() {
+        let result = OrderResult {
+            sccs: vec![vec![VertexId(999)]],
+            conflict_tree: ConflictTree::new(),
+            cyclic_conflicts: 0,
+            forward_edges: Vec::new(),
+        };
+        assert_eq!(
+            result.validate_partition(2),
+            Err(OrderInvariantError::OutOfRange {
+                vertex: VertexId(999),
+                vertex_count: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn test_compute_order_produces_partition_on_linear_chain() {
+        // A real graph run through compute_order must satisfy the invariant.
+        let mut graph = AliveGraph::new();
+        graph.push_vertex(AliveVertex::DUMMY);
+
+        for i in 1..=3u64 {
+            let v = GraphNode::new(
+                NodeId::new(i),
+                ChangePosition::new(0),
+                ChangePosition::new(10),
+            );
+            graph.push_vertex(AliveVertex::new(v));
+            graph.set_last_children_start();
+            let next = if i < 3 {
+                VertexId::new((i + 1) as usize)
+            } else {
+                VertexId::DUMMY
+            };
+            graph.push_child_to_last(None, next);
+        }
+
+        let result = compute_order(&mut graph);
+        assert_eq!(result.validate_partition(graph.len_vertices()), Ok(()));
     }
 
     // -------------------------------------------------------------------------

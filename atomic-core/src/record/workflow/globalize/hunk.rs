@@ -539,13 +539,27 @@ where
         }
     }
 
-    // Fallback: whole-file deletion. `delete_all_content` already does the
-    // thorough SCC-aware search, so no further fallback is needed here.
+    // Whole-file deletion (empty `deleted_lines`, or a targeted range we
+    // could not resolve). `delete_all_content` does the thorough SCC-aware
+    // search and marks every content vertex deleted.
+    //
+    // Emit `GraphOp::FileDel` — not a bare `GraphOp::Edit` — so the
+    // delete-INTENT travels with the change itself. The tree-maintenance
+    // layers (`collect_tree_ops`, `insert_change`, `write_recorded`) already
+    // understand FileDel and clean up TREE/INODES for it; an Edit-based
+    // deletion only worked at record time via the out-of-band
+    // `deleted_files()` list, which does not exist when the change is later
+    // INSERTED into another view — leaving the deleted file tracked and its
+    // stale content on disk (docs/MERGE-CONFLICT-RUBRIC.md §6.5). Graph
+    // application is unchanged: FileDel yields the same single EdgeUpdate
+    // atom. A truncate-to-empty keeps the Edit representation, so the two
+    // remain distinguishable.
     let deletion = delete_all_content(ctx, inode_pos)?;
 
-    Ok(vec![GraphOp::Edit {
-        change: Atom::EdgeUpdate(deletion),
-        local,
+    Ok(vec![GraphOp::FileDel {
+        del: deletion,
+        contents: None,
+        path: local.path.clone(),
         encoding,
     }])
 }

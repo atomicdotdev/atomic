@@ -32,7 +32,23 @@ pub enum DoctorCommands {
     /// stored in the imported changes.
     #[command(name = "materialize-crdt")]
     MaterializeCrdt(MaterializeCrdt),
+
+    /// Verify working-copy consistency against the graph (read-only).
+    ///
+    /// Recomputes each file's content from the graph and reports two classes
+    /// of problem:
+    ///   * materialization drift — a clean file whose on-disk bytes differ
+    ///     from what the graph would materialize (silent corruption);
+    ///   * conflict-state disagreement — on-disk markers, `atomic status`,
+    ///     and `atomic conflicts` must all agree.
+    ///
+    /// Mutates nothing. Exits non-zero when problems are found.
+    Check(Check),
 }
+
+/// Read-only working-copy consistency check.
+#[derive(Debug, Args, Default)]
+pub struct Check {}
 
 /// Rebuild the normal change dependency index from stored changes.
 #[derive(Debug, Args, Default)]
@@ -59,7 +75,43 @@ impl Command for Doctor {
         match &self.command {
             DoctorCommands::RepairDependencyIndex(cmd) => cmd.run(),
             DoctorCommands::MaterializeCrdt(cmd) => cmd.run(),
+            DoctorCommands::Check(cmd) => cmd.run(),
         }
+    }
+}
+
+impl Command for Check {
+    fn run(&self) -> CliResult<()> {
+        let repo = require_repository(None)?;
+
+        print_info("Verifying working-copy consistency against the graph...");
+        let report = repo
+            .verify_working_copy()
+            .map_err(|e| crate::error::CliError::Internal(e.into()))?;
+
+        print_info(&format!(
+            "Checked {} clean file(s); {} with uncommitted edits skipped; {} conflicted.",
+            report.clean_files_checked, report.uncommitted_skipped, report.conflicted_files
+        ));
+
+        if report.is_healthy() {
+            print_success("Working copy is consistent with the graph.");
+            return Ok(());
+        }
+
+        print_warning(&format!("{} problem(s) found:", report.problems.len()));
+        for p in &report.problems {
+            println!("  ✗ {}", p);
+        }
+        print_hint(
+            "Materialization drift can often be repaired by re-materializing \
+             (e.g. `atomic view switch <current-view>`); conflict-state \
+             disagreements indicate a bug worth reporting.",
+        );
+        Err(crate::error::CliError::Internal(anyhow::anyhow!(
+            "working-copy verification found {} problem(s)",
+            report.problems.len()
+        )))
     }
 }
 

@@ -89,6 +89,14 @@ pub struct RecordOptions {
     ///
     /// Empty by default — most non-agent recordings don't need this.
     metadata_bytes: Vec<u8>,
+
+    /// Whether to allow recording files that still contain conflict markers.
+    ///
+    /// Defaults to `false`: `record` refuses a file whose on-disk content
+    /// carries `>>>>>>>`/`=======`/`<<<<<<<` markers, so a merge conflict is
+    /// resolved before it is baked into history. Set true to override (for
+    /// the rare case where such lines are legitimate content).
+    allow_conflict_markers: bool,
 }
 
 impl RecordOptions {
@@ -246,6 +254,19 @@ impl RecordOptions {
     #[must_use]
     pub fn get_metadata_bytes(&self) -> &[u8] {
         &self.metadata_bytes
+    }
+
+    /// Set whether to allow recording files that contain conflict markers.
+    #[must_use]
+    pub fn allow_conflict_markers(mut self, allow: bool) -> Self {
+        self.allow_conflict_markers = allow;
+        self
+    }
+
+    /// Get whether recording marker-laden files is allowed.
+    #[must_use]
+    pub fn get_allow_conflict_markers(&self) -> bool {
+        self.allow_conflict_markers
     }
 
     /// Set AI provenance information for this change.
@@ -428,6 +449,7 @@ impl Default for RecordOptions {
             sync_vault: true,
             enrich_kg: true,
             provenance: Vec::new(),
+            allow_conflict_markers: false,
         }
     }
 }

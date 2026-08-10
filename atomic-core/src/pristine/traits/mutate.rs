@@ -8,7 +8,7 @@ use crate::types::{GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge
 use crate::pristine::error::PristineError;
 
 use super::tree::TreeTxnT;
-use super::view::{ViewScope, ViewState, ViewTxnT};
+use super::view::{StoredConflict, ViewScope, ViewState, ViewTxnT};
 
 /// Mutable graph operations
 ///
@@ -172,8 +172,27 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT + super::CrdtTxnT {
     ///
     /// Only **Draft** views can be deleted. Shared views return
     /// `CannotDeleteSharedView`. Views with children return `ViewHasChildren`.
-    /// Cleans up: VIEW_CHANGES, REV_VIEW_CHANGES, STATES, MERKLE_CHAIN.
+    /// Cleans up: VIEW_CHANGES, REV_VIEW_CHANGES, STATES, MERKLE_CHAIN, CONFLICTS.
     fn del_view(&mut self, view: &ViewState) -> Result<(), PristineError>;
+
+    // ── Conflict State ──────────────────────────────────────────
+
+    /// Persist the conflicts detected for a file (`inode`) on a view,
+    /// replacing any previously stored for that file. An empty slice clears
+    /// the entry.
+    fn put_conflicts(
+        &mut self,
+        view_id: u64,
+        inode: u64,
+        conflicts: &[StoredConflict],
+    ) -> Result<(), PristineError>;
+
+    /// Remove the conflict entry for a single file (`inode`) on a view.
+    fn del_conflicts(&mut self, view_id: u64, inode: u64) -> Result<(), PristineError>;
+
+    /// Remove all conflict entries for a view (used when replacing the view's
+    /// full conflict set after a complete materialize, and on view deletion).
+    fn del_conflicts_prefix(&mut self, view_id: u64) -> Result<(), PristineError>;
 
     // ── Tree Operations ─────────────────────────────────────────
 

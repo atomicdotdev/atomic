@@ -451,6 +451,49 @@ impl Repository {
             }
         }
 
+        // ── Conflicted files ────────────────────────────────────────────
+        //
+        // Surface persisted conflict state (written by the last materialize
+        // on this view) so a conflicted working tree is never reported clean.
+        // A Conflicted entry supersedes any Modified entry for the same path.
+        if let Some(view) = txn
+            .get_view(&self.current_view)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            let conflicts = txn
+                .iter_conflicts(view.id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            for (inode, records) in conflicts {
+                let Some(first) = records.first() else {
+                    continue;
+                };
+                let path = PathBuf::from(&first.path);
+                // Honesty invariant: only report Conflicted while the file on
+                // disk still carries markers. Once the user resolves them the
+                // file falls back to normal Modified detection and becomes
+                // recordable again (which then clears the stale entry).
+                let abs_path = self.root.join(&path);
+                let still_conflicted = std::fs::read(&abs_path)
+                    .ok()
+                    .and_then(|c| super::materialize::first_conflict_marker_line(&c))
+                    .is_some();
+                if !still_conflicted {
+                    continue;
+                }
+                let detail = if records.len() > 1 {
+                    format!("{} ({} conflicts)", first.summary(), records.len())
+                } else {
+                    first.summary()
+                };
+                let mut entry = FileStatusEntry::new(path, FileStatus::Conflicted);
+                entry.set_inode(atomic_core::types::Inode::new(inode));
+                entry.set_details(detail);
+                // Conflicted supersedes any prior (e.g. Modified) entry so the
+                // file is reported exactly once.
+                status.add_or_replace_entry(entry);
+            }
+        }
+
         let untracked_ms = untracked_start.elapsed().as_millis();
         let total_ms = overall_start.elapsed().as_millis();
         if total_ms > 100 {
@@ -476,6 +519,50 @@ impl Repository {
         }
 
         Ok(status)
+    }
+
+    /// List the current view's persisted conflicts.
+    ///
+    /// Returns `(path, conflicts)` pairs for every conflicted file, sorted by
+    /// path. Honesty invariant: a file is included only while its on-disk
+    /// content still carries conflict markers (matching
+    /// [`Repository::status`]); a resolved-but-not-yet-recorded file is
+    /// omitted. Read-only.
+    #[allow(clippy::type_complexity)]
+    pub fn list_conflicts(
+        &self,
+    ) -> Result<Vec<(String, Vec<atomic_core::pristine::StoredConflict>)>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view = match txn
+            .get_view(&self.current_view)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        };
+        let mut out = Vec::new();
+        for (_inode, records) in txn
+            .iter_conflicts(view.id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            let Some(first) = records.first() else {
+                continue;
+            };
+            let abs_path = self.root.join(&first.path);
+            let still_conflicted = std::fs::read(&abs_path)
+                .ok()
+                .and_then(|c| super::materialize::first_conflict_marker_line(&c))
+                .is_some();
+            if !still_conflicted {
+                continue;
+            }
+            out.push((first.path.clone(), records));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
     }
 
     /// Quick status check — uses default options.
@@ -538,7 +625,7 @@ impl Repository {
 ///
 /// Returns `false` when the deletion has been recorded (no alive content
 /// from this view's perspective).
-fn is_file_alive_via_retrieval<T: GraphTxnT>(
+pub(crate) fn is_file_alive_via_retrieval<T: GraphTxnT>(
     txn: &T,
     _inode: Inode,
     position: Position<NodeId>,

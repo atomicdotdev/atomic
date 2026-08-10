@@ -255,6 +255,7 @@ fn run_single_insert(repo: &Repository, change_str: &str, args: &Insert) -> CliR
             "{} files updated, {} directories",
             output_result.files_written, output_result.directories_created
         ));
+        print_conflict_summary(repo);
     }
 
     Ok(())
@@ -443,6 +444,7 @@ fn run_view_insert(repo: &Repository, args: &ViewArgs) -> CliResult<()> {
                 output_result.files_written, output_result.directories_created
             ),
         );
+        print_conflict_summary(repo);
     }
 
     Ok(())
@@ -511,6 +513,7 @@ fn run_tag(repo: &Repository, args: &TagArgs) -> CliResult<()> {
                 output_result.files_written, output_result.directories_created
             ),
         );
+        print_conflict_summary(repo);
     }
 
     Ok(())
@@ -554,6 +557,7 @@ fn run_change_insert(repo: &Repository, args: &ChangeArgs) -> CliResult<()> {
             "{} files updated, {} directories",
             output_result.files_written, output_result.directories_created
         ));
+        print_conflict_summary(repo);
     }
 
     Ok(())
@@ -673,8 +677,40 @@ fn print_insert_outcome(
 
     if has_conflicts {
         println!();
-        output::print_warning("Conflicts detected. Run 'atomic status' to see details.");
+        output::print_warning("Conflicts detected. Run 'atomic conflicts' to see details.");
     }
+}
+
+/// After materializing the current view, list any conflicted files inline so
+/// the user does not have to run a second command to find them.
+fn print_conflict_summary(repo: &Repository) {
+    let conflicts = match repo.list_conflicts() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if conflicts.is_empty() {
+        return;
+    }
+    println!();
+    let file_word = if conflicts.len() == 1 {
+        "file"
+    } else {
+        "files"
+    };
+    output::print_warning(&format!(
+        "{} conflicted {} — resolve markers, then record:",
+        conflicts.len(),
+        file_word
+    ));
+    for (path, records) in &conflicts {
+        let where_ = records
+            .first()
+            .and_then(|c| c.line)
+            .map(|l| format!(" (line {})", l))
+            .unwrap_or_default();
+        println!("    {}{}", path, where_);
+    }
+    output::print_hint("See 'atomic conflicts' for details.");
 }
 
 /// Print the outcome of a cross-view insert operation.
@@ -715,7 +751,7 @@ fn print_cross_view_outcome(outcome: &CrossViewInsertOutcome, dry_run: bool) {
 
     if outcome.has_conflicts {
         println!();
-        output::print_warning("Conflicts detected. Run 'atomic status' to see details.");
+        output::print_warning("Conflicts detected. Run 'atomic conflicts' to see details.");
     }
 }
 

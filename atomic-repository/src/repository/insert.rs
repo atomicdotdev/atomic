@@ -1730,38 +1730,12 @@ impl Repository {
                             }
                         }
                     }
-                    GraphOp::FileMove { add, path, .. } if !preserve_existing_tree_paths => {
-                        // A FileMove reuses the existing inode — look it up via
-                        // the inode position stored in add.inode, then update
-                        // TREE: remove the old path mapping and insert the new one.
-                        //
-                        // add.inode is Position<Option<Hash>>; resolve it to
-                        // Position<NodeId> so we can call position_inode().
-                        let inode_change_id = match &add.inode.change {
-                            None => change_id, // self-reference (shouldn't happen for FileMove)
-                            Some(h) if *h == Hash::NONE => NodeId::ROOT,
-                            Some(h) => txn.get_internal(h).unwrap_or(None).unwrap_or(NodeId::ROOT),
-                        };
-                        let inode_pos = Position::new(inode_change_id, add.inode.pos);
-
-                        if let Ok(Some(inode)) = txn.position_inode(inode_pos) {
-                            // Remove the old TREE entry (old path → inode)
-                            if let Ok(Some(old_path)) = txn.get_path(inode) {
-                                // Guard: only delete the old path if it differs
-                                // from the new path.  When multiple files share
-                                // the same inode position (a rare data-integrity
-                                // edge case), position_inode may resolve to an
-                                // inode whose current path was already updated
-                                // by a prior FileMove in this same change.
-                                // Deleting it would undo that earlier rename.
-                                if old_path != *path {
-                                    let _ = txn.del_tree(&old_path);
-                                }
-                            }
-                            // Insert the new TREE entry (new path → inode)
-                            let _ = txn.put_tree(path, inode);
-                        }
-                    }
+                    // NOTE: FileMove TREE maintenance is handled unconditionally
+                    // below (not gated by `!already_in_graph`), because a
+                    // draft-recorded rename inserted cross-view is always
+                    // already-ambient in GRAPH and would otherwise be skipped
+                    // here — leaving TREE pointed at the old path so the rename
+                    // never materializes (rubric A10, ATOM::36).
                     _ => {}
                 }
             }
@@ -1772,6 +1746,43 @@ impl Repository {
                     &hash.to_base32()[..12],
                     t_tree.elapsed(),
                 );
+            }
+        }
+
+        // FileMove TREE maintenance for the CURRENT view — ALWAYS (even when the
+        // change's edges are already ambient in GRAPH). Inserting a rename must
+        // repoint TREE old→new now so the caller's materialize produces the new
+        // path; the eager `!already_in_graph` block above only runs for brand-new
+        // changes and misses the common cross-view-insert case. Old on-disk
+        // paths are collected and removed after commit (materialize writes the
+        // new path but never removes the old one), mirroring the FileDel
+        // working-copy cleanup below. The deferred-tree journal append still
+        // happens, so a later view switch replays to the same TREE state
+        // idempotently.
+        let mut moved_from_disk: Vec<String> = Vec::new();
+        if !preserve_existing_tree_paths {
+            for graph_op in change.hunks() {
+                if let GraphOp::FileMove { add, path, .. } = graph_op {
+                    // add.inode is Position<Option<Hash>>; resolve to Position<NodeId>.
+                    let inode_change_id = match &add.inode.change {
+                        None => change_id,
+                        Some(h) if *h == Hash::NONE => NodeId::ROOT,
+                        Some(h) => txn.get_internal(h).unwrap_or(None).unwrap_or(NodeId::ROOT),
+                    };
+                    let inode_pos = Position::new(inode_change_id, add.inode.pos);
+                    if let Ok(Some(inode)) = txn.position_inode(inode_pos) {
+                        if let Ok(Some(old_path)) = txn.get_path(inode) {
+                            // Only repoint when the tracked path actually differs
+                            // (guards against a prior FileMove in this same change
+                            // already having updated it).
+                            if old_path != *path {
+                                let _ = txn.del_tree(&old_path);
+                                moved_from_disk.push(old_path);
+                            }
+                        }
+                        let _ = txn.put_tree(path, inode);
+                    }
+                }
             }
         }
 
@@ -1819,6 +1830,46 @@ impl Repository {
             );
         } else {
             log::debug!("insert_change: txn.commit() took {}ms", commit_ms);
+        }
+
+        // Working-copy cleanup for whole-file deletions (FileDel hunks).
+        //
+        // TREE/INODES are global and only cleaned up when no other view still
+        // references the file, so a delete inserted into the current view can
+        // leave the (now dead) file's stale bytes on disk — materialize only
+        // writes or skips, it never removes. Re-check the file's visible
+        // content on this view AFTER the change is applied and remove the
+        // stale working-copy file when the content is truly gone. A
+        // delete-vs-modify merge where lines survive yields Some(content) and
+        // is left for materialize to rewrite. Truncate-to-empty is recorded
+        // as an Edit (not FileDel) and never reaches this path.
+        if view_name == self.current_view {
+            for graph_op in change.hunks() {
+                if let GraphOp::FileDel { path, .. } = graph_op {
+                    let gone = matches!(self.get_file_content_on_view(path, view_name), Ok(None));
+                    if gone {
+                        let abs = self.root.join(path);
+                        if abs.is_file() {
+                            let _ = std::fs::remove_file(&abs);
+                        }
+                        let _ = self.del_file_index(path);
+                    }
+                }
+            }
+
+            // Remove the stale source of each applied FileMove. TREE was
+            // repointed old→new above, so materialize will write the new path
+            // but never deletes the old one. Only remove when the old path is
+            // truly untracked on this view now (guards an A12-style shared path).
+            for old_path in &moved_from_disk {
+                if matches!(self.get_file_inode(old_path), Ok(None)) {
+                    let abs = self.root.join(old_path);
+                    if abs.is_file() {
+                        let _ = std::fs::remove_file(&abs);
+                    }
+                    let _ = self.del_file_index(old_path);
+                }
+            }
         }
 
         if trace_insert {

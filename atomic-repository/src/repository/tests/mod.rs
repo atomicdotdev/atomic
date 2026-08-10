@@ -6,16 +6,21 @@ use atomic_core::types::Base32;
 use tempfile::TempDir;
 
 mod change_tests;
+mod conflict_surface_tests;
 mod cross_view_merge_tests;
+mod delete_propagation_tests;
 mod edit_tests;
 mod history_tests;
 mod init_tests;
 mod integration_tests;
+mod merge_property_tests;
 mod record_duplication_tests;
 mod record_tests;
+mod rename_tests;
 mod status_tests;
 
 mod tracking_tests;
+mod verify_tests;
 mod view_tests;
 
 // ── Shared Helpers ──────────────────────────────────────────────────────
