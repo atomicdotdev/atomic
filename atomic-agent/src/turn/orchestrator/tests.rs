@@ -228,7 +228,9 @@ async fn test_sandbox_session_on_a_root_view_records_no_parent() {
     // Nothing to report, and saying so is the honest answer: a root view has
     // no fork behind it. The point is that this does not error or invent one.
     let canonical = TempDir::new().unwrap();
-    let mut repo = Repository::init(canonical.path()).unwrap();
+    // Not `mut`, unlike its siblings: this one forks no view, so nothing here
+    // needs a mutable handle.
+    let repo = Repository::init(canonical.path()).unwrap();
     let root = repo.current_view().to_string(); // "dev", created with no parent
 
     let sandbox_dir = TempDir::new().unwrap();
