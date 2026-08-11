@@ -330,10 +330,9 @@ impl Diff {
     /// This is the preferred path - it displays line-level and token-level
     /// changes directly from the stored CRDT operations, without recomputing.
     ///
-    /// Hunks are anchored at their true file offsets (derived from the line
-    /// numbers stored on each operation at record time) and padded with
-    /// context lines from the file's recorded before-content, so downstream
-    /// renderers see standard unified-diff hunk headers.
+    /// Building the `Vec<FileDiff>` is delegated to the reusable
+    /// [`change_file_diffs`] builder; this method applies the positional file
+    /// filter and prints, preserving `atomic diff -c <hash>` output exactly.
     fn show_change_diff_from_file_ops(
         &self,
         repo: &Repository,
@@ -341,219 +340,8 @@ impl Diff {
         change_hash: &Hash,
         config: &DiffOutputConfig,
     ) -> CliResult<()> {
-        if let Some((file_diffs, stats)) = Self::build_git_import_file_diffs(change) {
-            let (file_diffs, stats) = self.filter_file_diffs(file_diffs, stats);
-            if file_diffs.is_empty() {
-                self.print_no_changes();
-                return Ok(());
-            }
-
-            if config.format == DiffFormat::Unified {
-                self.print_change_header(change, change_hash, config);
-            }
-
-            return match config.format {
-                DiffFormat::Unified => self.print_unified(&file_diffs, config),
-                DiffFormat::Stat => self.print_stat(&stats, config),
-                DiffFormat::NameOnly => self.print_name_only(&file_diffs),
-                DiffFormat::NameStatus => self.print_name_status(&file_diffs, config),
-            };
-        }
-
-        let file_ops = change.file_ops();
-
-        if file_ops.is_empty() {
-            self.print_no_changes();
-            return Ok(());
-        }
-
-        let mut file_diffs = Vec::new();
-        let mut stats = DiffStats::new();
-
-        for ops in file_ops {
-            let file_path = ops.path();
-
-            // Honor the positional file filter (`diff --change <hash> <file>`)
-            if !self.file_matches_filter(file_path) {
-                continue;
-            }
-
-            let trunk_op = ops.trunk_op();
-            let line_ops = ops.line_ops();
-
-            // Determine file change status from trunk operation
-            let change_status = match trunk_op {
-                Some(TrunkOp::Create { .. }) => FileChangeStatus::Added,
-                Some(TrunkOp::Delete { .. }) => FileChangeStatus::Deleted,
-                Some(TrunkOp::Move { .. }) => FileChangeStatus::Renamed,
-                Some(TrunkOp::Undelete { .. }) => FileChangeStatus::Modified,
-                None => FileChangeStatus::Modified,
-            };
-
-            let mut file_diff = match change_status {
-                FileChangeStatus::Added => FileDiff::added(file_path),
-                FileChangeStatus::Deleted => FileDiff::deleted(file_path),
-                FileChangeStatus::Renamed => FileDiff::modified(file_path),
-                _ => FileDiff::modified(file_path),
-            };
-
-            // Pass 1: flatten line operations into numbered changed lines.
-            //
-            // `net` tracks (insertions - deletions) so far, which is what
-            // lets each line be mapped between old-file and new-file
-            // coordinates when computing true hunk offsets.
-            let mut insertions = 0usize;
-            let mut deletions = 0usize;
-            let mut new_line_num = 1usize;
-            let mut old_line_num = 1usize;
-            let mut net: isize = 0;
-            let mut changed: Vec<NumberedLine> = Vec::new();
-
-            for line_op in line_ops {
-                match line_op.operation() {
-                    BranchOp::Insert { content, .. } => {
-                        // Reconstruct line content from leaf operations
-                        let line_content = Self::reconstruct_line_from_leaf_ops(content);
-                        // Use stored line number if available, otherwise use counter
-                        let line_num = line_op.new_line_num().unwrap_or(new_line_num);
-                        changed.push(NumberedLine::added(line_content, line_num, net));
-                        new_line_num = line_num + 1;
-                        insertions += 1;
-                        net += 1;
-                    }
-                    BranchOp::Delete { content, .. } => {
-                        // Reconstruct deleted line content from stored leaf operations
-                        let line_content = if content.is_empty() {
-                            String::from("<deleted line>")
-                        } else {
-                            Self::reconstruct_line_from_leaf_ops(content)
-                        };
-                        // Use stored line number if available, otherwise use counter
-                        let line_num = line_op.old_line_num().unwrap_or(old_line_num);
-                        changed.push(NumberedLine::removed(line_content, line_num, net));
-                        old_line_num = line_num + 1;
-                        deletions += 1;
-                        net -= 1;
-                    }
-                    BranchOp::Modify {
-                        old_content,
-                        new_content,
-                        ..
-                    } => {
-                        // A Modify carries both old and new content.
-                        // Emit them as adjacent removed + added lines
-                        // so print_unified can pair them for word-level
-                        // highlighting.
-                        let old_line_content = if old_content.is_empty() {
-                            String::from("<modified line>")
-                        } else {
-                            Self::reconstruct_line_from_leaf_ops(old_content)
-                        };
-                        let new_line_content = Self::reconstruct_line_from_leaf_ops(new_content);
-
-                        let old_ln = line_op.old_line_num().unwrap_or(old_line_num);
-                        let new_ln = line_op.new_line_num().unwrap_or(new_line_num);
-
-                        changed.push(NumberedLine::removed(old_line_content, old_ln, net));
-                        net -= 1;
-                        changed.push(NumberedLine::added(new_line_content, new_ln, net));
-                        net += 1;
-
-                        old_line_num = old_ln + 1;
-                        new_line_num = new_ln + 1;
-                        deletions += 1;
-                        insertions += 1;
-                    }
-                    BranchOp::Restore { .. } => {
-                        // Restore is like an add for display purposes
-                        let line_num = line_op.new_line_num().unwrap_or(new_line_num);
-                        changed.push(NumberedLine::added(
-                            String::from("<restored line>"),
-                            line_num,
-                            net,
-                        ));
-                        new_line_num = line_num + 1;
-                        insertions += 1;
-                        net += 1;
-                    }
-                    BranchOp::Reparent { .. } => {
-                        // Position-only change — no visible delta in
-                        // unified diff output.  A future "blame-aware"
-                        // diff might render these explicitly; for now
-                        // they're silent.
-                    }
-                }
-            }
-
-            // Fetch the file's recorded before-content so hunks can be
-            // padded with context lines. Only needed for unified output
-            // with a non-zero --context; failures degrade to zero context.
-            let before_lines: Option<Vec<Vec<u8>>> =
-                if config.format == DiffFormat::Unified && config.context_lines > 0 {
-                    match repo.get_file_content_before_change(file_path, change_hash) {
-                        Ok(Some(content)) => {
-                            Some(content.split(|&b| b == b'\n').map(|l| l.to_vec()).collect())
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-
-            // Pass 2: group changed lines into hunks at their true file
-            // offsets, padded with context lines.
-            let mut hunks = Self::hunks_from_changed_lines(
-                &changed,
-                before_lines.as_deref(),
-                config.context_lines,
-            );
-
-            for hunk in &mut hunks {
-                // Re-pair Delete+Insert lines by content similarity.
-                //
-                // The CRDT builder emits all Deletes before all Inserts
-                // for unequal-count Replace blocks (to preserve correct
-                // BRANCH_AFTER chain ordering).  This is correct for
-                // the graph, but produces poor diff output because
-                // modified lines appear as scattered -/+ pairs instead
-                // of adjacent ones.
-                //
-                // This post-pass identifies contiguous runs of Removed
-                // lines followed by Added lines and re-interleaves
-                // them: each Removed line is paired with its best-
-                // matching Added line (by bigram Jaccard similarity)
-                // and emitted adjacently (-/+).  Unpaired lines keep
-                // their original position.
-                //
-                // Git-imported changes already carry Git's authoritative
-                // line ordering in their stored FileOps. Running the
-                // heuristic re-pairing pass on top of that can scramble
-                // the exact +/- sequence and break diff parity.
-                if !Self::is_git_import_change(change) {
-                    hunk.lines = Self::repair_diff_lines(std::mem::take(&mut hunk.lines));
-                }
-            }
-
-            for hunk in hunks {
-                file_diff.add_hunk(hunk);
-            }
-
-            // Set stats based on change type
-            file_diff.stats = match change_status {
-                FileChangeStatus::Added => FileDiffStats::added(file_path, insertions),
-                FileChangeStatus::Deleted => FileDiffStats::deleted(file_path, deletions),
-                _ => FileDiffStats::modified(file_path, insertions, deletions),
-            };
-
-            stats.add_file(file_diff.stats.clone());
-            file_diffs.push(file_diff);
-        }
-
-        if file_diffs.is_empty() {
-            self.print_no_changes();
-            return Ok(());
-        }
-
+        let (file_diffs, stats) = change_file_diffs(repo, change, change_hash, config)?;
+        let (file_diffs, stats) = self.filter_file_diffs(file_diffs, stats);
         self.print_change_file_diffs(change, change_hash, config, file_diffs, stats)
     }
 
@@ -1081,4 +869,170 @@ impl Diff {
             }
         }
     }
+}
+
+/// Build the real per-file unified diff for a recorded change WITHOUT printing.
+///
+/// This is the computation `atomic diff -c <hash>` runs, factored out so other
+/// surfaces (e.g. the triage report) can embed actual code hunks instead of
+/// re-implementing diffing. It returns every changed file's [`FileDiff`] plus
+/// the aggregate [`DiffStats`], using the semantic layer (FileOps) with true
+/// hunk offsets and before-content context, or Git's captured `+/-` lines for
+/// git-imported changes.
+///
+/// It applies NO positional file filter (it has no `Diff` instance); the
+/// `atomic diff` path applies `filter_file_diffs` afterward, which yields the
+/// same result as the previous in-loop filtering.
+pub(crate) fn change_file_diffs(
+    repo: &Repository,
+    change: &Change,
+    change_hash: &Hash,
+    config: &DiffOutputConfig,
+) -> CliResult<(Vec<FileDiff>, DiffStats)> {
+    // Git-imported changes carry Git's captured +/- lines in unhashed metadata.
+    if let Some((file_diffs, stats)) = Diff::build_git_import_file_diffs(change) {
+        return Ok((file_diffs, stats));
+    }
+
+    let file_ops = change.file_ops();
+
+    let mut file_diffs = Vec::new();
+    let mut stats = DiffStats::new();
+
+    for ops in file_ops {
+        let file_path = ops.path();
+
+        let trunk_op = ops.trunk_op();
+        let line_ops = ops.line_ops();
+
+        // Determine file change status from trunk operation
+        let change_status = match trunk_op {
+            Some(TrunkOp::Create { .. }) => FileChangeStatus::Added,
+            Some(TrunkOp::Delete { .. }) => FileChangeStatus::Deleted,
+            Some(TrunkOp::Move { .. }) => FileChangeStatus::Renamed,
+            Some(TrunkOp::Undelete { .. }) => FileChangeStatus::Modified,
+            None => FileChangeStatus::Modified,
+        };
+
+        let mut file_diff = match change_status {
+            FileChangeStatus::Added => FileDiff::added(file_path),
+            FileChangeStatus::Deleted => FileDiff::deleted(file_path),
+            FileChangeStatus::Renamed => FileDiff::modified(file_path),
+            _ => FileDiff::modified(file_path),
+        };
+
+        // Pass 1: flatten line operations into numbered changed lines.
+        let mut insertions = 0usize;
+        let mut deletions = 0usize;
+        let mut new_line_num = 1usize;
+        let mut old_line_num = 1usize;
+        let mut net: isize = 0;
+        let mut changed: Vec<NumberedLine> = Vec::new();
+
+        for line_op in line_ops {
+            match line_op.operation() {
+                BranchOp::Insert { content, .. } => {
+                    let line_content = Diff::reconstruct_line_from_leaf_ops(content);
+                    let line_num = line_op.new_line_num().unwrap_or(new_line_num);
+                    changed.push(NumberedLine::added(line_content, line_num, net));
+                    new_line_num = line_num + 1;
+                    insertions += 1;
+                    net += 1;
+                }
+                BranchOp::Delete { content, .. } => {
+                    let line_content = if content.is_empty() {
+                        String::from("<deleted line>")
+                    } else {
+                        Diff::reconstruct_line_from_leaf_ops(content)
+                    };
+                    let line_num = line_op.old_line_num().unwrap_or(old_line_num);
+                    changed.push(NumberedLine::removed(line_content, line_num, net));
+                    old_line_num = line_num + 1;
+                    deletions += 1;
+                    net -= 1;
+                }
+                BranchOp::Modify {
+                    old_content,
+                    new_content,
+                    ..
+                } => {
+                    let old_line_content = if old_content.is_empty() {
+                        String::from("<modified line>")
+                    } else {
+                        Diff::reconstruct_line_from_leaf_ops(old_content)
+                    };
+                    let new_line_content = Diff::reconstruct_line_from_leaf_ops(new_content);
+
+                    let old_ln = line_op.old_line_num().unwrap_or(old_line_num);
+                    let new_ln = line_op.new_line_num().unwrap_or(new_line_num);
+
+                    changed.push(NumberedLine::removed(old_line_content, old_ln, net));
+                    net -= 1;
+                    changed.push(NumberedLine::added(new_line_content, new_ln, net));
+                    net += 1;
+
+                    old_line_num = old_ln + 1;
+                    new_line_num = new_ln + 1;
+                    deletions += 1;
+                    insertions += 1;
+                }
+                BranchOp::Restore { .. } => {
+                    let line_num = line_op.new_line_num().unwrap_or(new_line_num);
+                    changed.push(NumberedLine::added(
+                        String::from("<restored line>"),
+                        line_num,
+                        net,
+                    ));
+                    new_line_num = line_num + 1;
+                    insertions += 1;
+                    net += 1;
+                }
+                BranchOp::Reparent { .. } => {
+                    // Position-only change — no visible delta in unified output.
+                }
+            }
+        }
+
+        // Fetch the file's recorded before-content so hunks can be padded with
+        // context lines. Only needed for unified output with a non-zero
+        // --context; failures degrade to zero context.
+        let before_lines: Option<Vec<Vec<u8>>> =
+            if config.format == DiffFormat::Unified && config.context_lines > 0 {
+                match repo.get_file_content_before_change(file_path, change_hash) {
+                    Ok(Some(content)) => {
+                        Some(content.split(|&b| b == b'\n').map(|l| l.to_vec()).collect())
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+        // Pass 2: group changed lines into hunks at their true file offsets.
+        let mut hunks =
+            Diff::hunks_from_changed_lines(&changed, before_lines.as_deref(), config.context_lines);
+
+        for hunk in &mut hunks {
+            // Re-pair Delete+Insert lines by content similarity (skipped for
+            // git-imports, which carry Git's authoritative line ordering).
+            if !Diff::is_git_import_change(change) {
+                hunk.lines = Diff::repair_diff_lines(std::mem::take(&mut hunk.lines));
+            }
+        }
+
+        for hunk in hunks {
+            file_diff.add_hunk(hunk);
+        }
+
+        file_diff.stats = match change_status {
+            FileChangeStatus::Added => FileDiffStats::added(file_path, insertions),
+            FileChangeStatus::Deleted => FileDiffStats::deleted(file_path, deletions),
+            _ => FileDiffStats::modified(file_path, insertions, deletions),
+        };
+
+        stats.add_file(file_diff.stats.clone());
+        file_diffs.push(file_diff);
+    }
+
+    Ok((file_diffs, stats))
 }

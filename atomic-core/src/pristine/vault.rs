@@ -199,6 +199,29 @@ pub struct IntentSummary {
     /// Turn number within the session at creation (1-indexed, as `turn_count+1`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<u32>,
+    /// The `intentSubstanceHash` (T2) pinned when `done` was granted — the
+    /// reviewable substance the grant was made against (T5b). Mirrors the
+    /// intent's `doneSubstanceHash` frontmatter key. Absent unless the intent
+    /// currently holds a granted `done`; cleared when a lapse demotes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_substance_hash: Option<String>,
+    /// Why a granted `done` lapsed back to `in_progress` (T5b): the substance
+    /// drifted from the pin. Mirrors the intent's `doneLapsedReason`
+    /// frontmatter key. Queryable as "why did this leave done?".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_lapsed_reason: Option<String>,
+    /// Classification of the intent (e.g. `"intent"` or `"review"`), authored
+    /// via the frontmatter `type` key. Indexed in the manifest so
+    /// `intent list`/`intent show` can present the type without lifting each
+    /// intent. Legacy manifests without this field default to `"feature"`.
+    #[serde(default = "default_intent_kind")]
+    pub kind: String,
+}
+
+/// Default `kind` for [`IntentSummary`] entries in legacy manifests that
+/// predate the field. Every intent is at least a `"feature"`.
+fn default_intent_kind() -> String {
+    "feature".to_string()
 }
 
 /// Summary of a skill file in the manifest.
@@ -885,6 +908,33 @@ mod tests {
         }"#;
         let decoded: IntentSummary = serde_json::from_str(json).expect("deserialize legacy");
         assert_eq!(decoded.goals, 5);
+    }
+
+    #[test]
+    fn intent_summary_defaults_kind_to_feature_for_legacy_manifest() {
+        // Legacy manifests predate the `kind` field; they must still
+        // deserialize, defaulting `kind` to "feature".
+        let json = r#"{
+            "status": "open",
+            "priority": "high"
+        }"#;
+        let decoded: IntentSummary = serde_json::from_str(json).expect("deserialize legacy");
+        assert_eq!(decoded.kind, "feature");
+    }
+
+    #[test]
+    fn intent_summary_kind_roundtrip_preserves_review() {
+        let summary = IntentSummary {
+            status: "open".to_string(),
+            priority: "high".to_string(),
+            kind: "review".to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&summary).expect("serialize");
+        let decoded: IntentSummary = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.kind, "review");
+        assert_eq!(decoded.status, "open");
+        assert_eq!(decoded.priority, "high");
     }
 
     #[test]

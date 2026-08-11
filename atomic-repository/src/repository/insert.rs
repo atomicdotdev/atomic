@@ -946,6 +946,61 @@ impl Repository {
         debug_assert_eq!(hash, verified_hash);
         timings.assemble_ms = assemble_start.elapsed().as_millis();
 
+        // Idempotency guard for the single global GRAPH.
+        //
+        // A change is applied to the graph exactly once; views merely
+        // reference it. Because import registers and applies a change in the
+        // same transaction, an already-registered change has already been
+        // applied — re-running its graph ops here would allocate a second
+        // inode for every added path and manufacture a spurious name/order
+        // conflict on materialize. This is exactly what `git import --all`
+        // hits: a commit shared by two branches (a common ancestor) is
+        // imported once per branch. Reference the already-applied change into
+        // the target view instead — the same O(1) VIEW_CHANGES metadata
+        // operation `insert` performs — rather than re-applying it.
+        if let Some(change_id) = txn
+            .get_internal(&hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            use atomic_core::apply::compute_new_state;
+
+            txn.put_change_deps(change_id, final_change.dependencies())
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+            let mut view = txn
+                .open_or_create_view(view_name)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+            // Only reference the change if this view does not already contain
+            // it, so a genuine re-import never double-advances the merkle.
+            let missing = filter_missing_in_view(&txn, &view, std::slice::from_ref(&hash))
+                .map_err(|e| RepositoryError::Apply(e.to_string()))?;
+            if !missing.is_empty() {
+                let new_state = compute_new_state(&view.state, &hash);
+                let sequence = view.change_count + 1;
+                txn.put_change(&mut view, change_id, &hash)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                view.state = new_state;
+                view.change_count = sequence;
+                txn.update_view(&view)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            }
+
+            txn.commit()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+            return Ok(ImportWriteOutcome {
+                hash,
+                timings,
+                insert: InsertOutcome::new(
+                    view.state,
+                    view.change_count,
+                    false,
+                    InsertStats::new(),
+                ),
+            });
+        }
+
         let save_start = std::time::Instant::now();
         self.save_change_bytes(&hash, &v3_bytes, &final_change)?;
         timings.save_ms = save_start.elapsed().as_millis();

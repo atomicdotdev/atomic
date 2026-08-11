@@ -53,9 +53,30 @@ pub struct IntentList {
     #[arg(long)]
     pub identity: Option<String>,
 
-    /// Output as JSON (an array of {id,status,attested,verifies}).
+    /// Only list intents of this classification (one of feature, review, bug,
+    /// chore, remediation). Read from the manifest `IntentSummary.kind` — no
+    /// lift. Mutually exclusive with `--review`.
+    #[arg(long, value_name = "KIND", conflicts_with = "review")]
+    pub kind: Option<String>,
+
+    /// Shortcut for `--kind review`: only list review intents.
+    #[arg(long)]
+    pub review: bool,
+
+    /// Output as JSON (an array of {id,status,kind,attested,verifies}).
     #[arg(long)]
     pub json: bool,
+}
+
+impl IntentList {
+    /// The effective `kind` filter: `--review` is sugar for `--kind review`.
+    fn kind_filter(&self) -> Option<String> {
+        if self.review {
+            Some("review".to_string())
+        } else {
+            self.kind.clone()
+        }
+    }
 }
 
 /// The classification of one intent's attestation, for a table/JSON row.
@@ -121,6 +142,8 @@ impl Verifies {
 struct Row {
     human_key: String,
     status: String,
+    /// Classification tag, read from the manifest `IntentSummary.kind` (no lift).
+    kind: String,
     attested: Attested,
     verifies: Verifies,
 }
@@ -210,6 +233,7 @@ fn classify(attested: &bridge::Attestation) -> Attested {
 fn compute_row(
     repo: &Repository,
     info: &atomic_repository::IntentInfo,
+    kind: String,
     verifier: Option<&Verifier>,
 ) -> Row {
     // read_intent → inputs → load_attestation. Any failure ⇒ '–' columns.
@@ -222,9 +246,42 @@ fn compute_row(
     Row {
         human_key: info.id.clone(),
         status: info.status.clone(),
+        kind,
         attested,
         verifies,
     }
+}
+
+/// Build the (optionally kind-filtered) rows for the listing.
+///
+/// Enumeration reuses [`Repository::vault_intent_list`]; the `kind` tag is read
+/// straight from the manifest `IntentSummary.kind` (a manifest read, never a
+/// lift). Factored out of [`Command::run`] so the kind tag + filter are
+/// unit-testable without a global identity store. A row whose id is missing from
+/// the manifest (should not happen — the same manifest backs both) degrades to
+/// the default `feature`.
+fn build_rows(
+    repo: &Repository,
+    verifier: Option<&Verifier>,
+    filter: Option<&str>,
+) -> CliResult<Vec<Row>> {
+    let manifest = repo.vault_manifest().map_err(CliError::Repository)?;
+    let intents = repo.vault_intent_list(None).map_err(CliError::Repository)?;
+    let mut rows = Vec::new();
+    for info in &intents {
+        let kind = manifest
+            .intents
+            .get(&info.id)
+            .map(|s| s.kind.clone())
+            .unwrap_or_else(|| "feature".to_string());
+        if let Some(f) = filter {
+            if kind != f {
+                continue;
+            }
+        }
+        rows.push(compute_row(repo, info, kind, verifier));
+    }
+    Ok(rows)
 }
 
 impl Command for IntentList {
@@ -235,14 +292,25 @@ impl Command for IntentList {
         // Resolve the verifying identity ONCE (soft-fail to "no identity").
         let verifier = resolve_verifier(&self.identity)?;
 
-        // Enumerate via the SAME source `atomic vault intent list` uses; already
-        // sorted by id. Attestation entries are never in `manifest.intents`.
-        let intents = repo.vault_intent_list(None).map_err(CliError::Repository)?;
+        // Resolve + validate the kind filter (`--review` ⇒ `--kind review`). An
+        // unknown kind is a clean argument error rather than a silent empty list.
+        let filter = self.kind_filter();
+        if let Some(k) = &filter {
+            if !atomic_canonical::vocab::is_known_intent_kind(k) {
+                return Err(CliError::InvalidArgument {
+                    message: format!(
+                        "unknown intent kind '{}' (expected one of {:?})",
+                        k,
+                        atomic_canonical::vocab::INTENT_KIND
+                    ),
+                });
+            }
+        }
 
-        let rows: Vec<Row> = intents
-            .iter()
-            .map(|info| compute_row(&repo, info, verifier.as_ref()))
-            .collect();
+        // Enumerate via the SAME source `atomic vault intent list` uses; already
+        // sorted by id. Attestation entries are never in `manifest.intents`. The
+        // kind tag is read from the manifest summary (no lift).
+        let rows = build_rows(&repo, verifier.as_ref(), filter.as_deref())?;
 
         if self.json {
             let json: Vec<serde_json::Value> = rows
@@ -251,6 +319,7 @@ impl Command for IntentList {
                     serde_json::json!({
                         "id": r.human_key,
                         "status": r.status,
+                        "kind": r.kind,
                         "attested": r.attested.json(),
                         "verifies": r.verifies.json(),
                     })
@@ -278,16 +347,24 @@ impl Command for IntentList {
             .chain(std::iter::once("status".chars().count()))
             .max()
             .unwrap_or(6);
+        // The kind column renders as a `[tag]`, so size on the bracketed width.
+        let kind_w = rows
+            .iter()
+            .map(|r| r.kind.chars().count() + 2)
+            .chain(std::iter::once("kind".chars().count()))
+            .max()
+            .unwrap_or(4);
 
         println!(
-            "  {:<key_w$}  {:<status_w$}  {:<8}  verifies",
-            "humanKey", "status", "attested",
+            "  {:<key_w$}  {:<status_w$}  {:<kind_w$}  {:<8}  verifies",
+            "humanKey", "status", "kind", "attested",
         );
         for r in &rows {
             println!(
-                "  {:<key_w$}  {:<status_w$}  {:<8}  {}",
+                "  {:<key_w$}  {:<status_w$}  {:<kind_w$}  {:<8}  {}",
                 r.human_key,
                 r.status,
+                format!("[{}]", r.kind),
                 r.attested.table(),
                 r.verifies.table(),
             );
@@ -323,6 +400,7 @@ mod tests {
                     labels: Vec::new(),
                     session_id: None,
                     turn_id: None,
+                    kind: None,
                 })
                 .unwrap();
             ids.push(result.id);
@@ -363,6 +441,7 @@ mod tests {
     }
 
     /// Compute a single row using an explicit verifier keypair (no global store).
+    /// Reads the row's kind tag from the manifest, exactly as `build_rows` does.
     fn row_for(repo: &Repository, id: &str, kp: Option<&KeyPair>) -> Row {
         let verifier = kp.map(|kp| Verifier {
             did: did_for_public_key(&kp.public),
@@ -374,7 +453,30 @@ mod tests {
             .into_iter()
             .find(|i| i.id == id)
             .unwrap();
-        compute_row(repo, &info, verifier.as_ref())
+        let kind = repo
+            .vault_manifest()
+            .unwrap()
+            .intents
+            .get(id)
+            .map(|s| s.kind.clone())
+            .unwrap_or_else(|| "feature".to_string());
+        compute_row(repo, &info, kind, verifier.as_ref())
+    }
+
+    /// Create a review intent (kind mirrored into the manifest summary), returning
+    /// its human key.
+    fn create_review_intent(repo: &Repository, title: &str) -> String {
+        repo.vault_intent_create(IntentCreateOptions {
+            title: title.to_string(),
+            priority: Some("medium".to_string()),
+            assignee: None,
+            labels: Vec::new(),
+            session_id: None,
+            turn_id: None,
+            kind: Some("review".to_string()),
+        })
+        .unwrap()
+        .id
     }
 
     #[test]
@@ -488,6 +590,62 @@ mod tests {
         let row = row_for(&repo, &ids[0], None);
         assert_eq!(row.attested, Attested::Fresh);
         assert_eq!(row.verifies, Verifies::Na);
+    }
+
+    #[test]
+    fn row_carries_default_feature_kind() {
+        // An ordinary create (kind: None) mirrors `feature` into the manifest, so
+        // its row tag reads `feature`.
+        let (repo, ids, _dir) = repo_with_intents(1);
+        let row = row_for(&repo, &ids[0], None);
+        assert_eq!(row.kind, "feature");
+    }
+
+    #[test]
+    fn kind_tag_and_review_filter() {
+        // A mixed set: two default (feature) intents plus one review intent.
+        let (repo, _ids, _dir) = repo_with_intents(2);
+        let review_id = create_review_intent(&repo, "Review something");
+
+        // Unfiltered: every intent surfaces, tagged with its kind.
+        let all = build_rows(&repo, None, None).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            all.iter().filter(|r| r.kind == "feature").count(),
+            2,
+            "two feature intents"
+        );
+        let review_row = all.iter().find(|r| r.human_key == review_id).unwrap();
+        assert_eq!(review_row.kind, "review");
+
+        // `--kind review` (== `--review`) narrows to just the review intent.
+        let only = build_rows(&repo, None, Some("review")).unwrap();
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].human_key, review_id);
+        assert_eq!(only[0].kind, "review");
+
+        // Filtering by a kind no intent has yields an empty listing (not an error).
+        let none = build_rows(&repo, None, Some("chore")).unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn review_flag_is_kind_review_shortcut() {
+        // `--review` and `--kind review` resolve to the same filter.
+        let via_review = IntentList {
+            identity: None,
+            kind: None,
+            review: true,
+            json: false,
+        };
+        let via_kind = IntentList {
+            identity: None,
+            kind: Some("review".to_string()),
+            review: false,
+            json: false,
+        };
+        assert_eq!(via_review.kind_filter(), Some("review".to_string()));
+        assert_eq!(via_kind.kind_filter(), Some("review".to_string()));
     }
 
     #[test]

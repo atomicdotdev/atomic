@@ -209,7 +209,7 @@ fn render_memory_cli(node: &MemoryNode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::{Constraint, Ref, ScopeItem, CONTEXT_URL};
+    use crate::node::{default_kind, Constraint, Ref, ScopeItem, CONTEXT_URL};
     use crate::vocab::NodeType;
 
     fn scope(id: &str, text: &str) -> ScopeItem {
@@ -217,6 +217,7 @@ mod tests {
             type_: NodeType::ScopeItem.as_str().to_string(),
             id: id.to_string(),
             text: text.to_string(),
+            files: Vec::new(),
         }
     }
 
@@ -229,6 +230,7 @@ mod tests {
             human_key: "R-1".to_string(),
             title: "Render".to_string(),
             status: "todo".to_string(),
+            kind: default_kind(),
             priority: None,
             view: None,
             motivated_by: None,

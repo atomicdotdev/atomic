@@ -662,12 +662,33 @@ impl Repository {
                     // Infer entry type from path
                     let entry_type = infer_entry_type(&change.path);
 
+                    // T5b record-time grant-lapse (gap #2): a raw on-disk
+                    // substance edit to a `done` Draft intent reaches the vault
+                    // through THIS path (not `vault_intent_update`), so apply the
+                    // same demote-only lapse here. `record_time_lapse_frontmatter`
+                    // is Intent-only, demote-only, and returns the demoted
+                    // frontmatter iff a lapse applied; otherwise the incoming
+                    // frontmatter is stored unchanged. Single store, no recursion.
+                    let lapsed_fm = self.record_time_lapse_frontmatter(change, entry_type);
+                    let frontmatter_json = lapsed_fm
+                        .clone()
+                        .unwrap_or_else(|| change.frontmatter_json.clone());
+
                     self.vault_store(
                         &change.path,
                         entry_type,
                         change.content.clone(),
-                        change.frontmatter_json.clone(),
+                        frontmatter_json,
                     )?;
+
+                    // `vault_store` maintains only counts/merkle for Intent
+                    // entries — it does not sync the IntentSummary status/pin. On
+                    // a lapse, mirror the demoted status/reason into the manifest
+                    // so lists and triage stay consistent (as vault_intent_update
+                    // does on its path).
+                    if let Some(new_fm_json) = lapsed_fm {
+                        self.sync_intent_summary_after_lapse(&change.path, &new_fm_json)?;
+                    }
 
                     updated_paths.push(change.path.clone());
                 }
@@ -686,6 +707,127 @@ impl Repository {
         self.vault_reconcile_intent_manifest()?;
 
         Ok(updated_paths)
+    }
+
+    /// Record-time T5b grant-lapse for an intent deflated from disk (gap #2).
+    ///
+    /// Returns `Some(frontmatter_json)` with the demoted frontmatter iff a raw
+    /// on-disk edit lapsed a `done` Draft intent; `None` otherwise (the caller
+    /// then stores the incoming frontmatter unchanged). DEMOTE-ONLY and strictly
+    /// gated to `Intent` + `Modified`: a `New` intent has no prior grant, and a
+    /// non-Intent entry is never touched. Prior status + pin are read from the
+    /// pre-existing pristine entry (before this deflate overwrites it); the new
+    /// substance is lifted from the incoming on-disk content. Delegates the
+    /// decision to the shared `maybe_lapse_done_intent`, so both write paths
+    /// apply identical rules.
+    fn record_time_lapse_frontmatter(
+        &self,
+        change: &VaultFileChange,
+        entry_type: VaultEntryType,
+    ) -> Option<String> {
+        if entry_type != VaultEntryType::Intent {
+            return None;
+        }
+        // Only a MODIFIED intent has a prior grant to lapse; a NEW one cannot.
+        if !matches!(change.change_type, VaultChangeType::Modified) {
+            return None;
+        }
+
+        // Prior status + pin come from the pre-existing pristine entry.
+        let prior = self.vault_retrieve(&change.path).ok().flatten()?;
+        let prior_fm: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&prior.frontmatter_json).ok()?;
+        let prior_status = prior_fm
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if prior_status.as_deref() != Some("done") {
+            return None;
+        }
+        let prior_pin = prior_fm
+            .get("doneSubstanceHash")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        // The authoring view is stable across a body edit; read it from the
+        // authoritative stored entry rather than the YAML-round-tripped disk
+        // frontmatter.
+        let view_name = prior_fm
+            .get("view")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        // New frontmatter (from disk). Only consider a lapse when the disk edit
+        // KEEPS the intent marked done — i.e. it is a substance edit, not an
+        // explicit status change the author already made on disk (which we honor
+        // as-is, mirroring the interactive path's `options.status.is_none()`).
+        let mut new_fm: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&change.frontmatter_json).ok()?;
+        if new_fm.get("status").and_then(|v| v.as_str()) != Some("done") {
+            return None;
+        }
+
+        // Lift the NEW on-disk content for its substance hash. A body that does
+        // not lift carries no substance to compare — no lapse.
+        let body = String::from_utf8_lossy(&change.content);
+        let lifted = atomic_canonical::lift::lift_intent(&new_fm, &body).ok()?;
+
+        let demoted = self.maybe_lapse_done_intent(
+            &mut new_fm,
+            &lifted,
+            prior_status.as_deref(),
+            view_name.as_deref(),
+            prior_pin.as_deref(),
+        );
+        if demoted {
+            serde_json::to_string(&new_fm).ok()
+        } else {
+            None
+        }
+    }
+
+    /// Mirror a record-time lapse into the manifest `IntentSummary` (status,
+    /// pin, lapse reason) so lists/triage do not read a stale `done`. Located by
+    /// `vault_path`, since the record path has the path, not the intent key.
+    /// Best-effort and demote-consistent: it copies whatever the (already
+    /// demoted) frontmatter now holds.
+    fn sync_intent_summary_after_lapse(
+        &self,
+        path: &str,
+        new_frontmatter_json: &str,
+    ) -> Result<(), RepositoryError> {
+        use atomic_core::pristine::{VaultMutTxnT, VaultTxnT};
+
+        let fm: serde_json::Map<String, serde_json::Value> =
+            match serde_json::from_str(new_frontmatter_json) {
+                Ok(fm) => fm,
+                Err(_) => return Ok(()),
+            };
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let mut manifest = txn
+            .get_vault_manifest()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        if let Some(summary) = manifest.intents.values_mut().find(|s| s.vault_path == path) {
+            if let Some(status) = fm.get("status").and_then(|v| v.as_str()) {
+                summary.status = status.to_string();
+            }
+            summary.done_substance_hash = fm
+                .get("doneSubstanceHash")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            summary.done_lapsed_reason = fm
+                .get("doneLapsedReason")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+        }
+        txn.put_vault_manifest(&manifest)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -1531,6 +1673,9 @@ mod tests {
                     blocked_by: Vec::new(),
                     title: "Test".to_string(),
                     vault_path: intent_path.to_string(),
+                    // Derived `Default` gives kind == "" (empty); no IntentSummary
+                    // should ever be written with an empty kind.
+                    kind: "feature".to_string(),
                     ..Default::default()
                 },
             );
@@ -2342,5 +2487,139 @@ mod tests {
         // vault_list should return both entries
         let all = repo2.vault_list("", None).unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    // ── T5b record-time grant-lapse (gap #2) ─────────────────────────────
+
+    /// A canonical intent body whose checklist is complete, so a `done` grant
+    /// passes the rollup gate.
+    const RECORD_DONE_BODY: &str = "\
+:::why\nNeed rate limiting.\n:::\n\n\
+:::acceptance-criterion{#ac-1 status=met verifiedBy=did:atomic:lee evidence=urn:atomic:change:01J8}\n\
+Login attempts are rate-limited.\n:::\n\n\
+:::task{#t1 status=done satisfies=ac-1}\nAdd rate limiter middleware.\n:::";
+
+    /// Grant `done` on a Draft-scoped intent and return `(id, intent_file)`. The
+    /// grant stamps the substance pin and materializes the file to disk.
+    fn create_done_draft_intent(repo: &Repository) -> (String, String) {
+        let result = repo
+            .vault_intent_create(crate::repository::IntentCreateOptions {
+                title: "Record-time lapse".to_string(),
+                priority: None,
+                assignee: None,
+                labels: vec![],
+                session_id: None,
+                turn_id: None,
+                kind: None,
+            })
+            .unwrap();
+
+        // The authoring view (`dev`) is Shared by default; make it Draft so the
+        // lapse applies.
+        let view_name = repo.current_view().to_string();
+        repo.set_view_scope(&view_name, atomic_core::pristine::ViewScope::Draft)
+            .unwrap();
+
+        let updated = repo
+            .vault_intent_update(
+                &result.id,
+                crate::repository::IntentUpdateOptions {
+                    status: Some("done".to_string()),
+                    content: Some(RECORD_DONE_BODY.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.status, "done");
+        (result.id, result.intent_file)
+    }
+
+    /// (a) A raw on-disk substance edit deflated via the RECORD path (the path
+    /// that bypassed the lapse before this fix) demotes a `done` Draft intent to
+    /// `in_progress` with the reason recorded.
+    #[test]
+    fn test_record_time_lapse_on_disk_substance_edit() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        let (id, intent_file) = create_done_draft_intent(&repo);
+
+        // Raw on-disk edit of the AC definition text (substance drift), keeping
+        // the frontmatter (status=done, pin) untouched. This simulates a human/
+        // agent editing the .vault/ file directly, picked up by `atomic record`.
+        let disk_path = repo.vault_dir().join(&intent_file);
+        let original = std::fs::read_to_string(&disk_path).unwrap();
+        let edited = original.replace(
+            "Login attempts are rate-limited.",
+            "Login attempts are rate-limited to five per minute, precisely.",
+        );
+        assert_ne!(original, edited, "the on-disk edit must change the body");
+        std::fs::write(&disk_path, &edited).unwrap();
+
+        // The record-time deflate path must now apply the lapse.
+        let updated = repo.vault_record_working_copy().unwrap();
+        assert!(
+            updated.iter().any(|p| p == &intent_file),
+            "record must pick up the edited intent"
+        );
+
+        // Stored entry frontmatter is demoted, with the reason, pin cleared.
+        let entry = repo.vault_intent_show(&id).unwrap();
+        let fm: serde_json::Value = serde_json::from_str(&entry.frontmatter_json).unwrap();
+        assert_eq!(
+            fm["status"], "in_progress",
+            "record-time substance edit must lapse a done Draft intent"
+        );
+        assert!(fm["doneLapsedReason"]
+            .as_str()
+            .unwrap()
+            .contains("substance drifted"));
+        assert!(
+            fm.get("doneSubstanceHash").is_none(),
+            "pin cleared on lapse"
+        );
+
+        // Manifest mirror is kept consistent (not left at a stale `done`).
+        let manifest = repo.vault_manifest().unwrap();
+        let summary = manifest.intents.get(&id).unwrap();
+        assert_eq!(summary.status, "in_progress");
+        assert!(summary.done_lapsed_reason.is_some());
+        assert!(summary.done_substance_hash.is_none());
+    }
+
+    /// (b) A record-time deflate with NO substance change (a metadata-only
+    /// frontmatter edit) must NOT lapse a done Draft intent.
+    #[test]
+    fn test_record_time_no_lapse_without_substance_change() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        let (id, intent_file) = create_done_draft_intent(&repo);
+
+        // Raw on-disk edit that does NOT touch the reviewable substance: add a
+        // frontmatter label. The body (AC/task/scope/why) is unchanged.
+        let disk_path = repo.vault_dir().join(&intent_file);
+        let original = std::fs::read_to_string(&disk_path).unwrap();
+        // Insert a new frontmatter line right after the opening `---`.
+        let edited = original.replacen("---\n", "---\nassignee: someone-else\n", 1);
+        assert_ne!(original, edited, "the on-disk edit must change the file");
+        std::fs::write(&disk_path, &edited).unwrap();
+
+        repo.vault_record_working_copy().unwrap();
+
+        // The grant survives: still done, pin intact, no lapse reason.
+        let entry = repo.vault_intent_show(&id).unwrap();
+        let fm: serde_json::Value = serde_json::from_str(&entry.frontmatter_json).unwrap();
+        assert_eq!(
+            fm["status"], "done",
+            "a non-substance record-time edit must not lapse the grant"
+        );
+        assert!(
+            fm["doneSubstanceHash"].is_string(),
+            "pin retained when substance is unchanged"
+        );
+        assert!(fm.get("doneLapsedReason").is_none());
     }
 }

@@ -265,13 +265,35 @@ impl Repository {
             .read_txn()
             .map_err(|e| RecordError::Database(e.to_string()))?;
         let view_name_for_filter = options.get_view().unwrap_or(&self.current_view);
-        let shared_change_filter = if let Some(view) = shared_txn
+        // Alongside the change filter, collect the paths with a PERSISTED
+        // conflict on this view (the raw CONFLICTS table, deliberately NOT the
+        // marker-gated `list_conflicts`). At resolution time the user has
+        // already edited the markers out of the file, so a Modified record for
+        // one of these paths is a conflict RESOLUTION — the fork structure the
+        // retrieval sees is the surfaced conflict being superseded, which is
+        // the expected workflow, not an anomaly. Used below to route the
+        // fork-structure log to debug for resolutions and keep WARN for
+        // genuinely unexpected fork structure.
+        let (shared_change_filter, conflicted_paths) = if let Some(view) = shared_txn
             .get_view(view_name_for_filter)
             .map_err(|e| RecordError::Database(e.to_string()))?
         {
-            collect_visible_change_ids(&shared_txn, &view)?
+            let filter = collect_visible_change_ids(&shared_txn, &view)?;
+            let mut conflicted: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            if let Ok(conflicts) = shared_txn.iter_conflicts(view.id) {
+                for (_inode, records) in conflicts {
+                    for c in records {
+                        conflicted.insert(c.path.clone());
+                    }
+                }
+            }
+            (filter, conflicted)
         } else {
-            std::collections::HashSet::new()
+            (
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+            )
         };
         let shared_cached_txn =
             CachedGraphTxn::new(&shared_txn).map_err(|e| RecordError::Database(e.to_string()))?;
@@ -682,12 +704,25 @@ impl Repository {
                 detected.position = Some(file_position);
                 let working_copy = FileSystem::from_root(&self.root);
                 let file_options = if had_fork_structure {
-                    log::warn!(
-                        "record: '{}' had fork/cyclic conflict structure in its graph — \
-                         forcing a whole-file replace instead of a positional diff \
-                         (whole-file-replace safety fallback; expected to be rare and self-healing)",
-                        path
-                    );
+                    if conflicted_paths.contains(path.as_str()) {
+                        // The fork is a surfaced conflict this record is
+                        // resolving — the normal resolve-over-markers flow.
+                        // The whole-file-replace path is exactly right here;
+                        // nothing is wrong, so don't alarm the user.
+                        log::debug!(
+                            "record: '{}' is resolving a surfaced conflict — \
+                             recording the resolution as a whole-file replace \
+                             (the conflict fork is superseded by this record)",
+                            path
+                        );
+                    } else {
+                        log::warn!(
+                            "record: '{}' had fork/cyclic conflict structure in its graph — \
+                             forcing a whole-file replace instead of a positional diff \
+                             (whole-file-replace safety fallback; expected to be rare and self-healing)",
+                            path
+                        );
+                    }
                     core_options.clone().force_whole_file_replace(true)
                 } else {
                     core_options.clone()

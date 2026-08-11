@@ -15,7 +15,8 @@ use serde_json::{Map, Value};
 use crate::directive::{self, Directive};
 use crate::error::{CanonicalError, Result};
 use crate::node::{
-    AcceptanceCriterion, CanonicalNode, Constraint, Ref, ScopeItem, Task, CONTEXT_URL,
+    AcceptanceCriterion, CanonicalNode, Constraint, Ref, ScopeItem, Task, VerificationRecord,
+    CONTEXT_URL,
 };
 use crate::vocab::{self, NodeType};
 
@@ -33,6 +34,7 @@ pub(crate) const LIFTED_INTENT_DIRECTIVES: &[&str] = &[
     "constraint",
     "ref",
     "file-ref",
+    "verification",
 ];
 
 /// Lift an intent from its frontmatter spine and markdown body.
@@ -98,8 +100,9 @@ pub fn lift_intent(frontmatter: &Map<String, Value>, body: &str) -> Result<Canon
                 deps.push(lift_ref(d)?);
             }
             // `file-ref` is nested-only (consumed inside `task`); at top level
-            // it carries no meaning, so it is a recognized no-op.
-            "file-ref" => {}
+            // it carries no meaning, so it is a recognized no-op. `verification`
+            // is likewise nested-only (consumed inside `acceptance-criterion`).
+            "file-ref" | "verification" => {}
             other => {
                 debug_assert!(
                     !LIFTED_INTENT_DIRECTIVES.contains(&other),
@@ -120,6 +123,9 @@ pub fn lift_intent(frontmatter: &Map<String, Value>, body: &str) -> Result<Canon
         human_key,
         title: opt_str(frontmatter, "title").unwrap_or_default(),
         status: opt_str(frontmatter, "status").unwrap_or_else(|| "backlog".to_string()),
+        // Classification, authored via the frontmatter `kind` key. Absent ⇒ the
+        // default `"feature"`, which serializes to no `kind` key (hash-stable).
+        kind: opt_str(frontmatter, "kind").unwrap_or_else(crate::node::default_kind),
         priority: opt_str(frontmatter, "priority"),
         view: opt_str(frontmatter, "view"),
         motivated_by: opt_str(frontmatter, "motivatedBy"),
@@ -145,6 +151,27 @@ fn lift_ac(d: &Directive, id_base: &str, n: usize) -> Result<AcceptanceCriterion
     let local =
         d.id.clone()
             .unwrap_or_else(|| format!("{}-ac-{n}", slug(id_base)));
+    // Required verification kinds: a comma-separated `requiredKinds` attr
+    // (whitespace-tolerant, empty entries dropped). Absent ⇒ empty, so an AC
+    // that declares none is unchanged.
+    let required_kinds = d
+        .attr("requiredKinds")
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    // Nested `::verification{...}` leaf children become typed records. Absent ⇒
+    // empty, so an AC without verifications serializes exactly as before.
+    let verifications = d
+        .children
+        .iter()
+        .filter(|c| c.name == "verification")
+        .map(lift_verification)
+        .collect();
     Ok(AcceptanceCriterion {
         type_: NodeType::AcceptanceCriterion.as_str().to_string(),
         id: as_urn("ac", &local),
@@ -152,7 +179,25 @@ fn lift_ac(d: &Directive, id_base: &str, n: usize) -> Result<AcceptanceCriterion
         ac_status: d.attr("status").unwrap_or("open").to_string(),
         verified_by: d.attr("verifiedBy").map(str::to_string),
         evidence: d.attr("evidence").map(str::to_string),
+        verifications,
+        required_kinds,
     })
+}
+
+/// Lift a nested `::verification{kind= outcome= scope= observedAtMerkle= ref= observation=}`
+/// leaf into a typed [`VerificationRecord`]. Attributes map straight across;
+/// missing scalars become empty strings (the gate, not the lift, enforces the
+/// closed value sets).
+fn lift_verification(d: &Directive) -> VerificationRecord {
+    VerificationRecord {
+        type_: "VerificationRecord".to_string(),
+        kind: d.attr("kind").unwrap_or_default().to_string(),
+        outcome: d.attr("outcome").unwrap_or_default().to_string(),
+        scope: d.attr("scope").unwrap_or_default().to_string(),
+        observed_at_merkle: d.attr("observedAtMerkle").unwrap_or_default().to_string(),
+        reference: d.attr("ref").map(str::to_string),
+        observation: d.attr("observation").map(str::to_string),
+    }
 }
 
 fn lift_task(d: &Directive, id_base: &str, n: usize) -> Task {
@@ -200,15 +245,25 @@ fn lift_task(d: &Directive, id_base: &str, n: usize) -> Task {
 
 /// Lift a `:::scope-in` / `:::scope-out` container into a `ScopeItem`.
 /// `kind` is "scope-in" or "scope-out" and drives the generated id slug.
-/// Prose body is the unconstrained narrative (never graded).
+/// Prose body is the unconstrained narrative (never graded). Nested
+/// `::file-ref{path=}` leaves name the files this boundary covers — same leaf
+/// directive a `:::task` uses for `TOUCHES` — so a `:::scope-out` can declare
+/// concrete files out of scope for breach detection.
 fn lift_scope(d: &Directive, id_base: &str, kind: &str, n: usize) -> ScopeItem {
     let local =
         d.id.clone()
             .unwrap_or_else(|| format!("{}-{kind}-{n}", slug(id_base)));
+    let files = d
+        .children
+        .iter()
+        .filter(|c| c.name == "file-ref")
+        .filter_map(|c| c.attr("path").map(str::to_string))
+        .collect();
     ScopeItem {
         type_: NodeType::ScopeItem.as_str().to_string(),
         id: as_urn("scope", &local),
         text: d.body.clone(),
+        files,
     }
 }
 
@@ -224,11 +279,11 @@ fn lift_constraint(d: &Directive, id_base: &str, n: usize) -> Constraint {
     }
 }
 
-/// Lift a `:::ref{to= edge=}` leaf into a typed dependency edge. Both `to` and
-/// `edge` are required (a dependency with no target or no edge type is a lift
-/// error), and `edge` must be a known *dependency* edge — a `:::ref` sits on the
-/// dependency chain, so edges like `verifiedBy`/`about` are rejected even though
-/// they are valid edges elsewhere.
+/// Lift a `:::ref{to= edge=}` leaf into a typed reference edge. Both `to` and
+/// `edge` are required (a ref with no target or no edge type is a lift error),
+/// and `edge` must be a known *ref* edge: a dependency edge (`depends`/
+/// `blockedBy`) or a remediation edge (`remediates`). Edges like
+/// `verifiedBy`/`about` are rejected even though they are valid edges elsewhere.
 fn lift_ref(d: &Directive) -> Result<Ref> {
     let to = d
         .attr("to")
@@ -238,10 +293,11 @@ fn lift_ref(d: &Directive) -> Result<Ref> {
         .attr("edge")
         .ok_or_else(|| CanonicalError::Lift("':::ref' is missing required 'edge'".into()))?
         .to_string();
-    if !vocab::is_known_dependency_edge(&edge) {
+    if !vocab::is_known_ref_edge(&edge) {
         return Err(CanonicalError::Lift(format!(
-            "':::ref' edge '{edge}' is not a dependency edge {:?}",
-            vocab::DEPENDENCY_EDGES
+            "':::ref' edge '{edge}' is not a valid ref edge (dependency {:?} or remediation {:?})",
+            vocab::DEPENDENCY_EDGES,
+            vocab::REMEDIATION_EDGES
         )));
     }
     Ok(Ref {
@@ -362,6 +418,38 @@ mod tests {
     }
 
     #[test]
+    fn lifts_kind_review_from_frontmatter() {
+        let mut fm = fm();
+        fm.insert("kind".to_string(), json!("review"));
+        let node = lift_intent(&fm, "").unwrap();
+        assert_eq!(node.kind, "review");
+        // A non-default kind IS serialized.
+        assert_eq!(node.to_value()["kind"], "review");
+    }
+
+    #[test]
+    fn absent_kind_defaults_to_feature_and_omits_the_key() {
+        let node = lift_intent(&fm(), "").unwrap();
+        assert_eq!(node.kind, "feature");
+        // Hash back-compat: an ordinary intent emits NO `kind` key at all.
+        assert!(
+            node.to_value().as_object().unwrap().get("kind").is_none(),
+            "default kind must not serialize"
+        );
+    }
+
+    #[test]
+    fn lifts_ref_reviews() {
+        // `reviews` is an intent→intent ref on the same `:::ref` leaf as
+        // `blockedBy`/`remediates`, lifted into depends_on with edge="reviews".
+        let body = ":::ref{to=urn:atomic:intent:xyz edge=reviews}\n:::";
+        let node = lift_intent(&fm(), body).unwrap();
+        assert_eq!(node.depends_on.len(), 1);
+        assert_eq!(node.depends_on[0].to, "urn:atomic:intent:xyz");
+        assert_eq!(node.depends_on[0].edge, "reviews");
+    }
+
+    #[test]
     fn lifts_scope_in_out_and_constraints() {
         let body = "\
 :::scope-in
@@ -402,6 +490,92 @@ Do not touch the global keyboard handler.
             "urn:atomic:constraint:word-5-constraint-2"
         );
         assert!(node.has_scope_in[0].text.contains("src/App.tsx"));
+        // No `::file-ref` children ⇒ no files on the scope items.
+        assert!(node.has_scope_out[0].files.is_empty());
+    }
+
+    #[test]
+    fn scope_out_lifts_file_refs() {
+        // A `:::scope-out` may carry `::file-ref{path=}` leaves (same leaf a
+        // `:::task` uses) naming files declared out of scope.
+        let body = "\
+:::scope-out\n\
+The billing subsystem is off limits.\n\
+::file-ref{path=src/billing.rs}\n\
+::file-ref{path=src/billing/tax.rs}\n\
+:::";
+        let node = lift_intent(&fm(), body).unwrap();
+        assert_eq!(node.has_scope_out.len(), 1);
+        assert_eq!(
+            node.has_scope_out[0].files,
+            vec![
+                "src/billing.rs".to_string(),
+                "src/billing/tax.rs".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_scope_files_emit_no_key() {
+        // Hash back-compat: a scope item with no file-refs must serialize to
+        // exactly the pre-existing key-set (`files` is skipped when empty), so
+        // existing fixtures keep their content/substance hash.
+        let body = ":::scope-out\nSome prose boundary.\n:::";
+        let node = lift_intent(&fm(), body).unwrap();
+        let item = &node.has_scope_out[0];
+        assert!(item.files.is_empty());
+
+        let v = serde_json::to_value(item).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["@id", "@type", "text"]);
+    }
+
+    #[test]
+    fn empty_verifications_and_required_kinds_emit_no_keys() {
+        // Hash back-compat: an AC with no verifications and no required kinds
+        // must serialize to exactly the pre-existing key-set — the new fields
+        // are skipped when empty, so fixtures keep their content hash.
+        let body = ":::acceptance-criterion{status=met verifiedBy=did:atomic:lee evidence=urn:atomic:change:01J8}\nA checkable outcome.\n:::";
+        let node = lift_intent(&fm(), body).unwrap();
+        let ac = &node.has_acceptance_criterion[0];
+        assert!(ac.verifications.is_empty());
+        assert!(ac.required_kinds.is_empty());
+
+        let v = serde_json::to_value(ac).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        // Exactly the legacy key-set — no `verifications` or `requiredKinds` leak
+        // in (serde_json::Value sorts object keys, so compare the sorted set).
+        assert_eq!(
+            keys,
+            vec!["@id", "@type", "acStatus", "evidence", "text", "verifiedBy"]
+        );
+    }
+
+    #[test]
+    fn lifts_verification_records_and_required_kinds() {
+        // A nested `::verification` leaf plus a `requiredKinds` attr lift into
+        // the new typed fields; the rest of the AC is unchanged.
+        let body = "\
+:::acceptance-criterion{status=unmet requiredKinds=manual,e2e}\n\
+The view baseline holds.\n\
+::verification{kind=manual outcome=fail scope=view observedAtMerkle=ABC ref=urn:atomic:change:99 observation=\"caught by hand\"}\n\
+:::";
+        let node = lift_intent(&fm(), body).unwrap();
+        let ac = &node.has_acceptance_criterion[0];
+
+        assert_eq!(
+            ac.required_kinds,
+            vec!["manual".to_string(), "e2e".to_string()]
+        );
+        assert_eq!(ac.verifications.len(), 1);
+        let vr = &ac.verifications[0];
+        assert_eq!(vr.type_, "VerificationRecord");
+        assert_eq!(vr.kind, "manual");
+        assert_eq!(vr.outcome, "fail");
+        assert_eq!(vr.scope, "view");
+        assert_eq!(vr.observed_at_merkle, "ABC");
+        assert_eq!(vr.reference.as_deref(), Some("urn:atomic:change:99"));
+        assert_eq!(vr.observation.as_deref(), Some("caught by hand"));
     }
 
     #[test]
@@ -498,6 +672,17 @@ First criterion.\n:::\n\n\
         // No @type/@id emitted when the directive carries no #id.
         assert!(node.depends_on[0].type_.is_none());
         assert!(node.depends_on[0].id.is_none());
+    }
+
+    #[test]
+    fn lifts_ref_remediates() {
+        // `remediates` is an intent→intent ref carried on the same `:::ref` leaf
+        // as `blockedBy`, lifted into `depends_on` with edge="remediates".
+        let body = ":::ref{to=urn:atomic:intent:xyz edge=remediates}\n:::";
+        let node = lift_intent(&fm(), body).unwrap();
+        assert_eq!(node.depends_on.len(), 1);
+        assert_eq!(node.depends_on[0].to, "urn:atomic:intent:xyz");
+        assert_eq!(node.depends_on[0].edge, "remediates");
     }
 
     #[test]
