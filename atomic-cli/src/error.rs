@@ -252,6 +252,19 @@ pub enum CliError {
         description: String,
     },
 
+    /// A file still carries unresolved conflict markers.
+    ///
+    /// `record` refuses these by default so an unresolved merge is not
+    /// baked into history. This is an expected, user-fixable outcome of
+    /// the documented merge workflow — not a bug.
+    #[error("{path} still contains conflict markers at line {line}")]
+    ConflictMarkers {
+        /// Path of the file that still carries markers.
+        path: String,
+        /// 1-based line of the first marker.
+        line: u32,
+    },
+
     // Identity Errors
     /// The specified identity doesn't exist.
     ///
@@ -469,6 +482,7 @@ impl CliError {
                 | Self::AmbiguousHash { .. }
                 | Self::MissingDependency { .. }
                 | Self::Conflict { .. }
+                | Self::ConflictMarkers { .. }
                 | Self::IdentityNotFound(_)
                 | Self::IdentityAlreadyExists(_)
                 | Self::RemoteNotFound { .. }
@@ -561,6 +575,9 @@ impl CliError {
             Self::IdentityAlreadyExists(_) => {
                 Some("Choose a different name, or use 'atomic identity show <name>' to view the existing identity.")
             }
+            Self::ConflictMarkers { .. } => Some(
+                "Edit the file to remove the '>>>>>>>' / '=======' / '<<<<<<<' lines and keep the content you want, then record again. Run 'atomic conflicts' to list every conflict, or pass '--allow-conflict-markers' if the markers are legitimate content.",
+            ),
             Self::Cancelled => None,
             Self::InvalidArgument { .. } => {
                 Some("Run 'atomic <command> --help' for usage information.")
@@ -617,6 +634,7 @@ impl CliError {
             | Self::AmbiguousHash { .. }
             | Self::MissingDependency { .. }
             | Self::Conflict { .. }
+            | Self::ConflictMarkers { .. }
             | Self::IdentityNotFound(_)
             | Self::IdentityAlreadyExists(_) => 3,
 

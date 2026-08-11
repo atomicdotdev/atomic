@@ -70,6 +70,16 @@ impl Command for Record {
                     path: PathBuf::from(path),
                 }
             }
+            // Refusing to bake an unresolved merge into history is the
+            // documented behavior, not a bug — keep it out of the
+            // Internal bucket so it neither tells the user to file an
+            // issue nor exits 128.
+            atomic_repository::record::RecordError::ConflictMarkersPresent { path, line } => {
+                CliError::ConflictMarkers { path, line }
+            }
+            atomic_repository::record::RecordError::UnresolvedConflicts => CliError::Conflict {
+                description: "the working copy has unresolved conflicts".to_string(),
+            },
             other => CliError::Internal(anyhow::anyhow!("{}", other)),
         })?;
 
