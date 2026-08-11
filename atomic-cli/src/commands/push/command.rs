@@ -11,7 +11,6 @@ use clap::Parser;
 
 use atomic_core::types::{Base32, Hash};
 use atomic_remote::{HttpRemote, HttpRemoteConfig};
-use atomic_repository::history::HistoryOptions;
 use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, format_hash, Command};
@@ -359,10 +358,16 @@ impl Push {
         })?;
         finish_success(&spinner, "Got remote state");
 
-        // Get local history
+        // Get the target view's full effective change set in dependency
+        // order. For a draft view this includes the changes inherited from
+        // its shared base, not just the draft's own delta — the remote view
+        // is flattened (shared) and needs the complete graph. Changes the
+        // remote already has are skipped by the delta/adopt logic below, so
+        // re-including the base is idempotent. Using `local_view` (not the
+        // current view) also ensures `--to-view` pushes the right view.
         let spinner = create_spinner("Loading local history...");
         let local_entries = repo
-            .log(HistoryOptions::default())
+            .effective_history(Some(&local_view))
             .map_err(CliError::Repository)?;
         finish_success(
             &spinner,

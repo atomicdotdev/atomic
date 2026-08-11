@@ -112,13 +112,15 @@ pub struct Pull {
 
     /// Local view to pull into.
     ///
-    /// If not specified, uses the current view.
+    /// If not specified, defaults to the remote view being pulled
+    /// (`--from-view`), which itself defaults to the current view. The view
+    /// is created automatically if it does not already exist locally.
     #[arg(long = "to-view")]
     pub to_view: Option<String>,
 
     /// Remote view to pull from.
     ///
-    /// If not specified, uses the same name as the local view.
+    /// If not specified, uses the current view.
     #[arg(long = "from-view")]
     pub from_view: Option<String>,
 
@@ -278,22 +280,25 @@ impl Pull {
         }
     }
 
-    /// Get the local view name to pull into.
-    ///
-    /// Returns the explicitly specified view or the repository's current view.
-    fn get_local_view(&self, repo: &Repository) -> String {
-        self.to_view
-            .clone()
-            .unwrap_or_else(|| repo.current_view().to_string())
-    }
-
     /// Get the remote view name to pull from.
     ///
-    /// Returns the explicitly specified view or defaults to the local view name.
-    fn get_remote_view(&self, local_view: &str) -> String {
+    /// Returns the explicitly specified `--from-view`, or the current view
+    /// when omitted.
+    fn get_remote_view(&self, current_view: &str) -> String {
         self.from_view
             .clone()
-            .unwrap_or_else(|| local_view.to_string())
+            .unwrap_or_else(|| current_view.to_string())
+    }
+
+    /// Get the local view name to pull into.
+    ///
+    /// Returns the explicitly specified `--to-view`, or defaults to the
+    /// remote view being pulled — so `atomic pull --from-view X` pulls into
+    /// a local view named `X`.
+    fn get_local_view(&self, remote_view: &str) -> String {
+        self.to_view
+            .clone()
+            .unwrap_or_else(|| remote_view.to_string())
     }
 
     /// Build the HTTP remote configuration.
@@ -380,14 +385,31 @@ impl Pull {
     async fn run_async(&self) -> CliResult<()> {
         // Find and open repository
         let repo_root = find_repository_root()?;
-        let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let mut repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
 
         // Resolve remote name, URL, and identity hint
         let (remote_name, remote_url, identity_hint) = self.resolve_remote_url(&repo)?;
 
-        // Determine views
-        let local_view = self.get_local_view(&repo);
-        let remote_view = self.get_remote_view(&local_view);
+        // Determine views. The remote view defaults to the current view; the
+        // local view defaults to the remote view being pulled, so
+        // `atomic pull --from-view X` pulls into a local view named `X`.
+        let remote_view = self.get_remote_view(repo.current_view());
+        let local_view = self.get_local_view(&remote_view);
+
+        // Ensure the local target view exists. When pulling a view that is
+        // not present locally (a teammate's view, or a `--to-view` naming a
+        // fresh view), create it so downloaded changes have somewhere to go
+        // instead of failing to apply with "View not found". A dry run must
+        // not mutate the repository, so it only records the view's absence.
+        let mut local_view_exists = repo
+            .view_exists(&local_view)
+            .map_err(CliError::Repository)?;
+        if !local_view_exists && !self.dry_run {
+            repo.create_shared_view(&local_view)
+                .map_err(CliError::Repository)?;
+            local_view_exists = true;
+            print_info(&format!("Created local view '{}'", local_view));
+        }
 
         // Print header
         println!(
@@ -430,11 +452,16 @@ impl Pull {
             &format!("Got {} remote changes", remote_entries.len()),
         );
 
-        // Get local history
+        // Get local history for the target view. A freshly created view (or,
+        // under --dry-run, one that does not exist yet) has no local changes,
+        // so every remote change is treated as missing.
         let spinner = create_spinner("Loading local history...");
-        let local_entries = repo
-            .log(HistoryOptions::default())
-            .map_err(CliError::Repository)?;
+        let local_entries = if local_view_exists {
+            repo.log(HistoryOptions::new().view(&local_view))
+                .map_err(CliError::Repository)?
+        } else {
+            Vec::new()
+        };
         finish_success(
             &spinner,
             &format!("Loaded {} local changes", local_entries.len()),
@@ -670,26 +697,39 @@ impl Pull {
             }
         }
 
-        // Materialize the working copy so on-disk files reflect the new state
+        // Materialize the working copy so on-disk files reflect the new
+        // state — but only when the pulled view is the current view. Pulling
+        // into a different view updates that view's change log without
+        // disturbing the working copy; the user switches to it to see the
+        // files.
         let mut materialize_failed = false;
         if stats.has_applied() {
-            let mat_spinner = create_spinner("Updating working copy...");
-            match repo.materialize() {
-                Ok(result) => {
-                    finish_success(
-                        &mat_spinner,
-                        &format!("{} files updated", result.files_written),
-                    );
+            if local_view == repo.current_view() {
+                let mat_spinner = create_spinner("Updating working copy...");
+                match repo.materialize() {
+                    Ok(result) => {
+                        finish_success(
+                            &mat_spinner,
+                            &format!("{} files updated", result.files_written),
+                        );
+                    }
+                    Err(e) => {
+                        materialize_failed = true;
+                        finish_error(&mat_spinner, "Failed to update working copy");
+                        print_warning(&format!(
+                            "Applied {} but failed to update working copy: {}",
+                            format_count(stats.changes_applied, "change"),
+                            e
+                        ));
+                    }
                 }
-                Err(e) => {
-                    materialize_failed = true;
-                    finish_error(&mat_spinner, "Failed to update working copy");
-                    print_warning(&format!(
-                        "Applied {} but failed to update working copy: {}",
-                        format_count(stats.changes_applied, "change"),
-                        e
-                    ));
-                }
+            } else {
+                print_hint(&format!(
+                    "Applied {} to view '{}'. Run 'atomic view switch {}' to check it out.",
+                    format_count(stats.changes_applied, "change"),
+                    local_view,
+                    local_view
+                ));
             }
         }
 
@@ -991,11 +1031,25 @@ mod tests {
         assert_eq!(pull.get_remote_view("dev"), "production");
     }
 
-    /// Test get_remote_view defaults to local view name.
+    /// Test get_remote_view defaults to the current view name.
     #[test]
     fn test_get_remote_view_default() {
         let pull = Pull::new();
         assert_eq!(pull.get_remote_view("feature"), "feature");
+    }
+
+    /// Test get_local_view with an explicit --to-view.
+    #[test]
+    fn test_get_local_view_explicit() {
+        let pull = Pull::new().with_to_view("staging");
+        assert_eq!(pull.get_local_view("orange"), "staging");
+    }
+
+    /// Test get_local_view defaults to the remote view being pulled.
+    #[test]
+    fn test_get_local_view_default() {
+        let pull = Pull::new();
+        assert_eq!(pull.get_local_view("orange"), "orange");
     }
 
     /// Test build_remote_config with default settings.

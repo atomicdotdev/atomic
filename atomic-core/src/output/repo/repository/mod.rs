@@ -36,6 +36,9 @@ pub struct MaterializeResult {
     pub files_written: usize,
     /// Number of files skipped (due to mtime or prefix filter).
     pub files_skipped: usize,
+    /// Number of stale on-disk files removed because their content is fully
+    /// deleted on the materialized view.
+    pub files_deleted: usize,
     /// Number of directories created.
     pub directories_created: usize,
     /// Total bytes written across all files.

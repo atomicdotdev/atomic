@@ -261,6 +261,58 @@ impl ViewState {
     }
 }
 
+/// The kind of a persisted conflict, mirroring the output layer's
+/// `FileConflictType` in a storage-stable form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum StoredConflictKind {
+    /// Ambiguous ordering of content (concurrent insert at one position).
+    Order,
+    /// Cyclic conflict (an SCC with more than one vertex).
+    Cyclic,
+    /// Deleted content that still has live connections.
+    Zombie,
+    /// Two changes assigned different names to the same path.
+    Name,
+}
+
+impl std::fmt::Display for StoredConflictKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Order => write!(f, "order"),
+            Self::Cyclic => write!(f, "cyclic"),
+            Self::Zombie => write!(f, "zombie"),
+            Self::Name => write!(f, "name"),
+        }
+    }
+}
+
+/// A conflict persisted in the `CONFLICTS` table for one file on one view.
+///
+/// Captured from the materialization result so the repository can report
+/// conflicted files (`atomic status`) and refuse to `record` over markers
+/// without re-running a full materialize.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredConflict {
+    /// The kind of conflict.
+    pub kind: StoredConflictKind,
+    /// The file's path at detection time (for display).
+    pub path: String,
+    /// 1-based line where the conflict region begins, if known.
+    pub line: Option<u32>,
+    /// Base32 hashes of the changes involved.
+    pub sides: Vec<String>,
+}
+
+impl StoredConflict {
+    /// A short, human-readable summary for `atomic status` detail output.
+    pub fn summary(&self) -> String {
+        match self.line {
+            Some(line) => format!("{} conflict at line {}", self.kind, line),
+            None => format!("{} conflict", self.kind),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ViewTxnT — read-only view operations
 // ---------------------------------------------------------------------------
@@ -364,6 +416,22 @@ pub trait ViewTxnT: GraphTxnT {
         }
         Ok(children)
     }
+
+    /// Read the persisted conflicts for a file (`inode`) on a view.
+    ///
+    /// Returns an empty vec if the file has no recorded conflicts.
+    fn get_conflicts(&self, view_id: u64, inode: u64)
+        -> Result<Vec<StoredConflict>, PristineError>;
+
+    /// Iterate all persisted conflicts on a view.
+    ///
+    /// Returns `(inode, conflicts)` pairs for every file that has recorded
+    /// conflict state on this view.
+    #[allow(clippy::type_complexity)]
+    fn iter_conflicts(
+        &self,
+        view_id: u64,
+    ) -> Result<Vec<(u64, Vec<StoredConflict>)>, PristineError>;
 
     /// Get a view by name.
     fn get_view(&self, name: &str) -> Result<Option<ViewState>, PristineError>;

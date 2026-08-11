@@ -14,6 +14,7 @@ impl Record {
             algorithm: "myers".to_string(),
             dry_run: false,
             skip_binary: false,
+            allow_conflict_markers: false,
             max_size: None,
             ai_assisted: false,
             ai_provider: None,

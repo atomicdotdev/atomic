@@ -152,6 +152,12 @@ where
     // Track zombie state
     let mut in_zombie: Option<usize> = None;
 
+    // Debug-only guard: each vertex's content must be emitted at most once.
+    // Emitting a vertex twice is the silent-duplication signature (e.g. a
+    // conflict tail written once per side). Zero cost in release builds.
+    #[cfg(debug_assertions)]
+    let mut emitted_content: std::collections::HashSet<VertexId> = std::collections::HashSet::new();
+
     // Process SCCs in reverse order (Tarjan produces reverse topological order,
     // so we iterate in reverse to get forward topological order for correct output)
     for scc in order.sccs.iter().rev() {
@@ -228,6 +234,13 @@ where
             if vertex_len == 0 {
                 continue;
             }
+
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                emitted_content.insert(vertex_id),
+                "vertex {:?} content emitted more than once (duplication bug)",
+                vertex_id
+            );
 
             // Output the node content
             let get_contents = |buf: &mut [u8]| -> Result<(), std::io::Error> {
@@ -526,6 +539,12 @@ where
     // Track which fork-conflict vertices have already been emitted.
     let mut fork_emitted: std::collections::HashSet<VertexId> = std::collections::HashSet::new();
 
+    // Debug-only guard: each vertex's content must be emitted at most once
+    // across the resolved/fork/normal paths. Emitting a vertex twice is the
+    // silent-duplication signature. Zero cost in release builds.
+    #[cfg(debug_assertions)]
+    let mut emitted_content: std::collections::HashSet<VertexId> = std::collections::HashSet::new();
+
     for scc in order.sccs.iter().rev() {
         if scc.is_empty() {
             continue;
@@ -608,6 +627,13 @@ where
                             .map_err(OutputError::io)?;
                     }
 
+                    #[cfg(debug_assertions)]
+                    debug_assert!(
+                        emitted_content.insert(child_vid),
+                        "vertex {:?} content emitted more than once (fork duplication bug)",
+                        child_vid
+                    );
+
                     if let Some(vertex_data) = graph.try_get_vertex(child_vid) {
                         let node = vertex_data.node;
                         let vertex_len = node.end.get() - node.start.get();
@@ -645,6 +671,13 @@ where
             if resolved.should_skip(vertex_id) {
                 continue;
             }
+
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                emitted_content.insert(vertex_id),
+                "vertex {:?} content emitted more than once (duplication bug)",
+                vertex_id
+            );
 
             let vertex_data = match graph.try_get_vertex(vertex_id) {
                 Some(v) => v,

@@ -539,13 +539,27 @@ where
         }
     }
 
-    // Fallback: whole-file deletion. `delete_all_content` already does the
-    // thorough SCC-aware search, so no further fallback is needed here.
+    // Whole-file deletion (empty `deleted_lines`, or a targeted range we
+    // could not resolve). `delete_all_content` does the thorough SCC-aware
+    // search and marks every content vertex deleted.
+    //
+    // Emit `GraphOp::FileDel` — not a bare `GraphOp::Edit` — so the
+    // delete-INTENT travels with the change itself. The tree-maintenance
+    // layers (`collect_tree_ops`, `insert_change`, `write_recorded`) already
+    // understand FileDel and clean up TREE/INODES for it; an Edit-based
+    // deletion only worked at record time via the out-of-band
+    // `deleted_files()` list, which does not exist when the change is later
+    // INSERTED into another view — leaving the deleted file tracked and its
+    // stale content on disk (docs/MERGE-CONFLICT-RUBRIC.md §6.5). Graph
+    // application is unchanged: FileDel yields the same single EdgeUpdate
+    // atom. A truncate-to-empty keeps the Edit representation, so the two
+    // remain distinguishable.
     let deletion = delete_all_content(ctx, inode_pos)?;
 
-    Ok(vec![GraphOp::Edit {
-        change: Atom::EdgeUpdate(deletion),
-        local,
+    Ok(vec![GraphOp::FileDel {
+        del: deletion,
+        contents: None,
+        path: local.path.clone(),
         encoding,
     }])
 }
@@ -722,16 +736,23 @@ where
 // Graph vertex / edge helpers
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Collect content vertices for a file in **graph traversal order**.
+/// Collect content vertices for a file in **materialized file order**.
 ///
-/// Starts at the inode vertex and walks forward BLOCK edges, producing
-/// vertices in the order they appear in the file.  This is the only
-/// correct ordering when vertices come from multiple changes — sorting
-/// by `start` would interleave vertices from different changes whose
-/// position spaces are independent.
+/// Uses the same `retrieve_graph` + `compute_order` pipeline that renders
+/// file content (`output_graph_content`): SCCs are emitted in reverse
+/// Tarjan order, which is exactly the order the vertices' bytes appear in
+/// the materialized file.  The diff whose hunks we are globalizing was
+/// computed against that materialization, so this is the only traversal
+/// whose indices are guaranteed to line up with the hunks' old-file line
+/// numbers.
 ///
-/// Skips DELETED edges and PSEUDO edges.  Stops at empty vertices that
-/// aren't the inode.
+/// A linear child walk cannot be used here: targeted middle insertions
+/// leave diamonds in the additive graph (the old `pred → succ` edge stays
+/// alive next to the new `pred → inserted → succ` chain), and a vertex
+/// whose direct successors are all dead can carry several dead chains
+/// with live content hanging off any of them.  A single-successor walk
+/// picks one chain and silently drops the others, and an index mapping
+/// that is off by even one line deletes the wrong vertices.
 fn collect_sorted_content_vertices<T>(
     txn: &T,
     inode: Inode,
@@ -740,196 +761,33 @@ fn collect_sorted_content_vertices<T>(
 where
     T: GraphTxnT + InodeGraphOps,
 {
-    use crate::types::EdgeFlags;
-    use std::collections::HashSet;
-
-    if !txn.inode_graph_needs_view_filter() && txn.inode_graph_is_populated(inode).unwrap_or(false)
-    {
-        let step = std::time::Instant::now();
-        let ordered = collect_sorted_content_vertices_inode_ordered(txn, inode, inode_pos);
-        if !ordered.is_empty() {
-            let elapsed_ms = step.elapsed().as_millis();
-            if elapsed_ms > 50 {
-                log::warn!(
-                    "collect_sorted_content_vertices: inode fast path took {}ms (inode={:?}, vertices={})",
-                    elapsed_ms,
-                    inode,
-                    ordered.len(),
-                );
-            }
-            return Ok(ordered);
-        }
-    }
-    let mut ordered: Vec<GraphNode<NodeId>> = Vec::new();
-    let mut visited: HashSet<GraphNode<NodeId>> = HashSet::new();
-    let mut current = inode_pos.inode_node();
-
-    // Helper: is `node` dead in this view?
-    //
-    // We check parent edges through the same (view-filtered) `txn`.
-    // Any visible `BLOCK|DELETED` parent means a change inside the
-    // view deleted this vertex — it should be skipped during the
-    // line-order walk because it's no longer a live line.
-    let is_dead_in_view = |node: GraphNode<NodeId>| -> bool {
-        let parents = match txn.iter_adjacent(node, EdgeFlags::PARENT, EdgeFlags::all()) {
-            Ok(it) => it,
-            Err(_) => return false,
-        };
-        for e in parents {
-            let e = match e {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let flags = e.flag();
-            if flags.contains(EdgeFlags::PARENT) && flags.contains(EdgeFlags::DELETED) {
-                return true;
-            }
-        }
-        false
+    // `deletions_final` gives the retrieval the same aliveness semantics
+    // as the view-filtered materialization: any deletion the transaction
+    // can see kills its vertex, and live successors behind dead chains
+    // are re-attached in file order. Without it, the additive edge model
+    // keeps replaced vertices "alive" as zombies, which would occupy
+    // line indices the file content doesn't have.
+    let options = RetrieveOptions::new().deletions_final(true);
+    let mut result = match retrieve_graph(txn, inode_pos, options) {
+        Ok(r) => r,
+        Err(_) => return Ok(Vec::new()),
     };
+    let order = crate::output::alive::compute_order(&mut result.graph);
 
-    fn alive_reaches<T: GraphTxnT + InodeGraphOps>(
-        txn: &T,
-        inode: Inode,
-        start: GraphNode<NodeId>,
-        target: GraphNode<NodeId>,
-        is_dead_in_view: &dyn Fn(GraphNode<NodeId>) -> bool,
-    ) -> bool {
-        if start == target {
-            return true;
-        }
-
-        let mut stack = vec![start];
-        let mut seen = std::collections::HashSet::new();
-
-        while let Some(current) = stack.pop() {
-            if !seen.insert(current) {
-                continue;
-            }
-
-            let edges = match txn.iter_forward(current, false) {
-                Ok(edges) => edges,
-                Err(_) => continue,
-            };
-
-            for edge in edges {
-                if edge.kind.is_pseudo() {
-                    continue;
-                }
-                let dest = txn
-                    .find_block_in_inode(inode, edge.dest)
-                    .ok()
-                    .flatten()
-                    .or_else(|| txn.find_block(edge.dest).ok());
-                let Some(dest) = dest else {
-                    continue;
-                };
-                if is_dead_in_view(dest) {
-                    continue;
-                }
-                if dest == target {
-                    return true;
-                }
-                stack.push(dest);
-            }
-        }
-
-        false
-    }
-
-    loop {
-        if !visited.insert(current) {
-            break;
-        }
-
-        // Find the next alive BLOCK child of `current`.
-        let min_flag = EdgeFlags::BLOCK;
-        let max_flag = EdgeFlags::BLOCK | EdgeFlags::FOLDER;
-
-        let adj = match txn.iter_adjacent(current, min_flag, max_flag) {
-            Ok(a) => a,
-            Err(_) => break,
-        };
-
-        // Prefer alive destinations. When there are multiple alive children,
-        // choose the one that reaches another alive child downstream. This
-        // preserves linear order for cases like:
-        //   console.log(...) -> metrics -> }    and
-        //   console.log(...) -> }
-        // where the first encountered child may be the downstream `}` rather
-        // than the upstream `metrics` line we need to index next.
-        let mut alive_candidates: Vec<GraphNode<NodeId>> = Vec::new();
-        let mut next_dead: Option<GraphNode<NodeId>> = None;
-        for edge_result in adj {
-            let edge = match edge_result {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let flags = edge.flag();
-            if flags.contains(EdgeFlags::PARENT)
-                || flags.contains(EdgeFlags::DELETED)
-                || flags.contains(EdgeFlags::PSEUDO)
-            {
-                continue;
-            }
-            let dest = txn
-                .find_block_in_inode(inode, edge.dest())
-                .ok()
-                .flatten()
-                .or_else(|| txn.find_block(edge.dest()).ok());
-            let Some(dest) = dest else {
+    let mut ordered: Vec<GraphNode<NodeId>> = Vec::new();
+    for scc in order.sccs.iter().rev() {
+        for &vid in scc {
+            let Some(vertex) = result.graph.try_get_vertex(vid) else {
                 continue;
             };
-            if visited.contains(&dest) {
+            let node = vertex.node;
+            // Skip structural vertices: the virtual root, the inode marker,
+            // and empty vertices — none of them contribute output lines.
+            if node.change.is_root() || node.start == node.end {
                 continue;
             }
-            if !is_dead_in_view(dest) {
-                alive_candidates.push(dest);
-            } else if next_dead.is_none() {
-                next_dead = Some(dest);
-            }
+            ordered.push(node);
         }
-
-        let next_alive = if alive_candidates.len() <= 1 {
-            alive_candidates.into_iter().next()
-        } else {
-            alive_candidates
-                .iter()
-                .copied()
-                .find(|candidate| {
-                    let reaches_other = alive_candidates.iter().copied().any(|other| {
-                        other != *candidate
-                            && alive_reaches(txn, inode, *candidate, other, &is_dead_in_view)
-                    });
-                    let reached_by_other = alive_candidates.iter().copied().any(|other| {
-                        other != *candidate
-                            && alive_reaches(txn, inode, other, *candidate, &is_dead_in_view)
-                    });
-                    reaches_other && !reached_by_other
-                })
-                .or_else(|| {
-                    alive_candidates.iter().copied().find(|candidate| {
-                        alive_candidates.iter().copied().any(|other| {
-                            other != *candidate
-                                && alive_reaches(txn, inode, *candidate, other, &is_dead_in_view)
-                        })
-                    })
-                })
-                .or_else(|| alive_candidates.into_iter().next())
-        };
-
-        let dest = match next_alive.or(next_dead) {
-            Some(d) => d,
-            None => break,
-        };
-
-        let is_inode_marker = dest.start == dest.end && dest.start == inode_pos.pos;
-        let is_alive = !is_dead_in_view(dest);
-        if is_alive && !is_inode_marker && !dest.change.is_root() && dest.start != dest.end {
-            ordered.push(dest);
-        }
-
-        current = dest;
     }
 
     log::debug!(
@@ -949,214 +807,7 @@ where
         eprintln!("  total content bytes: {}", total);
     }
 
-    let _ = inode;
     Ok(ordered)
-}
-
-fn collect_sorted_content_vertices_inode_ordered<T>(
-    txn: &T,
-    inode: Inode,
-    inode_pos: Position<NodeId>,
-) -> Vec<GraphNode<NodeId>>
-where
-    T: GraphTxnT + InodeGraphOps,
-{
-    use crate::types::EdgeFlags;
-    use std::collections::HashSet;
-
-    let mut ordered: Vec<GraphNode<NodeId>> = Vec::new();
-    let mut visited: HashSet<GraphNode<NodeId>> = HashSet::new();
-    let mut current = inode_pos.inode_node();
-
-    let is_dead_in_inode = |node: GraphNode<NodeId>| -> bool {
-        let mut parents = match txn.init_inode_adj(
-            node_inode_or(inode),
-            node,
-            EdgeFlags::PARENT,
-            EdgeFlags::all(),
-        ) {
-            Ok(adj) => adj,
-            Err(_) => return false,
-        };
-        while let Some(edge) = txn.next_inode_adj(&mut parents) {
-            let Ok(edge) = edge else {
-                continue;
-            };
-            let flags = edge.flag();
-            if flags.contains(EdgeFlags::PARENT) && flags.contains(EdgeFlags::DELETED) {
-                return true;
-            }
-        }
-        false
-    };
-
-    fn alive_reaches_inode<T: GraphTxnT + InodeGraphOps>(
-        txn: &T,
-        inode: Inode,
-        start: GraphNode<NodeId>,
-        target: GraphNode<NodeId>,
-        is_dead: &dyn Fn(GraphNode<NodeId>) -> bool,
-    ) -> bool {
-        if start == target {
-            return true;
-        }
-
-        let mut stack = vec![start];
-        let mut seen = std::collections::HashSet::new();
-
-        while let Some(current) = stack.pop() {
-            if !seen.insert(current) {
-                continue;
-            }
-
-            let mut adj = match txn.init_inode_adj(
-                current_inode_or(inode),
-                current,
-                EdgeFlags::BLOCK,
-                EdgeFlags::all(),
-            ) {
-                Ok(adj) => adj,
-                Err(_) => continue,
-            };
-
-            while let Some(edge) = txn.next_inode_adj(&mut adj) {
-                let Ok(edge) = edge else {
-                    continue;
-                };
-                let flags = edge.flag();
-                if flags.contains(EdgeFlags::PARENT)
-                    || flags.contains(EdgeFlags::DELETED)
-                    || flags.contains(EdgeFlags::PSEUDO)
-                {
-                    continue;
-                }
-
-                let dest = txn
-                    .find_block_in_inode(inode, edge.dest())
-                    .ok()
-                    .flatten()
-                    .or_else(|| txn.find_block(edge.dest()).ok());
-                let Some(dest) = dest else {
-                    continue;
-                };
-                if is_dead(dest) {
-                    continue;
-                }
-                if dest == target {
-                    return true;
-                }
-                stack.push(dest);
-            }
-        }
-
-        false
-    }
-
-    loop {
-        if !visited.insert(current) {
-            break;
-        }
-
-        let mut adj = match txn.init_inode_adj(
-            inode,
-            current,
-            EdgeFlags::BLOCK,
-            EdgeFlags::BLOCK | EdgeFlags::FOLDER,
-        ) {
-            Ok(adj) => adj,
-            Err(_) => break,
-        };
-
-        let mut alive_candidates: Vec<GraphNode<NodeId>> = Vec::new();
-        let mut next_dead: Option<GraphNode<NodeId>> = None;
-
-        while let Some(edge) = txn.next_inode_adj(&mut adj) {
-            let Ok(edge) = edge else {
-                continue;
-            };
-            let flags = edge.flag();
-            if flags.contains(EdgeFlags::PARENT)
-                || flags.contains(EdgeFlags::DELETED)
-                || flags.contains(EdgeFlags::PSEUDO)
-            {
-                continue;
-            }
-
-            let dest = txn
-                .find_block_in_inode(inode, edge.dest())
-                .ok()
-                .flatten()
-                .or_else(|| txn.find_block(edge.dest()).ok());
-            let Some(dest) = dest else {
-                continue;
-            };
-            if visited.contains(&dest) {
-                continue;
-            }
-            if !is_dead_in_inode(dest) {
-                alive_candidates.push(dest);
-            } else if next_dead.is_none() {
-                next_dead = Some(dest);
-            }
-        }
-
-        let next_alive = if alive_candidates.len() <= 1 {
-            alive_candidates.into_iter().next()
-        } else {
-            alive_candidates
-                .iter()
-                .copied()
-                .find(|candidate| {
-                    let reaches_other = alive_candidates.iter().copied().any(|other| {
-                        other != *candidate
-                            && alive_reaches_inode(txn, inode, *candidate, other, &is_dead_in_inode)
-                    });
-                    let reached_by_other = alive_candidates.iter().copied().any(|other| {
-                        other != *candidate
-                            && alive_reaches_inode(txn, inode, other, *candidate, &is_dead_in_inode)
-                    });
-                    reaches_other && !reached_by_other
-                })
-                .or_else(|| {
-                    alive_candidates.iter().copied().find(|candidate| {
-                        alive_candidates.iter().copied().any(|other| {
-                            other != *candidate
-                                && alive_reaches_inode(
-                                    txn,
-                                    inode,
-                                    *candidate,
-                                    other,
-                                    &is_dead_in_inode,
-                                )
-                        })
-                    })
-                })
-                .or_else(|| alive_candidates.into_iter().next())
-        };
-
-        let dest = match next_alive.or(next_dead) {
-            Some(dest) => dest,
-            None => break,
-        };
-
-        let is_inode_marker = dest.start == dest.end && dest.start == inode_pos.pos;
-        let is_alive = !is_dead_in_inode(dest);
-        if is_alive && !is_inode_marker && !dest.change.is_root() && dest.start != dest.end {
-            ordered.push(dest);
-        }
-
-        current = dest;
-    }
-
-    ordered
-}
-
-fn node_inode_or(inode: Inode) -> Inode {
-    inode
-}
-
-fn current_inode_or(inode: Inode) -> Inode {
-    inode
 }
 
 /// Retrieve every alive content vertex for a file.

@@ -156,7 +156,7 @@ pub use types::{RecordedFile, RecordingResult, RecordingStats};
 
 use crate::change::{Encoding, FileOps, Local};
 use crate::crdt::{BranchId, TrunkId};
-use crate::diff::{DiffOp, Line};
+use crate::diff::Line;
 use crate::output::WorkingCopyRead;
 use crate::types::NodeId;
 
@@ -309,13 +309,16 @@ pub fn record_deleted_file(
         recorded.set_position(position);
     }
 
-    // Create a deletion graph_op for the file.
-    // The actual line information would come from the pristine graph traversal
-    // when integrated with the full repository context. The deletion graph_op
-    // marks the file's content edges as deleted in the graph.
+    // Create a deletion graph_op for the whole file.
+    //
+    // An EMPTY `deleted_lines` signals a whole-file deletion: globalize_delete
+    // then skips its targeted (line-range) branch and marks EVERY content
+    // vertex deleted. The previous `vec![0]` placeholder made the targeted
+    // branch delete only the first line, so inserting the delete into another
+    // view left the file's tail alive (docs/MERGE-CONFLICT-RUBRIC.md §6.5).
     let local = Local::new(&detected.path, 1);
     let encoding = detected.encoding;
-    let graph_op = BuiltHunk::new_delete(local, encoding, vec![0], 0);
+    let graph_op = BuiltHunk::new_delete(local, encoding, Vec::new(), 0);
     recorded.add_hunk(graph_op);
 
     // Generate CRDT operations for the deletion
@@ -470,18 +473,29 @@ where
     // Handle binary files: compare_content returns is_binary=true with zero
     // diff_ops when either old or new content contains null bytes.  Since we
     // know the content differs (identical content returns early above), create
-    // a single Replace hunk that swaps the entire file content.  Without this,
-    // binary modifications are silently dropped (zero hunks → empty RecordedFile
-    // → the graph never receives the new content, and `atomic status` reports
-    // the file as modified forever).
+    // a single whole-file Replace hunk that swaps the entire file content.
+    // Without this, binary modifications are silently dropped (zero hunks →
+    // empty RecordedFile → the graph never receives the new content, and
+    // `atomic status` reports the file as modified forever).
+    //
+    // Route through the whole-file-replace path via the `vec![usize::MAX]`
+    // sentinel (identical to the `force_whole_file_replace` block above), NOT
+    // an empty `deleted_lines`.  Empty `deleted_lines` sends the hunk down
+    // `globalize_replace`'s PURE-INSERTION branch, which inserts the new bytes
+    // but never deletes the base — so a "replace" leaves the old content alive.
+    // For a single edit that is invisible (the new content shadows the old on
+    // this view), but under a concurrent merge the stale base leaks OUTSIDE the
+    // conflict markers (rubric A15). The sentinel forces
+    // `globalize_replace_whole_file` → `delete_all_content`, so the base is
+    // deleted and the replace is honest.
     if comparison.is_binary && old_content != &new_content[..] {
         let mut replace_hunk = BuiltHunk::new_replace_with_lines(
             Local::new(&detected.path, 1),
             Some(encoding),
-            Vec::new(), // no per-line deletion tracking for binary
-            0,          // old_start
-            0,          // new_start
-            1,          // new_len: treat entire binary blob as one unit
+            vec![usize::MAX], // sentinel → whole-file replace (deletes base)
+            0,                // old_start
+            0,                // new_start
+            Line::from_bytes(&new_content).len(),
         );
         replace_hunk.content_start = Some(0);
         replace_hunk.content_end = Some(new_content.len() as u64);
@@ -495,9 +509,7 @@ where
     let hunk_options = options.to_hunk_options().encoding(encoding);
     let mut builder = HunkBuilder::with_options(&detected.path, hunk_options);
 
-    let graph_diff_ops = rewrite_shifted_equals_for_graph(&comparison.diff_ops);
-
-    for op in &graph_diff_ops {
+    for op in &comparison.diff_ops {
         builder.process_diff_op(op);
     }
 
@@ -580,30 +592,6 @@ where
     recorded.set_content(new_content);
 
     Ok(recorded)
-}
-
-fn rewrite_shifted_equals_for_graph(diff_ops: &[DiffOp]) -> Vec<DiffOp> {
-    diff_ops
-        .iter()
-        .map(|op| match *op {
-            DiffOp::Equal {
-                old_pos,
-                new_pos,
-                len,
-                // Only rewrite unchanged lines that were pushed *down* by
-                // inserted content above them. When lines shift *up* due to
-                // deletions above, the delete path should reconnect the old
-                // suffix in place; forcing a Replace there duplicates the
-                // suffix as fresh content.
-            } if new_pos > old_pos && len > 0 => DiffOp::Replace {
-                old_pos,
-                old_len: len,
-                new_pos,
-                new_len: len,
-            },
-            _ => op.clone(),
-        })
-        .collect()
 }
 
 /// Build CRDT FileOps directly from git diff lines.

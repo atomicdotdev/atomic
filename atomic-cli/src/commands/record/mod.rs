@@ -175,6 +175,14 @@ pub struct Record {
     #[arg(long)]
     pub skip_binary: bool,
 
+    /// Record files even if they still contain conflict markers.
+    ///
+    /// By default `record` refuses a file whose content contains
+    /// `>>>>>>>`/`=======`/`<<<<<<<` markers, so an unresolved merge is not
+    /// baked into history. Use this flag when such lines are legitimate.
+    #[arg(long)]
+    pub allow_conflict_markers: bool,
+
     /// Maximum file size to record (in bytes).
     ///
     /// Files larger than this limit will be skipped or cause an error

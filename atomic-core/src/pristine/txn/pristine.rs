@@ -92,6 +92,7 @@ impl Pristine {
             write_txn.open_table(VIEWS)?;
             write_txn.open_table(VIEW_CHANGES)?;
             write_txn.open_table(REV_VIEW_CHANGES)?;
+            write_txn.open_table(CONFLICTS)?;
 
             // Tree tables
             write_txn.open_table(TREE)?;

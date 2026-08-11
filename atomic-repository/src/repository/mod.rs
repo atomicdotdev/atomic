@@ -118,6 +118,7 @@ mod vault_intent;
 mod vault_kg_enrich;
 mod vault_names;
 mod vault_triples;
+mod verify;
 pub use insert::{
     ImportLineIndexSeed, ImportLineIndexSeedLine, ImportWriteOutcome, ImportWriteTimings,
 };
@@ -134,6 +135,7 @@ pub use vault_intent::{
 };
 pub use vault_kg_enrich::KgEnrichStats;
 pub use vault_names::{derive_intent_prefix, generate_goal_name};
+pub use verify::{VerifyProblem, VerifyReport};
 
 #[cfg(test)]
 mod tests;
