@@ -62,6 +62,7 @@ use commands::{
     Clone,
     Command,
     Completions,
+    Conflicts,
     Diff,
     Doctor,
     Git,
@@ -223,6 +224,13 @@ enum Commands {
     ///
     /// Displays information about modified, added, deleted, and untracked files.
     Status(Status),
+
+    /// List files that are in a conflicted state.
+    ///
+    /// Shows each conflicted file on the current view with the conflict kind,
+    /// the line where it begins, and the changes that contend. A file is
+    /// listed only while its content still carries conflict markers.
+    Conflicts(Conflicts),
 
     /// Add files to be tracked.
     ///
@@ -951,6 +959,8 @@ fn main() {
         Commands::Init(init) => init.run(),
 
         Commands::Status(status) => status.run(),
+
+        Commands::Conflicts(conflicts) => conflicts.run(),
 
         Commands::Add(add) => add.run(),
 

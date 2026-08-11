@@ -9,7 +9,26 @@ use crate::types::{
 };
 
 use crate::pristine::error::{PristineError, PristineResult};
-use crate::pristine::traits::{ViewScope, ViewState};
+use crate::pristine::traits::{StoredConflict, ViewScope, ViewState};
+
+// Conflict Serialization
+
+/// Serialize a list of conflicts to bytes (JSON).
+///
+/// Conflict metadata is tiny and rare, so JSON via `serde_json` (already a
+/// dependency) is preferred over a hand-rolled binary format for robustness.
+pub fn serialize_conflicts(conflicts: &[StoredConflict]) -> PristineResult<Vec<u8>> {
+    serde_json::to_vec(conflicts).map_err(|e| PristineError::Serialization {
+        message: format!("failed to serialize conflicts: {e}"),
+    })
+}
+
+/// Deserialize bytes (JSON) to a list of conflicts.
+pub fn deserialize_conflicts(bytes: &[u8]) -> PristineResult<Vec<StoredConflict>> {
+    serde_json::from_slice(bytes).map_err(|e| PristineError::Serialization {
+        message: format!("failed to deserialize conflicts: {e}"),
+    })
+}
 
 // Edge Serialization
 

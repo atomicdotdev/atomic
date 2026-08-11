@@ -17,65 +17,9 @@
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
-
-# ── Local helpers (not in helpers.sh) ──────────────────────────────────────
-
-assert_no_conflict_markers() {
-    local desc="$1" path="$2"
-    if [[ ! -f "$path" ]]; then _fail "$desc" "file does not exist: $path"; return; fi
-    if grep -qE '>>>>>>|<<<<<<|=======' "$path" 2>/dev/null; then
-        _fail "$desc" "conflict markers found in $path. Content: $(cat "$path" | head -20)"
-    else
-        _pass "$desc"
-    fi
-}
-
-assert_file_contains() {
-    local desc="$1" path="$2" needle="$3"
-    if [[ ! -f "$path" ]]; then _fail "$desc" "file does not exist: $path"; return; fi
-    if grep -qF "$needle" "$path"; then _pass "$desc"
-    else _fail "$desc" "'$needle' not found in $path. Content: $(cat "$path" | head -10)"; fi
-}
-
-# Check for conflict markers — returns 0 if found, 1 if clean.
-has_conflict_markers() {
-    local path="$1"
-    grep -qE '>>>>>>|<<<<<<|=======' "$path" 2>/dev/null
-}
-
-# Assert that conflict markers are well-formed (both sides present).
-assert_well_formed_conflict() {
-    local desc="$1" path="$2"
-    if [[ ! -f "$path" ]]; then _fail "$desc" "file does not exist: $path"; return; fi
-    local has_open has_mid has_close
-    has_open=$(grep -cE '<<<<<<' "$path" 2>/dev/null || true)
-    has_mid=$(grep -cE '=======' "$path" 2>/dev/null || true)
-    has_close=$(grep -cE '>>>>>>' "$path" 2>/dev/null || true)
-    if [[ "$has_open" -gt 0 && "$has_mid" -gt 0 && "$has_close" -gt 0 ]]; then
-        _pass "$desc"
-    else
-        _fail "$desc" "malformed conflict: <<<<<<=$has_open, =======$has_mid, >>>>>>=$has_close in $path"
-    fi
-}
-
-# Snapshot a file's content for later comparison.
-snapshot_file() {
-    local path="$1"
-    if [[ -f "$path" ]]; then cat "$path"; else echo "__MISSING__"; fi
-}
-
-# Assert that a file's content is identical to a saved snapshot.
-assert_file_stable() {
-    local desc="$1" path="$2" expected_snapshot="$3"
-    if [[ ! -f "$path" ]]; then _fail "$desc" "file does not exist: $path"; return; fi
-    local actual
-    actual="$(cat "$path")"
-    if [[ "$actual" == "$expected_snapshot" ]]; then
-        _pass "$desc"
-    else
-        _fail "$desc" "content changed. Expected $(echo "$expected_snapshot" | wc -c | tr -d ' ') bytes, got $(echo "$actual" | wc -c | tr -d ' ') bytes"
-    fi
-}
+source "$HARNESS_DIR/merge_helpers.sh"  # assert_no_conflict_markers, assert_file_contains,
+                                        # has_conflict_markers, assert_well_formed_conflict,
+                                        # snapshot_file, assert_file_stable
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Case 1: Identical edits from two drafts — should deduplicate"

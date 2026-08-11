@@ -92,6 +92,18 @@ pub const VIEW_CHANGES: TableDefinition<&[u8; 16], u64> = TableDefinition::new("
 pub const REV_VIEW_CHANGES: TableDefinition<&[u8; 16], u64> =
     TableDefinition::new("rev_view_changes");
 
+/// Per-view conflict state: (view_id, inode) → serialized `Vec<StoredConflict>`
+///
+/// Key: 16 bytes encoding (view_id: u64, inode: u64) via [`encode_view_seq`].
+/// Value: bincode-serialized list of conflicts detected in that file on that
+/// view during the most recent materialization.
+///
+/// This makes conflict state a persistent, first-class fact the repository
+/// knows about, rather than something visible only as markers buried in file
+/// bytes. `atomic status` reads it to report conflicted files; `record`
+/// clears it when a file is recorded without markers.
+pub const CONFLICTS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("conflicts");
+
 // File Tree Tables
 
 /// File tree: path → inode

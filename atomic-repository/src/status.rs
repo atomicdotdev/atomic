@@ -482,6 +482,18 @@ impl RepositoryStatus {
         self.entries.push(entry);
     }
 
+    /// Add an entry, replacing any existing entry for the same path.
+    ///
+    /// Used to let a Conflicted entry supersede a Modified one so a file is
+    /// reported exactly once.
+    pub fn add_or_replace_entry(&mut self, entry: FileStatusEntry) {
+        if let Some(&i) = self.path_index.get(&entry.path) {
+            self.entries[i] = entry;
+        } else {
+            self.add_entry(entry);
+        }
+    }
+
     /// Get the status entry for a specific path.
     pub fn get(&self, path: &Path) -> Option<&FileStatusEntry> {
         self.path_index.get(path).map(|&i| &self.entries[i])

@@ -151,7 +151,7 @@ pub use storage_types::{
 // Protocol types
 pub use types::{
     ChangelistEntry, Node, NodeType, ParseChangelistError, ParseNodeTypeError, ParseStateError,
-    PullDelta, PushDelta, StateResponse,
+    PullDelta, PushDelta, RemoteViewInfo, StateResponse,
 };
 
 // Sync engine

@@ -145,6 +145,21 @@ pub enum RecordError {
     #[error("Unresolved conflicts in working copy")]
     UnresolvedConflicts,
 
+    /// A file still contains conflict markers.
+    ///
+    /// Recording would bake the markers into history. Resolve the conflict
+    /// (remove the markers) or pass `--allow-conflict-markers` to override.
+    #[error(
+        "{path} still contains conflict markers at line {line} \
+             (resolve the conflict, or pass --allow-conflict-markers to override)"
+    )]
+    ConflictMarkersPresent {
+        /// The file path.
+        path: String,
+        /// 1-based line of the first marker.
+        line: u32,
+    },
+
     /// Binary file exceeds size limit.
     #[error("File too large: {path} ({size} bytes, limit: {limit})")]
     FileTooLarge {

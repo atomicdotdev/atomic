@@ -39,80 +39,9 @@ source "$HARNESS_DIR/helpers.sh"
 # Helper: count occurrences of a string in a file
 # ═══════════════════════════════════════════════════════════════════════════
 
-count_occurrences() {
-    local file="$1"
-    local pattern="$2"
-    grep -c "$pattern" "$file" 2>/dev/null || echo "0"
-}
-
-# Helper: assert that a string appears exactly N times in a file
-assert_occurrence_count() {
-    local desc="$1"
-    local file="$2"
-    local pattern="$3"
-    local expected="$4"
-    if [[ ! -f "$file" ]]; then
-        _fail "$desc" "file does not exist: $file"
-        return
-    fi
-    local actual
-    actual="$(count_occurrences "$file" "$pattern")"
-    if [[ "$actual" -eq "$expected" ]]; then
-        _pass "$desc"
-    else
-        _fail "$desc" "expected '$pattern' to appear $expected time(s), got $actual"
-    fi
-}
-
-# Helper: assert file has at most N lines
-assert_max_lines() {
-    local desc="$1"
-    local file="$2"
-    local max="$3"
-    if [[ ! -f "$file" ]]; then
-        _fail "$desc" "file does not exist: $file"
-        return
-    fi
-    local count
-    count="$(wc -l < "$file" | tr -d ' ')"
-    if [[ "$count" -le "$max" ]]; then
-        _pass "$desc"
-    else
-        _fail "$desc" "file has $count lines, expected at most $max"
-    fi
-}
-
-# Helper: assert file content contains a substring
-assert_file_contains() {
-    local desc="$1"
-    local file="$2"
-    local needle="$3"
-    if [[ ! -f "$file" ]]; then
-        _fail "$desc" "file does not exist: $file"
-        return
-    fi
-    if grep -qF "$needle" "$file"; then
-        _pass "$desc"
-    else
-        _fail "$desc" "file does not contain '$needle'"
-    fi
-}
-
-# Helper: assert file content does NOT contain a substring
-assert_file_not_contains() {
-    local desc="$1"
-    local file="$2"
-    local needle="$3"
-    if [[ ! -f "$file" ]]; then
-        _pass "$desc"  # file doesn't exist, so it doesn't contain it
-        return
-    fi
-    if grep -qF "$needle" "$file"; then
-        _fail "$desc" "file should not contain '$needle' but does"
-    else
-        _pass "$desc"
-    fi
-}
+# Shared merge helpers (count_occurrences, assert_occurrence_count,
+# assert_max_lines, assert_file_contains, assert_file_not_contains).
+source "$HARNESS_DIR/merge_helpers.sh"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

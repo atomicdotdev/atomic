@@ -20,10 +20,12 @@ use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
 use crate::pristine::tables::{TAG_NAME_INDEX, TAG_RECORDS};
 use crate::pristine::traits::{
-    FileIndexEntry, FileIndexMetadata, GraphTxnT, TreeTxnT, ViewState, ViewTxnT,
+    FileIndexEntry, FileIndexMetadata, GraphTxnT, StoredConflict, TreeTxnT, ViewState, ViewTxnT,
 };
 
-use super::helpers::{deserialize_edge, deserialize_view_state, AdjIterator};
+use super::helpers::{
+    deserialize_conflicts, deserialize_edge, deserialize_view_state, AdjIterator,
+};
 
 /// Read-only transaction
 ///
@@ -47,6 +49,24 @@ impl ReadTxn {
         &self,
     ) -> PristineResult<redb::ReadOnlyMultimapTable<&'static [u8; 32], &'static [u8; 24]>> {
         Ok(self.txn.open_multimap_table(INODE_GRAPH)?)
+    }
+
+    /// Enumerate every `(inode, path)` pair in `REV_TREE`.
+    ///
+    /// Unlike [`TreeTxnT::iter_tree`], which walks the single-valued
+    /// `path -> inode` `TREE` index (so it hides every inode a later
+    /// same-path create overwrote), this walks the inode-keyed `REV_TREE`
+    /// and therefore exposes ALL inodes that ever claimed a path. Callers
+    /// use it to detect name conflicts: a path with two distinct inodes that
+    /// are both visible and alive under a view's change filter.
+    pub fn iter_rev_tree(&self) -> PristineResult<Vec<(Inode, String)>> {
+        let table = self.txn.open_table(REV_TREE)?;
+        let mut results = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            results.push((Inode::new(k.value()), v.value().to_string()));
+        }
+        Ok(results)
     }
 }
 
@@ -340,6 +360,31 @@ impl ViewTxnT for ReadTxn {
             names.push(k.value().to_string());
         }
         Ok(names)
+    }
+
+    fn get_conflicts(&self, view_id: u64, inode: u64) -> PristineResult<Vec<StoredConflict>> {
+        let table = self.txn.open_table(CONFLICTS)?;
+        let key = encode_view_seq(view_id, inode);
+        match table.get(&key)? {
+            Some(value) => deserialize_conflicts(value.value()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn iter_conflicts(&self, view_id: u64) -> PristineResult<Vec<(u64, Vec<StoredConflict>)>> {
+        let table = self.txn.open_table(CONFLICTS)?;
+        let start = encode_view_seq(view_id, 0);
+        let end = encode_view_seq(view_id, u64::MAX);
+        let mut out = Vec::new();
+        for entry in table.range::<&[u8; 16]>(&start..=&end)? {
+            let (key, value) = entry?;
+            let (_vid, inode) = decode_view_seq(key.value());
+            let conflicts = deserialize_conflicts(value.value())?;
+            if !conflicts.is_empty() {
+                out.push((inode, conflicts));
+            }
+        }
+        Ok(out)
     }
 
     fn get_change_seq(&self, view: &ViewState, change_id: NodeId) -> PristineResult<Option<u64>> {
@@ -1940,6 +1985,21 @@ impl<'txn> InodePreloadTxn<'txn> {
             txn,
             edges,
             vertices,
+        })
+    }
+
+    /// Whether any pre-loaded edge for this inode is a DELETED edge whose
+    /// introducing change is in `visible`.
+    ///
+    /// Distinguishes "content was deleted on this view" from "file is
+    /// empty / has no visible content": a file recorded empty carries no
+    /// visible DELETED edges, while a (partially or fully) deleted file
+    /// does. Used by materialize to decide when a stale on-disk file whose
+    /// visible content vanished should be removed.
+    pub fn has_visible_deleted_edge(&self, visible: &std::collections::HashSet<NodeId>) -> bool {
+        self.edges.values().flatten().any(|e| {
+            e.flag().contains(crate::types::EdgeFlags::DELETED)
+                && visible.contains(&e.introduced_by())
         })
     }
 }

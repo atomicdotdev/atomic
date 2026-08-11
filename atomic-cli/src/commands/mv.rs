@@ -57,7 +57,7 @@ use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{print_hint, print_success, print_warning};
+use crate::output::{print_hint, print_success};
 
 // Move Command
 
@@ -239,7 +239,18 @@ impl Command for Move {
         // Perform the move
         println!("Moving: {} → {}", source, destination);
 
-        // First, move the file on disk
+        // Move the file on disk ONLY. We deliberately do NOT eagerly update
+        // tracking (no `repo.move_file`): doing so would rewrite TREE (drop
+        // old, add new) and thereby hide the rename from `record`'s move
+        // detection, which pairs a tracked-but-missing (Deleted) path with an
+        // untracked on-disk (Untracked) path of identical content into a
+        // single `GraphOp::FileMove` that preserves the inode. Leaving the
+        // working copy in that raw-rename shape lets the next `record` capture
+        // it as a genuine move. This mirrors the git importer, which also
+        // records a FileMove and lets apply update TREE rather than calling
+        // `move_file`. (Until you record, `atomic status` will show the old
+        // path as Deleted and the new path as Untracked — expected; there is
+        // no `Moved` status yet.)
         if let Err(e) = self.move_file_on_disk(&repo_root, &source, &destination) {
             return Err(CliError::Internal(anyhow::anyhow!(
                 "Failed to move file on disk: {}",
@@ -247,28 +258,11 @@ impl Command for Move {
             )));
         }
 
-        // Then update tracking
-        match repo.move_file(&source, &destination) {
-            Ok(_inode) => {
-                println!();
-                print_success("Moved 1 file");
-                println!();
-                print_hint("Run 'atomic record' to save this change");
-                Ok(())
-            }
-            Err(e) => {
-                // Try to undo the filesystem move
-                print_warning("Failed to update tracking, attempting to restore file...");
-                if let Err(restore_err) = self.move_file_on_disk(&repo_root, &destination, &source)
-                {
-                    print_warning(&format!(
-                        "Could not restore file: {}. Manual intervention required.",
-                        restore_err
-                    ));
-                }
-                Err(CliError::Repository(e))
-            }
-        }
+        println!();
+        print_success("Moved 1 file");
+        println!();
+        print_hint("Run 'atomic record' to capture this move (inode/history preserved)");
+        Ok(())
     }
 }
 

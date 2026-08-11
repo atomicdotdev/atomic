@@ -11,7 +11,7 @@ use log::{debug, trace};
 use reqwest::StatusCode;
 
 use crate::error::{RemoteError, RemoteResult};
-use crate::types::{ChangelistEntry, StateResponse};
+use crate::types::{ChangelistEntry, RemoteViewInfo, StateResponse};
 
 use super::{parse_changelist, HttpRemote};
 
@@ -364,6 +364,58 @@ impl HttpRemote {
                 "Attestation not found: {}",
                 hash
             ))),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::auth_failed(&url, msg))
+            }
+            _ => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::http(status.as_u16(), msg))
+            }
+        }
+    }
+
+    /// List all views on the remote repository.
+    ///
+    /// Returns one [`RemoteViewInfo`] per remote view (name, scope, parent,
+    /// change count, state). Clients use this to enumerate the remote's
+    /// views — for example to pull or recreate every view, not just the
+    /// default one.
+    ///
+    /// Servers that predate the `?views` endpoint answer the request with a
+    /// generic JSON info blob; that output does not match the tab-separated
+    /// line format and is skipped by [`RemoteViewInfo::parse`], so an old
+    /// server degrades to an empty list rather than an error.
+    ///
+    /// # Returns
+    ///
+    /// The remote's views, in server order (deterministically sorted by name).
+    pub async fn list_views(&self) -> RemoteResult<Vec<RemoteViewInfo>> {
+        let url = format!("{}?views", self.base_url);
+        debug!("GET views: {}", url);
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| RemoteError::connection_failed(&url, e))?;
+
+        crate::check_min_version_header(response.headers());
+        let status = response.status();
+
+        match status {
+            StatusCode::OK => {
+                let text = response
+                    .text()
+                    .await
+                    .map_err(|e| RemoteError::connection_failed(&url, e))?;
+                let views: Vec<RemoteViewInfo> =
+                    text.lines().filter_map(RemoteViewInfo::parse).collect();
+                debug!("Found {} remote views", views.len());
+                Ok(views)
+            }
+            StatusCode::NOT_FOUND => Ok(Vec::new()),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 let msg = response.text().await.unwrap_or_default();
                 Err(RemoteError::auth_failed(&url, msg))
