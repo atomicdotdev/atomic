@@ -41,6 +41,13 @@ impl NodeType {
 /// `icebox` is a terminal state (an intent reviewed and set aside — not built).
 pub const INTENT_STATUS: &[&str] = &["backlog", "todo", "in_progress", "done", "icebox"];
 
+/// Intent classification (`kind`) value set — the work taxonomy. `feature` is
+/// the default (an ordinary unit of work); `review` classifies an intent whose
+/// job is to review other work (it carries a `reviews` ref to what it reviews).
+/// Default is `feature`, so pre-existing intents omit the key entirely and keep
+/// their hashes. Extensible.
+pub const INTENT_KIND: &[&str] = &["feature", "review", "bug", "chore", "remediation"];
+
 /// Acceptance-criterion status value set. `unmet`/`met` are the official values
 /// (an acceptance criterion is either met or not); the legacy `open` is still
 /// accepted by [`is_known_ac_status`] so pre-existing intents keep conforming.
@@ -50,6 +57,37 @@ pub const AC_STATUS: &[&str] = &["unmet", "met"];
 /// `open` or `done`; the renderer checks the box only on `done`. `unmet`/`met`
 /// belong to acceptance criteria, not tasks, and are rejected here.
 pub const TASK_STATUS: &[&str] = &["open", "done"];
+
+/// Verification-record kind value set (closed). *What* was verified: an
+/// automated `unit`/`integration`/`e2e`/`runtime` check, or a `manual` review.
+/// A record whose `kind` is outside this set is a gate error, not a new kind the
+/// system absorbs (mirrors the triage doc's `verificationKind`).
+pub const VERIFICATION_KIND: &[&str] = &["unit", "integration", "manual", "e2e", "runtime"];
+
+/// Verification-record outcome value set (closed). A record is refutable: it
+/// either `pass`ed or `fail`ed — there is no ambiguous third state.
+pub const OUTCOME: &[&str] = &["pass", "fail"];
+
+/// Verification-record scope value set (closed). `ac` is a fact about a specific
+/// acceptance criterion; `view` is a whole-view baseline observation.
+pub const VERIFICATION_SCOPE: &[&str] = &["ac", "view"];
+
+/// Triage finding codes (closed set). Every machine-emitted triage finding
+/// carries one of these codes so downstream skins (CLI/JSON/HTML) and skills key
+/// off a stable, closed taxonomy rather than free-form strings.
+pub const FINDING_CODE: &[&str] = &[
+    "VIEW_VERIFY_FAIL",
+    "GATE_VIOLATION",
+    "SCOPE_OUT_BREACH",
+    "ORPHAN_CHANGE",
+    "MET_AC_NO_EVIDENCE",
+    "UNMET_AC_WITH_CANDIDATE",
+    "BAGGAGE_DEP",
+    "BLAST_UNREVIEWED",
+    "STALE_TRIAGE",
+    "OPEN_REMEDIATION",
+    "UNREVIEWED_CHANGE",
+];
 
 /// Directive names recognized by the parser + lift (closed set).
 /// Container directives wrap prose; leaf directives carry only edges.
@@ -66,6 +104,7 @@ pub const DIRECTIVE_NAMES: &[&str] = &[
     "ref", // leaf: a typed dependency edge
     "file-ref", // leaf: a file the task touches
     "memory", // container: carries a memory's body text
+    "verification", // leaf: a typed, merkle-pinned verification record on an AC
 ];
 
 /// Inline directive names (`:name[label]{attrs}` inside running prose).
@@ -138,6 +177,8 @@ pub const EDGE_NAMES: &[&str] = &[
     "verifiedBy",
     "evidence",
     "attributedTo",
+    "remediates",
+    "reviews",
 ];
 
 /// Is this a directive name the system recognizes? Unknown ⇒ gate error.
@@ -152,20 +193,51 @@ pub fn is_known_directive(name: &str) -> bool {
 /// dependency chain the gate keeps traversable).
 pub const DEPENDENCY_EDGES: &[&str] = &["depends", "blockedBy"];
 
+/// Non-dependency intent→intent edges a `:::ref` may *also* declare.
+///
+/// `remediates` is a forward link from a remediation intent to the flawed
+/// intent it fixes (a post-insert bug remediated forward — see triage.md). It
+/// is an intent→intent reference like `blockedBy`, but semantically it is *not*
+/// a dependency/blocker, so it is deliberately kept OUT of [`DEPENDENCY_EDGES`]
+/// (the traversable dependency chain) while still being a legitimate `:::ref`.
+pub const REMEDIATION_EDGES: &[&str] = &["remediates"];
+
+/// Non-dependency intent→intent edges a `:::ref` may *also* declare, linking a
+/// `review`-kind intent to the intent(s) it reviews. Like [`REMEDIATION_EDGES`]
+/// these are legitimate intent→intent refs that are NOT dependencies, so they
+/// are kept out of [`DEPENDENCY_EDGES`] but folded into [`is_known_ref_edge`].
+pub const REVIEW_EDGES: &[&str] = &["reviews"];
+
 /// Is this a typed edge name the system recognizes at all?
 pub fn is_known_edge(name: &str) -> bool {
     EDGE_NAMES.contains(&name)
 }
 
-/// Is this a valid `:::ref` dependency edge? The lift validates `edge=` against
-/// this subset — an out-of-subset (even if otherwise known) edge is a lift error.
+/// Is this a valid `:::ref` dependency edge? An out-of-subset (even if otherwise
+/// known) edge is not a *dependency* edge — used to keep the dependency chain
+/// semantically pure.
 pub fn is_known_dependency_edge(name: &str) -> bool {
     DEPENDENCY_EDGES.contains(&name)
+}
+
+/// Is this an edge a `:::ref` leaf may declare? The closed set the lift
+/// validates `edge=` against: the dependency subset plus the remediation and
+/// review intent→intent edges. An edge outside this union is a lift error.
+pub fn is_known_ref_edge(name: &str) -> bool {
+    is_known_dependency_edge(name)
+        || REMEDIATION_EDGES.contains(&name)
+        || REVIEW_EDGES.contains(&name)
 }
 
 /// Is this a valid intent status value?
 pub fn is_known_intent_status(value: &str) -> bool {
     INTENT_STATUS.contains(&value)
+}
+
+/// Is this a valid intent classification (`kind`) value? Unknown ⇒ gate error
+/// (closed vocabulary).
+pub fn is_known_intent_kind(value: &str) -> bool {
+    INTENT_KIND.contains(&value)
 }
 
 /// Is this a valid acceptance-criterion status value? Accepts the official
@@ -189,6 +261,26 @@ pub fn is_known_memory_status(value: &str) -> bool {
     MEMORY_STATUS.contains(&value)
 }
 
+/// Is this a valid verification-record kind? Unknown ⇒ gate error.
+pub fn is_known_verification_kind(value: &str) -> bool {
+    VERIFICATION_KIND.contains(&value)
+}
+
+/// Is this a valid verification-record outcome? Unknown ⇒ gate error.
+pub fn is_known_outcome(value: &str) -> bool {
+    OUTCOME.contains(&value)
+}
+
+/// Is this a valid verification-record scope? Unknown ⇒ gate error.
+pub fn is_known_verification_scope(value: &str) -> bool {
+    VERIFICATION_SCOPE.contains(&value)
+}
+
+/// Is this a recognized triage finding code? Unknown ⇒ gate error.
+pub fn is_known_finding_code(value: &str) -> bool {
+    FINDING_CODE.contains(&value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +300,37 @@ mod tests {
             );
             assert!(!doc.trim().is_empty(), "kind {kind} has empty guidance");
         }
+    }
+
+    #[test]
+    fn verification_vocab_accepts_members_and_rejects_unknown() {
+        // Every listed member of each closed set is accepted by its predicate,
+        // and a value outside the set is rejected — the closed-vocabulary
+        // property the gate relies on.
+        for k in VERIFICATION_KIND {
+            assert!(is_known_verification_kind(k), "kind {k} should be known");
+        }
+        assert!(!is_known_verification_kind("smoke"));
+
+        for o in OUTCOME {
+            assert!(is_known_outcome(o), "outcome {o} should be known");
+        }
+        assert!(!is_known_outcome("maybe"));
+
+        for s in VERIFICATION_SCOPE {
+            assert!(is_known_verification_scope(s), "scope {s} should be known");
+        }
+        assert!(!is_known_verification_scope("repo"));
+
+        for c in FINDING_CODE {
+            assert!(is_known_finding_code(c), "code {c} should be known");
+        }
+        assert!(!is_known_finding_code("WAT"));
+        // The review-coverage gate's code is the newest member (appended last).
+        assert_eq!(FINDING_CODE.last(), Some(&"UNREVIEWED_CHANGE"));
+
+        // The new edge and directive names joined their closed registries.
+        assert!(is_known_edge("remediates"));
+        assert!(is_known_directive("verification"));
     }
 }

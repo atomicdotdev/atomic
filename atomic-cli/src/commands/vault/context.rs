@@ -1601,6 +1601,7 @@ mod tests {
                 labels: vec!["rs256".to_string(), "authentication".to_string()],
                 session_id: Some("context-test".to_string()),
                 turn_id: Some(1),
+                kind: None,
             })
             .unwrap();
 

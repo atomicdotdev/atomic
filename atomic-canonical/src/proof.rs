@@ -34,6 +34,21 @@ pub const PROP_PROOF: &str = "proof";
 pub const PROP_CONTENT_HASH: &str = "contentHash";
 pub const PROP_ATTRIBUTED_TO: &str = "attributedTo";
 
+/// Top-level intent property carrying review *state* (not substance).
+pub const PROP_STATUS: &str = "status";
+/// The acceptance-criterion array whose per-element review state the substance
+/// view strips (keeping each criterion's reviewable *definition*).
+pub const PROP_HAS_ACCEPTANCE_CRITERION: &str = "hasAcceptanceCriterion";
+
+/// Per-acceptance-criterion keys that are review *state*, not definition. The
+/// substance view strips these from every element of `hasAcceptanceCriterion`
+/// so an intent's substance hash is stable across review activity (a criterion
+/// flipping `unmet`→`met`, gaining a verifier/evidence, or accumulating
+/// verification records). `verifications` extends the doc's original
+/// `{acStatus, verifiedBy, evidence}` list — it postdates the doc but is the
+/// same principle (review state, not substance).
+pub const AC_REVIEW_STATE_KEYS: &[&str] = &["acStatus", "verifiedBy", "evidence", "verifications"];
+
 /// The value covered by a signature: the document minus its `proof` (the
 /// standard Data Integrity shape). `contentHash` is retained so the signature
 /// also commits to the hash. This is the single site that owns the exclusion.
@@ -51,6 +66,42 @@ pub fn hashing_view(value: &Value) -> Value {
     let mut value = signing_view(value);
     if let Some(obj) = value.as_object_mut() {
         obj.remove(PROP_CONTENT_HASH);
+    }
+    value
+}
+
+/// The value covered by the *substance* hash (`intentSubstanceHash`): the
+/// reviewable definition of an intent, with all review **state** and
+/// authorship/proof **metadata** removed. It extends [`hashing_view`] (which
+/// already drops `proof` + `contentHash`) by additionally stripping the
+/// top-level `status` and `attributedTo`, and, from every element of
+/// `hasAcceptanceCriterion`, the review-state keys in [`AC_REVIEW_STATE_KEYS`].
+///
+/// `attributedTo` is excluded because [`attest_value`] injects it when an intent
+/// is signed — so a pin stamped at `done` (before attestation) would otherwise
+/// disagree with the recomputed hash of the *attested* node, producing a
+/// spurious `STALE_TRIAGE`. Authorship is not reviewable substance.
+///
+/// What stays is the definition an editor could meaningfully change: each
+/// criterion's `text`/`@id`/`@type` and its `requiredKinds` (the verification
+/// bar is part of the criterion's *definition*, not review state), plus `why`,
+/// scope, constraints, and tasks. So the substance hash moves when the intent's
+/// *meaning* changes and holds steady while it is merely being reviewed or
+/// attested.
+pub fn substance_view(value: &Value) -> Value {
+    let mut value = hashing_view(value);
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove(PROP_STATUS);
+        obj.remove(PROP_ATTRIBUTED_TO);
+        if let Some(Value::Array(acs)) = obj.get_mut(PROP_HAS_ACCEPTANCE_CRITERION) {
+            for ac in acs.iter_mut() {
+                if let Some(ac_obj) = ac.as_object_mut() {
+                    for key in AC_REVIEW_STATE_KEYS {
+                        ac_obj.remove(*key);
+                    }
+                }
+            }
+        }
     }
     value
 }
@@ -272,6 +323,28 @@ mod tests {
     }
 
     #[test]
+    fn substance_view_is_stable_across_attestation() {
+        // Attesting injects attributedTo + proof + contentHash. None are
+        // reviewable substance, so the substance view (and thus
+        // intentSubstanceHash) must be identical before and after — otherwise a
+        // pin stamped at `done` (pre-attest) spuriously reads as STALE_TRIAGE
+        // against the attested node.
+        let (id, kp) = dev_identity();
+        let before = minimal_value();
+        let attested = attest_value(before.clone(), &id, &kp);
+
+        assert!(
+            attested.get(PROP_ATTRIBUTED_TO).is_some(),
+            "attestation should have injected attributedTo"
+        );
+        assert_eq!(
+            substance_view(&before),
+            substance_view(&attested),
+            "substance view must ignore attributedTo/proof/contentHash injected by attestation"
+        );
+    }
+
+    #[test]
     fn typed_wrapper_matches_value_core() {
         let (id, kp) = dev_identity();
         let node = CanonicalNode {
@@ -281,6 +354,7 @@ mod tests {
             human_key: "W-1".to_string(),
             title: "Wrapper equivalence".to_string(),
             status: "todo".to_string(),
+            kind: crate::node::default_kind(),
             priority: None,
             view: None,
             motivated_by: None,

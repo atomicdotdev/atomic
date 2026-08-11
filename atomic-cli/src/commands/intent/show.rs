@@ -49,12 +49,33 @@ impl Command for IntentShow {
         };
 
         if self.json {
+            // The canonical JSON already carries `kind` (when non-default) and the
+            // `reviews` refs under `dependsOn`, so no supplement is needed here.
             println!(
                 "{}",
                 serde_json::to_string_pretty(&node.to_value()).unwrap()
             );
         } else {
             print!("{}", render(&node, Target::Cli));
+            // The renderer has no `kind` field of its own, so surface the
+            // classification (and, for a review, what it reviews) here.
+            println!("Kind:      {}", node.kind);
+            if node.kind == "review" {
+                let targets: Vec<&str> = node
+                    .depends_on
+                    .iter()
+                    .filter(|r| r.edge == "reviews")
+                    .map(|r| r.to.as_str())
+                    .collect();
+                if targets.is_empty() {
+                    println!("Reviews:   (none declared)");
+                } else {
+                    println!("Reviews:");
+                    for t in targets {
+                        println!("  • {t}");
+                    }
+                }
+            }
         }
 
         Ok(())

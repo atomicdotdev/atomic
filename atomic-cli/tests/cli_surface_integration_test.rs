@@ -71,9 +71,12 @@ fn visible_subcommands(help: &str) -> Vec<String> {
             continue;
         };
 
+        let description = row[name.len()..].trim_start();
+
         // Clap adds this standard dispatcher automatically. Its child paths
         // duplicate the commands already traversed from their canonical path.
-        if name == "help" {
+        // Removed commands are redirect shims, not live command families.
+        if name == "help" || description.starts_with("[REMOVED") {
             continue;
         }
 

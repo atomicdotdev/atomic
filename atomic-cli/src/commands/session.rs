@@ -467,6 +467,7 @@ mod tests {
             labels: Vec::new(),
             session_id: Some(session.to_string()),
             turn_id: Some(turn),
+            kind: None,
         };
 
         // Two intents in ses-x (turns 1 and 2), one in ses-y.
