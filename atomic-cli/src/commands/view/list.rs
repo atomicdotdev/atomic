@@ -29,13 +29,20 @@
 //! * feature-auth
 //! ```
 
+use std::time::Duration;
+
 use clap::Parser;
 
+use atomic_remote::{HttpRemote, HttpRemoteConfig, RemoteViewInfo};
 use atomic_repository::Repository;
 
+use crate::commands::auth::attach_identity;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{hint, view as style_view};
+
+/// Default request timeout (seconds) for the remote view listing.
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 #[cfg(test)]
 use std::path::PathBuf;
@@ -59,6 +66,27 @@ pub struct List {
     /// This is now the default behavior. Kept for backward compatibility.
     #[arg(long, short = 'v', hide = true)]
     pub verbose: bool,
+
+    /// List views on a remote instead of locally.
+    ///
+    /// Pass `--remote` alone to use the default remote, or
+    /// `--remote <name|url>` to target a specific configured remote or URL.
+    #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "REMOTE")]
+    pub remote: Option<String>,
+
+    /// Identity to use for authenticating to the remote.
+    ///
+    /// Only meaningful together with `--remote`. Overrides the identity
+    /// inferred from the remote URL. Must match a locally stored identity.
+    #[arg(long)]
+    pub identity: Option<String>,
+
+    /// Skip TLS certificate verification when querying a remote.
+    ///
+    /// Only meaningful together with `--remote`. Reduces security; use only
+    /// for testing or self-signed certificates.
+    #[arg(short = 'k', long)]
+    pub insecure: bool,
 }
 
 impl List {
@@ -67,6 +95,9 @@ impl List {
         Self {
             short: false,
             verbose: false,
+            remote: None,
+            identity: None,
+            insecure: false,
         }
     }
 
@@ -77,8 +108,122 @@ impl List {
     }
 }
 
+impl List {
+    /// List views on a remote repository.
+    ///
+    /// `remote_arg` is the raw `--remote` value: empty means "use the default
+    /// remote", otherwise it is a configured remote name or a URL.
+    fn run_remote(&self, remote_arg: &str) -> CliResult<()> {
+        let repo_root = find_repository_root()?;
+        let repo = Repository::open(&repo_root).map_err(|e| match e {
+            atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
+                searched_path: path.into(),
+            },
+            other => CliError::Repository(other),
+        })?;
+
+        // Resolve the remote name and URL.
+        let (remote_name, remote_url) = if remote_arg.is_empty() {
+            repo.get_default_remote()
+                .map(|(name, entry)| (name, entry.url))
+                .map_err(CliError::Repository)?
+        } else if remote_arg.contains("://") {
+            (remote_arg.to_string(), remote_arg.to_string())
+        } else {
+            let entry = repo
+                .get_remote(remote_arg)
+                .map_err(|_| CliError::RemoteNotFound {
+                    name: remote_arg.to_string(),
+                })?;
+            (remote_arg.to_string(), entry.url)
+        };
+
+        println!(
+            "Views on {} ({})",
+            style_view(&remote_name),
+            hint(&remote_url)
+        );
+
+        let rt = tokio::runtime::Runtime::new().map_err(|e| {
+            CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {}", e))
+        })?;
+
+        let views = rt.block_on(async {
+            let config = HttpRemoteConfig::new()
+                .with_timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+                .danger_accept_invalid_certs(self.insecure);
+            let config = attach_identity(config, &remote_url, self.identity.as_deref()).await;
+            let remote = HttpRemote::with_config(&remote_url, config)
+                .map_err(|e| CliError::remote_error(e.to_string(), Some(remote_url.clone())))?;
+            remote
+                .list_views()
+                .await
+                .map_err(|e| CliError::remote_error(e.to_string(), Some(remote_url.clone())))
+        })?;
+
+        self.print_remote_views(&views);
+        Ok(())
+    }
+
+    /// Render the remote view listing.
+    fn print_remote_views(&self, views: &[RemoteViewInfo]) {
+        if views.is_empty() {
+            println!("{}", hint("No views found on the remote."));
+            return;
+        }
+
+        let mut sorted: Vec<&RemoteViewInfo> = views.iter().collect();
+        sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+        if self.short {
+            for view in sorted {
+                println!("  {}", style_view(&view.name));
+            }
+            return;
+        }
+
+        let max_name_len = sorted.iter().map(|v| v.name.len()).max().unwrap_or(0);
+
+        for view in sorted {
+            let kind_tag = if view.is_draft() {
+                "[draft]"
+            } else {
+                "[shared]"
+            };
+            let change_display = if view.change_count == 1 {
+                "(1 change)".to_string()
+            } else {
+                format!("({} changes)", view.change_count)
+            };
+            let parent_info = match &view.parent {
+                Some(p) => format!("  parent: {}", style_view(p)),
+                None => String::new(),
+            };
+            let state_display = view
+                .state
+                .as_deref()
+                .map(|s| &s[..12.min(s.len())])
+                .unwrap_or("-");
+            println!(
+                "  {:<width$}  {:<10}  {}  state: {}{}",
+                style_view(&view.name),
+                kind_tag,
+                change_display,
+                state_display,
+                parent_info,
+                width = max_name_len
+            );
+        }
+    }
+}
+
 impl Command for List {
     fn run(&self) -> CliResult<()> {
+        // Remote listing takes over entirely when --remote is present.
+        if let Some(remote_arg) = &self.remote {
+            return self.run_remote(remote_arg);
+        }
+
         // Find the repository
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(|e| match e {
