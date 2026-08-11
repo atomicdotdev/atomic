@@ -70,7 +70,7 @@ pub struct CandidateSet {
 impl Repository {
     /// Compute the triage candidate set for `feature` relative to `target`.
     ///
-    /// See the [module documentation](self) for the semantics of each field.
+    /// See the module documentation for the semantics of each field.
     ///
     /// # Errors
     ///

@@ -242,7 +242,7 @@ pub fn build_report(
     let mut intent_reports: Vec<IntentReport> = Vec::new();
     let mut intent_substance_hashes: BTreeMap<String, String> = BTreeMap::new();
 
-    for (intent_kg_id, _changes) in &intent_to_changes {
+    for intent_kg_id in intent_to_changes.keys() {
         let bare = intent_kg_id.strip_prefix("intent:").unwrap_or(intent_kg_id);
         match load_intent_node(repo, bare) {
             Ok(node) => {
