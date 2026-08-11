@@ -132,8 +132,8 @@ else
 fi
 
 # Creating an intent should work
-out="$(atomic vault intent create --title "User B task" 2>&1)" || true
-if echo "$out" | grep -qE "[A-Za-z]+-[0-9]+|Created"; then
+out="$(atomic intent new "User B task" 2>&1)" || true
+if echo "$out" | grep -qE "Created intent:"; then
     _pass "User B: intent create works after bootstrap"
 else
     _fail "User B: intent create" "$out"
@@ -153,21 +153,19 @@ new_view "agent-session-1" --draft --parent dev >/dev/null 2>&1 || \
     new_view "agent-session-1" >/dev/null 2>&1
 switch_view "agent-session-1" >/dev/null 2>&1
 
-# Create an intent on the draft view.
-# Without an active agent session, this falls back to the manual path:
-#   intents/manual/<identity>/<N>/intent.md
-# With an agent session it would be:
-#   intents/<view>/<session>/<turn>/intent.md
-out="$(atomic vault intent create --title "Draft intent 1" --json 2>&1)" || true
-intent_file_1="$(echo "$out" | grep -o '"intent_file"[[:space:]]*:[[:space:]]*"[^"]*"' \
-    | sed 's/.*"intent_file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')" || true
+# Create an intent on the draft view. Intent files are flat and ULID-scoped
+# (globally unique, not view-scoped):
+#   intents/<ULID>/intent.md
+out="$(atomic intent new "Draft intent 1" 2>&1)" || true
+intent_file_1="$(echo "$out" | sed -n 's|.*file: \.vault/||p' | head -1)" || true
 
-# The path should be scoped (either under view name or manual/<identity>)
-if echo "$intent_file_1" | grep -qE "intents/(agent-session-1|manual)/"; then
+# The path is ULID-scoped under intents/
+if echo "$intent_file_1" | grep -qE "intents/[A-Za-z0-9]+/intent\.md"; then
     _pass "Intent path is scoped: $intent_file_1"
 else
-    # Fallback: check if any intent dirs exist
-    if [[ -d ".vault/intents/manual" ]] || [[ -d ".vault/intents/agent-session-1" ]]; then
+    # Fallback: check if any intent dir exists
+    found="$(find .vault/intents -name "intent.md" 2>/dev/null | head -1)" || true
+    if [[ -n "$found" ]]; then
         _pass "Intent directory scoped correctly"
     else
         _fail "Intent path is scoped" "file: $intent_file_1"
@@ -197,13 +195,11 @@ new_view "agent-session-2" --draft --parent dev >/dev/null 2>&1 || \
 switch_view "agent-session-2" >/dev/null 2>&1
 
 # Create an intent on the second view
-out2="$(atomic vault intent create --title "Draft intent 2" --json 2>&1)" || true
-intent_file_2="$(echo "$out2" | grep -o '"intent_file"[[:space:]]*:[[:space:]]*"[^"]*"' \
-    | sed 's/.*"intent_file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')" || true
+out2="$(atomic intent new "Draft intent 2" 2>&1)" || true
+intent_file_2="$(echo "$out2" | sed -n 's|.*file: \.vault/||p' | head -1)" || true
 
-# The two intent files should be different paths.
-# Without agent sessions, both land in manual/<identity>/ but with
-# different counter values, so paths still differ.
+# The two intent files should be different paths: each intent gets its own
+# unique ULID directory, so paths never collide across views.
 if [[ -n "$intent_file_1" ]] && [[ -n "$intent_file_2" ]]; then
     if [[ "$intent_file_1" != "$intent_file_2" ]]; then
         _pass "Intent files have different paths"
@@ -222,11 +218,11 @@ fi
 
 # Each view should only see its own intents
 switch_view "agent-session-1" >/dev/null 2>&1
-list1="$(atomic vault intent list --json 2>/dev/null)" || true
+list1="$(atomic intent list --json 2>/dev/null)" || true
 count1="$(echo "$list1" | grep -c '"id"' || true)"
 
 switch_view "agent-session-2" >/dev/null 2>&1
-list2="$(atomic vault intent list --json 2>/dev/null)" || true
+list2="$(atomic intent list --json 2>/dev/null)" || true
 count2="$(echo "$list2" | grep -c '"id"' || true)"
 
 # Note: the manifest is shared (local redb), so both intents may appear.
@@ -246,7 +242,7 @@ first_id="$(echo "$list1" | grep -oE '"id"\s*:\s*"[^"]+"' | head -1 \
 
 if [[ -n "$first_id" ]]; then
     # Show should work
-    show_out="$(atomic vault intent show "$first_id" --json 2>/dev/null)" || true
+    show_out="$(atomic intent show "$first_id" --json 2>/dev/null)" || true
     if echo "$show_out" | grep -qi "draft intent"; then
         _pass "Intent show works on view-scoped path"
     else
@@ -254,7 +250,7 @@ if [[ -n "$first_id" ]]; then
     fi
 
     # Update should work
-    update_out="$(atomic vault intent update "$first_id" --status in-progress 2>&1)" || true
+    update_out="$(atomic intent update "$first_id" --status in-progress 2>&1)" || true
     if echo "$update_out" | grep -qiE "updated|in-progress"; then
         _pass "Intent update works on view-scoped path"
     else

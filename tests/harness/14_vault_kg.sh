@@ -120,20 +120,20 @@ make_temp_repo "vault-intents"
 init_repo --vault
 
 # Create an intent — must print the assigned ID
-run_cmd atomic vault intent create --title "Fix authentication" --priority high
-assert_ran "intent create returns an ID" "Created intent: [A-Za-z0-9-]+-[0-9]+"
+run_cmd atomic intent new "Fix authentication"
+assert_ran "intent create returns an ID" "Created intent: [A-Za-z0-9:_-]+::[0-9]+"
 
-first_id="$(echo "$OUT" | sed -n 's/.*Created intent: \([A-Za-z0-9-]*\).*/\1/p' | head -1)"
+first_id="$(echo "$OUT" | sed -n 's/.*Created intent: \([A-Za-z0-9:_-]*\).*/\1/p' | head -1)"
 
-# List intents
-run_cmd atomic vault intent list --json
-assert_ran "intent appears in list with title" "fix authentication"
+# List intents — the new intent must appear under its assigned key
+run_cmd atomic intent list --json
+assert_ran "intent appears in list" "$first_id"
 
 # Create a second intent
-run_cmd atomic vault intent create --title "Add logging"
+run_cmd atomic intent new "Add logging"
 assert_ran "second intent create succeeds" "Created intent:"
 
-run_cmd atomic vault intent list --json
+run_cmd atomic intent list --json
 intent_count="$(echo "$OUT" | grep -c '"id"' || true)"
 if [[ $RC -eq 0 && "$intent_count" -ge 2 ]]; then
     _pass "multiple intents created (count: $intent_count)"
@@ -143,10 +143,10 @@ fi
 
 # Show the first intent by ID
 if [[ -n "$first_id" ]]; then
-    run_cmd atomic vault intent show "$first_id" --json
+    run_cmd atomic intent show "$first_id" --json
     assert_ran "intent show returns detail for $first_id" "fix authentication"
 
-    run_cmd atomic vault intent update "$first_id" --status in-progress
+    run_cmd atomic intent update "$first_id" --status in-progress
     assert_ran "intent update sets status" "Updated intent: $first_id"
 else
     _fail "intent show" "could not extract intent ID from create output"
@@ -158,7 +158,7 @@ run_cmd atomic vault goal start --name intent-goal
 assert_ran "goal for linking created" "Started goal: intent-goal"
 
 if [[ -n "$first_id" ]]; then
-    run_cmd atomic vault intent link "$first_id" --goal intent-goal
+    run_cmd atomic intent link "$first_id" --goal intent-goal
     assert_ran "intent linked to goal" "link|intent-goal"
 else
     _fail "intent link" "could not extract intent ID from create output"
@@ -312,9 +312,15 @@ begin_section "Vault: Memory and Materialize"
 make_temp_repo "vault-memory"
 init_repo --vault
 
-# Memory list should show the default MEMORY.md
-run_cmd atomic vault memory list --json
-assert_ran "memory list shows default index" "memory/MEMORY\.md"
+# Memory listing works: create a memory, then it must appear in the list.
+# (The default MEMORY.md index file is covered by the file-exists check above;
+# `atomic memory list` enumerates recorded memory entries, not the index.)
+run_cmd atomic memory new --kind lesson --text "Prefer atomic intent new over the removed vault verb"
+assert_ran "memory create returns an ID" "Created memory:"
+mem_id="$(echo "$OUT" | sed -n 's/.*Created memory: \([A-Za-z0-9]*\).*/\1/p' | head -1)"
+
+run_cmd atomic memory list --json
+assert_ran "memory list shows the created memory" "$mem_id"
 
 # Materialize all vault entries
 run_cmd atomic vault materialize
