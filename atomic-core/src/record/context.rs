@@ -904,6 +904,21 @@ mod tests {
             Ok(Vec::new())
         }
 
+        fn get_conflicts(
+            &self,
+            _view_id: u64,
+            _inode: u64,
+        ) -> Result<Vec<crate::pristine::StoredConflict>, PristineError> {
+            Ok(Vec::new())
+        }
+
+        fn iter_conflicts(
+            &self,
+            _view_id: u64,
+        ) -> Result<Vec<(u64, Vec<crate::pristine::StoredConflict>)>, PristineError> {
+            Ok(Vec::new())
+        }
+
         fn get_change_seq(
             &self,
             _view: &ViewState,

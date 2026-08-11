@@ -48,6 +48,7 @@
     unused_assignments
 )]
 
+mod agent_error;
 mod commands;
 mod error;
 mod output;
@@ -60,6 +61,8 @@ use commands::{
     ChangeCmd,
     Clone,
     Command,
+    Completions,
+    Conflicts,
     Diff,
     Doctor,
     Git,
@@ -136,10 +139,12 @@ fn apply_agent_help(cmd: clap::Command) -> clap::Command {
         .get_subcommands()
         .map(|c| c.get_name().to_string())
         .collect();
+
     let mut cmd = cmd
         .help_template(AGENT_HELP_TEMPLATE)
         .long_about(None::<&str>)
         .mut_args(|arg| arg.long_help(None::<&str>));
+
     for name in subcommand_names {
         cmd = cmd.mut_subcommand(name, apply_agent_help);
     }
@@ -220,6 +225,13 @@ enum Commands {
     ///
     /// Displays information about modified, added, deleted, and untracked files.
     Status(Status),
+
+    /// List files that are in a conflicted state.
+    ///
+    /// Shows each conflicted file on the current view with the conflict kind,
+    /// the line where it begins, and the changes that contend. A file is
+    /// listed only while its content still carries conflict markers.
+    Conflicts(Conflicts),
 
     /// Add files to be tracked.
     ///
@@ -862,22 +874,93 @@ enum Commands {
     /// atomic triage candidates feature --into dev --json
     /// ```
     Triage(Triage),
+
+    /// Generate a shell completion script.
+    ///
+    /// Emits a static completion script for the given shell. For live
+    /// completion of view names and change hashes, enable the dynamic engine
+    /// instead with `source <(COMPLETE=zsh atomic)`.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic completions zsh > ~/.zfunc/_atomic
+    /// ```
+    Completions(Completions),
 }
 
 // Main Entry Point
 
+/// The log filter `--verbose` turns on.
+///
+/// Scoped to the Atomic crates on purpose: a bare `debug` also unleashes
+/// `reqwest`/`hyper` wire logging, which buries the one line the user wanted.
+///
+/// `atomic` is a prefix match, so it covers this binary (whose module paths
+/// are `atomic::…`, after the `[[bin]]` name rather than the `atomic-cli`
+/// package) along with every `atomic_*` library crate. `atomic_core` is pegged
+/// back to `info`: its per-vertex graph logging is far below the level anyone
+/// reaching for `--verbose` is asking about.
+const VERBOSE_FILTER: &str = "atomic=debug,atomic_core=info";
+
+/// Detect the global `--verbose` flag straight from `argv`.
+///
+/// Logging has to be live before clap runs, because argument parsing itself
+/// can fail and we want the debug trail for that too. `--verbose` is a global
+/// flag, so its position is unconstrained — scanning argv is both simpler and
+/// more faithful than trying to parse twice.
+fn verbose_requested() -> bool {
+    std::env::args_os().any(|a| a == "-v" || a == "--verbose")
+}
+
+/// Install the logger, honouring `--verbose`.
+///
+/// Every command advertises `-v, --verbose  Emit extra diagnostic output`, but
+/// the flag was parsed into a field nothing ever read: logging was initialised
+/// before parsing and only `RUST_LOG` could raise the level. The debug lines
+/// that explain *which identity a request authenticated as* already existed —
+/// they were simply unreachable through the documented flag, which turned an
+/// identity misconfiguration into an opaque server-side 401.
+///
+/// `RUST_LOG` still wins when set, so existing workflows are untouched.
+fn init_logging() {
+    let default = if verbose_requested() {
+        VERBOSE_FILTER
+    } else {
+        "warn"
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default)).init();
+}
+
 fn main() {
     // Initialize logging
-    env_logger::init();
+    init_logging();
 
-    // Parse command-line arguments through the agent-native help layout. We
-    // build the command tree, stamp the template onto every node, let clap do
-    // its normal validation/help/error handling, then reconstruct the typed
-    // `Cli` from the resulting matches.
-    let matches = apply_agent_help(Cli::command()).get_matches();
+    // Dynamic shell completion. When invoked in completion mode (the `COMPLETE`
+    // env var is set by the installed shell hook), this emits candidates —
+    // including live view names and change hashes registered on the insert
+    // args — and exits before normal argument parsing. In normal invocations
+    // it is a no-op. The factory mirrors the real command tree so completion
+    // matches actual subcommands and aliases.
+    clap_complete::CompleteEnv::with_factory(|| apply_agent_help(Cli::command())).complete();
+
+    // Parse command-line arguments through the agent-native help layout.
+    //
+    // `try_get_matches_from_mut` rather than `get_matches`: clap's own failure
+    // output is human prose ending in "For more information, try '--help'",
+    // which costs an agent a second round trip and may discard the option/value
+    // relationship or the parser's underlying cause. We intercept and re-render
+    // in the same `key: value` dialect the rest of the machine surface speaks.
+    // Help and version still print through clap untouched.
+    let mut cmd = apply_agent_help(Cli::command());
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let matches = match cmd.try_get_matches_from_mut(args.clone()) {
+        Ok(matches) => matches,
+        Err(err) => agent_error::render_and_exit(err, &cmd, &args),
+    };
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
-        Err(err) => err.exit(),
+        Err(err) => agent_error::render_and_exit(err, &cmd, &args),
     };
 
     // Configure color output
@@ -894,6 +977,8 @@ fn main() {
         Commands::Init(init) => init.run(),
 
         Commands::Status(status) => status.run(),
+
+        Commands::Conflicts(conflicts) => conflicts.run(),
 
         Commands::Add(add) => add.run(),
 
@@ -956,6 +1041,8 @@ fn main() {
         Commands::Unrecord(unrecord) => unrecord.run(),
 
         Commands::Update(update) => update.run(),
+
+        Commands::Completions(completions) => completions.generate(Cli::command()),
 
         Commands::Query(query) => query.run(),
 

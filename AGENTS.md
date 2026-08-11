@@ -28,8 +28,7 @@ atomic/
 
 ### Related Projects
 
-- **atomic-remote-client** (`atomic-enterprise/atomic-remote`) - Clean-room HTTP client for remote operations
-- **atomic-api** (`atomic-enterprise/atomic-api`) - Server-side HTTP API for remote operations
+- **atomic-remote** (`atomic-remote/`) - HTTP client for push/pull/clone
 
 ## Core Concepts
 

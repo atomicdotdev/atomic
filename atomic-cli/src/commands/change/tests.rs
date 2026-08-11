@@ -4,6 +4,7 @@ use super::*;
 mod tests {
     use super::*;
     use atomic_core::change::ChangeHeader;
+    use atomic_core::change::{AITool, AIVendor, PromptContent, Provenance, SuggestionType};
     use atomic_core::change::{Atom, Encoding, Insertion, Local};
     use atomic_core::types::{ChangePosition, Merkle, Position};
     use atomic_core::EdgeFlags;
@@ -405,6 +406,36 @@ mod tests {
         let json = serde_json::to_string_pretty(&json_change).unwrap();
         assert!(json.contains("\"message\": \"Test change message\""));
         assert!(json.contains("\"description\": \"This is a description\""));
+    }
+
+    #[test]
+    fn test_json_change_omits_unhashed_when_absent() {
+        let change = create_test_change();
+        let hash = Hash::of(b"test change");
+        let json_change = JsonChange::from_change(&change, &hash, None);
+
+        assert!(json_change.unhashed.is_none());
+        let json = serde_json::to_string(&json_change).unwrap();
+        assert!(!json.contains("unhashed"));
+    }
+
+    #[test]
+    fn test_json_change_surfaces_unhashed_agent_turn() {
+        let mut change = create_test_change();
+        change.unhashed = Some(serde_json::json!({
+            "agent_turn": {
+                "session_id": "sess-1",
+                "turn_number": 3,
+                "condensed_text": "[User] fix it\n[Assistant] fixed",
+            }
+        }));
+        let hash = Hash::of(b"test change");
+        let json_change = JsonChange::from_change(&change, &hash, None);
+
+        let value = serde_json::to_value(&json_change).unwrap();
+        let turn = &value["unhashed"]["agent_turn"];
+        assert_eq!(turn["session_id"], "sess-1");
+        assert_eq!(turn["turn_number"], 3);
     }
 
     // Helper Function Tests
@@ -843,5 +874,81 @@ mod tests {
 
         let result2 = truncate_string("Hello 世界!", 8);
         assert!(result2.ends_with("..."));
+    }
+
+    #[test]
+    fn test_json_provenance_surfaces_agent_context_fields() {
+        let prov = Provenance {
+            vendor: AIVendor::Anthropic,
+            model: "claude-sonnet-4".to_string(),
+            tool: AITool::Cli("claude-code".to_string()),
+            suggestion_type: SuggestionType::Complete,
+            prompt: PromptContent::hash_from("fix the bug"),
+            metadata: vec![("turn_number".to_string(), "2".to_string())],
+            agent_mode: Some("build".to_string()),
+            finish_reason: Some("stop".to_string()),
+            step_count: Some(3),
+            session_slug: Some("mighty-rocket".to_string()),
+            reasoning_signature: Some("sig-abc".to_string()),
+            reasoning_text: Some("thought hard about it".to_string()),
+            task_plan: Some("[{\"content\":\"fix\"}]".to_string()),
+            ..Default::default()
+        };
+
+        let json = JsonProvenance::from(&prov);
+
+        assert_eq!(json.agent_mode.as_deref(), Some("build"));
+        assert_eq!(json.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(json.step_count, Some(3));
+        assert_eq!(json.session_slug.as_deref(), Some("mighty-rocket"));
+        assert_eq!(json.reasoning_signature.as_deref(), Some("sig-abc"));
+        assert_eq!(
+            json.reasoning_text.as_deref(),
+            Some("thought hard about it")
+        );
+        assert!(json.prompt_hash.is_some());
+        assert!(json.metadata.is_some());
+
+        // The serialized form carries the keys the gap report measured.
+        let value = serde_json::to_value(&json).unwrap();
+        for key in [
+            "reasoning_text",
+            "reasoning_signature",
+            "agent_mode",
+            "finish_reason",
+            "step_count",
+            "session_slug",
+            "task_plan",
+            "prompt_hash",
+            "metadata",
+        ] {
+            assert!(value.get(key).is_some(), "missing key: {}", key);
+        }
+    }
+
+    #[test]
+    fn test_json_provenance_omits_absent_agent_fields() {
+        let prov = Provenance {
+            vendor: AIVendor::OpenAI,
+            model: "gpt-5".to_string(),
+            tool: AITool::Cli("codex".to_string()),
+            suggestion_type: SuggestionType::Complete,
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(JsonProvenance::from(&prov)).unwrap();
+        let obj = value.as_object().unwrap();
+
+        // Absent fields stay out of the output entirely.
+        for key in [
+            "reasoning_text",
+            "agent_mode",
+            "step_count",
+            "prompt_hash",
+            "metadata",
+        ] {
+            assert!(!obj.contains_key(key), "unexpected key: {}", key);
+        }
+        assert_eq!(obj.get("vendor").and_then(|v| v.as_str()), Some("OpenAI"));
     }
 }

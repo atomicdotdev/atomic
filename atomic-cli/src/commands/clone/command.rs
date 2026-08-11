@@ -143,6 +143,16 @@ pub struct Clone {
     /// Atomic content over Git's working tree.
     #[arg(long, requires = "path", conflicts_with = "download_only")]
     pub into_existing: bool,
+
+    /// Also clone every other view the remote exposes, not just `--view`.
+    ///
+    /// Each additional view is created locally and populated from the
+    /// remote. Changes are content-addressed and shared across views, so
+    /// this mostly adds view references without re-downloading. Requires
+    /// server support for the view-inventory endpoint; older servers are
+    /// treated as single-view.
+    #[arg(long, conflicts_with = "download_only")]
+    pub all_views: bool,
 }
 
 fn validate_existing_git_checkout(path: &Path) -> CliResult<()> {
@@ -220,6 +230,7 @@ impl Clone {
             timeout: DEFAULT_TIMEOUT_SECS,
             download_only: false,
             into_existing: false,
+            all_views: false,
         }
     }
 
@@ -259,6 +270,12 @@ impl Clone {
         self
     }
 
+    /// Builder: clone all remote views, not just the primary one.
+    pub fn with_all_views(mut self, all_views: bool) -> Self {
+        self.all_views = all_views;
+        self
+    }
+
     // Internal Helper Methods
 
     /// Build the HTTP remote configuration.
@@ -282,6 +299,157 @@ impl Clone {
             .clone()
             .or_else(|| infer_repo_name(&self.url))
             .unwrap_or_else(|| "repo".to_string())
+    }
+
+    /// Clone every remote view other than the primary `--view`.
+    ///
+    /// Each view is created locally (as a shared view, matching how the
+    /// server stores pushed views) and populated from its remote changelist.
+    /// Changes are content-addressed, so any already downloaded for the
+    /// primary view are reused — only genuinely new changes are fetched.
+    /// Returns the number of additional views cloned.
+    async fn clone_additional_views(
+        &self,
+        repo: &mut Repository,
+        remote: &HttpRemote,
+        stats: &mut CloneStats,
+    ) -> CliResult<usize> {
+        let remote_views = match remote.list_views().await {
+            Ok(v) => v,
+            // Older servers don't expose the inventory — treat as single-view.
+            Err(_) => return Ok(0),
+        };
+
+        let others: Vec<String> = remote_views
+            .into_iter()
+            .map(|v| v.name)
+            .filter(|name| name != &self.view)
+            .collect();
+
+        if others.is_empty() {
+            return Ok(0);
+        }
+
+        print_blank();
+        println!(
+            "Cloning {} additional {}:",
+            others.len(),
+            if others.len() == 1 { "view" } else { "views" }
+        );
+
+        let mut cloned = 0usize;
+        for name in &others {
+            match self.clone_one_view(repo, remote, name, stats).await {
+                Ok(applied) => {
+                    cloned += 1;
+                    println!(
+                        "  {} {} ({})",
+                        success("\u{2713}"),
+                        style_view(name),
+                        format_count(applied, "change")
+                    );
+                }
+                Err(e) => {
+                    print_warning(&format!("Failed to clone view '{}': {}", name, e));
+                }
+            }
+        }
+
+        Ok(cloned)
+    }
+
+    /// Create one view locally and populate it from its remote changelist.
+    ///
+    /// Returns the number of changes inserted into the view.
+    async fn clone_one_view(
+        &self,
+        repo: &mut Repository,
+        remote: &HttpRemote,
+        view_name: &str,
+        stats: &mut CloneStats,
+    ) -> CliResult<usize> {
+        if !repo.view_exists(view_name).map_err(CliError::Repository)? {
+            repo.create_shared_view(view_name)
+                .map_err(CliError::Repository)?;
+        }
+
+        let entries = remote
+            .get_changelist(view_name, 0)
+            .await
+            .map_err(|e| convert_remote_error(e, &self.url))?;
+
+        let mut applied = 0usize;
+        for entry in &entries {
+            let Some(hash) = atomic_core::types::Hash::from_base32(entry.hash.as_bytes()) else {
+                continue;
+            };
+
+            // Reuse content already present locally; fetch only what's missing.
+            if !repo.has_change(&hash) {
+                let data = remote
+                    .download_change(&entry.hash)
+                    .await
+                    .map_err(|e| convert_remote_error(e, &self.url))?;
+                let len = data.len() as u64;
+                save_downloaded_change(&*repo, &hash, data).map_err(|e| {
+                    CliError::Internal(anyhow::anyhow!("save change {}: {}", entry.hash, e))
+                })?;
+                stats.record_change_downloaded(len);
+            }
+
+            // Insert the change (and its dependency closure) into this view.
+            // Changes arrive in dependency order, so deps are already present.
+            let opts = atomic_repository::InsertOptions::default()
+                .apply_deps(true)
+                .view(view_name);
+            match repo.insert_change_rec(&hash, opts) {
+                Ok(_) => applied += 1,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("already applied") || msg.contains("AlreadyApplied") {
+                        applied += 1;
+                    } else {
+                        return Err(CliError::Internal(anyhow::anyhow!(
+                            "insert {} into '{}': {}",
+                            entry.hash,
+                            view_name,
+                            e
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(applied)
+    }
+
+    /// Print a hint listing the other views available on the remote.
+    ///
+    /// Best-effort: silent if the server has no inventory endpoint or only
+    /// the primary view.
+    async fn hint_other_views(&self, remote: &HttpRemote) {
+        let Ok(remote_views) = remote.list_views().await else {
+            return;
+        };
+        let others: Vec<String> = remote_views
+            .into_iter()
+            .map(|v| v.name)
+            .filter(|name| name != &self.view)
+            .collect();
+        if others.is_empty() {
+            return;
+        }
+
+        print_blank();
+        print_hint(&format!(
+            "This remote has {} other {}: {}",
+            others.len(),
+            if others.len() == 1 { "view" } else { "views" },
+            others.join(", ")
+        ));
+        print_hint(
+            "Clone them too with 'atomic clone --all-views', or list them with 'atomic view list --remote'.",
+        );
     }
 
     /// Async implementation of the clone command.
@@ -619,6 +787,29 @@ impl Clone {
             finish_success(&spinner, "Remote 'origin' configured");
         }
 
+        // Clone additional views (--all-views), or at least tell the user
+        // that other views exist on the remote. The remote stores every view
+        // as shared, so a draft's parent relationship isn't recoverable — but
+        // the sibling views themselves can be reconstructed by name.
+        if !self.download_only {
+            if self.all_views {
+                match self
+                    .clone_additional_views(&mut repo, &remote, &mut stats)
+                    .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => print_success(&format!(
+                        "Cloned {} additional {}",
+                        n,
+                        if n == 1 { "view" } else { "views" }
+                    )),
+                    Err(e) => print_warning(&format!("Failed to clone additional views: {}", e)),
+                }
+            } else {
+                self.hint_other_views(&remote).await;
+            }
+        }
+
         // Build content search index and enrich KG
         if stats.has_applied() {
             let spinner = create_spinner("Building search index...");
@@ -760,6 +951,7 @@ mod tests {
         assert_eq!(clone.timeout, DEFAULT_TIMEOUT_SECS);
         assert!(!clone.download_only);
         assert!(!clone.into_existing);
+        assert!(!clone.all_views);
     }
 
     /// Test Default trait implementation.
@@ -811,6 +1003,13 @@ mod tests {
         assert!(clone.into_existing);
     }
 
+    /// Test with_all_views builder method.
+    #[test]
+    fn test_clone_with_all_views() {
+        let clone = Clone::new("https://example.com/repo".to_string()).with_all_views(true);
+        assert!(clone.all_views);
+    }
+
     /// Test chaining multiple builder methods.
     #[test]
     fn test_clone_builder_chain() {
@@ -820,7 +1019,8 @@ mod tests {
             .with_insecure(true)
             .with_timeout(120)
             .with_download_only(true)
-            .with_into_existing(true);
+            .with_into_existing(true)
+            .with_all_views(true);
 
         assert_eq!(clone.url, "https://example.com/repo");
         assert_eq!(clone.path, Some("my-project".to_string()));
@@ -829,6 +1029,7 @@ mod tests {
         assert_eq!(clone.timeout, 120);
         assert!(clone.download_only);
         assert!(clone.into_existing);
+        assert!(clone.all_views);
     }
 
     /// Test Clone can be cloned (the trait, not the command).

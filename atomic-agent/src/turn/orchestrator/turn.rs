@@ -133,9 +133,12 @@ impl TurnOrchestrator {
     /// repository what changed since the last recorded state.
     pub(super) async fn handle_turn_end(
         &mut self,
-        event: TurnEvent,
+        mut event: TurnEvent,
     ) -> AgentResult<DispatchResult> {
-        let session_id = &event.session_id;
+        // Clone so `event` stays mutable for enrichment below while the
+        // id is borrowed throughout this function.
+        let session_id_owned = event.session_id.clone();
+        let session_id = session_id_owned.as_str();
         let _turn_end_lock = match self.try_turn_end_lock(session_id) {
             TurnEndLock::Acquired(guard) => Some(guard),
             TurnEndLock::Busy => {
@@ -184,6 +187,20 @@ impl TurnOrchestrator {
                 }
             }
         }
+
+        // Update the transcript path from the Stop event. Claude Code's Stop
+        // payload carries `transcript_path`, but a session created without one
+        // (transcript file not yet minted at SessionStart) would otherwise
+        // record with `transcript_path = None` and lose the unhashed
+        // `agent_turn` transcript data — the record below is the consumer.
+        if let Some(path) = &event.transcript_path {
+            session.set_transcript_path(path);
+        }
+
+        // OpenCode: recover transcript/reasoning/response from its local
+        // store before recording — thin plugins send none of these, and
+        // OpenCode writes no transcript file of its own.
+        self.enrich_opencode_turn(&mut session, &mut event);
 
         // Release the watcher if it was active (best-effort, ignore errors)
         if self.watcher.is_active() {
@@ -269,9 +286,11 @@ impl TurnOrchestrator {
                                 self.ingest_sherpa_trace(session_id, Path::new(trace_path));
                             }
 
-                            // Provenance: inject reasoning blocks as Decision nodes,
+                            // Provenance: inject reasoning blocks as Decision nodes
+                            // and the agent's closing message as an LlmResponse node,
                             // then append a patch proposal node and save the graph.
                             self.inject_reasoning_nodes(session_id, &event);
+                            self.inject_response_node(session_id, &session, &event);
                             self.save_turn_provenance(session_id, &session, &outcome, &event);
 
                             log::info!(

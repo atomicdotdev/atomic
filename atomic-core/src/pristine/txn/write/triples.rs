@@ -331,6 +331,24 @@ impl<'a> KgTxnT for WriteTxn<'a> {
         Ok(table.len()? as usize)
     }
 
+    fn kg_node_ids_by_source(&self, sources: &[&str]) -> PristineResult<Vec<String>> {
+        let table = match self.txn.open_table(KG_NODES) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(PristineError::from(e)),
+        };
+        let mut ids = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            if let Ok(node) = serde_json::from_slice::<KgNode>(value.value()) {
+                if sources.contains(&node.source.as_str()) {
+                    ids.push(key.value().to_string());
+                }
+            }
+        }
+        Ok(ids)
+    }
+
     fn count_kg_edges(&self) -> PristineResult<usize> {
         let table = match self.txn.open_table(KG_EDGES) {
             Ok(t) => t,

@@ -1,5 +1,5 @@
 use super::helpers::{build_tool_detail, short_hash, truncate_prompt};
-use super::{ProvenanceAccumulator, MAX_GOAL_PROMPT_LEN};
+use super::{ProvenanceAccumulator, MAX_GOAL_PROMPT_LEN, MAX_RESPONSE_TEXT_LEN};
 use crate::provenance::classify::{classify_tool_call, summarize_tool_call};
 use crate::provenance::types::{EdgeKind, GraphEdge, GraphNode, NodeKind};
 
@@ -76,7 +76,7 @@ impl ProvenanceAccumulator {
         }
 
         // Attach detail based on kind
-        node.detail = build_tool_detail(kind, tool_name, tool_input, tool_output);
+        node.detail = build_tool_detail(kind, tool_name, tool_input, tool_output, status);
 
         let node_id = node.id.clone();
 
@@ -163,7 +163,58 @@ impl ProvenanceAccumulator {
             }
         }
 
-        self.stats.decision_count += 1;
+        self.push_node(node);
+        node_id
+    }
+
+    /// Append an LLM response node — the agent's final answer for the turn.
+    ///
+    /// Created at turn end from the agent's closing message: the stop
+    /// payload's response field (`last_assistant_message`,
+    /// `prompt_response`, …) or, failing that, the last assistant entry of
+    /// the session transcript. This is the durable record of what the agent
+    /// *concluded*, complementing the tool-derived nodes that record what it
+    /// *did*.
+    ///
+    /// Returns the new node's ID.
+    pub fn append_llm_response(&mut self, text: &str, timestamp: i64) -> String {
+        let summary = truncate_prompt(text, 200);
+        let mut node = GraphNode::new(self.next_id(), NodeKind::LlmResponse, timestamp, &summary);
+
+        let stored: String = text.chars().take(MAX_RESPONSE_TEXT_LEN).collect();
+        node.detail = Some(serde_json::json!({
+            "response_text": stored,
+            "text_length": text.len(),
+        }));
+
+        // Mark as classified so the Phase 3 consolidator doesn't touch it
+        node.classified = true;
+        node.confidence = Some(1.0);
+
+        let node_id = node.id.clone();
+
+        // Edge: goal --led_to-→ response (the answer serves the prompt)
+        if let Some(goal) = &self.current_goal {
+            self.edges.push(GraphEdge::new(
+                goal.clone(),
+                node_id.clone(),
+                EdgeKind::LedTo,
+            ));
+            self.stats.edge_count += 1;
+        }
+
+        // Also chain from the previous node for temporal ordering
+        if let Some(prev) = &self.last_node {
+            if self.current_goal.as_ref() != Some(prev) {
+                self.edges.push(GraphEdge::new(
+                    prev.clone(),
+                    node_id.clone(),
+                    EdgeKind::LedTo,
+                ));
+                self.stats.edge_count += 1;
+            }
+        }
+
         self.push_node(node);
         node_id
     }

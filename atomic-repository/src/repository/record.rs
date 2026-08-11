@@ -80,8 +80,62 @@ impl Repository {
             status.untracked_count(),
         );
 
-        // Filter to recordable files
-        let files_to_record = filter_files(status.entries(), &options);
+        // Refuse to record files that still contain conflict markers, so an
+        // unresolved merge is never baked into history. This runs over the
+        // raw status (before the recordable filter) so it also catches files
+        // reported as Conflicted. Overridable via
+        // `RecordOptions::allow_conflict_markers`.
+        if !options.get_allow_conflict_markers() {
+            for entry in status.entries() {
+                let is_directory = entry.details().map(|d| d == "directory").unwrap_or(false);
+                if is_directory {
+                    continue;
+                }
+                if !matches!(
+                    entry.status(),
+                    FileStatus::Added | FileStatus::Modified | FileStatus::Conflicted
+                ) {
+                    continue;
+                }
+                let path = entry.path().to_string_lossy().to_string();
+                if !options.should_include(&path) {
+                    continue;
+                }
+                let full_path = self.root.join(&path);
+                if let Ok(content) = std::fs::read(&full_path) {
+                    if let Some(line) = super::materialize::first_conflict_marker_line(&content) {
+                        return Err(RecordError::ConflictMarkersPresent { path, line });
+                    }
+                }
+            }
+        }
+
+        // Filter to recordable files. When conflict markers are explicitly
+        // allowed, remap Conflicted entries to Modified so they remain
+        // recordable (the file's underlying change is a modification).
+        let remapped_entries: Vec<FileStatusEntry>;
+        let entries_for_filter: &[FileStatusEntry] = if options.get_allow_conflict_markers() {
+            remapped_entries = status
+                .entries()
+                .iter()
+                .map(|e| {
+                    if e.status() == FileStatus::Conflicted {
+                        let mut m =
+                            FileStatusEntry::new(e.path().to_path_buf(), FileStatus::Modified);
+                        if let Some(inode) = e.inode() {
+                            m.set_inode(inode);
+                        }
+                        m
+                    } else {
+                        e.clone()
+                    }
+                })
+                .collect();
+            &remapped_entries
+        } else {
+            status.entries()
+        };
+        let files_to_record = filter_files(entries_for_filter, &options);
 
         log::debug!(
             "record: filter_files returned {} recordable files",
@@ -95,6 +149,78 @@ impl Repository {
             return Err(RecordError::NothingToRecord);
         }
 
+        // ── Rename detection (Stage 1: git-style raw rename) ──────────────
+        //
+        // A tracked path now missing from disk (Deleted) whose byte-identical
+        // content reappears at an untracked on-disk path (Untracked) is a
+        // RENAME, not a delete+add. Pair them and emit a single
+        // `GraphOp::FileMove` that reuses the ORIGINAL inode (preserving
+        // history/blame), instead of a FileDel + FileAdd that would allocate a
+        // fresh inode and lose the connection.
+        //
+        // The old path is still in TREE (a raw `fs::rename` never touches
+        // tracking), so globalize's FileMove emitter can resolve the inode via
+        // `get_inode(old_path)` unchanged. The `atomic mv` command eagerly
+        // rewrites TREE and is therefore NOT covered here — that is Stage 2
+        // (see docs/MERGE-CONFLICT-RUBRIC.md §6.7).
+        //
+        // `renamed_from` collects the old (Deleted) paths that were reclassified
+        // as moves so the main loop skips deleting them.
+        let mut renamed_from: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut rename_moves: Vec<(String, String, atomic_core::types::Inode)> = Vec::new();
+        {
+            // Candidate destinations: untracked files present on disk.
+            let mut untracked: Vec<(String, Vec<u8>)> = Vec::new();
+            for e in status.entries() {
+                if e.status() != FileStatus::Untracked {
+                    continue;
+                }
+                let p = e.path().to_string_lossy().to_string();
+                if !options.should_include(&p) {
+                    continue;
+                }
+                if let Ok(bytes) = std::fs::read(self.root.join(&p)) {
+                    untracked.push((p, bytes));
+                }
+            }
+            if !untracked.is_empty() {
+                let mut used_new: std::collections::HashSet<usize> =
+                    std::collections::HashSet::new();
+                for f in &files_to_record {
+                    if f.status() != FileStatus::Deleted {
+                        continue;
+                    }
+                    if f.details().map(|d| d == "directory").unwrap_or(false) {
+                        continue; // directory renames are out of scope for Stage 1
+                    }
+                    let old_path = f.path().to_string_lossy().to_string();
+                    // The deleted file's content as the graph still holds it.
+                    let old_bytes = match self.get_file_content(&old_path) {
+                        Ok(Some(b)) => b,
+                        _ => continue,
+                    };
+                    // Pair with the first unused untracked file of identical bytes.
+                    let matched = untracked.iter().enumerate().find(|(i, (_, nb))| {
+                        !used_new.contains(i) && nb.len() == old_bytes.len() && **nb == old_bytes
+                    });
+                    let Some((idx, (new_path, _))) = matched else {
+                        continue;
+                    };
+                    let new_path = new_path.clone();
+                    let inode = match f.inode() {
+                        Some(ino) => ino,
+                        None => match self.get_file_inode(&old_path) {
+                            Ok(Some(ino)) => ino,
+                            _ => continue,
+                        },
+                    };
+                    used_new.insert(idx);
+                    renamed_from.insert(old_path.clone());
+                    rename_moves.push((old_path, new_path, inode));
+                }
+            }
+        }
+
         // Statistics tracking
         let mut stats = RecordStats::new();
         let mut recorded_files: Vec<RecordedFile> = Vec::new();
@@ -102,6 +228,25 @@ impl Repository {
         let mut deleted_paths: Vec<String> = Vec::new();
         let mut skipped_paths: Vec<String> = Vec::new();
         let mut errors: Vec<(String, String)> = Vec::new();
+
+        // Emit a FileMove RecordedFile for each detected rename. globalize's
+        // Moved branch turns each into a single `GraphOp::FileMove` (reusing the
+        // original inode); write_recorded then updates TREE (old → new).
+        for (old_path, new_path, inode) in &rename_moves {
+            let mut recorded = RecordedFile::new(new_path);
+            recorded.set_kind(atomic_core::record::workflow::DetectionKind::Moved);
+            recorded.set_old_path(old_path.clone());
+            recorded.set_inode(*inode);
+            if let Ok(txn) = self.pristine.read_txn() {
+                if let Ok(Some(pos)) = txn.inode_position(*inode) {
+                    recorded.set_position(pos);
+                }
+            }
+            stats.files_recorded += 1;
+            stats.vertices_added += 1; // new name vertex
+            recorded_paths.push(new_path.clone());
+            recorded_files.push(recorded);
+        }
 
         let core_options = options.to_core_options();
 
@@ -147,6 +292,13 @@ impl Repository {
             let path = entry.path().to_string_lossy().to_string();
             let full_path = self.root.join(&path);
             let file_t0 = std::time::Instant::now();
+
+            // Skip the old side of a detected rename: it was reclassified as a
+            // FileMove above, so recording it as a Deleted here would emit a
+            // spurious FileDel and drop the inode.
+            if renamed_from.contains(&path) {
+                continue;
+            }
 
             // Check if this is a directory (from the details field)
             let is_directory = entry.details().map(|d| d == "directory").unwrap_or(false);
@@ -800,6 +952,20 @@ impl Repository {
                             let _ = idx_txn.del_file_index(path_str);
                         }
 
+                        // Clear persisted conflict state for recorded files:
+                        // recording without markers IS the resolution.
+                        let record_view =
+                            options.get_view().unwrap_or(&self.current_view).to_string();
+                        if let Ok(Some(view)) = idx_txn.get_view(&record_view) {
+                            for path_str in outcome.recorded_files() {
+                                let clean_path =
+                                    path_str.strip_suffix("/ (directory)").unwrap_or(path_str);
+                                if let Ok(Some(inode)) = idx_txn.get_inode(clean_path) {
+                                    let _ = idx_txn.del_conflicts(view.id, inode.get());
+                                }
+                            }
+                        }
+
                         let _ = idx_txn.commit();
                         if trace_record {
                             eprintln!(
@@ -836,11 +1002,19 @@ impl Repository {
             }
         }
 
-        // Auto-enrich KG with the new change (best-effort)
+        // Auto-update the enrich database (KG + content search index) with the
+        // new change (best-effort). The content index step is a no-op unless an
+        // index already exists, so this maintains — never builds — it.
         if options.get_enrich_kg() && outcome.was_saved() {
             let hash = *outcome.hash();
             if let Err(e) = self.kg_enrich_change(&hash) {
                 log::debug!("KG enrich for change: {}", e);
+            }
+            if let Err(e) = crate::content_search::update_content_index_paths(
+                self.root(),
+                outcome.recorded_files(),
+            ) {
+                log::debug!("content index update for change: {}", e);
             }
         }
 

@@ -7,12 +7,14 @@
 //! - Cherry-picking specific changes
 
 use clap::{Args, Subcommand};
+use clap_complete::engine::ArgValueCompleter;
 
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::{
     CrossViewInsertOptions, CrossViewInsertOutcome, InsertOptions, Repository,
 };
 
+use crate::commands::complete::{complete_change_hashes, complete_view_names};
 use crate::commands::{format_hash, require_repository};
 use crate::error::{CliError, CliResult};
 use crate::output;
@@ -24,21 +26,31 @@ use crate::output;
 /// This command inserts changes into the repository graph. It supports several
 /// modes of operation:
 ///
+/// - **Bare `atomic insert`** (no arguments): promote the current view's
+///   changes into its parent view. This is the "I'm done with this draft,
+///   land it" gesture.
 /// - Insert a single change by hash
-/// - Insert all changes from one view to another
-/// - Insert changes up to a specific tag
-/// - Cherry-pick specific changes
+/// - Insert all changes from one view to another (`from-view`)
+/// - Insert changes up to a specific tag (`tag`)
+/// - Cherry-pick specific changes (`pick`)
 #[derive(Debug, Args)]
 pub struct Insert {
     #[command(subcommand)]
     command: Option<InsertSubcommand>,
 
     /// Hash of the change to insert (when not using subcommands).
-    #[arg(value_name = "CHANGE")]
+    ///
+    /// Omit entirely to promote the current view's changes into its parent
+    /// view (see the command-level docs).
+    #[arg(value_name = "CHANGE", add = ArgValueCompleter::new(complete_change_hashes))]
     change: Option<String>,
 
-    /// View to insert the change into (default: current view).
-    #[arg(long)]
+    /// Target view.
+    ///
+    /// For `atomic insert <hash>` this is the view the change is inserted
+    /// into (default: current view). For the bare `atomic insert` promotion
+    /// it overrides the target (default: the current view's parent).
+    #[arg(long, visible_alias = "to", add = ArgValueCompleter::new(complete_view_names))]
     view: Option<String>,
 
     /// Insert dependencies automatically.
@@ -49,6 +61,14 @@ pub struct Insert {
     #[arg(long)]
     allow_conflicts: bool,
 
+    /// Preview the promotion without inserting anything.
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+
+    /// Skip the confirmation prompt when promoting between two shared views.
+    #[arg(long)]
+    confirm: bool,
+
     /// Repository path.
     #[arg(short = 'R', long)]
     repository: Option<String>,
@@ -57,32 +77,36 @@ pub struct Insert {
 /// Insert subcommands for cross-view operations.
 #[derive(Debug, Subcommand)]
 pub enum InsertSubcommand {
-    /// Insert changes from one view to another.
-    #[command(name = "from-view")]
-    FromView(FromViewArgs),
+    /// Insert all changes from another view.
+    ///
+    /// `from-view` is kept as an alias for backward compatibility.
+    #[command(name = "view", alias = "from-view")]
+    View(ViewArgs),
 
     /// Insert changes up to a specific tag.
     #[command(name = "tag")]
     Tag(TagArgs),
 
-    /// Cherry-pick specific changes.
-    #[command(name = "pick")]
-    Pick(PickArgs),
+    /// Insert specific change(s) by hash.
+    ///
+    /// `pick` is kept as an alias for backward compatibility.
+    #[command(name = "change", alias = "pick")]
+    Change(ChangeArgs),
 
     /// Show what would be inserted (dry run).
     #[command(name = "preview")]
     Preview(PreviewArgs),
 }
 
-/// Arguments for inserting from one view to another.
+/// Arguments for inserting all changes from another view.
 #[derive(Debug, Args)]
-pub struct FromViewArgs {
+pub struct ViewArgs {
     /// Source view to copy changes from.
-    #[arg(value_name = "SOURCE")]
+    #[arg(value_name = "SOURCE", add = ArgValueCompleter::new(complete_view_names))]
     from_view: String,
 
     /// Target view to insert changes into (default: current view).
-    #[arg(long)]
+    #[arg(long, visible_alias = "to", add = ArgValueCompleter::new(complete_view_names))]
     to_view: Option<String>,
 
     /// Insert dependencies automatically.
@@ -94,7 +118,7 @@ pub struct FromViewArgs {
     allow_conflicts: bool,
 
     /// Perform a dry run (don't actually insert).
-    #[arg(long)]
+    #[arg(short = 'n', long)]
     dry_run: bool,
 }
 
@@ -106,11 +130,11 @@ pub struct TagArgs {
     tag_name: String,
 
     /// Source view containing the tag.
-    #[arg(long)]
+    #[arg(long, add = ArgValueCompleter::new(complete_view_names))]
     from_view: Option<String>,
 
     /// Target view to insert changes into (default: current view).
-    #[arg(long)]
+    #[arg(long, visible_alias = "to", add = ArgValueCompleter::new(complete_view_names))]
     to_view: Option<String>,
 
     /// Insert dependencies automatically.
@@ -122,19 +146,19 @@ pub struct TagArgs {
     allow_conflicts: bool,
 
     /// Perform a dry run (don't actually insert).
-    #[arg(long)]
+    #[arg(short = 'n', long)]
     dry_run: bool,
 }
 
-/// Arguments for cherry-picking specific changes.
+/// Arguments for inserting specific change(s) by hash.
 #[derive(Debug, Args)]
-pub struct PickArgs {
-    /// Hashes of changes to cherry-pick.
-    #[arg(value_name = "CHANGES", required = true)]
+pub struct ChangeArgs {
+    /// Hashes of changes to insert.
+    #[arg(value_name = "CHANGES", required = true, add = ArgValueCompleter::new(complete_change_hashes))]
     changes: Vec<String>,
 
     /// Target view to insert changes into (default: current view).
-    #[arg(long)]
+    #[arg(long, visible_alias = "to", add = ArgValueCompleter::new(complete_view_names))]
     to_view: Option<String>,
 
     /// Insert dependencies automatically.
@@ -150,11 +174,11 @@ pub struct PickArgs {
 #[derive(Debug, Args)]
 pub struct PreviewArgs {
     /// Source view to preview changes from.
-    #[arg(value_name = "SOURCE")]
+    #[arg(value_name = "SOURCE", add = ArgValueCompleter::new(complete_view_names))]
     from_view: String,
 
     /// Target view (default: current view).
-    #[arg(long)]
+    #[arg(long, visible_alias = "to", add = ArgValueCompleter::new(complete_view_names))]
     to_view: Option<String>,
 
     /// Optional tag to limit preview up to.
@@ -170,18 +194,18 @@ impl crate::commands::Command for Insert {
         let repo = require_repository(repo_path)?;
 
         match &self.command {
-            Some(InsertSubcommand::FromView(args)) => run_from_view(&repo, args),
+            Some(InsertSubcommand::View(args)) => run_view_insert(&repo, args),
             Some(InsertSubcommand::Tag(args)) => run_tag(&repo, args),
-            Some(InsertSubcommand::Pick(args)) => run_pick(&repo, args),
+            Some(InsertSubcommand::Change(args)) => run_change_insert(&repo, args),
             Some(InsertSubcommand::Preview(args)) => run_preview(&repo, args),
             None => {
-                // Insert a single change
                 if let Some(ref change_str) = self.change {
+                    // Insert a single change into the current (or --view) view.
                     run_single_insert(&repo, change_str, self)
                 } else {
-                    Err(CliError::InvalidArgument {
-                        message: "Missing CHANGE argument. Provide a change hash or use a subcommand (from-view, tag, pick)".to_string(),
-                    })
+                    // No change and no subcommand: promote the current view's
+                    // changes into its parent view.
+                    run_promote_to_parent(&repo, self)
                 }
             }
         }
@@ -231,13 +255,134 @@ fn run_single_insert(repo: &Repository, change_str: &str, args: &Insert) -> CliR
             "{} files updated, {} directories",
             output_result.files_written, output_result.directories_created
         ));
+        print_conflict_summary(repo);
     }
 
     Ok(())
 }
 
-/// Insert changes from one view to another.
-fn run_from_view(repo: &Repository, args: &FromViewArgs) -> CliResult<()> {
+/// Promote the current view's changes into its parent view.
+///
+/// This is the behavior of a bare `atomic insert` (no change hash and no
+/// subcommand). The source is always the current view; the target defaults to
+/// the current view's parent but can be overridden with `--to`/`--view`.
+///
+/// The working copy is intentionally NOT rematerialized: the target view is
+/// not checked out, so the current view's on-disk state is unchanged.
+fn run_promote_to_parent(repo: &Repository, args: &Insert) -> CliResult<()> {
+    let source = repo.current_view().to_string();
+    let source_info = repo
+        .get_view_info(&source)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
+
+    // Resolve the target: explicit --to/--view, else the current view's parent.
+    let target = match args.view.as_deref() {
+        Some(v) => v.to_string(),
+        None => source_info
+            .parent_name
+            .clone()
+            .ok_or_else(|| CliError::InvalidArgument {
+                message: format!(
+                    "'{source}' is a root view — there is no parent to insert into.\n  \
+                     Use 'atomic insert from-view <source>' or pass --to <view> \
+                     to choose a target."
+                ),
+            })?,
+    };
+
+    if target == source {
+        return Err(CliError::InvalidArgument {
+            message: format!(
+                "Source and target are the same view ('{source}'). \
+                 Pass --to <view> to insert somewhere else."
+            ),
+        });
+    }
+
+    // Figure out what would move so we can show a count and short-circuit.
+    let missing = repo
+        .get_missing_changes_between(&source, Some(&target))
+        .map_err(|e| CliError::Conflict {
+            description: e.to_string(),
+        })?;
+
+    if missing.is_empty() {
+        output::print_success(&format!(
+            "Already even with '{target}' — nothing to insert."
+        ));
+        return Ok(());
+    }
+
+    output::print_info(&format!(
+        "Inserting {} change(s): {source} → {target}",
+        missing.len()
+    ));
+
+    // Dry run: list the changes and stop before mutating.
+    if args.dry_run {
+        println!();
+        for (i, hash) in missing.iter().enumerate() {
+            if let Ok(change) = repo.load_change(hash) {
+                let message = &change.hashed.header.message;
+                let short_msg = if message.len() > 50 {
+                    format!("{}...", &message[..47])
+                } else {
+                    message.to_string()
+                };
+                println!("  {}. {} {}", i + 1, format_hash(hash, true), short_msg);
+            } else {
+                println!("  {}. {}", i + 1, format_hash(hash, true));
+            }
+        }
+        println!();
+        output::print_info("Dry run: no changes inserted. Re-run without --dry-run to insert.");
+        return Ok(());
+    }
+
+    // Guard: promoting between two shared views is a bigger deal than landing
+    // a draft, so require confirmation unless --confirm was passed.
+    let target_info = repo
+        .get_view_info(&target)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
+    let both_shared = source_info.scope.is_shared() && target_info.scope.is_shared();
+    if both_shared && !args.confirm {
+        let prompt = format!(
+            "Insert {} change(s) from shared view '{source}' into shared view '{target}'?",
+            missing.len()
+        );
+        let confirmed = dialoguer::Confirm::new()
+            .with_prompt(&prompt)
+            .default(false)
+            .interact()
+            .map_err(|_| CliError::InvalidArgument {
+                message: "Refusing to insert between two shared views without \
+                          confirmation. Re-run with --confirm to proceed \
+                          non-interactively."
+                    .to_string(),
+            })?;
+        if !confirmed {
+            output::print_info("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let options = CrossViewInsertOptions::new(&source, &target)
+        .with_dependencies(args.deps)
+        .allow_conflicts(args.allow_conflicts);
+
+    let outcome = repo
+        .insert_from_view(options)
+        .map_err(|e| CliError::Conflict {
+            description: e.to_string(),
+        })?;
+
+    print_cross_view_outcome(&outcome, false);
+
+    Ok(())
+}
+
+/// Insert all changes from another view (the `insert view` subcommand).
+fn run_view_insert(repo: &Repository, args: &ViewArgs) -> CliResult<()> {
     let to_view = args
         .to_view
         .clone()
@@ -299,6 +444,7 @@ fn run_from_view(repo: &Repository, args: &FromViewArgs) -> CliResult<()> {
                 output_result.files_written, output_result.directories_created
             ),
         );
+        print_conflict_summary(repo);
     }
 
     Ok(())
@@ -367,13 +513,14 @@ fn run_tag(repo: &Repository, args: &TagArgs) -> CliResult<()> {
                 output_result.files_written, output_result.directories_created
             ),
         );
+        print_conflict_summary(repo);
     }
 
     Ok(())
 }
 
-/// Cherry-pick specific changes.
-fn run_pick(repo: &Repository, args: &PickArgs) -> CliResult<()> {
+/// Insert specific change(s) by hash (the `insert change` subcommand).
+fn run_change_insert(repo: &Repository, args: &ChangeArgs) -> CliResult<()> {
     let to_view = args
         .to_view
         .clone()
@@ -410,6 +557,7 @@ fn run_pick(repo: &Repository, args: &PickArgs) -> CliResult<()> {
             "{} files updated, {} directories",
             output_result.files_written, output_result.directories_created
         ));
+        print_conflict_summary(repo);
     }
 
     Ok(())
@@ -473,7 +621,7 @@ fn run_preview(repo: &Repository, args: &PreviewArgs) -> CliResult<()> {
         }
         println!();
         output::print_info(&format!(
-            "Run 'atomic insert from-view {}' to insert these changes.",
+            "Run 'atomic insert view {}' to insert these changes.",
             args.from_view
         ));
     }
@@ -529,8 +677,40 @@ fn print_insert_outcome(
 
     if has_conflicts {
         println!();
-        output::print_warning("Conflicts detected. Run 'atomic status' to see details.");
+        output::print_warning("Conflicts detected. Run 'atomic conflicts' to see details.");
     }
+}
+
+/// After materializing the current view, list any conflicted files inline so
+/// the user does not have to run a second command to find them.
+fn print_conflict_summary(repo: &Repository) {
+    let conflicts = match repo.list_conflicts() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if conflicts.is_empty() {
+        return;
+    }
+    println!();
+    let file_word = if conflicts.len() == 1 {
+        "file"
+    } else {
+        "files"
+    };
+    output::print_warning(&format!(
+        "{} conflicted {} — resolve markers, then record:",
+        conflicts.len(),
+        file_word
+    ));
+    for (path, records) in &conflicts {
+        let where_ = records
+            .first()
+            .and_then(|c| c.line)
+            .map(|l| format!(" (line {})", l))
+            .unwrap_or_default();
+        println!("    {}{}", path, where_);
+    }
+    output::print_hint("See 'atomic conflicts' for details.");
 }
 
 /// Print the outcome of a cross-view insert operation.
@@ -571,7 +751,7 @@ fn print_cross_view_outcome(outcome: &CrossViewInsertOutcome, dry_run: bool) {
 
     if outcome.has_conflicts {
         println!();
-        output::print_warning("Conflicts detected. Run 'atomic status' to see details.");
+        output::print_warning("Conflicts detected. Run 'atomic conflicts' to see details.");
     }
 }
 
@@ -584,7 +764,7 @@ mod tests {
     #[test]
     fn test_insert_subcommand_variants() {
         // Just verify the enums compile correctly
-        let _ = InsertSubcommand::FromView(FromViewArgs {
+        let _ = InsertSubcommand::View(ViewArgs {
             from_view: "feature".to_string(),
             to_view: Some("main".to_string()),
             deps: true,
@@ -601,7 +781,7 @@ mod tests {
             dry_run: false,
         });
 
-        let _ = InsertSubcommand::Pick(PickArgs {
+        let _ = InsertSubcommand::Change(ChangeArgs {
             changes: vec!["abc123".to_string()],
             to_view: None,
             deps: true,
@@ -616,8 +796,8 @@ mod tests {
     }
 
     #[test]
-    fn test_from_view_args_defaults() {
-        let args = FromViewArgs {
+    fn test_view_args_defaults() {
+        let args = ViewArgs {
             from_view: "feature".to_string(),
             to_view: None,
             deps: true,
@@ -652,8 +832,8 @@ mod tests {
     }
 
     #[test]
-    fn test_pick_args_multiple_changes() {
-        let args = PickArgs {
+    fn test_change_args_multiple_changes() {
+        let args = ChangeArgs {
             changes: vec![
                 "abc123".to_string(),
                 "def456".to_string(),

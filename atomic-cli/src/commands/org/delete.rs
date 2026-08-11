@@ -137,26 +137,26 @@ impl OrgDelete {
 
 /// Remove references to a deleted org from the local global config.
 ///
-/// Returns the side effects performed so the caller can print appropriate
-/// hints. Specifically:
-///   - If `server.default_org == Some(slug)`, set it to `None` and hint.
-///   - Remove `server.default_workspaces[slug]` if present.
+/// Operates on the **active** server profile (the same one reads/writes
+/// resolve to), so cleanup stays consistent when a named profile is active.
+/// Specifically:
+///   - If `default_org == Some(slug)`, set it to `None` and hint.
+///   - Remove `default_workspaces[slug]` if present.
 fn clean_up_local_config(deleted_slug: &str) -> CliResult<()> {
     let mut config = GlobalConfig::load()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {e}")))?;
 
+    let (server, _name) = config
+        .resolve_server_mut(None)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("{e}")))?;
+
     let mut changed = false;
-    let was_default_org = config.server.default_org.as_deref() == Some(deleted_slug);
+    let was_default_org = server.default_org.as_deref() == Some(deleted_slug);
     if was_default_org {
-        config.server.default_org = None;
+        server.default_org = None;
         changed = true;
     }
-    if config
-        .server
-        .default_workspaces
-        .remove(deleted_slug)
-        .is_some()
-    {
+    if server.default_workspaces.remove(deleted_slug).is_some() {
         changed = true;
     }
 

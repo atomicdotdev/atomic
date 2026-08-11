@@ -384,4 +384,118 @@ mod tests {
             via_core.proof.as_ref().map(|p| &p.proof_value)
         );
     }
+
+    /// A node shaped the way pre-widening attestations were: `satisfies` is a
+    /// bare string, not a list. Built at the Value level so the fixture is
+    /// genuinely scalar on the wire — which is exactly how the old typed struct
+    /// (`satisfies: Option<String>`) serialized it.
+    fn legacy_scalar_satisfies_value() -> Value {
+        json!({
+            "@context": CONTEXT_URL,
+            "@type": "Intent",
+            "@id": "urn:atomic:intent:legacy-1",
+            "humanKey": "LEG-1",
+            "title": "A pre-widening intent",
+            "status": "backlog",
+            "createdAt": "2026-07-20T14:50:41Z",
+            "hasAcceptanceCriterion": [{
+                "@type": "AcceptanceCriterion",
+                "@id": "urn:atomic:ac:leg-1-ac-1",
+                "text": "It works.",
+                "acStatus": "open"
+            }],
+            "hasTask": [{
+                "@type": "Task",
+                "@id": "urn:atomic:task:leg-1-1",
+                "text": "Do the thing.",
+                "taskStatus": "open",
+                "satisfies": "urn:atomic:ac:leg-1-ac-1"
+            }]
+        })
+    }
+
+    #[test]
+    fn legacy_scalar_satisfies_deserializes_and_still_verifies() {
+        // The regression this locks down: `satisfies` was widened from
+        // `Option<String>` to a list, which made every attestation signed before
+        // that change fail to deserialize — so valid signatures were reported as
+        // absent and the intent showed as unattested.
+        let (id, kp) = dev_identity();
+        let attested = attest_value(legacy_scalar_satisfies_value(), &id, &kp);
+
+        // Sanity: the fixture really is scalar on the wire, or this test proves
+        // nothing about the shape we care about.
+        assert!(attested["hasTask"][0]["satisfies"].is_string());
+
+        // 1. It deserializes at all — this is what used to fail outright.
+        let node: CanonicalNode =
+            serde_json::from_value(attested.clone()).expect("legacy scalar must deserialize");
+        assert_eq!(
+            node.has_task[0].satisfies.as_slice(),
+            vec!["urn:atomic:ac:leg-1-ac-1".to_string()],
+            "a scalar must read as a one-element slice"
+        );
+
+        // 2. Re-serializing reproduces the signed bytes EXACTLY. This is the
+        //    property that rules out the tempting `"x"` -> `["x"]` shim: the
+        //    signature covers `to_value()` output, so any normalization would
+        //    change the content hash and turn a valid signature into a reported
+        //    forgery.
+        assert_eq!(
+            node.to_value(),
+            attested,
+            "round-trip must preserve the scalar shape byte-for-byte"
+        );
+        assert_eq!(
+            jcs::canonicalize(&node.signing_value()),
+            jcs::canonicalize(&signing_view(&attested)),
+            "canonical signing bytes must be unchanged by the round-trip"
+        );
+
+        // 3. And therefore the original signature verifies through the typed path.
+        verify(&node, &kp.public).expect("legacy attestation must still verify");
+    }
+
+    #[test]
+    fn normalizing_a_legacy_scalar_would_break_verification() {
+        // Guards the reasoning above rather than the code: it demonstrates why
+        // `Satisfies` preserves representation. If someone later "simplifies" the
+        // enum back to a plain `Vec`, this test documents the cost — verification
+        // fails on data that is cryptographically sound.
+        let (id, kp) = dev_identity();
+        let attested = attest_value(legacy_scalar_satisfies_value(), &id, &kp);
+
+        let mut normalized = attested.clone();
+        normalized["hasTask"][0]["satisfies"] =
+            json!([attested["hasTask"][0]["satisfies"].as_str().unwrap()]);
+
+        let err = verify_value(&normalized, &kp.public)
+            .expect_err("normalizing the shape must break the content hash");
+        assert!(
+            matches!(err, CanonicalError::HashMismatch { .. }),
+            "expected a hash mismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn newly_lifted_tasks_never_mint_the_scalar_shape() {
+        // The scalar variant exists only to round-trip history. Anything we
+        // author must serialize as a list, so the old shape does not spread.
+        let node = crate::lift::lift_intent(
+            &serde_json::from_value(json!({
+                "id": "NEW-1",
+                "uid": "01KYWH0XDVKKYE4PX0ZENJYB5G",
+                "title": "A new intent",
+                "status": "backlog"
+            }))
+            .unwrap(),
+            ":::task{#t-1 status=open satisfies=new-1-ac-1}\nWork.\n:::",
+        )
+        .expect("lift must succeed");
+
+        assert!(
+            node.to_value()["hasTask"][0]["satisfies"].is_array(),
+            "a freshly lifted task must serialize `satisfies` as an array"
+        );
+    }
 }

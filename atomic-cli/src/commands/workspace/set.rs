@@ -46,7 +46,7 @@ use clap::Parser;
 
 use atomic_config::GlobalConfig;
 
-use crate::commands::client::{build_client_with_org, remote_err};
+use crate::commands::client::{build_client_with_org, remote_err, resolve_org_with_server};
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success};
@@ -112,10 +112,9 @@ impl WorkspaceSet {
             CliError::Internal(anyhow::anyhow!("Failed to load global config: {e}"))
         })?;
 
-        // Determine the target org. Explicit --org wins; otherwise fall
-        // back to the configured default. We don't go through `resolve_org`
-        // here because we want a distinct error message tied to *this*
-        // command's flow.
+        // Determine the target org. Explicit --org wins; otherwise resolve
+        // the active server profile's default org (falling back to the
+        // identity's personal org), so this matches what read commands use.
         let target_org = match self.org.as_deref() {
             Some(o) if !o.is_empty() => o.to_string(),
             Some(_) => {
@@ -123,15 +122,12 @@ impl WorkspaceSet {
                     message: "Organization slug cannot be empty.".to_string(),
                 });
             }
-            None => config
-                .server
-                .default_org
-                .clone()
-                .ok_or_else(|| CliError::InvalidArgument {
-                    message: "No default org set. Use --org or first run: \
-                              atomic org set <slug>"
-                        .to_string(),
-                })?,
+            None => {
+                let (server, _name) = config
+                    .resolve_server(None)
+                    .map_err(|e| CliError::Internal(anyhow::anyhow!("{e}")))?;
+                resolve_org_with_server(None, server)?
+            }
         };
 
         // Validate against the server first so a bad slug fails fast
@@ -142,10 +138,16 @@ impl WorkspaceSet {
             verify(&target_org, &self.slug)?;
         }
 
-        let previous = config
-            .server
+        // Write into the *active* server profile so the default is read back
+        // by commands that resolve the same profile.
+        let (server, _profile_name) = config
+            .resolve_server_mut(None)
+            .map_err(|e| CliError::Internal(anyhow::anyhow!("{e}")))?;
+
+        let previous = server
             .default_workspaces
             .insert(target_org.clone(), self.slug.clone());
+        let current_org = server.default_org.clone();
 
         config.save().map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to save global config: {e}"))
@@ -164,7 +166,7 @@ impl WorkspaceSet {
 
         // If the user set a workspace for a non-current org, remind them
         // that it won't take effect until they switch orgs.
-        if let Some(current_org) = config.server.default_org.as_deref() {
+        if let Some(current_org) = current_org.as_deref() {
             if current_org != target_org {
                 print_hint(&format!(
                     "Current default org is '{current_org}' — \
@@ -255,12 +257,16 @@ mod tests {
     // mutated. Protects against accidentally reordering verify / save in
     // future refactors.
     //
-    // Tests touch HOME to redirect `GlobalConfig::{load,save}` at an
-    // isolated config dir, so `#[serial]` is required.
+    // Tests redirect `ATOMIC_CONFIG_DIR` to isolate `GlobalConfig::{load,save}`
+    // at a tempdir, so `#[serial]` is required.
     // -----------------------------------------------------------------
 
     use serial_test::serial;
 
+    /// Redirect `ATOMIC_CONFIG_DIR` to a tempdir for the lifetime of the guard,
+    /// isolating `GlobalConfig` from the real user config. `ATOMIC_CONFIG_DIR`
+    /// (not `HOME`) is used because `atomic_config` resolves its path via that
+    /// override — `HOME` alone does not isolate on Windows.
     struct HomeGuard {
         _tmp: tempfile::TempDir,
         original: Option<std::ffi::OsString>,
@@ -269,18 +275,12 @@ mod tests {
     impl HomeGuard {
         fn new() -> Self {
             let tmp = tempfile::tempdir().unwrap();
-            let original = std::env::var_os("HOME");
-            // SAFETY: env mutation is technically UB if accessed
-            // concurrently from another thread. `#[serial]` serializes
-            // these tests against each other but does NOT prevent
-            // unmarked tests elsewhere in the workspace from reading
-            // HOME concurrently. No other test in this crate currently
-            // mutates or reads HOME outside its own `#[serial]` block,
-            // so the race window is empty today. A path-aware
-            // GlobalConfig API would eliminate this — tracked as a
-            // follow-up.
+            let original = std::env::var_os("ATOMIC_CONFIG_DIR");
+            // SAFETY: env mutation is technically UB under concurrent access.
+            // `#[serial]` serializes these tests, and no other test reads
+            // ATOMIC_CONFIG_DIR outside its own `#[serial]` block.
             unsafe {
-                std::env::set_var("HOME", tmp.path());
+                std::env::set_var("ATOMIC_CONFIG_DIR", tmp.path());
             }
             Self {
                 _tmp: tmp,
@@ -294,8 +294,8 @@ mod tests {
             // SAFETY: see HomeGuard::new.
             unsafe {
                 match &self.original {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
+                    Some(v) => std::env::set_var("ATOMIC_CONFIG_DIR", v),
+                    None => std::env::remove_var("ATOMIC_CONFIG_DIR"),
                 }
             }
         }

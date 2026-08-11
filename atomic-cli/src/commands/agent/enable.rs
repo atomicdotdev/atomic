@@ -27,9 +27,12 @@
 //! atomic agent enable --all
 //! ```
 
+use std::path::PathBuf;
+
 use clap::Args;
 
-use atomic_agent::hooks::AgentRegistry;
+use atomic_agent::hooks::{codex::CodexHook, AgentRegistry};
+use atomic_agent::integrations::Receipt;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::CliResult;
@@ -103,6 +106,49 @@ impl Enable {
             from: None,
         }
     }
+}
+
+/// Return the hook files managed by a Codex integration receipt.
+///
+/// Current receipts record the exact manifest target. The global default is
+/// retained for older receipts that predate the `settings` field.
+fn receipt_codex_hook_targets(receipt: &Receipt) -> Vec<PathBuf> {
+    let mut targets = Vec::new();
+    for settings in &receipt.settings {
+        if settings.command_prefix.contains("atomic agent hooks codex")
+            && !targets.contains(&settings.target)
+        {
+            targets.push(settings.target.clone());
+        }
+    }
+
+    if targets.is_empty() {
+        if let Some(path) = CodexHook::global_hooks_path() {
+            targets.push(path);
+        }
+    }
+    targets
+}
+
+/// Migrate stale Codex hooks in the settings files owned by an integration
+/// receipt. `None` means every receipt-managed target was already current.
+fn repair_stale_codex_receipt_hooks(
+    receipt: &Receipt,
+) -> atomic_agent::error::AgentResult<Option<usize>> {
+    let hook = CodexHook::new();
+    let stale_targets: Vec<PathBuf> = receipt_codex_hook_targets(receipt)
+        .into_iter()
+        .filter(|path| !hook.is_installed_at(path))
+        .collect();
+    if stale_targets.is_empty() {
+        return Ok(None);
+    }
+
+    let mut installed = 0;
+    for target in stale_targets {
+        installed += hook.install_at(&target, false)?;
+    }
+    Ok(Some(installed))
 }
 
 impl Command for Enable {
@@ -214,16 +260,41 @@ impl Command for Enable {
             // with --from. This supersedes the adapter's built-in install,
             // which remains as a fallback if the package can't be fetched.
             if let Some(spec) = atomic_agent::integrations::resolve(agent_name) {
-                let receipt_exists = atomic_agent::integrations::Receipt::load(agent_name)
-                    .map(|r| r.is_some())
-                    .unwrap_or(false);
+                let receipt = Receipt::load(agent_name).ok().flatten();
 
-                if receipt_exists && !self.force {
-                    println!(
-                        "  ✓ integration already installed for {}. Use --force to refresh.",
-                        agent.display_name(),
-                    );
-                    continue;
+                if let Some(ref receipt) = receipt {
+                    if !self.force {
+                        if *agent_name == "codex" {
+                            match repair_stale_codex_receipt_hooks(receipt) {
+                                Ok(Some(count)) => {
+                                    print_warning(
+                                        "Codex integration receipt exists, but its hook set is outdated; repaired the receipt-managed hooks from the current Atomic binary.",
+                                    );
+                                    print_success(&format!(
+                                        "Repaired {} hook{} for {}",
+                                        count,
+                                        if count == 1 { "" } else { "s" },
+                                        agent.display_name(),
+                                    ));
+                                    total_installed += count;
+                                    continue;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    return Err(crate::error::CliError::Internal(anyhow::anyhow!(
+                                        "Failed to repair receipt-managed Codex hooks: {}",
+                                        error
+                                    )));
+                                }
+                            }
+                        }
+
+                        println!(
+                            "  ✓ integration already installed for {}. Use --force to refresh.",
+                            agent.display_name(),
+                        );
+                        continue;
+                    }
                 }
 
                 match self.install_integration(agent_name, &spec) {
@@ -703,5 +774,48 @@ mod tests {
         let count3 = agent.install(dir.path()).unwrap();
         assert_eq!(count3, 8);
         assert!(agent.is_installed(dir.path()));
+    }
+
+    #[test]
+    fn test_receipt_managed_codex_repair_uses_recorded_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let global_target = dir.path().join("home/.codex/hooks.json");
+        std::fs::create_dir_all(global_target.parent().unwrap()).unwrap();
+        std::fs::write(
+            &global_target,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "hooks": {
+                    "Stop": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": "test -d .atomic || test -f .atomic-sandbox && atomic agent hooks codex stop || true"
+                        }]
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let receipt: Receipt = serde_json::from_value(serde_json::json!({
+            "schema": 1,
+            "agent": "codex",
+            "version": "0.1.0",
+            "cli_version": "0.12.1",
+            "installed_at": "2026-08-04T00:00:00Z",
+            "source": "test",
+            "files": [],
+            "settings": [{
+                "target": global_target,
+                "hooks_key": "hooks",
+                "command_prefix": "atomic agent hooks codex"
+            }]
+        }))
+        .unwrap();
+
+        let repaired = repair_stale_codex_receipt_hooks(&receipt).unwrap();
+        assert!(repaired.is_some_and(|count| count > 0));
+        assert!(CodexHook::new().is_installed_at(&global_target));
+        assert!(!dir.path().join("repo/.codex/hooks.json").exists());
     }
 }

@@ -193,10 +193,43 @@ impl TurnOrchestrator {
                             );
                         }
                     }
+                    // Record where the sandbox's view forked from. Not the
+                    // current view — inside a sandbox that IS the run's own
+                    // view, so it would name itself as its own parent. The
+                    // graph already knows: `sandbox create --from <base>`
+                    // stored the fork as the view's parent, so this is a read
+                    // of a recorded fact, and it stays within the constraints
+                    // above — no fork, no switch, nothing written.
+                    //
+                    // Without it a sandboxed session is the one kind that
+                    // reaches the ledger with `parent_view: null`, and every
+                    // reader downstream — `session show`, a UI grouping runs
+                    // by where they came from — has nothing to say about work
+                    // that plainly came from somewhere.
+                    match repo.get_view_info(&current) {
+                        Ok(info) => match info.parent_name {
+                            Some(parent) => session.set_parent_view(&parent),
+                            // A root view genuinely has no parent. Leaving the
+                            // field empty is the honest answer, not a failure.
+                            None => log::debug!(
+                                "Sandbox view '{}' is a root view — no parent to record",
+                                current,
+                            ),
+                        },
+                        Err(e) => log::debug!(
+                            "Could not read the parent of sandbox view '{}': {} — \
+                             continuing without it",
+                            current,
+                            e,
+                        ),
+                    }
+
                     log::info!(
-                        "Sandbox session {}: recording on provisioned view '{}' (no fork/switch)",
+                        "Sandbox session {}: recording on provisioned view '{}' \
+                         (forked from '{}'; no fork/switch)",
                         session_id,
                         current,
+                        session.parent_view.as_deref().unwrap_or("—"),
                     );
                     session.view_name = current;
                 }
@@ -240,8 +273,9 @@ impl TurnOrchestrator {
                     // Switch to the agent view so that all file writes during
                     // the session (tool calls, npm install, builds, etc.) happen
                     // while current_view points to the agent view. This ensures
-                    // status/add/record see the right view. session-end will
-                    // switch back to the user's view.
+                    // status/add/record see the right view. The working copy
+                    // stays on the agent view after session-end so the user
+                    // lands where the agent's work happened.
                     if let Err(e) = repo.align_to_view(&session.view_name) {
                         log::warn!(
                             "Could not align to agent view '{}': {} (non-fatal)",

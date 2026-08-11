@@ -74,7 +74,9 @@ use atomic_core::record::workflow::extract_filename;
 use atomic_core::record::workflow::graph_op::BuiltHunk;
 use atomic_core::record::workflow::GitDiffLine;
 use atomic_core::record::workflow::RecordedFile;
-use atomic_core::types::{ChangePosition, EdgeFlags, GraphNode, Hash as ContentHash, Position};
+use atomic_core::types::{
+    Base32, ChangePosition, EdgeFlags, GraphNode, Hash as ContentHash, Merkle, Position,
+};
 use atomic_repository::Repository;
 
 use crate::error::{CliError, CliResult};
@@ -97,12 +99,29 @@ pub struct ImportStats {
     pub empty_commits: usize,
     /// Number of merge commits with duplicate content.
     pub merge_commits: usize,
+    /// Commits skipped because they were created by `atomic git push` and
+    /// the view already contains the state they reference.
+    pub self_push_skipped: usize,
     /// Time spent in Phase 1 (parsing).
     pub phase1_duration: std::time::Duration,
     /// Time spent in Phase 2 (writing).
     pub phase2_duration: std::time::Duration,
     /// Files processed across all commits.
     pub files_processed: usize,
+}
+
+/// `atomic git push` trailers parsed from a commit message.
+///
+/// Used to recognize commits that Atomic itself created: the `Atomic-State`
+/// they carry is the Merkle state of the view at push time, so if that state
+/// already exists in the view, importing the commit would duplicate changes
+/// the view already has.
+#[derive(Debug, Clone)]
+pub struct PushTrailer {
+    /// Value of the `Atomic-View` trailer.
+    pub view: String,
+    /// Value of the `Atomic-State` trailer.
+    pub state: Merkle,
 }
 
 /// A parsed git commit ready for Phase 2 processing.
@@ -122,6 +141,38 @@ pub struct ParsedCommit {
     pub is_merge: bool,
     /// Whether git reported 0 files changed.
     pub is_empty: bool,
+    /// `atomic git push` trailers, when the commit message ends with them.
+    pub push_trailer: Option<PushTrailer>,
+}
+
+impl ParsedCommit {
+    /// Full commit message (subject + body), for trailer-aware
+    /// classification of merges and squashes.
+    fn full_message(&self) -> String {
+        match &self.metadata.description {
+            Some(desc) => format!("{}\n\n{}", self.metadata.message, desc),
+            None => self.metadata.message.clone(),
+        }
+    }
+}
+
+/// Whether to skip importing this commit because `atomic git push` created
+/// it and the target view already contains the state it represents.
+///
+/// The trailer's `Atomic-State` is the Merkle of the view's change sequence
+/// at push time; if that state is in the view, every change the commit
+/// carries is already there by definition. Importing it would duplicate
+/// them (the push → pull → import round trip).
+fn should_skip_self_push(parsed: &ParsedCommit, options: &ParallelImportOptions) -> bool {
+    if !options.incremental {
+        return false;
+    }
+    match &parsed.push_trailer {
+        Some(trailer) => {
+            trailer.view == options.target_view && options.known_states.contains(&trailer.state)
+        }
+        None => false,
+    }
 }
 
 /// Metadata extracted from a git commit.
@@ -203,6 +254,21 @@ pub struct ParallelImportOptions {
     /// duplicate file content are omitted, which significantly reduces change
     /// size and import time for large repositories.
     pub graph_only: bool,
+    /// Keep a foreign Atomic view's working copy untouched while importing.
+    ///
+    /// When an agent draft is current, the files on disk describe that draft,
+    /// not the Git branch view being updated. In that mode the importer must
+    /// not reconcile target tracking or target-driven FILE_INDEX deletions
+    /// against the draft working copy.
+    pub preserve_working_copy: bool,
+    /// The view being imported into (the branch name). Compared against the
+    /// `Atomic-View` trailer when skipping self-pushed commits.
+    pub target_view: String,
+    /// Merkle states already present in the target view, used to skip
+    /// commits created by `atomic git push`: such a commit carries the
+    /// view state it represents, and if that state is already known the
+    /// commit adds nothing. Only populated for incremental imports.
+    pub known_states: HashSet<Merkle>,
 }
 
 impl Default for ParallelImportOptions {
@@ -214,6 +280,9 @@ impl Default for ParallelImportOptions {
             ignored_path_patterns: Vec::new(),
             mainline_only: true,
             graph_only: false,
+            preserve_working_copy: false,
+            target_view: String::new(),
+            known_states: HashSet::new(),
         }
     }
 }
@@ -2211,6 +2280,7 @@ impl ParallelImporter {
             stats.changes_written += write_stats.changes_written;
             stats.empty_commits += write_stats.empty_commits;
             stats.merge_commits += write_stats.merge_commits;
+            stats.self_push_skipped += write_stats.self_push_skipped;
             stats.files_processed += write_stats.files_processed;
 
             commits_written +=
@@ -2246,6 +2316,18 @@ impl ParallelImporter {
             },
         ));
 
+        if stats.self_push_skipped > 0 {
+            print_info(&format!(
+                "Skipped {} commit{} created by `atomic git push` (state already in view)",
+                stats.self_push_skipped,
+                if stats.self_push_skipped == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            ));
+        }
+
         // Post-import classification: detect merge/squash commits and
         // create ReviewGate tags.
         if self.options.incremental && !all_imported_commits.is_empty() {
@@ -2266,6 +2348,22 @@ impl ParallelImporter {
                     print_warning(&format!("Post-import classification failed: {}", e));
                 }
             }
+        }
+
+        if self.options.preserve_working_copy {
+            // FILE_INDEX describes the physical working copy, even while this
+            // handle imports into another view. Drop stale cache entries for
+            // draft-deleted files without removing their global TREE entries;
+            // a later view switch must still be able to materialize them from
+            // the target graph.
+            let repo_root = repo.root().to_path_buf();
+            for file in repo.list_tracked_files().unwrap_or_default() {
+                if !repo_root.join(&file.path).exists() {
+                    let _ = repo.del_file_index(&file.path.to_string_lossy());
+                }
+            }
+            self.phase3_finalize(&stats)?;
+            return Ok(stats);
         }
 
         // Phase 3: Reconciliation — remove TREE entries for files that
@@ -2356,7 +2454,6 @@ impl ParallelImporter {
                 reconcile_start.elapsed().as_secs_f64()
             ));
         }
-
         // Phase 4: Finalization (verification)
         self.phase3_finalize(&stats)?;
 
@@ -2507,6 +2604,13 @@ impl ParallelImporter {
         let mut batch_start = Instant::now();
 
         for (idx, parsed) in commits.iter().enumerate() {
+            // Commits created by `atomic git push` whose referenced view
+            // state is already present add nothing — skip them entirely.
+            if should_skip_self_push(parsed, &self.options) {
+                stats.self_push_skipped += 1;
+                continue;
+            }
+
             // Progress reporting with per-batch timing
             if total > 100 && idx % 100 == 0 {
                 if idx == 0 {
@@ -2526,23 +2630,19 @@ impl ParallelImporter {
                 batch_start = Instant::now();
             }
 
-            // Write the change
-            match self.write_commit(repo, parsed, line_index) {
-                Ok(info) => {
-                    if parsed.is_empty {
-                        stats.empty_commits += 1;
-                    } else if parsed.is_merge {
-                        stats.merge_commits += 1;
-                    } else {
-                        stats.changes_written += 1;
-                    }
-                    stats.files_processed += parsed.files.len();
-                    imported_commits.push(info);
-                }
-                Err(e) => {
-                    print_warning(&format!("Failed to write {}: {}", parsed.short_sha, e));
-                }
+            // Fail closed on a partial import. Earlier successfully written
+            // commits remain indexed, so an incremental retry resumes from
+            // them instead of publishing a silent hole in the Git history.
+            let info = self.write_commit(repo, parsed, line_index)?;
+            if parsed.is_empty {
+                stats.empty_commits += 1;
+            } else if parsed.is_merge {
+                stats.merge_commits += 1;
+            } else {
+                stats.changes_written += 1;
             }
+            stats.files_processed += parsed.files.len();
+            imported_commits.push(info);
         }
 
         // Populate the file index for all files written during this batch.
@@ -2666,6 +2766,7 @@ impl ParallelImporter {
             let write_result = repo.write_import_graph_change(
                 graph_change,
                 &graph_deleted_paths,
+                self.options.preserve_working_copy,
                 Default::default(),
             );
             let write_ms = write_start.elapsed().as_millis();
@@ -2716,7 +2817,7 @@ impl ParallelImporter {
             ));
             // Index git SHA → Atomic change in GIT_SHA_INDEX
             let _ = repo.index_git_sha(&parsed.git_sha, &write_outcome.hash);
-            if !graph_deleted_paths.is_empty() {
+            if !self.options.preserve_working_copy && !graph_deleted_paths.is_empty() {
                 let del_refs: Vec<&str> = graph_deleted_paths.iter().map(|s| s.as_str()).collect();
                 let _ = repo.del_file_index_batch(&del_refs);
             }
@@ -2725,7 +2826,7 @@ impl ParallelImporter {
                 short_sha: parsed.short_sha.clone(),
                 atomic_hash: write_outcome.hash,
                 is_merge: parsed.is_merge,
-                message: parsed.metadata.message.clone(),
+                message: parsed.full_message(),
             });
         }
 
@@ -2743,7 +2844,7 @@ impl ParallelImporter {
             }
         }
         let step = std::time::Instant::now();
-        if !added_paths.is_empty() {
+        if !self.options.preserve_working_copy && !added_paths.is_empty() {
             let _ = repo.add_batch(&added_paths);
         }
         let add_batch_ms = step.elapsed().as_millis();
@@ -3118,6 +3219,7 @@ impl ParallelImporter {
                 &recorded_files,
                 metadata,
                 &deleted_paths,
+                self.options.preserve_working_copy,
                 Default::default(),
             )
             .map_err(|e| CliError::Internal(e.into()))?;
@@ -3154,7 +3256,7 @@ impl ParallelImporter {
         // `atomic status` after import matches the git working copy.
         // Also remove from FILE_INDEX so status doesn't show them as deleted.
         // Batch-remove deleted files from TREE and FILE_INDEX in single write txns.
-        if !deleted_paths.is_empty() {
+        if !self.options.preserve_working_copy && !deleted_paths.is_empty() {
             let cleanup_start = Instant::now();
             let del_refs: Vec<&str> = deleted_paths.iter().map(|s| s.as_str()).collect();
             let _ = repo.del_file_index_batch(&del_refs);
@@ -3200,7 +3302,7 @@ impl ParallelImporter {
             short_sha: parsed.short_sha.clone(),
             atomic_hash: write_outcome.hash,
             is_merge: parsed.is_merge,
-            message: parsed.metadata.message.clone(),
+            message: parsed.full_message(),
         })
     }
 
@@ -3214,7 +3316,14 @@ impl ParallelImporter {
         let commit_start = Instant::now();
         let metadata = self.build_git_metadata(parsed, true, false);
         let write_outcome = repo
-            .write_import_recorded(header, &[], metadata, &[], Default::default())
+            .write_import_recorded(
+                header,
+                &[],
+                metadata,
+                &[],
+                self.options.preserve_working_copy,
+                Default::default(),
+            )
             .map_err(|e| CliError::Internal(e.into()))?;
         // Index git SHA → Atomic change in GIT_SHA_INDEX
         let _ = repo.index_git_sha(&parsed.git_sha, &write_outcome.hash);
@@ -3236,7 +3345,7 @@ impl ParallelImporter {
             short_sha: parsed.short_sha.clone(),
             atomic_hash: write_outcome.hash,
             is_merge: parsed.is_merge,
-            message: parsed.metadata.message.clone(),
+            message: parsed.full_message(),
         })
     }
 
@@ -3383,13 +3492,18 @@ impl ParallelImporter {
     fn phase3_finalize(&self, stats: &ImportStats) -> CliResult<()> {
         // Verify counts
         let expected = stats.commits_parsed;
-        let actual = stats.changes_written + stats.empty_commits + stats.merge_commits;
+        let actual = stats.changes_written
+            + stats.empty_commits
+            + stats.merge_commits
+            + stats.self_push_skipped;
 
         if actual != expected {
-            print_warning(&format!(
-                "Verification: {} commits parsed but {} changes created",
-                expected, actual
-            ));
+            return Err(CliError::GitError {
+                message: format!(
+                    "Import verification failed: {} commits parsed but {} changes created",
+                    expected, actual
+                ),
+            });
         }
 
         Ok(())
@@ -3406,6 +3520,7 @@ struct WriteStats {
     changes_written: usize,
     empty_commits: usize,
     merge_commits: usize,
+    self_push_skipped: usize,
     files_processed: usize,
 }
 
@@ -3729,6 +3844,39 @@ fn parse_commit(
         parent_index,
         is_merge,
         is_empty,
+        push_trailer: parse_push_trailer(commit.message().unwrap_or("")),
+    })
+}
+
+/// Parse `atomic git push` trailers from a commit message.
+///
+/// Only matches when the trailers form the message's final paragraph — the
+/// shape `atomic git push` itself produces. Trailer lines embedded mid-body
+/// (e.g. a GitHub squash-merge message quoting the original commit) do NOT
+/// match: those commits may carry conflict resolutions and must be imported.
+fn parse_push_trailer(message: &str) -> Option<PushTrailer> {
+    let last_paragraph = message.trim_end().rsplit("\n\n").next()?;
+
+    let mut view = None;
+    let mut state = None;
+    for line in last_paragraph.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("Atomic-View:") {
+            view = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("Atomic-State:") {
+            state = Merkle::from_base32(value.trim().as_bytes());
+        } else if line.starts_with("Atomic-Changes:") {
+            // Optional trailer; not needed for self-push detection.
+        } else {
+            // Non-trailer content in the final paragraph — not a commit
+            // produced by `atomic git push`.
+            return None;
+        }
+    }
+
+    Some(PushTrailer {
+        view: view?,
+        state: state?,
     })
 }
 
@@ -4075,6 +4223,136 @@ mod tests {
         assert!(desc.is_none());
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // Self-push trailer detection (round-trip dedup)
+    // ═══════════════════════════════════════════════════════════════════
+
+    fn test_state() -> (String, Merkle) {
+        let state = Merkle::of(b"test view state");
+        (state.to_base32(), state)
+    }
+
+    #[test]
+    fn test_parse_push_trailer_full_message() {
+        let (state_b32, state) = test_state();
+        let msg = format!(
+            "feat: add greet\n\nSome body text.\n\nAtomic-View: main\nAtomic-State: {}\nAtomic-Changes: ABC, DEF\n",
+            state_b32
+        );
+        let trailer = parse_push_trailer(&msg).expect("should parse");
+        assert_eq!(trailer.view, "main");
+        assert_eq!(trailer.state, state);
+    }
+
+    #[test]
+    fn test_parse_push_trailer_without_changes_trailer() {
+        let (state_b32, state) = test_state();
+        let msg = format!(
+            "Working copy changes\n\nAtomic-View: dev\nAtomic-State: {}",
+            state_b32
+        );
+        let trailer = parse_push_trailer(&msg).expect("should parse");
+        assert_eq!(trailer.view, "dev");
+        assert_eq!(trailer.state, state);
+    }
+
+    #[test]
+    fn test_parse_push_trailer_rejects_embedded_trailers() {
+        let (state_b32, _) = test_state();
+        // GitHub squash-merge shape: the original commit (trailers and all)
+        // is quoted mid-message, with more content after it.
+        let msg = format!(
+            "feat: add greet (#42)\n\n* feat: add greet\n\nAtomic-View: main\nAtomic-State: {}\nAtomic-Changes: ABC\n\nCo-authored-by: Dana <dana@acme.dev>",
+            state_b32
+        );
+        assert!(parse_push_trailer(&msg).is_none());
+    }
+
+    #[test]
+    fn test_parse_push_trailer_rejects_mixed_final_paragraph() {
+        let (state_b32, _) = test_state();
+        let msg = format!(
+            "feat: add greet\n\nAtomic-View: main\nAtomic-State: {}\nsome stray line",
+            state_b32
+        );
+        assert!(parse_push_trailer(&msg).is_none());
+    }
+
+    #[test]
+    fn test_parse_push_trailer_rejects_missing_state() {
+        assert!(parse_push_trailer("msg\n\nAtomic-View: main").is_none());
+    }
+
+    #[test]
+    fn test_parse_push_trailer_rejects_invalid_state() {
+        assert!(
+            parse_push_trailer("msg\n\nAtomic-View: main\nAtomic-State: not-valid-base32!!")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_parse_push_trailer_empty_message() {
+        assert!(parse_push_trailer("").is_none());
+        assert!(parse_push_trailer("plain subject, no trailers").is_none());
+    }
+
+    fn self_push_commit(view: &str, state_b32: &str) -> ParsedCommit {
+        ParsedCommit {
+            git_sha: "aabbccdd11223344".to_string(),
+            short_sha: "aabbccdd".to_string(),
+            metadata: CommitMetadata {
+                author_name: "Test".to_string(),
+                author_email: None,
+                timestamp: Utc::now(),
+                message: "feat: test".to_string(),
+                description: None,
+            },
+            files: Vec::new(),
+            parent_index: None,
+            is_merge: false,
+            is_empty: true,
+            push_trailer: parse_push_trailer(&format!(
+                "feat: test\n\nAtomic-View: {}\nAtomic-State: {}",
+                view, state_b32
+            )),
+        }
+    }
+
+    #[test]
+    fn test_should_skip_self_push() {
+        let (state_b32, state) = test_state();
+        let mut options = ParallelImportOptions {
+            incremental: true,
+            target_view: "main".to_string(),
+            ..ParallelImportOptions::default()
+        };
+        options.known_states.insert(state);
+
+        let parsed = self_push_commit("main", &state_b32);
+        assert!(should_skip_self_push(&parsed, &options));
+
+        // Wrong view (e.g. commit pushed from `dev`, now imported on `main`)
+        let mut options_dev = options.clone();
+        options_dev.target_view = "dev".to_string();
+        assert!(!should_skip_self_push(&parsed, &options_dev));
+
+        // Unknown state → must import (content may not be present locally)
+        let mut options_empty = options.clone();
+        options_empty.known_states = HashSet::new();
+        assert!(!should_skip_self_push(&parsed, &options_empty));
+
+        // No trailer → never skipped
+        let mut plain = self_push_commit("main", &state_b32);
+        plain.push_trailer = None;
+        assert!(!should_skip_self_push(&plain, &options));
+
+        // Full (non-incremental) imports never skip
+        let mut options_full = options.clone();
+        options_full.incremental = false;
+        assert!(!should_skip_self_push(&parsed, &options_full));
+    }
+
     #[test]
     fn test_file_operation_equality() {
         assert_eq!(FileOperation::Added, FileOperation::Added);
@@ -4086,6 +4364,23 @@ mod tests {
         let stats = ImportStats::default();
         assert_eq!(stats.commits_found, 0);
         assert_eq!(stats.changes_written, 0);
+    }
+
+    #[test]
+    fn test_finalize_rejects_partial_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_repo = GitRepository::init(dir.path()).unwrap();
+        let importer = ParallelImporter::new(&git_repo, ParallelImportOptions::default());
+        let stats = ImportStats {
+            commits_parsed: 2,
+            changes_written: 1,
+            ..ImportStats::default()
+        };
+
+        assert!(matches!(
+            importer.phase3_finalize(&stats),
+            Err(CliError::GitError { .. })
+        ));
     }
 
     #[test]

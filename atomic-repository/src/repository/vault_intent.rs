@@ -320,6 +320,136 @@ impl Repository {
         })
     }
 
+    /// Rebuild missing `manifest.intents` summaries from stored intent entries.
+    ///
+    /// Intent entries can reach the vault without `vault_intent_create` ever
+    /// running: clone bootstrap and `vault sync` deflate inherited
+    /// `.vault/intents/**` files straight into redb, and
+    /// `update_manifest_for_store` deliberately leaves intent summaries to
+    /// "higher-level methods". This is that higher-level method for the
+    /// ingestion path. Existing summaries are never overwritten — the
+    /// authoring path stays the source of truth for intents it created.
+    ///
+    /// Also adopts the authoring repo's intent prefix when the local one is
+    /// unset, and advances the per-author sequence allocator past inherited
+    /// keys so a later `vault_intent_create` cannot re-issue one.
+    ///
+    /// Returns the number of summaries added.
+    pub fn vault_reconcile_intent_manifest(&self) -> Result<usize, RepositoryError> {
+        if !self.has_vault()? {
+            return Ok(0);
+        }
+
+        let entries = self.vault_list("intents/", Some(VaultEntryType::Intent))?;
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let mut manifest = txn
+            .get_vault_manifest()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let mut added = 0usize;
+
+        for meta in &entries {
+            // Already indexed (the authoring path stores vault_path on every
+            // summary) — leave it alone.
+            if manifest
+                .intents
+                .values()
+                .any(|summary| summary.vault_path == meta.path)
+            {
+                continue;
+            }
+
+            let Some(entry) = txn
+                .get_vault_entry(&meta.path)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            else {
+                continue;
+            };
+            let Ok(fm) = serde_json::from_str::<serde_json::Value>(&entry.frontmatter_json) else {
+                log::warn!(
+                    "vault reconcile: skipping intent entry {} with unparsable frontmatter",
+                    meta.path
+                );
+                continue;
+            };
+            // `id` is the human key; an entry without one is not a canonical
+            // intent scaffold and has nothing to index.
+            let Some(human_key) = fm.get("id").and_then(|v| v.as_str()).map(str::to_owned) else {
+                continue;
+            };
+            if manifest.intents.contains_key(&human_key) {
+                continue;
+            }
+
+            let text = |key: &str| fm.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+            let seq = fm.get("seq").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let author = text("author").unwrap_or_default();
+
+            if manifest.intent_prefix.is_empty() {
+                if let Some(project) = text("project").filter(|p| !p.is_empty()) {
+                    manifest.intent_prefix = project;
+                }
+            }
+            if !author.is_empty() && seq > 0 {
+                let next = manifest.intent_seq.entry(author.clone()).or_insert(1);
+                if *next <= seq {
+                    *next = seq + 1;
+                }
+            }
+
+            manifest.intents.insert(
+                human_key.clone(),
+                IntentSummary {
+                    status: text("status").unwrap_or_else(|| "backlog".to_string()),
+                    priority: text("priority").unwrap_or_else(|| "medium".to_string()),
+                    assignee: text("assignee"),
+                    goals: fm
+                        .get("goals")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len() as u32)
+                        .unwrap_or(0),
+                    blocked_by: fm
+                        .get("blocked_by")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|b| b.as_str().map(str::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    title: text("title").unwrap_or_default(),
+                    vault_path: meta.path.clone(),
+                    uid: text("uid").unwrap_or_default(),
+                    human_key: human_key.clone(),
+                    project: text("project").unwrap_or_default(),
+                    author,
+                    seq,
+                    session: text("session"),
+                    turn: fm.get("turn").and_then(|v| v.as_u64()).map(|t| t as u32),
+                    done_substance_hash: text("doneSubstanceHash"),
+                    done_lapsed_reason: text("doneLapsedReason"),
+                    kind: text("kind").unwrap_or_else(|| "feature".to_string()),
+                },
+            );
+            added += 1;
+        }
+
+        if added > 0 {
+            manifest.updated_at = chrono::Utc::now().to_rfc3339();
+            txn.put_vault_manifest(&manifest)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            txn.commit()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
+        Ok(added)
+    }
+
     /// List vault intents.
     ///
     /// Optionally filtered by status. Pass `Some("all")` or `None` for all intents.
@@ -1023,6 +1153,11 @@ impl Repository {
     /// - `PIMO::alice::3`  -> exact (project uppercased)
     /// - a ULID or prefix  -> resolved to the matching intent's human key
     /// - a legacy `PIMO-1` -> matched case-insensitively against manifest keys
+    ///
+    /// Note that a legacy dash-style id reaches the manifest-key match through
+    /// the `Uid` arm, not the `HumanKey` arm: `parse_intent_reference` only
+    /// produces a `HumanKey` for `::`-separated or all-digit input, so anything
+    /// else — including `PIMO-1` — arrives here classified as a ULID.
     fn normalize_intent_id(&self, id: &str) -> Result<String, RepositoryError> {
         use atomic_core::pristine::vault::{parse_intent_reference, IntentRef};
 
@@ -1082,6 +1217,36 @@ impl Repository {
                             .collect(),
                     });
                 }
+
+                // Legacy fallback: a pre-ULID intent is keyed in the manifest by
+                // its dash-style id (`TEST-1`), which `parse_intent_reference`
+                // classifies as a Uid because it has neither `::` nor an
+                // all-digit form. Such summaries carry no ULID (`uid` is
+                // documented as empty on legacy entries), so neither lookup
+                // above can match and the intent would be unaddressable even
+                // though `vault_intent_list` still reports it.
+                //
+                // Fall back to the manifest key itself — the same
+                // case-insensitive match the `HumanKey` arm performs — so
+                // intents created before the ULID migration stay resolvable by
+                // `show` / `update` / `attest` / `link`. Ambiguity is reported
+                // rather than silently picking one, matching how a colliding
+                // ULID prefix is handled.
+                let legacy: Vec<&String> = manifest
+                    .intents
+                    .keys()
+                    .filter(|key| key.eq_ignore_ascii_case(id))
+                    .collect();
+                if legacy.len() == 1 {
+                    return Ok(legacy[0].clone());
+                }
+                if legacy.len() > 1 {
+                    return Err(RepositoryError::AmbiguousIntent {
+                        prefix: id.to_string(),
+                        matches: legacy.into_iter().cloned().collect(),
+                    });
+                }
+
                 Err(RepositoryError::InvalidOperation {
                     message: format!("No intent matches reference '{}'", id),
                 })
@@ -1250,6 +1415,70 @@ mod tests {
             serde_json::from_str(&repo.vault_intent_show(&review.id).unwrap().frontmatter_json)
                 .unwrap();
         assert_eq!(rev_fm["kind"], "review");
+    }
+
+    /// Reproduces the clone-inheritance gap: an intent file that arrives as
+    /// bytes (clone materializes it; `vault sync` deflates it) must become
+    /// listable and resolvable — `vault_intent_create` never runs on the
+    /// receiving side, so the sync path itself must index the entry.
+    #[test]
+    fn ingested_intent_is_indexed_by_vault_sync() {
+        // Author repo: create an intent the normal way.
+        let author_dir = tempdir().unwrap();
+        let author = init_repo_with_vault(author_dir.path());
+        let created = author
+            .vault_intent_create(create_opts_manual("Inherited intent"))
+            .unwrap();
+
+        // Receiver repo: inherit only the materialized intent file — exactly
+        // what clone delivers.
+        let receiver_dir = tempdir().unwrap();
+        let receiver = init_repo_with_vault(receiver_dir.path());
+        let src = author_dir.path().join(".vault").join(&created.intent_file);
+        let dst = receiver_dir
+            .path()
+            .join(".vault")
+            .join(&created.intent_file);
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::copy(&src, &dst).unwrap();
+
+        // Sync deflates the inherited file into redb…
+        let synced = receiver.vault_record_working_copy().unwrap();
+        assert!(
+            synced.iter().any(|p| p == &created.intent_file),
+            "sync should ingest the inherited file, got: {synced:?}"
+        );
+
+        // …and must also index it: the list shows it and the human key
+        // resolves.
+        let intents = receiver.vault_intent_list(None).unwrap();
+        assert_eq!(intents.len(), 1, "inherited intent must appear in the list");
+        assert_eq!(intents[0].id, created.id);
+        assert_eq!(intents[0].title, "Inherited intent");
+        assert_eq!(
+            receiver.resolve_intent_key(&created.id).unwrap(),
+            created.id
+        );
+
+        // The allocator must not re-issue the inherited seq for the same
+        // author — a later local create gets a fresh human key.
+        let second = receiver
+            .vault_intent_create(create_opts_manual("New local intent"))
+            .unwrap();
+        assert_ne!(
+            second.id, created.id,
+            "allocator must not collide with inherited human keys"
+        );
+        assert_eq!(
+            receiver.vault_intent_list(None).unwrap().len(),
+            2,
+            "both intents must be listed"
+        );
+
+        // Reconciliation is idempotent: a second sync with nothing to do
+        // leaves the index intact.
+        receiver.vault_record_working_copy().unwrap();
+        assert_eq!(receiver.vault_intent_list(None).unwrap().len(), 2);
     }
 
     #[test]
@@ -2161,6 +2390,57 @@ Login attempts are rate-limited to five per minute, precisely.\n:::\n\n\
             repo.vault_intent_path(&intent.id).unwrap(),
             Some(intent.intent_file)
         );
+    }
+
+    /// A pre-ULID intent is keyed in the manifest by its dash-style id and has
+    /// no `uid`. `parse_intent_reference` classifies such a reference as a ULID
+    /// (no `::`, not all digits), so resolution must fall back to the manifest
+    /// key or the intent becomes unaddressable while still being listed.
+    #[test]
+    fn test_resolve_legacy_dash_id_without_uid() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let intent = repo
+            .vault_intent_create(create_opts("Legacy dash id"))
+            .unwrap();
+
+        // Rewrite the manifest to look like a pre-ULID entry: keyed `TEST-1`,
+        // with no uid and no human key.
+        let mut txn = repo.pristine.write_txn().unwrap();
+        let mut manifest = txn.get_vault_manifest().unwrap();
+        let mut summary = manifest.intents.remove(&intent.id).unwrap();
+        summary.uid.clear();
+        summary.human_key.clear();
+        manifest.intents.insert("TEST-1".to_string(), summary);
+        txn.put_vault_manifest(&manifest).unwrap();
+        txn.commit().unwrap();
+
+        assert_eq!(repo.resolve_intent_key("TEST-1").unwrap(), "TEST-1");
+        // Case-insensitively too, matching the `HumanKey` arm's behavior.
+        assert_eq!(repo.resolve_intent_key("test-1").unwrap(), "TEST-1");
+        // A genuinely absent reference must still fail rather than resolve.
+        assert!(repo.resolve_intent_key("NOPE-9").is_err());
+    }
+
+    /// The legacy fallback must not shadow ULID resolution: a modern intent is
+    /// still resolvable by full key, bare sequence, and ULID prefix.
+    #[test]
+    fn test_resolve_modern_intent_unaffected_by_legacy_fallback() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let intent = repo
+            .vault_intent_create(create_opts("Modern identity"))
+            .unwrap();
+
+        let uid = {
+            let manifest = repo.vault_manifest().unwrap();
+            manifest.intents[&intent.id].uid.clone()
+        };
+        assert!(!uid.is_empty(), "a new intent must have a ULID");
+
+        assert_eq!(repo.resolve_intent_key(&intent.id).unwrap(), intent.id);
+        assert_eq!(repo.resolve_intent_key(&uid).unwrap(), intent.id);
+        assert_eq!(repo.resolve_intent_key(&uid[..10]).unwrap(), intent.id);
     }
 
     #[test]

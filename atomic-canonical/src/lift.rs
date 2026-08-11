@@ -236,7 +236,10 @@ fn lift_task(d: &Directive, id_base: &str, n: usize) -> Task {
         text: d.body.clone(),
         task_status: d.attr("status").unwrap_or("open").to_string(),
         touches_file: touches,
-        satisfies,
+        // `.into()` yields `Satisfies::Many`, so freshly lifted tasks always
+        // serialize as a list. The scalar variant is reachable only by
+        // deserializing a pre-widening attestation; nothing here mints one.
+        satisfies: satisfies.into(),
     }
 }
 
@@ -528,12 +531,60 @@ The billing subsystem is off limits.\n\
     }
 
     #[test]
+    fn empty_verifications_and_required_kinds_emit_no_keys() {
+        // Hash back-compat: an AC with no verifications and no required kinds
+        // must serialize to exactly the pre-existing key-set — the new fields
+        // are skipped when empty, so fixtures keep their content hash.
+        let body = ":::acceptance-criterion{status=met verifiedBy=did:atomic:lee evidence=urn:atomic:change:01J8}\nA checkable outcome.\n:::";
+        let node = lift_intent(&fm(), body).unwrap();
+        let ac = &node.has_acceptance_criterion[0];
+        assert!(ac.verifications.is_empty());
+        assert!(ac.required_kinds.is_empty());
+
+        let v = serde_json::to_value(ac).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        // Exactly the legacy key-set — no `verifications` or `requiredKinds` leak
+        // in (serde_json::Value sorts object keys, so compare the sorted set).
+        assert_eq!(
+            keys,
+            vec!["@id", "@type", "acStatus", "evidence", "text", "verifiedBy"]
+        );
+    }
+
+    #[test]
+    fn lifts_verification_records_and_required_kinds() {
+        // A nested `::verification` leaf plus a `requiredKinds` attr lift into
+        // the new typed fields; the rest of the AC is unchanged.
+        let body = "\
+:::acceptance-criterion{status=unmet requiredKinds=manual,e2e}\n\
+The view baseline holds.\n\
+::verification{kind=manual outcome=fail scope=view observedAtMerkle=ABC ref=urn:atomic:change:99 observation=\"caught by hand\"}\n\
+:::";
+        let node = lift_intent(&fm(), body).unwrap();
+        let ac = &node.has_acceptance_criterion[0];
+
+        assert_eq!(
+            ac.required_kinds,
+            vec!["manual".to_string(), "e2e".to_string()]
+        );
+        assert_eq!(ac.verifications.len(), 1);
+        let vr = &ac.verifications[0];
+        assert_eq!(vr.type_, "VerificationRecord");
+        assert_eq!(vr.kind, "manual");
+        assert_eq!(vr.outcome, "fail");
+        assert_eq!(vr.scope, "view");
+        assert_eq!(vr.observed_at_merkle, "ABC");
+        assert_eq!(vr.reference.as_deref(), Some("urn:atomic:change:99"));
+        assert_eq!(vr.observation.as_deref(), Some("caught by hand"));
+    }
+
+    #[test]
     fn task_satisfies_single_criterion() {
         let body = ":::task{#WORD-5-1 status=done satisfies=WORD-5-ac-1}\nDo the thing.\n:::";
         let node = lift_intent(&fm(), body).unwrap();
         assert_eq!(node.has_task.len(), 1);
         assert_eq!(
-            node.has_task[0].satisfies,
+            node.has_task[0].satisfies.as_slice(),
             vec!["urn:atomic:ac:WORD-5-ac-1".to_string()]
         );
     }
@@ -545,7 +596,7 @@ The billing subsystem is off limits.\n\
         let body = ":::task{#demo-2-1 status=met criteria=demo-2-ac-1,demo-2-ac-2,demo-2-ac-3}\nDo the thing.\n:::";
         let node = lift_intent(&fm(), body).unwrap();
         assert_eq!(
-            node.has_task[0].satisfies,
+            node.has_task[0].satisfies.as_slice(),
             vec![
                 "urn:atomic:ac:demo-2-ac-1".to_string(),
                 "urn:atomic:ac:demo-2-ac-2".to_string(),
@@ -562,7 +613,7 @@ The billing subsystem is off limits.\n\
         let body = ":::task{#t1 status=open criteria=\"WORD-5-ac-1, WORD-5-ac-2 ,\"}\nWork.\n:::";
         let node = lift_intent(&fm(), body).unwrap();
         assert_eq!(
-            node.has_task[0].satisfies,
+            node.has_task[0].satisfies.as_slice(),
             vec![
                 "urn:atomic:ac:WORD-5-ac-1".to_string(),
                 "urn:atomic:ac:WORD-5-ac-2".to_string(),
@@ -609,54 +660,6 @@ First criterion.\n:::\n\n\
         assert_eq!(tasks[1].id, "urn:atomic:task:word-5-2");
         assert_eq!(tasks[1].text, "Second task.");
         assert_eq!(tasks[1].task_status, "open");
-    }
-
-    #[test]
-    fn empty_verifications_and_required_kinds_emit_no_keys() {
-        // Hash back-compat: an AC with no verifications and no required kinds
-        // must serialize to exactly the pre-existing key-set — the new fields
-        // are skipped when empty, so fixtures keep their content hash.
-        let body = ":::acceptance-criterion{status=met verifiedBy=did:atomic:lee evidence=urn:atomic:change:01J8}\nA checkable outcome.\n:::";
-        let node = lift_intent(&fm(), body).unwrap();
-        let ac = &node.has_acceptance_criterion[0];
-        assert!(ac.verifications.is_empty());
-        assert!(ac.required_kinds.is_empty());
-
-        let v = serde_json::to_value(ac).unwrap();
-        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        // Exactly the legacy key-set — no `verifications` or `requiredKinds` leak
-        // in (serde_json::Value sorts object keys, so compare the sorted set).
-        assert_eq!(
-            keys,
-            vec!["@id", "@type", "acStatus", "evidence", "text", "verifiedBy"]
-        );
-    }
-
-    #[test]
-    fn lifts_verification_records_and_required_kinds() {
-        // A nested `::verification` leaf plus a `requiredKinds` attr lift into
-        // the new typed fields; the rest of the AC is unchanged.
-        let body = "\
-:::acceptance-criterion{status=unmet requiredKinds=manual,e2e}\n\
-The view baseline holds.\n\
-::verification{kind=manual outcome=fail scope=view observedAtMerkle=ABC ref=urn:atomic:change:99 observation=\"caught by hand\"}\n\
-:::";
-        let node = lift_intent(&fm(), body).unwrap();
-        let ac = &node.has_acceptance_criterion[0];
-
-        assert_eq!(
-            ac.required_kinds,
-            vec!["manual".to_string(), "e2e".to_string()]
-        );
-        assert_eq!(ac.verifications.len(), 1);
-        let vr = &ac.verifications[0];
-        assert_eq!(vr.type_, "VerificationRecord");
-        assert_eq!(vr.kind, "manual");
-        assert_eq!(vr.outcome, "fail");
-        assert_eq!(vr.scope, "view");
-        assert_eq!(vr.observed_at_merkle, "ABC");
-        assert_eq!(vr.reference.as_deref(), Some("urn:atomic:change:99"));
-        assert_eq!(vr.observation.as_deref(), Some("caught by hand"));
     }
 
     #[test]

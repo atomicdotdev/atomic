@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.12.1"
+version = "0.15.0"
 edition = "2021"
 authors = ["Atomic Contributors"]
 license = "Apache-2.0"
@@ -58,9 +58,13 @@ zstd = "0.13"
 
 # Database
 redb = "2.1"
+# Read-only access to OpenCode's session store (transcript recovery);
+# bundled so no system SQLite is required.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+clap_complete = { version = "4.5", features = ["unstable-dynamic"] }
 indicatif = "0.17"
 dialoguer = "0.11"
 console = "0.15"

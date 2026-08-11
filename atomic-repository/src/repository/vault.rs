@@ -654,10 +654,6 @@ impl Repository {
     pub fn vault_record_working_copy(&self) -> Result<Vec<String>, RepositoryError> {
         let changes = self.vault_scan_working_copy()?;
 
-        if changes.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let mut updated_paths = Vec::new();
 
         for change in &changes {
@@ -702,6 +698,13 @@ impl Repository {
                 }
             }
         }
+
+        // Index any intent entries the manifest is missing — even when no
+        // file changed. Entries can predate this call (clone bootstrap
+        // deflates inherited files) and `update_manifest_for_store` leaves
+        // intent summaries to higher-level methods; without this, inherited
+        // intents exist in redb but never show up in `intent list`.
+        self.vault_reconcile_intent_manifest()?;
 
         Ok(updated_paths)
     }

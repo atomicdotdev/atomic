@@ -541,6 +541,85 @@ impl PullDelta {
     }
 }
 
+// RemoteViewInfo
+
+/// Metadata about a single view on a remote repository.
+///
+/// Returned by the `?views` inventory endpoint. Clients use this to
+/// enumerate the remote's views — for example to pull or recreate every
+/// view, not just the default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteViewInfo {
+    /// The view name.
+    pub name: String,
+
+    /// The view scope: `"shared"` or `"draft"`.
+    pub scope: String,
+
+    /// The parent view name, or `None` for a root view.
+    pub parent: Option<String>,
+
+    /// Number of changes in the view (includes inherited changes for drafts).
+    pub change_count: u64,
+
+    /// The view's current base32 Merkle state, or `None` if the view is empty.
+    pub state: Option<String>,
+}
+
+impl RemoteViewInfo {
+    /// Parse one protocol line into a [`RemoteViewInfo`].
+    ///
+    /// Wire format (tab-separated): `name\tscope\tparent\tchange_count\tstate`,
+    /// where `parent` and `state` use `-` to mean "none".
+    ///
+    /// Returns `None` for blank lines or lines that don't have at least the
+    /// `name` and `scope` fields, so unrelated output (e.g. an older server's
+    /// JSON fallback) is skipped rather than misparsed.
+    pub fn parse(line: &str) -> Option<Self> {
+        let line = line.trim();
+        if line.is_empty() {
+            return None;
+        }
+
+        let mut fields = line.split('\t');
+        let name = fields.next()?.trim();
+        let scope = fields.next()?.trim();
+        if name.is_empty() || scope.is_empty() {
+            return None;
+        }
+
+        let parent = fields.next().map(str::trim).filter(|p| !p.is_empty());
+        let change_count = fields
+            .next()
+            .and_then(|c| c.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let state = fields.next().map(str::trim).filter(|s| !s.is_empty());
+
+        let none_or = |v: Option<&str>| match v {
+            Some("-") | None => None,
+            Some(other) => Some(other.to_string()),
+        };
+
+        Some(Self {
+            name: name.to_string(),
+            scope: scope.to_string(),
+            parent: none_or(parent),
+            change_count,
+            state: none_or(state),
+        })
+    }
+
+    /// Whether the view is a draft view.
+    pub fn is_draft(&self) -> bool {
+        self.scope.eq_ignore_ascii_case("draft")
+    }
+
+    /// Whether the view is empty (has no changes).
+    pub fn is_empty(&self) -> bool {
+        self.change_count == 0
+    }
+}
+
 // Tests
 
 #[cfg(test)]
@@ -830,5 +909,67 @@ mod tests {
         let mut delta = PullDelta::new();
         delta.local_only.push("LOCAL".to_string());
         assert!(delta.has_local_only());
+    }
+
+    // -------------------------------------------------------------------------
+    // RemoteViewInfo tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_remote_view_info_parse_full() {
+        let v = RemoteViewInfo::parse("dev\tshared\t-\t3\t2AAAAAAAAAAA").unwrap();
+        assert_eq!(v.name, "dev");
+        assert_eq!(v.scope, "shared");
+        assert_eq!(v.parent, None);
+        assert_eq!(v.change_count, 3);
+        assert_eq!(v.state.as_deref(), Some("2AAAAAAAAAAA"));
+        assert!(!v.is_draft());
+        assert!(!v.is_empty());
+    }
+
+    #[test]
+    fn test_remote_view_info_parse_draft_with_parent() {
+        let v = RemoteViewInfo::parse("feature\tdraft\tdev\t2\tXYZ").unwrap();
+        assert_eq!(v.name, "feature");
+        assert!(v.is_draft());
+        assert_eq!(v.parent.as_deref(), Some("dev"));
+        assert_eq!(v.change_count, 2);
+    }
+
+    #[test]
+    fn test_remote_view_info_parse_empty_view() {
+        let v = RemoteViewInfo::parse("fresh\tshared\t-\t0\t-").unwrap();
+        assert_eq!(v.change_count, 0);
+        assert!(v.is_empty());
+        assert_eq!(v.state, None);
+        assert_eq!(v.parent, None);
+    }
+
+    #[test]
+    fn test_remote_view_info_parse_name_and_scope_only() {
+        // Trailing fields are optional; missing ones default sensibly.
+        let v = RemoteViewInfo::parse("dev\tshared").unwrap();
+        assert_eq!(v.name, "dev");
+        assert_eq!(v.change_count, 0);
+        assert_eq!(v.parent, None);
+        assert_eq!(v.state, None);
+    }
+
+    #[test]
+    fn test_remote_view_info_parse_rejects_blank_and_malformed() {
+        // Blank lines and lines lacking a scope field are skipped, so an old
+        // server's JSON info blob (a single tab-less line) yields no views.
+        assert!(RemoteViewInfo::parse("").is_none());
+        assert!(RemoteViewInfo::parse("   ").is_none());
+        assert!(RemoteViewInfo::parse("dev").is_none());
+        assert!(RemoteViewInfo::parse(r#"{"workspace":"w","project":"p"}"#).is_none());
+    }
+
+    #[test]
+    fn test_remote_view_info_parse_trims_whitespace() {
+        let v = RemoteViewInfo::parse("  dev\tshared\t-\t1\tABC  ").unwrap();
+        assert_eq!(v.name, "dev");
+        assert_eq!(v.change_count, 1);
+        assert_eq!(v.state.as_deref(), Some("ABC"));
     }
 }

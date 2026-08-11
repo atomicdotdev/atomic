@@ -172,6 +172,7 @@ impl Record {
             .with_all(self.all)
             .with_algorithm(algorithm)
             .with_skip_binary(self.skip_binary)
+            .allow_conflict_markers(self.allow_conflict_markers)
             .apply_after_record(!self.dry_run)
             .save_to_store(!self.dry_run);
 

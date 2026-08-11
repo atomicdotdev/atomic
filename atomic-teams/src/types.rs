@@ -172,6 +172,11 @@ pub enum GrantSubjectType {
     User,
     /// A team within the organization.
     Team,
+    /// Every caller, returned by the server for public/wildcard grants.
+    ///
+    /// Grant mutation helpers reject this response-only subject because the
+    /// Storage API only accepts concrete user or team UUIDs.
+    Everyone,
 }
 
 impl fmt::Display for GrantSubjectType {
@@ -179,6 +184,7 @@ impl fmt::Display for GrantSubjectType {
         match self {
             Self::User => write!(f, "user"),
             Self::Team => write!(f, "team"),
+            Self::Everyone => write!(f, "everyone"),
         }
     }
 }
@@ -190,6 +196,7 @@ impl FromStr for GrantSubjectType {
         match s.to_lowercase().as_str() {
             "user" => Ok(Self::User),
             "team" => Ok(Self::Team),
+            "everyone" => Ok(Self::Everyone),
             other => Err(format!("unknown grant subject type: {other}")),
         }
     }
@@ -223,6 +230,43 @@ pub struct OrgInfo {
     pub updated_at: DateTime<Utc>,
 }
 
+/// An organization the caller belongs to, with their membership role.
+///
+/// Returned by the apex `GET /orgs` ("list my orgs") endpoint. Unlike
+/// [`OrgInfo`] (which redacts `email`/`plan` for non-members), the caller is
+/// always a member here, so `email` and `plan` are always present, and the
+/// caller's `role`, `joined_at`, and `invited_by` are included.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MyOrgInfo {
+    /// Unique identifier.
+    pub id: Uuid,
+    /// URL-safe slug (e.g. `"acme"`).
+    pub slug: String,
+    /// Human-readable display name.
+    pub name: String,
+    /// Contact email for the organization.
+    pub email: Option<String>,
+    /// Organization kind (e.g. `"personal"`, `"team"`).
+    pub kind: String,
+    /// Billing plan (e.g. `"free"`, `"team"`, `"enterprise"`).
+    pub plan: String,
+    /// When the organization was created.
+    #[serde(alias = "created_at")]
+    pub created_at: DateTime<Utc>,
+    /// When the organization was last updated.
+    #[serde(alias = "updated_at")]
+    pub updated_at: DateTime<Utc>,
+    /// The caller's role in this org (`"owner"`, `"admin"`, or `"member"`).
+    pub role: String,
+    /// When the caller joined this org.
+    #[serde(alias = "joined_at")]
+    pub joined_at: DateTime<Utc>,
+    /// Identity that invited the caller, if any.
+    #[serde(alias = "invited_by")]
+    pub invited_by: Option<Uuid>,
+}
+
 /// Organization member metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -241,6 +285,26 @@ pub struct OrgMemberInfo {
     /// Identity that sent the invitation, if applicable.
     #[serde(alias = "invited_by")]
     pub invited_by: Option<Uuid>,
+
+    // The fields below describe the member's *identity* rather than the
+    // membership. Every one is `#[serde(default)]` because a server older than
+    // the release that added them omits it entirely — without the defaults the
+    // whole response would fail to deserialize and `member list` would break
+    // against an un-upgraded deployment. `None` therefore means "this server
+    // did not say", not "this member has none".
+    /// Display name of the member's identity.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Ed25519 public key, base32 no-pad — the same encoding used elsewhere in
+    /// Atomic, and the value a caller's token is keyed by.
+    #[serde(default, alias = "public_key")]
+    pub public_key: Option<String>,
+    /// Identity lifecycle status: `active`, `suspended`, or `deleted`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Preferred email — verified if available, otherwise the oldest on file.
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 /// Team metadata.
@@ -288,22 +352,52 @@ pub struct TeamMemberInfo {
     pub added_by: Uuid,
 }
 
-/// Permission grant on an organization or workspace.
+/// Permission grant on an organization.
+///
+/// Matches the server's `OrgGrantResponse` (snake_case, no serde renames).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct GrantInfo {
     /// Unique identifier.
     pub id: Uuid,
-    /// Whether the subject is a user or team.
+    /// Whether the subject is a user, team, or everyone.
     pub subject_type: GrantSubjectType,
-    /// The subject's identity or team ID (may be absent for wildcard grants).
+    /// The subject's identity or team ID (absent for wildcard/everyone grants).
     pub subject_id: Option<Uuid>,
-    /// The permission level.
+    /// The permission level (`"read"`, `"write"`, `"admin"`, or `"owner"`).
     pub relation: GrantRelation,
     /// Identity that created the grant.
     pub granted_by: Option<Uuid>,
     /// When the grant was created.
     pub granted_at: DateTime<Utc>,
+}
+
+/// A workspace permission grant as returned by the server.
+///
+/// Matches the server's `GrantResponse` (snake_case, no serde renames).
+/// Unlike [`GrantInfo`] (org grants), workspace grants carry `subject_relation`,
+/// `object_type`, and `object_id` — the server always includes these for
+/// workspace grants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceGrantInfo {
+    /// Unique identifier of the ReBAC tuple.
+    pub id: Uuid,
+    /// Whether the subject is a user, team, or everyone.
+    pub subject_type: GrantSubjectType,
+    /// The subject's identity or team UUID (absent for wildcard/everyone grants).
+    pub subject_id: Option<Uuid>,
+    /// The subject's relation within its team, if applicable (typically `None`
+    /// for direct user/team grants).
+    pub subject_relation: Option<String>,
+    /// The permission level (`"read"`, `"write"`, or `"admin"`).
+    pub relation: GrantRelation,
+    /// The resource type (always `"workspace"` for workspace grants).
+    pub object_type: String,
+    /// The workspace UUID the grant applies to.
+    pub object_id: Uuid,
+    /// When the grant was created.
+    pub granted_at: DateTime<Utc>,
+    /// Identity that created the grant.
+    pub granted_by: Option<Uuid>,
 }
 
 /// Domain alias claimed by an organization.
@@ -401,23 +495,15 @@ pub(crate) struct UpdateTeamMemberRoleRequest {
     pub role: TeamRole,
 }
 
-/// Body for adding a grant.
+/// Body for adding a grant (workspace or org).
+///
+/// Serialized as snake_case to match the server's `AddGrantRequest` /
+/// `AddOrgGrantRequest` (no serde renames server-side).
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct AddGrantRequest {
     pub subject_type: GrantSubjectType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subject_id: Option<Uuid>,
+    pub subject_id: Uuid,
     pub relation: GrantRelation,
-}
-
-/// Body for revoking a grant.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RevokeGrantRequest {
-    pub subject_type: GrantSubjectType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subject_id: Option<Uuid>,
 }
 
 /// Body for claiming a domain.
@@ -490,7 +576,11 @@ mod tests {
 
     #[test]
     fn grant_subject_type_display_roundtrip() {
-        for st in [GrantSubjectType::User, GrantSubjectType::Team] {
+        for st in [
+            GrantSubjectType::User,
+            GrantSubjectType::Team,
+            GrantSubjectType::Everyone,
+        ] {
             let s = st.to_string();
             let parsed: GrantSubjectType = s.parse().unwrap();
             assert_eq!(parsed, st);
@@ -514,6 +604,59 @@ mod tests {
         let de: OrgInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(de.slug, "acme");
         assert_eq!(de.email.as_deref(), Some("admin@acme.com"));
+    }
+
+    #[test]
+    fn my_org_info_serde_roundtrip() {
+        let now = Utc::now();
+        let info = MyOrgInfo {
+            id: Uuid::new_v4(),
+            slug: "acme".into(),
+            name: "Acme Corp".into(),
+            email: Some("admin@acme.com".into()),
+            kind: "team".into(),
+            plan: "enterprise".into(),
+            created_at: now,
+            updated_at: now,
+            role: "owner".into(),
+            joined_at: now,
+            invited_by: Some(Uuid::new_v4()),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        // camelCase wire format (server returns createdAt/joinedAt/invitedBy).
+        assert!(json.contains("createdAt"));
+        assert!(json.contains("joinedAt"));
+        assert!(json.contains("invitedBy"));
+        assert!(!json.contains("created_at"));
+
+        let de: MyOrgInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.slug, "acme");
+        assert_eq!(de.role, "owner");
+        assert!(de.invited_by.is_some());
+    }
+
+    #[test]
+    fn my_org_info_accepts_snake_case_aliases() {
+        // Server-side `to_string()` emits camelCase, but earlier deployments
+        // may emit snake_case; the aliases keep deserialization lenient.
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "slug": "acme",
+            "name": "Acme",
+            "email": null,
+            "kind": "team",
+            "plan": "free",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "role": "member",
+            "joined_at": "2024-01-02T00:00:00Z",
+            "invited_by": null
+        }"#;
+        let de: MyOrgInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(de.slug, "acme");
+        assert_eq!(de.role, "member");
+        assert!(de.email.is_none());
+        assert!(de.invited_by.is_none());
     }
 
     #[test]
@@ -571,6 +714,70 @@ mod tests {
     }
 
     #[test]
+    fn grant_info_deserializes_from_server_snake_case() {
+        // The server sends snake_case JSON (no serde renames). GrantInfo must
+        // accept that, not camelCase.
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "subject_type": "team",
+            "subject_id": "550e8400-e29b-41d4-a716-446655440001",
+            "relation": "admin",
+            "granted_by": null,
+            "granted_at": "2024-01-01T00:00:00Z"
+        }"#;
+        let de: GrantInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(de.subject_type, GrantSubjectType::Team);
+        assert_eq!(de.relation, GrantRelation::Admin);
+        assert!(de.granted_by.is_none());
+    }
+
+    #[test]
+    fn workspace_grant_info_deserializes_from_server_snake_case() {
+        // The server's GrantResponse includes subject_relation, object_type,
+        // and object_id — all snake_case.
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "subject_type": "team",
+            "subject_id": "550e8400-e29b-41d4-a716-446655440001",
+            "subject_relation": null,
+            "relation": "write",
+            "object_type": "workspace",
+            "object_id": "550e8400-e29b-41d4-a716-446655440002",
+            "granted_at": "2024-01-01T00:00:00Z",
+            "granted_by": "550e8400-e29b-41d4-a716-446655440003"
+        }"#;
+        let de: WorkspaceGrantInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(de.subject_type, GrantSubjectType::Team);
+        assert_eq!(de.relation, GrantRelation::Write);
+        assert_eq!(de.object_type, "workspace");
+        assert!(de.subject_relation.is_none());
+        assert!(de.granted_by.is_some());
+    }
+
+    #[test]
+    fn workspace_grant_info_deserializes_public_everyone_grant() {
+        // Public workspaces use a wildcard grant. Its subject has no UUID,
+        // and Storage reports the subject type explicitly as `everyone`.
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "subject_type": "everyone",
+            "subject_id": null,
+            "subject_relation": null,
+            "relation": "read",
+            "object_type": "workspace",
+            "object_id": "550e8400-e29b-41d4-a716-446655440002",
+            "granted_at": "2024-01-01T00:00:00Z",
+            "granted_by": null
+        }"#;
+
+        let grant: WorkspaceGrantInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(grant.subject_type, GrantSubjectType::Everyone);
+        assert!(grant.subject_id.is_none());
+        assert_eq!(grant.relation, GrantRelation::Read);
+        assert_eq!(grant.subject_type.to_string(), "everyone");
+    }
+
+    #[test]
     fn domain_alias_info_serde_roundtrip() {
         let info = DomainAliasInfo {
             id: Uuid::new_v4(),
@@ -595,11 +802,62 @@ mod tests {
             role: OrgRole::Admin,
             joined_at: now,
             invited_by: Some(Uuid::new_v4()),
+            name: Some("ada".to_string()),
+            public_key: Some("MFRGGZDFMZTWQ2LK".to_string()),
+            status: Some("active".to_string()),
+            email: Some("ada@example.com".to_string()),
         };
         let json = serde_json::to_string(&info).unwrap();
         let de: OrgMemberInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(de.role, OrgRole::Admin);
         assert!(de.invited_by.is_some());
+        assert_eq!(de.name.as_deref(), Some("ada"));
+        assert_eq!(de.public_key.as_deref(), Some("MFRGGZDFMZTWQ2LK"));
+        assert_eq!(de.status.as_deref(), Some("active"));
+        assert_eq!(de.email.as_deref(), Some("ada@example.com"));
+    }
+
+    /// A server predating the identity-detail fields omits them entirely.
+    ///
+    /// Without `#[serde(default)]` on each, the whole response would fail to
+    /// parse and `org member list` would break against an un-upgraded
+    /// deployment rather than degrading to the columns it does know.
+    #[test]
+    fn org_member_info_tolerates_server_without_identity_details() {
+        let json = r#"{
+            "org_id": "00000000-0000-0000-0000-000000000001",
+            "identity_id": "00000000-0000-0000-0000-000000000002",
+            "role": "member",
+            "joined_at": "2026-01-01T00:00:00Z",
+            "invited_by": null
+        }"#;
+
+        let de: OrgMemberInfo = serde_json::from_str(json).expect("legacy payload must parse");
+        assert_eq!(de.role, OrgRole::Member);
+        assert_eq!(de.name, None);
+        assert_eq!(de.public_key, None);
+        assert_eq!(de.status, None);
+        assert_eq!(de.email, None);
+    }
+
+    /// The server serializes these as snake_case; the struct is camelCase.
+    #[test]
+    fn org_member_info_accepts_snake_case_public_key() {
+        let json = r#"{
+            "org_id": "00000000-0000-0000-0000-000000000001",
+            "identity_id": "00000000-0000-0000-0000-000000000002",
+            "role": "owner",
+            "joined_at": "2026-01-01T00:00:00Z",
+            "invited_by": null,
+            "name": "ada",
+            "public_key": "MFRGGZDFMZTWQ2LK",
+            "status": "active",
+            "email": "ada@example.com"
+        }"#;
+
+        let de: OrgMemberInfo = serde_json::from_str(json).expect("snake_case payload must parse");
+        assert_eq!(de.public_key.as_deref(), Some("MFRGGZDFMZTWQ2LK"));
+        assert_eq!(de.name.as_deref(), Some("ada"));
     }
 
     #[test]
@@ -668,6 +926,9 @@ mod tests {
 
         let json = serde_json::to_string(&GrantSubjectType::Team).unwrap();
         assert_eq!(json, "\"team\"");
+
+        let json = serde_json::to_string(&GrantSubjectType::Everyone).unwrap();
+        assert_eq!(json, "\"everyone\"");
     }
 
     #[test]
@@ -680,5 +941,8 @@ mod tests {
 
         let rel: GrantRelation = serde_json::from_str("\"write\"").unwrap();
         assert_eq!(rel, GrantRelation::Write);
+
+        let subject: GrantSubjectType = serde_json::from_str("\"everyone\"").unwrap();
+        assert_eq!(subject, GrantSubjectType::Everyone);
     }
 }

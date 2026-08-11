@@ -58,6 +58,58 @@ pub async fn build_client(
     Ok(client)
 }
 
+/// Build a [`StorageClient`] targeting the server **apex** (no org subdomain).
+///
+/// Apex-scoped endpoints — notably `GET /orgs` ("list my orgs") and
+/// `POST /orgs` ("create org") — span orgs, so they must be hit on the bare
+/// server host rather than an `<org>.<host>` subdomain. This helper resolves
+/// the active server profile, mints a self-signed EdDSA JWT against the apex
+/// URL, and constructs a `StorageClient` whose `base_url` is the apex.
+///
+/// Unlike [`build_client`], this does **not** require a default org to be
+/// configured — which is essential for `atomic org list`, whose entire
+/// purpose is to discover the orgs you belong to before any default is set.
+///
+/// `server_override` selects a named profile from `[servers.*]` in
+/// `~/.atomic/config.toml`, exactly as in [`build_client`].
+///
+/// # Errors
+///
+/// - Config not loaded or server not configured (no `url`).
+/// - Named server profile not found.
+/// - Identity store cannot be opened or no default identity set.
+/// - HTTP client construction failure.
+pub async fn build_apex_client(server_override: Option<&str>) -> CliResult<StorageClient> {
+    let config = GlobalConfig::load()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
+
+    let server = config
+        .resolve_server(server_override)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?
+        .0;
+
+    let apex_url = server.url.clone().ok_or_else(|| {
+        let hint = if let Some(name) = server_override {
+            format!("Server profile '{}' has no URL configured.", name)
+        } else {
+            "Server not configured. Run 'atomic identity register <server-url>' first.".to_string()
+        };
+        CliError::Internal(anyhow::anyhow!("{}", hint))
+    })?;
+
+    let identity = resolve_identity_for_server(server)?;
+
+    // Self-signed EdDSA JWT keyed by the identity's own public key; minted
+    // against the apex URL (the token is portable across the deployment).
+    let bearer_token = crate::commands::token::get_token(&apex_url, &identity).await?;
+
+    let client = StorageClient::new(&apex_url, "", &bearer_token).map_err(|e| {
+        CliError::Internal(anyhow::anyhow!("Failed to create storage client: {}", e))
+    })?;
+
+    Ok(client)
+}
+
 /// Build a [`StorageClient`] and return the resolved org slug alongside it.
 ///
 /// Useful for commands that also need to resolve org-scoped state (e.g.
@@ -93,32 +145,7 @@ pub async fn build_client_with_org(
     })?;
 
     // Resolve identity: per-server override → global default.
-    let store = IdentityStore::open_default()
-        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to open identity store: {}", e)))?;
-
-    let identity = if let Some(ref identity_name) = server.identity {
-        // Server profile specifies an identity — use it.
-        store.load_by_name(identity_name).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!(
-                "Identity '{}' specified by server profile not found: {}",
-                identity_name,
-                e
-            ))
-        })?
-    } else {
-        // Fall back to global default identity.
-        store
-            .get_default()
-            .map_err(|e| {
-                CliError::Internal(anyhow::anyhow!("Failed to load default identity: {}", e))
-            })?
-            .ok_or_else(|| {
-                CliError::Internal(anyhow::anyhow!(
-                    "No default identity set. Create one first:\n  \
-                     atomic identity new <name> --email <email> --set-default"
-                ))
-            })?
-    };
+    let identity = resolve_identity_for_server(server)?;
 
     // Log in against the server apex for a JWT bearer token.
     let bearer_token = crate::commands::token::get_token(&server_url, &identity).await?;
@@ -128,6 +155,70 @@ pub async fn build_client_with_org(
     })?;
 
     Ok((client, org_slug))
+}
+
+/// Resolve the identity to authenticate as for a given server profile.
+///
+/// Resolution order:
+/// 1. `server.identity` — a per-server identity override (set when
+///    `atomic identity register --identity <name>` is used).
+/// 2. Global default identity from the identity store.
+///
+/// Shared by [`build_client_with_org`] and [`build_apex_client`] so the
+/// org-scoped and apex-scoped code paths pick the same identity.
+///
+/// # Errors
+///
+/// - Identity store cannot be opened.
+/// - Per-server identity name not found in the store.
+/// - No default identity set.
+pub fn resolve_identity_for_server(
+    server: &atomic_config::ServerConfig,
+) -> CliResult<atomic_identity::Identity> {
+    let store = IdentityStore::open_default()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to open identity store: {}", e)))?;
+
+    if let Some(ref identity_name) = server.identity {
+        // Server profile specifies an identity — use it.
+        log::debug!(
+            "Authenticating as '{}' (bound to server profile {})",
+            identity_name,
+            server.url.as_deref().unwrap_or("<no url>")
+        );
+        store.load_by_name(identity_name).map_err(|e| {
+            CliError::Internal(anyhow::anyhow!(
+                "Identity '{}' specified by server profile not found: {}",
+                identity_name,
+                e
+            ))
+        })
+    } else {
+        // Fall back to global default identity.
+        //
+        // Worth logging loudly: the fallback is silent on the wire, so when
+        // the default identity is not the one registered with this server the
+        // only symptom is a 401 from the far end that names no identity at
+        // all. Saying which identity was chosen, and that it was a fallback,
+        // is the difference between a one-line fix and a blind hunt.
+        let identity = store
+            .get_default()
+            .map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to load default identity: {}", e))
+            })?
+            .ok_or_else(|| {
+                CliError::Internal(anyhow::anyhow!(
+                    "No default identity set. Create one first:\n  \
+                     atomic identity new <name> --email <email> --set-default"
+                ))
+            })?;
+        log::debug!(
+            "Server profile {} declares no identity; falling back to the default identity '{}'. \
+             Bind one with 'atomic server set-identity <profile> <identity>'.",
+            server.url.as_deref().unwrap_or("<no url>"),
+            identity.name
+        );
+        Ok(identity)
+    }
 }
 
 /// Convenience: map a [`atomic_remote::RemoteError`] to a [`CliError`].
@@ -146,7 +237,9 @@ pub fn remote_err(e: atomic_remote::RemoteError) -> CliError {
 /// Resolution order:
 /// 1. `--org` override (if `Some(non-empty)`)
 /// 2. `server.default_org` from the resolved server profile
-/// 3. Error with a hint to run `atomic org set`
+/// 3. The default identity's personal org (the identity name), so commands
+///    always target the tenant associated with the active identity even
+///    before any `atomic org set`
 ///
 /// An explicit empty string (`--org ""`) is an error: the user asked for "no
 /// org" which never makes sense.
@@ -163,19 +256,27 @@ pub fn resolve_org_with_server(
         return Ok(s.to_string());
     }
 
-    server
-        .default_org
-        .clone()
-        .ok_or_else(|| CliError::InvalidArgument {
-            message: "No organization specified.\n  \
-                      Use --org or set a default with: atomic org set <slug>"
-                .to_string(),
-        })
+    if let Some(org) = &server.default_org {
+        return Ok(org.clone());
+    }
+
+    // Fall back to the personal org of the identity this server authenticates
+    // as. Registration seeds the personal org slug from the identity name, so
+    // the identity name is the correct default until the user runs
+    // `atomic org set` to switch to a team org.
+    let identity = resolve_identity_for_server(server).map_err(|_| CliError::InvalidArgument {
+        message: "No organization specified.\n  \
+                  Use --org or set a default with: atomic org set <slug>"
+            .to_string(),
+    })?;
+    Ok(identity.name)
 }
 
-/// Resolve the org slug using the legacy (single-server) config path.
+/// Resolve the org slug for callers that don't already hold a server config.
 ///
-/// Kept for callers that don't yet pass a server override.
+/// Loads global config, resolves the active server profile, and delegates to
+/// [`resolve_org_with_server`] so the identity-personal-org fallback applies
+/// consistently.
 pub fn resolve_org(org_override: Option<&str>) -> CliResult<String> {
     if let Some(s) = org_override {
         if s.is_empty() {
@@ -189,14 +290,11 @@ pub fn resolve_org(org_override: Option<&str>) -> CliResult<String> {
     let config = GlobalConfig::load()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
 
-    config
-        .server
-        .default_org
-        .ok_or_else(|| CliError::InvalidArgument {
-            message: "No organization specified.\n  \
-                      Use --org or set a default with: atomic org set <slug>"
-                .to_string(),
-        })
+    let (server, _name) = config
+        .resolve_server(None)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
+
+    resolve_org_with_server(None, server)
 }
 
 /// Resolve the workspace slug for a command, with fallback to the
@@ -237,22 +335,28 @@ pub fn resolve_workspace_with_server(
 }
 
 /// Resolve the workspace slug for a command, with fallback to the
-/// org-scoped default workspace from global config.
+/// org-scoped default workspace from the **active** server profile.
 ///
-/// Uses the legacy (single-server) config path. Prefer
-/// [`resolve_workspace_with_server`] when you have already resolved the
-/// active server.
+/// Loads global config, resolves the active server profile (honouring
+/// `server_override` → `default_server` → legacy `[server]`), and delegates
+/// to [`resolve_workspace_with_server`]. This keeps reads aligned with
+/// `atomic workspace set`, which writes into that same active profile —
+/// otherwise a default set on a named profile would be invisible here.
 ///
 /// Resolution order:
 /// 1. `--workspace` override (if `Some(non-empty)`)
-/// 2. `server.default_workspaces[org_slug]` from global config
+/// 2. `server.default_workspaces[org_slug]` from the active server profile
 /// 3. Error with a hint to run `atomic workspace set`
 ///
 /// An explicit empty string (`--workspace ""`) is an error: the user
 /// explicitly asked for "no workspace", which is meaningless. Distinguishing
 /// `None` (not provided → fall back to default) from `Some("")` (provided
 /// empty → error) prevents a class of confusing bugs.
-pub fn resolve_workspace(org_slug: &str, workspace_override: Option<&str>) -> CliResult<String> {
+pub fn resolve_workspace(
+    org_slug: &str,
+    workspace_override: Option<&str>,
+    server_override: Option<&str>,
+) -> CliResult<String> {
     if let Some(s) = workspace_override {
         if s.is_empty() {
             return Err(CliError::InvalidArgument {
@@ -265,17 +369,11 @@ pub fn resolve_workspace(org_slug: &str, workspace_override: Option<&str>) -> Cl
     let config = GlobalConfig::load()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
 
-    config
-        .server
-        .default_workspaces
-        .get(org_slug)
-        .cloned()
-        .ok_or_else(|| CliError::InvalidArgument {
-            message: format!(
-                "No workspace specified for org '{org_slug}'.\n  \
-                 Use --workspace or set a default with: atomic workspace set <slug>"
-            ),
-        })
+    let (server, _name) = config
+        .resolve_server(server_override)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
+
+    resolve_workspace_with_server(org_slug, None, server)
 }
 
 /// Resolve a flexible identity reference to a UUID.
@@ -414,13 +512,13 @@ mod tests {
 
     #[test]
     fn resolve_workspace_passes_through_explicit_override() {
-        let result = resolve_workspace("acme", Some("backend")).unwrap();
+        let result = resolve_workspace("acme", Some("backend"), None).unwrap();
         assert_eq!(result, "backend");
     }
 
     #[test]
     fn resolve_workspace_rejects_explicit_empty_override() {
-        let err = resolve_workspace("acme", Some("")).unwrap_err();
+        let err = resolve_workspace("acme", Some(""), None).unwrap_err();
         match err {
             CliError::InvalidArgument { message } => {
                 assert!(message.contains("cannot be empty"));

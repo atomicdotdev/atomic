@@ -8,8 +8,8 @@
 //!
 //! Kiro IDE hooks are configured through the IDE's Agent Steering & Skills
 //! panel. Each hook uses a "Shell Command" action that invokes the Atomic CLI.
-//! The `atomic-kiro` npm package provides the shell scripts that bridge
-//! Kiro's hook triggers to `atomic agent hooks kiro <verb>`.
+//! The `atomic-kiro` package provides the shell scripts that bridge Kiro's
+//! hook triggers to `atomic agent hooks kiro <verb>`.
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────────────┐
@@ -48,9 +48,9 @@
 //!
 //! # Installation
 //!
-//! Kiro hook configuration is managed through the IDE panel and the
-//! `atomic-kiro` npm package. This adapter only parses hook events —
-//! `install()` and `uninstall()` are no-ops.
+//! Kiro hook configuration is managed through the IDE panel and installed by
+//! the `atomic-kiro` package via the integrations engine. This adapter only
+//! parses hook events — `install()` and `uninstall()` are no-ops.
 //!
 //! # Detection
 //!
@@ -180,7 +180,8 @@ struct PostTaskInput {
 /// Kiro IDE agent hook adapter.
 ///
 /// Parses hook JSON from Kiro IDE's shell command hooks. Hook configuration
-/// is managed through the IDE panel and the `atomic-kiro` npm package.
+/// is managed through the IDE panel and the `atomic-kiro` package via the
+/// integrations engine.
 #[derive(Debug)]
 pub struct KiroHook {
     _private: (),
@@ -365,15 +366,17 @@ impl AgentHook for KiroHook {
     }
 
     fn install(&self, _repo_root: &Path) -> AgentResult<usize> {
-        Ok(0) // Installation handled by atomic-kiro package via IDE panel
+        // Installation is owned by the integrations engine (the atomic-kiro
+        // package on Atomic storage); this adapter installs nothing.
+        Ok(0)
     }
 
     fn uninstall(&self, _repo_root: &Path) -> AgentResult<()> {
-        Ok(()) // Uninstallation handled by atomic-kiro package
+        Ok(()) // Uninstallation is receipt-driven via the integrations engine.
     }
 
     fn is_installed(&self, _repo_root: &Path) -> bool {
-        false // Managed by atomic-kiro npm package
+        false // Managed by the integrations engine (atomic-kiro package)
     }
 
     fn supported_hooks(&self) -> Vec<HookType> {

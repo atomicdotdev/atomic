@@ -87,6 +87,85 @@ impl Repository {
         Ok(entries)
     }
 
+    /// Get the full **effective** change set of a view in dependency order.
+    ///
+    /// Unlike [`log`](Self::log) — which for a draft view returns only that
+    /// view's own *new* changes — this returns every change visible from the
+    /// view: the draft's own changes plus all changes inherited from its
+    /// ancestor draft views and its nearest shared ancestor (the graph base).
+    /// Entries are ordered base-first, so the list is a valid dependency
+    /// order for replay or upload.
+    ///
+    /// For a shared view this is identical to `log` with no ancestor
+    /// filtering — shared views are self-contained.
+    ///
+    /// This is what `push` uploads: the complete graph a view depends on, so
+    /// a flattened (shared) remote view receives every change it needs rather
+    /// than only the draft's delta. Changes the remote already holds are
+    /// deduplicated by the caller.
+    ///
+    /// # Arguments
+    ///
+    /// * `view_name` - The view to query, or `None` for the current view.
+    pub fn effective_history(
+        &self,
+        view_name: Option<&str>,
+    ) -> Result<Vec<crate::history::HistoryEntry>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let view_name = view_name.unwrap_or(&self.current_view);
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+
+        // Build the view chain base-first: walk `.parent` up from this view,
+        // stopping at (and including) the nearest shared ancestor, which
+        // holds a self-contained change set. Reversing yields shared base →
+        // draft ancestors (oldest first) → this view.
+        let mut chain: Vec<atomic_core::pristine::ViewState> = Vec::new();
+        let mut cursor = Some(view);
+        while let Some(v) = cursor {
+            let is_shared = v.kind.is_shared();
+            let parent = v.parent;
+            chain.push(v);
+            if is_shared {
+                break;
+            }
+            cursor = match parent {
+                Some(pid) => txn
+                    .get_view_by_id(pid)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?,
+                None => None,
+            };
+        }
+        chain.reverse();
+
+        // Concatenate each view's own change log (sequence order respects
+        // dependencies), skipping changes already emitted by an earlier view
+        // in the chain (a draft created via `create_view_from` carries copies
+        // of its base's changes in its own log).
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        let mut entries: Vec<crate::history::HistoryEntry> = Vec::new();
+        for v in &chain {
+            let iter = crate::history::log(&txn, v, &HistoryOptions::default())
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            for result in iter {
+                let entry = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
+                if seen.insert(entry.node_id) {
+                    entries.push(entry);
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
     /// Get a reverse history log (most recent first).
     ///
     /// # Arguments

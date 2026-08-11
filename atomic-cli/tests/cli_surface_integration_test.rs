@@ -33,9 +33,9 @@ fn display_path(path: &[String]) -> String {
 /// Extract the first column from Clap's `Commands:` section.
 ///
 /// Command rows have exactly two leading spaces. Wrapped descriptions are
-/// indented further, so they are ignored. Removed redirect shims are also
-/// ignored because invoking them intentionally exits non-zero with migration
-/// guidance instead of rendering child help.
+/// indented further, so they are ignored. Rows marked `[REMOVED` are skipped:
+/// those are deprecation shims that deliberately print a redirect and exit
+/// non-zero instead of rendering help, so they are not public commands.
 fn visible_subcommands(help: &str) -> Vec<String> {
     let mut in_commands = false;
     let mut commands = Vec::new();
@@ -80,6 +80,12 @@ fn visible_subcommands(help: &str) -> Vec<String> {
             continue;
         }
 
+        // Retired command families keep a shim that redirects to the new path
+        // and exits non-zero; it has no help to render.
+        if row.contains("[REMOVED") {
+            continue;
+        }
+
         commands.push(name.to_string());
     }
 
@@ -111,9 +117,15 @@ fn every_public_command_renders_help() {
             stdout,
             stderr
         );
+        // The agent-native help template renders a lowercase `usage:` line in
+        // place of clap's default `Usage:` heading. Anchor to the line start so
+        // prose in a command's description cannot satisfy this on its own.
+        let renders_usage = stdout
+            .lines()
+            .any(|line| line.trim_end_matches('\r').starts_with("usage: "));
         assert!(
-            stdout.contains("usage:"),
-            "`atomic{} --help` did not render the agent-native usage section\nstdout:\n{}\nstderr:\n{}",
+            renders_usage,
+            "`atomic{} --help` did not render a usage section\nstdout:\n{}\nstderr:\n{}",
             display_path(&path),
             stdout,
             stderr
@@ -159,13 +171,13 @@ fn every_public_command_renders_help() {
 }
 
 #[test]
-fn command_section_parser_ignores_wrapped_descriptions_and_help_dispatcher() {
+fn command_section_parser_ignores_wrapped_descriptions_help_dispatcher_and_removed() {
     let help = "\
 Commands:
   alpha  First command
          with a wrapped description
   beta   Second command
-  legacy [REMOVED — use `atomic modern`] Redirect shim
+  gamma  [REMOVED — use `atomic gamma`] Agent-facing redirect shim
   help   Print this message or the help of the given subcommand(s)
 
 Options:

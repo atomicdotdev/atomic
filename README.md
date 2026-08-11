@@ -30,7 +30,7 @@ Now AI agents write most of the code. They work in sessions and turns, use multi
 Enable agent hooks once. Every turn is recorded automatically.
 
 ```bash
-# Enable for your agent (auto-detects Claude Code, Antigravity CLI, Gemini CLI, OpenCode)
+# Enable for your agent (auto-detects Claude Code, Codex, Antigravity CLI, Gemini CLI, OpenCode)
 atomic agent enable
 
 # That's it. Every agent turn now produces an Atomic change with:
@@ -355,6 +355,7 @@ Every change stores two parallel representations:
 | Agent | Config | Hook System |
 |-------|--------|-------------|
 | Claude Code | `.claude/settings.json` | Native hooks |
+| Codex | `~/.codex/hooks.json` | Native hooks, including terminal `SessionEnd` |
 | Antigravity CLI (`agy`) | `~/.gemini/config/plugins/atomic/` | Plugin hooks |
 | Gemini CLI (deprecated) | `.gemini/settings.json` | Native hooks |
 | OpenCode | `.opencode/plugins/atomic/` | Plugin-based |
@@ -401,8 +402,7 @@ atomic/
 
 | Project | Location | Description |
 |---------|----------|-------------|
-| **atomic-api** | `atomic-enterprise/atomic-api` | HTTP API for remote operations and multi-tenant hosting |
-| **atomic-remote-client** | `atomic-enterprise/atomic-remote` | HTTP client library for push/pull/clone |
+| **atomic-remote** | `atomic-remote/` | HTTP client for push/pull/clone |
 | **atomic-docs** | `atomic-docs/` | Documentation site ([docs.atomic.dev](https://docs.atomic.dev/)) |
 
 ## Atomic + smolvm: Concurrent Agent Sandboxes

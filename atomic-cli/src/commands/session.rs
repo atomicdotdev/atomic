@@ -209,8 +209,13 @@ fn show_session_detail(repo: &Repository, session_id: &str, json: bool) -> CliRe
     let (record, turns) = repo
         .get_session_ledger(session_id)
         .map_err(CliError::Repository)?
-        .ok_or_else(|| CliError::InvalidArgument {
-            message: format!("session not found: {}", session_id),
+        .ok_or_else(|| CliError::VaultEntityNotFound {
+            kind: "session",
+            id: session_id.to_string(),
+            // No hint: there is no session-listing command to point at, and the
+            // id comes from the caller's own ledger rather than something a
+            // user would create on demand.
+            hint: None,
         })?;
 
     if json {

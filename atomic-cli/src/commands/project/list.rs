@@ -76,7 +76,8 @@ impl Command for ProjectList {
         rt.block_on(async {
             let (client, org_slug) =
                 build_client_with_org(self.org.as_deref(), self.server.as_deref()).await?;
-            let workspace = resolve_workspace(&org_slug, self.workspace.as_deref())?;
+            let workspace =
+                resolve_workspace(&org_slug, self.workspace.as_deref(), self.server.as_deref())?;
 
             let projects = client.list_projects(&workspace).await.map_err(remote_err)?;
 

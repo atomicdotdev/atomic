@@ -1,7 +1,147 @@
 use super::*;
-use atomic_core::pristine::CachedGraphTxn;
+use atomic_core::pristine::{CachedGraphTxn, StoredConflict, StoredConflictKind};
+
+/// Return the 1-based line number of the first Atomic conflict-start marker
+/// (`>>>>>>>`) in `content`, or `None` if the content has no markers.
+///
+/// This is the authoritative signal for "this materialized file is
+/// conflicted": it reflects exactly what was written to disk, so persisted
+/// conflict state stays in lock-step with the bytes the user sees.
+pub(crate) fn first_conflict_marker_line(content: &[u8]) -> Option<u32> {
+    let text = match std::str::from_utf8(content) {
+        Ok(t) => t,
+        Err(_) => return None, // binary content carries no textual markers
+    };
+    for (idx, line) in text.lines().enumerate() {
+        if line.starts_with(">>>>>>>") {
+            return Some((idx + 1) as u32);
+        }
+    }
+    None
+}
+
+/// Render a name conflict: two or more inodes are alive at the same path on
+/// this view, so instead of silently emitting whichever inode `TREE` happened
+/// to keep, wrap every side's materialized content in conflict markers.
+///
+/// The block opens with a `>>>>>>>` line (so the existing marker-driven
+/// surfacing pipeline — `first_conflict_marker_line` → `conflicts_by_path` →
+/// `persist_view_conflicts` — flags the file exactly as it does for content
+/// conflicts), separates sides with `=======`, and closes with `<<<<<<<`,
+/// matching Atomic's inverted marker convention. `sides` must already be in a
+/// deterministic order so the rendering is stable across runs.
+#[allow(clippy::too_many_arguments)]
+fn render_name_conflict<C: atomic_core::change::ChangeStore>(
+    txn: &atomic_core::pristine::ReadTxn,
+    store: &C,
+    inode_graph_table: &redb::ReadOnlyMultimapTable<&'static [u8; 32], &'static [u8; 24]>,
+    change_filter_arc: &Arc<std::collections::HashSet<NodeId>>,
+    path: &str,
+    sides: &[(Inode, Position<NodeId>)],
+) -> Result<Vec<u8>, String> {
+    use atomic_core::output::repo::{
+        output_graph_content_resolved, resolve_conflicts_semantically,
+    };
+    use atomic_core::output::{compute_order, retrieve_graph, RetrieveOptions, Writer};
+    use atomic_core::pristine::InodePreloadTxn;
+
+    let mut out: Vec<u8> = Vec::new();
+    for (i, (inode, position)) in sides.iter().enumerate() {
+        if i == 0 {
+            out.extend_from_slice(format!(">>>>>>> {} (name conflict)\n", path).as_bytes());
+        } else {
+            out.extend_from_slice(b"=======\n");
+        }
+
+        let preloaded = InodePreloadTxn::from_table(txn, *inode, inode_graph_table)
+            .map_err(|e| format!("{}: name-conflict preload: {:?}", path, e))?;
+        let retrieve_opts =
+            RetrieveOptions::default().with_change_filter_arc(change_filter_arc.clone());
+        let retrieve_result = retrieve_graph(&preloaded, *position, retrieve_opts)
+            .map_err(|e| format!("{}: name-conflict retrieve: {:?}", path, e))?;
+        let mut graph = retrieve_result.graph;
+        let order = compute_order(&mut graph);
+        let resolved = resolve_conflicts_semantically(&preloaded, store, &graph, &order);
+        let buffer = Vec::with_capacity(graph.total_bytes());
+        let mut writer = Writer::new(buffer);
+        let hash_fn = |node_id: NodeId| -> Option<Hash> {
+            if node_id.is_root() {
+                return None;
+            }
+            preloaded.get_external(node_id).ok().flatten()
+        };
+        output_graph_content_resolved(store, hash_fn, &graph, &order, &mut writer, &resolved)
+            .map_err(|e| format!("{}: name-conflict content: {:?}", path, e))?;
+        let side = writer.into_inner();
+        out.extend_from_slice(&side);
+        if !side.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+    }
+    out.extend_from_slice(format!("<<<<<<< {} (name conflict)\n", path).as_bytes());
+    Ok(out)
+}
 
 impl Repository {
+    /// Persist the conflict state discovered by a materialize into the
+    /// `CONFLICTS` table for `view_id`.
+    ///
+    /// A full materialize (`only_paths` is `None`) replaces the view's entire
+    /// conflict set: every prior entry is dropped and the current conflicts
+    /// re-written. A partial materialize updates only the touched files,
+    /// setting or clearing each. This keeps a partial run from wrongly
+    /// discarding conflicts for files it did not re-materialize.
+    fn persist_view_conflicts(
+        &self,
+        view_id: u64,
+        path_to_inode: &std::collections::HashMap<String, u64>,
+        conflicts_by_path: &std::collections::HashMap<String, u32>,
+        only_paths: &Option<std::collections::HashSet<String>>,
+    ) -> Result<(), RepositoryError> {
+        let mut wtxn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mk = |path: &str, line: u32| StoredConflict {
+            kind: StoredConflictKind::Order,
+            path: path.to_string(),
+            line: Some(line),
+            sides: Vec::new(),
+        };
+
+        match only_paths {
+            None => {
+                wtxn.del_conflicts_prefix(view_id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                for (path, line) in conflicts_by_path {
+                    if let Some(&inode) = path_to_inode.get(path) {
+                        let sc = mk(path, *line);
+                        wtxn.put_conflicts(view_id, inode, std::slice::from_ref(&sc))
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    }
+                }
+            }
+            Some(paths) => {
+                for path in paths {
+                    if let Some(&inode) = path_to_inode.get(path) {
+                        if let Some(line) = conflicts_by_path.get(path) {
+                            let sc = mk(path, *line);
+                            wtxn.put_conflicts(view_id, inode, std::slice::from_ref(&sc))
+                                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        } else {
+                            wtxn.del_conflicts(view_id, inode)
+                                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        }
+                    }
+                }
+            }
+        }
+
+        wtxn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(())
+    }
     /// Compute the set of file paths visible on a view.
     ///
     /// Visibility includes the view's own changes AND all changes
@@ -262,6 +402,60 @@ impl Repository {
         let total_files = file_items.len();
         let skipped_in_filter = items.iter().filter(|i| !i.is_directory).count() - total_files;
 
+        // ── Name-conflict detection ──────────────────────────────────────
+        //
+        // TREE is a single-valued path→inode index, so `iter_tree` (and hence
+        // `file_items`) exposes only ONE inode per path even when two
+        // independent creates on different views both claim it — the later
+        // recorder silently wins and the first inode is orphaned (rubric A12,
+        // ATOM::29/30). Walk REV_TREE to recover every inode that claims each
+        // path; when ≥ 2 of them are BOTH visible (creating change in the
+        // filter) and alive under this view, the path is a genuine name
+        // conflict that must be surfaced rather than silently collapsed.
+        //
+        // The (relatively expensive) aliveness probe runs ONLY for paths with
+        // ≥ 2 candidate inodes, so the common single-inode file pays nothing.
+        let name_conflicts: std::collections::HashMap<String, Vec<(Inode, Position<NodeId>)>> = {
+            use atomic_core::pristine::TreeTxnT;
+            let mut by_path: std::collections::HashMap<String, Vec<Inode>> =
+                std::collections::HashMap::new();
+            if let Ok(pairs) = txn.iter_rev_tree() {
+                for (inode, path) in pairs {
+                    by_path.entry(path).or_default().push(inode);
+                }
+            }
+            let filter = change_filter_arc.as_ref();
+            let mut conflicts: std::collections::HashMap<String, Vec<(Inode, Position<NodeId>)>> =
+                std::collections::HashMap::new();
+            for item in &file_items {
+                let candidates = match by_path.get(&item.path) {
+                    Some(c) if c.len() >= 2 => c,
+                    _ => continue,
+                };
+                let mut live: Vec<(Inode, Position<NodeId>)> = Vec::new();
+                for &inode in candidates {
+                    let pos = match txn.inode_position(inode) {
+                        Ok(Some(p)) => p,
+                        _ => continue,
+                    };
+                    if !pos.change.is_root() && !filter.contains(&pos.change) {
+                        continue; // not visible on this view
+                    }
+                    if crate::repository::status::is_file_alive_via_retrieval(
+                        &txn, inode, pos, filter,
+                    ) {
+                        live.push((inode, pos));
+                    }
+                }
+                if live.len() >= 2 {
+                    // Deterministic order: creating change, then position, then inode.
+                    live.sort_by_key(|(ino, p)| (p.change.get(), p.pos.get(), ino.get()));
+                    conflicts.insert(item.path.clone(), live);
+                }
+            }
+            conflicts
+        };
+
         // Phase 3: Create directories needed by passing files
         let mut result = MaterializeResult::new();
         result.files_skipped += skipped_in_filter;
@@ -359,7 +553,7 @@ impl Repository {
 
         // Phase 5c: Process files in parallel — retrieve graph, buffer content,
         // check content-hash, write to disk only if changed
-        type FileResult = Result<Option<(String, u64, Hash, bool)>, String>;
+        type FileResult = Result<Option<(String, u64, Hash, bool, Option<u32>)>, String>;
         let file_results: Vec<FileResult> = file_items
             .par_iter()
             .map(|item| {
@@ -426,6 +620,27 @@ impl Repository {
                     return Ok(None);
                 }
 
+                // Name-conflict override (rare): when ≥ 2 inodes are alive at
+                // this path on the view, replace the single-inode content with
+                // a marker-wrapped rendering of every side so the conflict is
+                // surfaced instead of silently collapsed (rubric A12).
+                let content = match name_conflicts.get(&item.path) {
+                    Some(sides) => render_name_conflict(
+                        &txn,
+                        store,
+                        &inode_graph_table,
+                        &change_filter_arc,
+                        &item.path,
+                        sides,
+                    )
+                    .unwrap_or(content),
+                    None => content,
+                };
+
+                // Detect conflict markers in the materialized bytes. This is
+                // the source of truth for persisted conflict state.
+                let marker_line = first_conflict_marker_line(&content);
+
                 // Compute content hash from the in-memory buffer
                 let content_hash = Hash::of(&content);
                 let bytes_written = content.len() as u64;
@@ -459,6 +674,7 @@ impl Repository {
                                             bytes_written,
                                             content_hash,
                                             false, // not written
+                                            marker_line,
                                         )));
                                     }
                                 }
@@ -496,7 +712,13 @@ impl Repository {
                     }
                 }
 
-                Ok(Some((item.path.clone(), bytes_written, content_hash, true)))
+                Ok(Some((
+                    item.path.clone(),
+                    bytes_written,
+                    content_hash,
+                    true,
+                    marker_line,
+                )))
             })
             .collect();
 
@@ -510,10 +732,17 @@ impl Repository {
 
         // Phase 6: Aggregate results and update FILE_INDEX
         let mut index_entries: Vec<(String, i64, u32, u64, Hash)> = Vec::new();
+        // Files whose materialized content carries conflict markers, with the
+        // 1-based line of the first marker.
+        let mut conflicts_by_path: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
 
         for file_result in file_results {
             match file_result {
-                Ok(Some((path, bytes, content_hash, was_written))) => {
+                Ok(Some((path, bytes, content_hash, was_written, marker_line))) => {
+                    if let Some(line) = marker_line {
+                        conflicts_by_path.insert(path.clone(), line);
+                    }
                     if was_written {
                         result.files_written += 1;
                         result.bytes_written += bytes;
@@ -554,6 +783,23 @@ impl Repository {
         // Batch-update FILE_INDEX with pre-computed hashes
         if !index_entries.is_empty() {
             let _ = self.update_file_index(&index_entries);
+        }
+
+        // Persist conflict state so `atomic status` can surface conflicted
+        // files and `record` can refuse to bake markers into history.
+        // Build path→inode from the materialized items, then write in a
+        // dedicated txn (the read txn above is dropped first).
+        let path_to_inode: std::collections::HashMap<String, u64> = file_items
+            .iter()
+            .map(|i| (i.path.clone(), i.inode.get()))
+            .collect();
+        let view_id = view.id;
+        drop(inode_graph_table);
+        drop(txn);
+        if let Err(e) =
+            self.persist_view_conflicts(view_id, &path_to_inode, &conflicts_by_path, &only_paths)
+        {
+            log::warn!("failed to persist conflict state: {}", e);
         }
 
         Ok(result)

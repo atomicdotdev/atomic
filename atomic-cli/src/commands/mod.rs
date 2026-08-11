@@ -69,6 +69,9 @@ use crate::error::{CliError, CliResult};
 // Phase 2: Core Local Commands
 pub mod add;
 pub mod change;
+pub mod complete;
+pub mod completions;
+pub mod conflicts;
 pub mod diff;
 pub mod doctor;
 pub mod init;
@@ -131,6 +134,8 @@ pub use add::Add;
 pub use agent::Agent;
 pub use change::ChangeCmd;
 pub use clone::Clone;
+pub use completions::Completions;
+pub use conflicts::Conflicts;
 pub use diff::Diff;
 pub use doctor::Doctor;
 pub use git::Git;

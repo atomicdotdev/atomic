@@ -236,6 +236,12 @@ pub struct JsonChange {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<JsonProvenance>,
 
+    /// Data stored outside the content hash — the agent turn transcript
+    /// (`agent_turn`) and anything else attached unhashed — when the change
+    /// carries it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unhashed: Option<serde_json::Value>,
+
     /// Sequence number in the current view (if known).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<u64>,
@@ -271,6 +277,7 @@ impl JsonChange {
             hunks: change.hashed.hunks.iter().map(hunk_to_summary).collect(),
             has_provenance: change.has_provenance(),
             provenance: None,
+            unhashed: change.unhashed.clone(),
             sequence,
         }
     }
@@ -321,6 +328,34 @@ pub struct JsonProvenance {
     /// Session ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Hash of the prompt (base32), when only the hash is stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_hash: Option<String>,
+    /// Additional metadata key-value pairs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    /// Agent mode: "build", "code", "ask", etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_mode: Option<String>,
+    /// Why the model stopped on the final step ("stop", "tool-calls",
+    /// "length").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    /// Number of LLM roundtrips (steps) in the turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_count: Option<u32>,
+    /// Human-readable session slug (e.g., "mighty-rocket").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_slug: Option<String>,
+    /// Model-provider signature over the reasoning blocks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_signature: Option<String>,
+    /// Concatenated reasoning/thinking text from the turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_text: Option<String>,
+    /// Agent's structured task plan at turn completion (JSON string).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_plan: Option<String>,
 }
 
 /// JSON representation of token usage.
@@ -362,6 +397,25 @@ impl From<&Provenance> for JsonProvenance {
             None
         };
 
+        let prompt_hash = match &prov.prompt {
+            atomic_core::change::PromptContent::Hashed(h) => {
+                use atomic_core::types::Base32;
+                Some(h.to_base32())
+            }
+            _ => None,
+        };
+
+        let metadata = if prov.metadata.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Array(
+                prov.metadata
+                    .iter()
+                    .map(|(k, v)| serde_json::json!({ "key": k, "value": v }))
+                    .collect(),
+            ))
+        };
+
         Self {
             vendor: format!("{:?}", prov.vendor),
             model: prov.model.clone(),
@@ -374,6 +428,15 @@ impl From<&Provenance> for JsonProvenance {
             timestamp: prov.timestamp,
             request_id: prov.request_id.clone(),
             session_id: prov.session_id.clone(),
+            prompt_hash,
+            metadata,
+            agent_mode: prov.agent_mode.clone(),
+            finish_reason: prov.finish_reason.clone(),
+            step_count: prov.step_count,
+            session_slug: prov.session_slug.clone(),
+            reasoning_signature: prov.reasoning_signature.clone(),
+            reasoning_text: prov.reasoning_text.clone(),
+            task_plan: prov.task_plan.clone(),
         }
     }
 }

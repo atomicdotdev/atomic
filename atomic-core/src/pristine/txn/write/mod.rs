@@ -22,12 +22,13 @@ use crate::types::{
 use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
 use crate::pristine::traits::{
-    FileIndexEntry, FileIndexMetadata, GraphTxnT, KgMutTxnT, MutTxnT, TreeTxnT, ViewScope,
-    ViewState, ViewTxnT,
+    FileIndexEntry, FileIndexMetadata, GraphTxnT, KgMutTxnT, MutTxnT, StoredConflict, TreeTxnT,
+    ViewScope, ViewState, ViewTxnT,
 };
 
 use super::helpers::{
-    deserialize_edge, deserialize_view_state, serialize_edge, serialize_view_state, AdjIterator,
+    deserialize_conflicts, deserialize_edge, deserialize_view_state, serialize_conflicts,
+    serialize_edge, serialize_view_state, AdjIterator,
 };
 
 const SESSION_LEDGER_SCHEMA_VERSION: u32 = 1;
@@ -1344,6 +1345,53 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         use crate::pristine::traits::tag::TagMutTxnT;
         self.del_tags_for_view(&view.name)?;
 
+        // Remove all persisted conflict state for this view.
+        self.del_conflicts_prefix(view.id)?;
+
+        Ok(())
+    }
+
+    fn put_conflicts(
+        &mut self,
+        view_id: u64,
+        inode: u64,
+        conflicts: &[StoredConflict],
+    ) -> PristineResult<()> {
+        let mut table = self.txn.open_table(CONFLICTS)?;
+        let key = encode_view_seq(view_id, inode);
+        if conflicts.is_empty() {
+            table.remove(&key)?;
+        } else {
+            let bytes = serialize_conflicts(conflicts)?;
+            table.insert(&key, bytes.as_slice())?;
+        }
+        Ok(())
+    }
+
+    fn del_conflicts(&mut self, view_id: u64, inode: u64) -> PristineResult<()> {
+        let mut table = self.txn.open_table(CONFLICTS)?;
+        let key = encode_view_seq(view_id, inode);
+        table.remove(&key)?;
+        Ok(())
+    }
+
+    fn del_conflicts_prefix(&mut self, view_id: u64) -> PristineResult<()> {
+        // Collect the keys in range first to avoid iterating while removing.
+        let keys: Vec<[u8; 16]> = {
+            let table = self.txn.open_table(CONFLICTS)?;
+            let start = encode_view_seq(view_id, 0);
+            let end = encode_view_seq(view_id, u64::MAX);
+            let mut keys = Vec::new();
+            for entry in table.range::<&[u8; 16]>(&start..=&end)? {
+                let (key, _) = entry?;
+                keys.push(*key.value());
+            }
+            keys
+        };
+        let mut table = self.txn.open_table(CONFLICTS)?;
+        for key in &keys {
+            table.remove(key)?;
+        }
         Ok(())
     }
 

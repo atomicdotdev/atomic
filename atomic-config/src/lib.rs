@@ -296,6 +296,47 @@ impl GlobalConfig {
         // 3. Legacy [server] block
         Ok((&self.server, None))
     }
+
+    /// Resolve the effective server config mutably, honouring the optional
+    /// name override.
+    ///
+    /// Mirrors the resolution order of [`resolve_server`](Self::resolve_server)
+    /// so that writes (e.g. `atomic org set`, `atomic workspace set`) land on
+    /// the same profile that reads resolve to:
+    ///
+    /// 1. `server_override` (from `--server <name>` CLI flag)
+    /// 2. `default_server` (from `~/.atomic/config.toml`)
+    /// 3. Legacy `server` block
+    ///
+    /// Returns the mutable profile plus its name (`Some` for a named profile,
+    /// `None` for the legacy block).
+    pub fn resolve_server_mut(
+        &mut self,
+        server_override: Option<&str>,
+    ) -> Result<(&mut ServerConfig, Option<String>), String> {
+        // Determine which profile name to target, if any. We resolve the name
+        // first (immutable borrow) so the mutable borrow below is unambiguous.
+        let name = if let Some(name) = server_override {
+            Some(name.to_string())
+        } else {
+            self.default_server.clone()
+        };
+
+        match name {
+            Some(name) => {
+                let profile = self.servers.get_mut(&name).ok_or_else(|| {
+                    format!(
+                        "Server profile '{}' not found. \
+                         Use 'atomic server list' to see available profiles, \
+                         or 'atomic server add {0} <url>' to create it.",
+                        name
+                    )
+                })?;
+                Ok((profile, Some(name)))
+            }
+            None => Ok((&mut self.server, None)),
+        }
+    }
 }
 
 /// Color output preference
@@ -366,8 +407,29 @@ pub struct RemoteConfig {
     pub default_channel: Option<String>,
 }
 
-/// Get the global configuration directory
+/// Get the global configuration directory.
+///
+/// Resolution order:
+/// 1. The `ATOMIC_CONFIG_DIR` environment variable, if set — used verbatim as
+///    the config directory (the one containing `config.toml`). This lets tests
+///    isolate the global config on every platform, and lets users relocate it.
+/// 2. `dirs::home_dir()/.atomic` (the default).
+///
+/// The variable is read at call time so it can be set and restored per test
+/// (`dirs::home_dir()` on Windows resolves the profile known-folder, not
+/// `HOME`, so an env override is the only reliable cross-platform isolation).
 pub fn global_config_dir() -> Option<PathBuf> {
+    global_config_dir_from(std::env::var_os("ATOMIC_CONFIG_DIR"))
+}
+
+/// Resolve the global config directory from an explicit override value.
+///
+/// Split out so the override precedence is unit-testable without mutating
+/// process environment (which is racy and platform-sensitive).
+fn global_config_dir_from(env_override: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    if let Some(dir) = env_override {
+        return Some(PathBuf::from(dir));
+    }
     dirs::home_dir().map(|p| p.join(".atomic"))
 }
 
@@ -664,6 +726,81 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_server_mut_targets_named_profile() {
+        // default_server points at a named profile → mutation must land there,
+        // not on the legacy [server] block.
+        let mut config = GlobalConfig {
+            default_server: Some("prod".to_string()),
+            ..GlobalConfig::default()
+        };
+        config.servers.insert(
+            "prod".to_string(),
+            ServerConfig {
+                url: Some("https://atomic.storage".to_string()),
+                default_org: None,
+                default_workspaces: BTreeMap::new(),
+                identity: Some("continuouslee".to_string()),
+                single_tenant: false,
+            },
+        );
+
+        let (server, name) = config.resolve_server_mut(None).unwrap();
+        assert_eq!(name.as_deref(), Some("prod"));
+        server.default_org = Some("atomic".to_string());
+
+        assert_eq!(
+            config.servers["prod"].default_org.as_deref(),
+            Some("atomic")
+        );
+        assert!(config.server.default_org.is_none());
+    }
+
+    #[test]
+    fn test_resolve_server_mut_falls_back_to_legacy_block() {
+        // No default_server and no override → legacy [server] block.
+        let mut config = GlobalConfig::default();
+
+        let (server, name) = config.resolve_server_mut(None).unwrap();
+        assert!(name.is_none());
+        server.default_org = Some("alice".to_string());
+
+        assert_eq!(config.server.default_org.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn test_resolve_server_mut_override_wins() {
+        let mut config = GlobalConfig {
+            default_server: Some("prod".to_string()),
+            ..GlobalConfig::default()
+        };
+        config
+            .servers
+            .insert("prod".to_string(), ServerConfig::default());
+        config
+            .servers
+            .insert("staging".to_string(), ServerConfig::default());
+
+        let (server, name) = config.resolve_server_mut(Some("staging")).unwrap();
+        assert_eq!(name.as_deref(), Some("staging"));
+        server.default_org = Some("staging-org".to_string());
+
+        assert_eq!(
+            config.servers["staging"].default_org.as_deref(),
+            Some("staging-org")
+        );
+        assert!(config.servers["prod"].default_org.is_none());
+    }
+
+    #[test]
+    fn test_resolve_server_mut_missing_profile_errors() {
+        let mut config = GlobalConfig {
+            default_server: Some("ghost".to_string()),
+            ..GlobalConfig::default()
+        };
+        assert!(config.resolve_server_mut(None).is_err());
+    }
+
+    #[test]
     fn test_default_workspaces_backward_compatibility() {
         // Old configs without default_workspaces should still parse.
         let toml_str = r#"
@@ -748,5 +885,28 @@ default_org = "alice"
             config.org_base_url("alice").as_deref(),
             Some("https://alice.atomic.storage")
         );
+    }
+
+    #[test]
+    fn global_config_dir_uses_env_override_verbatim() {
+        // With the override set, the directory is used exactly as given.
+        let override_dir = std::ffi::OsString::from("/some/test/config/dir");
+        assert_eq!(
+            global_config_dir_from(Some(override_dir)),
+            Some(PathBuf::from("/some/test/config/dir"))
+        );
+    }
+
+    #[test]
+    fn global_config_dir_falls_back_to_home_when_unset() {
+        // Without the override, it falls back to <home>/.atomic (matching the
+        // pre-existing behavior). We only assert the `.atomic` suffix so the
+        // test is host-independent.
+        if let Some(dir) = global_config_dir_from(None) {
+            assert!(
+                dir.ends_with(".atomic"),
+                "expected <home>/.atomic, got {dir:?}"
+            );
+        }
     }
 }

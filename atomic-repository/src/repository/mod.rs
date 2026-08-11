@@ -75,6 +75,7 @@ use crate::RepositoryError;
 
 // ── Sub-modules (new) ───────────────────────────────────────────────────
 
+mod deferred_tree;
 mod filter;
 mod materialize;
 mod sandbox;
@@ -118,6 +119,7 @@ mod vault_intent;
 mod vault_kg_enrich;
 mod vault_names;
 mod vault_triples;
+mod verify;
 pub use insert::{
     ImportLineIndexSeed, ImportLineIndexSeedLine, ImportWriteOutcome, ImportWriteTimings,
 };
@@ -135,6 +137,7 @@ pub use vault_intent::{
 };
 pub use vault_kg_enrich::KgEnrichStats;
 pub use vault_names::{derive_intent_prefix, generate_goal_name};
+pub use verify::{VerifyProblem, VerifyReport};
 
 #[cfg(test)]
 mod tests;
@@ -331,14 +334,16 @@ default = "{}"
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        Ok(Self {
+        let mut repository = Self {
             root,
             dot_dir,
             current_view,
             pristine,
             change_store,
             is_sandbox: false,
-        })
+        };
+        repository.recover_pending_deferred_tree_alignment()?;
+        Ok(repository)
     }
 
     /// Open an existing repository without the table-init write lock.
@@ -368,14 +373,16 @@ default = "{}"
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        Ok(Self {
+        let mut repository = Self {
             root,
             dot_dir,
             current_view,
             pristine,
             change_store,
             is_sandbox: false,
-        })
+        };
+        repository.recover_pending_deferred_tree_alignment()?;
+        Ok(repository)
     }
 
     /// Open an existing repository in read-only mode.
@@ -429,14 +436,21 @@ default = "{}"
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        Ok(Self {
+        let repository = Self {
             root,
             dot_dir,
             current_view,
             pristine,
             change_store,
             is_sandbox: false,
-        })
+        };
+        if repository.has_pending_deferred_tree_alignment() {
+            return Err(RepositoryError::InvalidOperation {
+                message: "repository view switch is still completing; retry with a writable repository open"
+                    .to_string(),
+            });
+        }
+        Ok(repository)
     }
 
     /// Open an existing repository using a pre-opened `Pristine`.
@@ -467,14 +481,16 @@ default = "{}"
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        Ok(Self {
+        let mut repository = Self {
             root,
             dot_dir,
             current_view,
             pristine,
             change_store,
             is_sandbox: false,
-        })
+        };
+        repository.recover_pending_deferred_tree_alignment()?;
+        Ok(repository)
     }
 
     /// Find the repository root by searching for .atomic directory.
@@ -632,8 +648,8 @@ default = "{}"
             }
         }
 
-        self.current_view = view.to_string();
         self.write_current_view(view)?;
+        self.current_view = view.to_string();
         Ok(())
     }
 
@@ -661,13 +677,15 @@ default = "{}"
     /// Returns an error if the view does not exist or the pointer file
     /// cannot be written.
     pub fn align_to_view(&mut self, view: &str) -> Result<(), RepositoryError> {
-        self.set_current_view(view)
+        self.align_deferred_tree_and_publish_view(view).map(|_| ())
     }
 
     /// Set the current view on this handle only.
     ///
     /// This does not validate the view or persist `.atomic/current_view`. It is
-    /// intended for read-only handles that need `status()` to read another view.
+    /// intended for scoped handles that must read or write another validated
+    /// view without publishing a process-global working-copy switch (for
+    /// example agent recording or background Git import).
     #[inline]
     pub fn set_current_view_in_memory(&mut self, view: &str) {
         self.current_view = view.to_string();
@@ -701,8 +719,32 @@ default = "{}"
 
     /// Write the current view to disk.
     fn write_current_view(&self, view: &str) -> Result<(), RepositoryError> {
+        use std::io::Write;
+
         let current_path = self.dot_dir.join("current_view");
-        std::fs::write(&current_path, view)?;
+        let mut temp = tempfile::NamedTempFile::new_in(&self.dot_dir)?;
+        temp.as_file_mut().write_all(view.as_bytes())?;
+        temp.as_file_mut().write_all(b"\n")?;
+        temp.as_file().sync_all()?;
+        temp.persist(&current_path).map_err(|error| {
+            RepositoryError::Io(std::io::Error::other(format!(
+                "failed to persist current view: {}",
+                error
+            )))
+        })?;
+        self.sync_dot_dir()?;
+        Ok(())
+    }
+
+    /// Make prior atomic renames/removals in `.atomic` durable before a
+    /// coupled database transition is allowed to advance. Directory fsync is
+    /// available on Unix; other supported platforms retain atomic rename
+    /// semantics but do not expose a portable directory durability barrier.
+    fn sync_dot_dir(&self) -> Result<(), RepositoryError> {
+        #[cfg(unix)]
+        {
+            std::fs::File::open(&self.dot_dir)?.sync_all()?;
+        }
         Ok(())
     }
 

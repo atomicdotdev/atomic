@@ -160,6 +160,12 @@ fn current_git_branch(git_repo: &GitRepository) -> Option<String> {
 
 const GIT_SHADOW_EXCLUDE_PATTERNS: &[&str] = &["/.atomic/", "/.vault/", "/.atomicignore"];
 
+#[derive(Debug, Clone, Copy)]
+struct BranchImportMode {
+    mainline_only: bool,
+    preserve_working_copy: bool,
+}
+
 fn ensure_git_shadow_excludes(git_dir: &Path) -> CliResult<bool> {
     let info_dir = git_dir.join("info");
     std::fs::create_dir_all(&info_dir)?;
@@ -205,7 +211,8 @@ impl Import {
         branch_name: &str,
         repo: &mut Repository,
         imported_shas: &HashSet<String>,
-        mainline_only: bool,
+        known_states: &HashSet<atomic_core::types::Merkle>,
+        mode: BranchImportMode,
     ) -> CliResult<usize> {
         // Get repository name from remote URL or working directory
         let repo_name = self.get_repo_name(git_repo);
@@ -219,15 +226,17 @@ impl Import {
                 git_repo.workdir().unwrap_or_else(|| repo.root()),
                 self.kind.as_deref(),
             ),
-            mainline_only,
+            mainline_only: mode.mainline_only,
             graph_only: !self.with_crdt,
+            preserve_working_copy: mode.preserve_working_copy,
+            target_view: branch_name.to_string(),
+            known_states: known_states.clone(),
         };
 
         let importer = ParallelImporter::new(git_repo, options);
 
         // Run the three-phase parallel import
         let stats = importer.import_branch(branch_name, repo)?;
-
         // Return total changes created (written + empty + merge)
         Ok(stats.changes_written + stats.empty_commits + stats.merge_commits)
     }
@@ -258,34 +267,62 @@ impl Import {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
-    /// Get the set of already imported Git SHAs from existing changes.
-    fn get_imported_shas(&self, repo: &Repository) -> HashSet<String> {
+    /// Get the set of already imported Git SHAs from existing changes,
+    /// plus the Merkle states already present in the import target view.
+    ///
+    /// The states let the importer skip commits created by `atomic git
+    /// push`: such a commit trailers the view state it represents, and if
+    /// that state is already known the commit adds nothing.
+    fn get_incremental_markers(
+        &self,
+        repo: &Repository,
+        view_name: &str,
+    ) -> CliResult<(HashSet<String>, HashSet<atomic_core::types::Merkle>)> {
         use atomic_repository::HistoryOptions;
 
-        // Ensure the GIT_SHA_INDEX is populated for repos imported before
-        // the index existed. This is a one-time O(n) scan that makes all
-        // subsequent --incremental runs O(1) per commit.
-        let _ = repo.backfill_git_sha_index();
-
         let mut shas = HashSet::new();
+        let mut states = HashSet::new();
+        let mut index_repairs = Vec::new();
 
-        // Iterate through all changes on the current view via log
-        let options = HistoryOptions::default();
-        if let Ok(entries) = repo.log(options) {
-            for entry in entries {
-                if let Ok(change) = repo.load_change(&entry.hash) {
-                    if let Some(ref unhashed) = change.unhashed {
-                        if let Some(git) = unhashed.get("git") {
-                            if let Some(sha) = git.get("sha").and_then(|v| v.as_str()) {
-                                shas.insert(sha.to_string());
-                            }
+        // Query the explicit target instead of the current view. Agent drafts
+        // intentionally hide inherited changes from their default log, so
+        // scanning the current draft makes already-imported parent commits look
+        // new and duplicates them onto the Git branch view.
+        let options = HistoryOptions::default()
+            .view(view_name)
+            .include_inherited(true);
+        let entries = repo
+            .log(options)
+            .map_err(|error| CliError::Internal(error.into()))?;
+        for entry in entries {
+            states.insert(entry.state);
+            let change = repo
+                .load_change(&entry.hash)
+                .map_err(|error| CliError::Internal(error.into()))?;
+            if let Some(ref unhashed) = change.unhashed {
+                if let Some(git) = unhashed.get("git") {
+                    if let Some(sha) = git.get("sha").and_then(|v| v.as_str()) {
+                        if shas.insert(sha.to_string()) {
+                            index_repairs.push((sha.to_string(), entry.hash));
                         }
                     }
                 }
             }
         }
 
-        shas
+        // Repair the acceleration index while scanning older repositories.
+        // The explicit target-view history is authoritative; index repair is
+        // best-effort and batched so a no-op sync never commits once per
+        // historical Git change.
+        if let Err(error) = repo.index_git_shas(&index_repairs) {
+            log::warn!(
+                "Failed to repair Git SHA index for view '{}': {}",
+                view_name,
+                error
+            );
+        }
+
+        Ok((shas, states))
     }
 
     /// Get all local branch names.
@@ -432,12 +469,8 @@ impl Command for Import {
             Repository::init(workdir).map_err(|e| CliError::Internal(e.into()))?
         };
 
-        // Get already imported SHAs for incremental mode
-        let imported_shas = if self.incremental {
-            self.get_imported_shas(&repo)
-        } else {
-            HashSet::new()
-        };
+        let original_view = repo.current_view().to_string();
+        let preserve_current_view = repo_exists && self.incremental;
 
         if self.with_crdt {
             print_info(
@@ -459,6 +492,9 @@ impl Command for Import {
 
             let mut total_imported = 0;
             for branch_name in branches {
+                let preserve_branch_working_copy =
+                    preserve_current_view && original_view != branch_name;
+
                 // Ensure the view exists
                 if !repo
                     .view_exists(&branch_name)
@@ -468,23 +504,65 @@ impl Command for Import {
                         .map_err(|e| CliError::Internal(e.into()))?;
                 }
 
-                // Align to the view (materialize happens after all branches imported)
-                repo.align_to_view(&branch_name)
-                    .map_err(|e| CliError::Internal(e.into()))?;
+                let (imported_shas, known_states) = if self.incremental {
+                    self.get_incremental_markers(&repo, &branch_name)?
+                } else {
+                    (HashSet::new(), HashSet::new())
+                };
 
-                // Import the branch
-                let count =
-                    self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas, false)?;
+                // Existing incremental imports are background bookkeeping.
+                // Select the target only on this handle so concurrent hooks
+                // and crashes never observe a temporary global view pointer.
+                if preserve_branch_working_copy {
+                    repo.set_current_view_in_memory(&branch_name);
+                } else {
+                    repo.align_to_view(&branch_name)
+                        .map_err(|e| CliError::Internal(e.into()))?;
+                }
+
+                // Import the branch. A foreign target is selected only on
+                // this handle; restore the handle to the persisted working
+                // copy view before processing the next branch (including on
+                // error) so no later transition mistakes the scoped target
+                // for the recovery source.
+                let import_result = self.import_branch(
+                    &git_repo,
+                    &branch_name,
+                    &mut repo,
+                    &imported_shas,
+                    &known_states,
+                    BranchImportMode {
+                        mainline_only: false,
+                        preserve_working_copy: preserve_branch_working_copy,
+                    },
+                );
+                if preserve_branch_working_copy {
+                    repo.set_current_view_in_memory(&original_view);
+                }
+                let count = import_result?;
                 total_imported += count;
             }
 
-            // Materialize the working copy from the graph
-            print_info("Materializing working copy...");
-            match repo.materialize() {
-                Ok(result) => print_info(&format!("Materialized {} files", result.files_written)),
-                Err(e) => print_warning(&format!("Working copy materialization failed: {}", e)),
+            if preserve_current_view {
+                // Incremental Git shadow sync is background bookkeeping. Keep
+                // both the user's Atomic view pointer and its working copy in
+                // place while updating the requested Git branch views.
+                repo.set_current_view_in_memory(&original_view);
+                print_info(&format!(
+                    "Preserved current Atomic view '{}'.",
+                    original_view
+                ));
+            } else {
+                // Materialize the working copy from the graph
+                print_info("Materializing working copy...");
+                match repo.materialize() {
+                    Ok(result) => {
+                        print_info(&format!("Materialized {} files", result.files_written))
+                    }
+                    Err(e) => print_warning(&format!("Working copy materialization failed: {}", e)),
+                }
+                reindex_working_copy(&repo);
             }
-            reindex_working_copy(&repo);
 
             // Initialize .atomicignore + vault AFTER import + materialize.
             // Must be before KG enrichment so has_vault() returns true.
@@ -531,15 +609,42 @@ impl Command for Import {
                     .map_err(|e| CliError::Internal(e.into()))?;
             }
 
-            // Align to the view (materialize/reindex follows)
-            repo.align_to_view(&branch_name)
-                .map_err(|e| CliError::Internal(e.into()))?;
+            let (imported_shas, known_states) = if self.incremental {
+                self.get_incremental_markers(&repo, &branch_name)?
+            } else {
+                (HashSet::new(), HashSet::new())
+            };
+
+            let restore_original_view = preserve_current_view && original_view != branch_name;
+
+            if restore_original_view {
+                repo.set_current_view_in_memory(&branch_name);
+            } else {
+                // User-facing/new imports still publish the selected branch;
+                // materialization or reindexing below makes disk match it.
+                repo.align_to_view(&branch_name)
+                    .map_err(|e| CliError::Internal(e.into()))?;
+            }
 
             // Import
-            let count =
-                self.import_branch(&git_repo, &branch_name, &mut repo, &imported_shas, true)?;
+            let count = self.import_branch(
+                &git_repo,
+                &branch_name,
+                &mut repo,
+                &imported_shas,
+                &known_states,
+                BranchImportMode {
+                    mainline_only: true,
+                    preserve_working_copy: restore_original_view,
+                },
+            )?;
 
-            if current_git_branch(&git_repo).as_deref() == Some(branch_name.as_str()) {
+            if restore_original_view {
+                print_info(&format!(
+                    "Preserving current Atomic view '{}'.",
+                    original_view
+                ));
+            } else if current_git_branch(&git_repo).as_deref() == Some(branch_name.as_str()) {
                 print_info("Using Git working copy as imported materialization.");
                 reindex_working_copy(&repo);
             } else {
@@ -572,6 +677,10 @@ impl Command for Import {
                     Ok(stats) => print_info(&format!("KG enriched: {}", stats)),
                     Err(e) => log::warn!("KG enrichment failed: {}", e),
                 }
+            }
+
+            if restore_original_view {
+                repo.set_current_view_in_memory(&original_view);
             }
 
             // Build the content search index (syntext)

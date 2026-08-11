@@ -101,8 +101,10 @@ pub fn read_memory(repo: &Repository, id_or_path: &str) -> CliResult<MemLiftInpu
     let entry = repo
         .vault_retrieve(&path)
         .map_err(CliError::Repository)?
-        .ok_or_else(|| CliError::InvalidArgument {
-            message: format!("memory not found: {id_or_path} (create with `atomic memory new`)"),
+        .ok_or_else(|| CliError::VaultEntityNotFound {
+            kind: "memory",
+            id: id_or_path.to_string(),
+            hint: Some("create with `atomic memory new`".to_string()),
         })?;
     inputs_from_entry(&entry)
 }

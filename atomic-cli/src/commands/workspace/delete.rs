@@ -115,14 +115,21 @@ impl Command for WorkspaceDelete {
     }
 }
 
-/// Remove a deleted workspace from `[server.default_workspaces]` if it was
-/// the configured default for its org.
+/// Remove a deleted workspace from the active server profile's
+/// `default_workspaces` if it was the configured default for its org.
+///
+/// Operates on the **active** server profile (the same one
+/// `atomic workspace set` writes to) so cleanup stays consistent when a
+/// named profile is active.
 fn clean_up_local_config(org_slug: &str, deleted_workspace: &str) -> CliResult<()> {
     let mut config = GlobalConfig::load()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {e}")))?;
 
-    let was_default = config
-        .server
+    let (server, _name) = config
+        .resolve_server_mut(None)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("{e}")))?;
+
+    let was_default = server
         .default_workspaces
         .get(org_slug)
         .map(|v| v == deleted_workspace)
@@ -132,7 +139,7 @@ fn clean_up_local_config(org_slug: &str, deleted_workspace: &str) -> CliResult<(
         return Ok(());
     }
 
-    config.server.default_workspaces.remove(org_slug);
+    server.default_workspaces.remove(org_slug);
     config
         .save()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to save global config: {e}")))?;

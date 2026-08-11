@@ -919,3 +919,81 @@ fn test_parse_claude_response_missing_optional_fields() {
     assert!(reasoning.learnings.code[0].function.is_none());
     assert!(reasoning.learnings.code[0].category.is_none());
 }
+
+// condense_opencode_transcript / format_for_agent / last_assistant_text
+
+#[test]
+fn test_condense_opencode_transcript() {
+    let jsonl = [
+        r#"{"type":"user","text":"fix the bug"}"#,
+        r#"{"type":"reasoning","text":"thinking about it"}"#,
+        r#"{"type":"tool","tool":"bash","title":"cargo test","status":"completed"}"#,
+        r#"{"type":"assistant","text":"fixed"}"#,
+    ]
+    .join("\n");
+
+    let entries = condense_opencode_transcript(jsonl.as_bytes());
+
+    // Reasoning lines stay out of the condensed view.
+    assert_eq!(entries.len(), 3);
+    assert!(entries[0].is_user());
+    assert_eq!(entries[0].content.as_deref(), Some("fix the bug"));
+    assert!(entries[1].is_tool());
+    assert_eq!(entries[1].tool_name.as_deref(), Some("bash"));
+    assert_eq!(entries[1].tool_detail.as_deref(), Some("cargo test"));
+    assert!(entries[2].is_assistant());
+    assert_eq!(entries[2].content.as_deref(), Some("fixed"));
+}
+
+#[test]
+fn test_condense_opencode_transcript_skips_bad_lines() {
+    let jsonl = "not json\n{\"type\":\"assistant\",\"text\":\"ok\"}\n";
+    let entries = condense_opencode_transcript(jsonl.as_bytes());
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].is_assistant());
+}
+
+#[test]
+fn test_format_for_agent() {
+    assert_eq!(format_for_agent("claude-code"), "jsonl");
+    assert_eq!(format_for_agent("codex"), "jsonl");
+    assert_eq!(format_for_agent("gemini-cli"), "json");
+    assert_eq!(format_for_agent("opencode"), "opencode");
+}
+
+#[test]
+fn test_last_assistant_text_claude_jsonl() {
+    let jsonl = [
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"q"}]}}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"first"}]}}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{}}]}}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"final answer"}]}}"#,
+    ]
+    .join("\n");
+
+    assert_eq!(
+        last_assistant_text(jsonl.as_bytes(), "jsonl").as_deref(),
+        Some("final answer")
+    );
+}
+
+#[test]
+fn test_last_assistant_text_opencode() {
+    let jsonl = [
+        r#"{"type":"assistant","text":"one"}"#,
+        r#"{"type":"tool","tool":"bash"}"#,
+        r#"{"type":"assistant","text":"two"}"#,
+    ]
+    .join("\n");
+
+    assert_eq!(
+        last_assistant_text(jsonl.as_bytes(), "opencode").as_deref(),
+        Some("two")
+    );
+}
+
+#[test]
+fn test_last_assistant_text_none_when_no_assistant() {
+    let jsonl = r#"{"type":"user","text":"hello"}"#;
+    assert_eq!(last_assistant_text(jsonl.as_bytes(), "opencode"), None);
+}
