@@ -1,5 +1,10 @@
 use super::*;
 
+use std::collections::HashSet;
+
+use crate::apply::InsertOptions;
+use crate::manifest::ViewManifest;
+
 /// Information about a view.
 ///
 /// This struct provides metadata about a view including its current
@@ -541,4 +546,332 @@ impl Repository {
             parent_name,
         })
     }
+
+    /// Create a new Draft view parented on an explicit named parent.
+    ///
+    /// Unlike [`Repository::create_view`], which parents on the nearest
+    /// shared ancestor of the *current* view, this method parents on the
+    /// given view regardless of what is currently checked out. The new
+    /// view's change log starts empty.
+    ///
+    /// Returns `ViewNotFound` if the parent does not exist and
+    /// `ViewAlreadyExists` if the name is taken.
+    pub fn create_draft_view(
+        &mut self,
+        name: &str,
+        parent_name: &str,
+    ) -> Result<(), RepositoryError> {
+        self.create_view_with_identity(name, ViewScope::Draft, Some(parent_name))
+    }
+
+    /// Create a view with an explicit scope and optional named parent.
+    ///
+    /// The view's change log starts empty; this only establishes identity.
+    fn create_view_with_identity(
+        &mut self,
+        name: &str,
+        scope: ViewScope,
+        parent_name: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        ensure_workspace_dir(&self.dot_dir, name)?;
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if txn
+            .get_view(name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .is_some()
+        {
+            return Err(RepositoryError::ViewAlreadyExists {
+                name: name.to_string(),
+            });
+        }
+
+        let parent_id = match parent_name {
+            Some(p) => Some(
+                txn.get_view(p)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .ok_or_else(|| RepositoryError::ViewNotFound {
+                        name: p.to_string(),
+                    })?
+                    .id,
+            ),
+            None => None,
+        };
+
+        txn.create_view(name, scope, parent_id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Export a view's complete identity as a [`ViewManifest`].
+    ///
+    /// The manifest carries the view's change log **exactly as stored** in
+    /// `VIEW_CHANGES` (for a draft this includes the inherited prefix copied
+    /// at fork time), plus scope, parent name, and the view's merkle state.
+    /// The exported manifest is verified before it is returned, so a
+    /// corrupted log surfaces here rather than on the receiving end.
+    pub fn view_manifest(&self, name: &str) -> Result<ViewManifest, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let view = txn
+            .get_view(name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: name.to_string(),
+            })?;
+
+        let parent = match view.parent {
+            Some(parent_id) => txn
+                .get_view_by_id(parent_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .map(|p| p.name),
+            None => None,
+        };
+
+        let mut changes = Vec::with_capacity(view.change_count as usize);
+        for item in txn
+            .iter_changes(&view, 0)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            let (_seq, node_id, _merkle) =
+                item.map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let hash = txn
+                .get_external(node_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| {
+                    RepositoryError::Database(format!(
+                        "change {} in view '{}' has no external hash",
+                        node_id.0, name
+                    ))
+                })?;
+            changes.push(hash);
+        }
+
+        let manifest = ViewManifest {
+            name: view.name.clone(),
+            scope: view.kind,
+            parent,
+            changes,
+            state: view.state,
+        };
+        manifest.verify()?;
+        Ok(manifest)
+    }
+
+    /// Declaratively apply a [`ViewManifest`]: create the view with its
+    /// declared identity if absent, then fast-forward its change log to
+    /// match the manifest.
+    ///
+    /// # Semantics
+    ///
+    /// Everything is validated **before** any write:
+    ///
+    /// 1. The manifest's declared state must equal the fold of its log.
+    /// 2. Every referenced change file must be present in the local store.
+    /// 3. Every dependency of every change must appear earlier in the log
+    ///    or already be applied locally (dependency truth is read from the
+    ///    change files themselves, never from sender claims).
+    /// 4. If the view exists, its scope and parent must match the manifest
+    ///    and its log must be a prefix of the manifest log; anything else
+    ///    is a divergence error, never a silent merge.
+    /// 5. If the view is absent, the declared parent must already exist
+    ///    (apply manifests root → leaf).
+    ///
+    /// Replay is prefix-resumable, not single-transaction: each change
+    /// application is individually atomic, so an interrupted apply leaves
+    /// the view at a valid earlier prefix and re-applying the same manifest
+    /// resumes where it stopped. After replay the view's merkle state is
+    /// verified against the declared state.
+    pub fn apply_view_manifest(
+        &mut self,
+        manifest: &ViewManifest,
+    ) -> Result<ManifestApplyOutcome, RepositoryError> {
+        // 1. Structural integrity: declared state == fold of the log.
+        manifest.verify()?;
+
+        // 2. Presence: every change file must exist locally.
+        let missing: Vec<&Hash> = manifest
+            .changes
+            .iter()
+            .filter(|h| !self.has_change(h))
+            .collect();
+        if let Some(first) = missing.first() {
+            return Err(RepositoryError::ManifestMissingChanges {
+                view: manifest.name.clone(),
+                count: missing.len(),
+                first: first.to_base32(),
+            });
+        }
+
+        // 3. Dependency closure: deps must be earlier in the log or already
+        //    applied locally. Read from the change files (self-contained DAG).
+        {
+            let txn = self
+                .pristine
+                .read_txn()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let mut seen: HashSet<Hash> = HashSet::with_capacity(manifest.changes.len());
+            for hash in &manifest.changes {
+                let change = self.load_change(hash)?;
+                for dep in change.dependencies() {
+                    if seen.contains(dep) {
+                        continue;
+                    }
+                    let applied = txn
+                        .get_internal(dep)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?
+                        .is_some();
+                    if !applied {
+                        return Err(RepositoryError::ManifestDependencyMissing {
+                            view: manifest.name.clone(),
+                            change: hash.to_base32(),
+                            dependency: dep.to_base32(),
+                        });
+                    }
+                }
+                seen.insert(*hash);
+            }
+        }
+
+        // 4. Identity + prefix rule against the existing view (if any).
+        let prefix_len = {
+            let txn = self
+                .pristine
+                .read_txn()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            match txn
+                .get_view(&manifest.name)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                Some(view) => {
+                    if view.kind != manifest.scope {
+                        return Err(RepositoryError::ManifestIdentityMismatch {
+                            view: manifest.name.clone(),
+                            reason: format!(
+                                "local scope is {:?}, manifest declares {:?}",
+                                view.kind, manifest.scope
+                            ),
+                        });
+                    }
+                    let local_parent = match view.parent {
+                        Some(pid) => txn
+                            .get_view_by_id(pid)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?
+                            .map(|p| p.name),
+                        None => None,
+                    };
+                    if local_parent != manifest.parent {
+                        return Err(RepositoryError::ManifestIdentityMismatch {
+                            view: manifest.name.clone(),
+                            reason: format!(
+                                "local parent is {:?}, manifest declares {:?}",
+                                local_parent, manifest.parent
+                            ),
+                        });
+                    }
+
+                    // Local log must be a prefix of the manifest log.
+                    let mut local_len = 0usize;
+                    for item in txn
+                        .iter_changes(&view, 0)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    {
+                        let (_seq, node_id, _merkle) =
+                            item.map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        let local_hash = txn
+                            .get_external(node_id)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?
+                            .ok_or_else(|| {
+                                RepositoryError::Database(format!(
+                                    "change {} in view '{}' has no external hash",
+                                    node_id.0, manifest.name
+                                ))
+                            })?;
+                        match manifest.changes.get(local_len) {
+                            Some(expected) if *expected == local_hash => local_len += 1,
+                            _ => {
+                                return Err(RepositoryError::ManifestDiverged {
+                                    view: manifest.name.clone(),
+                                    at: local_len as u64,
+                                })
+                            }
+                        }
+                    }
+                    local_len
+                }
+                None => 0,
+            }
+        };
+
+        // 5. Create the view with its declared identity if absent.
+        if prefix_len == 0 && !self.view_exists(&manifest.name)? {
+            match self.create_view_with_identity(
+                &manifest.name,
+                manifest.scope,
+                manifest.parent.as_deref(),
+            ) {
+                Ok(()) => {}
+                Err(RepositoryError::ViewNotFound { name }) => {
+                    return Err(RepositoryError::ManifestParentMissing {
+                        view: manifest.name.clone(),
+                        parent: name,
+                    })
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // 6. Replay the suffix in exact log order. insert_change appends to
+        //    this view's log (put_change) and skips hunk application for
+        //    changes already in the global graph, so replaying a draft's
+        //    inherited prefix is a metadata-only operation.
+        let mut replayed = 0usize;
+        for hash in &manifest.changes[prefix_len..] {
+            let options = InsertOptions::default().view(&manifest.name);
+            self.insert_change(hash, options)?;
+            replayed += 1;
+        }
+
+        // 7. End-to-end verification: the view's state must now equal the
+        //    declared merkle.
+        let info = self.get_view_info(&manifest.name)?;
+        if info.state != manifest.state {
+            return Err(RepositoryError::ManifestStateMismatch {
+                view: manifest.name.clone(),
+                declared: manifest.state.to_base32(),
+                actual: info.state.to_base32(),
+            });
+        }
+
+        Ok(ManifestApplyOutcome {
+            view: manifest.name.clone(),
+            already_present: prefix_len,
+            replayed,
+            state: info.state,
+        })
+    }
+}
+
+/// Outcome of [`Repository::apply_view_manifest`].
+#[derive(Debug, Clone)]
+pub struct ManifestApplyOutcome {
+    /// The view the manifest was applied to.
+    pub view: String,
+    /// Log entries that were already present locally (the matched prefix).
+    pub already_present: usize,
+    /// Log entries replayed by this apply.
+    pub replayed: usize,
+    /// The view's merkle state after apply (equals the declared state).
+    pub state: Merkle,
 }

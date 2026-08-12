@@ -20,6 +20,7 @@
 //!
 //! This module provides the helper functions that support these operations.
 
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
@@ -28,7 +29,7 @@ use bytes::Bytes;
 use atomic_core::change::Change;
 use atomic_core::types::{Base32, Hash};
 use atomic_remote::RemoteError;
-use atomic_repository::Repository;
+use atomic_repository::{Repository, ViewManifest};
 
 use crate::error::{CliError, CliResult};
 
@@ -351,6 +352,146 @@ pub fn save_downloaded_change(repo: &Repository, hash: &Hash, data: Bytes) -> Cl
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to save change: {}", e)))?;
 
     Ok(())
+}
+
+// View Manifests
+
+/// Parse and verify a view manifest downloaded from the remote.
+///
+/// Validates three things before the manifest is trusted:
+///
+/// 1. The text parses structurally (header + base32 change log).
+/// 2. The header names the view that was requested.
+/// 3. The declared merkle state equals the fold of the change log.
+///
+/// # Arguments
+///
+/// * `view` - The view name that was requested from the remote
+/// * `text` - The raw manifest text returned by the server
+/// * `url` - The remote URL (for error context)
+pub fn parse_remote_manifest(view: &str, text: &str, url: &str) -> CliResult<ViewManifest> {
+    let manifest = ViewManifest::parse(text).map_err(|e| CliError::RemoteError {
+        message: format!("Corrupt manifest for view '{}': {}", view, e),
+        url: Some(url.to_string()),
+    })?;
+
+    if manifest.name != view {
+        return Err(CliError::RemoteError {
+            message: format!(
+                "Manifest name mismatch: requested view '{}', server sent '{}'",
+                view, manifest.name
+            ),
+            url: Some(url.to_string()),
+        });
+    }
+
+    manifest.verify().map_err(|e| CliError::RemoteError {
+        message: format!("Corrupt manifest for view '{}': {}", view, e),
+        url: Some(url.to_string()),
+    })?;
+
+    Ok(manifest)
+}
+
+/// Order manifests so every parent is applied before its children.
+///
+/// A manifest is ready when its declared parent is `None` (a root view),
+/// already applied locally (`already_applied`), or emitted earlier in the
+/// order. Repeatedly emits ready manifests until no progress can be made.
+///
+/// # Returns
+///
+/// `(ordered, stuck)` — indices into `manifests`. `ordered` is a valid
+/// root→leaf apply order; `stuck` holds manifests that can never apply
+/// (their parent chain has a cycle or references a view that is neither
+/// in the set nor already applied).
+pub fn manifest_apply_order(
+    manifests: &[ViewManifest],
+    already_applied: &HashSet<String>,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut ordered: Vec<usize> = Vec::with_capacity(manifests.len());
+    let mut emitted: HashSet<&str> = HashSet::with_capacity(manifests.len());
+    let mut remaining: Vec<usize> = (0..manifests.len()).collect();
+
+    loop {
+        let before = ordered.len();
+        remaining.retain(|&i| {
+            let ready = match manifests[i].parent.as_deref() {
+                None => true,
+                Some(p) => already_applied.contains(p) || emitted.contains(p),
+            };
+            if ready {
+                emitted.insert(manifests[i].name.as_str());
+                ordered.push(i);
+                false
+            } else {
+                true
+            }
+        });
+        if ordered.len() == before {
+            break;
+        }
+    }
+
+    (ordered, remaining)
+}
+
+/// The union of change hashes across a set of manifests.
+///
+/// Changes are content-addressed and shared across views (a draft's log
+/// includes its inherited prefix), so the union is deduplicated: each hash
+/// appears once, at its first occurrence. Iterating manifests root→leaf
+/// therefore yields parents' changes before children's own suffixes.
+pub fn change_union(manifests: &[ViewManifest]) -> Vec<Hash> {
+    let mut seen: HashSet<Hash> = HashSet::new();
+    let mut union = Vec::new();
+    for manifest in manifests {
+        for hash in &manifest.changes {
+            if seen.insert(*hash) {
+                union.push(*hash);
+            }
+        }
+    }
+    union
+}
+
+// Inventory Support Detection
+
+/// Interpretation of an `?views` inventory response under `--all-views`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InventoryOutcome {
+    /// The inventory lists views beyond those already applied — clone them.
+    Views(Vec<String>),
+    /// The inventory lists only views the primary chain already applied —
+    /// a genuinely single-chain remote; nothing more to do.
+    NothingNew,
+    /// The inventory is empty. A server that supports `?views` always lists
+    /// at least the view that was just cloned, so an empty inventory is the
+    /// signature of a server without inventory support (its generic info
+    /// blob parses to zero views). Under `--all-views` this must be a hard
+    /// error, never a silent single-view clone.
+    Unsupported,
+}
+
+/// Classify an `?views` inventory for `--all-views`.
+///
+/// `applied` is the set of view names the primary manifest chain already
+/// reconstructed (always non-empty by the time additional views are
+/// considered).
+pub fn classify_inventory(inventory: &[String], applied: &HashSet<String>) -> InventoryOutcome {
+    if inventory.is_empty() {
+        return InventoryOutcome::Unsupported;
+    }
+    let others: Vec<String> = inventory
+        .iter()
+        .filter(|name| !applied.contains(*name))
+        .cloned()
+        .collect();
+    if others.is_empty() {
+        InventoryOutcome::NothingNew
+    } else {
+        InventoryOutcome::Views(others)
+    }
 }
 
 // Error Conversion
@@ -913,5 +1054,189 @@ mod tests {
     #[test]
     fn test_format_bytes_gb() {
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
+    }
+
+    // View Manifest Helper Tests
+
+    use atomic_core::pristine::ViewScope;
+    use std::collections::HashSet;
+
+    /// Deterministic test hash.
+    fn h(n: u8) -> Hash {
+        Hash::of(&[n])
+    }
+
+    /// Build a manifest with a computed (consistent) state.
+    fn manifest(
+        name: &str,
+        scope: ViewScope,
+        parent: Option<&str>,
+        changes: Vec<Hash>,
+    ) -> ViewManifest {
+        ViewManifest::new(name, scope, parent.map(String::from), changes)
+    }
+
+    /// A leaf→root chain orders root→leaf for apply.
+    #[test]
+    fn test_manifest_apply_order_chain_root_to_leaf() {
+        // Collected in walk order (leaf first): feature → dev → main.
+        let manifests = vec![
+            manifest("feature", ViewScope::Draft, Some("dev"), vec![h(1), h(2)]),
+            manifest("dev", ViewScope::Shared, Some("main"), vec![h(1)]),
+            manifest("main", ViewScope::Shared, None, vec![]),
+        ];
+
+        let (ordered, stuck) = manifest_apply_order(&manifests, &HashSet::new());
+        assert!(stuck.is_empty());
+        let names: Vec<&str> = ordered
+            .iter()
+            .map(|&i| manifests[i].name.as_str())
+            .collect();
+        assert_eq!(names, vec!["main", "dev", "feature"]);
+    }
+
+    /// A parent already applied locally counts as satisfied.
+    #[test]
+    fn test_manifest_apply_order_uses_already_applied() {
+        let manifests = vec![manifest(
+            "feature",
+            ViewScope::Draft,
+            Some("dev"),
+            vec![h(1)],
+        )];
+        let applied: HashSet<String> = ["dev".to_string()].into_iter().collect();
+
+        let (ordered, stuck) = manifest_apply_order(&manifests, &applied);
+        assert_eq!(ordered, vec![0]);
+        assert!(stuck.is_empty());
+    }
+
+    /// A parent cycle can never be ordered: both manifests end up stuck.
+    #[test]
+    fn test_manifest_apply_order_detects_cycle() {
+        let manifests = vec![
+            manifest("a", ViewScope::Shared, Some("b"), vec![h(1)]),
+            manifest("b", ViewScope::Shared, Some("a"), vec![h(2)]),
+        ];
+
+        let (ordered, stuck) = manifest_apply_order(&manifests, &HashSet::new());
+        assert!(ordered.is_empty());
+        assert_eq!(stuck.len(), 2);
+    }
+
+    /// A parent that is neither in the set nor applied leaves the child
+    /// stuck without blocking unrelated manifests.
+    #[test]
+    fn test_manifest_apply_order_missing_parent_is_stuck() {
+        let manifests = vec![
+            manifest("orphan", ViewScope::Draft, Some("ghost"), vec![h(1)]),
+            manifest("main", ViewScope::Shared, None, vec![h(2)]),
+        ];
+
+        let (ordered, stuck) = manifest_apply_order(&manifests, &HashSet::new());
+        assert_eq!(ordered, vec![1]);
+        assert_eq!(stuck, vec![0]);
+    }
+
+    /// The union dedupes hashes shared between manifests (a draft's
+    /// inherited prefix repeats its ancestors' changes) and preserves
+    /// first-occurrence order.
+    #[test]
+    fn test_change_union_dedupes_across_manifests() {
+        let manifests = vec![
+            manifest("main", ViewScope::Shared, None, vec![h(1), h(2)]),
+            manifest(
+                "dev",
+                ViewScope::Shared,
+                Some("main"),
+                vec![h(1), h(2), h(3)],
+            ),
+            manifest(
+                "feature",
+                ViewScope::Draft,
+                Some("dev"),
+                vec![h(1), h(2), h(3), h(4)],
+            ),
+        ];
+
+        let union = change_union(&manifests);
+        assert_eq!(union, vec![h(1), h(2), h(3), h(4)]);
+    }
+
+    /// The union of no manifests (or all-empty manifests) is empty.
+    #[test]
+    fn test_change_union_empty() {
+        assert!(change_union(&[]).is_empty());
+        let manifests = vec![manifest("main", ViewScope::Shared, None, vec![])];
+        assert!(change_union(&manifests).is_empty());
+    }
+
+    /// A valid manifest for the requested view parses and verifies.
+    #[test]
+    fn test_parse_remote_manifest_round_trip() {
+        let m = manifest("dev", ViewScope::Shared, Some("main"), vec![h(1), h(2)]);
+        let parsed = parse_remote_manifest("dev", &m.to_text(), "http://example.com").unwrap();
+        assert_eq!(parsed, m);
+    }
+
+    /// A manifest naming a different view than requested is rejected.
+    #[test]
+    fn test_parse_remote_manifest_rejects_name_mismatch() {
+        let m = manifest("other", ViewScope::Shared, None, vec![h(1)]);
+        let err = parse_remote_manifest("dev", &m.to_text(), "http://example.com").unwrap_err();
+        match err {
+            CliError::RemoteError { message, .. } => {
+                assert!(message.contains("Manifest name mismatch"));
+            }
+            other => panic!("Expected RemoteError, got {:?}", other),
+        }
+    }
+
+    /// A declared state that doesn't fold from the log is rejected.
+    #[test]
+    fn test_parse_remote_manifest_rejects_state_mismatch() {
+        let mut m = manifest("dev", ViewScope::Shared, None, vec![h(1)]);
+        m.state = atomic_core::types::Merkle::of(b"tampered");
+        let err = parse_remote_manifest("dev", &m.to_text(), "http://example.com").unwrap_err();
+        match err {
+            CliError::RemoteError { message, .. } => {
+                assert!(message.contains("Corrupt manifest"));
+            }
+            other => panic!("Expected RemoteError, got {:?}", other),
+        }
+    }
+
+    /// An empty inventory is the no-support signature: a supporting server
+    /// always lists at least the view that was just cloned.
+    #[test]
+    fn test_classify_inventory_empty_is_unsupported() {
+        let applied: HashSet<String> = ["dev".to_string()].into();
+        assert_eq!(
+            classify_inventory(&[], &applied),
+            InventoryOutcome::Unsupported
+        );
+    }
+
+    /// An inventory listing only already-applied views is a genuinely
+    /// single-chain remote — quiet success.
+    #[test]
+    fn test_classify_inventory_only_applied_is_nothing_new() {
+        let applied: HashSet<String> = ["dev".to_string()].into();
+        assert_eq!(
+            classify_inventory(&["dev".to_string()], &applied),
+            InventoryOutcome::NothingNew
+        );
+    }
+
+    /// Views beyond the applied set are returned for cloning; applied ones
+    /// are filtered out.
+    #[test]
+    fn test_classify_inventory_returns_unapplied_views() {
+        let applied: HashSet<String> = ["dev".to_string()].into();
+        let inventory = vec!["dev".to_string(), "snowy-mountain-75eb".to_string()];
+        assert_eq!(
+            classify_inventory(&inventory, &applied),
+            InventoryOutcome::Views(vec!["snowy-mountain-75eb".to_string()])
+        );
     }
 }

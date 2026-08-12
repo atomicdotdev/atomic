@@ -90,7 +90,7 @@ pub use filter::{
     expand_indexed_dependency_closure,
 };
 pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
-pub use views::ViewInfo;
+pub use views::{ManifestApplyOutcome, ViewInfo};
 
 // Re-import workspace helpers from `switch` so they are available to
 // `mod.rs` (used in `init`) and to sibling sub-modules via `use super::*;`.

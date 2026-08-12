@@ -1,152 +1,307 @@
 //! Helper functions for the push command.
 //!
-//! # Delta Transfer Protocol
+//! # Manifest Sync Model
 //!
-//! The push command uses a threshold-gated delta transfer protocol:
+//! Push syncs views by **identity**, not by flattening. Each view in the
+//! local parent chain (root → leaf) is exported as a [`ViewManifest`] —
+//! name, scope, parent, ordered change log, merkle state — and declared on
+//! the remote:
 //!
-//! - **Small changes (< 1 MB)**: Sent directly as a single HTTP POST.
-//!   No manifest exchange, no chunk negotiation. This covers 99% of
-//!   source code changes where each change is already a small delta.
+//! 1. Fetch the remote's manifest for the view (`?view-manifest=<name>`).
+//! 2. Require the remote log to be a **prefix** of the local log
+//!    (fast-forward rule); otherwise the histories have diverged.
+//! 3. Store the suffix's change files (`?store=<hash>`, content-only,
+//!    idempotent, no view application).
+//! 4. Declare the local manifest (`POST ?view-manifest=<name>`); the server
+//!    creates/fast-forwards the view and verifies the merkle state.
 //!
-//! - **Large changes (≥ 1 MB)**: Negotiate chunks first. The client sends
-//!   a chunk manifest (list of content chunk hashes + sizes), the server
-//!   responds with which chunks it already has, and the client sends only
-//!   the missing chunks + metadata. This saves significant bandwidth for
-//!   large binary files or initial records where the server has a prior version.
-//!
-//! The threshold is configurable via [`DELTA_TRANSFER_THRESHOLD`].
-//!
-//! This module provides utility functions used by the push command, including:
-//!
-//! - Delta calculation between local and remote changelists
-//! - Error conversion from remote errors to CLI errors
-//! - State comparison display
-//! - Change data loading and formatting
+//! The pure planning pieces live here so they can be unit tested without a
+//! repository or network: chain construction ([`build_view_chain`]), suffix
+//! computation and divergence detection ([`plan_view_sync`]), and the
+//! old-server hard error ([`require_manifest_support`]).
 
 use std::collections::HashSet;
 
 use bytes::Bytes;
 
-use atomic_core::types::{Base32, Hash, Merkle, NodeId};
-use atomic_remote::{ChangelistEntry, RemoteError, StateResponse};
-use atomic_repository::history::HistoryEntry;
-use atomic_repository::Repository;
+use atomic_core::types::{Base32, Hash};
+use atomic_remote::RemoteError;
+use atomic_repository::{Repository, ViewManifest};
 
 use crate::error::{CliError, CliResult};
 use crate::output::{info, view as style_view};
 
-use super::types::PushChange;
+// View Chain Construction
 
-// Delta Calculation
+/// Errors from walking a view's parent chain.
+#[derive(Debug)]
+pub enum ChainError<E> {
+    /// The parent chain loops back on itself at this view.
+    Cycle { view: String },
 
-/// Calculate which changes need to be pushed to the remote.
+    /// Looking up a view's parent failed.
+    Lookup(E),
+}
+
+/// Build the ancestor chain for a view, ordered root → leaf.
 ///
-/// Compares local and remote changelists to determine which local
-/// changes are missing from the remote. Changes are returned in
-/// dependency order (earliest first) so they can be uploaded correctly.
+/// Walks `parent_of` from the leaf upward, guarding against cycles with a
+/// visited set. A root view (no parent) yields a chain of length 1.
 ///
-/// # Arguments
-///
-/// * `repo` - The local repository (for loading change metadata)
-/// * `local_entries` - Local history entries in forward order
-/// * `remote_entries` - Remote changelist entries
-/// * `push_all` - Whether to push all changes regardless of remote state
-///
-/// # Returns
-///
-/// A vector of changes that should be uploaded to the remote.
+/// `parent_of` is injected so the traversal is pure and unit-testable; the
+/// command wires it to `Repository::get_view_info(...).parent_name`.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// let graph_hashes = std::collections::HashSet::new();
-/// let to_push = calculate_push_delta(&repo, &local_history, &remote_list, &graph_hashes, false)?;
-/// println!("Need to push {} changes", to_push.len());
+/// // draft `orange` parented on `dev` → ["dev", "orange"]
+/// let chain = build_view_chain("orange", |name| {
+///     repo.get_view_info(name).map(|info| info.parent_name)
+/// })?;
 /// ```
-pub fn calculate_push_delta(
-    repo: &Repository,
-    local_entries: &[HistoryEntry],
-    remote_entries: &[ChangelistEntry],
-    graph_hashes: &HashSet<String>,
-    push_all: bool,
-) -> CliResult<Vec<PushChange>> {
-    // Build set of remote hashes for quick lookup (changes already in this view)
-    let remote_hashes: HashSet<String> = remote_entries.iter().map(|e| e.hash.clone()).collect();
+pub fn build_view_chain<E>(
+    leaf: &str,
+    mut parent_of: impl FnMut(&str) -> Result<Option<String>, E>,
+) -> Result<Vec<String>, ChainError<E>> {
+    let mut chain = vec![leaf.to_string()];
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(leaf.to_string());
 
-    let mut to_upload = Vec::new();
-
-    for entry in local_entries {
-        let hash_str = entry.hash.to_base32();
-
-        // Skip if already on this view on the remote (unless pushing all)
-        if !push_all && remote_hashes.contains(&hash_str) {
-            continue;
+    let mut current = leaf.to_string();
+    while let Some(parent) = parent_of(&current).map_err(ChainError::Lookup)? {
+        if !visited.insert(parent.clone()) {
+            return Err(ChainError::Cycle { view: parent });
         }
-
-        // Try to load the change header to get the message
-        let message = load_change_message(repo, &entry.hash);
-
-        // Check if the change is already in the remote graph (via another view).
-        // If so, only view adoption is needed — no data transfer.
-        let already_in_graph = graph_hashes.contains(&hash_str);
-
-        let push_change = PushChange::new(entry.hash, entry.sequence, entry.state)
-            .with_tagged(entry.is_tagged)
-            .with_in_graph(already_in_graph);
-
-        let push_change = if let Some(msg) = message {
-            push_change.with_message(msg)
-        } else {
-            push_change
-        };
-
-        to_upload.push(push_change);
+        chain.push(parent.clone());
+        current = parent;
     }
 
-    Ok(to_upload)
+    chain.reverse();
+    Ok(chain)
 }
 
-/// Load the message from a change, returning None if it fails.
-fn load_change_message(repo: &Repository, hash: &Hash) -> Option<String> {
-    repo.load_change(hash)
-        .ok()
-        .map(|c| c.hashed.header.message.clone())
+// Sync Planning
+
+/// Why a view cannot be fast-forwarded on the remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewSyncConflict {
+    /// The remote log is not a prefix of the local log.
+    Diverged {
+        /// Index of the first differing entry, or `None` if the remote log
+        /// is simply longer than the local log.
+        first_mismatch: Option<usize>,
+        local_len: usize,
+        remote_len: usize,
+    },
+
+    /// The view exists on both sides with different identity (scope or
+    /// parent). The server would reject the declare with a 409; catching it
+    /// client-side gives a clearer message.
+    IdentityMismatch {
+        field: &'static str,
+        local: String,
+        remote: String,
+    },
 }
 
-/// Check if local and remote histories have diverged.
+impl std::fmt::Display for ViewSyncConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Diverged {
+                first_mismatch,
+                local_len,
+                remote_len,
+            } => match first_mismatch {
+                Some(i) => write!(
+                    f,
+                    "remote log ({} changes) is not a prefix of local log ({} changes): \
+                     first mismatch at position {}",
+                    remote_len, local_len, i
+                ),
+                None => write!(
+                    f,
+                    "remote log ({} changes) is longer than local log ({} changes)",
+                    remote_len, local_len
+                ),
+            },
+            Self::IdentityMismatch {
+                field,
+                local,
+                remote,
+            } => write!(
+                f,
+                "view {} differs: local '{}' vs remote '{}'",
+                field, local, remote
+            ),
+        }
+    }
+}
+
+/// Plan for syncing one view to the remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewSyncPlan {
+    /// Changes to store on the remote, in log order. For a fast-forward
+    /// this is the local log beyond the remote prefix; for a forced push
+    /// against a diverged remote it is every local-log hash the remote
+    /// view lacks.
+    pub suffix: Vec<Hash>,
+
+    /// Whether the manifest needs to be declared (PUT). False only when
+    /// local and remote logs are already identical.
+    pub declare: bool,
+
+    /// True when divergence was overridden with `--force`. The server is
+    /// still authoritative and may reject the declare.
+    pub forced: bool,
+}
+
+impl ViewSyncPlan {
+    /// True when neither storing nor declaring is needed.
+    pub fn is_noop(&self) -> bool {
+        self.suffix.is_empty() && !self.declare
+    }
+}
+
+/// Compute the sync plan for one view: what to store and whether to declare.
 ///
-/// Returns true if the remote has changes that are not in the local history.
-/// This indicates a conflict that needs to be resolved before pushing.
+/// `remote` is the remote's parsed manifest, or `None` if the view does not
+/// exist on the remote (the remote log is empty).
 ///
-/// # Arguments
+/// The fast-forward rule: the remote log must be a prefix of the local log.
+/// The suffix (everything beyond the prefix) is what needs storing — its
+/// dependencies are either earlier in the log or already on the remote by
+/// induction over the root→leaf chain.
 ///
-/// * `local_entries` - Local history entries
-/// * `remote_entries` - Remote changelist entries
-///
-/// # Returns
-///
-/// `true` if the remote has changes not present locally.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// if has_diverged(&local_history, &remote_list) {
-///     println!("Histories have diverged - need to pull first");
-/// }
-/// ```
-pub fn has_diverged(local_entries: &[HistoryEntry], remote_entries: &[ChangelistEntry]) -> bool {
-    // Empty remote can't have diverged
-    if remote_entries.is_empty() {
-        return false;
+/// With `force`, a diverged remote does not fail the plan: the suffix
+/// becomes the set difference (local-log hashes the remote view lacks) and
+/// the declare is attempted anyway, leaving the server as the authority.
+/// Identity mismatches (scope/parent) are never forced — they are
+/// structural, and the server would reject them regardless.
+pub fn plan_view_sync(
+    local: &ViewManifest,
+    remote: Option<&ViewManifest>,
+    force: bool,
+) -> Result<ViewSyncPlan, ViewSyncConflict> {
+    let remote = match remote {
+        None => {
+            // View absent on remote: the whole log is the suffix.
+            return Ok(ViewSyncPlan {
+                suffix: local.changes.clone(),
+                declare: true,
+                forced: false,
+            });
+        }
+        Some(r) => r,
+    };
+
+    // Identity must match: the manifest declares scope and parent, and the
+    // server refuses to mutate an existing view's identity.
+    if remote.scope != local.scope {
+        return Err(ViewSyncConflict::IdentityMismatch {
+            field: "scope",
+            local: local.scope.to_string(),
+            remote: remote.scope.to_string(),
+        });
+    }
+    if remote.parent != local.parent {
+        let show = |p: &Option<String>| p.clone().unwrap_or_else(|| "(none)".to_string());
+        return Err(ViewSyncConflict::IdentityMismatch {
+            field: "parent",
+            local: show(&local.parent),
+            remote: show(&remote.parent),
+        });
     }
 
-    // Build set of local hashes
-    let local_hashes: HashSet<String> = local_entries.iter().map(|e| e.hash.to_base32()).collect();
+    // Prefix rule.
+    let diverged = if remote.changes.len() > local.changes.len() {
+        Some(ViewSyncConflict::Diverged {
+            first_mismatch: None,
+            local_len: local.changes.len(),
+            remote_len: remote.changes.len(),
+        })
+    } else {
+        remote
+            .changes
+            .iter()
+            .zip(local.changes.iter())
+            .position(|(r, l)| r != l)
+            .map(|i| ViewSyncConflict::Diverged {
+                first_mismatch: Some(i),
+                local_len: local.changes.len(),
+                remote_len: remote.changes.len(),
+            })
+    };
 
-    // Check if any remote change is not in local
-    remote_entries
-        .iter()
-        .any(|e| !local_hashes.contains(&e.hash))
+    if let Some(conflict) = diverged {
+        if !force {
+            return Err(conflict);
+        }
+        // Forced: store whatever the remote view lacks and attempt the
+        // declare anyway. The server remains authoritative.
+        let remote_set: HashSet<&Hash> = remote.changes.iter().collect();
+        let suffix: Vec<Hash> = local
+            .changes
+            .iter()
+            .filter(|h| !remote_set.contains(h))
+            .copied()
+            .collect();
+        return Ok(ViewSyncPlan {
+            suffix,
+            declare: true,
+            forced: true,
+        });
+    }
+
+    // Remote is a (possibly complete) prefix of local.
+    let suffix: Vec<Hash> = local.changes[remote.changes.len()..].to_vec();
+    let declare = !suffix.is_empty();
+    Ok(ViewSyncPlan {
+        suffix,
+        declare,
+        forced: false,
+    })
+}
+
+// Manifest Support Detection
+
+/// Interpret the result of `get_view_manifest`, turning "server predates
+/// manifest support" into a hard, actionable error.
+///
+/// Identity-preserving push has no fallback: this client no longer flattens
+/// views, so a server without `?view-manifest` support cannot be pushed to.
+pub fn require_manifest_support(
+    result: Result<Option<String>, RemoteError>,
+    url: &str,
+) -> CliResult<Option<String>> {
+    match result {
+        Ok(text) => Ok(text),
+        Err(RemoteError::ProtocolError { message }) => Err(CliError::RemoteError {
+            message: format!(
+                "The server does not support view manifests ({}). \
+                 Identity-preserving push requires a server upgrade; \
+                 this client no longer flattens views on push.",
+                message
+            ),
+            url: Some(url.to_string()),
+        }),
+        Err(e) => Err(convert_remote_error(e, url)),
+    }
+}
+
+/// Parse and verify a remote manifest, mapping failures to remote errors.
+///
+/// The declared state must equal the fold of the log — a remote that sends
+/// an inconsistent manifest is broken, and we refuse to plan against it.
+pub fn parse_remote_manifest(view: &str, text: &str, url: &str) -> CliResult<ViewManifest> {
+    let manifest = ViewManifest::parse(text).map_err(|e| CliError::RemoteError {
+        message: format!("Invalid manifest for view '{}' from remote: {}", view, e),
+        url: Some(url.to_string()),
+    })?;
+    manifest.verify().map_err(|e| CliError::RemoteError {
+        message: format!("Corrupt manifest for view '{}' from remote: {}", view, e),
+        url: Some(url.to_string()),
+    })?;
+    Ok(manifest)
 }
 
 // Change Data Loading
@@ -155,15 +310,6 @@ pub fn has_diverged(local_entries: &[HistoryEntry], remote_entries: &[Changelist
 ///
 /// Loads the change from the repository and serializes it to bytes
 /// suitable for uploading to a remote.
-///
-/// # Arguments
-///
-/// * `repo` - The repository to load from
-/// * `hash` - The hash of the change to load
-///
-/// # Returns
-///
-/// The serialized change data as bytes.
 ///
 /// # Errors
 ///
@@ -203,160 +349,11 @@ pub fn load_change_data(repo: &Repository, hash: &Hash) -> CliResult<Bytes> {
     Ok(Bytes::from(buffer))
 }
 
-// Delta Transfer Protocol
-
-/// Size threshold (in bytes) for delta transfer negotiation.
-///
-/// Changes smaller than this are sent directly — the overhead of a manifest
-/// exchange round trip (two HTTP requests) exceeds any bandwidth savings for
-/// small changes. For source code changes, this covers 99% of cases.
-///
-/// Changes larger than this trigger the delta protocol:
-/// 1. Client sends chunk manifest to server
-/// 2. Server responds with which chunks it already has
-/// 3. Client sends only missing chunks + metadata
-///
-/// The 1 MB threshold was chosen because:
-/// - A typical source code change is 200 bytes – 50 KB (well below)
-/// - A manifest exchange adds ~100ms latency (two round trips)
-/// - Below 1 MB, sending the full file on a 100 Mbps link takes <80ms
-/// - Above 1 MB, delta savings can be 90%+ (worth the negotiation cost)
-pub const DELTA_TRANSFER_THRESHOLD: usize = 1024 * 1024; // 1 MB
-
-/// Result of a push operation for a single change.
-///
-/// Describes whether the change was sent directly (fast path) or via
-/// delta transfer (large path), and the bytes transferred.
-#[derive(Debug)]
-pub struct PushTransferResult {
-    /// Whether delta transfer was used.
-    pub used_delta: bool,
-
-    /// Total bytes sent over the wire.
-    pub bytes_sent: u64,
-
-    /// Bytes saved by delta transfer (0 if direct send).
-    pub bytes_saved: u64,
-
-    /// Number of content chunks the server already had (0 if direct send).
-    pub chunks_reused: u32,
-
-    /// Total content chunks in the change (0 if direct send).
-    pub chunks_total: u32,
-}
-
-impl PushTransferResult {
-    /// Create a result for a direct (non-delta) send.
-    pub fn direct(bytes_sent: u64) -> Self {
-        Self {
-            used_delta: false,
-            bytes_sent,
-            bytes_saved: 0,
-            chunks_reused: 0,
-            chunks_total: 0,
-        }
-    }
-
-    /// Percentage of bytes saved (0.0–100.0).
-    pub fn savings_pct(&self) -> f64 {
-        let total = self.bytes_sent + self.bytes_saved;
-        if total == 0 {
-            return 0.0;
-        }
-        self.bytes_saved as f64 / total as f64 * 100.0
-    }
-}
-
-impl std::fmt::Display for PushTransferResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.used_delta {
-            write!(
-                f,
-                "delta: sent {} ({} saved, {}/{} chunks reused, {:.0}% savings)",
-                format_bytes(self.bytes_sent),
-                format_bytes(self.bytes_saved),
-                self.chunks_reused,
-                self.chunks_total,
-                self.savings_pct(),
-            )
-        } else {
-            write!(f, "direct: sent {}", format_bytes(self.bytes_sent))
-        }
-    }
-}
-
-/// Upload a single change using the threshold-gated delta transfer protocol.
-///
-/// - Changes smaller than [`DELTA_TRANSFER_THRESHOLD`]: sent directly (fast path)
-/// - Changes larger: manifest exchange → send only missing chunks (delta path)
-///
-/// # Arguments
-///
-/// * `remote` - The HTTP remote to push to.
-/// * `repo` - The local repository.
-/// * `hash` - The change hash.
-/// * `view` - The target view name on the remote.
-///
-/// # Returns
-///
-/// A [`PushTransferResult`] describing the transfer, or an error.
-pub async fn upload_change_smart(
-    remote: &atomic_remote::HttpRemote,
-    repo: &Repository,
-    hash: &Hash,
-    view: &str,
-) -> CliResult<PushTransferResult> {
-    let hash_str = hash.to_base32();
-
-    // Prefer streaming from the on-disk change file for large changes.
-    // This avoids loading 50MB+ into memory and uses chunked transfer
-    // encoding so the server can stream-to-disk instead of buffering.
-    let change_path = repo.change_store().change_path(hash);
-    let file_size = change_path.metadata().map(|m| m.len()).unwrap_or(0);
-
-    log::debug!(
-        "push: uploading {} ({} bytes / {}){}",
-        &hash_str[..12.min(hash_str.len())],
-        file_size,
-        format_bytes(file_size),
-        if file_size as usize >= DELTA_TRANSFER_THRESHOLD {
-            " [streamed]"
-        } else {
-            ""
-        },
-    );
-
-    // For large changes, stream directly from disk.
-    if file_size as usize >= DELTA_TRANSFER_THRESHOLD && change_path.exists() {
-        remote
-            .upload_change_streamed(&hash_str, view, &change_path)
-            .await
-            .map_err(|e| convert_remote_error(e, remote.url().as_ref()))?;
-
-        return Ok(PushTransferResult::direct(file_size));
-    }
-
-    // Small changes: load into memory and send directly.
-    let change_data = load_change_data(repo, hash)?;
-    let data_len = change_data.len();
-
-    remote
-        .upload_change(&hash_str, view, change_data)
-        .await
-        .map_err(|e| convert_remote_error(e, remote.url().as_ref()))?;
-
-    Ok(PushTransferResult::direct(data_len as u64))
-}
-
-/// Format a byte count for display.
-fn format_bytes(bytes: u64) -> String {
-    if bytes >= 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else if bytes >= 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{} B", bytes)
-    }
+/// Load the message from a change, returning None if it fails.
+pub fn load_change_message(repo: &Repository, hash: &Hash) -> Option<String> {
+    repo.load_change(hash)
+        .ok()
+        .map(|c| c.hashed.header.message.clone())
 }
 
 // Error Conversion
@@ -460,70 +457,37 @@ pub fn convert_remote_error(err: RemoteError, url: &str) -> CliError {
 
 // Display Helpers
 
-/// Display the state comparison between local and remote.
+/// Display a local vs remote manifest state comparison for one view.
 ///
-/// Shows the user a summary of where local and remote are at,
-/// helping them understand what will be pushed.
-///
-/// # Arguments
-///
-/// * `local_view` - Name of the local view
-/// * `local_entries` - Local history entries
-/// * `remote_view` - Name of the remote view
-/// * `remote_state` - Current state of the remote
-/// * `remote_entries` - Remote changelist entries
-pub fn display_state_comparison(
-    local_view: &str,
-    local_entries: &[HistoryEntry],
-    remote_view: &str,
-    remote_state: &StateResponse,
-    remote_entries: &[ChangelistEntry],
-) {
-    let local_state_str = format_local_state(local_entries);
-    let remote_state_str = format_remote_state(remote_state, remote_entries);
-
+/// Used when a view has diverged, so the user can see where each side is.
+pub fn display_manifest_divergence(local_view: &str, local: &ViewManifest, remote: &ViewManifest) {
     println!(
         "  Local:  {} at {}",
         style_view(local_view),
-        info(&local_state_str)
+        info(&format_manifest_state(local))
     );
     println!(
         "  Remote: {} at {}",
-        style_view(remote_view),
-        info(&remote_state_str)
+        style_view(&remote.name),
+        info(&format_manifest_state(remote))
     );
 }
 
-/// Format the local state for display.
-fn format_local_state(entries: &[HistoryEntry]) -> String {
-    if let Some(entry) = entries.last() {
-        let short_state = &entry.state.to_base32()[..12];
-        format!("{} ({} changes)", short_state, entries.len())
-    } else {
+/// Format a manifest's state for display.
+fn format_manifest_state(manifest: &ViewManifest) -> String {
+    if manifest.changes.is_empty() {
         "(empty)".to_string()
-    }
-}
-
-/// Format the remote state for display.
-fn format_remote_state(state: &StateResponse, entries: &[ChangelistEntry]) -> String {
-    if let Some(merkle_str) = state.merkle() {
-        let short_state = &merkle_str[..12.min(merkle_str.len())];
-        format!("{} ({} changes)", short_state, entries.len())
     } else {
-        "(empty)".to_string()
+        let state = manifest.state.to_base32();
+        format!(
+            "{} ({} changes)",
+            &state[..12.min(state.len())],
+            manifest.changes.len()
+        )
     }
 }
 
 /// Format a count with singular/plural suffix.
-///
-/// # Arguments
-///
-/// * `count` - The count to format
-/// * `singular` - The singular form of the word
-///
-/// # Returns
-///
-/// A formatted string like "1 change" or "5 changes".
 ///
 /// # Example
 ///
@@ -544,63 +508,310 @@ pub fn format_count(count: usize, singular: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atomic_core::pristine::ViewScope;
+    use std::collections::HashMap;
 
-    // Delta Calculation Tests
+    /// Deterministic test hash.
+    fn h(n: u8) -> Hash {
+        Hash::of(&[n])
+    }
+
+    /// Build a manifest with a computed (consistent) state.
+    fn manifest(
+        name: &str,
+        scope: ViewScope,
+        parent: Option<&str>,
+        changes: Vec<Hash>,
+    ) -> ViewManifest {
+        ViewManifest::new(name, scope, parent.map(str::to_string), changes)
+    }
+
+    /// Parent lookup backed by a map, for pure chain tests.
+    fn parents(
+        pairs: &[(&str, Option<&str>)],
+    ) -> impl FnMut(&str) -> Result<Option<String>, String> {
+        let map: HashMap<String, Option<String>> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.map(str::to_string)))
+            .collect();
+        move |name: &str| {
+            map.get(name)
+                .cloned()
+                .ok_or_else(|| format!("view '{}' not found", name))
+        }
+    }
+
+    // Chain Construction Tests
 
     #[test]
-    fn test_has_diverged_empty_remote() {
-        let local_entries = vec![
-            create_test_entry(0, "ABC123"),
-            create_test_entry(1, "DEF456"),
-        ];
-        let remote_entries: Vec<ChangelistEntry> = vec![];
-
-        assert!(!has_diverged(&local_entries, &remote_entries));
+    fn test_chain_root_view_is_length_one() {
+        let chain = build_view_chain("main", parents(&[("main", None)])).unwrap();
+        assert_eq!(chain, vec!["main"]);
     }
 
     #[test]
-    fn test_has_diverged_subset() {
-        // Remote is a subset of local - no divergence
-        let local_entries = vec![
-            create_test_entry(0, "ABC123"),
-            create_test_entry(1, "DEF456"),
-            create_test_entry(2, "GHI789"),
-        ];
-        let remote_entries = vec![
-            create_test_changelist_entry(0, "ABC123"),
-            create_test_changelist_entry(1, "DEF456"),
-        ];
-
-        assert!(!has_diverged(&local_entries, &remote_entries));
+    fn test_chain_orders_root_to_leaf() {
+        // orange → dev → main should come out as [main, dev, orange]
+        let chain = build_view_chain(
+            "orange",
+            parents(&[
+                ("orange", Some("dev")),
+                ("dev", Some("main")),
+                ("main", None),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(chain, vec!["main", "dev", "orange"]);
     }
 
     #[test]
-    fn test_has_diverged_different_changes() {
-        // Remote has a change not in local - diverged
-        let local_entries = vec![
-            create_test_entry(0, "ABC123"),
-            create_test_entry(1, "DEF456"),
-        ];
-        let remote_entries = vec![
-            create_test_changelist_entry(0, "ABC123"),
-            create_test_changelist_entry(1, "XYZ999"), // Different!
-        ];
-
-        assert!(has_diverged(&local_entries, &remote_entries));
+    fn test_chain_detects_cycle() {
+        // a → b → a is a corrupt parent chain, not an infinite loop.
+        let err =
+            build_view_chain("a", parents(&[("a", Some("b")), ("b", Some("a"))])).unwrap_err();
+        match err {
+            ChainError::Cycle { view } => assert_eq!(view, "a"),
+            other => panic!("Expected Cycle, got {:?}", other),
+        }
     }
 
     #[test]
-    fn test_has_diverged_identical() {
-        let local_entries = vec![
-            create_test_entry(0, "ABC123"),
-            create_test_entry(1, "DEF456"),
-        ];
-        let remote_entries = vec![
-            create_test_changelist_entry(0, "ABC123"),
-            create_test_changelist_entry(1, "DEF456"),
-        ];
+    fn test_chain_detects_self_cycle() {
+        let err = build_view_chain("a", parents(&[("a", Some("a"))])).unwrap_err();
+        assert!(matches!(err, ChainError::Cycle { view } if view == "a"));
+    }
 
-        assert!(!has_diverged(&local_entries, &remote_entries));
+    #[test]
+    fn test_chain_propagates_lookup_error() {
+        // Parent references a view that cannot be resolved.
+        let err = build_view_chain("a", parents(&[("a", Some("ghost"))])).unwrap_err();
+        assert!(matches!(err, ChainError::Lookup(msg) if msg.contains("ghost")));
+    }
+
+    // Sync Planning Tests
+
+    #[test]
+    fn test_plan_absent_remote_uploads_full_log() {
+        let local = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2), h(3)]);
+        let plan = plan_view_sync(&local, None, false).unwrap();
+
+        assert_eq!(plan.suffix, vec![h(1), h(2), h(3)]);
+        assert!(plan.declare);
+        assert!(!plan.forced);
+    }
+
+    #[test]
+    fn test_plan_remote_prefix_uploads_suffix_only() {
+        let local = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2), h(3), h(4)]);
+        let remote = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2)]);
+        let plan = plan_view_sync(&local, Some(&remote), false).unwrap();
+
+        assert_eq!(plan.suffix, vec![h(3), h(4)]);
+        assert!(plan.declare);
+        assert!(!plan.forced);
+    }
+
+    #[test]
+    fn test_plan_identical_logs_is_noop() {
+        let local = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2)]);
+        let remote = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2)]);
+        let plan = plan_view_sync(&local, Some(&remote), false).unwrap();
+
+        assert!(plan.suffix.is_empty());
+        assert!(!plan.declare);
+        assert!(plan.is_noop());
+    }
+
+    #[test]
+    fn test_plan_empty_remote_view_uploads_full_log() {
+        // View exists on the remote but its log is empty (freshly declared).
+        let local = manifest("dev", ViewScope::Shared, None, vec![h(1)]);
+        let remote = manifest("dev", ViewScope::Shared, None, vec![]);
+        let plan = plan_view_sync(&local, Some(&remote), false).unwrap();
+
+        assert_eq!(plan.suffix, vec![h(1)]);
+        assert!(plan.declare);
+    }
+
+    #[test]
+    fn test_plan_diverged_hash_mismatch() {
+        let local = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2), h(3)]);
+        let remote = manifest("dev", ViewScope::Shared, None, vec![h(1), h(9)]);
+        let err = plan_view_sync(&local, Some(&remote), false).unwrap_err();
+
+        assert_eq!(
+            err,
+            ViewSyncConflict::Diverged {
+                first_mismatch: Some(1),
+                local_len: 3,
+                remote_len: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn test_plan_diverged_remote_longer() {
+        // Remote is ahead of local: not a prefix, so pull first.
+        let local = manifest("dev", ViewScope::Shared, None, vec![h(1)]);
+        let remote = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2)]);
+        let err = plan_view_sync(&local, Some(&remote), false).unwrap_err();
+
+        assert_eq!(
+            err,
+            ViewSyncConflict::Diverged {
+                first_mismatch: None,
+                local_len: 1,
+                remote_len: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn test_plan_forced_diverged_stores_set_difference() {
+        let local = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2), h(3)]);
+        let remote = manifest("dev", ViewScope::Shared, None, vec![h(1), h(9)]);
+        let plan = plan_view_sync(&local, Some(&remote), true).unwrap();
+
+        // h(1) is already on the remote view; h(2), h(3) are not.
+        assert_eq!(plan.suffix, vec![h(2), h(3)]);
+        assert!(plan.declare);
+        assert!(plan.forced);
+    }
+
+    #[test]
+    fn test_plan_scope_mismatch_is_conflict_even_forced() {
+        let local = manifest("x", ViewScope::Draft, Some("dev"), vec![h(1)]);
+        let remote = manifest("x", ViewScope::Shared, Some("dev"), vec![h(1)]);
+
+        let err = plan_view_sync(&local, Some(&remote), false).unwrap_err();
+        assert!(matches!(
+            err,
+            ViewSyncConflict::IdentityMismatch { field: "scope", .. }
+        ));
+
+        // Identity mismatches are structural — force does not bypass them.
+        let err = plan_view_sync(&local, Some(&remote), true).unwrap_err();
+        assert!(matches!(
+            err,
+            ViewSyncConflict::IdentityMismatch { field: "scope", .. }
+        ));
+    }
+
+    #[test]
+    fn test_plan_parent_mismatch_is_conflict() {
+        let local = manifest("x", ViewScope::Draft, Some("dev"), vec![h(1)]);
+        let remote = manifest("x", ViewScope::Draft, Some("release"), vec![h(1)]);
+        let err = plan_view_sync(&local, Some(&remote), false).unwrap_err();
+
+        match err {
+            ViewSyncConflict::IdentityMismatch {
+                field,
+                local,
+                remote,
+            } => {
+                assert_eq!(field, "parent");
+                assert_eq!(local, "dev");
+                assert_eq!(remote, "release");
+            }
+            other => panic!("Expected IdentityMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_conflict_display_is_actionable() {
+        let diverged = ViewSyncConflict::Diverged {
+            first_mismatch: Some(2),
+            local_len: 5,
+            remote_len: 4,
+        };
+        let msg = diverged.to_string();
+        assert!(msg.contains("not a prefix"));
+        assert!(msg.contains("position 2"));
+
+        let longer = ViewSyncConflict::Diverged {
+            first_mismatch: None,
+            local_len: 1,
+            remote_len: 3,
+        };
+        assert!(longer.to_string().contains("longer than local"));
+    }
+
+    // Old-Server Hard Error Tests
+
+    #[test]
+    fn test_require_manifest_support_passes_through_manifest() {
+        let text = "dev\tshared\t-\t-\n".to_string();
+        let result = require_manifest_support(Ok(Some(text.clone())), "http://example.com");
+        assert_eq!(result.unwrap(), Some(text));
+    }
+
+    #[test]
+    fn test_require_manifest_support_passes_through_absent_view() {
+        let result = require_manifest_support(Ok(None), "http://example.com");
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn test_require_manifest_support_hard_errors_on_old_server() {
+        // A protocol error from get_view_manifest means the server predates
+        // manifest support — there is no flatten fallback anymore.
+        let err = require_manifest_support(
+            Err(RemoteError::protocol(
+                "server does not support view manifests (?view-manifest)",
+            )),
+            "http://example.com",
+        )
+        .unwrap_err();
+
+        match err {
+            CliError::RemoteError { message, url } => {
+                assert!(message.contains("does not support view manifests"));
+                assert!(message.contains("server upgrade"));
+                assert!(message.contains("no longer flattens"));
+                assert_eq!(url.as_deref(), Some("http://example.com"));
+            }
+            other => panic!("Expected RemoteError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_require_manifest_support_converts_other_errors() {
+        let err = require_manifest_support(
+            Err(RemoteError::auth_failed("http://example.com", "nope")),
+            "http://example.com",
+        )
+        .unwrap_err();
+        assert!(matches!(err, CliError::AuthenticationFailed { .. }));
+    }
+
+    // Remote Manifest Parsing Tests
+
+    #[test]
+    fn test_parse_remote_manifest_round_trip() {
+        let m = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2)]);
+        let parsed = parse_remote_manifest("dev", &m.to_text(), "http://example.com").unwrap();
+        assert_eq!(parsed, m);
+    }
+
+    #[test]
+    fn test_parse_remote_manifest_rejects_garbage() {
+        let err = parse_remote_manifest("dev", "", "http://example.com").unwrap_err();
+        assert!(matches!(err, CliError::RemoteError { .. }));
+    }
+
+    #[test]
+    fn test_parse_remote_manifest_rejects_state_mismatch() {
+        // Header declares a state that does not fold from the log.
+        let mut m = manifest("dev", ViewScope::Shared, None, vec![h(1)]);
+        m.state = atomic_core::types::Merkle::of(b"tampered");
+        let err = parse_remote_manifest("dev", &m.to_text(), "http://example.com").unwrap_err();
+
+        match err {
+            CliError::RemoteError { message, .. } => {
+                assert!(message.contains("Corrupt manifest"));
+            }
+            other => panic!("Expected RemoteError, got {:?}", other),
+        }
     }
 
     // Error Conversion Tests
@@ -718,60 +929,16 @@ mod tests {
     // Display Helper Tests
 
     #[test]
-    fn test_format_local_state_empty() {
-        let entries: Vec<HistoryEntry> = vec![];
-        assert_eq!(format_local_state(&entries), "(empty)");
+    fn test_format_manifest_state_empty() {
+        let m = manifest("dev", ViewScope::Shared, None, vec![]);
+        assert_eq!(format_manifest_state(&m), "(empty)");
     }
 
     #[test]
-    fn test_format_local_state_with_entries() {
-        let entries = vec![
-            create_test_entry(0, "ABC123"),
-            create_test_entry(1, "DEF456"),
-        ];
-        let result = format_local_state(&entries);
-
-        assert!(result.contains("2 changes"));
-    }
-
-    #[test]
-    fn test_format_remote_state_empty() {
-        let state = StateResponse::empty();
-        let entries: Vec<ChangelistEntry> = vec![];
-
-        assert_eq!(format_remote_state(&state, &entries), "(empty)");
-    }
-
-    // Test Helpers
-
-    /// Create a test history entry with a deterministic hash.
-    /// The hash is created from the hash_str so that when compared with
-    /// a ChangelistEntry using the same string, they will match.
-    fn create_test_entry(sequence: u64, hash_str: &str) -> HistoryEntry {
-        // Create a hash that will produce the expected base32 string
-        // For testing, we use a hash derived from the string itself
-        let hash = Hash::of(hash_str.as_bytes());
-        HistoryEntry {
-            sequence,
-            hash,
-            state: Merkle::ZERO,
-            node_id: NodeId::from(sequence),
-            header: None,
-            is_tagged: false,
-        }
-    }
-
-    /// Create a test changelist entry.
-    /// The hash should be the base32 encoding of the same hash used in create_test_entry.
-    fn create_test_changelist_entry(sequence: u64, hash_str: &str) -> ChangelistEntry {
-        // Use the same hash derivation as create_test_entry
-        let hash = Hash::of(hash_str.as_bytes());
-        let hash_base32 = hash.to_base32();
-        ChangelistEntry::new(
-            sequence,
-            &hash_base32,
-            "ABCD1234ABCD1234ABCD1234ABCD1234",
-            false,
-        )
+    fn test_format_manifest_state_with_changes() {
+        let m = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2)]);
+        let text = format_manifest_state(&m);
+        assert!(text.contains("2 changes"));
+        assert!(text.starts_with(&m.state.to_base32()[..12]));
     }
 }
