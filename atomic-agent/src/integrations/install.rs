@@ -149,10 +149,11 @@ pub fn install_from_dir(pkg_dir: &Path, opts: &InstallOptions) -> AgentResult<In
         )?;
     }
 
-    // Auto-install all skills from the shared cache via [skills] block.
-    // The installer globs skills/*/SKILL.md and formats dst_pattern with
-    // {name}. This means adding a skill to atomic-skills requires zero
-    // plugin manifest changes.
+    // Auto-install skills from the shared cache via [skills] block.
+    // The skill list comes from the atomic-skills package's own manifest
+    // ([[declared-skill]] entries) — not from globbing the filesystem.
+    // Adding a skill to atomic-skills = one [[declared-skill]] entry in its
+    // manifest. Zero plugin manifest changes.
     if let Some(ref config) = manifest.skills_config {
         let cache = opts
             .skills_cache_dir
@@ -174,38 +175,43 @@ pub fn install_from_dir(pkg_dir: &Path, opts: &InstallOptions) -> AgentResult<In
             });
         }
 
-        // Glob skills/*/SKILL.md in the cache.
-        let skills_dir = cache.join("skills");
-        let skill_names: Vec<String> = std::fs::read_dir(&skills_dir)
-            .map_err(|e| AgentError::Integration {
+        // Load the atomic-skills manifest from the cache to get the
+        // declared skill list. This is a manifest read, not a filesystem glob.
+        let skills_manifest = IntegrationManifest::load(cache)?;
+        if skills_manifest.declared_skills.is_empty() {
+            return Err(AgentError::Integration {
                 agent: manifest.agent.clone(),
-                reason: format!("cannot read skills dir {}: {}", skills_dir.display(), e),
-            })?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if e.path().join("SKILL.md").is_file() {
-                    Some(name)
-                } else {
-                    None
-                }
-            })
-            .collect();
+                reason: "atomic-skills manifest has no [[declared-skill]] entries \
+                         — cannot install skills via [skills] block"
+                    .to_string(),
+            });
+        }
 
         // Filter by install list if not "all".
-        let wanted: Vec<String> = if config.install.trim() == "all" {
-            skill_names
+        let wanted: Vec<&str> = if config.install.trim() == "all" {
+            skills_manifest
+                .declared_skills
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect()
         } else {
             let allowed: Vec<&str> = config.install.split(',').map(|s| s.trim()).collect();
-            skill_names
-                .into_iter()
-                .filter(|n| allowed.contains(&n.as_str()))
+            skills_manifest
+                .declared_skills
+                .iter()
+                .map(|d| d.name.as_str())
+                .filter(|n| allowed.contains(n))
                 .collect()
         };
 
         for name in &wanted {
             let src = cache.join("skills").join(name).join("SKILL.md");
+            if !src.is_file() {
+                return Err(AgentError::Integration {
+                    agent: manifest.agent.clone(),
+                    reason: format!("declared skill '{}' not found at {}", name, src.display()),
+                });
+            }
             let dst_str = config.dst_pattern.replace("{name}", name);
             let dst = expand_dst(&dst_str)?;
             copy_one(
@@ -965,8 +971,8 @@ manifest = "hooks/hooks.json"
 
     // ── New install paths: skills, repo-file, agent-definition ──────────
 
-    /// Build a fake skills cache (mimics atomic-skills/) with AGENTS.md and
-    /// one skill.
+    /// Build a fake skills cache (mimics atomic-skills/) with AGENTS.md,
+    /// one skill, and the atomic-integration.toml declaring it.
     fn fake_skills_cache() -> tempfile::TempDir {
         let cache = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(cache.path().join("skills/atomic-vault")).unwrap();
@@ -980,6 +986,39 @@ manifest = "hooks/hooks.json"
             "# atomic-vault skill\n",
         )
         .unwrap();
+        // The atomic-skills manifest declares its skills explicitly.
+        std::fs::write(
+            cache.path().join(MANIFEST_FILE),
+            r#"
+schema = 1
+agent = "atomic-skills"
+version = "1.0.0"
+
+[[declared-skill]]
+name = "atomic-vault"
+"#,
+        )
+        .unwrap();
+        cache
+    }
+
+    /// Build a fake skills cache with multiple declared skills.
+    fn fake_skills_cache_multi(skills: &[&str]) -> tempfile::TempDir {
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cache.path().join("AGENTS.md"),
+            "# Atomic VCS Agent\n\ncanonical body\n",
+        )
+        .unwrap();
+        let mut manifest =
+            String::from("schema = 1\nagent = \"atomic-skills\"\nversion = \"1.0.0\"\n\n");
+        for skill in skills {
+            let dir = cache.path().join("skills").join(skill);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), format!("# {skill}\n")).unwrap();
+            manifest.push_str(&format!("[[declared-skill]]\nname = \"{skill}\"\n\n"));
+        }
+        std::fs::write(cache.path().join(MANIFEST_FILE), manifest).unwrap();
         cache
     }
 
@@ -1472,13 +1511,8 @@ dst = "AGENTS.md"
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
         let dst = tempfile::tempdir().unwrap();
 
-        // Build a skills cache with 3 skills.
-        let cache = tempfile::tempdir().unwrap();
-        for skill in &["atomic-vault", "atomic-vcs", "code-intelligence"] {
-            let dir = cache.path().join("skills").join(skill);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("SKILL.md"), format!("# {skill}\n")).unwrap();
-        }
+        // Build a skills cache with 3 declared skills.
+        let cache = fake_skills_cache_multi(&["atomic-vault", "atomic-vcs", "code-intelligence"]);
 
         let pkg = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1521,13 +1555,8 @@ dst_pattern = "{0}/skills/{{name}}/SKILL.md"
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
         let dst = tempfile::tempdir().unwrap();
 
-        // Cache with 2 skills.
-        let cache = tempfile::tempdir().unwrap();
-        for skill in &["atomic-vault", "code-intelligence"] {
-            let dir = cache.path().join("skills").join(skill);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("SKILL.md"), format!("# {skill}\n")).unwrap();
-        }
+        // Cache with 2 declared skills.
+        let cache = fake_skills_cache_multi(&["atomic-vault", "code-intelligence"]);
 
         let pkg = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1568,13 +1597,8 @@ dst_pattern = "{0}/workflows/{{name}}.md"
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
         let dst = tempfile::tempdir().unwrap();
 
-        // Cache with 2 skills initially.
-        let cache = tempfile::tempdir().unwrap();
-        for skill in &["atomic-vault", "atomic-vcs"] {
-            let dir = cache.path().join("skills").join(skill);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("SKILL.md"), format!("# {skill}\n")).unwrap();
-        }
+        // Cache with 2 declared skills initially.
+        let cache = fake_skills_cache_multi(&["atomic-vault", "atomic-vcs"]);
 
         let pkg = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1602,10 +1626,16 @@ dst_pattern = "{0}/skills/{{name}}/SKILL.md"
         let outcome1 = install_from_dir(pkg.path(), &o).unwrap();
         assert_eq!(outcome1.installed.len(), 2);
 
-        // A new skill is added to the cache — no manifest change needed.
+        // A new skill is added to the cache AND declared in the atomic-skills
+        // manifest — no plugin manifest change needed.
         let new_skill_dir = cache.path().join("skills/triage-review");
         std::fs::create_dir_all(&new_skill_dir).unwrap();
         std::fs::write(new_skill_dir.join("SKILL.md"), "# triage-review\n").unwrap();
+        // Add the [[declared-skill]] entry to the atomic-skills manifest.
+        let skills_manifest_path = cache.path().join(MANIFEST_FILE);
+        let mut manifest_text = std::fs::read_to_string(&skills_manifest_path).unwrap();
+        manifest_text.push_str("\n[[declared-skill]]\nname = \"triage-review\"\n");
+        std::fs::write(skills_manifest_path, manifest_text).unwrap();
 
         // Re-install with force — picks up the new skill automatically.
         o.force = true;

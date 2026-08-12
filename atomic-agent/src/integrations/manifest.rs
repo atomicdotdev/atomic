@@ -53,6 +53,13 @@ pub struct IntegrationManifest {
     /// prefer `[skills]` with `install = "all"` — it's automatic.
     #[serde(default, rename = "skill")]
     pub skills: Vec<SkillEntry>,
+    /// Skills declared by the atomic-skills package itself. Each entry is a
+    /// skill name (e.g. `"atomic-vault"`). When a plugin's `[skills]` block
+    /// has `install = "all"`, the installer loads the atomic-skills manifest
+    /// from the cache and iterates this list. The skill file is always at
+    /// `skills/{name}/SKILL.md` — convention over configuration.
+    #[serde(default, rename = "declared-skill")]
+    pub declared_skills: Vec<DeclaredSkill>,
     /// Files to install into the *repository* root (not the user's home).
     /// Used for the canonical AGENTS.md so the workflow is always-on without
     /// picking a bundled agent. `dst` is relative to the repo root. Only
@@ -124,6 +131,16 @@ pub struct SkillEntry {
     /// Destination (`~` expands to home). Vendors with flat skill layouts
     /// (Cline, agy) use a flat filename here.
     pub dst: String,
+}
+
+/// A skill declared by the atomic-skills package. The installer copies
+/// `skills/{name}/SKILL.md` from the cache to the plugin's formatted
+/// `dst_pattern`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeclaredSkill {
+    /// Skill directory name (e.g. `"atomic-vault"`). The file is at
+    /// `skills/{name}/SKILL.md` in the atomic-skills cache.
+    pub name: String,
 }
 
 /// One file to install into the repository root.
