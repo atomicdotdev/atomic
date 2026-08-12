@@ -30,6 +30,14 @@ pub struct InstallOptions {
     /// When set, the package manifest's `agent` field must match — guards
     /// against installing the wrong package with `--from`.
     pub expect_agent: Option<String>,
+    /// Path to the cloned `atomic-skills` cache. Required when the manifest
+    /// declares `[skills-source]` or `[agent-definition]`. The CLI syncs
+    /// the cache before calling `install_from_dir`.
+    pub skills_cache_dir: Option<PathBuf>,
+    /// Repository root for `[[repo-file]]` entries (AGENTS.md-into-repo).
+    /// When `None`, `[[repo-file]]` entries are skipped silently — the caller
+    /// gates this via the `--repo-agents` prompt.
+    pub repo_root: Option<PathBuf>,
 }
 
 /// Why a destination file was left untouched.
@@ -128,35 +136,170 @@ pub fn install_from_dir(pkg_dir: &Path, opts: &InstallOptions) -> AgentResult<In
             });
         }
         let dst = expand_dst(&entry.dst)?;
+        copy_one(
+            &manifest.agent,
+            &src,
+            &dst,
+            previous.as_ref(),
+            opts.force,
+            &mut installed,
+            &mut refreshed,
+            &mut skipped,
+            &mut receipt_files,
+        )?;
+    }
 
-        match install_decision(&dst, previous.as_ref(), opts.force)? {
-            Decision::Install => installed.push(dst.clone()),
-            Decision::Refresh => refreshed.push(dst.clone()),
+    // Skills from the shared atomic-skills cache.
+    if !manifest.skills.is_empty() {
+        let cache = opts.skills_cache_dir.as_deref().ok_or_else(|| {
+            AgentError::Integration {
+                agent: manifest.agent.clone(),
+                reason: "manifest declares [[skill]] entries but no skills cache was \
+                         provided (expected [skills-source] to be synced by the CLI)"
+                    .to_string(),
+            }
+        })?;
+        for entry in &manifest.skills {
+            reject_parent_traversal(&manifest.agent, &entry.src)?;
+            let src = cache.join(&entry.src);
+            if !src.is_file() {
+                return Err(AgentError::Integration {
+                    agent: manifest.agent.clone(),
+                    reason: format!("skill source missing: {}", src.display()),
+                });
+            }
+            let dst = expand_dst(&entry.dst)?;
+            copy_one(
+                &manifest.agent,
+                &src,
+                &dst,
+                previous.as_ref(),
+                opts.force,
+                &mut installed,
+                &mut refreshed,
+                &mut skipped,
+                &mut receipt_files,
+            )?;
+        }
+    }
+
+    // Repo-level files (AGENTS.md into the repo root). Only when the caller
+    // passed a repo_root — gated by the --agents-md prompt in the CLI.
+    // Unlike [[file]] and [[skill]], a repo-file that exists but isn't ours
+    // is *merged* (canonical content appended with a separator) rather than
+    // skipped — the user's project-specific AGENTS.md content is preserved.
+    if !manifest.repo_files.is_empty() {
+        if let Some(repo) = opts.repo_root.as_deref() {
+            for entry in &manifest.repo_files {
+                reject_parent_traversal(&manifest.agent, &entry.src)?;
+                // src comes from the skills cache (or the package if no
+                // skills-source is set — uncommon but valid).
+                let src_base = opts
+                    .skills_cache_dir
+                    .as_deref()
+                    .unwrap_or(pkg_dir);
+                let src = src_base.join(&entry.src);
+                if !src.is_file() {
+                    return Err(AgentError::Integration {
+                        agent: manifest.agent.clone(),
+                        reason: format!("repo-file source missing: {}", src.display()),
+                    });
+                }
+                // dst is relative to the repo root.
+                let dst = expand_repo_dst(&entry.dst, repo)?;
+                copy_repo_file(
+                    &src,
+                    &dst,
+                    previous.as_ref(),
+                    opts.force,
+                    &mut installed,
+                    &mut refreshed,
+                    &mut skipped,
+                    &mut receipt_files,
+                )?;
+            }
+        }
+    }
+
+    // Bundled agent definition: stitch frontmatter + canonical body at install
+    // time. Pure string concat — no exec, same safety category as fs::copy.
+    if let Some(def) = &manifest.agent_definition {
+        let cache = opts.skills_cache_dir.as_deref().ok_or_else(|| {
+            AgentError::Integration {
+                agent: manifest.agent.clone(),
+                reason: "manifest declares [agent-definition] but no skills cache \
+                         was provided (needed for body_from)"
+                    .to_string(),
+            }
+        })?;
+        reject_parent_traversal(&manifest.agent, &def.src)?;
+        let frontmatter_path = pkg_dir.join(&def.src);
+        let frontmatter = std::fs::read_to_string(&frontmatter_path).map_err(|e| {
+            AgentError::Integration {
+                agent: manifest.agent.clone(),
+                reason: format!(
+                    "agent-definition frontmatter missing: {}: {}",
+                    frontmatter_path.display(),
+                    e
+                ),
+            }
+        })?;
+        let body_path =
+            manifest
+                .resolve_body_from(&def.body_from, cache)
+                .ok_or_else(|| AgentError::Integration {
+                    agent: manifest.agent.clone(),
+                    reason: format!(
+                        "agent-definition body_from '{}' is malformed or does not \
+                         match the skills-source package",
+                        def.body_from
+                    ),
+                })?;
+        let body = std::fs::read_to_string(&body_path).map_err(|e| {
+            AgentError::Integration {
+                agent: manifest.agent.clone(),
+                reason: format!(
+                    "agent-definition body missing: {}: {}",
+                    body_path.display(),
+                    e
+                ),
+            }
+        })?;
+        let stitched = format!("{frontmatter}\n\n{body}");
+        let slot = expand_dst(&def.slot)?;
+
+        match install_decision(&slot, previous.as_ref(), opts.force)? {
+            Decision::Install => installed.push(slot.clone()),
+            Decision::Refresh => refreshed.push(slot.clone()),
+            // Merge only applies to [[repo-file]] (via repo_file_decision).
+            // install_decision never returns Merge for an agent-definition
+            // slot — treat it as a refresh if it somehow occurs.
+            Decision::Merge => refreshed.push(slot.clone()),
             Decision::Skip(reason) => {
                 skipped.push(SkippedFile {
-                    dst: dst.clone(),
+                    dst: slot.clone(),
                     reason,
                 });
-                // Keep protecting this file: preserve any prior receipt entry
-                // so a later --force still knows whether it was ours.
                 if let Some(old) = previous
                     .as_ref()
-                    .and_then(|r| r.files.iter().find(|f| f.dst == dst))
+                    .and_then(|r| r.files.iter().find(|f| f.dst == slot))
                 {
                     receipt_files.push(old.clone());
                 }
-                continue;
+                // We don't write the stitched content, but we still proceed.
             }
         }
 
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
+        if !skipped.iter().any(|s| s.dst == slot) {
+            if let Some(parent) = slot.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&slot, &stitched)?;
+            receipt_files.push(ReceiptFile {
+                blake3: hash_file(&slot)?,
+                dst: slot,
+            });
         }
-        std::fs::copy(&src, &dst)?;
-        receipt_files.push(ReceiptFile {
-            blake3: hash_file(&dst)?,
-            dst,
-        });
     }
 
     let mut settings_outcomes = Vec::new();
@@ -266,8 +409,15 @@ pub fn uninstall(agent: &str) -> AgentResult<UninstallOutcome> {
 enum Decision {
     Install,
     Refresh,
+    Merge,
     Skip(SkipReason),
 }
+
+/// The Atomic marker that identifies a file as already containing the
+/// canonical Atomic workflow instructions. Used to distinguish "user's own
+/// AGENTS.md" from "has Atomic content already (maybe from a prior install
+/// or copy)".
+const ATOMIC_MARKER: &str = "# Atomic VCS Agent";
 
 /// Decide what to do with a destination that may already exist.
 fn install_decision(dst: &Path, previous: Option<&Receipt>, force: bool) -> AgentResult<Decision> {
@@ -282,6 +432,41 @@ fn install_decision(dst: &Path, previous: Option<&Receipt>, force: bool) -> Agen
         Some(_) if !force => Ok(Decision::Skip(SkipReason::UserModified)),
         // Not ours → hands off unless forced.
         None if !force => Ok(Decision::Skip(SkipReason::UserFile)),
+        _ => Ok(Decision::Refresh),
+    }
+}
+
+/// Decide what to do with a [[repo-file]] destination. Unlike [[file]] and
+/// [[skill]], a repo-file that exists but isn't ours can be *merged* — the
+/// canonical content is appended with a separator, preserving the user's
+/// existing content. If the file already contains the Atomic marker, it's
+/// treated as a refresh (replace the whole file).
+fn repo_file_decision(
+    dst: &Path,
+    previous: Option<&Receipt>,
+    force: bool,
+) -> AgentResult<Decision> {
+    if !dst.exists() {
+        return Ok(Decision::Install);
+    }
+    let recorded = previous.and_then(|r| r.recorded_hash(dst));
+    match recorded {
+        // Ours and untouched since install → safe to refresh.
+        Some(hash) if hash == hash_file(dst)? => Ok(Decision::Refresh),
+        // Ours but the user changed it → hands off unless forced.
+        Some(_) if !force => Ok(Decision::Skip(SkipReason::UserModified)),
+        // Not ours. If it already has the Atomic marker, treat as refresh
+        // (replace the whole file — it's Atomic content, just not from this
+        // receipt). Otherwise merge (append with separator).
+        None if !force => {
+            let existing = std::fs::read_to_string(dst).unwrap_or_default();
+            if existing.contains(ATOMIC_MARKER) {
+                Ok(Decision::Refresh)
+            } else {
+                Ok(Decision::Merge)
+            }
+        }
+        // --force: clobber everything.
         _ => Ok(Decision::Refresh),
     }
 }
@@ -303,6 +488,140 @@ fn expand_dst(dst: &str) -> AgentResult<PathBuf> {
             });
     }
     Ok(PathBuf::from(dst))
+}
+
+/// Resolve a `[[repo-file]]` destination against the repository root.
+/// `dst` must be a relative path (no `~`, no absolute) — it lands inside the
+/// repo. Rejects parent traversal so a manifest can't write outside the repo.
+fn expand_repo_dst(dst: &str, repo_root: &Path) -> AgentResult<PathBuf> {
+    if dst.starts_with('/') || dst.starts_with('~') {
+        return Err(AgentError::Integration {
+            agent: "<any>".to_string(),
+            reason: format!(
+                "repo-file dst '{dst}' must be relative to the repo root, not absolute or home"
+            ),
+        });
+    }
+    if dst.split('/').any(|c| c == "..") {
+        return Err(AgentError::Integration {
+            agent: "<any>".to_string(),
+            reason: format!("repo-file dst '{dst}' must not escape the repo root"),
+        });
+    }
+    Ok(repo_root.join(dst))
+}
+
+/// Copy one file into place with the standard install-decision logic.
+/// Shared by [[file]], [[skill]], and [[repo-file]] entries.
+#[allow(clippy::too_many_arguments)]
+fn copy_one(
+    agent: &str,
+    src: &Path,
+    dst: &Path,
+    previous: Option<&Receipt>,
+    force: bool,
+    installed: &mut Vec<PathBuf>,
+    refreshed: &mut Vec<PathBuf>,
+    skipped: &mut Vec<SkippedFile>,
+    receipt_files: &mut Vec<ReceiptFile>,
+) -> AgentResult<()> {
+    let _ = agent; // used only in error context by callers
+    match install_decision(dst, previous, force)? {
+        Decision::Install => installed.push(dst.to_path_buf()),
+        Decision::Refresh => refreshed.push(dst.to_path_buf()),
+        // Merge only applies to [[repo-file]] (via copy_repo_file). For
+        // [[file]] and [[skill]], install_decision never returns Merge —
+        // treat as a refresh if it somehow occurs.
+        Decision::Merge => refreshed.push(dst.to_path_buf()),
+        Decision::Skip(reason) => {
+            skipped.push(SkippedFile {
+                dst: dst.to_path_buf(),
+                reason,
+            });
+            // Keep protecting this file: preserve any prior receipt entry
+            // so a later --force still knows whether it was ours.
+            if let Some(old) = previous.and_then(|r| r.files.iter().find(|f| f.dst == dst)) {
+                receipt_files.push(old.clone());
+            }
+            return Ok(());
+        }
+    }
+
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(src, dst)?;
+    receipt_files.push(ReceiptFile {
+        blake3: hash_file(dst)?,
+        dst: dst.to_path_buf(),
+    });
+    Ok(())
+}
+
+/// Copy a [[repo-file]] into the repo root, with merge support.
+///
+/// Unlike [[file]] and [[skill]] (which use `copy_one`), a repo-file that
+/// exists but isn't ours is *merged* — the canonical content is appended
+/// with a markdown horizontal rule separator, preserving the user's
+/// existing project-specific content above. If the file already contains
+/// the Atomic marker (`# Atomic VCS Agent`), it's treated as a refresh
+/// (replace the whole file). `--force` always clobbers.
+#[allow(clippy::too_many_arguments)]
+fn copy_repo_file(
+    src: &Path,
+    dst: &Path,
+    previous: Option<&Receipt>,
+    force: bool,
+    installed: &mut Vec<PathBuf>,
+    refreshed: &mut Vec<PathBuf>,
+    skipped: &mut Vec<SkippedFile>,
+    receipt_files: &mut Vec<ReceiptFile>,
+) -> AgentResult<()> {
+    match repo_file_decision(dst, previous, force)? {
+        Decision::Install => {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(src, dst)?;
+            installed.push(dst.to_path_buf());
+            receipt_files.push(ReceiptFile {
+                blake3: hash_file(dst)?,
+                dst: dst.to_path_buf(),
+            });
+        }
+        Decision::Refresh => {
+            std::fs::copy(src, dst)?;
+            refreshed.push(dst.to_path_buf());
+            receipt_files.push(ReceiptFile {
+                blake3: hash_file(dst)?,
+                dst: dst.to_path_buf(),
+            });
+        }
+        Decision::Merge => {
+            // Append the canonical content to the user's existing file with
+            // a markdown horizontal rule separator. The user's content is
+            // preserved above; the Atomic workflow content goes below.
+            let existing = std::fs::read_to_string(dst)?;
+            let canonical = std::fs::read_to_string(src)?;
+            let merged = format!("{existing}\n\n---\n\n{canonical}");
+            std::fs::write(dst, merged)?;
+            installed.push(dst.to_path_buf());
+            receipt_files.push(ReceiptFile {
+                blake3: hash_file(dst)?,
+                dst: dst.to_path_buf(),
+            });
+        }
+        Decision::Skip(reason) => {
+            skipped.push(SkippedFile {
+                dst: dst.to_path_buf(),
+                reason,
+            });
+            if let Some(old) = previous.and_then(|r| r.files.iter().find(|f| f.dst == dst)) {
+                receipt_files.push(old.clone());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reject `src` paths that would escape the package directory.
@@ -390,6 +709,8 @@ manifest = "hooks/hooks.json"
             cli_version: "0.11.1".to_string(),
             source: "test".to_string(),
             expect_agent: None,
+            skills_cache_dir: None,
+            repo_root: None,
         }
     }
 
@@ -569,6 +890,500 @@ manifest = "hooks/hooks.json"
         .unwrap();
         let err = install_from_dir(pkg.path(), &opts(false)).unwrap_err();
         assert!(err.to_string().contains("must be a relative path"));
+        std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
+    }
+
+    // ── New install paths: skills, repo-file, agent-definition ──────────
+
+    /// Build a fake skills cache (mimics atomic-skills/) with AGENTS.md and
+    /// one skill.
+    fn fake_skills_cache() -> tempfile::TempDir {
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cache.path().join("skills/atomic-vault")).unwrap();
+        std::fs::write(cache.path().join("AGENTS.md"), "# Atomic VCS Agent\n\ncanonical body\n").unwrap();
+        std::fs::write(
+            cache.path().join("skills/atomic-vault/SKILL.md"),
+            "# atomic-vault skill\n",
+        )
+        .unwrap();
+        cache
+    }
+
+    /// Build a fake plugin that uses [skills-source] + [[skill]].
+    fn fake_plugin_with_skills(agent: &str, dst_dir: &Path) -> tempfile::TempDir {
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pkg.path().join(MANIFEST_FILE),
+            format!(
+                r#"
+schema = 1
+agent = "{agent}"
+version = "1.0.0"
+
+[requires]
+atomic = ">=0.1.0"
+
+[skills-source]
+package = "atomic-skills"
+
+[[skill]]
+src = "skills/atomic-vault/SKILL.md"
+dst = "{0}/skills/atomic-vault/SKILL.md"
+"#,
+                toml_path(dst_dir),
+            ),
+        )
+        .unwrap();
+        pkg
+    }
+
+    #[test]
+    #[serial]
+    fn installs_skills_from_cache() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
+        let dst = tempfile::tempdir().unwrap();
+        let cache = fake_skills_cache();
+        let pkg = fake_plugin_with_skills("skill-test", dst.path());
+
+        let mut o = opts(false);
+        o.skills_cache_dir = Some(cache.path().to_path_buf());
+        let outcome = install_from_dir(pkg.path(), &o).unwrap();
+
+        assert_eq!(outcome.installed.len(), 1);
+        let skill_dst = dst.path().join("skills/atomic-vault/SKILL.md");
+        assert!(skill_dst.exists());
+        assert_eq!(
+            std::fs::read_to_string(&skill_dst).unwrap(),
+            "# atomic-vault skill\n"
+        );
+        std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn skills_without_cache_errors() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
+        let dst = tempfile::tempdir().unwrap();
+        let pkg = fake_plugin_with_skills("skill-test-err", dst.path());
+
+        let err = install_from_dir(pkg.path(), &opts(false)).unwrap_err();
+        assert!(err.to_string().contains("no skills cache was provided"));
+        std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn installs_repo_file_into_repo_root() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
+        let repo = tempfile::tempdir().unwrap();
+        let cache = fake_skills_cache();
+
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pkg.path().join(MANIFEST_FILE),
+            format!(
+                r#"
+schema = 1
+agent = "repo-file-test"
+version = "1.0.0"
+
+[skills-source]
+package = "atomic-skills"
+
+[[repo-file]]
+src = "AGENTS.md"
+dst = "AGENTS.md"
+"#,
+            ),
+        )
+        .unwrap();
+
+        let mut o = opts(false);
+        o.skills_cache_dir = Some(cache.path().to_path_buf());
+        o.repo_root = Some(repo.path().to_path_buf());
+        let outcome = install_from_dir(pkg.path(), &o).unwrap();
+
+        assert_eq!(outcome.installed.len(), 1);
+        let agents_dst = repo.path().join("AGENTS.md");
+        assert!(agents_dst.exists());
+        assert!(std::fs::read_to_string(&agents_dst).unwrap().contains("canonical body"));
+        std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn repo_file_skipped_without_repo_root() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
+        let repo = tempfile::tempdir().unwrap();
+        let cache = fake_skills_cache();
+
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pkg.path().join(MANIFEST_FILE),
+            r#"
+schema = 1
+agent = "repo-file-skip-test"
+version = "1.0.0"
+
+[skills-source]
+package = "atomic-skills"
+
+[[repo-file]]
+src = "AGENTS.md"
+dst = "AGENTS.md"
+"#,
+        )
+        .unwrap();
+
+        let mut o = opts(false);
+        o.skills_cache_dir = Some(cache.path().to_path_buf());
+        // repo_root intentionally None — simulates user said "no" to the prompt.
+        let outcome = install_from_dir(pkg.path(), &o).unwrap();
+
+        assert!(outcome.installed.is_empty());
+        assert!(!repo.path().join("AGENTS.md").exists());
+        std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn repo_file_rejects_absolute_dst() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
+        let repo = tempfile::tempdir().unwrap();
+        let cache = fake_skills_cache();
+
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pkg.path().join(MANIFEST_FILE),
+            r#"
+schema = 1
+agent = "repo-file-abs-test"
+version = "1.0.0"
+
+[skills-source]
+package = "atomic-skills"
+
+[[repo-file]]
+src = "AGENTS.md"
+dst = "/etc/passwd"
+"#,
+        )
+        .unwrap();
+
+        let mut o = opts(false);
+        o.skills_cache_dir = Some(cache.path().to_path_buf());
+        o.repo_root = Some(repo.path().to_path_buf());
+        let err = install_from_dir(pkg.path(), &o).unwrap_err();
+        assert!(err.to_string().contains("must be relative to the repo root"));
+        std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn repo_file_rejects_traversal_dst() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
+        let repo = tempfile::tempdir().unwrap();
+        let cache = fake_skills_cache();
+
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pkg.path().join(MANIFEST_FILE),
+            r#"
+schema = 1
+agent = "repo-file-trav-test"
+version = "1.0.0"
+
+[skills-source]
+package = "atomic-skills"
+
+[[repo-file]]
+src = "AGENTS.md"
+dst = "../escape.md"
+"#,
+        )
+        .unwrap();
+
+        let mut o = opts(false);
+        o.skills_cache_dir = Some(cache.path().to_path_buf());
+        o.repo_root = Some(repo.path().to_path_buf());
+        let err = install_from_dir(pkg.path(), &o).unwrap_err();
+        assert!(err.to_string().contains("must not escape the repo root"));
+        std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn stitches_agent_definition_at_install() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
+        let dst = tempfile::tempdir().unwrap();
+        let cache = fake_skills_cache();
+
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(pkg.path().join("agents")).unwrap();
+        std::fs::write(
+            pkg.path().join("agents/atomic.md.frontmatter"),
+            "---\ndescription: Test agent\nmode: primary\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.path().join(MANIFEST_FILE),
+            format!(
+                r#"
+schema = 1
+agent = "stitch-test"
+version = "1.0.0"
+
+[skills-source]
+package = "atomic-skills"
+
+[agent-definition]
+src = "agents/atomic.md.frontmatter"
+body_from = "atomic-skills:AGENTS.md"
+slot = "{0}/agents/atomic.md"
+"#,
+                toml_path(dst.path()),
+            ),
+        )
+        .unwrap();
+
+        let mut o = opts(false);
+        o.skills_cache_dir = Some(cache.path().to_path_buf());
+        let outcome = install_from_dir(pkg.path(), &o).unwrap();
+
+        assert_eq!(outcome.installed.len(), 1);
+        let agent_file = dst.path().join("agents/atomic.md");
+        assert!(agent_file.exists());
+        let content = std::fs::read_to_string(&agent_file).unwrap();
+        // Frontmatter present.
+        assert!(content.starts_with("---\ndescription: Test agent\nmode: primary\n---\n"));
+        // Canonical body present.
+        assert!(content.contains("canonical body"));
+        // The receipt recorded the stitched file.
+        let receipt = Receipt::load("stitch-test").unwrap().unwrap();
+        assert_eq!(receipt.files.len(), 1);
+        std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn agent_definition_without_cache_errors() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
+        let dst = tempfile::tempdir().unwrap();
+
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(pkg.path().join("agents")).unwrap();
+        std::fs::write(
+            pkg.path().join("agents/atomic.md.frontmatter"),
+            "---\ndescription: Test\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.path().join(MANIFEST_FILE),
+            format!(
+                r#"
+schema = 1
+agent = "stitch-no-cache"
+version = "1.0.0"
+
+[agent-definition]
+src = "agents/atomic.md.frontmatter"
+body_from = "atomic-skills:AGENTS.md"
+slot = "{0}/agents/atomic.md"
+"#,
+                toml_path(dst.path()),
+            ),
+        )
+        .unwrap();
+
+        let err = install_from_dir(pkg.path(), &opts(false)).unwrap_err();
+        assert!(err.to_string().contains("no skills cache was provided"));
+        std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn repo_file_uninstall_removes_from_repo() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
+        let repo = tempfile::tempdir().unwrap();
+        let cache = fake_skills_cache();
+
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pkg.path().join(MANIFEST_FILE),
+            r#"
+schema = 1
+agent = "repo-uninstall-test"
+version = "1.0.0"
+
+[skills-source]
+package = "atomic-skills"
+
+[[repo-file]]
+src = "AGENTS.md"
+dst = "AGENTS.md"
+"#,
+        )
+        .unwrap();
+
+        let mut o = opts(false);
+        o.skills_cache_dir = Some(cache.path().to_path_buf());
+        o.repo_root = Some(repo.path().to_path_buf());
+        install_from_dir(pkg.path(), &o).unwrap();
+        assert!(repo.path().join("AGENTS.md").exists());
+
+        // Uninstall must remove it.
+        let outcome = uninstall("repo-uninstall-test").unwrap();
+        assert_eq!(outcome.removed.len(), 1);
+        assert!(!repo.path().join("AGENTS.md").exists());
+        std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn repo_file_merges_with_existing_user_file() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
+        let repo = tempfile::tempdir().unwrap();
+        let cache = fake_skills_cache();
+
+        // User already has a project-specific AGENTS.md.
+        let user_content = "# My Project\n\nThis is my custom project guide.\n";
+        std::fs::write(repo.path().join("AGENTS.md"), user_content).unwrap();
+
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pkg.path().join(MANIFEST_FILE),
+            r#"
+schema = 1
+agent = "merge-test"
+version = "1.0.0"
+
+[skills-source]
+package = "atomic-skills"
+
+[[repo-file]]
+src = "AGENTS.md"
+dst = "AGENTS.md"
+"#,
+        )
+        .unwrap();
+
+        let mut o = opts(false);
+        o.skills_cache_dir = Some(cache.path().to_path_buf());
+        o.repo_root = Some(repo.path().to_path_buf());
+        let outcome = install_from_dir(pkg.path(), &o).unwrap();
+
+        // Should be "installed" (merged), not skipped.
+        assert_eq!(outcome.installed.len(), 1);
+        assert!(outcome.skipped.is_empty());
+
+        let result = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
+        // User's content is preserved above the separator.
+        assert!(result.starts_with("# My Project"));
+        assert!(result.contains("This is my custom project guide."));
+        // Separator is present.
+        assert!(result.contains("\n\n---\n\n"));
+        // Canonical Atomic content is appended below.
+        assert!(result.contains("# Atomic VCS Agent"));
+        assert!(result.contains("canonical body"));
+        std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn repo_file_refreshes_when_atomic_marker_present() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
+        let repo = tempfile::tempdir().unwrap();
+        let cache = fake_skills_cache();
+
+        // File already has the Atomic marker (maybe from a manual copy).
+        let stale = "# Atomic VCS Agent\n\nOld stale content\n";
+        std::fs::write(repo.path().join("AGENTS.md"), stale).unwrap();
+
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pkg.path().join(MANIFEST_FILE),
+            r#"
+schema = 1
+agent = "marker-test"
+version = "1.0.0"
+
+[skills-source]
+package = "atomic-skills"
+
+[[repo-file]]
+src = "AGENTS.md"
+dst = "AGENTS.md"
+"#,
+        )
+        .unwrap();
+
+        let mut o = opts(false);
+        o.skills_cache_dir = Some(cache.path().to_path_buf());
+        o.repo_root = Some(repo.path().to_path_buf());
+        let outcome = install_from_dir(pkg.path(), &o).unwrap();
+
+        // Should be refreshed, not merged (marker present → replace).
+        assert_eq!(outcome.refreshed.len(), 1);
+        assert!(outcome.installed.is_empty());
+
+        let result = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
+        // Stale content is gone, canonical is in place.
+        assert!(result.contains("canonical body"));
+        assert!(!result.contains("Old stale content"));
+        std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn repo_file_force_clobbers_user_file() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
+        let repo = tempfile::tempdir().unwrap();
+        let cache = fake_skills_cache();
+
+        // User has their own AGENTS.md (no Atomic marker).
+        let user_content = "# My Project\n\nDon't clobber me\n";
+        std::fs::write(repo.path().join("AGENTS.md"), user_content).unwrap();
+
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pkg.path().join(MANIFEST_FILE),
+            r#"
+schema = 1
+agent = "force-clobber-test"
+version = "1.0.0"
+
+[skills-source]
+package = "atomic-skills"
+
+[[repo-file]]
+src = "AGENTS.md"
+dst = "AGENTS.md"
+"#,
+        )
+        .unwrap();
+
+        let mut o = opts(true); // force = clobber
+        o.skills_cache_dir = Some(cache.path().to_path_buf());
+        o.repo_root = Some(repo.path().to_path_buf());
+        let outcome = install_from_dir(pkg.path(), &o).unwrap();
+
+        // Force clobbers — user's content is gone.
+        assert!(outcome.skipped.is_empty());
+        let result = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
+        assert!(!result.contains("Don't clobber me"));
+        assert!(result.contains("canonical body"));
         std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
     }
 }

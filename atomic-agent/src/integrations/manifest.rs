@@ -29,12 +29,36 @@ pub struct IntegrationManifest {
     /// Version gates.
     #[serde(default)]
     pub requires: Requires,
-    /// Files to copy into place.
+    /// Files to copy into place (from the package itself).
     #[serde(default, rename = "file")]
     pub files: Vec<FileEntry>,
     /// Hooks-manifest files to merge via the hooks::manifest engine.
     #[serde(default, rename = "settings")]
     pub settings: Vec<SettingsEntry>,
+    /// Shared skills source — names another registry package (typically
+    /// `"atomic-skills"`) whose cache provides the `[[skill]]` src paths and
+    /// the `[[agent-definition]]` body. When set, the installer expects
+    /// `opts.skills_cache_dir` to point at that package's cloned cache.
+    #[serde(default, rename = "skills-source")]
+    pub skills_source: Option<SkillsSource>,
+    /// Skills to copy from the skills-source cache into the agent's skill
+    /// location. `src` resolves against the skills cache dir; `dst` uses the
+    /// same `~` expansion as [[file]].
+    #[serde(default, rename = "skill")]
+    pub skills: Vec<SkillEntry>,
+    /// Files to install into the *repository* root (not the user's home).
+    /// Used for the canonical AGENTS.md so the workflow is always-on without
+    /// picking a bundled agent. `dst` is relative to the repo root. Only
+    /// installed when the caller passes `opts.repo_root` (gated by the
+    /// `--repo-agents` prompt in the CLI).
+    #[serde(default, rename = "repo-file")]
+    pub repo_files: Vec<RepoFileEntry>,
+    /// Declares that the plugin bundles a custom agent definition (e.g.
+    /// opencode's `agents/atomic.md`). The agent body is stitched at install
+    /// time from `src` (frontmatter, in the plugin package) + the canonical
+    /// AGENTS.md body (from the skills cache), and written to `slot`.
+    #[serde(default, rename = "agent-definition")]
+    pub agent_definition: Option<AgentDefinition>,
 }
 
 /// Version requirements the package imposes on its host.
@@ -59,6 +83,50 @@ pub struct SettingsEntry {
     /// Path to a hooks manifest (hooks::manifest format), relative to the
     /// package root.
     pub manifest: String,
+}
+
+/// Names the shared skills package that provides skill content + AGENTS.md.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillsSource {
+    /// Registry agent name (e.g. `"atomic-skills"`). Resolved via the
+    /// embedded registry.toml to a storage URL + view, cloned into the
+    /// shared cache by the CLI, and passed as `opts.skills_cache_dir`.
+    pub package: String,
+}
+
+/// One skill to copy from the skills-source cache.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillEntry {
+    /// Path relative to the skills-source cache root (e.g.
+    /// `"skills/atomic-vault/SKILL.md"`).
+    pub src: String,
+    /// Destination (`~` expands to home). Vendors with flat skill layouts
+    /// (Cline, agy) use a flat filename here.
+    pub dst: String,
+}
+
+/// One file to install into the repository root.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RepoFileEntry {
+    /// Path relative to the skills-source cache root (e.g. `"AGENTS.md"`).
+    pub src: String,
+    /// Destination relative to the repo root (e.g. `"AGENTS.md"`).
+    pub dst: String,
+}
+
+/// A bundled custom agent definition, stitched at install time.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentDefinition {
+    /// Frontmatter template file, relative to the plugin package root (e.g.
+    /// `"agents/atomic.md.frontmatter"`). Contains the YAML frontmatter block
+    /// and any vendor-specific preamble.
+    pub src: String,
+    /// Reference to the canonical body, in the form
+    /// `"atomic-skills:AGENTS.md"` (package-name-relative path). The
+    /// installer reads this from the skills cache.
+    pub body_from: String,
+    /// Destination in the vendor's agent slot (`~` expands to home).
+    pub slot: String,
 }
 
 impl IntegrationManifest {
@@ -121,6 +189,19 @@ impl IntegrationManifest {
             .iter()
             .map(|s| pkg_dir.join(&s.manifest))
             .collect()
+    }
+
+    /// Resolve a `body_from` reference (`"atomic-skills:AGENTS.md"`) into an
+    /// absolute path inside the skills cache. Returns `None` if the format is
+    /// unrecognized.
+    pub fn resolve_body_from(&self, body_from: &str, skills_cache: &Path) -> Option<PathBuf> {
+        let (pkg, rel) = body_from.split_once(':')?;
+        // The package name in body_from must match the skills-source package.
+        let expected = self.skills_source.as_ref()?.package.as_str();
+        if pkg != expected {
+            return None;
+        }
+        Some(skills_cache.join(rel))
     }
 }
 

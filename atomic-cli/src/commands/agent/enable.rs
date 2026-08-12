@@ -91,6 +91,23 @@ pub struct Enable {
     /// package's atomic-integration.toml, without any network access.
     #[arg(long, value_name = "PATH")]
     from: Option<std::path::PathBuf>,
+
+    /// Also install AGENTS.md into the repository root so the Atomic
+    /// workflow is always-on without picking a bundled agent.
+    ///
+    /// When set, `[[repo-file]]` entries from the manifest are installed
+    /// into the repo. When neither `--agents-md` nor `--no-agents-md`
+    /// is set, the user is prompted interactively (default: no).
+    #[arg(long)]
+    agents_md: bool,
+
+    /// Skip the AGENTS.md-into-repo prompt entirely.
+    ///
+    /// Suppresses the interactive prompt and skips `[[repo-file]]` entries.
+    /// Useful in non-interactive contexts or when you only want the global
+    /// agent install.
+    #[arg(long)]
+    no_agents_md: bool,
 }
 
 impl Enable {
@@ -104,6 +121,8 @@ impl Enable {
             global: false,
             hooks: None,
             from: None,
+            agents_md: false,
+            no_agents_md: false,
         }
     }
 }
@@ -394,6 +413,24 @@ impl Command for Enable {
     }
 }
 
+/// Sync the shared atomic-skills package into the CLI-managed cache
+/// (`~/.atomic/integrations/atomic-skills/repo`). Skills and the canonical
+/// AGENTS.md are sourced from this cache, so every plugin install reuses it.
+///
+/// First run clones the package; later runs reuse the cache. `--force`
+/// discards and re-clones.
+fn sync_skills_cache(force: bool) -> CliResult<std::path::PathBuf> {
+    const SKILLS_AGENT: &str = "atomic-skills";
+
+    let spec = atomic_agent::integrations::resolve(SKILLS_AGENT).ok_or_else(|| {
+        crate::error::CliError::Internal(anyhow::anyhow!(
+            "atomic-skills not found in the integration registry — this is a bug"
+        ))
+    })?;
+
+    sync_integration_package(SKILLS_AGENT, &spec, force)
+}
+
 /// Sync an agent's integration package into the CLI-managed cache
 /// (`~/.atomic/integrations/<agent>/repo`) using Atomic's own remote
 /// protocol, and return the package directory (the cache's working copy).
@@ -440,6 +477,11 @@ impl Enable {
     /// syncing the registry's Atomic storage project into the CLI-managed
     /// cache. Installation itself is done by the integrations engine per the
     /// package's atomic-integration.toml.
+    ///
+    /// When the manifest declares `[skills-source]`, the shared atomic-skills
+    /// cache is synced (or reused) and passed as `skills_cache_dir`. When the
+    /// user opts in via `--agents-md` or the prompt, the repo root is passed
+    /// so `[[repo-file]]` entries land in the repo.
     fn install_integration(
         &self,
         agent_name: &str,
@@ -454,15 +496,78 @@ impl Enable {
             sync_integration_package(agent_name, spec, self.force)?
         };
 
+        // Peek at the manifest to see if we need the skills cache.
+        let manifest = atomic_agent::integrations::IntegrationManifest::load(&pkg_dir)
+            .map_err(|e| crate::error::CliError::Internal(anyhow::anyhow!(e.to_string())))?;
+
+        let skills_cache_dir = if manifest.skills_source.is_some()
+            || manifest.agent_definition.is_some()
+        {
+            Some(sync_skills_cache(self.force)?)
+        } else {
+            None
+        };
+
+        // Determine repo_root from the --agents-md / --no-agents-md flags
+        // or the interactive prompt. Only relevant when the manifest has
+        // [[repo-file]] entries.
+        let repo_root = if !manifest.repo_files.is_empty() {
+            self.resolve_repo_root()?
+        } else {
+            None
+        };
+
         let opts = atomic_agent::integrations::InstallOptions {
             force: self.force,
             cli_version: env!("CARGO_PKG_VERSION").to_string(),
             source,
             expect_agent: Some(agent_name.to_string()),
+            skills_cache_dir,
+            repo_root,
         };
 
         atomic_agent::integrations::install_from_dir(&pkg_dir, &opts)
             .map_err(|e| crate::error::CliError::Internal(anyhow::anyhow!(e.to_string())))
+    }
+
+    /// Sync the shared atomic-skills package into the CLI-managed cache.
+    ///
+    /// First run clones it; later runs reuse the cache so installs work
+    /// offline. `--force` discards the cache and re-clones.
+    fn resolve_repo_root(&self) -> CliResult<Option<std::path::PathBuf>> {
+        // If the user explicitly said no, skip.
+        if self.no_agents_md {
+            return Ok(None);
+        }
+        // If the user explicitly said yes, find the repo root and proceed.
+        if self.agents_md {
+            let repo_root = find_repository_root()?;
+            return Ok(Some(repo_root));
+        }
+        // Otherwise prompt (interactive TTY only; non-interactive defaults to no).
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            println!("Skipping repo AGENTS.md (non-interactive). Use --agents-md to install.");
+            return Ok(None);
+        }
+        print!(
+            "Also install/merge AGENTS.md into this repo so the workflow is always-on\n\
+             without picking the Atomic agent? [y/N] "
+        );
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| crate::error::CliError::Internal(anyhow::anyhow!(e.to_string())))?;
+        let input = input.trim().to_lowercase();
+        if input == "y" || input == "yes" {
+            let repo_root = find_repository_root()?;
+            Ok(Some(repo_root))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Install hooks from an integration-supplied manifest file.
@@ -679,6 +784,8 @@ mod tests {
             global: false,
             hooks: None,
             from: None,
+            agents_md: false,
+            no_agents_md: false,
         };
     }
 
@@ -691,6 +798,8 @@ mod tests {
             global: false,
             hooks: None,
             from: None,
+            agents_md: false,
+            no_agents_md: false,
         };
         assert!(cmd.force);
         assert_eq!(cmd.agent.as_deref(), Some("claude-code"));
@@ -705,6 +814,8 @@ mod tests {
             global: false,
             hooks: None,
             from: None,
+            agents_md: false,
+            no_agents_md: false,
         };
         assert!(cmd.all);
         assert!(cmd.agent.is_none());
@@ -719,6 +830,8 @@ mod tests {
             global: true,
             hooks: None,
             from: None,
+            agents_md: false,
+            no_agents_md: false,
         };
         assert!(cmd.global);
         assert_eq!(cmd.agent.as_deref(), Some("claude-code"));
