@@ -34,7 +34,8 @@ pub use install::{
     UninstallOutcome,
 };
 pub use manifest::{
-    AgentDefinition, IntegrationManifest, RepoFileEntry, SkillEntry, SkillsSource, MANIFEST_FILE,
+    AgentDefinition, IntegrationManifest, RepoFileEntry, SkillEntry, SkillsConfig, SkillsSource,
+    MANIFEST_FILE,
 };
 pub use receipt::{agent_dir, cache_repo_dir, integrations_root, receipt_path, Receipt};
 pub use registry::{agents as registered_integrations, resolve, IntegrationSpec};

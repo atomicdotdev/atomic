@@ -41,9 +41,16 @@ pub struct IntegrationManifest {
     /// `opts.skills_cache_dir` to point at that package's cloned cache.
     #[serde(default, rename = "skills-source")]
     pub skills_source: Option<SkillsSource>,
-    /// Skills to copy from the skills-source cache into the agent's skill
-    /// location. `src` resolves against the skills cache dir; `dst` uses the
-    /// same `~` expansion as [[file]].
+    /// Auto-install all skills from the cache using a dst pattern. When
+    /// present, the installer globs `skills/*/SKILL.md` in the cache and
+    /// copies each to `dst_pattern` with `{name}` replaced by the skill
+    /// directory name. This means adding a new skill to `atomic-skills`
+    /// requires zero plugin manifest changes.
+    #[serde(default, rename = "skills")]
+    pub skills_config: Option<SkillsConfig>,
+    /// Explicit skill entries for non-skill cache files (e.g. AGENTS.md
+    /// copied to a vendor-specific instruction-file path). For actual skills,
+    /// prefer `[skills]` with `install = "all"` — it's automatic.
     #[serde(default, rename = "skill")]
     pub skills: Vec<SkillEntry>,
     /// Files to install into the *repository* root (not the user's home).
@@ -92,6 +99,20 @@ pub struct SkillsSource {
     /// embedded registry.toml to a storage URL + view, cloned into the
     /// shared cache by the CLI, and passed as `opts.skills_cache_dir`.
     pub package: String,
+}
+
+/// Auto-install all skills from the cache using a dst pattern.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillsConfig {
+    /// Which skills to install. `"all"` globs `skills/*/SKILL.md` in the
+    /// cache and installs every one. Alternatively, a comma-separated list
+    /// of skill directory names (e.g. `"atomic-vault,atomic-vcs"`).
+    pub install: String,
+    /// Destination pattern with `{name}` placeholder. The installer replaces
+    /// `{name}` with each skill's directory name. Examples:
+    /// - Nested: `"~/.config/opencode/skills/{name}/SKILL.md"`
+    /// - Flat: `"~/Documents/Cline/Workflows/{name}.md"`
+    pub dst_pattern: String,
 }
 
 /// One skill to copy from the skills-source cache.

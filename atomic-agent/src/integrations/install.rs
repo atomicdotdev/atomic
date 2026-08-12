@@ -149,7 +149,82 @@ pub fn install_from_dir(pkg_dir: &Path, opts: &InstallOptions) -> AgentResult<In
         )?;
     }
 
-    // Skills from the shared atomic-skills cache.
+    // Auto-install all skills from the shared cache via [skills] block.
+    // The installer globs skills/*/SKILL.md and formats dst_pattern with
+    // {name}. This means adding a skill to atomic-skills requires zero
+    // plugin manifest changes.
+    if let Some(ref config) = manifest.skills_config {
+        let cache = opts
+            .skills_cache_dir
+            .as_deref()
+            .ok_or_else(|| AgentError::Integration {
+                agent: manifest.agent.clone(),
+                reason: "manifest declares [skills] but no skills cache was \
+                         provided (expected [skills-source] to be synced by the CLI)"
+                    .to_string(),
+            })?;
+
+        if !config.dst_pattern.contains("{name}") {
+            return Err(AgentError::Integration {
+                agent: manifest.agent.clone(),
+                reason: format!(
+                    "[skills] dst_pattern must contain '{{name}}' placeholder, got '{}'",
+                    config.dst_pattern
+                ),
+            });
+        }
+
+        // Glob skills/*/SKILL.md in the cache.
+        let skills_dir = cache.join("skills");
+        let skill_names: Vec<String> = std::fs::read_dir(&skills_dir)
+            .map_err(|e| AgentError::Integration {
+                agent: manifest.agent.clone(),
+                reason: format!("cannot read skills dir {}: {}", skills_dir.display(), e),
+            })?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if e.path().join("SKILL.md").is_file() {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Filter by install list if not "all".
+        let wanted: Vec<String> = if config.install.trim() == "all" {
+            skill_names
+        } else {
+            let allowed: Vec<&str> = config.install.split(',').map(|s| s.trim()).collect();
+            skill_names
+                .into_iter()
+                .filter(|n| allowed.contains(&n.as_str()))
+                .collect()
+        };
+
+        for name in &wanted {
+            let src = cache.join("skills").join(name).join("SKILL.md");
+            let dst_str = config.dst_pattern.replace("{name}", name);
+            let dst = expand_dst(&dst_str)?;
+            copy_one(
+                &manifest.agent,
+                &src,
+                &dst,
+                previous.as_ref(),
+                opts.force,
+                &mut installed,
+                &mut refreshed,
+                &mut skipped,
+                &mut receipt_files,
+            )?;
+        }
+    }
+
+    // Explicit [[skill]] entries — for non-skill cache files (AGENTS.md to
+    // vendor instruction paths). For actual skills, prefer [skills] with
+    // install = "all".
     if !manifest.skills.is_empty() {
         let cache = opts
             .skills_cache_dir
@@ -1387,6 +1462,195 @@ dst = "AGENTS.md"
         let result = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
         assert!(!result.contains("Don't clobber me"));
         assert!(result.contains("canonical body"));
+        std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn skills_glob_installs_all_from_cache() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
+        let dst = tempfile::tempdir().unwrap();
+
+        // Build a skills cache with 3 skills.
+        let cache = tempfile::tempdir().unwrap();
+        for skill in &["atomic-vault", "atomic-vcs", "code-intelligence"] {
+            let dir = cache.path().join("skills").join(skill);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), format!("# {skill}\n")).unwrap();
+        }
+
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pkg.path().join(MANIFEST_FILE),
+            format!(
+                r#"
+schema = 1
+agent = "glob-test"
+version = "1.0.0"
+
+[skills-source]
+package = "atomic-skills"
+
+[skills]
+install = "all"
+dst_pattern = "{0}/skills/{{name}}/SKILL.md"
+"#,
+                toml_path(dst.path()),
+            ),
+        )
+        .unwrap();
+
+        let mut o = opts(false);
+        o.skills_cache_dir = Some(cache.path().to_path_buf());
+        let outcome = install_from_dir(pkg.path(), &o).unwrap();
+
+        // All 3 skills installed.
+        assert_eq!(outcome.installed.len(), 3);
+        for skill in &["atomic-vault", "atomic-vcs", "code-intelligence"] {
+            let path = dst.path().join("skills").join(skill).join("SKILL.md");
+            assert!(path.exists(), "skill {skill} not installed");
+        }
+        std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn skills_glob_flat_pattern() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
+        let dst = tempfile::tempdir().unwrap();
+
+        // Cache with 2 skills.
+        let cache = tempfile::tempdir().unwrap();
+        for skill in &["atomic-vault", "code-intelligence"] {
+            let dir = cache.path().join("skills").join(skill);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), format!("# {skill}\n")).unwrap();
+        }
+
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pkg.path().join(MANIFEST_FILE),
+            format!(
+                r#"
+schema = 1
+agent = "flat-glob-test"
+version = "1.0.0"
+
+[skills-source]
+package = "atomic-skills"
+
+[skills]
+install = "all"
+dst_pattern = "{0}/workflows/{{name}}.md"
+"#,
+                toml_path(dst.path()),
+            ),
+        )
+        .unwrap();
+
+        let mut o = opts(false);
+        o.skills_cache_dir = Some(cache.path().to_path_buf());
+        let outcome = install_from_dir(pkg.path(), &o).unwrap();
+
+        // 2 skills installed as flat .md files.
+        assert_eq!(outcome.installed.len(), 2);
+        assert!(dst.path().join("workflows/atomic-vault.md").exists());
+        assert!(dst.path().join("workflows/code-intelligence.md").exists());
+        std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn skills_glob_picks_up_new_skill_automatically() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
+        let dst = tempfile::tempdir().unwrap();
+
+        // Cache with 2 skills initially.
+        let cache = tempfile::tempdir().unwrap();
+        for skill in &["atomic-vault", "atomic-vcs"] {
+            let dir = cache.path().join("skills").join(skill);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), format!("# {skill}\n")).unwrap();
+        }
+
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pkg.path().join(MANIFEST_FILE),
+            format!(
+                r#"
+schema = 1
+agent = "auto-new-skill-test"
+version = "1.0.0"
+
+[skills-source]
+package = "atomic-skills"
+
+[skills]
+install = "all"
+dst_pattern = "{0}/skills/{{name}}/SKILL.md"
+"#,
+                toml_path(dst.path()),
+            ),
+        )
+        .unwrap();
+
+        let mut o = opts(false);
+        o.skills_cache_dir = Some(cache.path().to_path_buf());
+        let outcome1 = install_from_dir(pkg.path(), &o).unwrap();
+        assert_eq!(outcome1.installed.len(), 2);
+
+        // A new skill is added to the cache — no manifest change needed.
+        let new_skill_dir = cache.path().join("skills/triage-review");
+        std::fs::create_dir_all(&new_skill_dir).unwrap();
+        std::fs::write(new_skill_dir.join("SKILL.md"), "# triage-review\n").unwrap();
+
+        // Re-install with force — picks up the new skill automatically.
+        o.force = true;
+        let outcome2 = install_from_dir(pkg.path(), &o).unwrap();
+        // 2 refreshed + 1 new = 3 installed/refreshed total.
+        assert_eq!(outcome2.installed.len() + outcome2.refreshed.len(), 3);
+        assert!(dst.path().join("skills/triage-review/SKILL.md").exists());
+        std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn skills_glob_errors_without_name_placeholder() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
+        let dst = tempfile::tempdir().unwrap();
+        let cache = fake_skills_cache();
+
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pkg.path().join(MANIFEST_FILE),
+            format!(
+                r#"
+schema = 1
+agent = "no-placeholder-test"
+version = "1.0.0"
+
+[skills-source]
+package = "atomic-skills"
+
+[skills]
+install = "all"
+dst_pattern = "{0}/skills/all.md"
+"#,
+                toml_path(dst.path()),
+            ),
+        )
+        .unwrap();
+
+        let mut o = opts(false);
+        o.skills_cache_dir = Some(cache.path().to_path_buf());
+        let err = install_from_dir(pkg.path(), &o).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("must contain '{name}' placeholder"));
         std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
     }
 }

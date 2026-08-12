@@ -413,13 +413,14 @@ impl Command for Enable {
     }
 }
 
-/// Sync the shared atomic-skills package into the CLI-managed cache
-/// (`~/.atomic/integrations/atomic-skills/repo`). Skills and the canonical
-/// AGENTS.md are sourced from this cache, so every plugin install reuses it.
+/// Always sync the atomic-skills cache to latest.
 ///
-/// First run clones the package; later runs reuse the cache. `--force`
-/// discards and re-clones.
-fn sync_skills_cache(force: bool) -> CliResult<std::path::PathBuf> {
+/// Unlike the plugin cache (which reuses until --force), the skills cache
+/// is **always** re-cloned on every install. This ensures new skills added
+/// to atomic-skills are picked up immediately without --force. If the
+/// re-clone fails (network), the error is returned — the caller can retry
+/// or use --from to install from a local checkout.
+fn sync_skills_cache(_force: bool) -> CliResult<std::path::PathBuf> {
     const SKILLS_AGENT: &str = "atomic-skills";
 
     let spec = atomic_agent::integrations::resolve(SKILLS_AGENT).ok_or_else(|| {
@@ -428,7 +429,21 @@ fn sync_skills_cache(force: bool) -> CliResult<std::path::PathBuf> {
         ))
     })?;
 
-    sync_integration_package(SKILLS_AGENT, &spec, force)
+    let cache = atomic_agent::integrations::cache_repo_dir(SKILLS_AGENT)
+        .map_err(|e| crate::error::CliError::Internal(anyhow::anyhow!(e.to_string())))?;
+
+    // Always delete + re-clone to get latest. The atomic-skills package is
+    // small (markdown files only), so this is fast.
+    if cache.exists() {
+        std::fs::remove_dir_all(&cache).map_err(crate::error::CliError::Io)?;
+    }
+
+    crate::commands::clone::Clone::new(spec.url.clone())
+        .with_path(cache.display().to_string())
+        .with_view(spec.view.clone())
+        .run()?;
+
+    Ok(cache)
 }
 
 /// Sync an agent's integration package into the CLI-managed cache
@@ -500,12 +515,15 @@ impl Enable {
         let manifest = atomic_agent::integrations::IntegrationManifest::load(&pkg_dir)
             .map_err(|e| crate::error::CliError::Internal(anyhow::anyhow!(e.to_string())))?;
 
-        let skills_cache_dir =
-            if manifest.skills_source.is_some() || manifest.agent_definition.is_some() {
-                Some(sync_skills_cache(self.force)?)
-            } else {
-                None
-            };
+        let skills_cache_dir = if manifest.skills_source.is_some()
+            || manifest.skills_config.is_some()
+            || manifest.agent_definition.is_some()
+            || !manifest.skills.is_empty()
+        {
+            Some(sync_skills_cache(self.force)?)
+        } else {
+            None
+        };
 
         // Determine repo_root from the --agents-md / --no-agents-md flags
         // or the interactive prompt. Only relevant when the manifest has
