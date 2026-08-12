@@ -164,6 +164,50 @@ pub enum RepositoryError {
     /// Walkdir error (during file traversal)
     #[error("Directory traversal error: {0}")]
     WalkDir(#[from] walkdir::Error),
+
+    /// View manifest structural error (parse or fold verification)
+    #[error("Manifest error: {0}")]
+    Manifest(#[from] crate::manifest::ManifestError),
+
+    /// Manifest references change files not present in the local store
+    #[error("Manifest for view '{view}' references {count} change(s) not present locally (first: {first})")]
+    ManifestMissingChanges {
+        view: String,
+        count: usize,
+        first: String,
+    },
+
+    /// A change in the manifest log has a dependency that is neither earlier
+    /// in the log nor already applied locally
+    #[error("Manifest for view '{view}': change {change} depends on {dependency}, which is neither earlier in the log nor present locally")]
+    ManifestDependencyMissing {
+        view: String,
+        change: String,
+        dependency: String,
+    },
+
+    /// The local view log is not a prefix of the manifest log
+    #[error("View '{view}' has diverged from the manifest (first mismatch at sequence {at})")]
+    ManifestDiverged { view: String, at: u64 },
+
+    /// The local view exists with a different identity (scope or parent)
+    #[error("View '{view}' identity mismatch: {reason}")]
+    ManifestIdentityMismatch { view: String, reason: String },
+
+    /// The manifest declares a parent view that does not exist locally
+    #[error("Manifest for view '{view}' requires parent view '{parent}', which does not exist")]
+    ManifestParentMissing { view: String, parent: String },
+
+    /// After replaying the manifest, the view state does not match the
+    /// declared merkle
+    #[error(
+        "View '{view}' state mismatch after manifest apply: declared {declared}, got {actual}"
+    )]
+    ManifestStateMismatch {
+        view: String,
+        declared: String,
+        actual: String,
+    },
 }
 
 impl RepositoryError {

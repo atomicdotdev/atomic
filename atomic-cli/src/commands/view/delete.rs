@@ -38,6 +38,9 @@
 //! ```
 
 use clap::Parser;
+use clap_complete::engine::ArgValueCompleter;
+
+use crate::commands::complete::complete_view_names;
 
 use atomic_repository::Repository;
 
@@ -64,7 +67,7 @@ pub struct Delete {
     /// Name of the view to delete.
     ///
     /// The view must exist and cannot be the current view.
-    #[arg(value_name = "NAME")]
+    #[arg(value_name = "NAME", add = ArgValueCompleter::new(complete_view_names))]
     pub name: Option<String>,
 
     /// Force deletion without confirmation.

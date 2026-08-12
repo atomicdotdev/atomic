@@ -65,6 +65,109 @@ impl HttpRemote {
         }
     }
 
+    /// Store a change file on the remote without applying it to any view.
+    ///
+    /// Content-only companion to [`Self::upload_change`]: the server writes
+    /// the change file (content-addressed, idempotent — 200 if it already
+    /// exists) but does not touch any view's change log. View membership is
+    /// declared separately via [`Self::put_view_manifest`], which is what
+    /// makes the store/declare split safe: a view is never half-created
+    /// with guessed identity.
+    pub async fn store_change(&self, hash: &str, data: Bytes) -> RemoteResult<()> {
+        let url = format!("{}?store={}", self.base_url, hash);
+        debug!("POST store: {} ({} bytes)", url, data.len());
+
+        let response = self
+            .client
+            .post(&url)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(data)
+            .send()
+            .await
+            .map_err(|e| RemoteError::connection_failed(&url, e))?;
+
+        crate::check_min_version_header(response.headers());
+        let status = response.status();
+
+        match status {
+            StatusCode::OK => {
+                debug!("Successfully stored change {}", hash);
+                Ok(())
+            }
+            StatusCode::NOT_FOUND => Err(RemoteError::repo_not_found(&url)),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::auth_failed(&url, msg))
+            }
+            _ => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::http(status.as_u16(), msg))
+            }
+        }
+    }
+
+    /// Declare a view's identity and change log on the remote.
+    ///
+    /// POSTs the manifest text (header `name\tscope\tparent\tstate` plus the
+    /// change log, one base32 hash per line). The server applies it
+    /// declaratively: creates the view with the declared scope/parent if
+    /// absent, fast-forwards its log, and verifies the resulting merkle
+    /// equals the declared state. Every referenced change must already be
+    /// on the server (see [`Self::store_change`]); push manifests
+    /// root → leaf so a draft's parent exists before the draft.
+    ///
+    /// String-level like the rest of this client: serialization lives in
+    /// `atomic-repository`.
+    pub async fn put_view_manifest(&self, view: &str, manifest_text: String) -> RemoteResult<()> {
+        let url = format!("{}?view-manifest={}", self.base_url, view);
+        debug!(
+            "POST view-manifest: {} ({} bytes)",
+            url,
+            manifest_text.len()
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header(CONTENT_TYPE, "text/plain")
+            .body(manifest_text)
+            .send()
+            .await
+            .map_err(|e| RemoteError::connection_failed(&url, e))?;
+
+        crate::check_min_version_header(response.headers());
+        let status = response.status();
+
+        match status {
+            StatusCode::OK => {
+                debug!("Successfully declared view manifest for {}", view);
+                Ok(())
+            }
+            StatusCode::NOT_FOUND => Err(RemoteError::repo_not_found(&url)),
+            StatusCode::CONFLICT => {
+                // Divergence / identity mismatch / state mismatch.
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::protocol(msg))
+            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::auth_failed(&url, msg))
+            }
+            StatusCode::BAD_REQUEST => {
+                let msg = response.text().await.unwrap_or_default();
+                if msg.contains("missing") && msg.contains("change") {
+                    Err(RemoteError::missing_deps(vec![]))
+                } else {
+                    Err(RemoteError::http(status.as_u16(), msg))
+                }
+            }
+            _ => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::http(status.as_u16(), msg))
+            }
+        }
+    }
+
     /// Upload a tag (short format).
     ///
     /// # Arguments

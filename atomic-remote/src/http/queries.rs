@@ -427,6 +427,68 @@ impl HttpRemote {
         }
     }
 
+    /// Fetch a view's manifest from the remote.
+    ///
+    /// The manifest is the view's complete identity — header line
+    /// `name\tscope\tparent\tstate` followed by the view's change log, one
+    /// base32 hash per line, exactly as stored on the remote. Returns
+    /// `Ok(None)` if the remote does not have the view, and
+    /// [`RemoteError::protocol`] if the server predates manifest support
+    /// (callers decide whether that is fatal — e.g. draft push — or not).
+    ///
+    /// This method is string-level: parsing into a typed manifest happens in
+    /// `atomic-repository`, which owns the format.
+    pub async fn get_view_manifest(&self, view: &str) -> RemoteResult<Option<String>> {
+        let url = format!("{}?view-manifest={}", self.base_url, view);
+        debug!("GET view-manifest: {}", url);
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| RemoteError::connection_failed(&url, e))?;
+
+        crate::check_min_version_header(response.headers());
+        let status = response.status();
+
+        match status {
+            StatusCode::OK => {
+                let text = response
+                    .text()
+                    .await
+                    .map_err(|e| RemoteError::connection_failed(&url, e))?;
+                // A manifest response is line-based with a tab-separated
+                // header. An older server answers `?view-manifest` with its
+                // generic JSON info blob — detect that and report missing
+                // support rather than handing garbage to the parser.
+                let looks_like_manifest = text
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .map(|l| l.contains('\t'))
+                    .unwrap_or(false);
+                if text.trim().is_empty() {
+                    Ok(None)
+                } else if looks_like_manifest {
+                    Ok(Some(text))
+                } else {
+                    Err(RemoteError::protocol(
+                        "server does not support view manifests (?view-manifest)",
+                    ))
+                }
+            }
+            StatusCode::NOT_FOUND => Ok(None),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::auth_failed(&url, msg))
+            }
+            _ => {
+                let msg = response.text().await.unwrap_or_default();
+                Err(RemoteError::http(status.as_u16(), msg))
+            }
+        }
+    }
+
     /// List all provenance graph hashes the remote holds.
     ///
     /// This mirrors the `.change` sync model: the server advertises a flat

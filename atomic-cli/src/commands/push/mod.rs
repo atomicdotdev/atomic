@@ -1,8 +1,9 @@
-//! The `push` command for uploading changes to a remote repository.
+//! The `push` command for syncing views to a remote repository.
 //!
-//! This module implements the `atomic push` command, which uploads local changes
-//! to a remote repository. It communicates with `atomic-api` servers using the
-//! HTTP protocol defined in the `atomic-remote-client` crate.
+//! This module implements the `atomic push` command, which syncs local views
+//! to a remote repository **identity-preservingly** via view manifests. It
+//! communicates with `atomic-api` servers using the HTTP protocol defined in
+//! the `atomic-remote` crate.
 //!
 //! # Module Structure
 //!
@@ -10,20 +11,38 @@
 //!
 //! - [`command`]: The main `Push` struct and `Command` implementation
 //! - [`types`]: Data structures (`PushChange`, `PushStats`, `PushOutcome`)
-//! - [`helpers`]: Utility functions for delta calculation, error conversion, etc.
+//! - [`helpers`]: Chain construction, sync planning, error conversion, etc.
 //!
 //! # Overview
 //!
-//! The push command performs the following workflow:
+//! Push no longer flattens a draft view into a shared remote view. Instead,
+//! each view in the target's parent chain is transferred as a
+//! [`ViewManifest`](atomic_repository::ViewManifest) — name, scope, parent,
+//! ordered change log, merkle state — so the remote ends up with the same
+//! view hierarchy as the local repository:
 //!
-//! 1. **Open local repository** and determine current view
-//! 2. **Load remote configuration** from repository settings
+//! 1. **Open local repository** and determine the leaf view (current or
+//!    `--from-view`)
+//! 2. **Build the ancestor chain** root → leaf by walking view parents
+//!    (cycle-guarded)
 //! 3. **Connect to remote** using HTTP client
-//! 4. **Query remote state** to determine what changes exist remotely
-//! 5. **Calculate delta** between local and remote changelists
-//! 6. **Upload changes** in dependency order (dependencies first)
-//! 7. **Upload tags** for any tagged states
-//! 8. **Report results** to the user
+//! 4. For each view in the chain, root → leaf:
+//!    - **Export the local manifest** (`Repository::view_manifest`)
+//!    - **Fetch the remote manifest** (`?view-manifest=<name>`); a server
+//!      without manifest support is a hard error — no flatten fallback
+//!    - **Require the fast-forward rule**: the remote log must be a prefix
+//!      of the local log, otherwise the push reports divergence
+//!    - **Store the suffix** — change files the remote lacks — via
+//!      `?store=<hash>` (content-only, idempotent, no view application)
+//!    - **Declare the manifest** (`POST ?view-manifest=<name>`); the server
+//!      creates/fast-forwards the view and verifies the merkle state
+//! 5. **Upload attestations, provenance graphs, and tags** that travel with
+//!    the pushed changes
+//! 6. **Report results** to the user
+//!
+//! Because the chain is synced root → leaf, a draft's parent always exists
+//! on the remote before the draft's manifest references it, and a draft's
+//! inherited prefix is never re-stored (it was synced with the parent).
 //!
 //! # Usage
 //!
@@ -34,43 +53,49 @@
 //!   [REMOTE]  Remote name or URL (default: the configured default remote, or "origin")
 //!
 //! Options:
-//!       --to-channel <CHANNEL>    Remote channel to push to (default: same as local)
-//!       --from-channel <CHANNEL>  Local channel to push from (default: current)
-//!   -n, --dry-run                 Show what would be pushed without pushing
-//!   -f, --force                   Force push even with diverged history
-//!   -a, --all                     Push all changes (not just new ones)
-//!   -k, --insecure                Skip TLS certificate verification
-//!       --timeout <SECONDS>       Request timeout in seconds (default: 30)
-//!   -h, --help                    Print help information
+//!       --to-view <VIEW>      Remote name for the leaf view (default: same as local)
+//!       --from-view <VIEW>    Local view to push from (default: current)
+//!   -n, --dry-run             Show what would be synced without pushing
+//!   -f, --force               Attempt the push even with diverged history
+//!                             (server remains authoritative)
+//!   -a, --all                 Store all changes in the log, not just the suffix
+//!   -k, --insecure            Skip TLS certificate verification
+//!       --timeout <SECONDS>   Request timeout in seconds (default: 30)
+//!   -h, --help                Print help information
 //! ```
 //!
 //! # Output
 //!
-//! On success, the command displays information about pushed changes:
+//! On success, the command displays the per-view sync progress:
 //!
 //! ```text
 //! Pushing to origin (https://api.example.com/tenant/t/portfolio/p/project/pr/code)
-//!   Remote: main at ABC123...
-//!   Local:  main at DEF456...
+//! ✓ Remote dev has 2 changes
+//! ✓ Remote orange does not exist yet
+//! Syncing view dev (1 new):
+//!   ✓ GHI789... (1/1) Fix login bug
+//! ✓ Declared dev [shared] (3 changes in log)
+//! Syncing view orange (2 new):
+//!   ✓ JKL012... (1/2) Add authentication module
+//!   ✓ DEF456... (2/2) Update tests
+//! ✓ Declared orange [draft] (5 changes in log)
 //!
-//! Uploading 3 changes:
-//!   ✓ GHI789... (1/3) Add authentication module
-//!   ✓ JKL012... (2/3) Fix login bug
-//!   ✓ DEF456... (3/3) Update tests
-//!
-//! Push complete: 3 changes uploaded
+//! Push complete: 2 views synced (3 changes stored) to origin
 //! ```
 //!
 //! # Dry Run
 //!
-//! Use `--dry-run` to preview what would be pushed:
+//! Use `--dry-run` to preview what would be synced:
 //!
 //! ```text
 //! $ atomic push --dry-run
-//! Would push 3 changes to origin:
-//!   GHI789... Add authentication module
-//!   JKL012... Fix login bug
-//!   DEF456... Update tests
+//! Would sync 2 views to origin:
+//!
+//!   dev [shared]: 1 change to store, declare manifest (3 changes in log)
+//!     GHI789... Fix login bug
+//!   orange [draft, parent dev]: 2 changes to store, declare manifest (5 changes in log)
+//!     JKL012... Add authentication module
+//!     DEF456... Update tests
 //! ```
 //!
 //! # Error Handling
@@ -80,8 +105,12 @@
 //! - **No remote configured**: Suggests adding a remote
 //! - **Authentication failed**: Suggests checking credentials
 //! - **Network errors**: Provides retry suggestions
-//! - **Diverged history**: Explains the situation and suggests `--force`
-//! - **Missing dependencies**: Suggests pushing with `--all`
+//! - **Diverged history**: The remote log is not a prefix of the local log;
+//!   suggests `atomic pull`, or `--force` to let the server decide
+//! - **Identity mismatch**: The view exists remotely with a different
+//!   scope/parent; never forceable
+//! - **Old server**: A server without `?view-manifest` support is a hard
+//!   error — identity-preserving push has no flatten fallback
 //!
 //! # Architecture
 //!
@@ -92,22 +121,26 @@
 //! │                                                                         │
 //! │  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────────┐ │
 //! │  │  Repository │    │ ChangeStore │    │      HttpRemote             │ │
-//! │  │  (local)    │    │ (local)     │    │ (atomic-remote-client)      │ │
+//! │  │  (local)    │    │ (local)     │    │ (atomic-remote)             │ │
 //! │  └──────┬──────┘    └──────┬──────┘    └────────────┬────────────────┘ │
 //! │         │                  │                        │                  │
-//! │         │  1. Get history  │                        │                  │
+//! │         │ 1. Build chain + │                        │                  │
+//! │         │    export manifests                       │                  │
 //! │         ├─────────────────►│                        │                  │
 //! │         │                  │                        │                  │
-//! │         │           2. Query remote state           │                  │
+//! │         │           2. GET ?view-manifest per view  │                  │
 //! │         │───────────────────────────────────────────►                  │
 //! │         │                  │                        │                  │
-//! │         │           3. Calculate delta              │                  │
+//! │         │           3. Plan fast-forward suffix     │                  │
 //! │         │◄──────────────────────────────────────────┤                  │
 //! │         │                  │                        │                  │
 //! │         │  4. Load changes │                        │                  │
 //! │         ├─────────────────►│                        │                  │
 //! │         │                  │                        │                  │
-//! │         │           5. Upload changes               │                  │
+//! │         │           5. POST ?store per new change   │                  │
+//! │         │───────────────────────────────────────────►                  │
+//! │         │                  │                        │                  │
+//! │         │           6. POST ?view-manifest per view │                  │
 //! │         │───────────────────────────────────────────►                  │
 //! │         │                  │                        │                  │
 //! └─────────────────────────────────────────────────────────────────────────┘

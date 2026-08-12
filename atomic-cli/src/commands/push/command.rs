@@ -2,6 +2,11 @@
 //!
 //! This module contains the `Push` struct and its `Command` implementation,
 //! which orchestrates the push operation from the CLI.
+//!
+//! Push is **identity-preserving**: it syncs the target view's full parent
+//! chain (root → leaf) via view manifests instead of flattening a draft into
+//! a shared remote view. Each view's scope, parent, and exact change log
+//! survive the transfer.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -11,20 +16,20 @@ use clap::Parser;
 
 use atomic_core::types::{Base32, Hash};
 use atomic_remote::{HttpRemote, HttpRemoteConfig};
-use atomic_repository::Repository;
+use atomic_repository::{Repository, ViewManifest};
 
 use crate::commands::{find_repository_root, format_hash, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{
-    create_progress_bar, create_spinner, error, finish_error, finish_success, hash as style_hash,
-    hint, print_blank, print_hint, print_success, print_warning, success, view as style_view,
+    create_progress_bar, create_spinner, finish_error, finish_success, hash as style_hash, hint,
+    print_blank, print_hint, print_success, print_warning, success, view as style_view,
 };
 
 use super::helpers::{
-    calculate_push_delta, convert_remote_error, display_state_comparison, format_count,
-    has_diverged, upload_change_smart,
+    build_view_chain, convert_remote_error, display_manifest_divergence, format_count,
+    load_change_data, load_change_message, parse_remote_manifest, plan_view_sync,
+    require_manifest_support, ChainError, ViewSyncConflict, ViewSyncPlan,
 };
-use super::types::PushChange;
 
 // Constants
 
@@ -38,9 +43,11 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Push changes to a remote repository.
 ///
-/// Uploads local changes to the specified remote, making them available
-/// to other users. Changes are pushed in dependency order to ensure the
-/// remote can apply them correctly.
+/// Syncs the local view — and every ancestor in its parent chain — to the
+/// remote via view manifests. Each view is transferred with its identity
+/// intact: a draft stays a draft, parented on the same view, with the same
+/// ordered change log. Change files are stored content-first (idempotent),
+/// then the view's manifest is declared, so a view is never half-created.
 ///
 /// # Remote Configuration
 ///
@@ -51,7 +58,8 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// # View Mapping
 ///
 /// By default, the local view is pushed to a view with the same name
-/// on the remote. Use `--to-view` to push to a different remote view.
+/// on the remote. Use `--to-view` to declare the leaf view under a
+/// different name on the remote; ancestors keep their own names.
 ///
 /// # Examples
 ///
@@ -62,13 +70,13 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// # Push to a specific remote
 /// atomic push upstream
 ///
-/// # Push to a different view
+/// # Push the leaf view under a different remote name
 /// atomic push --to-view main
 ///
 /// # Preview what would be pushed
 /// atomic push --dry-run
 ///
-/// # Force push (overwrite remote)
+/// # Attempt the push even if histories have diverged (server decides)
 /// atomic push --force
 /// ```
 #[derive(Parser, Debug, Clone)]
@@ -82,9 +90,10 @@ pub struct Push {
     #[arg()]
     pub remote: Option<String>,
 
-    /// Remote view to push to.
+    /// Remote view name to declare the leaf view under.
     ///
-    /// If not specified, uses the same name as the local view.
+    /// If not specified, uses the same name as the local view. Ancestor
+    /// views in the parent chain always keep their own names.
     #[arg(long = "to-view")]
     pub to_view: Option<String>,
 
@@ -100,15 +109,19 @@ pub struct Push {
     #[arg(short = 'n', long)]
     pub dry_run: bool,
 
-    /// Force push even if histories have diverged.
+    /// Attempt the push even if histories have diverged.
     ///
-    /// Use with caution: this can overwrite remote changes.
+    /// Stores every local change the remote view lacks and declares the
+    /// manifest anyway. The server remains authoritative: manifests only
+    /// fast-forward, so a genuinely diverged remote will still reject the
+    /// declare. Identity mismatches (scope/parent) are never forced.
     #[arg(short, long)]
     pub force: bool,
 
-    /// Push all changes, not just those missing on the remote.
+    /// Store all changes in the view's log, not just those missing on the remote.
     ///
-    /// Useful for ensuring all dependencies are present.
+    /// Useful for repairing a remote that is missing change files. Storing
+    /// is content-addressed and idempotent.
     #[arg(short, long)]
     pub all: bool,
 
@@ -131,6 +144,25 @@ pub struct Push {
     /// Example: `atomic push --identity alice-staging`
     #[arg(long)]
     pub identity: Option<String>,
+}
+
+/// Per-view sync work computed before any writes happen.
+///
+/// Built once per view in the chain; drives the dry-run preview and the
+/// actual store/declare phase.
+struct ViewSync {
+    /// Name of the view on the remote (leaf may be renamed via `--to-view`).
+    remote_name: String,
+
+    /// The local manifest to declare (name already rewritten for the leaf).
+    manifest: ViewManifest,
+
+    /// The plan: what to store, whether to declare.
+    plan: ViewSyncPlan,
+
+    /// Changes that actually need storing (plan suffix minus hashes already
+    /// known to be on the remote from earlier views in this push).
+    to_store: Vec<Hash>,
 }
 
 impl Push {
@@ -252,7 +284,7 @@ impl Push {
             .unwrap_or_else(|| repo.current_view().to_string())
     }
 
-    /// Get the remote view name to push to.
+    /// Get the remote view name to declare the leaf view under.
     ///
     /// Returns the explicitly specified view or the local view name.
     fn get_remote_view(&self, local_view: &str) -> String {
@@ -277,37 +309,98 @@ impl Push {
         crate::commands::auth::attach_identity(config, remote_url, identity_hint).await
     }
 
-    /// Display the dry run preview.
+    /// Display the dry run preview: per-view manifest sync plans.
     fn display_dry_run(
         &self,
+        repo: &Repository,
         remote_name: &str,
         remote_url: &str,
-        remote_view: &str,
-        to_upload: &[PushChange],
+        syncs: &[ViewSync],
     ) -> CliResult<()> {
-        if to_upload.is_empty() {
+        let active: Vec<&ViewSync> = syncs.iter().filter(|s| !s.plan.is_noop()).collect();
+
+        if active.is_empty() {
             print_success("Already up to date - nothing to push");
             return Ok(());
         }
 
         println!(
-            "Would push {} to {} (view: {}):",
-            format_count(to_upload.len(), "change"),
-            remote_name,
-            remote_view
+            "Would sync {} to {}:",
+            format_count(active.len(), "view"),
+            remote_name
         );
         print_blank();
 
-        for change in to_upload {
-            let hash_str = format_hash(&change.hash, false);
-            let msg = change.message_or_default();
-            println!("  {} {}", style_hash(&hash_str), msg);
+        for sync in &active {
+            let scope = sync.manifest.scope.to_string();
+            let parent = sync
+                .manifest
+                .parent
+                .as_deref()
+                .map(|p| format!(", parent {}", p))
+                .unwrap_or_default();
+            println!(
+                "  {} [{}{}]: {} to store, declare manifest ({} in log)",
+                style_view(&sync.remote_name),
+                scope,
+                parent,
+                format_count(sync.to_store.len(), "change"),
+                format_count(sync.manifest.changes.len(), "change"),
+            );
+            for hash in &sync.to_store {
+                let msg =
+                    load_change_message(repo, hash).unwrap_or_else(|| "(no message)".to_string());
+                println!("    {} {}", style_hash(&format_hash(hash, false)), msg);
+            }
         }
 
         print_blank();
         print_hint(&format!("Remote URL: {}", remote_url));
 
         Ok(())
+    }
+
+    /// Report a divergence conflict and build the error to return.
+    fn divergence_error(
+        &self,
+        local_view: &str,
+        local: &ViewManifest,
+        remote: Option<&ViewManifest>,
+        conflict: &ViewSyncConflict,
+    ) -> CliError {
+        match conflict {
+            ViewSyncConflict::Diverged { .. } => {
+                crate::output::print_error(&format!(
+                    "View '{}' has diverged from the remote",
+                    local_view
+                ));
+                print_blank();
+                if let Some(remote) = remote {
+                    display_manifest_divergence(local_view, local, remote);
+                    print_blank();
+                }
+                print_hint("The remote view's log is not a prefix of your local log.");
+                print_hint("Use 'atomic pull' to fetch remote changes, or");
+                print_hint("Use 'atomic push --force' to attempt the push anyway (server decides)");
+                CliError::Conflict {
+                    description: format!("View '{}': {}", local_view, conflict),
+                }
+            }
+            ViewSyncConflict::IdentityMismatch { .. } => {
+                crate::output::print_error(&format!(
+                    "View '{}' exists on the remote with a different identity",
+                    local_view
+                ));
+                print_blank();
+                print_hint(&format!("{}", conflict));
+                print_hint("A view's scope and parent are fixed at creation and cannot be");
+                print_hint("changed by a push. Rename the local view or push to a different");
+                print_hint("remote view with '--to-view'.");
+                CliError::Conflict {
+                    description: format!("View '{}': {}", local_view, conflict),
+                }
+            }
+        }
     }
 
     /// Async implementation of the push command.
@@ -319,10 +412,9 @@ impl Push {
         // Resolve remote name, URL, and identity hint
         let (remote_name, remote_url, identity_hint) = self.resolve_remote_url(&repo)?;
 
-        // Determine views
+        // Determine views: the leaf we push, and its name on the remote.
         let local_view = self.get_local_view(&repo);
         let remote_view = self.get_remote_view(&local_view);
-        let default_remote_view = "dev".to_string();
 
         // Print header
         println!(
@@ -339,6 +431,19 @@ impl Push {
         // actionable error instead.
         crate::commands::auth::check_push_credentials(&remote_url, identity_hint.as_deref())?;
 
+        // Build the local ancestor chain, root → leaf. A draft's parent must
+        // exist on the remote before the draft's manifest can reference it,
+        // so the whole chain is synced in order.
+        let chain = build_view_chain(&local_view, |name| {
+            repo.get_view_info(name).map(|info| info.parent_name)
+        })
+        .map_err(|e| match e {
+            ChainError::Cycle { view } => CliError::InvalidRepository {
+                reason: format!("view parent chain contains a cycle at '{}'", view),
+            },
+            ChainError::Lookup(err) => CliError::Repository(err),
+        })?;
+
         // Connect to remote
         let spinner = create_spinner("Connecting to remote...");
         let config = self
@@ -350,233 +455,231 @@ impl Push {
         })?;
         finish_success(&spinner, "Connected");
 
-        // Query remote state
-        let spinner = create_spinner("Querying remote state...");
-        let remote_state = remote.get_state(&remote_view).await.map_err(|e| {
-            finish_error(&spinner, "Failed to query state");
-            convert_remote_error(e, &remote_url)
-        })?;
-        finish_success(&spinner, "Got remote state");
+        // Plan phase: for each view in the chain, export the local manifest,
+        // fetch the remote's, and compute the fast-forward suffix. Hashes
+        // known to be on the remote (remote prefixes, or stored for an
+        // earlier view in this push) are skipped when storing — a draft's
+        // inherited prefix was already synced with its parent.
+        let mut known_on_remote: HashSet<Hash> = HashSet::new();
+        let mut syncs: Vec<ViewSync> = Vec::with_capacity(chain.len());
 
-        // Get the target view's full effective change set in dependency
-        // order. For a draft view this includes the changes inherited from
-        // its shared base, not just the draft's own delta — the remote view
-        // is flattened (shared) and needs the complete graph. Changes the
-        // remote already has are skipped by the delta/adopt logic below, so
-        // re-including the base is idempotent. Using `local_view` (not the
-        // current view) also ensures `--to-view` pushes the right view.
-        let spinner = create_spinner("Loading local history...");
-        let local_entries = repo
-            .effective_history(Some(&local_view))
-            .map_err(CliError::Repository)?;
-        finish_success(
-            &spinner,
-            &format!("Loaded {} local changes", local_entries.len()),
-        );
+        for name in &chain {
+            let is_leaf = name == &local_view;
+            let remote_view_name = if is_leaf {
+                remote_view.clone()
+            } else {
+                name.clone()
+            };
 
-        // Get remote changelist for the target view
-        let spinner = create_spinner("Fetching remote changelist...");
-        let remote_entries = if !remote_state.is_empty() {
-            // Remote has changes - fetch the full changelist from position 0
-            remote.get_changelist(&remote_view, 0).await.map_err(|e| {
-                finish_error(&spinner, "Failed to fetch changelist");
-                convert_remote_error(e, &remote_url)
-            })?
-        } else {
-            // Remote is empty (returned "-") - no changes to fetch
-            Vec::new()
-        };
-        finish_success(
-            &spinner,
-            &format!("Got {} remote changes", remote_entries.len()),
-        );
-
-        // If the target view is empty/new and differs from the default,
-        // check the default view to find a fork source. Views are perspectives
-        // of the same graph — we can fork instead of re-uploading.
-        let mut fork_source: Option<String> = None;
-        let mut graph_hashes: HashSet<String> = HashSet::new();
-
-        if remote_entries.is_empty() && remote_view != default_remote_view {
-            let default_state = remote.get_state(&default_remote_view).await;
-            if let Ok(ref state) = default_state {
-                if !state.is_empty() {
-                    if let Ok(default_entries) =
-                        remote.get_changelist(&default_remote_view, 0).await
-                    {
-                        for entry in &default_entries {
-                            graph_hashes.insert(entry.hash.clone());
-                        }
-                        if !default_entries.is_empty() {
-                            fork_source = Some(default_remote_view.clone());
-                        }
-                    }
-                }
+            // Export the local view identity. For a renamed leaf
+            // (`--to-view`) the manifest is declared under the remote name.
+            let mut manifest = repo.view_manifest(name).map_err(CliError::Repository)?;
+            if manifest.name != remote_view_name {
+                manifest.name = remote_view_name.clone();
             }
-        }
-        // Also include the target view's own entries
-        for entry in &remote_entries {
-            graph_hashes.insert(entry.hash.clone());
-        }
 
-        // Display state comparison
-        print_blank();
-        display_state_comparison(
-            &local_view,
-            &local_entries,
-            &remote_view,
-            &remote_state,
-            &remote_entries,
-        );
-        print_blank();
+            // Fetch the remote's manifest. A server without manifest support
+            // is a hard error: there is no flatten fallback.
+            let spinner = create_spinner(&format!(
+                "Fetching remote manifest for {}...",
+                style_view(&remote_view_name)
+            ));
+            let remote_text = require_manifest_support(
+                remote.get_view_manifest(&remote_view_name).await,
+                &remote_url,
+            )
+            .inspect_err(|_| finish_error(&spinner, "Failed to fetch manifest"))?;
+            let remote_manifest = match remote_text {
+                Some(text) => Some(parse_remote_manifest(
+                    &remote_view_name,
+                    &text,
+                    &remote_url,
+                )?),
+                None => None,
+            };
+            finish_success(
+                &spinner,
+                &format!(
+                    "Remote {} {}",
+                    style_view(&remote_view_name),
+                    match &remote_manifest {
+                        Some(m) => format!("has {}", format_count(m.changes.len(), "change")),
+                        None => "does not exist yet".to_string(),
+                    }
+                ),
+            );
 
-        // Calculate what to push
-        let to_upload = calculate_push_delta(
-            &repo,
-            &local_entries,
-            &remote_entries,
-            &graph_hashes,
-            self.all,
-        )?;
+            // Everything the remote view already logs is known-present.
+            if let Some(rm) = &remote_manifest {
+                known_on_remote.extend(rm.changes.iter().copied());
+            }
+
+            let plan = plan_view_sync(&manifest, remote_manifest.as_ref(), self.force).map_err(
+                |conflict| {
+                    self.divergence_error(name, &manifest, remote_manifest.as_ref(), &conflict)
+                },
+            )?;
+
+            if plan.forced {
+                print_warning(&format!(
+                    "View '{}' has diverged; pushing anyway (--force). The server may still reject it.",
+                    remote_view_name
+                ));
+            }
+
+            // With --all, re-store the full log (content-addressed and
+            // idempotent) to repair a remote missing change files. Otherwise
+            // store only the suffix, minus what's already known present.
+            let candidates: &[Hash] = if self.all {
+                &manifest.changes
+            } else {
+                &plan.suffix
+            };
+            let to_store: Vec<Hash> = candidates
+                .iter()
+                .filter(|h| self.all || !known_on_remote.contains(h))
+                .copied()
+                .collect();
+
+            syncs.push(ViewSync {
+                remote_name: remote_view_name,
+                manifest,
+                plan,
+                to_store,
+            });
+        }
 
         // Handle dry run
         if self.dry_run {
-            return self.display_dry_run(&remote_name, &remote_url, &remote_view, &to_upload);
+            return self.display_dry_run(&repo, &remote_name, &remote_url, &syncs);
         }
 
         // Check for nothing to push
-        if to_upload.is_empty() {
+        if syncs.iter().all(|s| s.plan.is_noop()) {
             print_success("Already up to date");
             return Ok(());
         }
 
-        // Check for diverged history (unless forcing)
-        if !self.force && has_diverged(&local_entries, &remote_entries) {
-            crate::output::print_error("Histories have diverged");
-            print_blank();
-            print_hint("The remote has changes that are not in your local history.");
-            print_hint("Use 'atomic pull' to fetch remote changes, or");
-            print_hint("Use 'atomic push --force' to overwrite remote (use with caution)");
-            return Err(CliError::Conflict {
-                description: "Remote has changes not present locally".to_string(),
-            });
-        }
+        // Sync phase: store change files, then declare each manifest,
+        // root → leaf so a draft's parent always exists before the draft.
+        let mut total_stored = 0usize;
+        let mut views_declared = 0usize;
+        let mut stored_hashes: Vec<Hash> = Vec::new();
 
-        // Partition into changes that need uploading vs already in graph
-        let new_changes: Vec<&PushChange> = to_upload.iter().filter(|c| c.needs_upload()).collect();
-        let adopt_count = to_upload.iter().filter(|c| c.in_graph).count();
-
-        // If there's a fork source and changes to adopt, fork the view first.
-        // This is a single server-side operation that copies the changelog —
-        // no data transfer, no per-change round trips. Views are perspectives.
-        if let Some(ref source) = fork_source {
-            if adopt_count > 0 {
-                let spinner = create_spinner(&format!(
-                    "Forking {} view from {}...",
-                    style_view(&remote_view),
-                    style_view(source)
-                ));
-
-                match remote.fork_view(&remote_view, source).await {
-                    Ok(count) => {
-                        finish_success(
-                            &spinner,
-                            &format!("Forked {} → {} ({} changes)", source, remote_view, count),
-                        );
-                    }
-                    Err(e) => {
-                        finish_error(&spinner, "Fork failed");
-                        return Err(convert_remote_error(e, &remote_url));
-                    }
-                }
+        for sync in &syncs {
+            if sync.plan.is_noop() {
+                println!(
+                    "  {} {} already up to date",
+                    success("✓"),
+                    style_view(&sync.remote_name)
+                );
+                continue;
             }
-        }
 
-        // Now upload only the truly new changes (not in any remote view)
-        if new_changes.is_empty() {
-            // Everything was handled by the fork
-            print_blank();
-            print_success(&format!(
-                "Push complete: {} view created on {}",
-                remote_view, remote_name
+            // Store the change files the remote lacks.
+            if !sync.to_store.is_empty() {
+                println!(
+                    "Syncing view {} ({} new):",
+                    style_view(&sync.remote_name),
+                    format_count(sync.to_store.len(), "change")
+                );
+
+                let progress = create_progress_bar(sync.to_store.len() as u64, "Storing changes");
+
+                for (i, hash) in sync.to_store.iter().enumerate() {
+                    // Loaded fully into memory for now; a streamed `?store`
+                    // for large changes is a known follow-up.
+                    let data = load_change_data(&repo, hash)?;
+                    let msg = load_change_message(&repo, hash)
+                        .unwrap_or_else(|| "(no message)".to_string());
+
+                    match remote.store_change(&hash.to_base32(), data).await {
+                        Ok(()) => {
+                            println!(
+                                "  {} {} ({}/{}) {}",
+                                success("✓"),
+                                style_hash(&format_hash(hash, false)),
+                                i + 1,
+                                sync.to_store.len(),
+                                msg,
+                            );
+                        }
+                        Err(e) => {
+                            finish_error(&progress, "Store failed");
+                            println!(
+                                "  {} {} ({}/{}) {}",
+                                crate::output::error("✗"),
+                                style_hash(&format_hash(hash, false)),
+                                i + 1,
+                                sync.to_store.len(),
+                                msg,
+                            );
+                            return Err(convert_remote_error(e, &remote_url));
+                        }
+                    }
+                    progress.inc(1);
+                }
+
+                finish_success(
+                    &progress,
+                    &format!("Stored {}", format_count(sync.to_store.len(), "change")),
+                );
+
+                total_stored += sync.to_store.len();
+                stored_hashes.extend(sync.to_store.iter().copied());
+            }
+
+            // Declare the view's identity and log. The server creates the
+            // view (with the declared scope/parent) if absent, fast-forwards
+            // its log, and verifies the merkle state.
+            let spinner = create_spinner(&format!(
+                "Declaring view {}...",
+                style_view(&sync.remote_name)
             ));
-            return Ok(());
-        }
-
-        // Upload new changes
-        println!(
-            "Uploading {}:",
-            format_count(new_changes.len(), "new change")
-        );
-        print_blank();
-
-        let progress = create_progress_bar(new_changes.len() as u64, "Pushing changes");
-
-        let mut _total_bytes_sent: u64 = 0;
-        let mut _total_bytes_saved: u64 = 0;
-        let mut _delta_count: usize = 0;
-
-        for (i, change) in new_changes.iter().enumerate() {
-            let transfer = upload_change_smart(&remote, &repo, &change.hash, &remote_view).await;
-
-            match transfer {
-                Ok(result) => {
-                    let msg = change.message_or_default();
-                    let transfer_info = if result.used_delta {
-                        _delta_count += 1;
-                        format!(" [{}]", result)
-                    } else {
-                        String::new()
-                    };
-                    _total_bytes_sent += result.bytes_sent;
-                    _total_bytes_saved += result.bytes_saved;
-
-                    println!(
-                        "  {} {} ({}/{}) {}{}",
-                        success("✓"),
-                        style_hash(&format_hash(&change.hash, false)),
-                        i + 1,
-                        new_changes.len(),
-                        msg,
-                        transfer_info,
+            match remote
+                .put_view_manifest(&sync.remote_name, sync.manifest.to_text())
+                .await
+            {
+                Ok(()) => {
+                    views_declared += 1;
+                    finish_success(
+                        &spinner,
+                        &format!(
+                            "Declared {} [{}] ({} in log)",
+                            style_view(&sync.remote_name),
+                            sync.manifest.scope,
+                            format_count(sync.manifest.changes.len(), "change"),
+                        ),
                     );
                 }
                 Err(e) => {
-                    let msg = change.message_or_default();
-                    println!(
-                        "  {} {} ({}/{}) {} - {}",
-                        error("✗"),
-                        style_hash(&format_hash(&change.hash, false)),
-                        i + 1,
-                        new_changes.len(),
-                        msg,
-                        e
-                    );
-                    return Err(e);
+                    finish_error(&spinner, "Declare failed");
+                    return Err(convert_remote_error(e, &remote_url));
                 }
             }
-
-            progress.inc(1);
         }
 
-        finish_success(&progress, &format!("Pushed {} changes", new_changes.len()));
+        // All changes in the leaf view's log are on the remote after a
+        // successful sync (chain views are subsets by the prefix rule).
+        let all_synced: HashSet<Hash> = syncs
+            .last()
+            .map(|s| s.manifest.changes.iter().copied().collect())
+            .unwrap_or_default();
 
         // Upload attestations that cover the pushed changes.
         // Attestations are graph-level audit nodes — they travel with
         // their dependencies but aren't part of any view's changelog.
         let mut attest_count = 0;
         {
-            let all_pushed_hashes: Vec<Hash> = to_upload.iter().map(|c| c.hash).collect();
-
             // Collect unique attestations — the same attestation can cover
             // multiple changes, so searching per-change produces duplicates.
-            let mut seen_attest: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+            let mut seen_attest: HashSet<Hash> = HashSet::new();
             let mut unique_attestations: Vec<(
                 Hash,
                 atomic_core::change::attestation::Attestation,
             )> = Vec::new();
 
-            for pushed_hash in &all_pushed_hashes {
+            for pushed_hash in &stored_hashes {
                 let attestations = repo
                     .find_attestations_for_change(pushed_hash)
                     .unwrap_or_default();
@@ -586,11 +689,11 @@ impl Push {
                         continue; // Already collected this attestation
                     }
 
-                    // Only upload if all covered changes have been pushed
+                    // Only upload if all covered changes are on the remote
                     let all_covered = attestation
                         .changes_covered
                         .iter()
-                        .all(|h| all_pushed_hashes.contains(h));
+                        .all(|h| all_synced.contains(h));
 
                     if all_covered {
                         unique_attestations.push((attest_hash, attestation));
@@ -638,20 +741,18 @@ impl Push {
         // upload only what it does not already hold.
         let mut provenance_count = 0;
         {
-            let remote_provenance: std::collections::HashSet<String> = remote
+            let remote_provenance: HashSet<String> = remote
                 .get_provenance_list()
                 .await
                 .unwrap_or_default()
                 .into_iter()
                 .collect();
 
-            let all_pushed_hashes: Vec<Hash> = to_upload.iter().map(|c| c.hash).collect();
-
             // Collect unique provenance graphs — same dedup logic as attestations.
-            let mut seen_prov: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+            let mut seen_prov: HashSet<Hash> = HashSet::new();
             let mut unique_graphs: Vec<(Hash, atomic_core::change::ProvenanceGraph)> = Vec::new();
 
-            for pushed_hash in &all_pushed_hashes {
+            for pushed_hash in &stored_hashes {
                 let graphs = repo
                     .find_provenance_for_change(pushed_hash)
                     .unwrap_or_default();
@@ -664,11 +765,11 @@ impl Push {
             }
 
             for (prov_hash, graph) in &unique_graphs {
-                // Only upload if all explained changes have been pushed
+                // Only upload if all explained changes are on the remote
                 let all_explained = graph
                     .changes_explained
                     .iter()
-                    .all(|h| all_pushed_hashes.contains(h));
+                    .all(|h| all_synced.contains(h));
 
                 if !all_explained {
                     continue;
@@ -710,10 +811,12 @@ impl Push {
             }
         }
 
-        // Upload tags for the pushed view.
+        // Upload tags for the pushed leaf view. Tags live locally under the
+        // local view name but are declared remotely under the (possibly
+        // renamed) remote view name.
         let mut tag_count = 0;
         {
-            let tags = repo.list_tags_for_view(&remote_view).unwrap_or_default();
+            let tags = repo.list_tags_for_view(&local_view).unwrap_or_default();
 
             for tag in &tags {
                 let tag_hash = tag.content_hash();
@@ -751,17 +854,11 @@ impl Push {
         // Summary
         print_blank();
         let mut summary = format!(
-            "Push complete: {} uploaded to {}",
-            format_count(new_changes.len(), "change"),
-            remote_view
+            "Push complete: {} synced ({} stored) to {}",
+            format_count(views_declared, "view"),
+            format_count(total_stored, "change"),
+            remote_name
         );
-        if adopt_count > 0 {
-            summary.push_str(&format!(
-                " (forked {} from {})",
-                format_count(adopt_count, "change"),
-                fork_source.as_deref().unwrap_or("graph")
-            ));
-        }
         if attest_count > 0 {
             summary.push_str(&format!(
                 ", {} synced",
@@ -792,34 +889,25 @@ impl Default for Push {
 impl Command for Push {
     /// Execute the push command.
     ///
-    /// # Workflow
-    ///
-    /// 1. Find and open the local repository
-    /// 2. Resolve the remote URL from configuration or argument
-    /// 3. Determine local and remote view names
-    /// 4. Connect to the remote server
-    /// 5. Query remote state and changelist
-    /// 6. Calculate which changes need to be pushed
-    /// 7. If dry run, display preview and exit
-    /// 8. Upload changes in dependency order
-    /// 9. Upload any tagged states
-    /// 10. Display summary
+    /// Syncs the current (or specified) view's parent chain to the remote
+    /// via view manifests, then uploads attestations, provenance graphs,
+    /// and tags that travel with the pushed changes.
     ///
     /// # Errors
     ///
-    /// Returns errors for:
-    /// - Repository not found
-    /// - Remote not configured
-    /// - Network/connection failures
-    /// - Authentication failures
-    /// - Diverged histories (without --force)
+    /// - `CliError::RepositoryNotFound` - Not in a repository
+    /// - `CliError::RemoteNotFound` - Remote doesn't exist
+    /// - `CliError::AuthenticationFailed` - Auth failure
+    /// - `CliError::Conflict` - Histories diverged or view identity mismatch
+    /// - `CliError::RemoteError` - Network/server error (including servers
+    ///   that predate view-manifest support)
     fn run(&self) -> CliResult<()> {
-        // Create a tokio runtime for async operations
-        let rt = tokio::runtime::Runtime::new().map_err(|e| {
+        // Create async runtime for HTTP operations
+        let runtime = tokio::runtime::Runtime::new().map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {}", e))
         })?;
 
-        rt.block_on(self.run_async())
+        runtime.block_on(self.run_async())
     }
 }
 
@@ -829,7 +917,7 @@ impl Command for Push {
 mod tests {
     use super::*;
 
-    // Push Command Construction Tests
+    // Constructor Tests
 
     #[test]
     fn test_push_new() {
@@ -850,28 +938,33 @@ mod tests {
         assert!(push.remote.is_none());
     }
 
+    // Builder Tests
+
     #[test]
     fn test_push_with_remote() {
         let push = Push::new().with_remote("upstream");
-        assert_eq!(push.remote.as_deref(), Some("upstream"));
+        assert_eq!(push.remote, Some("upstream".to_string()));
     }
 
     #[test]
     fn test_push_with_remote_url() {
-        let push = Push::new().with_remote("https://example.com/repo");
-        assert_eq!(push.remote.as_deref(), Some("https://example.com/repo"));
+        let push = Push::new().with_remote("https://api.example.com/repo");
+        assert_eq!(
+            push.remote,
+            Some("https://api.example.com/repo".to_string())
+        );
     }
 
     #[test]
     fn test_push_with_to_view() {
-        let push = Push::new().with_to_view("main");
-        assert_eq!(push.to_view, Some("main".to_string()));
+        let push = Push::new().with_to_view("production");
+        assert_eq!(push.to_view, Some("production".to_string()));
     }
 
     #[test]
     fn test_push_with_from_view() {
-        let push = Push::new().with_from_view("dev");
-        assert_eq!(push.from_view, Some("dev".to_string()));
+        let push = Push::new().with_from_view("feature");
+        assert_eq!(push.from_view, Some("feature".to_string()));
     }
 
     #[test]
@@ -879,8 +972,8 @@ mod tests {
         let push = Push::new().with_dry_run(true);
         assert!(push.dry_run);
 
-        let push2 = push.with_dry_run(false);
-        assert!(!push2.dry_run);
+        let push = Push::new().with_dry_run(false);
+        assert!(!push.dry_run);
     }
 
     #[test]
@@ -914,16 +1007,16 @@ mod tests {
             .with_to_view("main")
             .with_from_view("feature")
             .with_dry_run(true)
-            .with_force(false)
+            .with_force(true)
             .with_all(true)
             .with_insecure(true)
             .with_timeout(120);
 
-        assert_eq!(push.remote.as_deref(), Some("upstream"));
+        assert_eq!(push.remote, Some("upstream".to_string()));
         assert_eq!(push.to_view, Some("main".to_string()));
         assert_eq!(push.from_view, Some("feature".to_string()));
         assert!(push.dry_run);
-        assert!(!push.force);
+        assert!(push.force);
         assert!(push.all);
         assert!(push.insecure);
         assert_eq!(push.timeout, 120);
@@ -931,11 +1024,11 @@ mod tests {
 
     #[test]
     fn test_push_clone() {
-        let push = Push::new().with_remote("test").with_dry_run(true);
+        let push = Push::new().with_remote("origin").with_dry_run(true);
         let cloned = push.clone();
 
-        assert_eq!(push.remote, cloned.remote);
-        assert_eq!(push.dry_run, cloned.dry_run);
+        assert_eq!(cloned.remote, push.remote);
+        assert_eq!(cloned.dry_run, push.dry_run);
     }
 
     #[test]
@@ -947,18 +1040,18 @@ mod tests {
         assert!(debug_str.contains("origin"));
     }
 
-    // Remote Channel Tests
+    // View Resolution Tests
 
     #[test]
     fn test_get_remote_view_explicit() {
-        let push = Push::new().with_to_view("main");
-        assert_eq!(push.get_remote_view("dev"), "main");
+        let push = Push::new().with_to_view("production");
+        assert_eq!(push.get_remote_view("local"), "production");
     }
 
     #[test]
     fn test_get_remote_view_default() {
         let push = Push::new();
-        assert_eq!(push.get_remote_view("dev"), "dev");
+        assert_eq!(push.get_remote_view("local"), "local");
     }
 
     // Remote Config Tests
@@ -967,7 +1060,7 @@ mod tests {
     async fn test_build_remote_config_default() {
         let push = Push::new();
         let config = push
-            .build_remote_config("http://test.localhost:8080/code", None)
+            .build_remote_config("https://api.example.com/none", None)
             .await;
 
         assert_eq!(config.timeout, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
@@ -976,25 +1069,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_remote_config_custom_timeout() {
-        let push = Push::new().with_timeout(120);
+        let push = Push::new().with_timeout(60);
         let config = push
-            .build_remote_config("http://test.localhost:8080/code", None)
+            .build_remote_config("https://api.example.com/none", None)
             .await;
 
-        assert_eq!(config.timeout, Duration::from_secs(120));
+        assert_eq!(config.timeout, Duration::from_secs(60));
     }
 
     #[tokio::test]
     async fn test_build_remote_config_insecure() {
         let push = Push::new().with_insecure(true);
         let config = push
-            .build_remote_config("http://test.localhost:8080/code", None)
+            .build_remote_config("https://api.example.com/none", None)
             .await;
 
         assert!(config.danger_accept_invalid_certs);
     }
 
-    // Constants Tests
+    // Constant Tests
 
     #[test]
     fn test_default_remote() {
