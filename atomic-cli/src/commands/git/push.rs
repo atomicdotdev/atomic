@@ -7,6 +7,7 @@
 use clap::Args;
 use git2::Repository as GitRepository;
 
+use atomic_core::pristine::ViewScope;
 use atomic_core::types::{Base32, Merkle};
 use atomic_repository::{HistoryEntry, HistoryOptions, Repository};
 
@@ -19,6 +20,11 @@ use crate::output::{print_info, print_success, print_warning};
 /// Creates a Git commit from the current Atomic view's working copy state,
 /// with trailers linking back to the Atomic changes. Optionally pushes to
 /// the Git remote.
+///
+/// When the current view is a **draft** and `--branch` is not given, the push
+/// targets a Git branch named after the view (`HEAD:refs/heads/<view>`),
+/// creating the remote ref on first push so each draft publishes to its own
+/// branch. Shared views land on the current Git branch as before.
 ///
 /// # Examples
 ///
@@ -79,6 +85,26 @@ impl Command for Push {
 
         // Get current view name for trailers
         let current_view = repo.current_view().to_string();
+
+        // Resolve the git branch this push targets. Explicit `--branch` wins;
+        // otherwise a draft view maps to a git branch named after the view so
+        // each draft publishes to its own remote ref. Shared views keep the
+        // historical behavior (commit lands on the current git branch).
+        let view_scope = repo
+            .get_view_info(&current_view)
+            .map_err(CliError::Repository)?
+            .scope;
+        let branch_override =
+            Self::resolve_branch_override(self.branch.as_deref(), view_scope, &current_view)?;
+        if self.branch.is_none() {
+            if let Some(ref branch) = branch_override {
+                print_info(&format!(
+                    "Draft view '{}' publishes to git branch '{}' (created on the remote if absent).",
+                    current_view, branch
+                ));
+            }
+        }
+        let target_override = branch_override.as_deref();
 
         // Load change history for commit message + trailers
         let history = repo
@@ -154,9 +180,9 @@ impl Command for Push {
                     .ok()
                     .and_then(|h| h.shorthand().map(str::to_owned))
                     .unwrap_or_else(|| "HEAD".to_string());
-                let target = self.branch.as_deref().unwrap_or(&branch_name);
-                let ahead = self.unpushed_commit_count(&git_repo, &branch_name);
-                if ahead == 0 && self.branch.is_none() {
+                let target = target_override.unwrap_or(&branch_name);
+                let ahead = self.unpushed_commit_count(&git_repo, &branch_name, target_override);
+                if ahead == 0 && target_override.is_none() {
                     print_info("Working copy matches Git HEAD. Nothing to commit.");
                     return Ok(());
                 }
@@ -186,7 +212,7 @@ impl Command for Push {
                         self.remote, target
                     ));
                 }
-                self.push_to_remote(&git_repo)?;
+                self.push_to_remote(&git_repo, target_override)?;
                 print_success(&format!("Pushed to {}/{}", self.remote, target));
                 return Ok(());
             }
@@ -234,9 +260,9 @@ impl Command for Push {
 
         // Push to remote unless --no-push
         if !self.no_push {
-            match self.push_to_remote(&git_repo) {
+            match self.push_to_remote(&git_repo, target_override) {
                 Ok(()) => {
-                    let target = self.target_branch(&git_repo);
+                    let target = self.target_branch(&git_repo, target_override);
                     print_success(&format!("Pushed to {}/{}", self.remote, target));
                 }
                 Err(e) => {
@@ -345,11 +371,48 @@ impl Push {
         None
     }
 
-    /// The git branch the push will land on: `--branch` if given, else
+    /// Resolve the git branch this push targets, applying draft-view
+    /// auto-mapping.
+    ///
+    /// Explicit `--branch` (`explicit`) always wins. Otherwise, when the
+    /// current Atomic view is a draft, the target defaults to a git branch
+    /// named after the view, so each draft publishes to its own remote ref
+    /// (created on first push). Shared views keep the historical behavior of
+    /// landing on the current git branch, signalled by returning `None`.
+    ///
+    /// A draft view whose name is not a valid git refname is a hard error:
+    /// the name is used verbatim (never silently rewritten), so the caller is
+    /// told to pass an explicit `--branch` instead.
+    fn resolve_branch_override(
+        explicit: Option<&str>,
+        scope: ViewScope,
+        view: &str,
+    ) -> CliResult<Option<String>> {
+        if let Some(branch) = explicit {
+            return Ok(Some(branch.to_string()));
+        }
+        if scope.is_draft() {
+            let refname = format!("refs/heads/{}", view);
+            if !git2::Reference::is_valid_name(&refname) {
+                return Err(CliError::GitError {
+                    message: format!(
+                        "Draft view '{}' is not a valid git branch name; \
+                         pass --branch to choose an explicit target.",
+                        view
+                    ),
+                });
+            }
+            return Ok(Some(view.to_string()));
+        }
+        Ok(None)
+    }
+
+    /// The git branch the push will land on: the resolved `override_branch`
+    /// (explicit `--branch` or a draft view's mapped branch) if present, else
     /// the currently checked-out branch.
-    fn target_branch(&self, git_repo: &GitRepository) -> String {
-        if let Some(ref branch) = self.branch {
-            return branch.clone();
+    fn target_branch(&self, git_repo: &GitRepository, override_branch: Option<&str>) -> String {
+        if let Some(branch) = override_branch {
+            return branch.to_string();
         }
         git_repo
             .head()
@@ -360,13 +423,19 @@ impl Push {
 
     /// Count commits on `branch_name` that haven't been pushed to the push
     /// target. The comparison point is the branch's configured upstream,
-    /// or `refs/remotes/<remote>/<branch>` when `--branch` overrides the
-    /// target. Returns 0 when there is no remote ref to compare against.
-    fn unpushed_commit_count(&self, git_repo: &GitRepository, branch_name: &str) -> usize {
+    /// or `refs/remotes/<remote>/<override_branch>` when a resolved target
+    /// (explicit `--branch` or a draft view's mapped branch) redirects the
+    /// push. Returns 0 when there is no remote ref to compare against.
+    fn unpushed_commit_count(
+        &self,
+        git_repo: &GitRepository,
+        branch_name: &str,
+        override_branch: Option<&str>,
+    ) -> usize {
         let local_ref = format!("refs/heads/{}", branch_name);
 
-        let upstream_oid = match &self.branch {
-            // Explicit target: compare against the remote-tracking ref.
+        let upstream_oid = match override_branch {
+            // Redirected target: compare against the remote-tracking ref.
             Some(target) => git_repo
                 .refname_to_id(&format!("refs/remotes/{}/{}", self.remote, target))
                 .ok(),
@@ -401,12 +470,16 @@ impl Push {
     /// callback can only consult the ssh-agent, which fails for anyone
     /// whose keys live in `~/.ssh/config` (a common setup, e.g.
     /// `IdentityFile ~/.ssh_keys/github` with an empty agent).
-    fn push_to_remote(&self, git_repo: &GitRepository) -> CliResult<()> {
+    fn push_to_remote(
+        &self,
+        git_repo: &GitRepository,
+        override_branch: Option<&str>,
+    ) -> CliResult<()> {
         let head = git_repo.head().map_err(|e| CliError::GitError {
             message: format!("Failed to get HEAD: {}", e),
         })?;
         let current = head.shorthand().unwrap_or("HEAD");
-        let target = self.branch.as_deref().unwrap_or(current);
+        let target = override_branch.unwrap_or(current);
         let refspec = format!("HEAD:refs/heads/{}", target);
 
         let workdir = git_repo.workdir().ok_or_else(|| CliError::GitError {
@@ -537,9 +610,9 @@ mod tests {
 
         let push = Push::default();
         // No upstream configured → nothing counted as unpushed.
-        assert_eq!(push.unpushed_commit_count(&repo, "main"), 0);
+        assert_eq!(push.unpushed_commit_count(&repo, "main", None), 0);
         // Unknown branch → 0, not an error.
-        assert_eq!(push.unpushed_commit_count(&repo, "nonexistent"), 0);
+        assert_eq!(push.unpushed_commit_count(&repo, "nonexistent", None), 0);
     }
 
     #[test]
@@ -573,25 +646,27 @@ mod tests {
             .unwrap();
 
         let push = Push::default();
-        assert_eq!(push.unpushed_commit_count(&repo, "main"), 0);
+        assert_eq!(push.unpushed_commit_count(&repo, "main", None), 0);
 
         // A second local commit puts us one ahead of the upstream.
         let parent = repo.find_commit(first).unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "work", &tree, &[&parent])
             .unwrap();
-        assert_eq!(push.unpushed_commit_count(&repo, "main"), 1);
+        assert_eq!(push.unpushed_commit_count(&repo, "main", None), 1);
 
-        // With --branch pointing at a remote branch that has nothing, the
-        // same local state counts differently: refs/remotes/origin/feature
-        // doesn't exist → 0; after creating it at the first commit → 1.
-        let push_feature = Push {
-            branch: Some("feature".to_string()),
-            ..Push::default()
-        };
-        assert_eq!(push_feature.unpushed_commit_count(&repo, "main"), 0);
+        // With a redirected target branch that has nothing, the same local
+        // state counts differently: refs/remotes/origin/feature doesn't
+        // exist → 0; after creating it at the first commit → 1.
+        assert_eq!(
+            push.unpushed_commit_count(&repo, "main", Some("feature")),
+            0
+        );
         repo.reference("refs/remotes/origin/feature", first, true, "remote")
             .unwrap();
-        assert_eq!(push_feature.unpushed_commit_count(&repo, "main"), 1);
+        assert_eq!(
+            push.unpushed_commit_count(&repo, "main", Some("feature")),
+            1
+        );
     }
 
     #[test]
@@ -610,14 +685,54 @@ mod tests {
         repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
             .unwrap();
 
-        // Default: the checked-out branch.
-        assert_eq!(Push::default().target_branch(&repo), "main");
+        // Default (no override): the checked-out branch.
+        assert_eq!(Push::default().target_branch(&repo, None), "main");
 
-        // --branch wins.
-        let push = Push {
-            branch: Some("pr-42".to_string()),
-            ..Push::default()
-        };
-        assert_eq!(push.target_branch(&repo), "pr-42");
+        // A resolved override wins.
+        assert_eq!(Push::default().target_branch(&repo, Some("pr-42")), "pr-42");
+    }
+
+    #[test]
+    fn test_resolve_branch_override_explicit_wins() {
+        // Explicit --branch wins regardless of scope.
+        assert_eq!(
+            Push::resolve_branch_override(Some("pr-42"), ViewScope::Draft, "feature").unwrap(),
+            Some("pr-42".to_string())
+        );
+        assert_eq!(
+            Push::resolve_branch_override(Some("pr-42"), ViewScope::Shared, "main").unwrap(),
+            Some("pr-42".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_branch_override_draft_maps_to_view() {
+        assert_eq!(
+            Push::resolve_branch_override(None, ViewScope::Draft, "feature-login").unwrap(),
+            Some("feature-login".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_branch_override_shared_is_none() {
+        // Shared views keep the historical behavior (land on current branch).
+        assert_eq!(
+            Push::resolve_branch_override(None, ViewScope::Shared, "main").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_branch_override_invalid_refname_errors() {
+        // A draft name that is not a valid git refname is a hard error, not a
+        // silent rename.
+        let err = Push::resolve_branch_override(None, ViewScope::Draft, "bad~name").unwrap_err();
+        match err {
+            CliError::GitError { message } => {
+                assert!(message.contains("bad~name"));
+                assert!(message.contains("--branch"));
+            }
+            other => panic!("expected GitError, got {:?}", other),
+        }
     }
 }
