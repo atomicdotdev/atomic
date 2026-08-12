@@ -14,11 +14,19 @@
 //! 3. **Create with Guard**: Create directory with cleanup on error
 //! 4. **Initialize Repository**: Set up empty local repository
 //! 5. **Connect to Remote**: Establish HTTP connection
-//! 6. **Query Remote State**: Get channel state and changelist
-//! 7. **Download Changes**: Fetch all changes in order
-//! 8. **Apply Changes**: Apply to local view (unless download-only)
+//! 6. **Fetch View Manifests**: Get the requested view's manifest and walk
+//!    its parent chain to the root
+//! 7. **Download Changes**: Fetch the missing union of the chain's changes
+//! 8. **Apply Manifests**: Apply root→leaf, preserving each view's
+//!    scope and parent (unless download-only)
 //! 9. **Configure Remote**: Save "origin" remote configuration
 //! 10. **Report Results**: Display summary to user
+//!
+//! View reconstruction is manifest-based: each view arrives as a
+//! [`ViewManifest`] carrying its full identity (name, scope, parent, ordered
+//! change log, merkle state), so a draft cloned back is still a draft with
+//! its parent intact. Servers that predate `?view-manifest` support cannot
+//! be cloned from — that is a hard error, not a lossy fallback.
 //!
 //! # Error Handling
 //!
@@ -26,15 +34,17 @@
 //! resolution. If the clone fails partway through, the `CleanupGuard`
 //! ensures the partially created directory is removed.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
 use clap::Parser;
 use git2::Repository as GitRepository;
 
-use atomic_core::types::Base32;
-use atomic_remote::{HttpRemote, HttpRemoteConfig};
-use atomic_repository::Repository;
+use atomic_core::pristine::ViewScope;
+use atomic_core::types::{Base32, Hash};
+use atomic_remote::{HttpRemote, HttpRemoteConfig, RemoteError};
+use atomic_repository::{ManifestApplyOutcome, Repository, ViewManifest};
 
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
@@ -45,8 +55,9 @@ use crate::output::{
 };
 
 use super::helpers::{
-    convert_remote_error, format_bytes, format_count, infer_repo_name, resolve_target_path,
-    save_downloaded_change, validate_target_path, CleanupGuard,
+    change_union, classify_inventory, convert_remote_error, format_bytes, format_count,
+    infer_repo_name, manifest_apply_order, parse_remote_manifest, resolve_target_path,
+    save_downloaded_change, validate_target_path, CleanupGuard, InventoryOutcome,
 };
 use super::types::{ClonePhase, CloneProgress, CloneStats};
 
@@ -62,6 +73,15 @@ pub const DEFAULT_VIEW: &str = "dev";
 /// 30 seconds provides a reasonable balance between allowing slow networks
 /// and failing quickly on unresponsive servers.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// Temporary parking view used while deleting an init scaffold view.
+///
+/// `Repository::init` pre-creates a shared root view and leaves it current.
+/// When the remote's manifest for that view declares a different identity
+/// (draft, or a parent), the empty scaffold must be deleted and recreated —
+/// but the current view cannot be deleted, so clone briefly parks on this
+/// view and removes it again before finishing.
+const SCAFFOLD_PARK_VIEW: &str = "atomic-clone-scaffold-park";
 
 // Clone Command
 
@@ -301,34 +321,318 @@ impl Clone {
             .unwrap_or_else(|| "repo".to_string())
     }
 
-    /// Clone every remote view other than the primary `--view`.
+    /// Convert a manifest-fetch failure into a CLI error.
     ///
-    /// Each view is created locally (as a shared view, matching how the
-    /// server stores pushed views) and populated from its remote changelist.
-    /// Changes are content-addressed, so any already downloaded for the
-    /// primary view are reused — only genuinely new changes are fetched.
-    /// Returns the number of additional views cloned.
+    /// A protocol error means the server predates `?view-manifest` support.
+    /// That is fatal: without manifests a clone cannot preserve view
+    /// identity (scope and parent), so there is no fallback to the old flat
+    /// changelist path.
+    fn manifest_fetch_error(&self, err: RemoteError) -> CliError {
+        if matches!(err, RemoteError::ProtocolError { .. }) {
+            CliError::RemoteError {
+                message: "This server is too old for identity-preserving clone: it does not \
+                          support view manifests (?view-manifest). Upgrade the server."
+                    .to_string(),
+                url: Some(self.url.clone()),
+            }
+        } else {
+            convert_remote_error(err, &self.url)
+        }
+    }
+
+    /// Fetch and validate one view's manifest from the remote.
+    ///
+    /// Returns `Ok(None)` if the remote does not have the view.
+    async fn fetch_view_manifest(
+        &self,
+        remote: &HttpRemote,
+        view: &str,
+    ) -> CliResult<Option<ViewManifest>> {
+        match remote.get_view_manifest(view).await {
+            Ok(Some(text)) => parse_remote_manifest(view, &text, &self.url).map(Some),
+            Ok(None) => Ok(None),
+            Err(e) => Err(self.manifest_fetch_error(e)),
+        }
+    }
+
+    /// Fetch the requested view's manifest and walk its parent chain up to
+    /// the root, returning the manifests in root→leaf apply order.
+    ///
+    /// Returns `Ok(None)` when the requested view does not exist on the
+    /// remote. A declared parent that is missing remotely, or a parent chain
+    /// that loops, means the remote's view metadata is corrupted and is a
+    /// hard error.
+    async fn fetch_manifest_chain(
+        &self,
+        remote: &HttpRemote,
+    ) -> CliResult<Option<Vec<ViewManifest>>> {
+        let Some(leaf) = self.fetch_view_manifest(remote, &self.view).await? else {
+            return Ok(None);
+        };
+
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(leaf.name.clone());
+        let mut next_parent = leaf.parent.clone();
+        let mut chain = vec![leaf];
+
+        while let Some(parent) = next_parent {
+            if !visited.insert(parent.clone()) {
+                return Err(CliError::RemoteError {
+                    message: format!(
+                        "View parent chain loops at '{}' — the remote's view metadata is corrupted",
+                        parent
+                    ),
+                    url: Some(self.url.clone()),
+                });
+            }
+            let child_name = chain
+                .last()
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| self.view.clone());
+            let manifest = self
+                .fetch_view_manifest(remote, &parent)
+                .await?
+                .ok_or_else(|| CliError::RemoteError {
+                    message: format!(
+                        "View '{}' declares parent '{}', but the remote has no such view",
+                        child_name, parent
+                    ),
+                    url: Some(self.url.clone()),
+                })?;
+            next_parent = manifest.parent.clone();
+            chain.push(manifest);
+        }
+
+        // Collected leaf→root; parents must be applied first.
+        chain.reverse();
+        Ok(Some(chain))
+    }
+
+    /// Download every change in `missing` and save it to the change store.
+    ///
+    /// Stops on the first download failure to maintain consistency (the
+    /// manifest apply would fail on the missing change anyway).
+    async fn download_missing_changes(
+        &self,
+        repo: &Repository,
+        remote: &HttpRemote,
+        missing: &[Hash],
+        stats: &mut CloneStats,
+        progress: &mut CloneProgress,
+    ) -> CliResult<()> {
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        print_blank();
+        println!("Downloading {}:", format_count(missing.len(), "change"));
+        print_blank();
+
+        let progress_bar = create_progress_bar(missing.len() as u64, "Downloading changes");
+
+        for (i, hash) in missing.iter().enumerate() {
+            let hash_str = hash.to_base32();
+            let hash_display = &hash_str[..12.min(hash_str.len())];
+
+            match remote.download_change(&hash_str).await {
+                Ok(data) => {
+                    let data_len = data.len() as u64;
+
+                    // Save to local change store
+                    match save_downloaded_change(repo, hash, data) {
+                        Ok(()) => {
+                            stats.record_change_downloaded(data_len);
+                            progress.record_downloaded();
+                            println!(
+                                "  {} {}... ({}/{})",
+                                success("✓"),
+                                style_hash(hash_display),
+                                i + 1,
+                                missing.len()
+                            );
+                        }
+                        Err(e) => {
+                            stats.record_failed();
+                            println!(
+                                "  {} {}... ({}/{}) save failed: {}",
+                                error("✗"),
+                                hash_display,
+                                i + 1,
+                                missing.len(),
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    stats.record_failed();
+                    println!(
+                        "  {} {}... ({}/{}) download failed: {}",
+                        error("✗"),
+                        hash_display,
+                        i + 1,
+                        missing.len(),
+                        e
+                    );
+
+                    // Stop on first failure to maintain consistency
+                    return Err(convert_remote_error(e, &self.url));
+                }
+            }
+
+            progress_bar.inc(1);
+        }
+
+        finish_success(
+            &progress_bar,
+            &format!(
+                "Downloaded {} ({})",
+                format_count(stats.changes_downloaded, "change"),
+                format_bytes(stats.bytes_transferred)
+            ),
+        );
+
+        Ok(())
+    }
+
+    /// Remove an empty locally-created view whose identity conflicts with
+    /// the manifest about to be applied.
+    ///
+    /// `Repository::init` pre-creates a shared root view (e.g. "dev"). If
+    /// the remote's view of the same name is a draft or has a parent,
+    /// `apply_view_manifest` would report an identity mismatch even though
+    /// the local view is just an empty scaffold. Deleting the scaffold lets
+    /// the manifest recreate the view with its declared identity.
+    ///
+    /// Views with changes are left alone: a genuine divergence must surface
+    /// as an apply error, never a silent delete.
+    fn reconcile_scaffold_view(
+        &self,
+        repo: &mut Repository,
+        manifest: &ViewManifest,
+    ) -> CliResult<()> {
+        if !repo
+            .view_exists(&manifest.name)
+            .map_err(CliError::Repository)?
+        {
+            return Ok(());
+        }
+        let info = repo
+            .get_view_info(&manifest.name)
+            .map_err(CliError::Repository)?;
+        if info.scope == manifest.scope && info.parent_name == manifest.parent {
+            // Identity matches; apply_view_manifest handles the log.
+            return Ok(());
+        }
+        if info.change_count > 0 {
+            // Not a scaffold; let apply_view_manifest report the mismatch.
+            return Ok(());
+        }
+
+        // The scaffold may be the current view (init leaves it current),
+        // and the current view cannot be deleted — park on a temporary
+        // root view first. It is removed again before clone finishes.
+        if repo.current_view() == manifest.name {
+            if !repo
+                .view_exists(SCAFFOLD_PARK_VIEW)
+                .map_err(CliError::Repository)?
+            {
+                repo.create_shared_view(SCAFFOLD_PARK_VIEW)
+                    .map_err(CliError::Repository)?;
+            }
+            repo.align_to_view(SCAFFOLD_PARK_VIEW)
+                .map_err(CliError::Repository)?;
+        }
+
+        // Shared views cannot be deleted directly; demote first.
+        if info.scope.is_shared() {
+            repo.set_view_scope(&manifest.name, ViewScope::Draft)
+                .map_err(CliError::Repository)?;
+        }
+        repo.delete_view(&manifest.name)
+            .map_err(CliError::Repository)?;
+        Ok(())
+    }
+
+    /// Remove the temporary parking view, if scaffold reconciliation
+    /// created it. Best-effort: a leftover parking view is cosmetic.
+    fn remove_park_view(&self, repo: &mut Repository) {
+        if let Ok(true) = repo.view_exists(SCAFFOLD_PARK_VIEW) {
+            let _ = repo.set_view_scope(SCAFFOLD_PARK_VIEW, ViewScope::Draft);
+            if let Err(e) = repo.delete_view(SCAFFOLD_PARK_VIEW) {
+                log::warn!(
+                    "could not remove temporary view '{}': {}",
+                    SCAFFOLD_PARK_VIEW,
+                    e
+                );
+            }
+        }
+    }
+
+    /// Apply manifests in root→leaf order, reconciling scaffold views first.
+    ///
+    /// Returns one outcome per manifest, in apply order.
+    fn apply_manifests(
+        &self,
+        repo: &mut Repository,
+        manifests: &[ViewManifest],
+    ) -> CliResult<Vec<ManifestApplyOutcome>> {
+        let mut outcomes = Vec::with_capacity(manifests.len());
+        for manifest in manifests {
+            self.reconcile_scaffold_view(repo, manifest)?;
+            let outcome = repo.apply_view_manifest(manifest).map_err(|e| {
+                CliError::Internal(anyhow::anyhow!(
+                    "apply manifest for view '{}': {}",
+                    manifest.name,
+                    e
+                ))
+            })?;
+            outcomes.push(outcome);
+        }
+        Ok(outcomes)
+    }
+
+    /// Clone every remote view not already applied by the primary chain.
+    ///
+    /// Each view arrives as a manifest and is applied with the same
+    /// primitive as the primary view, so scope and parent are preserved.
+    /// Manifests are ordered parents-before-children; changes are
+    /// content-addressed and deduplicated against everything already
+    /// downloaded. Returns the number of additional views cloned.
     async fn clone_additional_views(
         &self,
         repo: &mut Repository,
         remote: &HttpRemote,
         stats: &mut CloneStats,
+        applied: &mut HashSet<String>,
     ) -> CliResult<usize> {
-        let remote_views = match remote.list_views().await {
-            Ok(v) => v,
-            // Older servers don't expose the inventory — treat as single-view.
-            Err(_) => return Ok(0),
+        // The user explicitly asked for every view, so a missing inventory
+        // is a hard error, not a silent single-view clone.
+        let remote_views = remote
+            .list_views()
+            .await
+            .map_err(|e| CliError::RemoteError {
+                message: format!(
+                    "--all-views requires the view inventory (?views), but the request failed: {}",
+                    e
+                ),
+                url: Some(self.url.clone()),
+            })?;
+
+        let names: Vec<String> = remote_views.into_iter().map(|v| v.name).collect();
+        let others = match classify_inventory(&names, applied) {
+            InventoryOutcome::Views(others) => others,
+            InventoryOutcome::NothingNew => return Ok(0),
+            InventoryOutcome::Unsupported => {
+                return Err(CliError::RemoteError {
+                    message: "--all-views requires the view inventory (?views), but this \
+                              server does not support it (empty inventory). Upgrade the \
+                              server, or clone a single view without --all-views."
+                        .to_string(),
+                    url: Some(self.url.clone()),
+                })
+            }
         };
-
-        let others: Vec<String> = remote_views
-            .into_iter()
-            .map(|v| v.name)
-            .filter(|name| name != &self.view)
-            .collect();
-
-        if others.is_empty() {
-            return Ok(0);
-        }
 
         print_blank();
         println!(
@@ -337,20 +641,66 @@ impl Clone {
             if others.len() == 1 { "view" } else { "views" }
         );
 
-        let mut cloned = 0usize;
+        // Fetch manifests for every remaining view.
+        let mut manifests: Vec<ViewManifest> = Vec::with_capacity(others.len());
         for name in &others {
-            match self.clone_one_view(repo, remote, name, stats).await {
-                Ok(applied) => {
+            match self.fetch_view_manifest(remote, name).await {
+                Ok(Some(m)) => manifests.push(m),
+                Ok(None) => {
+                    print_warning(&format!(
+                        "View '{}' vanished from the remote — skipped",
+                        name
+                    ));
+                }
+                Err(e) => {
+                    print_warning(&format!(
+                        "Failed to fetch manifest for view '{}': {}",
+                        name, e
+                    ));
+                }
+            }
+        }
+
+        // Parents must apply before children; anything unorderable (parent
+        // cycle or a parent that exists nowhere) is reported and skipped.
+        let (order, stuck) = manifest_apply_order(&manifests, applied);
+        for &i in &stuck {
+            print_warning(&format!(
+                "Cannot clone view '{}': parent '{}' is not available (cycle or missing view)",
+                manifests[i].name,
+                manifests[i].parent.as_deref().unwrap_or("-"),
+            ));
+        }
+
+        let ordered: Vec<ViewManifest> = order.iter().map(|&i| manifests[i].clone()).collect();
+
+        // Download the union of changes these views need, minus everything
+        // the primary chain already fetched (content-addressed dedupe).
+        let missing: Vec<Hash> = change_union(&ordered)
+            .into_iter()
+            .filter(|h| !repo.has_change(h))
+            .collect();
+        let mut progress = CloneProgress::new(missing.len());
+        progress.phase = ClonePhase::Downloading;
+        self.download_missing_changes(repo, remote, &missing, stats, &mut progress)
+            .await?;
+
+        let mut cloned = 0usize;
+        for manifest in &ordered {
+            self.reconcile_scaffold_view(repo, manifest)?;
+            match repo.apply_view_manifest(manifest) {
+                Ok(outcome) => {
                     cloned += 1;
+                    applied.insert(manifest.name.clone());
                     println!(
                         "  {} {} ({})",
                         success("\u{2713}"),
-                        style_view(name),
-                        format_count(applied, "change")
+                        style_view(&manifest.name),
+                        format_count(outcome.already_present + outcome.replayed, "change")
                     );
                 }
                 Err(e) => {
-                    print_warning(&format!("Failed to clone view '{}': {}", name, e));
+                    print_warning(&format!("Failed to clone view '{}': {}", manifest.name, e));
                 }
             }
         }
@@ -358,83 +708,19 @@ impl Clone {
         Ok(cloned)
     }
 
-    /// Create one view locally and populate it from its remote changelist.
-    ///
-    /// Returns the number of changes inserted into the view.
-    async fn clone_one_view(
-        &self,
-        repo: &mut Repository,
-        remote: &HttpRemote,
-        view_name: &str,
-        stats: &mut CloneStats,
-    ) -> CliResult<usize> {
-        if !repo.view_exists(view_name).map_err(CliError::Repository)? {
-            repo.create_shared_view(view_name)
-                .map_err(CliError::Repository)?;
-        }
-
-        let entries = remote
-            .get_changelist(view_name, 0)
-            .await
-            .map_err(|e| convert_remote_error(e, &self.url))?;
-
-        let mut applied = 0usize;
-        for entry in &entries {
-            let Some(hash) = atomic_core::types::Hash::from_base32(entry.hash.as_bytes()) else {
-                continue;
-            };
-
-            // Reuse content already present locally; fetch only what's missing.
-            if !repo.has_change(&hash) {
-                let data = remote
-                    .download_change(&entry.hash)
-                    .await
-                    .map_err(|e| convert_remote_error(e, &self.url))?;
-                let len = data.len() as u64;
-                save_downloaded_change(&*repo, &hash, data).map_err(|e| {
-                    CliError::Internal(anyhow::anyhow!("save change {}: {}", entry.hash, e))
-                })?;
-                stats.record_change_downloaded(len);
-            }
-
-            // Insert the change (and its dependency closure) into this view.
-            // Changes arrive in dependency order, so deps are already present.
-            let opts = atomic_repository::InsertOptions::default()
-                .apply_deps(true)
-                .view(view_name);
-            match repo.insert_change_rec(&hash, opts) {
-                Ok(_) => applied += 1,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("already applied") || msg.contains("AlreadyApplied") {
-                        applied += 1;
-                    } else {
-                        return Err(CliError::Internal(anyhow::anyhow!(
-                            "insert {} into '{}': {}",
-                            entry.hash,
-                            view_name,
-                            e
-                        )));
-                    }
-                }
-            }
-        }
-
-        Ok(applied)
-    }
-
     /// Print a hint listing the other views available on the remote.
     ///
-    /// Best-effort: silent if the server has no inventory endpoint or only
-    /// the primary view.
-    async fn hint_other_views(&self, remote: &HttpRemote) {
+    /// Views already cloned (the requested view and its ancestor chain) are
+    /// not hinted. Best-effort: silent if the server has no inventory
+    /// endpoint or nothing else to clone.
+    async fn hint_other_views(&self, remote: &HttpRemote, applied: &HashSet<String>) {
         let Ok(remote_views) = remote.list_views().await else {
             return;
         };
         let others: Vec<String> = remote_views
             .into_iter()
             .map(|v| v.name)
-            .filter(|name| name != &self.view)
+            .filter(|name| name != &self.view && !applied.contains(name))
             .collect();
         if others.is_empty() {
             return;
@@ -489,14 +775,10 @@ impl Clone {
         })?;
         finish_success(&spinner, "Repository initialized");
 
-        // Clone must insert remote changes into the requested local view,
-        // rather than whichever default view repository initialization chose.
-        if !repo.view_exists(&self.view).map_err(CliError::Repository)? {
-            repo.create_shared_view(&self.view)
-                .map_err(CliError::Repository)?;
-        }
-        repo.align_to_view(&self.view)
-            .map_err(CliError::Repository)?;
+        // The requested view is NOT pre-created here: its manifest declares
+        // its identity (scope + parent), and `apply_view_manifest` creates it
+        // accordingly. Pre-creating it as a shared root would clash with a
+        // remote draft or child view.
 
         // Connect to remote
         let spinner = create_spinner("Connecting to remote...");
@@ -507,15 +789,33 @@ impl Clone {
         })?;
         finish_success(&spinner, "Connected");
 
-        // Query remote state
-        let spinner = create_spinner("Querying remote state...");
-        let remote_state = remote.get_state(&self.view).await.map_err(|e| {
-            finish_error(&spinner, "Failed to query state");
-            convert_remote_error(e, &self.url)
-        })?;
+        // Fetch the requested view's manifest chain (view → ... → root).
+        // The manifests carry each view's identity, so clone reconstructs
+        // scope and parent exactly. An old server without manifest support
+        // is a hard error — there is no identity-losing fallback.
+        let spinner = create_spinner("Fetching view manifests...");
+        let manifests = match self.fetch_manifest_chain(&remote).await {
+            Ok(m) => m,
+            Err(e) => {
+                finish_error(&spinner, "Failed to fetch view manifests");
+                return Err(e);
+            }
+        };
 
-        if remote_state.is_empty() {
-            finish_success(&spinner, &format!("View '{}' is empty", self.view));
+        let Some(manifests) = manifests else {
+            // The remote doesn't have this view: create it empty locally,
+            // matching the empty-view clone behavior.
+            finish_success(
+                &spinner,
+                &format!("View '{}' not found on remote — starting empty", self.view),
+            );
+
+            if !repo.view_exists(&self.view).map_err(CliError::Repository)? {
+                repo.create_shared_view(&self.view)
+                    .map_err(CliError::Repository)?;
+            }
+            repo.align_to_view(&self.view)
+                .map_err(CliError::Repository)?;
 
             // Configure remote as "origin" even for empty repositories
             let spinner = create_spinner("Configuring remote...");
@@ -540,134 +840,55 @@ impl Clone {
                 guard.disable();
             }
             return Ok(());
-        }
+        };
 
-        let remote_merkle = remote_state.merkle().map(|m| m.to_string());
+        let leaf = manifests
+            .last()
+            .expect("manifest chain contains at least the requested view");
+        let leaf_state = if leaf.changes.is_empty() {
+            "(empty)".to_string()
+        } else {
+            let full = leaf.state.to_base32();
+            format!("{}...", &full[..12.min(full.len())])
+        };
         finish_success(
             &spinner,
             &format!(
-                "View '{}' at {}",
+                "View '{}' at {} ({} in chain)",
                 self.view,
-                remote_merkle
-                    .as_ref()
-                    .map(|m| format!("{}...", &m[..12.min(m.len())]))
-                    .unwrap_or_else(|| "(empty)".to_string())
+                leaf_state,
+                format_count(manifests.len(), "view"),
             ),
         );
 
-        // Get remote changelist
-        let spinner = create_spinner("Fetching changelist...");
-        let remote_entries = remote.get_changelist(&self.view, 0).await.map_err(|e| {
-            finish_error(&spinner, "Failed to fetch changelist");
-            convert_remote_error(e, &self.url)
-        })?;
-        finish_success(
-            &spinner,
-            &format!("Found {}", format_count(remote_entries.len(), "change")),
-        );
+        // The union of changes across the chain, deduplicated: changes
+        // shared between views (a draft's inherited prefix) download once.
+        let missing: Vec<Hash> = change_union(&manifests)
+            .into_iter()
+            .filter(|h| !repo.has_change(h))
+            .collect();
 
         // Initialize progress tracking
         let mut stats = CloneStats::new();
-        let mut progress = CloneProgress::new(remote_entries.len());
+        let mut progress = CloneProgress::new(missing.len());
         progress.phase = ClonePhase::Downloading;
 
-        // Download changes
-        if !remote_entries.is_empty() {
-            print_blank();
-            println!(
-                "Downloading {}:",
-                format_count(remote_entries.len(), "change")
-            );
-            print_blank();
-
-            let progress_bar =
-                create_progress_bar(remote_entries.len() as u64, "Downloading changes");
-
-            for (i, entry) in remote_entries.iter().enumerate() {
-                let hash_str = &entry.hash;
-                let hash_display = &hash_str[..12.min(hash_str.len())];
-
-                // Download the change
-                let result = remote.download_change(hash_str).await;
-
-                match result {
-                    Ok(data) => {
-                        let data_len = data.len() as u64;
-
-                        // Parse and verify the hash
-                        let expected_hash =
-                            match atomic_core::types::Hash::from_base32(hash_str.as_bytes()) {
-                                Some(h) => h,
-                                None => {
-                                    stats.record_failed();
-                                    println!(
-                                        "  {} {}... ({}/{}) invalid hash format",
-                                        error("✗"),
-                                        hash_display,
-                                        i + 1,
-                                        remote_entries.len()
-                                    );
-                                    continue;
-                                }
-                            };
-
-                        // Save to local change store
-                        match save_downloaded_change(&repo, &expected_hash, data) {
-                            Ok(()) => {
-                                stats.record_change_downloaded(data_len);
-                                progress.record_downloaded();
-                                println!(
-                                    "  {} {}... ({}/{})",
-                                    success("✓"),
-                                    style_hash(hash_display),
-                                    i + 1,
-                                    remote_entries.len()
-                                );
-                            }
-                            Err(e) => {
-                                stats.record_failed();
-                                println!(
-                                    "  {} {}... ({}/{}) save failed: {}",
-                                    error("✗"),
-                                    hash_display,
-                                    i + 1,
-                                    remote_entries.len(),
-                                    e
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        stats.record_failed();
-                        println!(
-                            "  {} {}... ({}/{}) download failed: {}",
-                            error("✗"),
-                            hash_display,
-                            i + 1,
-                            remote_entries.len(),
-                            e
-                        );
-
-                        // Stop on first failure to maintain consistency
-                        return Err(convert_remote_error(e, &self.url));
-                    }
-                }
-
-                progress_bar.inc(1);
-            }
-
-            finish_success(
-                &progress_bar,
-                &format!(
-                    "Downloaded {} ({})",
-                    format_count(stats.changes_downloaded, "change"),
-                    format_bytes(stats.bytes_transferred)
-                ),
-            );
-        }
+        // Download the missing changes
+        self.download_missing_changes(&repo, &remote, &missing, &mut stats, &mut progress)
+            .await?;
 
         // Apply changes (unless download-only)
         if self.download_only {
+            // Keep the pre-manifest behavior: the requested view exists and
+            // is current, but nothing is applied to it. (The manifest is not
+            // applied, so the downloaded changes stay in the change store.)
+            if !repo.view_exists(&self.view).map_err(CliError::Repository)? {
+                repo.create_shared_view(&self.view)
+                    .map_err(CliError::Repository)?;
+            }
+            repo.align_to_view(&self.view)
+                .map_err(CliError::Repository)?;
+
             // Configure remote as "origin" even for download-only mode
             let spinner = create_spinner("Configuring remote...");
             if let Err(e) = repo.add_remote_default("origin", &self.url) {
@@ -696,63 +917,60 @@ impl Clone {
             return Ok(());
         }
 
-        // Apply downloaded changes to the local view
+        // Apply the manifest chain root→leaf: each apply creates the view
+        // with its declared scope/parent (parents exist first) and replays
+        // its log — metadata-only for changes already in the graph.
         let mut apply_errors = Vec::new();
-        if stats.changes_downloaded > 0 {
+        let mut applied_views: HashSet<String> = HashSet::new();
+        {
             print_blank();
             progress.phase = ClonePhase::Applying;
-            let spinner = create_spinner("Inserting changes into view...");
+            let spinner = create_spinner("Applying view manifests...");
 
-            // Insert each downloaded change in order to build the graph
-            let insert_options = atomic_repository::InsertOptions::default();
-
-            for entry in &remote_entries {
-                let hash = match atomic_core::types::Hash::from_base32(entry.hash.as_bytes()) {
-                    Some(h) => h,
-                    None => continue,
-                };
-
-                match repo.insert_change(&hash, insert_options.clone()) {
-                    Ok(_outcome) => {
-                        stats.record_applied();
-                        progress.record_applied();
+            match self.apply_manifests(&mut repo, &manifests) {
+                Ok(outcomes) => {
+                    for outcome in &outcomes {
+                        applied_views.insert(outcome.view.clone());
                     }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        // "already applied" is fine — skip it
-                        if msg.contains("already applied") || msg.contains("AlreadyApplied") {
+                    // The requested view's log length (inherited + own).
+                    if let Some(leaf_outcome) = outcomes.last() {
+                        for _ in 0..(leaf_outcome.already_present + leaf_outcome.replayed) {
                             stats.record_applied();
                             progress.record_applied();
-                        } else {
-                            apply_errors.push(format!(
-                                "{}...: {}",
-                                &entry.hash[..12.min(entry.hash.len())],
-                                msg
-                            ));
+                        }
+                    }
+                }
+                Err(e) => apply_errors.push(e.to_string()),
+            }
+
+            // Make the requested view current.
+            if apply_errors.is_empty() {
+                if let Err(e) = repo.align_to_view(&self.view) {
+                    apply_errors.push(format!("align to view '{}': {}", self.view, e));
+                }
+            }
+
+            if apply_errors.is_empty() {
+                if self.into_existing {
+                    print_info("Preserving the existing Git working copy.");
+                } else {
+                    // Output the working copy — reconstruct files from the graph
+                    match repo.materialize() {
+                        Ok(output) => {
+                            log::info!(
+                                "Output working copy: {} files, {} dirs",
+                                output.files_written,
+                                output.directories_created
+                            );
+                        }
+                        Err(e) => {
+                            apply_errors.push(format!("output working copy: {}", e));
                         }
                     }
                 }
             }
 
-            if self.into_existing {
-                print_info("Preserving the existing Git working copy.");
-            } else {
-                // Output the working copy — reconstruct files from the graph
-                match repo.materialize() {
-                    Ok(output) => {
-                        log::info!(
-                            "Output working copy: {} files, {} dirs",
-                            output.files_written,
-                            output.directories_created
-                        );
-                    }
-                    Err(e) => {
-                        apply_errors.push(format!("output working copy: {}", e));
-                    }
-                }
-            }
-
-            if stats.has_applied() {
+            if apply_errors.is_empty() {
                 finish_success(
                     &spinner,
                     &format!(
@@ -762,10 +980,7 @@ impl Clone {
                     ),
                 );
             } else {
-                finish_error(&spinner, "No changes were applied");
-            }
-
-            if !apply_errors.is_empty() {
+                finish_error(&spinner, "Failed to apply view manifests");
                 for err in &apply_errors {
                     print_warning(err);
                 }
@@ -788,13 +1003,13 @@ impl Clone {
         }
 
         // Clone additional views (--all-views), or at least tell the user
-        // that other views exist on the remote. The remote stores every view
-        // as shared, so a draft's parent relationship isn't recoverable — but
-        // the sibling views themselves can be reconstructed by name.
-        if !self.download_only {
+        // that other views exist on the remote. View manifests carry each
+        // view's scope and parent, so a draft's parent relationship is
+        // recoverable and preserved — cloned views keep their identity.
+        if !self.download_only && apply_errors.is_empty() {
             if self.all_views {
                 match self
-                    .clone_additional_views(&mut repo, &remote, &mut stats)
+                    .clone_additional_views(&mut repo, &remote, &mut stats, &mut applied_views)
                     .await
                 {
                     Ok(0) => {}
@@ -803,12 +1018,18 @@ impl Clone {
                         n,
                         if n == 1 { "view" } else { "views" }
                     )),
-                    Err(e) => print_warning(&format!("Failed to clone additional views: {}", e)),
+                    // --all-views was an explicit request: failing to honor
+                    // it fails the clone rather than degrading silently.
+                    Err(e) => return Err(e),
                 }
             } else {
-                self.hint_other_views(&remote).await;
+                self.hint_other_views(&remote, &applied_views).await;
             }
         }
+
+        // Drop the temporary parking view, if scaffold reconciliation
+        // needed one while recreating an init-created view.
+        self.remove_park_view(&mut repo);
 
         // Build content search index and enrich KG
         if stats.has_applied() {
@@ -1171,6 +1392,45 @@ mod tests {
                 assert!(message.contains("URL"));
             }
             _ => panic!("Expected InvalidArgument error"),
+        }
+    }
+
+    // Manifest Error Mapping Tests
+
+    /// A protocol error (server predates ?view-manifest) is a hard error
+    /// telling the user to upgrade the server — clone never falls back to
+    /// the identity-losing flat path.
+    #[test]
+    fn test_manifest_fetch_error_old_server() {
+        let clone = Clone::new("https://example.com/repo".to_string());
+        let err = clone.manifest_fetch_error(RemoteError::protocol(
+            "server does not support view manifests (?view-manifest)",
+        ));
+
+        match err {
+            CliError::RemoteError { message, url } => {
+                assert!(message.contains("too old"));
+                assert!(message.contains("Upgrade the server"));
+                assert_eq!(url.as_deref(), Some("https://example.com/repo"));
+            }
+            other => panic!("Expected RemoteError, got {:?}", other),
+        }
+    }
+
+    /// Non-protocol failures pass through the standard remote-error mapping.
+    #[test]
+    fn test_manifest_fetch_error_other_errors_pass_through() {
+        let clone = Clone::new("https://example.com/repo".to_string());
+        let err = clone.manifest_fetch_error(RemoteError::ViewNotFound {
+            view: "dev".to_string(),
+        });
+
+        match err {
+            CliError::RemoteError { message, .. } => {
+                assert!(message.contains("View 'dev' not found"));
+                assert!(!message.contains("too old"));
+            }
+            other => panic!("Expected RemoteError, got {:?}", other),
         }
     }
 }

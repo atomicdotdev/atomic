@@ -22,12 +22,11 @@
 //! 3. **Create target directory** with cleanup guard for error recovery
 //! 4. **Initialize empty repository** using `Repository::init()`
 //! 5. **Connect to remote** using HTTP client
-//! 6. **Query remote state** to get the view's changelist
-//! 7. **Download all changes** in dependency order
-//! 8. **Apply changes** to the local view
-//! 9. **Download tags** for any tagged states
-//! 10. **Configure remote** as "origin" in repository config
-//! 11. **Report results** to the user
+//! 6. **Fetch view manifests** for the requested view and its parent chain
+//! 7. **Download the missing changes** (deduplicated union across the chain)
+//! 8. **Apply manifests** root→leaf, preserving each view's scope and parent
+//! 9. **Configure remote** as "origin" in repository config
+//! 10. **Report results** to the user
 //!
 //! # Usage
 //!

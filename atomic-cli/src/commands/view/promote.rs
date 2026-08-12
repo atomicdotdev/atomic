@@ -8,6 +8,9 @@
 //! change-loading slow path.
 
 use clap::Parser;
+use clap_complete::engine::ArgValueCompleter;
+
+use crate::commands::complete::complete_view_names;
 
 use atomic_core::pristine::ViewScope;
 use atomic_repository::Repository;
@@ -34,7 +37,7 @@ use crate::output::{print_info, print_success};
 #[derive(Parser, Debug)]
 pub struct Promote {
     /// Name of the view to promote. Defaults to the current view.
-    #[arg(value_name = "NAME")]
+    #[arg(value_name = "NAME", add = ArgValueCompleter::new(complete_view_names))]
     pub name: Option<String>,
 }
 

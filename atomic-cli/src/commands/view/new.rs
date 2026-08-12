@@ -52,6 +52,9 @@
 //! ```
 
 use clap::Parser;
+use clap_complete::engine::ArgValueCompleter;
+
+use crate::commands::complete::complete_view_names;
 
 use atomic_repository::Repository;
 
@@ -155,7 +158,7 @@ pub struct New {
     /// The new view inherits all changes from the source and gets
     /// its own view filter on the canonical `GRAPH` so that future
     /// changes recorded on it are invisible to the source.
-    #[arg(long, value_name = "VIEW")]
+    #[arg(long, value_name = "VIEW", add = ArgValueCompleter::new(complete_view_names))]
     pub from: Option<String>,
 
     /// Create an empty view with no inherited history.
@@ -211,7 +214,7 @@ pub struct New {
     /// # Parent on dev (the default if dev is current)
     /// atomic view create bugfix-123 --draft --parent dev
     /// ```
-    #[arg(long, value_name = "VIEW")]
+    #[arg(long, value_name = "VIEW", add = ArgValueCompleter::new(complete_view_names))]
     pub parent: Option<String>,
 }
 

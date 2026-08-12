@@ -91,6 +91,7 @@ pub mod apply;
 pub mod changestore;
 pub mod error;
 pub mod ignore;
+pub mod manifest;
 pub mod record;
 pub mod repository;
 pub mod status;
@@ -139,6 +140,8 @@ pub use changestore::{ChangeStore, ChangeStoreError, ChangeStoreResult, DEFAULT_
 
 // Error exports
 pub use error::*;
+
+pub use manifest::{ManifestError, ViewManifest};
 
 // Repository exports
 pub use repository::*;

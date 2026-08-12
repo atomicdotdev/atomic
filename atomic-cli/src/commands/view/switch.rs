@@ -37,6 +37,9 @@
 //! ```
 
 use clap::Parser;
+use clap_complete::engine::ArgValueCompleter;
+
+use crate::commands::complete::complete_view_names;
 
 use atomic_repository::Repository;
 
@@ -64,7 +67,7 @@ pub struct Switch {
     ///
     /// The view must already exist. Use `atomic view list` to see
     /// available views, or `atomic view create` to create a new one.
-    #[arg(value_name = "NAME")]
+    #[arg(value_name = "NAME", add = ArgValueCompleter::new(complete_view_names))]
     pub name: Option<String>,
 
     /// Force switch even with unrecorded changes.
