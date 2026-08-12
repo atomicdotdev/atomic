@@ -5,6 +5,8 @@
 //! line, the severity-sorted findings, and a compact per-intent view — never a
 //! diff dump.
 
+use std::collections::BTreeMap;
+
 use serde_json::Value;
 
 use atomic_canonical::proof::attest_value;
@@ -14,8 +16,8 @@ use crate::error::CliResult;
 use crate::output::{emphasis, hint, info};
 
 use super::model::{
-    ChangeReport, CriterionReport, Finding, IntentReport, TriageReport, Verdict, SEV_BLOCK,
-    SEV_INFO, SEV_WARN,
+    ChangeReport, CriterionReport, DiffFileView, Finding, IntentReport, TriageReport, Verdict,
+    WalkthroughLayer, SEV_BLOCK, SEV_INFO, SEV_WARN,
 };
 
 /// Render the report to stdout as the bounded human dashboard.
@@ -117,12 +119,120 @@ pub fn print_report(report: &TriageReport) {
         }
     }
 
-    // Drill-down pointer (JSON is the full worklist; keep the CLI bounded).
-    println!(
-        "\n{}",
-        hint("run with --json for the full worklist (findings, criteria, provenance)")
-    );
+    // Drill-down pointers (JSON is the full worklist; keep the CLI bounded).
+    if !report.walkthrough.is_empty() {
+        println!(
+            "\n{}",
+            hint(&format!(
+                "run with --walkthrough for the guided reading order ({} layer{})",
+                report.walkthrough.len(),
+                if report.walkthrough.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ))
+        );
+        println!(
+            "{}",
+            hint("run with --json for the full worklist (findings, criteria, provenance)")
+        );
+    } else {
+        println!(
+            "\n{}",
+            hint("run with --json for the full worklist (findings, criteria, provenance)")
+        );
+    }
     println!("{} {}", hint("ref"), hint(&report.reference));
+}
+
+// ── Walkthrough skin (bounded guided reading order) ──────────────────────
+
+/// Cap for inline path/change lists in the walkthrough skin — anything longer
+/// is elided with a count, keeping the output bounded on huge layers.
+const WALKTHROUGH_LIST_CAP: usize = 8;
+
+/// Comma-join up to [`WALKTHROUGH_LIST_CAP`] items, eliding the rest.
+fn capped_list(items: &[String]) -> String {
+    if items.len() <= WALKTHROUGH_LIST_CAP {
+        items.join(", ")
+    } else {
+        format!(
+            "{}, … and {} more",
+            items[..WALKTHROUGH_LIST_CAP].join(", "),
+            items.len() - WALKTHROUGH_LIST_CAP
+        )
+    }
+}
+
+/// Render the guided walkthrough as bounded text: a verdict line, then one
+/// numbered entry per layer — title, rationale, files, contributing changes
+/// with their inspect commands — never a hunk dump. The canonical section is
+/// rendered verbatim; nothing is re-derived here.
+pub fn walkthrough_text(report: &TriageReport) -> String {
+    let mut out = String::new();
+    let verdict_label = match report.verdict {
+        Verdict::Ready => info("READY").to_string(),
+        Verdict::Blocked => emphasis(crate::output::error("BLOCKED")).to_string(),
+        Verdict::Stale => crate::output::warning("STALE").to_string(),
+    };
+    out.push_str(&format!(
+        "{} {} \u{2192} {}   {}   ({} layer{}, {} change{})\n",
+        emphasis("walkthrough"),
+        report.inputs.feature,
+        report.inputs.target,
+        verdict_label,
+        report.walkthrough.len(),
+        if report.walkthrough.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
+        report.summary.changes,
+        if report.summary.changes == 1 { "" } else { "s" },
+    ));
+
+    if report.walkthrough.is_empty() {
+        out.push_str("\n  no walkthrough: the candidate set modifies no files\n");
+        return out;
+    }
+
+    // The exact inspect command per contributing change, from the canonical
+    // change reports (no re-derivation).
+    let review_cmd: BTreeMap<&str, &str> = report
+        .changes
+        .iter()
+        .map(|c| (c.id.as_str(), c.review_command.as_str()))
+        .collect();
+
+    for (i, layer) in report.walkthrough.iter().enumerate() {
+        out.push_str(&format!("\n{}. {}\n", i + 1, emphasis(&layer.title)));
+        out.push_str(&format!("   {}\n", layer.rationale));
+        let files: Vec<String> = layer
+            .files
+            .iter()
+            .map(|f| f.strip_prefix("file:").unwrap_or(f).to_string())
+            .collect();
+        out.push_str(&format!("   files: {}\n", capped_list(&files)));
+        if !layer.criteria.is_empty() {
+            out.push_str(&format!("   criteria: {}\n", capped_list(&layer.criteria)));
+        }
+        for ch in &layer.changes {
+            let short: String = ch.chars().take(12).collect();
+            match review_cmd.get(ch.as_str()) {
+                Some(cmd) => out.push_str(&format!("   {short}  {}\n", hint(cmd))),
+                None => out.push_str(&format!("   {short}\n")),
+            }
+        }
+    }
+
+    out.push_str(&format!("\n{} {}\n", hint("ref"), hint(&report.reference)));
+    out
+}
+
+/// Print the guided walkthrough skin to stdout.
+pub fn print_walkthrough(report: &TriageReport) {
+    print!("{}", walkthrough_text(report));
 }
 
 /// Aggregate (additions, deletions) across a change's embedded diff.
@@ -258,6 +368,12 @@ pub fn render_html(report: &TriageReport) -> String {
         }
     }
     h.push_str("</section>\n");
+
+    // Walkthrough — the guided chapter tour (only when the projection produced
+    // layers). Rendered verbatim from the canonical section.
+    if !report.walkthrough.is_empty() {
+        h.push_str(&render_walkthrough(report));
+    }
 
     // Intents.
     h.push_str("<section id=\"intents\">\n<h2>Intents</h2>\n");
@@ -449,32 +565,7 @@ fn render_change(c: &ChangeReport) -> String {
     ));
     // The real code-review surface: inline, color-coded unified diff.
     for f in &c.diff {
-        s.push_str(&format!(
-            "<div class=\"diff-file\"><span class=\"diff-path\">{}</span> <span class=\"diff-status {}\">{}</span></div>\n",
-            html_escape(&f.path),
-            html_escape(&f.status),
-            html_escape(&f.status)
-        ));
-        s.push_str("<pre class=\"diff\">");
-        for hunk in &f.hunks {
-            s.push_str(&format!(
-                "<div class=\"hunk-header\">{}</div>",
-                html_escape(&hunk.header)
-            ));
-            for line in &hunk.lines {
-                let cls = match line.tag.as_str() {
-                    "+" => "add",
-                    "-" => "del",
-                    _ => "ctx",
-                };
-                s.push_str(&format!(
-                    "<div class=\"line {cls}\">{}{}</div>",
-                    html_escape(&line.tag),
-                    html_escape(&line.content)
-                ));
-            }
-        }
-        s.push_str("</pre>\n");
+        s.push_str(&render_diff_file(f));
     }
     if !c.blast_radius.is_empty() {
         s.push_str(&format!(
@@ -488,6 +579,147 @@ fn render_change(c: &ChangeReport) -> String {
     }
     s.push_str("</details>\n");
     s
+}
+
+/// One file's color-coded unified diff — shared by the per-change view and the
+/// walkthrough chapters, so both render diffs identically.
+fn render_diff_file(f: &DiffFileView) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "<div class=\"diff-file\"><span class=\"diff-path\">{}</span> <span class=\"diff-status {}\">{}</span></div>\n",
+        html_escape(&f.path),
+        html_escape(&f.status),
+        html_escape(&f.status)
+    ));
+    s.push_str("<pre class=\"diff\">");
+    for hunk in &f.hunks {
+        s.push_str(&format!(
+            "<div class=\"hunk-header\">{}</div>",
+            html_escape(&hunk.header)
+        ));
+        for line in &hunk.lines {
+            let cls = match line.tag.as_str() {
+                "+" => "add",
+                "-" => "del",
+                _ => "ctx",
+            };
+            s.push_str(&format!(
+                "<div class=\"line {cls}\">{}{}</div>",
+                html_escape(&line.tag),
+                html_escape(&line.content)
+            ));
+        }
+    }
+    s.push_str("</pre>\n");
+    s
+}
+
+/// The walkthrough section: a reading-order nav plus one numbered collapsible
+/// chapter per layer (first chapter open). Each chapter shows the canonical
+/// rationale, its tasks/criteria, `depends_on` anchor links to earlier
+/// chapters, and the per-file diffs scoped to that layer's files.
+fn render_walkthrough(report: &TriageReport) -> String {
+    // layer id → (1-based chapter number, title) for depends_on anchors.
+    let chapter_of: BTreeMap<&str, (usize, &str)> = report
+        .walkthrough
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (l.id.as_str(), (i + 1, l.title.as_str())))
+        .collect();
+
+    let mut h = String::new();
+    h.push_str("<section id=\"walkthrough\">\n<h2>Walkthrough</h2>\n");
+    h.push_str("<p class=\"tour-intro\">Guided reading order — foundations first.</p>\n");
+
+    // Reading-order nav.
+    h.push_str("<ol class=\"toc\">\n");
+    for (i, layer) in report.walkthrough.iter().enumerate() {
+        h.push_str(&format!(
+            "<li><a href=\"#chapter-{}\">{}</a></li>\n",
+            i + 1,
+            html_escape(&layer.title)
+        ));
+    }
+    h.push_str("</ol>\n");
+
+    for (i, layer) in report.walkthrough.iter().enumerate() {
+        let n = i + 1;
+        let open = if i == 0 { " open" } else { "" };
+        h.push_str(&format!(
+            "<details class=\"chapter\" id=\"chapter-{n}\"{open}>\n"
+        ));
+        h.push_str(&format!(
+            "<summary><span class=\"chapter-num\">{n}</span> <span class=\"chapter-title\">{}</span> <span class=\"stat\">{} file(s) · {} change(s)</span></summary>\n",
+            html_escape(&layer.title),
+            layer.files.len(),
+            layer.changes.len()
+        ));
+        h.push_str(&format!(
+            "<p class=\"rationale\">{}</p>\n",
+            html_escape(&layer.rationale)
+        ));
+
+        // depends_on → anchor links to the chapters this one builds on.
+        if !layer.depends_on.is_empty() {
+            h.push_str("<div class=\"chapter-deps\">builds on: ");
+            let mut first = true;
+            for dep in &layer.depends_on {
+                if !first {
+                    h.push_str(" · ");
+                }
+                first = false;
+                match chapter_of.get(dep.as_str()) {
+                    Some((dn, title)) => h.push_str(&format!(
+                        "<a href=\"#chapter-{dn}\">{dn}. {}</a>",
+                        html_escape(title)
+                    )),
+                    // A dep outside the rendered set (defensive): plain text.
+                    None => h.push_str(&html_escape(dep)),
+                }
+            }
+            h.push_str("</div>\n");
+        }
+
+        if !layer.tasks.is_empty() {
+            h.push_str(&format!(
+                "<div class=\"chapter-meta\">tasks: <code>{}</code></div>\n",
+                html_escape(&layer.tasks.join(", "))
+            ));
+        }
+        if !layer.criteria.is_empty() {
+            h.push_str(&format!(
+                "<div class=\"chapter-meta\">criteria: <code>{}</code></div>\n",
+                html_escape(&layer.criteria.join(", "))
+            ));
+        }
+
+        // The layer's code: per-file diffs scoped to this chapter's files,
+        // pulled from the contributing changes' canonical diffs.
+        let layer_paths: std::collections::HashSet<&str> = layer
+            .files
+            .iter()
+            .map(|f| f.strip_prefix("file:").unwrap_or(f))
+            .collect();
+        for ch_id in &layer.changes {
+            let Some(change) = report.changes.iter().find(|c| &c.id == ch_id) else {
+                continue;
+            };
+            let short: String = ch_id.chars().take(12).collect();
+            for f in &change.diff {
+                if layer_paths.contains(f.path.as_str()) {
+                    h.push_str(&format!(
+                        "<div class=\"chapter-change\">from <code>{}</code></div>\n",
+                        html_escape(&short)
+                    ));
+                    h.push_str(&render_diff_file(f));
+                }
+            }
+        }
+
+        h.push_str("</details>\n");
+    }
+    h.push_str("</section>\n");
+    h
 }
 
 /// HTML-escape the five significant characters so no interpolated string can
@@ -616,7 +848,111 @@ mod tests {
                 "reaches <script>alert(1)</script> & <b>bold</b>",
             )
             .with_query("atomic vault query neighbors change:HASH1 -d 2 --json")],
+            walkthrough: vec![
+                WalkthroughLayer {
+                    id: "layer:src".to_string(),
+                    title: "src".to_string(),
+                    rationale: "reads <first> & foremost".to_string(),
+                    files: vec!["file:src/<a>.rs".to_string()],
+                    tasks: vec!["urn:atomic:task:T-1".to_string()],
+                    criteria: vec!["urn:atomic:ac:DEMO-A-1".to_string()],
+                    changes: vec!["HASH1".to_string()],
+                    depends_on: vec![],
+                },
+                WalkthroughLayer {
+                    id: "layer:cli".to_string(),
+                    title: "cli".to_string(),
+                    rationale: "the entry point".to_string(),
+                    files: vec!["file:cli/main.rs".to_string()],
+                    tasks: vec![],
+                    criteria: vec![],
+                    changes: vec!["HASH1".to_string()],
+                    depends_on: vec!["layer:src".to_string()],
+                },
+            ],
         }
+    }
+
+    /// The text walkthrough skin lists layers in canonical order with their
+    /// rationale, files, and inspect commands — and never dumps diff hunks.
+    #[test]
+    fn walkthrough_text_is_ordered_and_bounded() {
+        let report = sample_report();
+        let text = walkthrough_text(&report);
+
+        // Numbered entries in canonical (reading) order.
+        let pos_src = text.find("1. ").expect("first chapter");
+        let pos_cli = text.find("2. ").expect("second chapter");
+        assert!(pos_src < pos_cli);
+        assert!(text.contains("src"));
+        assert!(text.contains("cli"));
+
+        // Canonical rationale rendered verbatim; files stripped of the
+        // `file:` prefix; the exact inspect command from the change report.
+        assert!(text.contains("reads <first> & foremost"));
+        assert!(text.contains("files: src/<a>.rs"));
+        assert!(text.contains("criteria: urn:atomic:ac:DEMO-A-1"));
+        assert!(text.contains("atomic change HASH1 --show-hunks"));
+
+        // Bounded: no diff content lines leak into the text skin.
+        assert!(!text.contains("let x = <old> & 1;"));
+        assert!(!text.contains("let x = <new> & 2;"));
+
+        // The reproducible reference closes the view.
+        assert!(text.contains("urn:atomic:triage:abc123"));
+    }
+
+    /// A list longer than the cap is elided with a count.
+    #[test]
+    fn walkthrough_capped_list_elides() {
+        let items: Vec<String> = (0..12).map(|i| format!("f{i}")).collect();
+        let s = capped_list(&items);
+        assert!(s.contains("f0") && s.contains("f7"));
+        assert!(!s.contains("f8"));
+        assert!(s.contains("and 4 more"));
+
+        let short: Vec<String> = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(capped_list(&short), "a, b");
+    }
+
+    /// The HTML chapter tour: nav anchors, numbered chapters (first open),
+    /// depends_on links, escaped rationale, and layer-scoped diffs.
+    #[test]
+    fn render_html_walkthrough_chapter_tour() {
+        let html = render_html(&sample_report());
+
+        // Section + reading-order nav.
+        assert!(html.contains("<section id=\"walkthrough\">"));
+        assert!(html.contains("<a href=\"#chapter-1\">src</a>"));
+        assert!(html.contains("<a href=\"#chapter-2\">cli</a>"));
+
+        // First chapter open, second closed.
+        assert!(html.contains("<details class=\"chapter\" id=\"chapter-1\" open>"));
+        assert!(html.contains("<details class=\"chapter\" id=\"chapter-2\">"));
+
+        // depends_on renders as an anchor back to the earlier chapter.
+        assert!(html.contains("builds on: <a href=\"#chapter-1\">1. src</a>"));
+
+        // Rationale is escaped.
+        assert!(html.contains("reads &lt;first&gt; &amp; foremost"));
+        assert!(!html.contains("reads <first>"));
+
+        // Chapter 1 embeds the layer-scoped diff (src/<a>.rs from HASH1);
+        // chapter 2's files match no diff, so it embeds none. The chapter
+        // diff is attributed to its change.
+        assert!(html.contains("<div class=\"chapter-change\">from <code>HASH1</code></div>"));
+        let chapter2_pos = html.find("id=\"chapter-2\"").unwrap();
+        let after_chapter2 = &html[chapter2_pos
+            ..html
+                .find("</section>\n<section id=\"intents\">")
+                .unwrap_or(html.len())];
+        assert!(
+            !after_chapter2.contains("chapter-change"),
+            "chapter 2 has no matching diff files, so no scoped diff"
+        );
+
+        // Still self-contained.
+        assert!(!html.contains("http://") && !html.contains("https://"));
     }
 
     #[test]
@@ -782,4 +1118,18 @@ pre.diff .line{white-space:pre-wrap;word-break:break-word}
 pre.diff .line.add{background:rgba(46,160,67,.18);color:#7ee787}
 pre.diff .line.del{background:rgba(248,81,73,.18);color:#ffa198}
 pre.diff .line.ctx{color:#c9d1d9}
-.empty{color:#666;font-style:italic}"#;
+.empty{color:#666;font-style:italic}
+.tour-intro{color:#555;font-style:italic;margin:6px 0}
+ol.toc{margin:8px 0;padding-left:22px}
+ol.toc a{color:#1662c4;text-decoration:none}
+ol.toc a:hover{text-decoration:underline}
+details.chapter{background:#fff;border:1px solid #e2e4e8;border-radius:6px;padding:10px 12px;margin:10px 0}
+details.chapter summary{cursor:pointer;font-weight:600}
+.chapter-num{display:inline-block;min-width:22px;height:22px;line-height:22px;text-align:center;background:#1a1a1a;color:#fff;border-radius:11px;font-size:12px}
+.chapter-title{margin-left:4px}
+.rationale{color:#333;margin:8px 0 4px}
+.chapter-deps{font-size:13px;color:#555;margin:2px 0}
+.chapter-deps a{color:#1662c4;text-decoration:none}
+.chapter-deps a:hover{text-decoration:underline}
+.chapter-meta{font-size:13px;color:#555;margin:2px 0}
+.chapter-change{font-size:12px;color:#555;margin-top:8px}"#;

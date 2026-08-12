@@ -77,6 +77,12 @@ pub struct TriageReport {
     pub intents: Vec<IntentReport>,
     pub changes: Vec<ChangeReport>,
     pub findings: Vec<Finding>,
+    /// The guided walkthrough: candidate modifications grouped into semantic
+    /// layers (module clusters), in reading order — foundations first. A pure,
+    /// deterministic projection of the pinned inputs; empty when the candidate
+    /// set modifies no files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub walkthrough: Vec<WalkthroughLayer>,
 }
 
 /// The pinned inputs the report is a fact about (the evidence-bundle role).
@@ -191,6 +197,37 @@ pub struct ChangeReport {
     /// Compact provenance (session / agent / turn), best-effort; `None` if no
     /// provenance graph explains the change.
     pub provenance: Option<serde_json::Value>,
+}
+
+/// One semantic layer in the guided walkthrough: a cluster of modified files
+/// (a module), the tasks/criteria/changes that land there, and a deterministic
+/// prose rationale. The `Vec<WalkthroughLayer>` order on [`TriageReport`] IS
+/// the reading order (foundations first, entry points last).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WalkthroughLayer {
+    /// Stable layer id: `layer:<module>` (e.g. `layer:atomic-core/src/pristine`).
+    pub id: String,
+    /// Human title — the module path (or `(root)` for top-level files).
+    pub title: String,
+    /// Deterministic template prose explaining what this layer does and why it
+    /// reads at this position — assembled from task text, criteria, and change
+    /// messages. Never LLM-authored (the report must stay reproducible).
+    pub rationale: String,
+    /// Modified `file:<path>` node ids in this layer (keys into
+    /// `changes[].modifies` / `changes[].diff`).
+    pub files: Vec<String>,
+    /// Canonical ids of intent tasks whose `::file-ref` touches land here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<String>,
+    /// Acceptance-criterion ids those tasks satisfy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub criteria: Vec<String>,
+    /// Candidate change hashes (base32) that modify files in this layer.
+    pub changes: Vec<String>,
+    /// Earlier layer ids this layer builds on (via `IMPORTS`/`INCLUDES` edges
+    /// between modified files) — why it reads after them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 /// A finding — the machine + human face of one issue.
