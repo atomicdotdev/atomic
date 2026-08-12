@@ -500,13 +500,12 @@ impl Enable {
         let manifest = atomic_agent::integrations::IntegrationManifest::load(&pkg_dir)
             .map_err(|e| crate::error::CliError::Internal(anyhow::anyhow!(e.to_string())))?;
 
-        let skills_cache_dir = if manifest.skills_source.is_some()
-            || manifest.agent_definition.is_some()
-        {
-            Some(sync_skills_cache(self.force)?)
-        } else {
-            None
-        };
+        let skills_cache_dir =
+            if manifest.skills_source.is_some() || manifest.agent_definition.is_some() {
+                Some(sync_skills_cache(self.force)?)
+            } else {
+                None
+            };
 
         // Determine repo_root from the --agents-md / --no-agents-md flags
         // or the interactive prompt. Only relevant when the manifest has

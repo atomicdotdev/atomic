@@ -151,14 +151,15 @@ pub fn install_from_dir(pkg_dir: &Path, opts: &InstallOptions) -> AgentResult<In
 
     // Skills from the shared atomic-skills cache.
     if !manifest.skills.is_empty() {
-        let cache = opts.skills_cache_dir.as_deref().ok_or_else(|| {
-            AgentError::Integration {
+        let cache = opts
+            .skills_cache_dir
+            .as_deref()
+            .ok_or_else(|| AgentError::Integration {
                 agent: manifest.agent.clone(),
                 reason: "manifest declares [[skill]] entries but no skills cache was \
                          provided (expected [skills-source] to be synced by the CLI)"
                     .to_string(),
-            }
-        })?;
+            })?;
         for entry in &manifest.skills {
             reject_parent_traversal(&manifest.agent, &entry.src)?;
             let src = cache.join(&entry.src);
@@ -194,10 +195,7 @@ pub fn install_from_dir(pkg_dir: &Path, opts: &InstallOptions) -> AgentResult<In
                 reject_parent_traversal(&manifest.agent, &entry.src)?;
                 // src comes from the skills cache (or the package if no
                 // skills-source is set — uncommon but valid).
-                let src_base = opts
-                    .skills_cache_dir
-                    .as_deref()
-                    .unwrap_or(pkg_dir);
+                let src_base = opts.skills_cache_dir.as_deref().unwrap_or(pkg_dir);
                 let src = src_base.join(&entry.src);
                 if !src.is_file() {
                     return Err(AgentError::Integration {
@@ -224,46 +222,43 @@ pub fn install_from_dir(pkg_dir: &Path, opts: &InstallOptions) -> AgentResult<In
     // Bundled agent definition: stitch frontmatter + canonical body at install
     // time. Pure string concat — no exec, same safety category as fs::copy.
     if let Some(def) = &manifest.agent_definition {
-        let cache = opts.skills_cache_dir.as_deref().ok_or_else(|| {
-            AgentError::Integration {
+        let cache = opts
+            .skills_cache_dir
+            .as_deref()
+            .ok_or_else(|| AgentError::Integration {
                 agent: manifest.agent.clone(),
                 reason: "manifest declares [agent-definition] but no skills cache \
                          was provided (needed for body_from)"
                     .to_string(),
-            }
-        })?;
+            })?;
         reject_parent_traversal(&manifest.agent, &def.src)?;
         let frontmatter_path = pkg_dir.join(&def.src);
-        let frontmatter = std::fs::read_to_string(&frontmatter_path).map_err(|e| {
-            AgentError::Integration {
+        let frontmatter =
+            std::fs::read_to_string(&frontmatter_path).map_err(|e| AgentError::Integration {
                 agent: manifest.agent.clone(),
                 reason: format!(
                     "agent-definition frontmatter missing: {}: {}",
                     frontmatter_path.display(),
                     e
                 ),
-            }
-        })?;
-        let body_path =
-            manifest
-                .resolve_body_from(&def.body_from, cache)
-                .ok_or_else(|| AgentError::Integration {
-                    agent: manifest.agent.clone(),
-                    reason: format!(
-                        "agent-definition body_from '{}' is malformed or does not \
-                         match the skills-source package",
-                        def.body_from
-                    ),
-                })?;
-        let body = std::fs::read_to_string(&body_path).map_err(|e| {
-            AgentError::Integration {
+            })?;
+        let body_path = manifest
+            .resolve_body_from(&def.body_from, cache)
+            .ok_or_else(|| AgentError::Integration {
                 agent: manifest.agent.clone(),
                 reason: format!(
-                    "agent-definition body missing: {}: {}",
-                    body_path.display(),
-                    e
+                    "agent-definition body_from '{}' is malformed or does not \
+                         match the skills-source package",
+                    def.body_from
                 ),
-            }
+            })?;
+        let body = std::fs::read_to_string(&body_path).map_err(|e| AgentError::Integration {
+            agent: manifest.agent.clone(),
+            reason: format!(
+                "agent-definition body missing: {}: {}",
+                body_path.display(),
+                e
+            ),
         })?;
         let stitched = format!("{frontmatter}\n\n{body}");
         let slot = expand_dst(&def.slot)?;
@@ -900,7 +895,11 @@ manifest = "hooks/hooks.json"
     fn fake_skills_cache() -> tempfile::TempDir {
         let cache = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(cache.path().join("skills/atomic-vault")).unwrap();
-        std::fs::write(cache.path().join("AGENTS.md"), "# Atomic VCS Agent\n\ncanonical body\n").unwrap();
+        std::fs::write(
+            cache.path().join("AGENTS.md"),
+            "# Atomic VCS Agent\n\ncanonical body\n",
+        )
+        .unwrap();
         std::fs::write(
             cache.path().join("skills/atomic-vault/SKILL.md"),
             "# atomic-vault skill\n",
@@ -1009,7 +1008,9 @@ dst = "AGENTS.md"
         assert_eq!(outcome.installed.len(), 1);
         let agents_dst = repo.path().join("AGENTS.md");
         assert!(agents_dst.exists());
-        assert!(std::fs::read_to_string(&agents_dst).unwrap().contains("canonical body"));
+        assert!(std::fs::read_to_string(&agents_dst)
+            .unwrap()
+            .contains("canonical body"));
         std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
     }
 
@@ -1079,7 +1080,9 @@ dst = "/etc/passwd"
         o.skills_cache_dir = Some(cache.path().to_path_buf());
         o.repo_root = Some(repo.path().to_path_buf());
         let err = install_from_dir(pkg.path(), &o).unwrap_err();
-        assert!(err.to_string().contains("must be relative to the repo root"));
+        assert!(err
+            .to_string()
+            .contains("must be relative to the repo root"));
         std::env::remove_var("ATOMIC_INTEGRATIONS_HOME");
     }
 
