@@ -39,6 +39,22 @@ pub enum RepositoryError {
     #[error("Cannot delete the current view '{name}'")]
     CannotDeleteCurrentView { name: String },
 
+    /// A change requested for a split is not present in the source view's
+    /// own change log (it may be inherited from a parent view).
+    #[error("Change {hash} is not in view '{view}'")]
+    ChangeNotInView { hash: String, view: String },
+
+    /// Splitting the requested changes would leave changes behind in the
+    /// source view that still depend on them. Re-run with cascade to move
+    /// the dependents too.
+    #[error(
+        "cannot split: {} change(s) remaining in '{view}' still depend on the changes being split \
+         (use --cascade to move them too): {}",
+        blocking.len(),
+        blocking.join(", ")
+    )]
+    ViewSplitHasDependents { view: String, blocking: Vec<String> },
+
     /// Working copy has uncommitted changes
     #[error("Working copy has uncommitted changes")]
     UncommittedChanges,
@@ -230,6 +246,8 @@ impl RepositoryError {
                 | RepositoryError::TagAlreadyExists { .. }
                 | RepositoryError::InvalidTagName { .. }
                 | RepositoryError::ViewAlreadyExists { .. }
+                | RepositoryError::ChangeNotInView { .. }
+                | RepositoryError::ViewSplitHasDependents { .. }
         )
     }
 

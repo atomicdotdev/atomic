@@ -273,7 +273,7 @@ impl Command for List {
                         // show total for root views.
                         let change_display = if info.parent_name.is_some() {
                             let own = info.own_change_count;
-                            let inherited = info.change_count.saturating_sub(info.own_change_count);
+                            let inherited = info.inherited_change_count;
                             if own == 1 {
                                 format!("({} change, {} inherited)", own, inherited)
                             } else {

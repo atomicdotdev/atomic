@@ -80,6 +80,7 @@ mod filter;
 mod materialize;
 mod sandbox;
 mod semantic_materialize;
+mod split;
 mod switch;
 mod views;
 
@@ -90,6 +91,7 @@ pub use filter::{
     expand_indexed_dependency_closure,
 };
 pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
+pub use split::{SplitChange, SplitOptions, SplitOutcome};
 pub use views::{ManifestApplyOutcome, ViewInfo};
 
 // Re-import workspace helpers from `switch` so they are available to
