@@ -15,12 +15,20 @@ pub struct ViewInfo {
     pub name: String,
     /// The current Merkle state (hash of all inserted changes)
     pub state: Merkle,
-    /// Total number of changes in this view's VIEW_CHANGES
-    /// (includes inherited changes for draft views).
+    /// Number of entries in this view's own VIEW_CHANGES log.
+    ///
+    /// This is the length of the view's own change sequence and is used to
+    /// resolve change references (e.g. `@`, `@~1`). It is NOT the total
+    /// effective change count for a draft — inherited changes are not stored
+    /// in this view's log.
     pub change_count: u64,
-    /// Number of changes unique to this view (not in the parent).
-    /// For shared views or views without a parent, this equals `change_count`.
+    /// Number of this view's own changes that are unique to it (not visible
+    /// through the parent chain). For shared views or views without a parent,
+    /// this equals `change_count`.
     pub own_change_count: u64,
+    /// Number of changes this view inherits through its parent chain. Zero for
+    /// views without a parent.
+    pub inherited_change_count: u64,
     /// View scope (Draft or Shared)
     pub scope: ViewScope,
     /// Parent view name, if any
@@ -518,23 +526,26 @@ impl Repository {
                 name: name.to_string(),
             })?;
 
-        // Resolve parent name and compute own change count.
-        let (parent_name, parent_change_count) = if let Some(parent_id) = view.parent {
-            match txn
-                .get_view_by_id(parent_id)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?
-            {
-                Some(p) => (Some(p.name), p.change_count),
-                None => (None, 0),
+        // Resolve parent name and compute own/inherited change counts by
+        // actual graph membership rather than by assuming the own log is a
+        // superset of the parent (which only holds for `create_view_from`
+        // drafts, not for record- or split-created drafts).
+        let (parent_name, own_change_count, inherited_change_count) = match view.parent {
+            Some(parent_id) => {
+                match txn
+                    .get_view_by_id(parent_id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                {
+                    Some(parent) => {
+                        let parent_visible = collect_visible_change_ids(&txn, &parent)?;
+                        let own_ids = collect_view_change_ids(&txn, &view)?;
+                        let own = own_ids.difference(&parent_visible).count() as u64;
+                        (Some(parent.name), own, parent_visible.len() as u64)
+                    }
+                    None => (None, view.change_count, 0),
+                }
             }
-        } else {
-            (None, 0)
-        };
-
-        let own_change_count = if view.parent.is_some() {
-            view.change_count.saturating_sub(parent_change_count)
-        } else {
-            view.change_count
+            None => (None, view.change_count, 0),
         };
 
         Ok(ViewInfo {
@@ -542,6 +553,7 @@ impl Repository {
             state: view.state,
             change_count: view.change_count,
             own_change_count,
+            inherited_change_count,
             scope: view.kind,
             parent_name,
         })

@@ -352,6 +352,8 @@ TriageReport
     id, authored_by, diff_ref, files[], blast_radius[], closure_baggage, provenance{turn,session,memories}
   findings[]     (= "failures", also mirrored inline, severity-sorted)
     code, severity, focus, message, suggested_query, remedy
+  walkthrough[]  (= the guided reading order, foundations first)
+    id, title, rationale, files[], tasks[], criteria[], changes[], depends_on[]
 ```
 
 ### Skins and scale
@@ -366,16 +368,26 @@ review yields the same three-line verdict as a 4-change one.
 | **JSON** | streamable, paginated worklist | agent pages through it | the review skill |
 | **attested export** | signed frozen bytes (opt-in) | — | portability / compliance |
 
-Drill-down: `atomic triage feature --into dev [--finding block | --intent <ref> | --change <hash> | --html]`.
+Drill-down: `atomic triage feature --into dev [--finding block | --intent <ref> | --change <hash> | --walkthrough | --html]`.
 
 Shipped: `--json` (the agent worklist), the bounded CLI dashboard (default),
-`--html` (a self-contained, dependency-free document — inline CSS/JS, no CDN,
-verdict banner, severity-filterable finding cards, collapsible per-intent
-`<details>`, and the full report embedded as a JSON island), and `--attest`
+`--walkthrough` (the guided reading order: the report's `walkthrough` section
+— candidate modifications clustered into semantic layers by module, ordered
+foundations-first by import/include direction — as bounded text, one numbered
+entry per layer with rationale, files, and inspect commands, never a diff
+dump), `--html` (a self-contained, dependency-free document — inline CSS/JS,
+no CDN, verdict banner, severity-filterable finding cards, collapsible
+per-intent `<details>`, an ordered walkthrough chapter tour — reading-order
+nav, numbered collapsible chapters with `depends_on` anchors and layer-scoped
+diffs — and the full report embedded as a JSON island), and `--attest`
 (the signed frozen export: the report Value plus an `eddsa-jcs-2022` Data
-Integrity `proof`, alongside the content-addressed `reference`). A richer
-severity-colored node-link graph view (reusing the `query graph` machinery, once
-de-CDN'd) remains a future enhancement over the current structured document.
+Integrity `proof`, alongside the content-addressed `reference`). The
+walkthrough is a pure, deterministic projection built from facts already in
+the report (KG `PART_OF` modules with a parent-directory fallback,
+`IMPORTS`/`INCLUDES` ordering, task/criterion joins) — never LLM-authored, so
+the attested export stays reproducible. A richer severity-colored node-link
+graph view (reusing the `query graph` machinery, once de-CDN'd) remains a
+future enhancement over the current structured document.
 
 ## Finding taxonomy (closed set)
 

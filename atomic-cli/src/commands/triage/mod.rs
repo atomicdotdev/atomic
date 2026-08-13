@@ -59,6 +59,7 @@ pub enum TriageCommands {
     /// ```text
     /// atomic triage review feature --into dev
     /// atomic triage review feature --into dev --json
+    /// atomic triage review feature --into dev --walkthrough     # guided reading order
     /// atomic triage review feature --into dev --html            # write + open in browser
     /// atomic triage review feature --into dev --html --output review.html
     /// atomic triage review feature --into dev --html --no-open
@@ -216,6 +217,12 @@ pub struct TriageReview {
     #[arg(long)]
     pub json: bool,
 
+    /// Print the guided walkthrough: the candidate changes grouped into
+    /// ordered semantic layers (foundations first), with each layer's
+    /// rationale, files, and inspect commands. Bounded — never a diff dump.
+    #[arg(long)]
+    pub walkthrough: bool,
+
     /// Write a self-contained HTML report (inline CSS/JS, no external assets)
     /// to a file and open it in the default browser.
     #[arg(long)]
@@ -247,7 +254,8 @@ impl Command for TriageReview {
 
         let report = project::build_report(&repo, &self.feature, &self.into)?;
 
-        // Output selection precedence: attest > html > json > CLI dashboard.
+        // Output selection precedence:
+        // attest > html > json > walkthrough > CLI dashboard.
         if self.attest {
             let signed = output::attest_report(&report, self.identity.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&signed).unwrap());
@@ -256,6 +264,8 @@ impl Command for TriageReview {
             write_and_open_html(&html, &report, self.output.as_deref(), !self.no_open)?;
         } else if self.json {
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        } else if self.walkthrough {
+            output::print_walkthrough(&report);
         } else {
             output::print_report(&report);
         }
