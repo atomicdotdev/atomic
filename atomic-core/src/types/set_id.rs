@@ -89,7 +89,7 @@ const SETID_DOMAIN: &[u8] = b"atomic:setid:v1";
 ///
 /// `SetId` is a 32-byte additive homomorphic digest: the componentwise sum
 /// (four independent little-endian `u64` lanes, mod 2^64) of a domain-separated
-/// expansion of each member hash. See the [module docs](self) for the
+/// expansion of each member hash. See the module-level docs for the
 /// construction, the convergence-identity tradeoff, and the canonical domain
 /// contract.
 ///
@@ -205,7 +205,7 @@ impl SetId {
     /// [`SetId::ZERO`]. Order does not affect the result.
     ///
     /// The caller is responsible for supplying the canonical domain (applyable
-    /// change and tag hashes, sidecars excluded) — see the [module docs](self).
+    /// change and tag hashes, sidecars excluded) — see the module-level docs.
     pub fn of<'a, I>(changes: I) -> Self
     where
         I: IntoIterator<Item = &'a super::Merkle>,
