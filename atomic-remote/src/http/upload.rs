@@ -14,6 +14,23 @@ use crate::error::{RemoteError, RemoteResult};
 
 use super::HttpRemote;
 
+/// Extract base32 change-hash tokens from a server error message.
+///
+/// A "missing dependency/change" error from the manifest apply names the
+/// offending change(s) as full base32 hashes (e.g. `change ABC… depends on
+/// DEF…`). Pulling those out lets the CLI report *which* dependency is missing
+/// instead of the useless "requires 0 dependencies". A Blake3 change hash is 52
+/// base32 chars (`[A-Z2-7]`); we accept any run of ≥ 40 such chars so ordinary
+/// words never match while remaining robust to hash-length changes.
+fn extract_change_hashes(msg: &str) -> Vec<String> {
+    msg.split(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit()))
+        .filter(|tok| {
+            tok.len() >= 40 && tok.bytes().all(|b| matches!(b, b'A'..=b'Z' | b'2'..=b'7'))
+        })
+        .map(|s| s.to_string())
+        .collect()
+}
+
 impl HttpRemote {
     /// Upload a change file.
     ///
@@ -50,10 +67,16 @@ impl HttpRemote {
             }
             StatusCode::BAD_REQUEST | StatusCode::INTERNAL_SERVER_ERROR => {
                 let msg = response.text().await.unwrap_or_default();
-                // Check if it's a missing dependencies error
+                // Missing-dependency error: name the offending hashes when the
+                // server included them; otherwise preserve the full message
+                // rather than collapsing it to "0 dependencies".
                 if msg.contains("missing") && msg.contains("dependenc") {
-                    // Try to extract hash list from error message
-                    Err(RemoteError::missing_deps(vec![]))
+                    let hashes = extract_change_hashes(&msg);
+                    if hashes.is_empty() {
+                        Err(RemoteError::http(status.as_u16(), msg))
+                    } else {
+                        Err(RemoteError::missing_deps(hashes))
+                    }
                 } else {
                     Err(RemoteError::http(status.as_u16(), msg))
                 }
@@ -155,8 +178,16 @@ impl HttpRemote {
             }
             StatusCode::BAD_REQUEST => {
                 let msg = response.text().await.unwrap_or_default();
+                // A missing change/dependency from the manifest apply names the
+                // offending hash(es); surface them instead of "0 dependencies",
+                // and fall back to the full server message when none parse.
                 if msg.contains("missing") && msg.contains("change") {
-                    Err(RemoteError::missing_deps(vec![]))
+                    let hashes = extract_change_hashes(&msg);
+                    if hashes.is_empty() {
+                        Err(RemoteError::http(status.as_u16(), msg))
+                    } else {
+                        Err(RemoteError::missing_deps(hashes))
+                    }
                 } else {
                     Err(RemoteError::http(status.as_u16(), msg))
                 }
@@ -455,7 +486,12 @@ impl HttpRemote {
             StatusCode::BAD_REQUEST | StatusCode::INTERNAL_SERVER_ERROR => {
                 let msg = response.text().await.unwrap_or_default();
                 if msg.contains("missing") && msg.contains("dependenc") {
-                    Err(RemoteError::missing_deps(vec![]))
+                    let hashes = extract_change_hashes(&msg);
+                    if hashes.is_empty() {
+                        Err(RemoteError::http(status.as_u16(), msg))
+                    } else {
+                        Err(RemoteError::missing_deps(hashes))
+                    }
                 } else {
                     Err(RemoteError::http(status.as_u16(), msg))
                 }
@@ -490,5 +526,41 @@ impl HttpRemote {
         path: &Path,
     ) -> RemoteResult<()> {
         self.upload_change_streamed(hash, view, path).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_change_hashes;
+
+    #[test]
+    fn extracts_hashes_from_manifest_dependency_error() {
+        // The exact shape `apply_view_manifest` produces for a split-created
+        // draft whose first change depends on a change left in the parent.
+        let msg = "missing changes: Manifest for view 'orange-night-44fb': change \
+             GJGC6OK6JT77OB2PDGFYEC2BUISJWQNQVT345SNIZ2CKKXGV652A depends on \
+             FUGMXMFD7FJ6QARZ4RML2W5W6W3RGE2K7ILTZ55XKQ4Z3XZ4YQ4A, which is neither \
+             earlier in the log nor present locally";
+        let hashes = extract_change_hashes(msg);
+        assert_eq!(
+            hashes,
+            vec![
+                "GJGC6OK6JT77OB2PDGFYEC2BUISJWQNQVT345SNIZ2CKKXGV652A".to_string(),
+                "FUGMXMFD7FJ6QARZ4RML2W5W6W3RGE2K7ILTZ55XKQ4Z3XZ4YQ4A".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_ordinary_words_and_short_tokens() {
+        let msg = "missing changes not present locally on the REMOTE server";
+        assert!(extract_change_hashes(msg).is_empty());
+    }
+
+    #[test]
+    fn rejects_non_base32_long_tokens() {
+        // Contains 0/1/8/9 (not in base32 [A-Z2-7]) → not a hash.
+        let msg = "error 00000000000000000000000000000000000000000000000000";
+        assert!(extract_change_hashes(msg).is_empty());
     }
 }

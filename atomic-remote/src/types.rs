@@ -303,7 +303,10 @@ impl std::error::Error for ParseChangelistError {}
 /// the Merkle state at that position, and optionally the Merkle state of
 /// the most recent tag.
 ///
-/// Protocol format: `{position} {merkle} {tag_merkle}` or `-` for empty channel.
+/// Protocol format: `{position} {merkle} {tag_merkle} [{set_id}]` or `-` for
+/// an empty channel. The trailing `{set_id}` is optional and only emitted by
+/// servers that advertise the order-invariant [`SetId`](atomic_core::types::SetId);
+/// older servers omit it and clients fall back to the Merkle dichotomy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StateResponse {
     /// The channel has state.
@@ -314,18 +317,43 @@ pub enum StateResponse {
         merkle: String,
         /// The Merkle state of the most recent tag, or empty if no tags.
         tag_merkle: String,
+        /// The order-invariant `SetId` of the view's effective change set
+        /// (base32 encoded), or `None` when the server does not advertise it.
+        ///
+        /// This is an **additive, optional** field: it enables an
+        /// order-invariant sync fast path without changing the existing
+        /// Merkle-based protocol. Absent on older servers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        set_id: Option<String>,
     },
     /// The channel is empty.
     Empty,
 }
 
 impl StateResponse {
-    /// Create a state response with values.
+    /// Create a state response with values (no advertised `SetId`).
     pub fn state(position: u64, merkle: impl Into<String>, tag_merkle: impl Into<String>) -> Self {
         Self::State {
             position,
             merkle: merkle.into(),
             tag_merkle: tag_merkle.into(),
+            set_id: None,
+        }
+    }
+
+    /// Create a state response that also advertises the order-invariant
+    /// [`SetId`](atomic_core::types::SetId) of the view's change set.
+    pub fn state_with_set_id(
+        position: u64,
+        merkle: impl Into<String>,
+        tag_merkle: impl Into<String>,
+        set_id: impl Into<String>,
+    ) -> Self {
+        Self::State {
+            position,
+            merkle: merkle.into(),
+            tag_merkle: tag_merkle.into(),
+            set_id: Some(set_id.into()),
         }
     }
 
@@ -345,7 +373,7 @@ impl StateResponse {
     ///
     /// let state = StateResponse::parse("42 ABC123 DEF456").unwrap();
     /// match state {
-    ///     StateResponse::State { position, merkle, tag_merkle } => {
+    ///     StateResponse::State { position, merkle, tag_merkle, .. } => {
     ///         assert_eq!(position, 42);
     ///         assert_eq!(merkle, "ABC123");
     ///         assert_eq!(tag_merkle, "DEF456");
@@ -379,11 +407,15 @@ impl StateResponse {
 
         let merkle = parts[1].to_string();
         let tag_merkle = parts[2].to_string();
+        // Optional 4th token: the order-invariant SetId. Absent on older
+        // servers, which emit only three tokens.
+        let set_id = parts.get(3).map(|s| s.to_string());
 
         Ok(Self::State {
             position,
             merkle,
             tag_merkle,
+            set_id,
         })
     }
 
@@ -416,6 +448,15 @@ impl StateResponse {
         }
     }
 
+    /// Get the advertised order-invariant `SetId` (base32), if the server
+    /// provided one.
+    pub fn set_id(&self) -> Option<&str> {
+        match self {
+            Self::State { set_id, .. } => set_id.as_deref(),
+            Self::Empty => None,
+        }
+    }
+
     /// Format this response as a protocol line.
     pub fn to_protocol_line(&self) -> String {
         match self {
@@ -423,7 +464,11 @@ impl StateResponse {
                 position,
                 merkle,
                 tag_merkle,
-            } => format!("{} {} {}", position, merkle, tag_merkle),
+                set_id,
+            } => match set_id {
+                Some(sid) => format!("{} {} {} {}", position, merkle, tag_merkle, sid),
+                None => format!("{} {} {}", position, merkle, tag_merkle),
+            },
             Self::Empty => "-".to_string(),
         }
     }
@@ -795,6 +840,7 @@ mod tests {
                 position,
                 merkle,
                 tag_merkle,
+                ..
             } => {
                 assert_eq!(position, 42);
                 assert_eq!(merkle, "ABC123");
@@ -839,6 +885,46 @@ mod tests {
 
         let empty = StateResponse::empty();
         assert_eq!(empty.to_protocol_line(), "-");
+    }
+
+    #[test]
+    fn test_state_response_set_id_optional() {
+        // No SetId: three-token line, set_id() is None (older server).
+        let without = StateResponse::state(42, "ABC", "DEF");
+        assert_eq!(without.set_id(), None);
+        assert_eq!(without.to_protocol_line(), "42 ABC DEF");
+
+        // With SetId: four-token line, round-trips and set_id() is Some.
+        let with = StateResponse::state_with_set_id(42, "ABC", "DEF", "SID32");
+        assert_eq!(with.set_id(), Some("SID32"));
+        assert_eq!(with.to_protocol_line(), "42 ABC DEF SID32");
+        assert_eq!(
+            StateResponse::parse("42 ABC DEF SID32").unwrap(),
+            with,
+            "the optional SetId token round-trips through parse"
+        );
+    }
+
+    #[test]
+    fn test_state_response_parse_ignores_missing_set_id() {
+        // A legacy three-token line parses to set_id = None (backward compat).
+        let parsed = StateResponse::parse("7 MERK TAG").unwrap();
+        assert_eq!(parsed.set_id(), None);
+    }
+
+    #[test]
+    fn test_state_response_set_id_json_backward_compat() {
+        // Older JSON without `set_id` deserializes (serde default = None).
+        let legacy = r#"{"State":{"position":1,"merkle":"M","tag_merkle":"T"}}"#;
+        let parsed: StateResponse = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.set_id(), None);
+
+        // And a None set_id is skipped on serialize (no `set_id` key emitted).
+        let json = serde_json::to_string(&StateResponse::state(1, "M", "T")).unwrap();
+        assert!(
+            !json.contains("set_id"),
+            "None set_id must not be serialized"
+        );
     }
 
     #[test]

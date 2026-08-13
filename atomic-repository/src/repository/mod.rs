@@ -88,7 +88,7 @@ mod views;
 // use `use super::*;` continue to resolve them at `crate::repository::…`.
 pub use filter::{
     collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,
-    expand_indexed_dependency_closure,
+    expand_indexed_dependency_closure, view_set_id,
 };
 pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
 pub use split::{SplitChange, SplitOptions, SplitOutcome};

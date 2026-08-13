@@ -1,5 +1,7 @@
 use super::*;
 
+use atomic_core::types::SetId;
+
 /// Collect all change `NodeId`s inserted into a view into a `HashSet`.
 ///
 /// This is the canonical helper for building a **change filter** — the set
@@ -116,6 +118,74 @@ pub fn collect_visible_change_ids_with_deps<T: ViewTxnT>(
     let mut ids = collect_visible_change_ids(txn, view)?;
     expand_indexed_dependency_closure(txn, &mut ids)?;
     Ok(ids)
+}
+
+/// Fold a view's **effective visible change set** into an order-invariant
+/// [`SetId`].
+///
+/// The identity is derived on demand (never stored) by mapping every visible
+/// change `NodeId` — the view's own changes plus everything inherited through
+/// its parent chain, exactly as [`collect_visible_change_ids`] computes it —
+/// back to its external [`Merkle`](atomic_core::types::Merkle) hash and folding
+/// those hashes into a `SetId`.
+///
+/// Because `SetId` is order-invariant, the arbitrary iteration order of the
+/// underlying `HashSet` does not affect the result: two views holding the same
+/// set of changes in any order (e.g. before and after a `view split` +
+/// reinsert) yield the **same** `SetId`, even though their order-sensitive
+/// `Merkle` states legitimately differ.
+///
+/// # Domain
+///
+/// This folds the view's applyable **change** set. Sidecars
+/// (`.provenance`/`.attest`) are never part of `VIEW_CHANGES` and so are
+/// naturally excluded — matching the canonical cross-producer domain documented
+/// on [`atomic_core::types::SetId`].
+///
+/// # Complexity
+///
+/// O(C) in the number of visible changes: one pass to collect the ids and one
+/// external-hash lookup per change.
+pub fn view_set_id<T: ViewTxnT + GraphTxnT>(
+    txn: &T,
+    view: &atomic_core::pristine::ViewState,
+) -> Result<SetId, RepositoryError> {
+    let ids = collect_visible_change_ids(txn, view)?;
+    let mut acc = SetId::ZERO;
+    for id in ids {
+        let hash = txn
+            .get_external(id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| {
+                RepositoryError::Database(format!("change {} has no external hash", id.0))
+            })?;
+        acc = acc.add(&hash);
+    }
+    Ok(acc)
+}
+
+impl Repository {
+    /// Derive the order-invariant [`SetId`] of a view's effective visible
+    /// change set.
+    ///
+    /// This is the content identity that answers "do these two views hold the
+    /// same set of changes?" regardless of the order the changes were applied
+    /// in — the property the order-sensitive `Merkle` state cannot provide. See
+    /// [`view_set_id`] and [`atomic_core::types::SetId`] for the construction,
+    /// the domain contract, and the convergence-identity tradeoff.
+    pub fn view_set_id(&self, name: &str) -> Result<SetId, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view = txn
+            .get_view(name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: name.to_string(),
+            })?;
+        view_set_id(&txn, &view)
+    }
 }
 
 /// Expand `ids` in-place using the pristine change dependency index only.

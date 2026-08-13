@@ -12,6 +12,9 @@ keywords = ["vcs", "version-control", "distributed", "remote", "protocol"]
 categories = ["development-tools"]
 
 [dependencies]
+# Internal crates
+atomic-core = { workspace = true }
+
 # HTTP client
 reqwest = { workspace = true, features = ["json", "gzip", "deflate", "stream"] }
 
