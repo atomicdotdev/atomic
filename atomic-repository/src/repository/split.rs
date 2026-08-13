@@ -246,8 +246,11 @@ fn analyze_split<T: ViewTxnT>(
 impl Repository {
     /// Split a set of changes out of a view into a new Draft view.
     ///
-    /// See the [module documentation](self) for the full semantics and the
-    /// dependency safety guarantee.
+    /// This is a pure metadata operation guarded by a reverse-dependency
+    /// check: a change cannot leave the source while another change that stays
+    /// behind still depends on it, unless `cascade` moves the dependents too.
+    /// See [`SplitOptions`] for the options and [`SplitOutcome`] for the
+    /// result.
     ///
     /// # Errors
     ///
