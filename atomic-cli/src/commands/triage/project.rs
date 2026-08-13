@@ -122,6 +122,14 @@ pub fn build_report(
     // Entities defined in each candidate's modified files (parallel to
     // `change_reports`) — the seeds for the blast-radius walk below.
     let mut change_entities: Vec<Vec<String>> = Vec::new();
+    // Walkthrough facts, collected in the same KG passes (no extra queries):
+    // path → module (PART_OF) and file → file dependency edges (IMPORTS/
+    // INCLUDES). Best-effort — empty on an unenriched KG.
+    let mut file_module: BTreeMap<String, String> = BTreeMap::new();
+    let mut file_deps: BTreeSet<(String, String)> = BTreeSet::new();
+    // Task facts from reached intents (id, text, touches, satisfies), in
+    // intent-id order — the walkthrough's narrative inputs.
+    let mut task_facts: Vec<TaskFact> = Vec::new();
 
     for full in &set.only_in_feature {
         let hash = Hash::from_base32(full.as_bytes());
@@ -175,6 +183,7 @@ pub fn build_report(
             let Ok(fsub) = repo.vault_kg_neighbors(file_id, 1) else {
                 continue;
             };
+            let path = file_id.strip_prefix("file:").unwrap_or(file_id);
             for e in &fsub.edges {
                 if e.to_id == *file_id && kind_is(&e.kind, edge_kind::TOUCHES) {
                     covered = true;
@@ -182,6 +191,22 @@ pub fn build_report(
                 }
                 if e.from_id == *file_id && kind_is(&e.kind, edge_kind::DEFINES) {
                     entities.push(e.to_id.clone());
+                }
+                // Walkthrough facts on the same depth-1 neighborhood: the
+                // file's module (PART_OF) and its outgoing file dependencies
+                // (IMPORTS / INCLUDES) — the layer-ordering signal.
+                if e.from_id == *file_id && kind_is(&e.kind, edge_kind::PART_OF) {
+                    if let Some(module) = e.to_id.strip_prefix("module:") {
+                        file_module.insert(path.to_string(), module.to_string());
+                    }
+                }
+                if e.from_id == *file_id
+                    && (kind_is(&e.kind, edge_kind::IMPORTS)
+                        || kind_is(&e.kind, edge_kind::INCLUDES))
+                {
+                    if let Some(target) = e.to_id.strip_prefix("file:") {
+                        file_deps.insert((path.to_string(), target.to_string()));
+                    }
                 }
             }
         }
@@ -491,6 +516,18 @@ pub fn build_report(
                     );
                 }
 
+                // Task facts for the walkthrough: intent iteration order is a
+                // BTreeMap key walk and tasks keep their directive order, so
+                // this collection is deterministic.
+                for t in &node.has_task {
+                    task_facts.push(TaskFact {
+                        id: t.id.clone(),
+                        text: t.text.clone(),
+                        touches: t.touches_file.clone(),
+                        satisfies: t.satisfies.as_slice().to_vec(),
+                    });
+                }
+
                 let gate_violations: Vec<String> =
                     report.results.iter().map(|v| v.message.clone()).collect();
 
@@ -731,6 +768,20 @@ pub fn build_report(
     };
     let reference = triage_reference(&pins);
 
+    // 12. The guided walkthrough — a pure projection of facts already in hand
+    //     (no further repo access). Candidate order comes from the set itself.
+    let change_paths: Vec<(String, Vec<String>)> = set
+        .only_in_feature
+        .iter()
+        .map(|h| {
+            (
+                h.clone(),
+                change_raw_paths.get(h).cloned().unwrap_or_default(),
+            )
+        })
+        .collect();
+    let walkthrough = build_walkthrough(&change_paths, &file_module, &file_deps, &task_facts);
+
     Ok(TriageReport {
         reference,
         verdict,
@@ -746,7 +797,185 @@ pub fn build_report(
         intents: intent_reports,
         changes: change_reports,
         findings,
+        walkthrough,
     })
+}
+
+// ── The guided walkthrough (semantic layers) ─────────────────────────────
+
+/// The narrative-relevant slice of a reached intent's task: id, text, the
+/// paths its `::file-ref`s touch, and the criteria it satisfies.
+#[derive(Debug, Clone)]
+pub(crate) struct TaskFact {
+    pub id: String,
+    pub text: String,
+    pub touches: Vec<String>,
+    pub satisfies: Vec<String>,
+}
+
+/// A modified path's layer key: its KG module (`PART_OF`) when enriched,
+/// otherwise its parent directory (`(root)` for top-level files). Purely
+/// path-derived in the fallback, so unenriched repos still get a walkthrough.
+fn layer_key(path: &str, file_module: &BTreeMap<String, String>) -> String {
+    if let Some(module) = file_module.get(path) {
+        return module.clone();
+    }
+    match path.rsplit_once('/') {
+        Some((dir, _)) => dir.to_string(),
+        None => "(root)".to_string(),
+    }
+}
+
+/// First non-empty line of a task's directive body, trimmed — the walkthrough
+/// narrates with headlines, not whole bodies.
+fn task_headline(text: &str) -> &str {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+}
+
+/// Group the candidate modifications into ordered semantic layers.
+///
+/// Pure and deterministic: clusters modified paths by [`layer_key`], orders
+/// clusters foundations-first by a Kahn toposort over the module-level
+/// projection of `file_deps` (a layer that is imported reads before its
+/// importer), breaking ties — and cycles — lexicographically, then attaches
+/// the tasks, criteria, and changes that land in each layer plus a template
+/// prose rationale. No repo access; every input is already pinned by the
+/// report.
+pub(crate) fn build_walkthrough(
+    change_paths: &[(String, Vec<String>)],
+    file_module: &BTreeMap<String, String>,
+    file_deps: &BTreeSet<(String, String)>,
+    task_facts: &[TaskFact],
+) -> Vec<WalkthroughLayer> {
+    // 1. Cluster: layer key → sorted modified paths; path → layer key.
+    let mut layer_files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut path_layer: BTreeMap<String, String> = BTreeMap::new();
+    for (_, paths) in change_paths {
+        for p in paths {
+            let key = layer_key(p, file_module);
+            layer_files
+                .entry(key.clone())
+                .or_default()
+                .insert(p.clone());
+            path_layer.insert(p.clone(), key);
+        }
+    }
+    if layer_files.is_empty() {
+        return Vec::new();
+    }
+
+    // 2. Order: project file → file dependencies onto layers. `a imports b`
+    //    means b is more foundational, so the reading-order edge is b → a.
+    //    Only edges where BOTH ends are modified files count — the walkthrough
+    //    orders the change-set, not the whole codebase.
+    let mut reads_after: BTreeMap<String, BTreeSet<String>> = BTreeMap::new(); // layer → layers it builds on
+    for (from, to) in file_deps {
+        let (Some(from_layer), Some(to_layer)) = (path_layer.get(from), path_layer.get(to)) else {
+            continue;
+        };
+        if from_layer != to_layer {
+            reads_after
+                .entry(from_layer.clone())
+                .or_default()
+                .insert(to_layer.clone());
+        }
+    }
+
+    // Kahn's algorithm over the layer set, always taking the lexicographically
+    // smallest ready layer. A dependency cycle leaves layers with unresolved
+    // in-edges; they are appended in lexicographic order (deterministic, and
+    // their `depends_on` still names the relationship for the reader).
+    let mut remaining: BTreeSet<String> = layer_files.keys().cloned().collect();
+    let mut ordered: Vec<String> = Vec::new();
+    while !remaining.is_empty() {
+        let next = remaining
+            .iter()
+            .find(|l| {
+                reads_after
+                    .get(*l)
+                    .map(|deps| deps.iter().all(|d| !remaining.contains(d)))
+                    .unwrap_or(true)
+            })
+            .or_else(|| remaining.iter().next()) // cycle: break it lexicographically
+            .cloned()
+            .expect("remaining is non-empty");
+        remaining.remove(&next);
+        ordered.push(next);
+    }
+
+    // 3. Attach facts and narrate each layer.
+    ordered
+        .into_iter()
+        .map(|key| {
+            let files_set = &layer_files[&key];
+            let files: Vec<String> = files_set.iter().map(|p| format!("file:{p}")).collect();
+
+            // Candidate changes that modify a file in this layer (candidate order).
+            let changes: Vec<String> = change_paths
+                .iter()
+                .filter(|(_, paths)| paths.iter().any(|p| files_set.contains(p)))
+                .map(|(h, _)| h.clone())
+                .collect();
+
+            // Tasks whose touches land here (collection order = intent order),
+            // and the criteria they satisfy (sorted, deduped).
+            let mut tasks: Vec<String> = Vec::new();
+            let mut criteria: BTreeSet<String> = BTreeSet::new();
+            let mut headlines: Vec<String> = Vec::new();
+            for tf in task_facts {
+                if tf.touches.iter().any(|p| files_set.contains(p)) {
+                    tasks.push(tf.id.clone());
+                    criteria.extend(tf.satisfies.iter().cloned());
+                    let h = task_headline(&tf.text);
+                    if !h.is_empty() {
+                        headlines.push(h.to_string());
+                    }
+                }
+            }
+
+            let depends_on: Vec<String> = reads_after
+                .get(&key)
+                .map(|deps| deps.iter().map(|d| format!("layer:{d}")).collect())
+                .unwrap_or_default();
+
+            // Deterministic template prose — facts only, no generation.
+            let mut rationale = format!(
+                "{} file(s) in {} modified by {} change(s).",
+                files.len(),
+                key,
+                changes.len()
+            );
+            if !depends_on.is_empty() {
+                rationale.push_str(&format!(
+                    " Builds on {} — read those first.",
+                    depends_on
+                        .iter()
+                        .map(|d| d.strip_prefix("layer:").unwrap_or(d))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if headlines.is_empty() {
+                rationale.push_str(" No intent task touches this layer's files.");
+            } else {
+                rationale.push_str(&format!(" Motivated by: {}.", headlines.join("; ")));
+            }
+
+            WalkthroughLayer {
+                id: format!("layer:{key}"),
+                title: key,
+                rationale,
+                files,
+                tasks,
+                criteria: criteria.into_iter().collect(),
+                changes,
+                depends_on,
+            }
+        })
+        .collect()
 }
 
 fn coverage_label(cov: &atomic_repository::Coverage) -> &'static str {
@@ -1481,6 +1710,15 @@ Edit bar.
             "expected an added line with 'feature edit': {:?}",
             dfv.hunks
         );
+
+        // End-to-end walkthrough wiring: with no KG enrichment, the modified
+        // file clusters into its parent-directory layer, carrying the change.
+        assert_eq!(report.walkthrough.len(), 1, "one modified dir → one layer");
+        let layer = &report.walkthrough[0];
+        assert_eq!(layer.id, "layer:src");
+        assert_eq!(layer.files, vec!["file:src/foo.rs"]);
+        assert_eq!(layer.changes, vec![hash.clone()]);
+        assert!(layer.depends_on.is_empty());
     }
 
     const WORK_AUTHOR: &str = "did:atomic:alice";
@@ -1651,5 +1889,160 @@ Reviewed A independently.
         let f = unreviewed_findings(&report, &a_id);
         assert_eq!(f.len(), 1, "an in-flight review must not clear the gate");
         assert!(f[0].message.contains("self-authored or not yet done"));
+    }
+
+    // ── build_walkthrough (pure projection) ───────────────────────────────
+
+    fn tf(id: &str, text: &str, touches: &[&str], satisfies: &[&str]) -> TaskFact {
+        TaskFact {
+            id: id.to_string(),
+            text: text.to_string(),
+            touches: touches.iter().map(|s| s.to_string()).collect(),
+            satisfies: satisfies.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn cp(hash: &str, paths: &[&str]) -> (String, Vec<String>) {
+        (
+            hash.to_string(),
+            paths.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+
+    /// With no KG at all (no PART_OF, no IMPORTS), files cluster by parent
+    /// directory, top-level files land in `(root)`, and layers order
+    /// lexicographically (stable fallback).
+    #[test]
+    fn walkthrough_falls_back_to_path_clustering() {
+        let changes = vec![cp(
+            "HASH1",
+            &["src/storage/tables.rs", "src/cli/main.rs", "README.md"],
+        )];
+        let layers = build_walkthrough(&changes, &BTreeMap::new(), &BTreeSet::new(), &[]);
+
+        let ids: Vec<&str> = layers.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["layer:(root)", "layer:src/cli", "layer:src/storage"]
+        );
+
+        let root = &layers[0];
+        assert_eq!(root.files, vec!["file:README.md"]);
+        assert_eq!(root.changes, vec!["HASH1"]);
+        assert!(root.depends_on.is_empty());
+        assert!(root.rationale.contains("No intent task touches"));
+    }
+
+    /// An IMPORTS edge between modified files orders the imported (foundation)
+    /// layer before the importing (entry-point) layer, overriding lexicographic
+    /// order, and records the relationship in `depends_on`.
+    #[test]
+    fn walkthrough_orders_foundations_first() {
+        // "app" sorts before "zcore", but app/main.rs imports zcore/lib.rs —
+        // so zcore must read first.
+        let changes = vec![cp("HASH1", &["app/main.rs", "zcore/lib.rs"])];
+        let mut deps = BTreeSet::new();
+        deps.insert(("app/main.rs".to_string(), "zcore/lib.rs".to_string()));
+
+        let layers = build_walkthrough(&changes, &BTreeMap::new(), &deps, &[]);
+        let ids: Vec<&str> = layers.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(ids, vec!["layer:zcore", "layer:app"]);
+
+        assert!(layers[0].depends_on.is_empty());
+        assert_eq!(layers[1].depends_on, vec!["layer:zcore"]);
+        assert!(layers[1].rationale.contains("Builds on zcore"));
+    }
+
+    /// A dependency edge to a file OUTSIDE the change-set must not order (the
+    /// walkthrough orders the candidate set, not the whole codebase), and a
+    /// cycle between layers still yields every layer, deterministically.
+    #[test]
+    fn walkthrough_ignores_external_deps_and_survives_cycles() {
+        let changes = vec![cp("HASH1", &["a/x.rs", "b/y.rs"])];
+        let mut deps = BTreeSet::new();
+        // External target: no ordering effect.
+        deps.insert(("a/x.rs".to_string(), "vendor/z.rs".to_string()));
+        // Cycle: a → b and b → a.
+        deps.insert(("a/x.rs".to_string(), "b/y.rs".to_string()));
+        deps.insert(("b/y.rs".to_string(), "a/x.rs".to_string()));
+
+        let layers = build_walkthrough(&changes, &BTreeMap::new(), &deps, &[]);
+        let ids: Vec<&str> = layers.iter().map(|l| l.id.as_str()).collect();
+        // Cycle broken lexicographically; both layers present.
+        assert_eq!(ids, vec!["layer:a", "layer:b"]);
+        // The cyclic relationship is still visible to the reader.
+        assert_eq!(layers[0].depends_on, vec!["layer:b"]);
+        assert_eq!(layers[1].depends_on, vec!["layer:a"]);
+    }
+
+    /// PART_OF module membership beats the path fallback, and tasks/criteria
+    /// attach to the layer their touched files land in — with the task's
+    /// headline in the rationale.
+    #[test]
+    fn walkthrough_uses_modules_and_attaches_tasks() {
+        let changes = vec![
+            cp("HASH1", &["crates/store/src/tables.rs"]),
+            cp("HASH2", &["crates/cli/src/run.rs"]),
+        ];
+        let mut modules = BTreeMap::new();
+        modules.insert(
+            "crates/store/src/tables.rs".to_string(),
+            "store".to_string(),
+        );
+        modules.insert("crates/cli/src/run.rs".to_string(), "cli".to_string());
+
+        let tasks = vec![
+            tf(
+                "urn:atomic:task:T-1",
+                "Add the VIEW_CHANGES filter\nmore detail here",
+                &["crates/store/src/tables.rs"],
+                &["T-ac-1"],
+            ),
+            tf(
+                "urn:atomic:task:T-2",
+                "Wire the CLI flag",
+                &["crates/cli/src/run.rs"],
+                &["T-ac-1", "T-ac-2"],
+            ),
+        ];
+
+        let layers = build_walkthrough(&changes, &modules, &BTreeSet::new(), &tasks);
+        assert_eq!(layers.len(), 2);
+
+        let store = layers.iter().find(|l| l.id == "layer:store").unwrap();
+        assert_eq!(store.tasks, vec!["urn:atomic:task:T-1"]);
+        assert_eq!(store.criteria, vec!["T-ac-1"]);
+        assert_eq!(store.changes, vec!["HASH1"]);
+        assert!(store.rationale.contains("Add the VIEW_CHANGES filter"));
+        assert!(!store.rationale.contains("more detail here"));
+
+        let cli = layers.iter().find(|l| l.id == "layer:cli").unwrap();
+        assert_eq!(cli.tasks, vec!["urn:atomic:task:T-2"]);
+        assert_eq!(cli.criteria, vec!["T-ac-1", "T-ac-2"]);
+        assert_eq!(cli.changes, vec!["HASH2"]);
+    }
+
+    /// The projection is a pure function: identical inputs → identical output,
+    /// and an empty candidate set → empty walkthrough.
+    #[test]
+    fn walkthrough_is_deterministic_and_empty_on_no_files() {
+        assert!(
+            build_walkthrough(&[], &BTreeMap::new(), &BTreeSet::new(), &[]).is_empty(),
+            "no modified files → no walkthrough"
+        );
+
+        let changes = vec![cp("HASH1", &["m/a.rs", "n/b.rs"]), cp("HASH2", &["m/c.rs"])];
+        let mut deps = BTreeSet::new();
+        deps.insert(("n/b.rs".to_string(), "m/a.rs".to_string()));
+        let tasks = vec![tf("urn:atomic:task:T-1", "do it", &["m/a.rs"], &["T-ac-1"])];
+
+        let a = build_walkthrough(&changes, &BTreeMap::new(), &deps, &tasks);
+        let b = build_walkthrough(&changes, &BTreeMap::new(), &deps, &tasks);
+        assert_eq!(a, b);
+
+        // And the reading order is foundations-first: m (imported by n) → n.
+        let ids: Vec<&str> = a.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(ids, vec!["layer:m", "layer:n"]);
+        assert_eq!(a[0].changes, vec!["HASH1", "HASH2"]);
     }
 }
