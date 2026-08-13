@@ -464,6 +464,27 @@ impl<'a> SyncEngine<'a> {
         &self.stats
     }
 
+    /// Fold a set of base32 change hashes into the view's order-invariant
+    /// [`SetId`](atomic_core::types::SetId) string.
+    ///
+    /// Returns `None` if any hash is not valid base32, in which case the
+    /// caller must fall back to the Merkle dichotomy rather than risk a false
+    /// "in sync" from a partially-folded set.
+    ///
+    /// The domain is the local view's applyable change set — it must match
+    /// byte-for-byte the domain the server folds into the advertised `SetId`
+    /// (changes and tags, sidecars excluded); see the cross-producer contract
+    /// on [`atomic_core::types::SetId`].
+    fn local_set_id(local_hashes: &HashSet<String>) -> Option<String> {
+        use atomic_core::types::{Base32, Merkle, SetId};
+        let mut acc = SetId::ZERO;
+        for hash in local_hashes {
+            let merkle = Merkle::from_base32(hash.as_bytes())?;
+            acc = acc.add(&merkle);
+        }
+        Some(acc.to_base32())
+    }
+
     // Dichotomy Algorithm — O(log n) divergence detection
 
     /// Find the divergence point between our cached view and the remote's
@@ -616,6 +637,24 @@ impl<'a> SyncEngine<'a> {
         view: &str,
         local_hashes: &HashSet<String>,
     ) -> RemoteResult<RemoteDelta> {
+        // Order-invariant fast path (additive; dormant until the server
+        // advertises a SetId). If the remote publishes the SetId of its
+        // effective change set and it equals the SetId folded from our local
+        // hashes, both sides hold the same SET of changes regardless of order
+        // — we are in sync and can skip the O(log n) Merkle dichotomy and the
+        // changelist download entirely. When the field is absent (older
+        // server) or the local set cannot be folded, we fall through to the
+        // existing dichotomy with no behavior change.
+        let remote_state = self.remote.get_state(view).await?;
+        if let (Some(remote_sid), Some(local_sid)) =
+            (remote_state.set_id(), Self::local_set_id(local_hashes))
+        {
+            if remote_sid == local_sid {
+                debug!("sync: SetId match ({}), views already in sync", remote_sid);
+                return Ok(RemoteDelta::in_sync());
+            }
+        }
+
         // Handle from-scratch sync (no cache)
         if self.cache.is_empty() {
             return self.compute_delta_from_scratch(view, local_hashes).await;
