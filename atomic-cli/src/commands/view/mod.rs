@@ -90,6 +90,7 @@ pub mod delete;
 pub mod list;
 pub mod new;
 pub mod promote;
+pub mod split;
 pub mod switch;
 
 use clap::Subcommand;
@@ -98,6 +99,7 @@ pub use delete::Delete;
 pub use list::List;
 pub use new::New;
 pub use promote::Promote;
+pub use split::Split;
 pub use switch::Switch;
 
 use crate::commands::Command;
@@ -139,6 +141,25 @@ pub enum ViewCommands {
     /// ```
     #[command(name = "create")]
     Create(New),
+
+    /// Split changes out of a view into a new draft view.
+    ///
+    /// Creates a new draft that forks from the source view, then removes the
+    /// chosen changes from the source. This is a pure metadata operation — no
+    /// changes are rewritten. Splitting from the middle is refused when a
+    /// change staying behind depends on one being removed, unless `--cascade`
+    /// is given.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Split two specific changes out of the current view
+    /// atomic view split wip ABCDEF12 34567890
+    ///
+    /// # Split the last 3 changes out of dev, previewing first
+    /// atomic view split wip --from dev --last 3 --dry-run
+    /// ```
+    Split(Split),
 
     /// Switch to a different view.
     ///
@@ -197,6 +218,7 @@ impl Command for View {
     fn run(&self) -> CliResult<()> {
         match &self.command {
             ViewCommands::Create(cmd) => cmd.run(),
+            ViewCommands::Split(cmd) => cmd.run(),
             ViewCommands::Switch(cmd) => cmd.run(),
             ViewCommands::Delete(cmd) => cmd.run(),
             ViewCommands::List(cmd) => cmd.run(),
@@ -217,6 +239,7 @@ mod tests {
         fn check_variant(cmd: &ViewCommands) -> &'static str {
             match cmd {
                 ViewCommands::Create(_) => "create",
+                ViewCommands::Split(_) => "split",
                 ViewCommands::Switch(_) => "switch",
                 ViewCommands::Delete(_) => "delete",
                 ViewCommands::List(_) => "list",
