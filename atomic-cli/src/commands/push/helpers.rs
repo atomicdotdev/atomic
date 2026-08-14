@@ -153,6 +153,14 @@ pub struct ViewSyncPlan {
     /// True when divergence was overridden with `--force`. The server is
     /// still authoritative and may reject the declare.
     pub forced: bool,
+
+    /// True when the local view is a strict *subset* of the remote (it shrank,
+    /// e.g. after `atomic view split` moved changes out). By default such a
+    /// declare is skipped (`declare == false`) so the remote keeps its fuller
+    /// set and a descendant push is not blocked; with `--force` it is declared
+    /// (`declare == true`, `forced == true`), rewriting the remote view to the
+    /// smaller set. Purely informational — lets the caller explain the skip.
+    pub shrink: bool,
 }
 
 impl ViewSyncPlan {
@@ -177,10 +185,21 @@ impl ViewSyncPlan {
 /// the declare is attempted anyway, leaving the server as the authority.
 /// Identity mismatches (scope/parent) are never forced — they are
 /// structural, and the server would reject them regardless.
+///
+/// `is_leaf` marks the view the user actually asked to push (the tip of the
+/// chain) versus an *ancestor* pulled in only because a descendant needs it.
+/// For an ancestor whose remote already contains every local change, there is
+/// nothing to do — the remote already satisfies the descendant — so it is
+/// skipped even if the local ancestor shrank (e.g. via `atomic view split`);
+/// this keeps an ancestor's local shrink from aborting a leaf push, and never
+/// rewrites shared history implicitly. For the leaf, `local ⊂ remote` is
+/// genuinely ambiguous (local is behind vs. local shrank), so it is left to the
+/// prefix/divergence rules, which err toward "pull first, or `--force`".
 pub fn plan_view_sync(
     local: &ViewManifest,
     remote: Option<&ViewManifest>,
     force: bool,
+    is_leaf: bool,
 ) -> Result<ViewSyncPlan, ViewSyncConflict> {
     let remote = match remote {
         None => {
@@ -189,6 +208,7 @@ pub fn plan_view_sync(
                 suffix: local.changes.clone(),
                 declare: true,
                 forced: false,
+                shrink: false,
             });
         }
         Some(r) => r,
@@ -210,6 +230,27 @@ pub fn plan_view_sync(
             local: show(&local.parent),
             remote: show(&remote.parent),
         });
+    }
+
+    // Ancestor already satisfied. When this view is NOT the one being pushed (an
+    // ancestor pulled in for a descendant) and the remote already holds every
+    // local change, there is nothing to do: the remote's set already satisfies
+    // the descendant, and pushing a child never implies rewriting a parent. Skip
+    // without error — so a child push is never blocked by an ancestor whose
+    // remote is merely larger (a local shrink) — and flag `shrink` when the
+    // remote is strictly larger so the caller can explain the skip. The leaf
+    // falls through to the prefix/divergence rules below, where `local ⊂ remote`
+    // is ambiguous and errs toward "pull or --force".
+    if !is_leaf {
+        let remote_set: HashSet<&Hash> = remote.changes.iter().collect();
+        if local.changes.iter().all(|h| remote_set.contains(h)) {
+            return Ok(ViewSyncPlan {
+                suffix: Vec::new(),
+                declare: false,
+                forced: false,
+                shrink: local.changes.len() != remote.changes.len(),
+            });
+        }
     }
 
     // Prefix rule.
@@ -249,6 +290,7 @@ pub fn plan_view_sync(
             suffix,
             declare: true,
             forced: true,
+            shrink: false,
         });
     }
 
@@ -259,6 +301,7 @@ pub fn plan_view_sync(
         suffix,
         declare,
         forced: false,
+        shrink: false,
     })
 }
 
@@ -593,7 +636,7 @@ mod tests {
     #[test]
     fn test_plan_absent_remote_uploads_full_log() {
         let local = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2), h(3)]);
-        let plan = plan_view_sync(&local, None, false).unwrap();
+        let plan = plan_view_sync(&local, None, false, true).unwrap();
 
         assert_eq!(plan.suffix, vec![h(1), h(2), h(3)]);
         assert!(plan.declare);
@@ -604,7 +647,7 @@ mod tests {
     fn test_plan_remote_prefix_uploads_suffix_only() {
         let local = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2), h(3), h(4)]);
         let remote = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2)]);
-        let plan = plan_view_sync(&local, Some(&remote), false).unwrap();
+        let plan = plan_view_sync(&local, Some(&remote), false, true).unwrap();
 
         assert_eq!(plan.suffix, vec![h(3), h(4)]);
         assert!(plan.declare);
@@ -615,7 +658,7 @@ mod tests {
     fn test_plan_identical_logs_is_noop() {
         let local = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2)]);
         let remote = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2)]);
-        let plan = plan_view_sync(&local, Some(&remote), false).unwrap();
+        let plan = plan_view_sync(&local, Some(&remote), false, true).unwrap();
 
         assert!(plan.suffix.is_empty());
         assert!(!plan.declare);
@@ -627,7 +670,7 @@ mod tests {
         // View exists on the remote but its log is empty (freshly declared).
         let local = manifest("dev", ViewScope::Shared, None, vec![h(1)]);
         let remote = manifest("dev", ViewScope::Shared, None, vec![]);
-        let plan = plan_view_sync(&local, Some(&remote), false).unwrap();
+        let plan = plan_view_sync(&local, Some(&remote), false, true).unwrap();
 
         assert_eq!(plan.suffix, vec![h(1)]);
         assert!(plan.declare);
@@ -637,7 +680,7 @@ mod tests {
     fn test_plan_diverged_hash_mismatch() {
         let local = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2), h(3)]);
         let remote = manifest("dev", ViewScope::Shared, None, vec![h(1), h(9)]);
-        let err = plan_view_sync(&local, Some(&remote), false).unwrap_err();
+        let err = plan_view_sync(&local, Some(&remote), false, true).unwrap_err();
 
         assert_eq!(
             err,
@@ -651,10 +694,11 @@ mod tests {
 
     #[test]
     fn test_plan_diverged_remote_longer() {
-        // Remote is ahead of local: not a prefix, so pull first.
+        // Leaf pushed and remote is ahead (local ⊂ remote): ambiguous — behind
+        // vs. shrunk — so the leaf still errs toward "pull first, or --force".
         let local = manifest("dev", ViewScope::Shared, None, vec![h(1)]);
         let remote = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2)]);
-        let err = plan_view_sync(&local, Some(&remote), false).unwrap_err();
+        let err = plan_view_sync(&local, Some(&remote), false, true).unwrap_err();
 
         assert_eq!(
             err,
@@ -670,7 +714,7 @@ mod tests {
     fn test_plan_forced_diverged_stores_set_difference() {
         let local = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2), h(3)]);
         let remote = manifest("dev", ViewScope::Shared, None, vec![h(1), h(9)]);
-        let plan = plan_view_sync(&local, Some(&remote), true).unwrap();
+        let plan = plan_view_sync(&local, Some(&remote), true, true).unwrap();
 
         // h(1) is already on the remote view; h(2), h(3) are not.
         assert_eq!(plan.suffix, vec![h(2), h(3)]);
@@ -683,14 +727,14 @@ mod tests {
         let local = manifest("x", ViewScope::Draft, Some("dev"), vec![h(1)]);
         let remote = manifest("x", ViewScope::Shared, Some("dev"), vec![h(1)]);
 
-        let err = plan_view_sync(&local, Some(&remote), false).unwrap_err();
+        let err = plan_view_sync(&local, Some(&remote), false, true).unwrap_err();
         assert!(matches!(
             err,
             ViewSyncConflict::IdentityMismatch { field: "scope", .. }
         ));
 
         // Identity mismatches are structural — force does not bypass them.
-        let err = plan_view_sync(&local, Some(&remote), true).unwrap_err();
+        let err = plan_view_sync(&local, Some(&remote), true, true).unwrap_err();
         assert!(matches!(
             err,
             ViewSyncConflict::IdentityMismatch { field: "scope", .. }
@@ -698,10 +742,61 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_ancestor_shrunk_is_skipped_not_blocking() {
+        // An ANCESTOR in the chain (is_leaf = false) shrank locally, but the
+        // remote already holds every local change. It is skipped (no store, no
+        // declare) so a descendant push is not blocked, and `shrink` is flagged
+        // so the caller can explain the skip. Force does not change this —
+        // rewriting an ancestor must be done by pushing it directly.
+        let local = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2)]);
+        let remote = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2), h(3), h(4)]);
+
+        let plan = plan_view_sync(&local, Some(&remote), false, false).unwrap();
+        assert!(plan.suffix.is_empty(), "nothing to store for an ancestor");
+        assert!(!plan.declare, "an ancestor shrink is not declared");
+        assert!(!plan.forced);
+        assert!(plan.shrink, "flagged so the push can explain the skip");
+        assert!(plan.is_noop());
+
+        let forced = plan_view_sync(&local, Some(&remote), true, false).unwrap();
+        assert!(
+            !forced.declare,
+            "force does not rewrite an ancestor via a child push"
+        );
+    }
+
+    #[test]
+    fn test_plan_leaf_shrunk_forced_declares_smaller_set() {
+        // The LEAF being pushed shrank; with --force the remote view is rewritten
+        // to the smaller set (nothing new to store, since local ⊂ remote).
+        let local = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2)]);
+        let remote = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2), h(3), h(4)]);
+        let plan = plan_view_sync(&local, Some(&remote), true, true).unwrap();
+
+        assert!(plan.suffix.is_empty());
+        assert!(
+            plan.declare,
+            "a forced leaf shrink rewrites the remote view"
+        );
+        assert!(plan.forced);
+    }
+
+    #[test]
+    fn test_plan_genuine_divergence_still_errors_not_masked_by_shrink() {
+        // Remote is longer AND holds a change local lacks that local did not
+        // simply drop (h(2) local vs h(5)/h(6) remote) — a real divergence, not a
+        // subset shrink. Must still error without --force, even as an ancestor.
+        let local = manifest("dev", ViewScope::Shared, None, vec![h(1), h(2)]);
+        let remote = manifest("dev", ViewScope::Shared, None, vec![h(1), h(5), h(6)]);
+        let err = plan_view_sync(&local, Some(&remote), false, false).unwrap_err();
+        assert!(matches!(err, ViewSyncConflict::Diverged { .. }));
+    }
+
+    #[test]
     fn test_plan_parent_mismatch_is_conflict() {
         let local = manifest("x", ViewScope::Draft, Some("dev"), vec![h(1)]);
         let remote = manifest("x", ViewScope::Draft, Some("release"), vec![h(1)]);
-        let err = plan_view_sync(&local, Some(&remote), false).unwrap_err();
+        let err = plan_view_sync(&local, Some(&remote), false, true).unwrap_err();
 
         match err {
             ViewSyncConflict::IdentityMismatch {
