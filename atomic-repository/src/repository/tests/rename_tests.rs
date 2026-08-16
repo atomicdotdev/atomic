@@ -292,3 +292,38 @@ fn test_plain_delete_is_not_a_rename() {
     assert!(sawdel, "plain delete should still record as a FileDel");
     assert!(repo.get_file_inode("f.txt").unwrap().is_none());
 }
+
+/// Internal callers can explicitly disable raw rename detection when they
+/// already know every destination path. The tracked deletion must still be
+/// recorded, while the unrelated untracked file remains outside the change.
+#[test]
+fn test_raw_rename_detection_can_be_disabled() {
+    let (temp, repo) = create_temp_repo();
+    let old = temp.path().join("old.txt");
+
+    std::fs::write(&old, "same content\n").unwrap();
+    repo.add("old.txt", TrackingOptions::default()).unwrap();
+    record_all(&repo, "base").unwrap();
+
+    std::fs::rename(&old, temp.path().join("new.txt")).unwrap();
+    let outcome = repo
+        .record(
+            ChangeHeader::new("delete without rename detection"),
+            RecordOptions::new()
+                .with_all(true)
+                .detect_raw_renames(false),
+        )
+        .unwrap();
+
+    assert!(outcome
+        .change()
+        .hunks()
+        .iter()
+        .any(|op| matches!(op, GraphOp::FileDel { path, .. } if path == "old.txt")));
+    assert!(!outcome
+        .change()
+        .hunks()
+        .iter()
+        .any(|op| matches!(op, GraphOp::FileMove { .. })));
+    assert!(temp.path().join("new.txt").exists());
+}

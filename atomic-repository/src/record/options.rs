@@ -97,6 +97,13 @@ pub struct RecordOptions {
     /// resolved before it is baked into history. Set true to override (for
     /// the rare case where such lines are legitimate content).
     allow_conflict_markers: bool,
+
+    /// Whether to detect raw filesystem renames by matching deleted tracked
+    /// files with byte-identical untracked files.
+    ///
+    /// Defaults to `true`. Internal callers that already know every path they
+    /// intend to record may disable this to avoid an unrelated untracked scan.
+    detect_raw_renames: bool,
 }
 
 impl RecordOptions {
@@ -267,6 +274,19 @@ impl RecordOptions {
     #[must_use]
     pub fn get_allow_conflict_markers(&self) -> bool {
         self.allow_conflict_markers
+    }
+
+    /// Set whether raw filesystem renames should be detected.
+    #[must_use]
+    pub fn detect_raw_renames(mut self, detect: bool) -> Self {
+        self.detect_raw_renames = detect;
+        self
+    }
+
+    /// Get whether raw filesystem rename detection is enabled.
+    #[must_use]
+    pub fn get_detect_raw_renames(&self) -> bool {
+        self.detect_raw_renames
     }
 
     /// Set AI provenance information for this change.
@@ -450,6 +470,7 @@ impl Default for RecordOptions {
             enrich_kg: true,
             provenance: Vec::new(),
             allow_conflict_markers: false,
+            detect_raw_renames: true,
         }
     }
 }

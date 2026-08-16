@@ -361,6 +361,9 @@ pub fn record_turn(
         .view(options.session.view_name.clone())
         .apply_after_record(true)
         .save_to_store(true)
+        // The agent already discovered and added every untracked destination
+        // above, so a second raw-rename scan cannot find a move.
+        .detect_raw_renames(false)
         .sync_vault(false)
         .enrich_kg(false)
         .provenance(vec![provenance_entry])

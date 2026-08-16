@@ -588,7 +588,10 @@ impl Command for Init {
                 atomic_repository::TrackingOptions::default(),
             );
             let header = atomic_core::change::ChangeHeader::new("Initialize repository");
-            match repo.record(header, atomic_repository::RecordOptions::default()) {
+            let options = atomic_repository::RecordOptions::new()
+                .add_path(".atomicignore")
+                .detect_raw_renames(false);
+            match repo.record(header, options) {
                 Ok(_) => {}
                 Err(atomic_repository::RecordError::NothingToRecord) => {}
                 Err(e) => log::warn!("Failed to record .atomicignore: {}", e),
@@ -610,7 +613,10 @@ impl Command for Init {
 
             // Record vault files as their own change
             let header = atomic_core::change::ChangeHeader::new("Initialize vault");
-            match repo.record(header, atomic_repository::RecordOptions::default()) {
+            let options = atomic_repository::RecordOptions::new()
+                .add_path(".vault")
+                .detect_raw_renames(false);
+            match repo.record(header, options) {
                 Ok(outcome) => {
                     println!(
                         "Recorded vault defaults ({} files)",
