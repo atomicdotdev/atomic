@@ -265,6 +265,27 @@ pub enum CliError {
         line: u32,
     },
 
+    /// A file exceeded the maximum size `record` will take.
+    ///
+    /// Expected and user-fixable: the file is nearly always a build artifact
+    /// or dependency cache that should be ignored rather than versioned, and
+    /// the limit itself is adjustable. Sizes are rendered in human units
+    /// because a bare byte count tells the user nothing about how far over
+    /// the limit they are.
+    #[error(
+        "{path} is {} (limit: {})",
+        crate::commands::format_size(*size),
+        crate::commands::format_size(*limit)
+    )]
+    FileTooLarge {
+        /// Repository-relative path of the oversized file.
+        path: String,
+        /// Actual size of the file in bytes.
+        size: u64,
+        /// The configured limit in bytes.
+        limit: u64,
+    },
+
     // Identity Errors
     /// The specified identity doesn't exist.
     ///
@@ -483,6 +504,7 @@ impl CliError {
                 | Self::MissingDependency { .. }
                 | Self::Conflict { .. }
                 | Self::ConflictMarkers { .. }
+                | Self::FileTooLarge { .. }
                 | Self::IdentityNotFound(_)
                 | Self::IdentityAlreadyExists(_)
                 | Self::RemoteNotFound { .. }
@@ -578,6 +600,9 @@ impl CliError {
             Self::ConflictMarkers { .. } => Some(
                 "Edit the file to remove the '>>>>>>>' / '=======' / '<<<<<<<' lines and keep the content you want, then record again. Run 'atomic conflicts' to list every conflict, or pass '--allow-conflict-markers' if the markers are legitimate content.",
             ),
+            Self::FileTooLarge { .. } => Some(
+                "If this is build output or a dependency cache, add it to '.atomicignore' (or your '.gitignore') and record again. To record everything else and leave oversized files out, use 'atomic record --skip-binary'. To raise the ceiling instead, use 'atomic record --max-size <bytes>'.",
+            ),
             Self::Cancelled => None,
             Self::InvalidArgument { .. } => {
                 Some("Run 'atomic <command> --help' for usage information.")
@@ -635,6 +660,7 @@ impl CliError {
             | Self::MissingDependency { .. }
             | Self::Conflict { .. }
             | Self::ConflictMarkers { .. }
+            | Self::FileTooLarge { .. }
             | Self::IdentityNotFound(_)
             | Self::IdentityAlreadyExists(_) => 3,
 
@@ -876,6 +902,60 @@ mod tests {
     fn test_cancelled_no_suggestion() {
         let err = CliError::Cancelled;
         assert!(err.suggestion().is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // FileTooLarge
+    //
+    // Regression: `atomic record` in a Next.js project hit an 11 MB turbopack
+    // cache file and reported "Internal error … This appears to be a bug,
+    // please report it", exiting 128. It is neither internal nor a bug.
+    // -------------------------------------------------------------------------
+
+    fn oversized() -> CliError {
+        CliError::FileTooLarge {
+            path: ".next/dev/cache/turbopack/v16.2.10/00000012.sst".into(),
+            size: 11_290_117,
+            limit: 10 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn test_file_too_large_display_uses_human_units() {
+        let msg = oversized().to_string();
+        assert!(msg.contains("00000012.sst"), "message was: {msg}");
+        assert!(msg.contains("10.8 MiB"), "actual size unreadable: {msg}");
+        assert!(msg.contains("10.0 MiB"), "limit unreadable: {msg}");
+        assert!(
+            !msg.contains("11290117"),
+            "raw byte counts should not reach the user: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_file_too_large_is_not_reported_as_a_bug() {
+        let err = oversized();
+        assert!(err.is_user_fixable());
+        assert!(!err.is_internal());
+        assert_eq!(err.exit_code(), 3);
+        assert_ne!(err.exit_code(), 128);
+
+        let suggestion = err.suggestion().expect("needs an actionable hint");
+        assert!(
+            !suggestion.contains("github.com"),
+            "must not ask the user to file an issue: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn test_file_too_large_suggestion_names_every_escape_hatch() {
+        let suggestion = oversized().suggestion().unwrap();
+        for expected in [".atomicignore", "--skip-binary", "--max-size"] {
+            assert!(
+                suggestion.contains(expected),
+                "hint omits {expected}: {suggestion}"
+            );
+        }
     }
 
     // -------------------------------------------------------------------------

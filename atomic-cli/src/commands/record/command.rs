@@ -56,31 +56,54 @@ impl Command for Record {
             }
         }
 
-        // Record the changes
-        let outcome = repo.record(header, options).map_err(|e| match e {
-            atomic_repository::record::RecordError::NothingToRecord => CliError::NothingToRecord,
-            atomic_repository::record::RecordError::NoFilesMatched => CliError::NothingToRecord,
-            atomic_repository::record::RecordError::FileNotFound { path } => {
-                CliError::FileNotFound {
+        // Record the changes.
+        //
+        // This match is deliberately exhaustive: no `_ =>` arm. The catch-all
+        // it replaces routed everything unlisted into `CliError::Internal`,
+        // which tells the user "this appears to be a bug, please report it"
+        // and exits 128 — so every new `RecordError` variant silently
+        // defaulted to accusing Atomic of a bug. `FileTooLarge` reached users
+        // that way. Keeping the match exhaustive makes the compiler demand a
+        // classification decision for each variant added from here on.
+        let outcome = repo.record(header, options).map_err(|e| {
+            use atomic_repository::record::RecordError as RE;
+            match e {
+                RE::NothingToRecord | RE::NoFilesMatched => CliError::NothingToRecord,
+                RE::FileNotFound { path } => CliError::FileNotFound {
                     path: PathBuf::from(path),
-                }
-            }
-            atomic_repository::record::RecordError::FileNotTracked { path } => {
-                CliError::FileNotTracked {
+                },
+                RE::FileNotTracked { path } => CliError::FileNotTracked {
                     path: PathBuf::from(path),
+                },
+                // Refusing to bake an unresolved merge into history is the
+                // documented behavior, not a bug — keep it out of the
+                // Internal bucket so it neither tells the user to file an
+                // issue nor exits 128.
+                RE::ConflictMarkersPresent { path, line } => {
+                    CliError::ConflictMarkers { path, line }
                 }
+                RE::UnresolvedConflicts => CliError::Conflict {
+                    description: "the working copy has unresolved conflicts".to_string(),
+                },
+                // Almost always a build artifact or dependency cache that
+                // should have been ignored. The user can fix it three ways,
+                // all named in the error's suggestion.
+                RE::FileTooLarge { path, size, limit } => {
+                    CliError::FileTooLarge { path, size, limit }
+                }
+                // A bad `--message`/`--author` is a usage error, not a bug.
+                RE::InvalidHeader { reason } => CliError::InvalidArgument { message: reason },
+                // Unreadable file, full disk, bad permissions: the
+                // environment failed, not Atomic.
+                RE::Io(err) => CliError::Io(err),
+                RE::Repository(err) => CliError::Repository(err),
+                // Genuine internal failures: the change graph or the store
+                // itself misbehaved. These are the ones worth a bug report.
+                other @ (RE::Globalize(_)
+                | RE::Assembly(_)
+                | RE::ChangeStore(_)
+                | RE::Database(_)) => CliError::Internal(anyhow::anyhow!("{}", other)),
             }
-            // Refusing to bake an unresolved merge into history is the
-            // documented behavior, not a bug — keep it out of the
-            // Internal bucket so it neither tells the user to file an
-            // issue nor exits 128.
-            atomic_repository::record::RecordError::ConflictMarkersPresent { path, line } => {
-                CliError::ConflictMarkers { path, line }
-            }
-            atomic_repository::record::RecordError::UnresolvedConflicts => CliError::Conflict {
-                description: "the working copy has unresolved conflicts".to_string(),
-            },
-            other => CliError::Internal(anyhow::anyhow!("{}", other)),
         })?;
 
         // Display result

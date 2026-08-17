@@ -1,8 +1,9 @@
 //! Ignore pattern matching for Atomic VCS
 //!
-//! This module parses and applies `.atomicignore` patterns using gitignore syntax.
-//! It supports both global ignore rules (from `~/.config/atomic/ignore`) and
-//! repository-local rules (from `.atomicignore` in the repository root).
+//! This module parses and applies ignore patterns using gitignore syntax.
+//! It supports global ignore rules (from `~/.config/atomic/ignore`) and
+//! repository-local rules from `.gitignore`, `.ignore`, and `.atomicignore`
+//! at the repository root.
 //!
 //! # Pattern Syntax
 //!
@@ -18,8 +19,11 @@
 //!
 //! # Priority
 //!
-//! Local `.atomicignore` rules take precedence over global rules.
-//! Within each file, later rules override earlier ones.
+//! Repository-local rules take precedence over global rules. Among the local
+//! files the order is `.gitignore` < `.ignore` < `.atomicignore`, so Atomic's
+//! own file has the final say and a `!pattern` there can re-include something
+//! the project's `.gitignore` excludes. Within each file, later rules override
+//! earlier ones.
 //!
 //! # Example
 //!
@@ -63,7 +67,8 @@ pub enum IgnoreError {
 ///
 /// This struct aggregates ignore patterns from:
 /// - Global config: `~/.config/atomic/ignore`
-/// - Repository-local: `.atomicignore` in repository root
+/// - Repository-local: `.gitignore`, `.ignore`, and `.atomicignore` in the
+///   repository root
 ///
 /// # Example
 ///
@@ -87,7 +92,7 @@ pub enum IgnoreError {
 pub struct IgnoreRules {
     /// Global ignore rules from ~/.config/atomic/ignore
     global: Option<Gitignore>,
-    /// Repository-level rules from .atomicignore
+    /// Repository-level rules from .gitignore, .ignore, and .atomicignore
     local: Option<Gitignore>,
     /// Repository root path (for relative path resolution)
     repo_root: std::path::PathBuf,
@@ -96,8 +101,20 @@ pub struct IgnoreRules {
 impl IgnoreRules {
     /// Load ignore rules for a repository.
     ///
-    /// This loads rules from both global and local ignore files.
-    /// Missing files are silently ignored (not an error).
+    /// This loads rules from the global ignore file and from the repository's
+    /// `.gitignore`, `.ignore`, and `.atomicignore`. Missing files are
+    /// silently ignored (not an error).
+    ///
+    /// Honoring `.gitignore` matters because it is what virtually every
+    /// project already uses to exclude build artifacts. Without it a first
+    /// `atomic record` in, say, a Next.js repository walks straight into
+    /// `.next/` and trips over multi-megabyte bundler caches that were never
+    /// meant to be versioned.
+    ///
+    /// These rules govern *discovery* of new paths — `status` listing
+    /// untracked files, `add` picking up a directory. A file that is already
+    /// tracked stays tracked and keeps being recorded even if a pattern later
+    /// starts matching it, mirroring Git's behavior.
     ///
     /// # Arguments
     ///
@@ -118,24 +135,12 @@ impl IgnoreRules {
 
     /// Load ignore rules for knowledge-graph enrichment.
     ///
-    /// Like [`load`](Self::load), but the repository-local rules are built
-    /// from `.atomicignore`, `.gitignore`, and `.ignore` (in that order, so
-    /// later files take precedence on conflicting patterns). This lets
-    /// `atomic query enrich` skip build artifacts and dependencies that those
-    /// files exclude (e.g. `node_modules/`, `dist/`, `target/`) instead of
-    /// creating knowledge-graph nodes for them.
-    ///
-    /// Only the files at the repository root are consulted; nested ignore
-    /// files in subdirectories are not (matching the existing `.atomicignore`
-    /// behavior of [`load`](Self::load)).
+    /// Identical to [`load`](Self::load) — both read the same set of local
+    /// ignore files. Kept as a distinct entry point because enrichment and
+    /// content search additionally filter out Atomic-internal paths such as
+    /// `.vault`, and because the call sites read more clearly for it.
     pub fn load_for_enrichment(repo_root: &Path) -> Self {
-        let global = load_global_ignore();
-        let local = load_local_enrichment_ignore(repo_root);
-        Self {
-            global,
-            local,
-            repo_root: repo_root.to_path_buf(),
-        }
+        Self::load(repo_root)
     }
 
     /// Create an empty IgnoreRules (ignores nothing except built-in patterns).
@@ -356,49 +361,29 @@ fn load_global_ignore() -> Option<Gitignore> {
     }
 }
 
-/// Load repository-local ignore rules from .atomicignore
-fn load_local_ignore(repo_root: &Path) -> Option<Gitignore> {
-    let ignore_path = repo_root.join(".atomicignore");
-
-    if ignore_path.exists() {
-        let mut builder = GitignoreBuilder::new(repo_root);
-        // builder.add() returns Option<Error> - log if there's an issue
-        if let Some(err) = builder.add(&ignore_path) {
-            log::warn!(
-                "Failed to parse .atomicignore at {}: {}",
-                ignore_path.display(),
-                err
-            );
-            return None;
-        }
-        match builder.build() {
-            Ok(gitignore) => Some(gitignore),
-            Err(err) => {
-                log::warn!(
-                    "Failed to build ignore rules from {}: {}",
-                    ignore_path.display(),
-                    err
-                );
-                None
-            }
-        }
-    } else {
-        None
-    }
-}
-
-/// Load repository-local ignore rules for enrichment from `.atomicignore`,
-/// `.gitignore`, and `.ignore` at the repository root.
+/// Repository-local ignore files, lowest precedence first.
 ///
-/// All existing files are merged into a single matcher. Later files take
-/// precedence on conflicting patterns (`.atomicignore` < `.gitignore` <
-/// `.ignore`), following the `ignore` crate's last-match-wins semantics.
-/// Returns `None` when none of the files exist or all fail to parse.
-fn load_local_enrichment_ignore(repo_root: &Path) -> Option<Gitignore> {
+/// `.atomicignore` comes last so it wins on conflicting patterns: it is
+/// Atomic's own file, and a `!pattern` there must be able to re-include
+/// something the project's `.gitignore` excludes.
+const LOCAL_IGNORE_FILES: [&str; 3] = [".gitignore", ".ignore", ".atomicignore"];
+
+/// Load repository-local ignore rules from `.gitignore`, `.ignore`, and
+/// `.atomicignore` at the repository root.
+///
+/// All existing files are merged into a single matcher following the `ignore`
+/// crate's last-match-wins semantics, so the order in [`LOCAL_IGNORE_FILES`]
+/// is also the precedence order. A file that fails to parse is skipped with a
+/// warning rather than discarding the rules that did load. Returns `None` when
+/// none of the files exist or all fail to parse.
+///
+/// Only the files at the repository root are consulted; nested ignore files in
+/// subdirectories are not.
+fn load_local_ignore(repo_root: &Path) -> Option<Gitignore> {
     let mut builder = GitignoreBuilder::new(repo_root);
     let mut added = false;
 
-    for name in [".atomicignore", ".gitignore", ".ignore"] {
+    for name in LOCAL_IGNORE_FILES {
         let ignore_path = repo_root.join(name);
         if !ignore_path.exists() {
             continue;
@@ -423,7 +408,7 @@ fn load_local_enrichment_ignore(repo_root: &Path) -> Option<Gitignore> {
         Ok(gitignore) => Some(gitignore),
         Err(err) => {
             log::warn!(
-                "Failed to build enrichment ignore rules for {}: {}",
+                "Failed to build ignore rules for {}: {}",
                 repo_root.display(),
                 err
             );
@@ -521,15 +506,83 @@ mod tests {
     }
 
     #[test]
-    fn test_load_for_enrichment_load_does_not_read_gitignore() {
-        // The general-purpose `load` must remain `.atomicignore`-only so that
-        // enabling gitignore semantics for enrichment does not silently change
-        // VCS-wide behavior (status, tracking, switch).
+    fn test_load_reads_gitignore() {
+        // `load` is the VCS-wide matcher (status, tracking, switch). It must
+        // honor `.gitignore`, because that is the file every project already
+        // uses to exclude build output — and without it `record` walks into
+        // those directories and fails on artifacts nobody meant to version.
         let temp = TempDir::new().unwrap();
         std::fs::write(temp.path().join(".gitignore"), "node_modules/\n").unwrap();
 
         let rules = IgnoreRules::load(temp.path());
-        assert!(!rules.is_ignored(Path::new("node_modules/pkg/index.js"), false));
+        assert!(rules.is_ignored(Path::new("node_modules/pkg/index.js"), false));
+    }
+
+    #[test]
+    fn test_load_reads_dot_ignore() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join(".ignore"), "scratch/\n").unwrap();
+
+        let rules = IgnoreRules::load(temp.path());
+        assert!(rules.is_ignored(Path::new("scratch/tmp.txt"), false));
+    }
+
+    #[test]
+    fn test_load_honors_all_three_local_files() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join(".atomicignore"), "dist/\n").unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::write(temp.path().join(".ignore"), "scratch/\n").unwrap();
+
+        let rules = IgnoreRules::load(temp.path());
+
+        assert!(rules.is_ignored(Path::new("dist/index.js"), false));
+        assert!(rules.is_ignored(Path::new("node_modules/typescript/lib.d.ts"), false));
+        assert!(rules.is_ignored(Path::new("scratch/tmp.txt"), false));
+        assert!(!rules.is_ignored(Path::new("src/index.ts"), false));
+    }
+
+    #[test]
+    fn test_atomicignore_overrides_gitignore() {
+        // `.atomicignore` is loaded last, so a negation there re-includes a
+        // path the project's `.gitignore` excludes. Without this precedence
+        // there would be no way to version a generated file that Git skips.
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "dist/\n").unwrap();
+        std::fs::write(temp.path().join(".atomicignore"), "!dist/\n").unwrap();
+
+        let rules = IgnoreRules::load(temp.path());
+        assert!(!rules.is_ignored(Path::new("dist"), true));
+    }
+
+    #[test]
+    fn test_load_skips_unreadable_file_without_losing_others() {
+        // A `.gitignore` that is a directory cannot be parsed. The rules from
+        // the files that did load must survive.
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join(".gitignore")).unwrap();
+        std::fs::write(temp.path().join(".atomicignore"), "dist/\n").unwrap();
+
+        let rules = IgnoreRules::load(temp.path());
+        assert!(rules.is_ignored(Path::new("dist/index.js"), false));
+    }
+
+    #[test]
+    fn test_nextjs_build_cache_is_ignored_via_gitignore() {
+        // Regression: `atomic record` in a Next.js project aborted on
+        // `.next/dev/cache/turbopack/*.sst` because `.next/` was never
+        // ignored, even though the project's `.gitignore` excludes it.
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "/.next/\n/node_modules\n").unwrap();
+
+        let rules = IgnoreRules::load(temp.path());
+
+        assert!(rules.is_ignored(Path::new(".next"), true));
+        assert!(rules.is_ignored(
+            Path::new(".next/dev/cache/turbopack/v16.2.10/00000012.sst"),
+            false
+        ));
+        assert!(!rules.is_ignored(Path::new("src/app/page.tsx"), false));
     }
 
     #[test]
