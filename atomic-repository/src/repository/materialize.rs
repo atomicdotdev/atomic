@@ -20,6 +20,44 @@ pub(crate) fn first_conflict_marker_line(content: &[u8]) -> Option<u32> {
     None
 }
 
+impl Repository {
+    /// Return the first working-copy file that still contains an unresolved
+    /// conflict marker, as `(path, 1-based line)`, or `None` if the working
+    /// copy is clean.
+    ///
+    /// This scans the same status entries `record` guards on
+    /// (Added / Modified / Conflicted) with the same detector
+    /// ([`first_conflict_marker_line`]), so `atomic record` and
+    /// `atomic git push` agree on what counts as a conflicted working copy
+    /// (SPEC §5.4). It is the shared guard that stops any automated commit path
+    /// — including shadow materialization — from baking markers into history.
+    pub fn first_working_copy_conflict_marker(
+        &self,
+    ) -> Result<Option<(String, u32)>, RepositoryError> {
+        let status = self.status(StatusOptions::default())?;
+        for entry in status.entries() {
+            let is_directory = entry.details().map(|d| d == "directory").unwrap_or(false);
+            if is_directory {
+                continue;
+            }
+            if !matches!(
+                entry.status(),
+                FileStatus::Added | FileStatus::Modified | FileStatus::Conflicted
+            ) {
+                continue;
+            }
+            let path = entry.path().to_string_lossy().to_string();
+            let full_path = self.root.join(&path);
+            if let Ok(content) = std::fs::read(&full_path) {
+                if let Some(line) = first_conflict_marker_line(&content) {
+                    return Ok(Some((path, line)));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// Render a name conflict: two or more inodes are alive at the same path on
 /// this view, so instead of silently emitting whichever inode `TREE` happened
 /// to keep, wrap every side's materialized content in conflict markers.
@@ -945,5 +983,35 @@ impl Repository {
         self.populate_file_index(&result);
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod conflict_marker_tests {
+    use super::first_conflict_marker_line;
+
+    #[test]
+    fn detects_numbered_start_marker_at_line_start() {
+        let content = b"const shared = 1;\n>>>>>>> 1\nconst a = 2;\n======= 1 [C2YTBAHQ]\nconst b = 3;\n<<<<<<< 1\n";
+        assert_eq!(first_conflict_marker_line(content), Some(2));
+    }
+
+    #[test]
+    fn ignores_separator_or_content_that_only_appears_mid_line() {
+        // A legitimate line that merely contains `=======` (e.g. a Markdown
+        // rule or a comment) must not be misdetected — only a `>>>>>>>` at
+        // line start counts.
+        let content = b"let divider = \"=======\";\nfn eq() { a ======= b }\n";
+        assert_eq!(first_conflict_marker_line(content), None);
+    }
+
+    #[test]
+    fn clean_content_has_no_marker() {
+        assert_eq!(first_conflict_marker_line(b"fn main() {}\n"), None);
+    }
+
+    #[test]
+    fn binary_content_carries_no_marker() {
+        assert_eq!(first_conflict_marker_line(&[0xff, 0xfe, 0x00, 0x01]), None);
     }
 }

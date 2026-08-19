@@ -4,6 +4,9 @@
 //! `git add -A`, commits with Atomic provenance trailers, and optionally
 //! pushes to the remote.
 
+use std::io::IsTerminal;
+use std::path::Path;
+
 use clap::Args;
 use git2::Repository as GitRepository;
 
@@ -59,6 +62,12 @@ pub struct Push {
     /// current view's state to a PR branch).
     #[arg(long, short = 'b', value_name = "BRANCH")]
     pub branch: Option<String>,
+
+    /// Commit even if the working copy still contains unresolved conflict
+    /// markers. Off by default, mirroring `atomic record`; the shadow-sync
+    /// turn-end hook must never pass this.
+    #[arg(long = "allow-conflict-markers")]
+    pub allow_conflict_markers: bool,
 }
 
 impl Default for Push {
@@ -68,8 +77,30 @@ impl Default for Push {
             no_push: false,
             remote: "origin".to_string(),
             branch: None,
+            allow_conflict_markers: false,
         }
     }
+}
+
+/// Append a `shadow-conflict` entry to `.atomic/hook-errors.log` so a
+/// non-interactive shadow push that aborts on conflict markers leaves a durable,
+/// greppable trail instead of failing silently. Best-effort: log I/O errors are
+/// ignored (the push already fails loudly via its return value).
+fn append_shadow_conflict_log(repo_root: &Path, view: &str, file: &str, line: u32) {
+    use std::io::Write;
+    let log_path = repo_root.join(".atomic").join("hook-errors.log");
+    let entry = format!(
+        "{} shadow-conflict view={} file={} line={}\n",
+        chrono::Utc::now().to_rfc3339(),
+        view,
+        file,
+        line
+    );
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .and_then(|mut f| f.write_all(entry.as_bytes()));
 }
 
 impl Command for Push {
@@ -131,6 +162,34 @@ impl Command for Push {
         };
         let new_history = &history[start_idx..];
         let new_count = new_history.len();
+
+        // Conflict-marker guard (SPEC: shadow materialization must never commit
+        // unresolved markers). Runs BEFORE staging/tree/commit and shares the
+        // exact detector `atomic record` uses, so the two paths cannot disagree.
+        if !self.allow_conflict_markers {
+            if let Some((path, line)) = repo
+                .first_working_copy_conflict_marker()
+                .map_err(CliError::Repository)?
+            {
+                // Non-interactive (hook) contexts get a durable audit entry so a
+                // background materialization cannot fail silently.
+                if !std::io::stderr().is_terminal() {
+                    append_shadow_conflict_log(&repo_root, &current_view, &path, line);
+                }
+                print_warning(&format!(
+                    "Refusing to commit '{}': unresolved conflict marker at line {}.",
+                    path, line
+                ));
+                return Err(CliError::GitError {
+                    message: format!(
+                        "'{}' still contains conflict markers at line {} — resolve the \
+                         conflict (remove the >>>>>>> / ======= / <<<<<<< lines), or pass \
+                         --allow-conflict-markers to override. No commit was created.",
+                        path, line
+                    ),
+                });
+            }
+        }
 
         // Stage everything: git add -A (add_all + update_all handles new files and deletions)
         let mut index = git_repo.index().map_err(|e| CliError::GitError {
@@ -541,6 +600,7 @@ mod tests {
             no_push: true,
             remote: "upstream".to_string(),
             branch: Some("pr-branch".to_string()),
+            allow_conflict_markers: false,
         };
         assert_eq!(push.message.as_deref(), Some("custom message"));
         assert!(push.no_push);
