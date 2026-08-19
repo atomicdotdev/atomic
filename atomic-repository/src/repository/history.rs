@@ -484,6 +484,120 @@ impl Repository {
         Ok((view.state, view.change_count))
     }
 
+    /// Converge a view's own change log to a target effective set by
+    /// **removing** every own change absent from `target`.
+    ///
+    /// This is the removal half of set-based view convergence (the add half is
+    /// [`insert_change`](crate::Repository::insert_change)). A durable view
+    /// record declares the view's effective change set (its own changes plus
+    /// everything inherited through its parent chain); any of the view's OWN
+    /// changes not in that set were removed upstream — e.g. by `view split`,
+    /// which moves changes out of a view — and are unrecorded here so the local
+    /// view matches the declared set.
+    ///
+    /// Only the view's **own** log is considered: inherited changes live in an
+    /// ancestor view's log (converge the ancestor to drop those) and are never
+    /// touched here, so passing a `target` that omits an inherited change does
+    /// not remove it. Because `target` is the *effective* set, any own change
+    /// that should remain — inherited or not — is present in it and kept.
+    ///
+    /// Removal is at the `VIEW_CHANGES` level only, exactly like
+    /// [`unrecord`](crate::Repository::unrecord): the change bytes and graph
+    /// edges remain, so the removal is reversible via
+    /// [`reinsert_change`](crate::Repository::reinsert_change) or
+    /// [`insert_change`](crate::Repository::insert_change). The working copy is
+    /// **not** re-materialized (a caller that needs the tree on disk updated
+    /// must do so separately); stale `FILE_INDEX` entries for affected paths are
+    /// cleared so the next `status` recomputes against the graph.
+    ///
+    /// Idempotent: a view already matching its target removes nothing and
+    /// returns an empty vector. On success returns the hashes removed.
+    pub fn retain_view_changes(
+        &self,
+        view_name: &str,
+        target: &HashSet<Hash>,
+    ) -> Result<Vec<Hash>, RepositoryError> {
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut view = txn
+            .get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+
+        // Snapshot the view's own change ids first (the iterator borrows the
+        // txn immutably; collecting frees it for the mutable `del_change`).
+        let own_ids: Vec<NodeId> = txn
+            .iter_changes(&view, 0)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .map(|entry| entry.map(|(_seq, change_id, _merkle)| change_id))
+            .collect::<Result<_, _>>()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Any own change whose external hash is not in the target set is stale.
+        let mut to_remove: Vec<(NodeId, Hash)> = Vec::new();
+        for change_id in own_ids {
+            let hash = txn
+                .get_external(change_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| {
+                    RepositoryError::Database(format!(
+                        "change {} has no external hash",
+                        change_id.0
+                    ))
+                })?;
+            if !target.contains(&hash) {
+                to_remove.push((change_id, hash));
+            }
+        }
+
+        if to_remove.is_empty() {
+            // Leave the write txn unwritten — nothing to converge.
+            return Ok(Vec::new());
+        }
+
+        // `del_change` re-derives the sequence from `change_id` on each call, so
+        // it is robust to the resequencing it performs internally; removal order
+        // does not affect the final set.
+        let mut removed = Vec::with_capacity(to_remove.len());
+        for (change_id, hash) in &to_remove {
+            let seq = txn
+                .del_change(&mut view, *change_id, hash)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            if seq.is_some() {
+                removed.push(*hash);
+            }
+        }
+
+        txn.update_view(&view)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Post-removal: drop stale FILE_INDEX entries for affected paths so the
+        // next `status` does a full content comparison against the graph rather
+        // than trusting an index keyed to now-removed content (mirrors
+        // `unrecord`). We do NOT re-materialize — that would clobber on-disk work.
+        for hash in &removed {
+            if let Ok(change) = self.load_change(hash) {
+                if let Ok(mut idx_txn) = self.pristine.write_txn() {
+                    for op in change.hunks() {
+                        if let Some(p) = op.path() {
+                            let _ = idx_txn.del_file_index(p);
+                        }
+                    }
+                    let _ = idx_txn.commit();
+                }
+            }
+        }
+
+        Ok(removed)
+    }
+
     /// Check if a change can be unrecorded.
     ///
     /// This checks whether the change is in the view and whether it has
