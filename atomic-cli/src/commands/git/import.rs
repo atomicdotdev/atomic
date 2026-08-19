@@ -37,7 +37,10 @@ use git2::{Repository as GitRepository, Sort};
 
 use atomic_repository::Repository;
 
-use super::parallel::{ParallelImportOptions, ParallelImporter};
+use super::parallel::{
+    forecast_commit_kind, incremental_import_skips, ForecastKind, ParallelImportOptions,
+    ParallelImporter,
+};
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_info, print_success, print_warning};
@@ -273,10 +276,15 @@ impl Import {
     /// The states let the importer skip commits created by `atomic git
     /// push`: such a commit trailers the view state it represents, and if
     /// that state is already known the commit adds nothing.
+    ///
+    /// `repair_index` controls the best-effort Git SHA index repair. Real
+    /// imports pass `true`; the `--dry-run` forecast passes `false` so it can
+    /// compute markers against a read-only handle without writing anything.
     fn get_incremental_markers(
         &self,
         repo: &Repository,
         view_name: &str,
+        repair_index: bool,
     ) -> CliResult<(HashSet<String>, HashSet<atomic_core::types::Merkle>)> {
         use atomic_repository::HistoryOptions;
 
@@ -310,16 +318,37 @@ impl Import {
             }
         }
 
+        // Inserted squashes (SPEC §4) write no change record, so their git SHA
+        // isn't reachable via change `unhashed` metadata. The ReviewGate tag on
+        // the target view owns that provenance — scan tags for `git.sha` so a
+        // re-import recognises the squash as already imported and skips it.
+        if let Ok(tags) = repo.list_tags_for_view(view_name) {
+            for tag in tags {
+                if let Some(sha) = tag
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("git"))
+                    .and_then(|g| g.get("sha"))
+                    .and_then(|v| v.as_str())
+                {
+                    shas.insert(sha.to_string());
+                }
+            }
+        }
+
         // Repair the acceleration index while scanning older repositories.
         // The explicit target-view history is authoritative; index repair is
         // best-effort and batched so a no-op sync never commits once per
-        // historical Git change.
-        if let Err(error) = repo.index_git_shas(&index_repairs) {
-            log::warn!(
-                "Failed to repair Git SHA index for view '{}': {}",
-                view_name,
-                error
-            );
+        // historical Git change. Skipped for dry-run forecasts, which must not
+        // write to the repository.
+        if repair_index {
+            if let Err(error) = repo.index_git_shas(&index_repairs) {
+                log::warn!(
+                    "Failed to repair Git SHA index for view '{}': {}",
+                    view_name,
+                    error
+                );
+            }
         }
 
         Ok((shas, states))
@@ -365,12 +394,19 @@ impl Import {
         })
     }
 
-    /// Count commits for dry-run mode.
+    /// Count the commits a real import would create, for dry-run mode.
+    ///
+    /// In incremental mode this applies the exact same skip rules as the real
+    /// import — already-imported SHAs and self-pushed commits whose view state
+    /// is already present — via [`incremental_import_skips`], so the forecast
+    /// matches what the import would actually bring in.
     fn count_commits(
         &self,
         git_repo: &GitRepository,
         head_oid: git2::Oid,
         imported_shas: &HashSet<String>,
+        known_states: &HashSet<atomic_core::types::Merkle>,
+        target_view: &str,
         mainline_only: bool,
     ) -> CliResult<usize> {
         let mut revwalk = git_repo.revwalk().map_err(|e| CliError::GitError {
@@ -401,14 +437,119 @@ impl Import {
                 message: format!("Revwalk error: {}", e),
             })?;
 
-            if self.incremental && imported_shas.contains(&oid.to_string()) {
-                continue;
+            if self.incremental {
+                let sha = oid.to_string();
+                let commit = git_repo.find_commit(oid).map_err(|e| CliError::GitError {
+                    message: format!("Failed to load commit {}: {}", sha, e),
+                })?;
+                let message = commit.message().unwrap_or("");
+                if incremental_import_skips(&sha, message, imported_shas, target_view, known_states)
+                {
+                    continue;
+                }
             }
 
             count += 1;
         }
 
         Ok(count)
+    }
+
+    /// Classify the commits an incremental import would bring in and print a
+    /// per-shape recommendation (SPEC §4.4). Purely advisory — writes nothing.
+    fn print_forecast_recommendations(
+        &self,
+        git_repo: &GitRepository,
+        head_oid: git2::Oid,
+        imported_shas: &HashSet<String>,
+        known_states: &HashSet<atomic_core::types::Merkle>,
+        target_view: &str,
+        repo: Option<&Repository>,
+    ) -> CliResult<()> {
+        use atomic_core::types::{Base32, Hash};
+
+        let mut revwalk = git_repo.revwalk().map_err(|e| CliError::GitError {
+            message: format!("Failed to create revwalk: {}", e),
+        })?;
+        revwalk.push(head_oid).map_err(|e| CliError::GitError {
+            message: format!("Failed to push HEAD to revwalk: {}", e),
+        })?;
+        if !self.all_branches {
+            revwalk
+                .simplify_first_parent()
+                .map_err(|e| CliError::GitError {
+                    message: format!("Failed to simplify revwalk: {}", e),
+                })?;
+        }
+        revwalk
+            .set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)
+            .map_err(|e| CliError::GitError {
+                message: format!("Failed to set sorting: {}", e),
+            })?;
+
+        let mut insertable = 0usize;
+        let mut missing = 0usize;
+        let mut merges = 0usize;
+        let mut normal = 0usize;
+
+        for oid_result in revwalk {
+            let oid = oid_result.map_err(|e| CliError::GitError {
+                message: format!("Revwalk error: {}", e),
+            })?;
+            let sha = oid.to_string();
+            let commit = git_repo.find_commit(oid).map_err(|e| CliError::GitError {
+                message: format!("Failed to load commit {}: {}", sha, e),
+            })?;
+            let message = commit.message().unwrap_or("");
+            if incremental_import_skips(&sha, message, imported_shas, target_view, known_states) {
+                continue;
+            }
+            let is_merge = commit.parent_count() > 1;
+            let records_present = |h: &str| {
+                repo.map(|r| {
+                    Hash::from_base32(h.as_bytes())
+                        .map(|hash| r.has_change(&hash))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+            };
+            match forecast_commit_kind(message, is_merge, records_present) {
+                ForecastKind::SquashInsertable { count, pr } => {
+                    insertable += 1;
+                    let label = pr
+                        .map(|n| format!("PR #{}", n))
+                        .unwrap_or_else(|| "squash".to_string());
+                    print_info(&format!(
+                        "  squash ({}) — atomic headers present, {} record{} available: \
+                         will insert into '{}' and tag the aggregate",
+                        label,
+                        count,
+                        if count == 1 { "" } else { "s" },
+                        target_view
+                    ));
+                }
+                ForecastKind::SquashRecordsMissing { count } => {
+                    missing += 1;
+                    print_info(&format!(
+                        "  squash — atomic headers present but {} record{} missing locally: \
+                         run `atomic pull`, then re-import",
+                        count,
+                        if count == 1 { "" } else { "s" }
+                    ));
+                }
+                ForecastKind::Merge => merges += 1,
+                ForecastKind::Normal => normal += 1,
+            }
+        }
+
+        if normal > 0 && insertable == 0 && missing == 0 && merges == 0 {
+            print_info(
+                "  git-authored commits (no atomic headers): a normal import will \
+                 record them as changes",
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -434,19 +575,57 @@ impl Command for Import {
                 vec![self.branch.clone().unwrap_or(default_branch)]
             };
 
+            // For an incremental forecast, open the existing Atomic repo
+            // read-only so we can subtract what each branch's view already
+            // contains. A fresh (not-yet-initialized) repo has nothing
+            // imported, so the forecast is the full history — which is correct.
+            let repo = if self.incremental && workdir.join(".atomic").join("pristine.redb").exists()
+            {
+                Repository::open_readonly(workdir).ok()
+            } else {
+                None
+            };
+
             for branch_name in &branches {
                 if let Ok(reference) = git_repo.find_branch(branch_name, git2::BranchType::Local) {
                     if let Some(target) = reference.get().target() {
+                        // Compute the same incremental markers the real import
+                        // would use for this branch's view (without repairing
+                        // the index — a dry run writes nothing).
+                        let (imported_shas, known_states) = match &repo {
+                            Some(repo) if repo.view_exists(branch_name).unwrap_or(false) => {
+                                self.get_incremental_markers(repo, branch_name, false)?
+                            }
+                            _ => (HashSet::new(), HashSet::new()),
+                        };
+
                         let count = self.count_commits(
                             &git_repo,
                             target,
-                            &HashSet::new(),
+                            &imported_shas,
+                            &known_states,
+                            branch_name,
                             !self.all_branches,
                         )?;
                         print_info(&format!(
-                            "Would import {} commits from branch '{}'",
-                            count, branch_name
+                            "Would import {} commit{} from branch '{}'",
+                            count,
+                            if count == 1 { "" } else { "s" },
+                            branch_name
                         ));
+
+                        // Router (SPEC §4.4): classify the incoming commits and
+                        // recommend the right path for each shape.
+                        if self.incremental && count > 0 {
+                            self.print_forecast_recommendations(
+                                &git_repo,
+                                target,
+                                &imported_shas,
+                                &known_states,
+                                branch_name,
+                                repo.as_ref(),
+                            )?;
+                        }
                     }
                 }
             }
@@ -512,7 +691,7 @@ impl Command for Import {
                 }
 
                 let (imported_shas, known_states) = if self.incremental {
-                    self.get_incremental_markers(&repo, &branch_name)?
+                    self.get_incremental_markers(&repo, &branch_name, true)?
                 } else {
                     (HashSet::new(), HashSet::new())
                 };
@@ -617,7 +796,7 @@ impl Command for Import {
             }
 
             let (imported_shas, known_states) = if self.incremental {
-                self.get_incremental_markers(&repo, &branch_name)?
+                self.get_incremental_markers(&repo, &branch_name, true)?
             } else {
                 (HashSet::new(), HashSet::new())
             };
