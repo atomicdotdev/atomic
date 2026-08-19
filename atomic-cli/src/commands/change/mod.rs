@@ -68,9 +68,24 @@
 //!   "timestamp": "2024-01-15T15:30:45Z",
 //!   "dependencies": ["DEF987...", "GHI111..."],
 //!   "hunks": [...],
-//!   "provenance": null
+//!   "provenance": null,
+//!   "ledger": [
+//!     {
+//!       "graph_hash": "...",
+//!       "session_id": "...",
+//!       "agent_name": "opencode",
+//!       "node_count": 12,
+//!       "edge_count": 11,
+//!       "nodes": [{"id": "...", "kind": "goal", "summary": "..."}],
+//!       "edges": [{"from": "...", "to": "...", "kind": "led_to"}]
+//!     }
+//!   ]
 //! }
 //! ```
+//!
+//! The `ledger` array carries the causal decision graph(s) explaining the
+//! change (the machine-readable form of the `=== Change Ledger ===` text
+//! section). It is omitted entirely when no provenance graph is recorded.
 //!
 //! # Change Identification
 //!

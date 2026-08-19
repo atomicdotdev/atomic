@@ -509,7 +509,7 @@ mod tests {
         let cmd = ChangeCmd::new();
         let change = create_test_change();
         let hash = Hash::of(b"test");
-        let output = cmd.format_json(&change, &hash, Some(10));
+        let output = cmd.format_json(&change, &hash, Some(10), Vec::new());
 
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["message"], "Test change message");
@@ -521,7 +521,7 @@ mod tests {
         let cmd = ChangeCmd::new();
         let change = create_test_change();
         let hash = Hash::of(b"test");
-        let output = cmd.format_json(&change, &hash, None);
+        let output = cmd.format_json(&change, &hash, None, Vec::new());
 
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert!(parsed.get("sequence").is_none() || parsed["sequence"].is_null());
@@ -842,6 +842,94 @@ mod tests {
     }
 
     #[test]
+    fn test_format_json_includes_change_ledger() {
+        use atomic_core::change::provenance_graph::{
+            ProvenanceEdge, ProvenanceEdgeKind, ProvenanceNode, ProvenanceNodeKind,
+        };
+        use atomic_core::change::ProvenanceGraphBuilder;
+
+        let goal = ProvenanceNode {
+            id: "sess1-0".into(),
+            kind: ProvenanceNodeKind::Goal,
+            timestamp: 1000,
+            summary: "Add JSON ledger export".into(),
+            detail: Some(r#"{"intent":"export ledger"}"#.into()),
+            change_hash: None,
+            tool_name: None,
+            tool_call_id: None,
+            duration_ms: None,
+            classified: false,
+            confidence: None,
+            consolidated_from: Vec::new(),
+        };
+        let commit = ProvenanceNode {
+            id: "sess1-1".into(),
+            kind: ProvenanceNodeKind::Commitment,
+            timestamp: 2000,
+            summary: "Edit types.rs".into(),
+            detail: None,
+            change_hash: None,
+            tool_name: Some("edit".into()),
+            tool_call_id: Some("call-1".into()),
+            duration_ms: Some(150),
+            classified: false,
+            confidence: None,
+            consolidated_from: Vec::new(),
+        };
+        let graph = ProvenanceGraphBuilder::new("sess1", "opencode")
+            .agent_display_name("OpenCode")
+            .agent_vendor("anthropic")
+            .timestamp(42)
+            .add_node(goal)
+            .add_node(commit)
+            .add_edge(ProvenanceEdge {
+                from: "sess1-0".into(),
+                to: "sess1-1".into(),
+                kind: ProvenanceEdgeKind::CommittedVia,
+            })
+            .build();
+
+        let graph_hash = Hash::of(b"graph");
+        let ledger = vec![JsonChangeLedger::from_graph(&graph_hash, &graph)];
+
+        let cmd = ChangeCmd::new();
+        let change = create_test_change();
+        let hash = Hash::of(b"test");
+        let output = cmd.format_json(&change, &hash, Some(1), ledger);
+
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let ledgers = parsed["ledger"].as_array().expect("ledger array present");
+        assert_eq!(ledgers.len(), 1);
+        let l = &ledgers[0];
+        assert_eq!(l["session_id"], "sess1");
+        assert_eq!(l["agent_name"], "opencode");
+        assert_eq!(l["agent_display_name"], "OpenCode");
+        assert_eq!(l["node_count"], 2);
+        assert_eq!(l["edge_count"], 1);
+        assert_eq!(l["nodes"][0]["kind"], "goal");
+        // detail is parsed into a JSON object, not left as a string.
+        assert_eq!(l["nodes"][0]["detail"]["intent"], "export ledger");
+        assert_eq!(l["nodes"][1]["kind"], "commitment");
+        assert_eq!(l["nodes"][1]["tool_name"], "edit");
+        assert_eq!(l["nodes"][1]["duration_ms"], 150);
+        assert_eq!(l["edges"][0]["from"], "sess1-0");
+        assert_eq!(l["edges"][0]["to"], "sess1-1");
+        assert_eq!(l["edges"][0]["kind"], "committed_via");
+    }
+
+    #[test]
+    fn test_format_json_omits_ledger_when_empty() {
+        let cmd = ChangeCmd::new();
+        let change = create_test_change();
+        let hash = Hash::of(b"test");
+        let output = cmd.format_json(&change, &hash, Some(1), Vec::new());
+
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        // Empty ledger is omitted entirely (skip_serializing_if).
+        assert!(parsed.get("ledger").is_none());
+    }
+
+    #[test]
     fn test_format_json_with_dependencies() {
         let cmd = ChangeCmd::new();
         let dep_hash = Hash::of(b"dependency");
@@ -854,7 +942,7 @@ mod tests {
             vec![dep_hash],
         );
         let hash = Hash::of(b"main change");
-        let output = cmd.format_json(&change, &hash, None);
+        let output = cmd.format_json(&change, &hash, None, Vec::new());
 
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert!(parsed["dependencies"].is_array());
