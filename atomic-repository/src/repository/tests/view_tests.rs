@@ -73,6 +73,32 @@ fn test_default_view_name() {
 }
 
 #[test]
+fn test_init_with_view_uses_custom_default_view() {
+    // `git import` seeds the default view with the Git default branch name so
+    // Atomic's shared view matches the project's Git default branch instead of
+    // leaving an unused `dev` view behind.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init_with_view(temp_dir.path(), "main").unwrap();
+
+    // The current (and only) view is the custom one.
+    assert_eq!(repo.current_view(), "main");
+
+    let views = repo.list_views().unwrap();
+    assert_eq!(views, vec!["main".to_string()]);
+    assert!(!views.contains(&"dev".to_string()));
+
+    // The config's default view matches too.
+    let config = std::fs::read_to_string(temp_dir.path().join(".atomic/config.toml")).unwrap();
+    assert!(config.contains("default = \"main\""));
+
+    // Reopening resolves the same current view.
+    let root = repo.root().to_path_buf();
+    drop(repo);
+    let reopened = Repository::open(&root).unwrap();
+    assert_eq!(reopened.current_view(), "main");
+}
+
+#[test]
 fn test_delete_view() {
     use atomic_core::pristine::{MutTxnT, ViewScope, ViewTxnT};
     let (_temp_dir, mut repo) = create_temp_repo();

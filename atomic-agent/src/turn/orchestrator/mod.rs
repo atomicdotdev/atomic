@@ -67,6 +67,19 @@ mod turn;
 #[cfg(test)]
 mod tests;
 
+/// True if a `try_lock*` error means the file lock is currently held by another
+/// process, rather than a genuine I/O failure.
+///
+/// On Unix a contended non-blocking lock surfaces as `WouldBlock`, but on
+/// Windows the OS returns `ERROR_LOCK_VIOLATION` (code 33), which maps to
+/// `ErrorKind::Uncategorized` rather than `WouldBlock`. Comparing the raw OS
+/// error against `fs2::lock_contended_error()` handles both platforms.
+pub(crate) fn is_lock_contended(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::WouldBlock
+        || (e.raw_os_error().is_some()
+            && e.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+}
+
 use std::path::{Path, PathBuf};
 
 use crate::error::AgentResult;

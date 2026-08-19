@@ -658,10 +658,24 @@ impl ChangeCmd {
         change: &Change,
         hash: &Hash,
         sequence: Option<u64>,
+        ledger: Vec<JsonChangeLedger>,
     ) -> String {
-        let json_change = JsonChange::from_change_with_provenance(change, hash, sequence);
+        let json_change =
+            JsonChange::from_change_with_provenance(change, hash, sequence).with_ledger(ledger);
         serde_json::to_string_pretty(&json_change)
             .unwrap_or_else(|e| format!("{{\"error\": \"Failed to serialize: {}\"}}", e))
+    }
+
+    /// Load the change ledger(s) — the causal decision graph(s) from the
+    /// `.provenance` file — for JSON output. Mirrors the `=== Change Ledger ===`
+    /// section of the default text format. Missing/corrupt provenance is
+    /// non-fatal: the ledger simply stays empty (and is omitted from the JSON).
+    fn load_json_ledger(&self, hash: &Hash, repo: &Repository) -> Vec<JsonChangeLedger> {
+        repo.find_provenance_for_change(hash)
+            .unwrap_or_default()
+            .iter()
+            .map(|(graph_hash, graph)| JsonChangeLedger::from_graph(graph_hash, graph))
+            .collect()
     }
 
     /// Print the change in the configured format.
@@ -669,7 +683,10 @@ impl ChangeCmd {
         let output = match self.format {
             ChangeFormat::Default => self.format_default(change, hash, sequence, repo),
             ChangeFormat::Short => self.format_short(change, hash, sequence),
-            ChangeFormat::Json => self.format_json(change, hash, sequence),
+            ChangeFormat::Json => {
+                let ledger = self.load_json_ledger(hash, repo);
+                self.format_json(change, hash, sequence, ledger)
+            }
         };
         print!("{}", output);
     }

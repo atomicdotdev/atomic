@@ -485,7 +485,7 @@ impl TurnOrchestrator {
 
         match file.try_lock_exclusive() {
             Ok(()) => TurnEndLock::Acquired(TurnEndLockGuard { file }),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => TurnEndLock::Busy,
+            Err(e) if super::is_lock_contended(&e) => TurnEndLock::Busy,
             Err(e) => {
                 log::warn!(
                     "Failed to acquire turn-end lock for session {}: {}",

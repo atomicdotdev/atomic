@@ -365,6 +365,44 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
+    /// Return the names of all views whose change-set references `hash`.
+    pub fn views_containing_change(&self, hash: &Hash) -> Result<Vec<String>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let change_id = match txn
+            .get_internal(hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            Some(id) => id,
+            None => return Ok(vec![]),
+        };
+
+        let mut names = Vec::new();
+        for name in txn
+            .list_views()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            let view = match txn
+                .get_view(&name)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                Some(view) => view,
+                None => continue,
+            };
+            if txn
+                .get_change_seq(&view, change_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .is_some()
+            {
+                names.push(name);
+            }
+        }
+        Ok(names)
+    }
+
     /// Check if a view exists.
     ///
     /// # Arguments
