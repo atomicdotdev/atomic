@@ -963,7 +963,10 @@ fn init_atomicignore_and_vault(
             atomic_repository::TrackingOptions::default(),
         );
         let header = atomic_core::change::ChangeHeader::new("Initialize repository");
-        match repo.record(header, atomic_repository::RecordOptions::default()) {
+        let options = atomic_repository::RecordOptions::new()
+            .add_path(".atomicignore")
+            .detect_raw_renames(false);
+        match repo.record(header, options) {
             Ok(_) => print_info("Recorded .atomicignore"),
             Err(atomic_repository::RecordError::NothingToRecord) => {}
             Err(e) => log::warn!("Failed to record .atomicignore: {}", e),
@@ -1002,7 +1005,10 @@ fn init_atomicignore_and_vault(
             }
 
             let header = atomic_core::change::ChangeHeader::new("Initialize vault");
-            match repo.record(header, atomic_repository::RecordOptions::default()) {
+            let options = atomic_repository::RecordOptions::new()
+                .add_path(".vault")
+                .detect_raw_renames(false);
+            match repo.record(header, options) {
                 Ok(_) => print_info("Recorded vault defaults"),
                 Err(atomic_repository::RecordError::NothingToRecord) => {}
                 Err(e) => log::warn!("Failed to record vault files: {}", e),

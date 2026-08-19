@@ -2,6 +2,13 @@ use std::collections::HashMap;
 
 use super::*;
 
+#[derive(Debug, Clone, Copy)]
+enum UntrackedScanPolicy {
+    Always,
+    Never,
+    WhenRegularFileDeleted,
+}
+
 impl Repository {
     // Status Methods
 
@@ -22,6 +29,34 @@ impl Repository {
     /// | 43,000 files | ~150s | <3s |
     /// | 80,000 files | ~150s | <5s |
     pub fn status(&self, options: StatusOptions) -> Result<RepositoryStatus, RepositoryError> {
+        self.status_inner(options, UntrackedScanPolicy::Always, true)
+    }
+
+    /// Compute status for recording without scanning unrelated untracked files.
+    ///
+    /// Raw rename detection is the only record stage that consumes untracked
+    /// entries. When it is enabled, defer the walk until the selected tracked
+    /// status contains a deleted regular file. Untracked content hashes are
+    /// also unnecessary because rename matching reads candidates on demand.
+    pub(crate) fn status_for_record(
+        &self,
+        options: StatusOptions,
+        detect_raw_renames: bool,
+    ) -> Result<RepositoryStatus, RepositoryError> {
+        let policy = if detect_raw_renames {
+            UntrackedScanPolicy::WhenRegularFileDeleted
+        } else {
+            UntrackedScanPolicy::Never
+        };
+        self.status_inner(options, policy, false)
+    }
+
+    fn status_inner(
+        &self,
+        options: StatusOptions,
+        untracked_policy: UntrackedScanPolicy,
+        hash_untracked: bool,
+    ) -> Result<RepositoryStatus, RepositoryError> {
         use std::time::SystemTime;
 
         let overall_start = std::time::Instant::now();
@@ -426,7 +461,21 @@ impl Repository {
         // Only do the expensive walkdir when the caller wants untracked
         // files.  The walk skips .atomic, .git, and ignored paths.
         let untracked_start = std::time::Instant::now();
-        if options.include_untracked {
+        let scan_untracked = options.include_untracked
+            && match untracked_policy {
+                UntrackedScanPolicy::Always => true,
+                UntrackedScanPolicy::Never => false,
+                UntrackedScanPolicy::WhenRegularFileDeleted => status
+                    .entries()
+                    .iter()
+                    .any(|e| e.status() == FileStatus::Deleted && e.details() != Some("directory")),
+            };
+        log::debug!(
+            "status: untracked policy={:?}, scan={}",
+            untracked_policy,
+            scan_untracked
+        );
+        if scan_untracked {
             let rules = if options.respect_ignore_files {
                 Some(self.ignore_rules())
             } else {
@@ -440,7 +489,7 @@ impl Repository {
             for path in working_files {
                 if !tracked_paths.contains(&path) {
                     let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Untracked);
-                    if options.hash_contents {
+                    if hash_untracked && options.hash_contents {
                         let abs_path = self.root.join(&path);
                         if let Ok(hash) = hash_file_contents(&abs_path) {
                             entry.set_current_hash(hash);

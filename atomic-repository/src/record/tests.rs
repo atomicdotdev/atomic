@@ -27,6 +27,7 @@ fn test_options_new_returns_defaults() {
     assert!(opts.get_message().is_none());
     assert!(opts.get_apply_after_record());
     assert!(opts.get_save_to_store());
+    assert!(opts.get_detect_raw_renames());
 }
 
 #[test]
@@ -115,6 +116,12 @@ fn test_options_apply_after_record() {
 fn test_options_save_to_store() {
     let opts = RecordOptions::new().save_to_store(false);
     assert!(!opts.get_save_to_store());
+}
+
+#[test]
+fn test_options_detect_raw_renames() {
+    let opts = RecordOptions::new().detect_raw_renames(false);
+    assert!(!opts.get_detect_raw_renames());
 }
 
 #[test]

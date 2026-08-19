@@ -660,7 +660,7 @@ pub struct StatusOptions {
     /// If empty, all paths are checked.
     pub path_filters: Vec<PathBuf>,
 
-    /// Respect .gitignore and similar ignore files.
+    /// Respect Atomic ignore rules (`.atomicignore` and the global ignore file).
     ///
     /// Default: `true`
     pub respect_ignore_files: bool,
@@ -812,6 +812,17 @@ pub fn collect_working_copy_files_with_rules(
                 }
             }
 
+            // Prune directories that cannot contain a selected path. Without
+            // this check, a path-scoped status still traverses the entire
+            // working copy and only filters files after visiting them.
+            if !options.path_filters.is_empty() {
+                if let Ok(rel_path) = e.path().strip_prefix(root) {
+                    if !path_intersects_filters(rel_path, &options.path_filters) {
+                        return false;
+                    }
+                }
+            }
+
             // Check ignore rules if provided and not including ignored files
             if !options.include_ignored {
                 if let Some(rules) = rules {
@@ -838,14 +849,8 @@ pub fn collect_working_copy_files_with_rules(
         // Get path relative to root
         if let Ok(rel_path) = entry.path().strip_prefix(root) {
             // Check path filters if specified
-            if !options.path_filters.is_empty() {
-                let matches_filter = options
-                    .path_filters
-                    .iter()
-                    .any(|filter| rel_path.starts_with(filter) || filter.starts_with(rel_path));
-                if !matches_filter {
-                    continue;
-                }
+            if !path_intersects_filters(rel_path, &options.path_filters) {
+                continue;
             }
 
             // Normalize to forward slashes so paths match TREE entries
@@ -857,6 +862,19 @@ pub fn collect_working_copy_files_with_rules(
     }
 
     Ok(files)
+}
+
+fn path_intersects_filters(path: &Path, filters: &[PathBuf]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+
+    let normalized_path = PathBuf::from(path.to_string_lossy().replace('\\', "/"));
+    filters.iter().any(|filter| {
+        let normalized_filter = PathBuf::from(filter.to_string_lossy().replace('\\', "/"));
+        normalized_path.starts_with(&normalized_filter)
+            || normalized_filter.starts_with(&normalized_path)
+    })
 }
 
 // Tests
@@ -1303,6 +1321,32 @@ mod tests {
         assert!(files.contains(&PathBuf::from("src/main.rs")));
         assert!(!files.contains(&PathBuf::from("tests/test.rs")));
         assert!(!files.contains(&PathBuf::from("README.md")));
+    }
+
+    #[test]
+    fn test_path_filters_keep_ancestors_and_prune_siblings() {
+        let filters = vec![PathBuf::from("src/nested/main.rs")];
+
+        assert!(path_intersects_filters(Path::new(""), &filters));
+        assert!(path_intersects_filters(Path::new("src"), &filters));
+        assert!(path_intersects_filters(Path::new("src/nested"), &filters));
+        assert!(path_intersects_filters(
+            Path::new("src/nested/main.rs"),
+            &filters
+        ));
+        assert!(!path_intersects_filters(Path::new("tests"), &filters));
+        assert!(!path_intersects_filters(Path::new("src/other"), &filters));
+    }
+
+    #[test]
+    fn test_path_filters_normalize_platform_separators() {
+        let filters = vec![PathBuf::from("src\\nested\\main.rs")];
+
+        assert!(path_intersects_filters(Path::new("src/nested"), &filters));
+        assert!(path_intersects_filters(
+            Path::new("src/nested/main.rs"),
+            &filters
+        ));
     }
 
     // StatusError Tests
