@@ -747,7 +747,7 @@ src = "skills/code-intelligence/SKILL.md"
 dst = "~/.config/myagent/skills/code-intelligence/SKILL.md"
 
 # Install the canonical AGENTS.md into the repo root. Only fires when the
-# user opts in via --agents-md or the interactive prompt (default: no).
+# user opts in via --agents-md (no prompt by default).
 [[repo-file]]
 src = "AGENTS.md"              # from the atomic-skills cache
 dst = "AGENTS.md"              # relative to repo root
@@ -783,8 +783,7 @@ Rules of thumb:
   already exists and isn't ours, the installer **merges** — appends canonical
   content with a `---` separator, preserving the user's content. If the file
   contains the Atomic marker (`# Atomic VCS Agent`), it refreshes instead.
-  `--force` always clobbers. Only fires when the user opts in via `--agents-md`
-  or the interactive prompt (default: no).
+  `--force` always clobbers. Only fires when the user passes `--agents-md`.
 - `[agent-definition]` is a **single table** (not `[[agent-definition]]`).
   The stitch is pure string concat — `frontmatter + "\n\n" + body` — no exec.
 - `[[file]]` copies (permissions preserved); absolute paths inside the package

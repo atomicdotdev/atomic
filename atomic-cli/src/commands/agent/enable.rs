@@ -96,18 +96,10 @@ pub struct Enable {
     /// workflow is always-on without picking a bundled agent.
     ///
     /// When set, `[[repo-file]]` entries from the manifest are installed
-    /// into the repo. When neither `--agents-md` nor `--no-agents-md`
-    /// is set, the user is prompted interactively (default: no).
+    /// into the repo. Without this flag, `[[repo-file]]` entries are
+    /// skipped.
     #[arg(long)]
     agents_md: bool,
-
-    /// Skip the AGENTS.md-into-repo prompt entirely.
-    ///
-    /// Suppresses the interactive prompt and skips `[[repo-file]]` entries.
-    /// Useful in non-interactive contexts or when you only want the global
-    /// agent install.
-    #[arg(long)]
-    no_agents_md: bool,
 }
 
 impl Enable {
@@ -122,7 +114,6 @@ impl Enable {
             hooks: None,
             from: None,
             agents_md: false,
-            no_agents_md: false,
         }
     }
 }
@@ -528,8 +519,8 @@ impl Enable {
         // Determine repo_root from the --agents-md / --no-agents-md flags
         // or the interactive prompt. Only relevant when the manifest has
         // [[repo-file]] entries.
-        let repo_root = if !manifest.repo_files.is_empty() {
-            self.resolve_repo_root()?
+        let repo_root = if !manifest.repo_files.is_empty() && self.agents_md {
+            Some(find_repository_root()?)
         } else {
             None
         };
@@ -545,46 +536,6 @@ impl Enable {
 
         atomic_agent::integrations::install_from_dir(&pkg_dir, &opts)
             .map_err(|e| crate::error::CliError::Internal(anyhow::anyhow!(e.to_string())))
-    }
-
-    /// Sync the shared atomic-skills package into the CLI-managed cache.
-    ///
-    /// First run clones it; later runs reuse the cache so installs work
-    /// offline. `--force` discards the cache and re-clones.
-    fn resolve_repo_root(&self) -> CliResult<Option<std::path::PathBuf>> {
-        // If the user explicitly said no, skip.
-        if self.no_agents_md {
-            return Ok(None);
-        }
-        // If the user explicitly said yes, find the repo root and proceed.
-        if self.agents_md {
-            let repo_root = find_repository_root()?;
-            return Ok(Some(repo_root));
-        }
-        // Otherwise prompt (interactive TTY only; non-interactive defaults to no).
-        use std::io::IsTerminal;
-        if !std::io::stdin().is_terminal() {
-            println!("Skipping repo AGENTS.md (non-interactive). Use --agents-md to install.");
-            return Ok(None);
-        }
-        print!(
-            "Also install/merge AGENTS.md into this repo so the workflow is always-on\n\
-             without picking the Atomic agent? [y/N] "
-        );
-        use std::io::Write;
-        std::io::stdout().flush().ok();
-
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| crate::error::CliError::Internal(anyhow::anyhow!(e.to_string())))?;
-        let input = input.trim().to_lowercase();
-        if input == "y" || input == "yes" {
-            let repo_root = find_repository_root()?;
-            Ok(Some(repo_root))
-        } else {
-            Ok(None)
-        }
     }
 
     /// Install hooks from an integration-supplied manifest file.
@@ -802,7 +753,6 @@ mod tests {
             hooks: None,
             from: None,
             agents_md: false,
-            no_agents_md: false,
         };
     }
 
@@ -816,7 +766,6 @@ mod tests {
             hooks: None,
             from: None,
             agents_md: false,
-            no_agents_md: false,
         };
         assert!(cmd.force);
         assert_eq!(cmd.agent.as_deref(), Some("claude-code"));
@@ -832,7 +781,6 @@ mod tests {
             hooks: None,
             from: None,
             agents_md: false,
-            no_agents_md: false,
         };
         assert!(cmd.all);
         assert!(cmd.agent.is_none());
@@ -848,7 +796,6 @@ mod tests {
             hooks: None,
             from: None,
             agents_md: false,
-            no_agents_md: false,
         };
         assert!(cmd.global);
         assert_eq!(cmd.agent.as_deref(), Some("claude-code"));
