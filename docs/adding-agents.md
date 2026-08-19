@@ -45,7 +45,7 @@ An integration therefore has two halves:
 
 | Half | Question it answers | Built from |
 |------|--------------------|------------|
-| **Behavior** | Does the agent work the Atomic way — intent-first, using Atomic's tools, not fighting the recorder? | A system prompt + three skills (shipped in the `atomic-<agent>` package) |
+| **Behavior** | Does the agent work the Atomic way — intent-first, using Atomic's tools, not fighting the recorder? | A system prompt + skills (sourced from the shared [`atomic-skills`](https://github.com/atomicdotdev/atomic-skills) package and shipped via the `atomic-<agent>` package) |
 | **Capture** | Does Atomic receive the agent's lifecycle events and turn them into provenance-bearing changes? | Lifecycle wiring (plugin or hooks manifest) + a hook adapter in the `atomic` crate |
 
 And one requirement that spans both: **testing**, via the agent harness.
@@ -66,9 +66,17 @@ Agent support spans three repositories. Know which one owns which concern:
 
 A **skill** is an on-demand reference document the agent loads when a task
 calls for it (kept out of the always-on prompt to save context). Every Atomic
-agent ships the same three core skills, so that **behavior is identical no
-matter which agent the user runs** — the agent is interchangeable; the Atomic
-workflow is not.
+agent pulls the same skills from a single canonical source — the
+[`atomic-skills`](https://github.com/atomicdotdev/atomic-skills) package — so
+that **behavior is identical no matter which agent the user runs** — the agent
+is interchangeable; the Atomic workflow is not.
+
+The canonical skills live in `atomic-skills/skills/` and are copied into each
+agent's skill directory at install time via `[[skill]]` manifest entries
+(see [How installation works](#how-installation-works-the-integrations-engine)).
+You do **not** copy skill files into your plugin repo — you reference them
+from the shared cache. Fix a workflow detail once in `atomic-skills` and every
+agent benefits.
 
 ### 1. Intents (`atomic-vault`) — capturing the *why*
 
@@ -130,12 +138,11 @@ audit its own recorded work instead of guessing. It also reinforces the
 division of labor: **reading history is the agent's job; recording is the
 hook's job.**
 
-> Some agents ship extras on top of the core three — `atomic-claude` adds
-> `intent-builder` and `codebase-context` — but `atomic-vault`,
-> `code-intelligence`, and `atomic-vcs` are the baseline every package
-> includes. Reuse the existing `SKILL.md` files verbatim (copy them from
-> `atomic-claude/skills/`); keeping the content shared is the point — fix a
-> workflow detail once and every agent benefits.
+> The canonical `atomic-skills` package ships five skills: `atomic-vault`,
+> `atomic-vcs`, `code-intelligence`, `intent-builder`, and `decision-record`.
+> Every agent's manifest declares which skills it installs via `[[skill]]`
+> entries — most install all five, some install a subset. The skills
+> themselves are never duplicated; they always come from the shared cache.
 
 ---
 
@@ -163,11 +170,27 @@ Each agent reads its system prompt from a different file convention:
 | `steering/*.md` | Kiro |
 | `copilot-instructions.md` | Copilot |
 
-Whatever the filename, the prompt must establish the same four things. Real
-examples to copy from: [`atomic-claude/CLAUDE.md`](https://github.com/atomicdotdev/atomic-claude/blob/main/CLAUDE.md)
-(full version) and
-[`atomic-opencode/agents/atomic.md`](https://github.com/atomicdotdev/atomic-opencode/blob/main/agents/atomic.md)
-(compact version).
+Whatever the filename, the prompt must establish the same four things. The
+canonical body lives in [`atomic-skills/AGENTS.md`](https://github.com/atomicdotdev/atomic-skills/blob/main/AGENTS.md)
+— a vendor-neutral workflow document. There are two ways it gets into the
+agent's hands:
+
+1. **Bundled agent** (OpenCode, Claude, Kilo, Pi): The plugin ships a
+   frontmatter template (`agents/atomic.md.frontmatter`) containing only the
+   YAML frontmatter (description, mode, permissions, skill list). At install
+   time, the CLI stitches the frontmatter + canonical `AGENTS.md` body
+   together via `[agent-definition]` in the manifest — pure string concat, no
+   exec. The user picks the "Atomic" agent in their IDE.
+
+2. **Repo-level AGENTS.md** (all agents): `atomic agent enable --agents-md`
+   copies the canonical `AGENTS.md` into the repo root. Every agent in that
+   repo gets the workflow automatically — no agent picking. If the repo
+   already has an `AGENTS.md`, the installer appends the canonical content
+   with a `---` separator (preserving the user's project-specific content).
+
+Real examples to copy from: [`atomic-opencode/agents/atomic.md.frontmatter`](https://github.com/atomicdotdev/atomic-opencode/blob/main/agents/atomic.md.frontmatter)
+(frontmatter template) and [`atomic-skills/AGENTS.md`](https://github.com/atomicdotdev/atomic-skills/blob/main/AGENTS.md)
+(canonical body).
 
 1. **"You use Atomic VCS, not git."** — Set the tool up front so the agent
    stops reaching for `git` commands.
@@ -188,9 +211,10 @@ examples to copy from: [`atomic-claude/CLAUDE.md`](https://github.com/atomicdotd
 4. **Point at the skills.** — Tell the agent to load `atomic-vault`,
    `atomic-vcs`, and `code-intelligence` on demand.
 
-Copy an existing prompt and adapt the surface details (how that agent invokes
-skills, its permission block, its frontmatter) rather than writing from
-scratch — the workflow content should stay consistent across all agents.
+Copy a frontmatter template from an existing bundled-agent plugin and adapt
+the surface details (how that agent invokes skills, its permission block, its
+frontmatter) — the workflow body comes from the canonical `AGENTS.md` and
+should stay consistent across all agents.
 
 ---
 
@@ -458,9 +482,16 @@ Integration packages are published as **public projects on Atomic storage**.
 ```
 1. registry.toml (embedded in the CLI)   →  agent = storage URL + view
 2. atomic clone (Atomic's own sync)      →  ~/.atomic/integrations/<agent>/repo
-3. read atomic-integration.toml          →  check requires.atomic vs CLI version
-4. copy files (never symlinks)           →  merge JSON settings (never clobber)
-5. write receipt.json                    →  clean uninstall + user-file protection
+3. if [skills-source] present:
+   atomic clone atomic-skills            →  ~/.atomic/integrations/atomic-skills/repo
+   (shared cache — reused by every agent install)
+4. read atomic-integration.toml          →  check requires.atomic vs CLI version
+5. copy [[file]] entries                 →  plugins, package.json, hooks scripts
+6. copy [[skill]] entries                →  from atomic-skills cache → vendor skill path
+7. if [[repo-file]] + --agents-md:       →  copy/merge AGENTS.md into repo root
+8. if [agent-definition]:                →  stitch frontmatter + AGENTS.md body → agent slot
+9. merge [[settings]] JSON               →  into agent's settings (never clobber)
+10. write receipt.json                   →  clean uninstall + user-file protection
 ```
 
 Two artifacts make this work, and they live in different places on purpose:
@@ -468,13 +499,22 @@ Two artifacts make this work, and they live in different places on purpose:
 | Artifact | Question it answers | Where it lives |
 |----------|--------------------|----------------|
 | **`registry.toml`** (`atomic-agent/src/integrations/registry.toml`) | **Where to fetch** — adapter name → storage URL + view | In the **atomic** repo, embedded at build time. Adding an agent = a one-line PR here. |
-| **`atomic-integration.toml`** | **What to install** — files→destinations, settings manifests to merge, `requires.atomic` semver gate | In the **integration repo** (each `atomic-<agent>` package). The producer's contract: change the package layout without a CLI release. |
+| **`atomic-integration.toml`** | **What to install** — files→destinations, skills from shared cache, settings manifests to merge, `requires.atomic` semver gate | In the **integration repo** (each `atomic-<agent>` package). The producer's contract: change the package layout without a CLI release. |
+| **`atomic-skills`** ([repo](https://github.com/atomicdotdev/atomic-skills)) | **What the skills + AGENTS.md say** — the canonical skill content and vendor-neutral workflow body | A separate storage project, cloned into the shared cache on first install. |
 
 Key properties of this model:
 
 - **The CLI executes nothing from the package** — no `install.sh`, no
-  postinstall. Files are copied, JSON is merged. Pure Rust, Windows-safe,
-  no bash/node/bun at install time.
+  postinstall. Files are copied, JSON is merged, agent bodies are stitched
+  via string concat. Pure Rust, Windows-safe, no bash/node/bun at install time.
+- **Skills come from a shared cache.** The `atomic-skills` package is cloned
+  once into `~/.atomic/integrations/atomic-skills/repo` and reused by every
+  agent install. No per-plugin skill duplication.
+- **AGENTS.md can merge.** When `--agents-md` installs the canonical
+  `AGENTS.md` into a repo that already has one, the installer appends the
+  canonical content with a `---` separator (preserving the user's content).
+  If the file already contains the Atomic marker (`# Atomic VCS Agent`), it's
+  refreshed instead. `--force` always clobbers.
 - **User files are sacred.** A destination the CLI didn't install, or one the
   user modified since, is skipped (unless `--force`). The receipt
   (`~/.atomic/integrations/<agent>/receipt.json`) is what makes this possible.
@@ -636,25 +676,35 @@ and [`atomic-claude`](https://github.com/atomicdotdev/atomic-claude)):
 ```
 atomic-<agent>/
 ├── atomic-integration.toml           # REQUIRED — the install manifest (below)
-├── agents/<agent>.md   or  CLAUDE.md / AGENTS.md   # system prompt (see above)
-├── skills/
-│   ├── atomic-vault/SKILL.md
-│   ├── atomic-vcs/SKILL.md
-│   └── code-intelligence/SKILL.md
+├── agents/<agent>.md.frontmatter     # frontmatter template (bundled-agent plugins only)
+│                                        body comes from atomic-skills/AGENTS.md at install
 ├── hooks/<agent>.atomic-hooks.json   # settings manifest (config-file style)
 │   —or—
 ├── plugins/atomic-hooks.ts           # plugin (plugin style)
+├── package.json                      # if the plugin needs npm deps (opencode, kilo)
 └── README.md                         # notes the definitive source is Atomic storage
 ```
+
+> **Skills and AGENTS.md do not live in the plugin repo.** They come from the
+> [`atomic-skills`](https://github.com/atomicdotdev/atomic-skills) shared
+> package. The plugin's manifest references them via `[skills-source]` +
+> `[[skill]]` + `[[repo-file]]` entries, and the installer copies them from
+> the shared cache at install time.
 
 You have already seen the three ingredients — the prompt, the skills, and the
 wiring — in the conceptual half of this doc. Assembly notes:
 
-- **Prompt**: ship it under the filename convention your agent reads (see the
-  table in [The system prompt](#the-system-prompt-agentsmd-and-friends)).
-- **Skills**: copy the three core `SKILL.md` files verbatim; the manifest
-  copies them into the agent's skills directory (e.g.
-  `~/.config/opencode/skills/`, `~/.claude/skills/`).
+- **Prompt**: for bundled-agent plugins, ship a frontmatter template
+  (`agents/<agent>.md.frontmatter`) containing only the YAML block. The
+  canonical workflow body comes from `atomic-skills/AGENTS.md` and is stitched
+  in at install time via `[agent-definition]`. For non-bundled plugins, the
+  canonical `AGENTS.md` is delivered via `[[skill]]` (to the agent's
+  instruction-file path) and/or `[[repo-file]]` (to the repo root).
+- **Skills**: declare them as `[[skill]]` entries in the manifest — `src`
+  points into the `atomic-skills` cache (e.g. `skills/atomic-vault/SKILL.md`),
+  `dst` is the vendor's skill path. Vendors with flat layouts (Cline
+  Workflows, agy plugin/skills) use a flat `.md` filename instead of
+  `<name>/SKILL.md`.
 - **Wiring**: whichever style the agent's extension model dictates (see
   [Plugin vs. config file](#plugin-vs-config-file-choosing-the-wiring)).
   Guard every hook: `test -d .atomic || test -f .atomic-sandbox && … || true`
@@ -673,17 +723,46 @@ agent = "myagent"              # must match the adapter name in the registry
 version = "1.0.0"
 
 [requires]
-atomic = ">=0.11.0"            # semver gate — older CLIs get a hard error,
-                               # not a silently broken install
+atomic = ">=0.15.0"            # semver gate — older CLIs get a hard error
 
-# Every file to copy, package-relative src → absolute dst (~ expands):
-[[file]]
-src = "agents/atomic.md"
-dst = "~/.config/myagent/agents/atomic.md"
+# Shared skills source — names the atomic-skills package in the registry.
+# When set, the CLI clones atomic-skills into the shared cache and
+# [[skill]] / [[repo-file]] / [agent-definition] entries resolve their
+# src paths against that cache.
+[skills-source]
+package = "atomic-skills"
 
-[[file]]
+# Skills to copy from the atomic-skills cache into the agent's skill dir.
+# src = path in atomic-skills cache; dst = vendor path (~ expands to home).
+[[skill]]
 src = "skills/atomic-vault/SKILL.md"
 dst = "~/.config/myagent/skills/atomic-vault/SKILL.md"
+
+[[skill]]
+src = "skills/atomic-vcs/SKILL.md"
+dst = "~/.config/myagent/skills/atomic-vcs/SKILL.md"
+
+[[skill]]
+src = "skills/code-intelligence/SKILL.md"
+dst = "~/.config/myagent/skills/code-intelligence/SKILL.md"
+
+# Install the canonical AGENTS.md into the repo root. Only fires when the
+# user opts in via --agents-md (no prompt by default).
+[[repo-file]]
+src = "AGENTS.md"              # from the atomic-skills cache
+dst = "AGENTS.md"              # relative to repo root
+
+# For bundled-agent plugins only (opencode, claude, kilo, pi):
+# Stitch frontmatter + canonical AGENTS.md body at install time.
+[agent-definition]
+src = "agents/atomic.md.frontmatter"        # frontmatter template in this package
+body_from = "atomic-skills:AGENTS.md"       # canonical body from the skills cache
+slot = "~/.config/myagent/agents/atomic.md"  # where the stitched file lands
+
+# Non-skill files to copy (plugins, package.json, hooks scripts, etc.)
+[[file]]
+src = "plugins/atomic-hooks.ts"
+dst = "~/.config/myagent/plugins/atomic-hooks.ts"
 
 # Settings manifests to merge (the hooks-manifest format — same engine as
 # `atomic agent enable --hooks`):
@@ -693,8 +772,21 @@ manifest = "hooks/myagent.atomic-hooks.json"
 
 Rules of thumb:
 
-- `[[file]]` copies (permissions preserved); destinations the user owns or
-  modified are skipped unless `--force`. Absolute paths inside the package
+- `[skills-source]` declares the shared package. Without it, `[[skill]]` and
+  `[agent-definition]` entries have no cache to resolve from and the installer
+  errors.
+- `[[skill]]` copies from the skills cache; destinations the user owns or
+  modified are skipped unless `--force`. Vendors with flat skill layouts
+  (Cline: `Workflows/<name>.md`, agy: `plugin/skills/<name>.md`) use a flat
+  `.md` filename in `dst`.
+- `[[repo-file]]` installs into the **repo root** (not home). When AGENTS.md
+  already exists and isn't ours, the installer **merges** — appends canonical
+  content with a `---` separator, preserving the user's content. If the file
+  contains the Atomic marker (`# Atomic VCS Agent`), it refreshes instead.
+  `--force` always clobbers. Only fires when the user passes `--agents-md`.
+- `[agent-definition]` is a **single table** (not `[[agent-definition]]`).
+  The stitch is pure string concat — `frontmatter + "\n\n" + body` — no exec.
+- `[[file]]` copies (permissions preserved); absolute paths inside the package
   (`src` starting with `/` or containing `..`) are rejected.
 - `[[settings]]` is also how you register things in the agent's own JSON
   config without clobbering it — e.g. atomic-opencode registers its plugin in
@@ -724,6 +816,13 @@ Then add the `registry.toml` entry (step 1.2b) so `enable` can find it.
 Public visibility matters: private projects can't be pulled anonymously, and
 the failure surfaces as a confusing "view not found".
 
+> **Skills are published separately.** The canonical `atomic-skills` package
+> (https://github.com/atomicdotdev/atomic-skills) is the single source of
+> truth for all skills and AGENTS.md content. Your plugin does not publish
+> its own copy — it references `atomic-skills` via `[skills-source]` in the
+> manifest. Updates to skills or the workflow body are pushed to
+> `atomic-skills` once and every plugin picks them up on next install.
+
 #### 2.6 Development loop
 
 Work on the package locally and install from the checkout — no push needed:
@@ -750,7 +849,8 @@ AgentEntry {
     package: "atomic-myagent",          // dir name under AGENTS_DIR
     prompt: PromptKind::AgentsDir,      // where the prompt lives
     installed_skills_dir: "~/.config/myagent/skills",
-    skills: &["atomic-vault", "atomic-vcs", "code-intelligence"],
+    skills: &["atomic-vault", "atomic-vcs", "code-intelligence",
+              "intent-builder", "decision-record"],
 }
 ```
 
@@ -840,9 +940,11 @@ You want all of them green before calling the integration done.
 
 **In `atomic-<agent>` (integration package):**
 
-- [ ] `atomic-integration.toml` with `agent` matching the adapter name, `requires.atomic`, all `[[file]]` srcs verified to exist.
-- [ ] System prompt in the agent's convention (`CLAUDE.md` / `AGENTS.md` / `agents/*.md` / …).
-- [ ] Skills: `atomic-vault`, `atomic-vcs`, `code-intelligence`.
+- [ ] `atomic-integration.toml` with `agent` matching the adapter name, `requires.atomic >=0.15.0`, all `[[file]]` srcs verified to exist.
+- [ ] `[skills-source]` declaring `package = "atomic-skills"`.
+- [ ] `[[skill]]` entries for the skills this agent should install (typically all 5: `atomic-vault`, `atomic-vcs`, `code-intelligence`, `intent-builder`, `decision-record`).
+- [ ] `[[repo-file]]` entry for AGENTS.md-into-repo (so `--agents-md` works).
+- [ ] For bundled-agent plugins: `agents/<agent>.md.frontmatter` (frontmatter template) + `[agent-definition]` entry with `body_from = "atomic-skills:AGENTS.md"`.
 - [ ] Lifecycle wiring: a hooks manifest **or** a plugin that calls `atomic agent hooks <agent> <verb>`.
 - [ ] Every hook guarded with `test -d .atomic || test -f .atomic-sandbox && … || true`.
 - [ ] Pushed to Atomic storage (`git import` for full history), project **public**, README notes the definitive source.
@@ -859,10 +961,11 @@ You want all of them green before calling the integration done.
 
 | Repo | Style | Look at it for |
 |------|-------|----------------|
-| [`atomicdotdev/atomic-opencode`](https://github.com/atomicdotdev/atomic-opencode) | Plugin | `plugins/atomic-hooks.ts` (lifecycle → CLI), `agents/atomic.md` (compact prompt) |
-| [`atomicdotdev/atomic-claude`](https://github.com/atomicdotdev/atomic-claude) | Hooks manifest | `hooks/claude-code.atomic-hooks.json` (manifest), `CLAUDE.md` (full prompt), all five skills |
+| [`atomicdotdev/atomic-skills`](https://github.com/atomicdotdev/atomic-skills) | Canonical content | `AGENTS.md` (vendor-neutral workflow body), `skills/*/SKILL.md` (5 canonical skills) |
+| [`atomicdotdev/atomic-opencode`](https://github.com/atomicdotdev/atomic-opencode) | Plugin + bundled agent | `atomic-integration.toml` (full manifest with all new fields), `agents/atomic.md.frontmatter` (frontmatter template), `plugins/atomic-hooks.ts` (lifecycle → CLI) |
+| [`atomicdotdev/atomic-claude`](https://github.com/atomicdotdev/atomic-claude) | Hooks manifest + bundled agent | `atomic-integration.toml`, `agents/intent.md.frontmatter`, `hooks/claude-code.atomic-hooks.json` (manifest) |
 | [`atomicdotdev/atomic-agents`](https://github.com/atomicdotdev/atomic-agents) | Test harness | `crates/atomic-agent-harness/src/env.rs` (agent registry) |
-| [`atomicdotdev/atomic`](https://github.com/atomicdotdev/atomic) | Engine (this repo) | `atomic-agent/src/hooks/opencode.rs` (reference adapter) |
+| [`atomicdotdev/atomic`](https://github.com/atomicdotdev/atomic) | Engine (this repo) | `atomic-agent/src/hooks/opencode.rs` (reference adapter), `atomic-agent/src/integrations/` (engine) |
 
 ## Reference: key files
 
@@ -872,6 +975,7 @@ You want all of them green before calling the integration done.
 - Verb → hook-type map: `atomic-agent/src/event.rs` (`HookType::from_verb`)
 - Integrations engine: `atomic-agent/src/integrations/` (`registry.toml`,
   `manifest.rs`, `install.rs`, `receipt.rs`)
+- Canonical skills + AGENTS.md: [`atomic-skills`](https://github.com/atomicdotdev/atomic-skills) (`AGENTS.md`, `skills/*/SKILL.md`)
 - Manifest install engine (settings merge): `atomic-agent/src/hooks/manifest.rs`
 - Orchestrator (does the recording): `atomic-agent/src/turn/orchestrator.rs`
 - Hooks CLI entry: `atomic-cli/src/commands/agent/hooks.rs`

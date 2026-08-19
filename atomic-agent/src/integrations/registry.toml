@@ -10,6 +10,10 @@
 
 schema = 1
 
+[agents.atomic-skills]
+url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-skills/code"
+view = "release"
+
 [agents.agy]
 url = "https://atomic.atomic.storage/workspaces/oss/projects/atomic-agy/code"
 view = "release"
