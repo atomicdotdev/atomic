@@ -514,11 +514,10 @@ impl Push {
                 known_on_remote.extend(rm.changes.iter().copied());
             }
 
-            let plan = plan_view_sync(&manifest, remote_manifest.as_ref(), self.force).map_err(
-                |conflict| {
+            let plan = plan_view_sync(&manifest, remote_manifest.as_ref(), self.force, is_leaf)
+                .map_err(|conflict| {
                     self.divergence_error(name, &manifest, remote_manifest.as_ref(), &conflict)
-                },
-            )?;
+                })?;
 
             if plan.forced {
                 print_warning(&format!(
@@ -568,11 +567,23 @@ impl Push {
 
         for sync in &syncs {
             if sync.plan.is_noop() {
-                println!(
-                    "  {} {} already up to date",
-                    success("✓"),
-                    style_view(&sync.remote_name)
-                );
+                if sync.plan.shrink {
+                    // Ancestor view shrank locally but its remote copy is larger.
+                    // We leave the remote intact (it already satisfies the view
+                    // we're pushing) rather than implicitly rewriting shared
+                    // history; the user can rewrite it deliberately.
+                    print_warning(&format!(
+                        "View '{}' is larger on the remote than locally; leaving it unchanged. \
+                         Push '{}' directly with --force to rewrite it to your smaller set.",
+                        sync.remote_name, sync.remote_name
+                    ));
+                } else {
+                    println!(
+                        "  {} {} already up to date",
+                        success("✓"),
+                        style_view(&sync.remote_name)
+                    );
+                }
                 continue;
             }
 

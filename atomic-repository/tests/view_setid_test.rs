@@ -89,3 +89,56 @@ fn view_set_id_round_trips_home_after_split_and_reinsert() {
         "Merkle is order-sensitive and must differ after reordering the log"
     );
 }
+
+/// `retain_view_changes` is the removal half of set-based view convergence: it
+/// drops exactly the view's own changes absent from a target set, is
+/// idempotent, and converges the view's `SetId` to the target.
+#[test]
+fn retain_view_changes_drops_changes_absent_from_target() {
+    use std::collections::HashSet;
+
+    let (repo, _temp, root) = init_repo();
+    let dev = repo.current_view().to_string();
+
+    // Three independent changes → the middle one can be dropped freely.
+    write_and_add(&repo, &root, "a.txt", "alpha\n");
+    let c1 = record(&repo, "add a");
+    write_and_add(&repo, &root, "b.txt", "bravo\n");
+    let c2 = record(&repo, "add b");
+    write_and_add(&repo, &root, "c.txt", "charlie\n");
+    let c3 = record(&repo, "add c");
+
+    // Target keeps {a, c} and drops b — the shape a `view split` leaves behind.
+    let target: HashSet<Hash> = [c1, c3].into_iter().collect();
+    let removed = repo.retain_view_changes(&dev, &target).expect("retain");
+    assert_eq!(
+        removed,
+        vec![c2],
+        "only the change absent from the target is removed"
+    );
+
+    // The converged view now holds exactly the target set.
+    let expected = SetId::ZERO.add(&c1).add(&c3);
+    assert_eq!(
+        repo.view_set_id(&dev).expect("set id"),
+        expected,
+        "view SetId converges to the target set"
+    );
+
+    // Idempotent: converging again to the same target removes nothing.
+    assert!(
+        repo.retain_view_changes(&dev, &target)
+            .expect("retain again")
+            .is_empty(),
+        "an already-converged view removes nothing"
+    );
+
+    // A superset target (the view is a subset of it) has nothing to drop.
+    let superset: HashSet<Hash> = [c1, c2, c3].into_iter().collect();
+    assert!(
+        repo.retain_view_changes(&dev, &superset)
+            .expect("retain superset")
+            .is_empty(),
+        "a target that is a superset of the view removes nothing"
+    );
+}
