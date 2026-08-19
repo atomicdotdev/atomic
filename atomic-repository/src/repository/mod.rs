@@ -240,6 +240,32 @@ impl Repository {
     /// - The directory cannot be created
     /// - The database cannot be initialized
     pub fn init<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
+        Self::init_with_view(path, DEFAULT_VIEW)
+    }
+
+    /// Initialize a new repository whose default view has the given name.
+    ///
+    /// Behaves like [`Repository::init`], but the initial shared root view —
+    /// and the config's `[view] default` — is `view_name` instead of
+    /// [`DEFAULT_VIEW`]. This is used by `atomic git import` so the imported
+    /// repository's default view matches the Git default branch rather than
+    /// leaving an unused `dev` view behind.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The directory to initialize as a repository
+    /// * `view_name` - The name of the initial shared root view
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - A repository already exists at the path
+    /// - The directory cannot be created
+    /// - The database cannot be initialized
+    pub fn init_with_view<P: AsRef<Path>>(
+        path: P,
+        view_name: &str,
+    ) -> Result<Self, RepositoryError> {
         let root = path.as_ref().to_path_buf();
         let dot_dir = root.join(DOT_DIR);
 
@@ -263,7 +289,7 @@ impl Repository {
 [view]
 default = "{}"
 "#,
-            DEFAULT_VIEW
+            view_name
         );
         std::fs::write(&config_path, initial_config)?;
 
@@ -282,25 +308,32 @@ default = "{}"
             let mut txn = pristine
                 .write_txn()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            txn.open_or_create_view(DEFAULT_VIEW)
+            txn.open_or_create_view(view_name)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             txn.commit()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
         }
-        ensure_workspace_dir(&dot_dir, DEFAULT_VIEW)?;
+        ensure_workspace_dir(&dot_dir, view_name)?;
 
         // Initialize the change store
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        Ok(Self {
+        let repository = Self {
             root,
             dot_dir,
-            current_view: DEFAULT_VIEW.to_string(),
+            current_view: view_name.to_string(),
             pristine,
             change_store,
             is_sandbox: false,
-        })
+        };
+
+        // Persist the current-view pointer so reopening resolves this view.
+        // `read_current_view` only falls back to `DEFAULT_STACK` ("dev") when
+        // the pointer file is absent, so a custom initial view must be written.
+        repository.write_current_view(view_name)?;
+
+        Ok(repository)
     }
 
     /// Open an existing repository.

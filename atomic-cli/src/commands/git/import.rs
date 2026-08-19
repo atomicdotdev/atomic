@@ -458,6 +458,10 @@ impl Command for Import {
             print_info("Configured Git to ignore Atomic local state.");
         }
 
+        // Determine Git's default branch up front so a fresh Atomic repo can
+        // adopt it as its default view (rather than the generic `dev` view).
+        let default_branch = self.get_default_branch(&git_repo)?;
+
         // Check if Atomic repository exists in THIS directory (not parent dirs).
         // Don't use find_repository_root() — it walks up and might find
         // ~/.atomic/ (global config dir) which isn't a repo.
@@ -465,8 +469,14 @@ impl Command for Import {
         let mut repo = if repo_exists {
             Repository::open(workdir).map_err(|e| CliError::Internal(e.into()))?
         } else {
-            print_info("Initializing Atomic repository...");
-            Repository::init(workdir).map_err(|e| CliError::Internal(e.into()))?
+            print_info(&format!(
+                "Initializing Atomic repository (default view '{}')...",
+                default_branch
+            ));
+            // Seed the default view with Git's default branch name so Atomic's
+            // shared view matches the project's Git default branch.
+            Repository::init_with_view(workdir, &default_branch)
+                .map_err(|e| CliError::Internal(e.into()))?
         };
 
         let original_view = repo.current_view().to_string();
@@ -482,9 +492,6 @@ impl Command for Import {
                  Pass --with-crdt to pre-materialize token-level blame/diff for imported history.",
             );
         }
-
-        // Determine which branches to import
-        let default_branch = self.get_default_branch(&git_repo)?;
 
         if self.all_branches {
             // Import all branches
