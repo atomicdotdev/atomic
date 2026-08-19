@@ -101,10 +101,10 @@ fi
 
 begin_section "Hook audit log + record consistency"
 
-if [ -f .atomic/hook-errors.log ] && grep -qa "shadow-conflict" .atomic/hook-errors.log; then
-    _pass "hook-errors.log records a shadow-conflict entry"
+if [ -f .atomic/hook-errors.log ] && grep -qa "shadow-validate:V1" .atomic/hook-errors.log; then
+    _pass "hook-errors.log records a shadow-validate:V1 entry"
 else
-    _fail "hook-errors.log records a shadow-conflict entry" \
+    _fail "hook-errors.log records a shadow-validate:V1 entry" \
         "log: $(cat .atomic/hook-errors.log 2>/dev/null | head -3)"
 fi
 
@@ -118,6 +118,12 @@ assert_failure "record refuses the same conflict markers" \
 
 begin_section "Explicit --allow-conflict-markers override"
 
+# Realistic path: the markers are accepted as legitimate content by recording
+# them with record's own override, so the working copy now matches the view
+# (V2 tree↔view coherence holds). The shadow-push override then bypasses the V1
+# marker gate and commits.
+assert_success "record accepts markers with its override" \
+    atomic record --allow-conflict-markers -m "accept markers as content"
 assert_success "override commits a marker-laden tree" \
     atomic git push --no-push --allow-conflict-markers -m "override"
 

@@ -17,6 +17,7 @@ mod merge_property_tests;
 mod record_duplication_tests;
 mod record_tests;
 mod rename_tests;
+mod shadow_lock_tests;
 mod status_tests;
 
 mod tracking_tests;

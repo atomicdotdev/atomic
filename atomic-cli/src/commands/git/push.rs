@@ -5,7 +5,6 @@
 //! pushes to the remote.
 
 use std::io::IsTerminal;
-use std::path::Path;
 
 use clap::Args;
 use git2::Repository as GitRepository;
@@ -82,27 +81,6 @@ impl Default for Push {
     }
 }
 
-/// Append a `shadow-conflict` entry to `.atomic/hook-errors.log` so a
-/// non-interactive shadow push that aborts on conflict markers leaves a durable,
-/// greppable trail instead of failing silently. Best-effort: log I/O errors are
-/// ignored (the push already fails loudly via its return value).
-fn append_shadow_conflict_log(repo_root: &Path, view: &str, file: &str, line: u32) {
-    use std::io::Write;
-    let log_path = repo_root.join(".atomic").join("hook-errors.log");
-    let entry = format!(
-        "{} shadow-conflict view={} file={} line={}\n",
-        chrono::Utc::now().to_rfc3339(),
-        view,
-        file,
-        line
-    );
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .and_then(|mut f| f.write_all(entry.as_bytes()));
-}
-
 impl Command for Push {
     fn run(&self) -> CliResult<()> {
         // Find and open the Atomic repository
@@ -116,6 +94,16 @@ impl Command for Push {
 
         // Get current view name for trailers
         let current_view = repo.current_view().to_string();
+
+        // Serialize the shadow-commit pipeline (SPEC §4.3): acquire the
+        // repo-scoped lock OUTERMOST, before any staging or git mutation. If
+        // another shadow materialize/commit is in flight this is a logged no-op
+        // — the in-flight operation owns this commit. Held for the whole run.
+        let _shadow_lock =
+            match super::shadow::acquire_shadow_lock(&repo, &repo_root, &current_view)? {
+                Some(guard) => guard,
+                None => return Ok(()),
+            };
 
         // Resolve the git branch this push targets. Explicit `--branch` wins;
         // otherwise a draft view maps to a git branch named after the view so
@@ -153,65 +141,61 @@ impl Command for Push {
         // Atomic-State to locate our position in the view's history.
         let last_pushed_state = self.find_last_pushed_state(&git_repo, &current_view);
         let start_idx = match &last_pushed_state {
-            Some(state) => history
-                .iter()
-                .position(|e| &e.state == state)
-                .map(|i| i + 1)
-                .unwrap_or(0),
+            Some(state) => match history.iter().position(|e| &e.state == state) {
+                // Fast-forward: the branch's last published state is in the
+                // view's recorded lineage. Push the changes recorded since.
+                Some(i) => i + 1,
+                // Validator Rule V3 (SPEC §6.3): the branch's last published
+                // state is NOT in this view's lineage — genuine drift (e.g. the
+                // branch was reset, or published from a foreign view/state).
+                // Refuse with **no bypass**; reconcile-then-push.
+                None => {
+                    if !std::io::stderr().is_terminal() {
+                        super::shadow::append_shadow_validate_log(
+                            &repo_root,
+                            "V3",
+                            &current_view,
+                            &format!(
+                                "branch state {} not in view lineage",
+                                &state.to_base32()[..12.min(state.to_base32().len())]
+                            ),
+                        );
+                    }
+                    print_warning(&format!(
+                        "Refusing to shadow-commit: git branch's last published state is \
+                         not in view '{}' history (drift).",
+                        current_view
+                    ));
+                    return Err(CliError::GitError {
+                        message: format!(
+                            "git shadow drift (V3): the branch was last published from a \
+                             state view '{}' cannot reach. Reconcile first, then re-push — \
+                             `git reset --hard` the branch to its last coherent shadow \
+                             commit, or `atomic git import` to onboard the git-side work. \
+                             No commit was created.",
+                            current_view
+                        ),
+                    });
+                }
+            },
+            // First publish for this view/branch — nothing to drift from.
             None => 0,
         };
         let new_history = &history[start_idx..];
         let new_count = new_history.len();
 
-        // Conflict-marker guard (SPEC: shadow materialization must never commit
-        // unresolved markers). Runs BEFORE staging/tree/commit and shares the
-        // exact detector `atomic record` uses, so the two paths cannot disagree.
-        if !self.allow_conflict_markers {
-            if let Some((path, line)) = repo
-                .first_working_copy_conflict_marker()
-                .map_err(CliError::Repository)?
-            {
-                // Non-interactive (hook) contexts get a durable audit entry so a
-                // background materialization cannot fail silently.
-                if !std::io::stderr().is_terminal() {
-                    append_shadow_conflict_log(&repo_root, &current_view, &path, line);
-                }
-                print_warning(&format!(
-                    "Refusing to commit '{}': unresolved conflict marker at line {}.",
-                    path, line
-                ));
-                return Err(CliError::GitError {
-                    message: format!(
-                        "'{}' still contains conflict markers at line {} — resolve the \
-                         conflict (remove the >>>>>>> / ======= / <<<<<<< lines), or pass \
-                         --allow-conflict-markers to override. No commit was created.",
-                        path, line
-                    ),
-                });
-            }
-        }
-
-        // Stage everything: git add -A (add_all + update_all handles new files and deletions)
-        let mut index = git_repo.index().map_err(|e| CliError::GitError {
-            message: format!("Failed to open git index: {}", e),
-        })?;
-        index
-            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
-            .map_err(|e| CliError::GitError {
-                message: format!("Failed to stage files: {}", e),
-            })?;
-        index
-            .update_all(["*"].iter(), None)
-            .map_err(|e| CliError::GitError {
-                message: format!("Failed to update index: {}", e),
-            })?;
-        index.write().map_err(|e| CliError::GitError {
-            message: format!("Failed to write index: {}", e),
-        })?;
-
-        let tree_oid = index.write_tree().map_err(|e| CliError::GitError {
-            message: format!("Failed to write tree: {}", e),
-        })?;
+        // Single shadow-commit pipeline (SPEC §5.2): stage the working copy and
+        // run the pre-commit Validator (V1 markers, V4 provenance) before a tree
+        // is produced. `git push` and the turn-end hook both go through this;
+        // there is no independent `add_all`/`write_tree` here. Any rule failure
+        // aborts atomically (index restored from HEAD, nothing committed).
+        let tree_oid = super::shadow::stage_and_validate_tree(
+            &repo,
+            &git_repo,
+            &repo_root,
+            &current_view,
+            self.allow_conflict_markers,
+        )?;
         let tree = git_repo
             .find_tree(tree_oid)
             .map_err(|e| CliError::GitError {

@@ -31,6 +31,29 @@ impl Repository {
     /// `atomic git push` agree on what counts as a conflicted working copy
     /// (SPEC §5.4). It is the shared guard that stops any automated commit path
     /// — including shadow materialization — from baking markers into history.
+    /// Try to acquire the repo-scoped shadow-commit lock **without blocking**.
+    ///
+    /// Returns `Some(guard)` if acquired (the lock is held until the returned
+    /// file is dropped), or `None` if another shadow materialize/commit is
+    /// already in flight. This serializes the single shadow-commit pipeline
+    /// (SPEC §4.3 / Principle 5) so concurrent hooks/commands never interleave
+    /// partial staging. It is a distinct lock from the deferred-tree alignment
+    /// lock and is meant to be taken **outermost**, before any DB write txn.
+    pub fn try_lock_shadow_commit(&self) -> Result<Option<std::fs::File>, RepositoryError> {
+        use fs2::FileExt;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.dot_dir.join("shadow-commit.lock"))?;
+        match lock.try_lock_exclusive() {
+            Ok(()) => Ok(Some(lock)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(RepositoryError::Io(e)),
+        }
+    }
+
     pub fn first_working_copy_conflict_marker(
         &self,
     ) -> Result<Option<(String, u32)>, RepositoryError> {

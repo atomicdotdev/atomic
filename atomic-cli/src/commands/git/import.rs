@@ -169,7 +169,7 @@ struct BranchImportMode {
     preserve_working_copy: bool,
 }
 
-fn ensure_git_shadow_excludes(git_dir: &Path) -> CliResult<bool> {
+pub(crate) fn ensure_git_shadow_excludes(git_dir: &Path) -> CliResult<bool> {
     let info_dir = git_dir.join("info");
     std::fs::create_dir_all(&info_dir)?;
 

@@ -1,9 +1,11 @@
 //! Git hook installer for automatic Atomic sync.
 //!
-//! Installs `post-commit`, `post-merge`, and `post-rewrite` hooks that
-//! call `atomic git import --incremental` after each git operation.
-//! The import is idempotent — if a commit is already indexed in
-//! GIT_SHA_INDEX, it's skipped.
+//! Installs `post-commit`, `post-merge`, and `post-rewrite` hooks that call
+//! `atomic git import --incremental` after each git operation (idempotent — an
+//! already-indexed commit is skipped), plus a **warn-only** `post-checkout`
+//! hook that flags when git HEAD has moved to a branch that no longer matches
+//! the current Atomic view, pointing the user at the resync command. The
+//! warn hook mutates nothing (SPEC-single-materializer-validator.md §5.4).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,12 +19,26 @@ use crate::output::{print_info, print_warning};
 const MARKER_BEGIN: &str = "# atomic:git:begin";
 const MARKER_END: &str = "# atomic:git:end";
 
-/// The hook script body inserted between markers.
+/// The import hook body inserted between markers on write hooks.
 /// Fails silently (|| true) so git operations never break.
 const HOOK_BODY: &str = r#"atomic git import --incremental 2>/dev/null || true"#;
 
-/// The three hooks we install.
-const HOOK_NAMES: &[&str] = &["post-commit", "post-merge", "post-rewrite"];
+/// Warn-only `post-checkout` body (SPEC §5.4): if git HEAD moved to a branch
+/// that differs from the current Atomic view, print a resync hint. It mutates
+/// nothing — no switch, no import, no commit — and only acts on branch
+/// checkouts (`$3 == 1`), not file checkouts.
+const SYNC_WARN_BODY: &str = r#"if [ "$3" = "1" ]; then b=$(git symbolic-ref --short HEAD 2>/dev/null); v=$(tr -d '[:space:]' < .atomic/current_view 2>/dev/null); if [ -n "$b" ] && [ -n "$v" ] && [ "$b" != "$v" ]; then echo "atomic: git is on '$b' but the Atomic view is '$v'; run 'atomic view switch $b' to resync (or 'atomic git import' to onboard git-side work)." >&2; fi; fi"#;
+
+/// The hooks we install. `post-checkout` is warn-only; the rest run import.
+const HOOK_NAMES: &[&str] = &["post-commit", "post-merge", "post-rewrite", "post-checkout"];
+
+/// The hook-script body for a given hook name.
+fn body_for_hook(name: &str) -> &'static str {
+    match name {
+        "post-checkout" => SYNC_WARN_BODY,
+        _ => HOOK_BODY,
+    }
+}
 
 /// Manage Git hooks for automatic Atomic sync.
 #[derive(Debug, Args)]
@@ -134,8 +150,13 @@ fn install_single_hook(path: &Path, _name: &str) -> Result<bool, std::io::Error>
         return Ok(false);
     }
 
-    // Build the section to append
-    let section = format!("\n{}\n{}\n{}\n", MARKER_BEGIN, HOOK_BODY, MARKER_END);
+    // Build the section to append (body depends on which hook this is).
+    let section = format!(
+        "\n{}\n{}\n{}\n",
+        MARKER_BEGIN,
+        body_for_hook(_name),
+        MARKER_END
+    );
 
     let new_content = if existing.is_empty() {
         format!("#!/bin/sh\n{}", section)
