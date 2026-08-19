@@ -183,6 +183,11 @@ impl Command for Switch {
             ),
         );
 
+        // git shadows Atomic: point the git shadow's HEAD at the mirror branch
+        // for the new view (Direction A, §5.4). Best-effort ref move, no-op
+        // outside a shadow-sync repo — never fails the switch.
+        crate::commands::git::shadow::sync_git_head_to_view(&repo_root, name);
+
         if result.has_conflicts() {
             crate::output::print_warning(&format!(
                 "{} conflicts detected",

@@ -20,6 +20,80 @@ pub(crate) fn first_conflict_marker_line(content: &[u8]) -> Option<u32> {
     None
 }
 
+/// True if a `try_lock*` error means the lock is currently held by someone else
+/// (as opposed to a genuine I/O failure).
+///
+/// On Unix a contended non-blocking lock surfaces as `WouldBlock`, but on
+/// Windows the OS returns `ERROR_LOCK_VIOLATION` (code 33), which maps to
+/// `ErrorKind::Uncategorized` rather than `WouldBlock`. Comparing the raw OS
+/// error against `fs2::lock_contended_error()` handles both platforms.
+pub(crate) fn is_lock_contended(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::WouldBlock
+        || (e.raw_os_error().is_some()
+            && e.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+}
+
+impl Repository {
+    /// Return the first working-copy file that still contains an unresolved
+    /// conflict marker, as `(path, 1-based line)`, or `None` if the working
+    /// copy is clean.
+    ///
+    /// This scans the same status entries `record` guards on
+    /// (Added / Modified / Conflicted) with the same detector
+    /// (`first_conflict_marker_line`), so `atomic record` and
+    /// `atomic git push` agree on what counts as a conflicted working copy
+    /// (SPEC §5.4). It is the shared guard that stops any automated commit path
+    /// — including shadow materialization — from baking markers into history.
+    /// Try to acquire the repo-scoped shadow-commit lock **without blocking**.
+    ///
+    /// Returns `Some(guard)` if acquired (the lock is held until the returned
+    /// file is dropped), or `None` if another shadow materialize/commit is
+    /// already in flight. This serializes the single shadow-commit pipeline
+    /// (SPEC §4.3 / Principle 5) so concurrent hooks/commands never interleave
+    /// partial staging. It is a distinct lock from the deferred-tree alignment
+    /// lock and is meant to be taken **outermost**, before any DB write txn.
+    pub fn try_lock_shadow_commit(&self) -> Result<Option<std::fs::File>, RepositoryError> {
+        use fs2::FileExt;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.dot_dir.join("shadow-commit.lock"))?;
+        match lock.try_lock_exclusive() {
+            Ok(()) => Ok(Some(lock)),
+            Err(e) if is_lock_contended(&e) => Ok(None),
+            Err(e) => Err(RepositoryError::Io(e)),
+        }
+    }
+
+    pub fn first_working_copy_conflict_marker(
+        &self,
+    ) -> Result<Option<(String, u32)>, RepositoryError> {
+        let status = self.status(StatusOptions::default())?;
+        for entry in status.entries() {
+            let is_directory = entry.details().map(|d| d == "directory").unwrap_or(false);
+            if is_directory {
+                continue;
+            }
+            if !matches!(
+                entry.status(),
+                FileStatus::Added | FileStatus::Modified | FileStatus::Conflicted
+            ) {
+                continue;
+            }
+            let path = entry.path().to_string_lossy().to_string();
+            let full_path = self.root.join(&path);
+            if let Ok(content) = std::fs::read(&full_path) {
+                if let Some(line) = first_conflict_marker_line(&content) {
+                    return Ok(Some((path, line)));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// Render a name conflict: two or more inodes are alive at the same path on
 /// this view, so instead of silently emitting whichever inode `TREE` happened
 /// to keep, wrap every side's materialized content in conflict markers.
@@ -945,5 +1019,35 @@ impl Repository {
         self.populate_file_index(&result);
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod conflict_marker_tests {
+    use super::first_conflict_marker_line;
+
+    #[test]
+    fn detects_numbered_start_marker_at_line_start() {
+        let content = b"const shared = 1;\n>>>>>>> 1\nconst a = 2;\n======= 1 [C2YTBAHQ]\nconst b = 3;\n<<<<<<< 1\n";
+        assert_eq!(first_conflict_marker_line(content), Some(2));
+    }
+
+    #[test]
+    fn ignores_separator_or_content_that_only_appears_mid_line() {
+        // A legitimate line that merely contains `=======` (e.g. a Markdown
+        // rule or a comment) must not be misdetected — only a `>>>>>>>` at
+        // line start counts.
+        let content = b"let divider = \"=======\";\nfn eq() { a ======= b }\n";
+        assert_eq!(first_conflict_marker_line(content), None);
+    }
+
+    #[test]
+    fn clean_content_has_no_marker() {
+        assert_eq!(first_conflict_marker_line(b"fn main() {}\n"), None);
+    }
+
+    #[test]
+    fn binary_content_carries_no_marker() {
+        assert_eq!(first_conflict_marker_line(&[0xff, 0xfe, 0x00, 0x01]), None);
     }
 }

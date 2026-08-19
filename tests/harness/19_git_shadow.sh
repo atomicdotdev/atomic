@@ -541,25 +541,33 @@ else
     _fail "git status stays clean after checked-out feature import" "$GIT_STATUS_AFTER_FEATURE"
 fi
 
-# Switching views must not move Git's administrative state even though `.git`
-# is ignored by the Atomic repository after Git import. Git remains able to
-# own and restore its checked-out worktree after the switch.
+# git shadows Atomic (SPEC-single-materializer-validator.md §5.4): an
+# `atomic view switch` now repoints the git shadow's HEAD to the mirror branch.
+# This supersedes the old "git owns the checkout; view switch must not move git"
+# model. It is a ref move — git metadata is preserved and files are never
+# re-rendered; Atomic stays the content authority.
 assert_success "Atomic view switch materializes primary view" atomic view switch "$PRIMARY_BRANCH"
 assert_dir_exists "Atomic view switch preserves Git metadata" ".git"
-GIT_STATUS_AFTER_ATOMIC_SWITCH=$(git status --short)
-if [[ -z "$GIT_STATUS_AFTER_ATOMIC_SWITCH" ]]; then
-    _pass "Atomic view switch preserves a clean Git checkout"
-else
-    _fail "Atomic view switch preserves a clean Git checkout" "$GIT_STATUS_AFTER_ATOMIC_SWITCH"
-fi
-git checkout "$PRIMARY_BRANCH" 2>/dev/null
-assert_success "incremental import restores Git-owned primary checkout" atomic git import --incremental --branch "$PRIMARY_BRANCH" --no-vault
+assert_file_content "primary view content is materialized" "shared.txt" "main baseline"
 
-GIT_STATUS_AFTER_RESTORE=$(git status --short)
-if [[ -z "$GIT_STATUS_AFTER_RESTORE" ]]; then
-    _pass "Git checkout restores a clean shared worktree"
+SWITCHED_GIT_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)
+if [ "$SWITCHED_GIT_BRANCH" = "$PRIMARY_BRANCH" ]; then
+    _pass "git shadow HEAD follows the view to '$PRIMARY_BRANCH'"
 else
-    _fail "Git checkout restores a clean shared worktree" "$GIT_STATUS_AFTER_RESTORE"
+    _fail "git shadow HEAD follows the view to '$PRIMARY_BRANCH'" "on '$SWITCHED_GIT_BRANCH'"
+fi
+
+# The feature-* files are residue from the earlier raw `git checkout
+# zz-materialization` (mixing raw git with Atomic — the anti-pattern SPEC §5.4
+# discourages). Now that git HEAD follows the view to the primary branch they
+# show as untracked; a shadow push would refuse them (V2). Clearing the residue
+# restores a clean tree.
+rm -f feature-only.txt feature-tool.sh feature-link
+GIT_STATUS_AFTER_CLEAN=$(git status --short)
+if [[ -z "$GIT_STATUS_AFTER_CLEAN" ]]; then
+    _pass "clean worktree once raw-git residue is cleared"
+else
+    _fail "clean worktree once raw-git residue is cleared" "$GIT_STATUS_AFTER_CLEAN"
 fi
 
 # ════════════════════════════════════════════════════════════════════════

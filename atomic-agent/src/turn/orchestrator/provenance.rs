@@ -80,7 +80,7 @@ impl TurnOrchestrator {
         };
 
         if let Err(e) = lock_file.try_lock_exclusive() {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
+            if super::is_lock_contended(&e) {
                 log::warn!(
                     "Provenance accumulator for session {} is already locked; skipping best-effort provenance update",
                     session_id,
@@ -158,7 +158,7 @@ impl TurnOrchestrator {
         };
 
         if let Err(e) = lock_file.try_lock_exclusive() {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
+            if super::is_lock_contended(&e) {
                 log::warn!(
                     "Provenance accumulator for session {} is already locked; skipping save",
                     session_id,

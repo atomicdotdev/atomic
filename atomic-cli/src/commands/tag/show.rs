@@ -33,8 +33,8 @@
 
 use clap::Parser;
 
-use atomic_core::types::Base32;
-use atomic_repository::Repository;
+use atomic_core::types::{Base32, Hash};
+use atomic_repository::{Repository, TagKind};
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
@@ -123,7 +123,11 @@ impl Command for Show {
                 }
 
                 if let Some(ref metadata) = tag.metadata {
-                    println!("{}: {}", emphasis("Metadata"), metadata);
+                    if tag.kind == TagKind::ReviewGate {
+                        render_review_gate_metadata(&repo, metadata);
+                    } else {
+                        println!("{}: {}", emphasis("Metadata"), metadata);
+                    }
                 }
 
                 Ok(())
@@ -137,6 +141,96 @@ impl Command for Show {
                     ))
                 );
                 Ok(())
+            }
+        }
+    }
+}
+
+/// Render `ReviewGate` tag metadata as a readable provenance block.
+///
+/// Only lines whose underlying data is present are printed. All lookups are
+/// defensive against absent fields, matching the extensible metadata shape.
+fn render_review_gate_metadata(repo: &Repository, metadata: &serde_json::Value) {
+    // Git provenance line: "Git: <merge_strategy> <sha> (PR #<n>)"
+    if let Some(git) = metadata.get("git") {
+        let sha = git.get("sha").and_then(|v| v.as_str());
+        let strategy = git.get("merge_strategy").and_then(|v| v.as_str());
+        if sha.is_some() || strategy.is_some() {
+            let mut line = String::new();
+            if let Some(strategy) = strategy {
+                line.push_str(strategy);
+            }
+            if let Some(sha) = sha {
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(sha);
+            }
+            if let Some(pr) = git.get("pr_number").and_then(|v| v.as_u64()) {
+                line.push_str(&format!(" (PR #{})", pr));
+            }
+            println!("{}: {}", emphasis("Git"), line);
+        }
+    }
+
+    let changes = metadata.get("changes");
+    let original = changes
+        .and_then(|c| c.get("original_hashes"))
+        .and_then(|v| v.as_array());
+
+    // Aggregate line.
+    if let Some(changes) = changes {
+        let from = changes.get("from").and_then(|v| v.as_str());
+        let to = changes.get("to").and_then(|v| v.as_str());
+        let count = changes.get("count").and_then(|v| v.as_u64());
+        let inserted = changes
+            .get("inserted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if let (Some(from), Some(to)) = (from, to) {
+            let count_val = count
+                .map(|c| c as usize)
+                .or_else(|| original.map(|a| a.len()))
+                .unwrap_or(0);
+            let inserted_suffix = if inserted { ", inserted" } else { "" };
+            println!(
+                "{}: {} \u{2026} {}  ({} records{})",
+                emphasis("Aggregate"),
+                from,
+                to,
+                count_val,
+                inserted_suffix
+            );
+        } else if let Some(original) = original {
+            let count_val = count.map(|c| c as usize).unwrap_or(original.len());
+            println!("{}: {} records", emphasis("Aggregate"), count_val);
+        }
+    }
+
+    // Per-record presence and view membership.
+    if let Some(original) = original {
+        if !original.is_empty() {
+            println!("{}:", emphasis("Records"));
+            for entry in original {
+                let Some(s) = entry.as_str() else { continue };
+                match Hash::from_base32(s.as_bytes()) {
+                    Some(hash) => {
+                        let present = repo.has_change(&hash);
+                        let mark = if present { "\u{2713}" } else { "\u{2717}" };
+                        let status = if present { "present" } else { "missing" };
+                        let views = repo.views_containing_change(&hash).unwrap_or_default();
+                        let views_suffix = if views.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  ({})", views.join(", "))
+                        };
+                        println!("  {} {}  {}{}", mark, s, status, views_suffix);
+                    }
+                    None => {
+                        println!("  {}", s);
+                    }
+                }
             }
         }
     }

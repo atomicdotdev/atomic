@@ -242,6 +242,13 @@ pub struct JsonChange {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unhashed: Option<serde_json::Value>,
 
+    /// Change ledger(s): the causal decision graph(s) explaining this change,
+    /// loaded from the `.provenance` file. Empty when no provenance graph is
+    /// recorded for the change. This is the machine-readable equivalent of the
+    /// `=== Change Ledger ===` section in the default text output.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ledger: Vec<JsonChangeLedger>,
+
     /// Sequence number in the current view (if known).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<u64>,
@@ -278,6 +285,7 @@ impl JsonChange {
             has_provenance: change.has_provenance(),
             provenance: None,
             unhashed: change.unhashed.clone(),
+            ledger: Vec::new(),
             sequence,
         }
     }
@@ -293,6 +301,166 @@ impl JsonChange {
             json.provenance = Some(JsonProvenance::from(prov));
         }
         json
+    }
+
+    /// Attach the change ledger(s) (causal decision graph) to this JSON change.
+    ///
+    /// Consumes and returns `self` so it can be chained after construction.
+    pub fn with_ledger(mut self, ledger: Vec<JsonChangeLedger>) -> Self {
+        self.ledger = ledger;
+        self
+    }
+}
+
+/// JSON representation of a change ledger (one provenance/decision graph).
+///
+/// Mirrors [`atomic_core::change::ProvenanceGraph`] but flattens node/edge
+/// kinds to their stable snake_case labels and encodes hashes as Base32 so the
+/// output is stable and self-describing for external tooling.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonChangeLedger {
+    /// Base32 hash of the provenance graph itself.
+    pub graph_hash: String,
+    /// Session identifier linking graphs within the same session.
+    pub session_id: String,
+    /// Agent registry key (e.g. "claude-code", "opencode").
+    pub agent_name: String,
+    /// Human-readable agent name (e.g. "Claude Code").
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub agent_display_name: String,
+    /// AI vendor (e.g. "anthropic", "openai").
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub agent_vendor: String,
+    /// Graph creation timestamp (Unix epoch seconds).
+    pub timestamp: i64,
+    /// Schema profile identifier (e.g. "sherpa-trace/1.0.0"), when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Vault work-item/intent ID governing this turn, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    /// Number of nodes in the decision graph.
+    pub node_count: usize,
+    /// Number of causal edges in the decision graph.
+    pub edge_count: usize,
+    /// Number of changes this graph explains.
+    pub change_count: usize,
+    /// Base32 hashes of the changes this graph explains.
+    pub changes_explained: Vec<String>,
+    /// Base32 hash of the previous graph in this session chain, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    /// The typed nodes in the decision DAG.
+    pub nodes: Vec<JsonLedgerNode>,
+    /// The causal edges between nodes.
+    pub edges: Vec<JsonLedgerEdge>,
+}
+
+/// JSON representation of a single provenance graph node.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonLedgerNode {
+    /// Unique node identifier within the graph.
+    pub id: String,
+    /// Node kind label (snake_case: "goal", "exploration", "commitment", ...).
+    pub kind: String,
+    /// When this activity occurred (Unix epoch milliseconds).
+    pub timestamp: i64,
+    /// One-line human-readable summary.
+    pub summary: String,
+    /// Kind-specific structured detail. Parsed to JSON when it is valid JSON,
+    /// otherwise carried as a raw string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+    /// Base32 hash of the change this node produced, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_hash: Option<String>,
+    /// Tool name that produced this node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Tool call ID for correlating pre/post pairs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Duration of the tool call in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Whether the classifier consolidated this node.
+    pub classified: bool,
+    /// Classifier confidence (0.0–1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    /// IDs of raw tool-call nodes this decision consolidates.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub consolidated_from: Vec<String>,
+}
+
+/// JSON representation of a causal edge between two provenance nodes.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonLedgerEdge {
+    /// Source node ID (the cause).
+    pub from: String,
+    /// Target node ID (the effect).
+    pub to: String,
+    /// Edge kind label (snake_case: "led_to", "explored_via", ...).
+    pub kind: String,
+}
+
+impl JsonChangeLedger {
+    /// Build a JSON ledger from a provenance graph and its content hash.
+    pub fn from_graph(graph_hash: &Hash, graph: &atomic_core::change::ProvenanceGraph) -> Self {
+        Self {
+            graph_hash: graph_hash.to_base32(),
+            session_id: graph.session_id.clone(),
+            agent_name: graph.agent_name.clone(),
+            agent_display_name: graph.agent_display_name.clone(),
+            agent_vendor: graph.agent_vendor.clone(),
+            timestamp: graph.timestamp,
+            profile: graph.profile.clone(),
+            plan_id: graph.plan_id.clone(),
+            node_count: graph.node_count(),
+            edge_count: graph.edge_count(),
+            change_count: graph.change_count(),
+            changes_explained: graph
+                .changes_explained
+                .iter()
+                .map(|h| h.to_base32())
+                .collect(),
+            previous: graph.previous.as_ref().map(|h| h.to_base32()),
+            nodes: graph.nodes.iter().map(JsonLedgerNode::from).collect(),
+            edges: graph.edges.iter().map(JsonLedgerEdge::from).collect(),
+        }
+    }
+}
+
+impl From<&atomic_core::change::provenance_graph::ProvenanceNode> for JsonLedgerNode {
+    fn from(node: &atomic_core::change::provenance_graph::ProvenanceNode) -> Self {
+        let detail = node.detail.as_ref().map(|d| {
+            serde_json::from_str::<serde_json::Value>(d)
+                .unwrap_or_else(|_| serde_json::Value::String(d.clone()))
+        });
+        Self {
+            id: node.id.clone(),
+            kind: node.kind.to_string(),
+            timestamp: node.timestamp,
+            summary: node.summary.clone(),
+            detail,
+            change_hash: node.change_hash.as_ref().map(|h| h.to_base32()),
+            tool_name: node.tool_name.clone(),
+            tool_call_id: node.tool_call_id.clone(),
+            duration_ms: node.duration_ms,
+            classified: node.classified,
+            confidence: node.confidence,
+            consolidated_from: node.consolidated_from.clone(),
+        }
+    }
+}
+
+impl From<&atomic_core::change::provenance_graph::ProvenanceEdge> for JsonLedgerEdge {
+    fn from(edge: &atomic_core::change::provenance_graph::ProvenanceEdge) -> Self {
+        Self {
+            from: edge.from.clone(),
+            to: edge.to.clone(),
+            kind: edge.kind.to_string(),
+        }
     }
 }
 

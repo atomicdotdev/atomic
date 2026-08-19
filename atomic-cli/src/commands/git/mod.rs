@@ -58,6 +58,7 @@ pub mod hooks;
 pub mod import;
 pub mod parallel;
 pub mod push;
+pub(crate) mod shadow;
 
 use clap::Subcommand;
 

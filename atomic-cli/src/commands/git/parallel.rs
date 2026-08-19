@@ -102,6 +102,12 @@ pub struct ImportStats {
     /// Commits skipped because they were created by `atomic git push` and
     /// the view already contains the state they reference.
     pub self_push_skipped: usize,
+    /// Squash commits represented by inserting their original change records
+    /// into the target view instead of writing a new squash change (SPEC §4).
+    pub squash_inserted: usize,
+    /// Atomic-origin squash commits skipped because their originals were not
+    /// present locally, or inserting them diverged from the git tree (SPEC §5).
+    pub squash_skipped: usize,
     /// Time spent in Phase 1 (parsing).
     pub phase1_duration: std::time::Duration,
     /// Time spent in Phase 2 (writing).
@@ -169,8 +175,46 @@ fn should_skip_self_push(parsed: &ParsedCommit, options: &ParallelImportOptions)
     }
     match &parsed.push_trailer {
         Some(trailer) => {
-            trailer.view == options.target_view && options.known_states.contains(&trailer.state)
+            self_push_state_known(trailer, &options.target_view, &options.known_states)
         }
+        None => false,
+    }
+}
+
+/// The self-push rule in one place: a commit created by `atomic git push`
+/// carries the target view's Merkle state, so if that view already has the
+/// state, the commit adds nothing. Shared by [`should_skip_self_push`] and
+/// [`incremental_import_skips`] so the real import and the `--dry-run` forecast
+/// can never disagree on it.
+fn self_push_state_known(
+    trailer: &PushTrailer,
+    target_view: &str,
+    known_states: &HashSet<Merkle>,
+) -> bool {
+    trailer.view == target_view && known_states.contains(&trailer.state)
+}
+
+/// Whether an incremental import would skip the git commit identified by `sha`
+/// with the given commit `message`, for a target view that already contains
+/// `imported_shas` and `known_states`.
+///
+/// This mirrors exactly what the real importer does — the SHA skip in
+/// `collect_commit_oids` (already-imported commits) plus the self-push skip in
+/// `phase2_write` (commits whose carried view state is already present). It is
+/// the single source of truth used by `atomic git import --dry-run` to forecast
+/// the real import count. Callers must only invoke it for incremental imports.
+pub(crate) fn incremental_import_skips(
+    sha: &str,
+    message: &str,
+    imported_shas: &HashSet<String>,
+    target_view: &str,
+    known_states: &HashSet<Merkle>,
+) -> bool {
+    if imported_shas.contains(sha) {
+        return true;
+    }
+    match parse_push_trailer(message) {
+        Some(trailer) => self_push_state_known(&trailer, target_view, known_states),
         None => false,
     }
 }
@@ -2281,10 +2325,14 @@ impl ParallelImporter {
             stats.empty_commits += write_stats.empty_commits;
             stats.merge_commits += write_stats.merge_commits;
             stats.self_push_skipped += write_stats.self_push_skipped;
+            stats.squash_inserted += write_stats.squash_inserted;
+            stats.squash_skipped += write_stats.squash_skipped;
             stats.files_processed += write_stats.files_processed;
 
-            commits_written +=
-                write_stats.changes_written + write_stats.empty_commits + write_stats.merge_commits;
+            commits_written += write_stats.changes_written
+                + write_stats.empty_commits
+                + write_stats.merge_commits
+                + write_stats.squash_inserted;
             all_imported_commits.extend(batch_imported);
 
             let total_elapsed = import_start.elapsed();
@@ -2611,6 +2659,27 @@ impl ParallelImporter {
                 continue;
             }
 
+            // Squash → insert (SPEC §4): an atomic-origin squash-merge is
+            // represented by inserting its original change records into the
+            // target view, not by writing a new squash change. Only attempted
+            // on incremental imports (the git-shadow-sync workflow), where the
+            // originals already exist in the graph.
+            if self.options.incremental {
+                match self.try_squash_insert(repo, parsed)? {
+                    SquashDecision::Inserted(info) => {
+                        stats.squash_inserted += 1;
+                        stats.files_processed += parsed.files.len();
+                        imported_commits.push(info);
+                        continue;
+                    }
+                    SquashDecision::Skipped => {
+                        stats.squash_skipped += 1;
+                        continue;
+                    }
+                    SquashDecision::NotSquash => {}
+                }
+            }
+
             // Progress reporting with per-batch timing
             if total > 100 && idx % 100 == 0 {
                 if idx == 0 {
@@ -2686,6 +2755,142 @@ impl ParallelImporter {
         }
 
         Ok((stats, imported_commits))
+    }
+
+    /// Attempt to represent an atomic-origin squash commit by inserting its
+    /// original change records into the target view instead of writing a new
+    /// squash change (SPEC §4). Verifies that the insert reproduces the git
+    /// tree for the touched paths; on divergence or missing originals it rolls
+    /// back and skips the commit (SPEC §5, decision D1-A).
+    fn try_squash_insert(
+        &self,
+        repo: &mut Repository,
+        parsed: &ParsedCommit,
+    ) -> CliResult<SquashDecision> {
+        use atomic_repository::InsertOptions;
+
+        // Merges are handled by the normal path + the phase-3 merge tag.
+        if parsed.is_merge {
+            return Ok(SquashDecision::NotSquash);
+        }
+
+        // Must carry Atomic-Changes trailers to be an atomic-origin squash.
+        let message = parsed.full_message();
+        let original_hashes = match parse_atomic_changes_trailer(&message) {
+            Some(h) => h,
+            None => return Ok(SquashDecision::NotSquash),
+        };
+        let pr_number = parse_pr_number(&message);
+
+        // Resolve every original to a Hash and confirm it exists locally. A
+        // missing original means we cannot reconstruct the aggregate — skip and
+        // advise `atomic pull` rather than fabricate a squash change (SPEC §5).
+        let mut parsed_hashes: Vec<ContentHash> = Vec::with_capacity(original_hashes.len());
+        for h in &original_hashes {
+            match ContentHash::from_base32(h.as_bytes()) {
+                Some(hash) if repo.has_change(&hash) => parsed_hashes.push(hash),
+                _ => {
+                    print_warning(&format!(
+                        "Squash {} references change {} which is not present locally; \
+                         skipping (run `atomic pull` to fetch it, then re-import).",
+                        parsed.short_sha, h
+                    ));
+                    return Ok(SquashDecision::Skipped);
+                }
+            }
+        }
+
+        let target = self.options.target_view.clone();
+
+        // Insert the originals (with dependency closure) into the target view.
+        // Track exactly which changes we newly added, for rollback on divergence.
+        let mut newly_applied: Vec<ContentHash> = Vec::new();
+        for hash in &parsed_hashes {
+            let options = InsertOptions::default()
+                .view(target.clone())
+                .apply_deps(true);
+            match repo.insert_change_rec(hash, options) {
+                Ok(outcome) => {
+                    newly_applied.extend(outcome.stats.applied_hashes.iter().copied());
+                }
+                Err(e) => {
+                    print_warning(&format!(
+                        "Squash {}: failed to insert original {}: {}; skipping.",
+                        parsed.short_sha,
+                        &hash.to_base32()[..12],
+                        e
+                    ));
+                    rollback_inserts(repo, &target, &newly_applied);
+                    return Ok(SquashDecision::Skipped);
+                }
+            }
+        }
+
+        // Verify the insert reproduces the git tree for every touched path
+        // (SPEC §5 / D1-A). Divergence means a human resolved a conflict in the
+        // PR; we must not silently desync the shared view from git.
+        if !self.squash_insert_matches_tree(repo, parsed, &target) {
+            print_warning(&format!(
+                "Squash {}: inserting its originals diverges from the git tree \
+                 (manual conflict resolution?); skipping. The shared view was \
+                 left unchanged.",
+                parsed.short_sha
+            ));
+            rollback_inserts(repo, &target, &newly_applied);
+            return Ok(SquashDecision::Skipped);
+        }
+
+        // Anchor the git SHA to the tip original so re-imports resolve it and
+        // `atomic change <sha>` works; the ReviewGate tag owns full provenance.
+        let tip = parsed_hashes.last().copied().unwrap_or(ContentHash::ZERO);
+        if tip != ContentHash::ZERO {
+            let _ = repo.index_git_sha(&parsed.git_sha, &tip);
+        }
+
+        Ok(SquashDecision::Inserted(ImportedCommitInfo {
+            git_sha: parsed.git_sha.clone(),
+            short_sha: parsed.short_sha.clone(),
+            atomic_hash: tip,
+            is_merge: false,
+            message,
+            squash_insert: Some(SquashInsert {
+                original_hashes,
+                pr_number,
+            }),
+        }))
+    }
+
+    /// Whether the target view's materialized content for every path the squash
+    /// touches matches the git tree recorded in `parsed`.
+    fn squash_insert_matches_tree(
+        &self,
+        repo: &Repository,
+        parsed: &ParsedCommit,
+        target: &str,
+    ) -> bool {
+        for file in &parsed.files {
+            match file.operation {
+                FileOperation::Deleted => {
+                    // The path must be absent (or empty) in the target view.
+                    if let Ok(Some(content)) = repo.get_file_content_on_view(&file.path, target) {
+                        if !content.is_empty() {
+                            return false;
+                        }
+                    }
+                }
+                _ => {
+                    let expected = match &file.new_content {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    match repo.get_file_content_on_view(&file.path, target) {
+                        Ok(Some(actual)) if &actual == expected => {}
+                        _ => return false,
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Write a single commit to the repository.
@@ -2827,6 +3032,7 @@ impl ParallelImporter {
                 atomic_hash: write_outcome.hash,
                 is_merge: parsed.is_merge,
                 message: parsed.full_message(),
+                squash_insert: None,
             });
         }
 
@@ -3303,6 +3509,7 @@ impl ParallelImporter {
             atomic_hash: write_outcome.hash,
             is_merge: parsed.is_merge,
             message: parsed.full_message(),
+            squash_insert: None,
         })
     }
 
@@ -3346,6 +3553,7 @@ impl ParallelImporter {
             atomic_hash: write_outcome.hash,
             is_merge: parsed.is_merge,
             message: parsed.full_message(),
+            squash_insert: None,
         })
     }
 
@@ -3418,6 +3626,47 @@ impl ParallelImporter {
         let mut stats = ClassificationStats::default();
 
         for info in imported {
+            // Squash represented by inserted originals (SPEC §4): tag the
+            // aggregate over those records rather than re-classifying from the
+            // message. The originals are already live in the target view.
+            if let Some(sq) = &info.squash_insert {
+                stats.squashes += 1;
+                let tag_name = if let Some(pr) = sq.pr_number {
+                    format!("pr-{}", pr)
+                } else {
+                    format!("squash-{}", info.short_sha)
+                };
+                let from = sq.original_hashes.first();
+                let to = sq.original_hashes.last();
+                let metadata = serde_json::json!({
+                    "git": {
+                        "sha": info.git_sha,
+                        "merge_strategy": "squash",
+                        "pr_number": sq.pr_number,
+                    },
+                    "changes": {
+                        "original_hashes": sq.original_hashes,
+                        "from": from,
+                        "to": to,
+                        "count": sq.original_hashes.len(),
+                        "inserted": true,
+                    }
+                });
+                if let Err(e) = repo.create_tag_with_metadata(
+                    &tag_name,
+                    Some(&format!("Squash merge {} (inserted)", info.short_sha)),
+                    TagKind::ReviewGate,
+                    Some(metadata),
+                ) {
+                    log::warn!(
+                        "Failed to create aggregate ReviewGate tag for squash {}: {}",
+                        info.short_sha,
+                        e
+                    );
+                }
+                continue;
+            }
+
             let classification = classify_commit(info);
             match classification {
                 CommitClassification::Normal => {
@@ -3495,7 +3744,9 @@ impl ParallelImporter {
         let actual = stats.changes_written
             + stats.empty_commits
             + stats.merge_commits
-            + stats.self_push_skipped;
+            + stats.self_push_skipped
+            + stats.squash_inserted
+            + stats.squash_skipped;
 
         if actual != expected {
             return Err(CliError::GitError {
@@ -3521,6 +3772,10 @@ struct WriteStats {
     empty_commits: usize,
     merge_commits: usize,
     self_push_skipped: usize,
+    /// Squash commits handled by inserting their originals (SPEC §4).
+    squash_inserted: usize,
+    /// Atomic-origin squash commits skipped (missing originals or divergence).
+    squash_skipped: usize,
     files_processed: usize,
 }
 
@@ -3537,6 +3792,31 @@ struct ImportedCommitInfo {
     is_merge: bool,
     /// The commit message (for squash detection).
     message: String,
+    /// Set when this squash was represented by inserting its original change
+    /// records into the target view (SPEC §4) rather than writing a new change.
+    /// Phase 3 turns this into an aggregate ReviewGate tag.
+    squash_insert: Option<SquashInsert>,
+}
+
+/// Provenance for a squash represented by inserting its originals (SPEC §4).
+#[derive(Debug, Clone)]
+struct SquashInsert {
+    /// The original change hashes named in the squash's trailers, trailer order.
+    original_hashes: Vec<String>,
+    /// PR/MR number parsed from the squash subject, if any.
+    pr_number: Option<u32>,
+}
+
+/// Outcome of attempting the squash → insert path in Phase 2 (SPEC §4/§5).
+enum SquashDecision {
+    /// Handled by inserting the originals; carries the info for tagging.
+    Inserted(ImportedCommitInfo),
+    /// An atomic-origin squash we could not insert (originals missing, or the
+    /// insert diverged from the git tree). The commit is left unimported so a
+    /// later run can complete it; caller warns and advises.
+    Skipped,
+    /// Not an insertable atomic squash — fall through to the normal write path.
+    NotSquash,
 }
 
 /// Classification of a commit detected during post-import analysis.
@@ -3561,6 +3841,66 @@ struct ClassificationStats {
 // ═══════════════════════════════════════════════════════════════════════
 // Commit Classification
 // ═══════════════════════════════════════════════════════════════════════
+
+/// Dry-run classification of an incoming commit, used by the `--dry-run` router
+/// to recommend the right import path (SPEC §4.4).
+pub(crate) enum ForecastKind {
+    /// Git-authored content with no atomic provenance.
+    Normal,
+    /// Multi-parent merge commit.
+    Merge,
+    /// Atomic-origin squash whose originals are all present — insertable.
+    SquashInsertable { count: usize, pr: Option<u32> },
+    /// Atomic-origin squash missing ≥ 1 original locally — needs `atomic pull`.
+    SquashRecordsMissing { count: usize },
+}
+
+/// Classify an incoming git commit for the `--dry-run` forecast (SPEC §4.4).
+///
+/// `records_present(hash)` reports whether a named original change hash exists
+/// locally; callers wire it to `Repository::has_change`.
+pub(crate) fn forecast_commit_kind(
+    message: &str,
+    is_merge: bool,
+    records_present: impl Fn(&str) -> bool,
+) -> ForecastKind {
+    if is_merge {
+        return ForecastKind::Merge;
+    }
+    match parse_atomic_changes_trailer(message) {
+        Some(hashes) => {
+            if hashes.iter().all(|h| records_present(h)) {
+                ForecastKind::SquashInsertable {
+                    count: hashes.len(),
+                    pr: parse_pr_number(message),
+                }
+            } else {
+                ForecastKind::SquashRecordsMissing {
+                    count: hashes.len(),
+                }
+            }
+        }
+        None => ForecastKind::Normal,
+    }
+}
+
+/// Remove change refs a failed squash-insert added to `view`, newest first, so
+/// a divergent or partial insert leaves the shared view exactly as it was
+/// (SPEC §5 / D1-A). Best-effort: rollback failures are logged, not fatal.
+fn rollback_inserts(repo: &Repository, view: &str, applied: &[ContentHash]) {
+    use atomic_repository::UnrecordOptions;
+    for hash in applied.iter().rev() {
+        let options = UnrecordOptions::default().view(view.to_string());
+        if let Err(e) = repo.unrecord(hash, options) {
+            print_warning(&format!(
+                "Failed to roll back inserted change {} from '{}': {}",
+                &hash.to_base32()[..12],
+                view,
+                e
+            ));
+        }
+    }
+}
 
 /// Classify an imported commit as normal, merge, or squash.
 fn classify_commit(info: &ImportedCommitInfo) -> CommitClassification {
@@ -3589,22 +3929,48 @@ fn classify_commit(info: &ImportedCommitInfo) -> CommitClassification {
     CommitClassification::Normal
 }
 
-/// Parse "Atomic-Changes: HASH1, HASH2, ..." from a commit message.
+/// Split the value of a single `Atomic-Changes:` trailer (the text after the
+/// colon) into individual, non-empty change hashes.
+fn split_atomic_changes_value(value: &str) -> impl Iterator<Item = String> + '_ {
+    value
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Parse **every** `Atomic-Changes:` trailer in a commit message.
+///
+/// A GitHub (or GitLab/Azure) squash-merge concatenates the bodies of all
+/// squashed commits, so a single squash commit legitimately carries
+/// **multiple** `Atomic-Changes:` blocks — one per materialization commit. We
+/// accumulate hashes across every block, de-duplicated with first-seen order
+/// preserved, so the ReviewGate links back to the *full* set of original
+/// changes rather than just the first block.
+///
+/// This differs deliberately from [`parse_push_trailer`], which inspects only
+/// the message's final paragraph. That function answers "did *I* just push this
+/// exact view state?", where only the trailing self-push block is
+/// authoritative; this function answers "which original changes does this
+/// squash represent?", where every block counts. They share the low-level
+/// [`split_atomic_changes_value`] splitter but must keep these distinct
+/// notions of which trailers are relevant.
 fn parse_atomic_changes_trailer(message: &str) -> Option<Vec<String>> {
+    let mut all: Vec<String> = Vec::new();
     for line in message.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("Atomic-Changes:") {
-            let hashes: Vec<String> = rest
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !hashes.is_empty() {
-                return Some(hashes);
+            for hash in split_atomic_changes_value(rest) {
+                if !all.contains(&hash) {
+                    all.push(hash);
+                }
             }
         }
     }
-    None
+    if all.is_empty() {
+        None
+    } else {
+        Some(all)
+    }
 }
 
 /// Parse a PR/MR number from a commit message.
@@ -3866,7 +4232,10 @@ fn parse_push_trailer(message: &str) -> Option<PushTrailer> {
         } else if let Some(value) = line.strip_prefix("Atomic-State:") {
             state = Merkle::from_base32(value.trim().as_bytes());
         } else if line.starts_with("Atomic-Changes:") {
-            // Optional trailer; not needed for self-push detection.
+            // Optional trailer; not needed for self-push detection (we only
+            // care about view + state here). The authoritative collection of
+            // these hashes for ReviewGate provenance happens in
+            // `parse_atomic_changes_trailer`, which scans the whole message.
         } else {
             // Non-trailer content in the final paragraph — not a commit
             // produced by `atomic git push`.
@@ -4354,6 +4723,66 @@ mod tests {
     }
 
     #[test]
+    fn test_incremental_import_skips() {
+        let (state_b32, state) = test_state();
+        let self_push_msg = format!(
+            "feat: test\n\nAtomic-View: main\nAtomic-State: {}",
+            state_b32
+        );
+        let plain_msg = "feat: ordinary human commit";
+
+        let mut imported = HashSet::new();
+        imported.insert("already-imported-sha".to_string());
+        let mut known_states = HashSet::new();
+        known_states.insert(state);
+
+        // Already-imported SHA is skipped regardless of message.
+        assert!(incremental_import_skips(
+            "already-imported-sha",
+            plain_msg,
+            &imported,
+            "main",
+            &known_states,
+        ));
+
+        // Self-push commit whose state is already in the target view is skipped.
+        assert!(incremental_import_skips(
+            "new-sha",
+            &self_push_msg,
+            &imported,
+            "main",
+            &known_states,
+        ));
+
+        // Self-push commit for a DIFFERENT view is not skipped.
+        assert!(!incremental_import_skips(
+            "new-sha",
+            &self_push_msg,
+            &imported,
+            "dev",
+            &known_states,
+        ));
+
+        // Self-push commit whose state is unknown is not skipped.
+        assert!(!incremental_import_skips(
+            "new-sha",
+            &self_push_msg,
+            &imported,
+            "main",
+            &HashSet::new(),
+        ));
+
+        // An ordinary new commit is imported (not skipped).
+        assert!(!incremental_import_skips(
+            "new-sha",
+            plain_msg,
+            &imported,
+            "main",
+            &known_states,
+        ));
+    }
+
+    #[test]
     fn test_file_operation_equality() {
         assert_eq!(FileOperation::Added, FileOperation::Added);
         assert_ne!(FileOperation::Added, FileOperation::Modified);
@@ -4473,6 +4902,7 @@ mod tests {
             atomic_hash: ContentHash::ZERO,
             is_merge,
             message: message.to_string(),
+            squash_insert: None,
         }
     }
 
@@ -4561,6 +4991,76 @@ mod tests {
     #[test]
     fn test_parse_atomic_changes_trailer_none() {
         assert_eq!(parse_atomic_changes_trailer("normal commit"), None);
+    }
+
+    #[test]
+    fn test_parse_atomic_changes_trailer_collects_all_blocks() {
+        // A GitHub squash-merge concatenates every squashed commit body, so the
+        // message carries multiple `Atomic-Changes:` blocks. All must survive.
+        let msg = "\
+squash (#2)
+
+* materialize
+Atomic-View: a
+Atomic-State: S1
+Atomic-Changes: AAA, BBB
+
+* materialize
+Atomic-View: b
+Atomic-State: S2
+Atomic-Changes: CCC
+
+Atomic-Changes: DDD, EEE
+";
+        let hashes = parse_atomic_changes_trailer(msg).expect("should parse");
+        assert_eq!(hashes, vec!["AAA", "BBB", "CCC", "DDD", "EEE"]);
+    }
+
+    #[test]
+    fn test_parse_atomic_changes_trailer_dedups_preserving_order() {
+        // The tip work can repeat a hash already listed in an earlier block;
+        // de-duplicate while keeping first-seen order.
+        let msg = "\
+squash (#3)
+
+Atomic-Changes: AAA, BBB
+Atomic-Changes: BBB, CCC, AAA
+";
+        let hashes = parse_atomic_changes_trailer(msg).expect("should parse");
+        assert_eq!(hashes, vec!["AAA", "BBB", "CCC"]);
+    }
+
+    #[test]
+    fn test_classify_squash_collects_all_trailer_blocks() {
+        // End-to-end through classify_commit: the squash ReviewGate must record
+        // every original hash, not just the first block's.
+        let msg = "\
+Materialize session view (#7)
+
+* chore(atomic): materialize
+Atomic-View: old-forest-591e
+Atomic-State: S1
+Atomic-Changes: FIRSTHASH
+
+* chore(atomic): materialize
+Atomic-View: calm-violet-8d7f
+Atomic-State: S2
+Atomic-Changes: SECONDHASH, THIRDHASH
+";
+        let info = test_info(msg, false);
+        match classify_commit(&info) {
+            CommitClassification::Squash {
+                original_hashes,
+                pr_number,
+            } => {
+                assert_eq!(
+                    original_hashes,
+                    vec!["FIRSTHASH", "SECONDHASH", "THIRDHASH"]
+                );
+                assert_eq!(pr_number, Some(7));
+            }
+            other => panic!("expected Squash, got {:?}", other),
+        }
     }
 
     #[test]

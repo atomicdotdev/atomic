@@ -59,8 +59,14 @@ impl Repository {
 
         // Get repository status to find modified files
         let status_t0 = std::time::Instant::now();
+        let mut status_options = StatusOptions::default();
+        if !options.all() {
+            for path in options.get_paths() {
+                status_options = status_options.filter_path(std::path::PathBuf::from(path));
+            }
+        }
         let status = self
-            .status(StatusOptions::default())
+            .status_for_record(status_options, options.get_detect_raw_renames())
             .map_err(RecordError::Repository)?;
         if trace_record {
             eprintln!(
@@ -168,9 +174,11 @@ impl Repository {
         // as moves so the main loop skips deleting them.
         let mut renamed_from: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut rename_moves: Vec<(String, String, atomic_core::types::Inode)> = Vec::new();
-        {
-            // Candidate destinations: untracked files present on disk.
-            let mut untracked: Vec<(String, Vec<u8>)> = Vec::new();
+        if options.get_detect_raw_renames() {
+            // Candidate destinations: regular untracked files present on disk,
+            // bucketed by size so unrelated contents are never loaded.
+            let mut untracked_by_size: std::collections::BTreeMap<u64, Vec<String>> =
+                std::collections::BTreeMap::new();
             for e in status.entries() {
                 if e.status() != FileStatus::Untracked {
                     continue;
@@ -179,34 +187,52 @@ impl Repository {
                 if !options.should_include(&p) {
                     continue;
                 }
-                if let Ok(bytes) = std::fs::read(self.root.join(&p)) {
-                    untracked.push((p, bytes));
+                if let Ok(metadata) = std::fs::metadata(self.root.join(&p)) {
+                    if metadata.is_file() {
+                        untracked_by_size.entry(metadata.len()).or_default().push(p);
+                    }
                 }
             }
-            if !untracked.is_empty() {
-                let mut used_new: std::collections::HashSet<usize> =
+
+            for paths in untracked_by_size.values_mut() {
+                paths.sort();
+            }
+
+            if !untracked_by_size.is_empty() {
+                let mut used_new: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
-                for f in &files_to_record {
-                    if f.status() != FileStatus::Deleted {
-                        continue;
-                    }
-                    if f.details().map(|d| d == "directory").unwrap_or(false) {
-                        continue; // directory renames are out of scope for Stage 1
-                    }
+                let mut deleted_candidates: Vec<&FileStatusEntry> = files_to_record
+                    .iter()
+                    .copied()
+                    .filter(|f| {
+                        f.status() == FileStatus::Deleted && f.details() != Some("directory")
+                    })
+                    .collect();
+                deleted_candidates.sort_by(|a, b| a.path().cmp(b.path()));
+
+                for f in deleted_candidates {
                     let old_path = f.path().to_string_lossy().to_string();
                     // The deleted file's content as the graph still holds it.
                     let old_bytes = match self.get_file_content(&old_path) {
                         Ok(Some(b)) => b,
                         _ => continue,
                     };
-                    // Pair with the first unused untracked file of identical bytes.
-                    let matched = untracked.iter().enumerate().find(|(i, (_, nb))| {
-                        !used_new.contains(i) && nb.len() == old_bytes.len() && **nb == old_bytes
-                    });
-                    let Some((idx, (new_path, _))) = matched else {
+                    let Some(candidates) = untracked_by_size.get(&(old_bytes.len() as u64)) else {
                         continue;
                     };
-                    let new_path = new_path.clone();
+                    // Pair with the first unused, same-sized destination whose
+                    // contents are byte-identical. Candidate order is stable.
+                    let matched = candidates.iter().find(|new_path| {
+                        if used_new.contains(*new_path) {
+                            return false;
+                        }
+                        std::fs::read(self.root.join(new_path))
+                            .map(|new_bytes| new_bytes == old_bytes)
+                            .unwrap_or(false)
+                    });
+                    let Some(new_path) = matched.cloned() else {
+                        continue;
+                    };
                     let inode = match f.inode() {
                         Some(ino) => ino,
                         None => match self.get_file_inode(&old_path) {
@@ -214,7 +240,7 @@ impl Repository {
                             _ => continue,
                         },
                     };
-                    used_new.insert(idx);
+                    used_new.insert(new_path.clone());
                     renamed_from.insert(old_path.clone());
                     rename_moves.push((old_path, new_path, inode));
                 }

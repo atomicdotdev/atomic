@@ -49,7 +49,10 @@ impl Command for Init {
 
         // Record vault files as their own change
         let header = atomic_core::change::ChangeHeader::new("Initialize vault");
-        match repo.record(header, atomic_repository::RecordOptions::default()) {
+        let options = atomic_repository::RecordOptions::new()
+            .add_path(".vault")
+            .detect_raw_renames(false);
+        match repo.record(header, options) {
             Ok(_) => print_success("Recorded vault defaults"),
             Err(atomic_repository::RecordError::NothingToRecord) => {}
             Err(e) => log::warn!("Failed to record vault files: {}", e),
