@@ -27,7 +27,7 @@ impl Repository {
     ///
     /// This scans the same status entries `record` guards on
     /// (Added / Modified / Conflicted) with the same detector
-    /// ([`first_conflict_marker_line`]), so `atomic record` and
+    /// (`first_conflict_marker_line`), so `atomic record` and
     /// `atomic git push` agree on what counts as a conflicted working copy
     /// (SPEC §5.4). It is the shared guard that stops any automated commit path
     /// — including shadow materialization — from baking markers into history.
