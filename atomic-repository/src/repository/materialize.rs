@@ -20,6 +20,19 @@ pub(crate) fn first_conflict_marker_line(content: &[u8]) -> Option<u32> {
     None
 }
 
+/// True if a `try_lock*` error means the lock is currently held by someone else
+/// (as opposed to a genuine I/O failure).
+///
+/// On Unix a contended non-blocking lock surfaces as `WouldBlock`, but on
+/// Windows the OS returns `ERROR_LOCK_VIOLATION` (code 33), which maps to
+/// `ErrorKind::Uncategorized` rather than `WouldBlock`. Comparing the raw OS
+/// error against `fs2::lock_contended_error()` handles both platforms.
+pub(crate) fn is_lock_contended(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::WouldBlock
+        || (e.raw_os_error().is_some()
+            && e.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+}
+
 impl Repository {
     /// Return the first working-copy file that still contains an unresolved
     /// conflict marker, as `(path, 1-based line)`, or `None` if the working
@@ -49,7 +62,7 @@ impl Repository {
             .open(self.dot_dir.join("shadow-commit.lock"))?;
         match lock.try_lock_exclusive() {
             Ok(()) => Ok(Some(lock)),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) if is_lock_contended(&e) => Ok(None),
             Err(e) => Err(RepositoryError::Io(e)),
         }
     }
