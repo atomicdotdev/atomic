@@ -203,6 +203,61 @@ impl Repository {
         Ok(())
     }
 
+    /// Repair an existing view's full identity (scope **and** parent) to match
+    /// a declared manifest/snapshot.
+    ///
+    /// Unlike [`Repository::set_view_scope`], which only touches the scope
+    /// (and clears the parent when promoting to Shared), this sets both fields
+    /// atomically, resolving `parent_name` to its id. It is used on the sync
+    /// path when a view was auto-created with the wrong identity (e.g. a draft
+    /// that `ensure_view_exists` created as Shared before its snapshot was
+    /// reconciled) so a subsequent `apply_view_manifest` no longer fails the
+    /// identity check.
+    ///
+    /// Returns `ViewNotFound` if the view — or a named parent — does not exist.
+    pub fn set_view_identity(
+        &self,
+        name: &str,
+        scope: ViewScope,
+        parent_name: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut view = txn
+            .get_view(name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: name.to_string(),
+            })?;
+
+        let parent_id = match parent_name {
+            Some(p) => Some(
+                txn.get_view(p)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .ok_or_else(|| RepositoryError::ViewNotFound {
+                        name: p.to_string(),
+                    })?
+                    .id,
+            ),
+            None => None,
+        };
+
+        view.kind = scope;
+        // A Shared view is a root; it never carries a parent.
+        view.parent = if scope.is_shared() { None } else { parent_id };
+
+        txn.update_view(&view)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Walk the parent chain from `view_name` and return the name of the
     /// first Shared view encountered.  If `view_name` is itself Shared,
     /// it is returned immediately.  This is used to determine the correct
