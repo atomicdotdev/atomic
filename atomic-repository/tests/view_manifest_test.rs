@@ -262,3 +262,50 @@ fn empty_view_manifest_declares_identity_only() {
     assert_eq!(info.parent_name.as_deref(), Some("dev"));
     assert!(info.is_empty());
 }
+
+/// Regression: a draft pushed alongside its changes can be auto-created as a
+/// Shared view (the server's `ensure_view_exists` does this before the view
+/// snapshot is reconciled). `apply_view_manifest` then refuses it forever with
+/// an identity mismatch. `set_view_identity` repairs the scope + parent so the
+/// manifest applies and the view resolves as a draft off its parent.
+#[test]
+fn repair_identity_unsticks_autocreated_shared_draft() {
+    let (origin, _t1, _r1, _hashes) = build_origin();
+
+    let dev_m = origin.view_manifest("dev").expect("dev manifest");
+    let orange_m = origin.view_manifest("orange").expect("orange manifest");
+
+    // Mirror gets dev (the parent) plus every change orange references.
+    let (mut mirror, _t2, _r2) = init_repo();
+    transfer_changes(&origin, &mirror, &dev_m);
+    mirror.apply_view_manifest(&dev_m).expect("apply dev");
+    transfer_changes(&origin, &mirror, &orange_m);
+
+    // Simulate the server auto-creating the draft as Shared before its
+    // snapshot was reconciled.
+    mirror
+        .create_shared_view("orange")
+        .expect("auto-create as shared");
+
+    // Left uncorrected, the identity check rejects the draft manifest.
+    let err = mirror
+        .apply_view_manifest(&orange_m)
+        .expect_err("scope mismatch must be rejected");
+    assert!(
+        matches!(err, RepositoryError::ManifestIdentityMismatch { .. }),
+        "got: {err}"
+    );
+
+    // Repair the identity, then the same manifest applies cleanly.
+    mirror
+        .set_view_identity("orange", ViewScope::Draft, Some("dev"))
+        .expect("repair identity");
+    mirror
+        .apply_view_manifest(&orange_m)
+        .expect("apply after repair");
+
+    let info = mirror.get_view_info("orange").unwrap();
+    assert_eq!(info.scope, ViewScope::Draft);
+    assert_eq!(info.parent_name.as_deref(), Some("dev"));
+    assert_eq!(info.state, orange_m.state);
+}
