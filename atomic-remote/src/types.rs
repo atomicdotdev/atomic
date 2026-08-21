@@ -609,13 +609,31 @@ pub struct RemoteViewInfo {
 
     /// The view's current base32 Merkle state, or `None` if the view is empty.
     pub state: Option<String>,
+
+    /// Order-invariant `SetId` (base32) of the view's effective change set, when
+    /// the server advertises it (6th wire field). This is the convergence
+    /// identity used to validate that a pull/clone reproduced the exact set;
+    /// `None` against servers that predate it.
+    pub set_id: Option<String>,
+}
+
+/// Outcome of a bare view-ref compare-and-swap (`PUT /refs/views/{name}`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefUpdate {
+    /// The ref moved to the new snapshot key (fast-forward or genesis).
+    Committed,
+    /// The move was rejected — divergent history or a lost concurrent CAS.
+    /// Carries the server's explanation.
+    Conflict(String),
 }
 
 impl RemoteViewInfo {
     /// Parse one protocol line into a [`RemoteViewInfo`].
     ///
-    /// Wire format (tab-separated): `name\tscope\tparent\tchange_count\tstate`,
-    /// where `parent` and `state` use `-` to mean "none".
+    /// Wire format (tab-separated):
+    /// `name\tscope\tparent\tchange_count\tstate\tset_id`, where `parent`,
+    /// `state`, and `set_id` use `-`/absence to mean "none". The trailing
+    /// `set_id` is optional so older 5-field servers still parse.
     ///
     /// Returns `None` for blank lines or lines that don't have at least the
     /// `name` and `scope` fields, so unrelated output (e.g. an older server's
@@ -639,6 +657,7 @@ impl RemoteViewInfo {
             .and_then(|c| c.trim().parse::<u64>().ok())
             .unwrap_or(0);
         let state = fields.next().map(str::trim).filter(|s| !s.is_empty());
+        let set_id = fields.next().map(str::trim).filter(|s| !s.is_empty());
 
         let none_or = |v: Option<&str>| match v {
             Some("-") | None => None,
@@ -651,6 +670,7 @@ impl RemoteViewInfo {
             parent: none_or(parent),
             change_count,
             state: none_or(state),
+            set_id: none_or(set_id),
         })
     }
 

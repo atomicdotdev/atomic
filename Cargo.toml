@@ -7,6 +7,7 @@ members = [
     "atomic-core",
     "atomic-config",
     "atomic-identity",
+    "atomic-objects",
     "atomic-remote",
     "atomic-repository",
     "atomic-semantic",
@@ -29,6 +30,7 @@ atomic-canonical = { path = "atomic-canonical" }
 atomic-core = { path = "atomic-core" }
 atomic-config = { path = "atomic-config" }
 atomic-identity = { path = "atomic-identity" }
+atomic-objects = { path = "atomic-objects" }
 atomic-remote = { path = "atomic-remote" }
 atomic-repository = { path = "atomic-repository" }
 atomic-semantic = { path = "atomic-semantic" }

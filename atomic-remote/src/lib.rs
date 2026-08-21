@@ -139,6 +139,7 @@ pub use version::{check_min_version_header, needs_upgrade};
 pub use error::{RemoteError, RemoteResult};
 
 // HTTP client
+pub use http::code_sync::PushSummary;
 pub use http::{HttpRemote, HttpRemoteConfig};
 
 // Storage management client
@@ -151,7 +152,7 @@ pub use storage_types::{
 // Protocol types
 pub use types::{
     ChangelistEntry, Node, NodeType, ParseChangelistError, ParseNodeTypeError, ParseStateError,
-    PullDelta, PushDelta, RemoteViewInfo, StateResponse,
+    PullDelta, PushDelta, RefUpdate, RemoteViewInfo, StateResponse,
 };
 
 // Sync engine

@@ -26,14 +26,17 @@
 //! - Missing remote channels
 //! - Diverged history warnings
 
+use std::collections::HashMap;
 use std::time::Duration;
 
+use bytes::Bytes;
 use clap::Parser;
 
-use atomic_core::types::{Base32, Hash};
-use atomic_remote::{HttpRemote, HttpRemoteConfig};
+use atomic_core::types::{Base32, Hash, Merkle, SetId};
+use atomic_objects::{ObjectFamily, SyncPack, SyncWants, ViewSnapshot};
+use atomic_remote::{ChangelistEntry, HttpRemote, HttpRemoteConfig, StateResponse};
 use atomic_repository::history::HistoryOptions;
-use atomic_repository::{InsertOptions, Repository};
+use atomic_repository::{InsertOptions, Repository, ViewManifest};
 
 use crate::commands::{find_repository_root, format_hash, Command};
 use crate::error::{CliError, CliResult};
@@ -48,6 +51,97 @@ use super::helpers::{
     format_bytes, format_count, has_local_only_changes, save_downloaded_change,
 };
 use super::types::{PullChange, PullStats};
+
+/// Reconstruct a view's manifest from a pulled [`SyncPack`]: find the view's ref
+/// target, then its view-snapshot object, and render the manifest text.
+/// Returns `None` when the pack carries no ref/snapshot for `name` (the remote
+/// view does not exist).
+///
+/// This replaces the per-object `get_view_ref` + `get_object("views", …)`
+/// round-trips: a pull now reads the remote's view state from the single `/code`
+/// sync response.
+fn manifest_from_pack(pack: &SyncPack, name: &str, url: &str) -> CliResult<Option<ViewManifest>> {
+    let target = match pack.refs.iter().find(|r| r.name == name) {
+        Some(r) => r.new_target.clone(),
+        None => return Ok(None),
+    };
+    let snapshot = pack
+        .objects
+        .iter()
+        .find(|o| o.family == ObjectFamily::View && o.key == target)
+        .and_then(|o| ViewSnapshot::from_bytes(&o.bytes));
+    let snapshot = match snapshot {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let manifest = ViewManifest::parse(&snapshot.to_manifest_text(name)).map_err(|e| {
+        CliError::RemoteError {
+            message: format!("Corrupt manifest for view '{name}': {e}"),
+            url: Some(url.to_string()),
+        }
+    })?;
+    // O(1) producer-integrity cross-check: the snapshot's declared `own_set_id`
+    // must equal the order-invariant fold of its own change list. Content
+    // addressing guarantees the object's bytes, but not that a (buggy) producer
+    // minted a self-consistent set-id; this catches that cheaply.
+    let mut fold = SetId::ZERO;
+    for h in &manifest.changes {
+        fold = fold.add(h);
+    }
+    if fold.to_base32() != snapshot.own_set_id {
+        print_warning(&format!(
+            "Remote view '{name}' snapshot set-id disagrees with its change list; \
+             the remote object may be inconsistent."
+        ));
+    }
+    Ok(Some(manifest))
+}
+
+/// Index a pack's objects of one family into `content key → bytes`.
+fn pack_objects_by_key(pack: &SyncPack, family: ObjectFamily) -> HashMap<String, Vec<u8>> {
+    pack.objects
+        .iter()
+        .filter(|o| o.family == family)
+        .map(|o| (o.key.clone(), o.bytes.clone()))
+        .collect()
+}
+
+/// Reconstruct the requested view's metadata chain from a sync pack in
+/// root-to-leaf order. The server includes the requested ref and every ancestor
+/// snapshot. Views are metadata closures over the common graph, so pull applies
+/// this whole chain after saving the missing graph objects.
+fn manifest_chain_from_pack(
+    pack: &SyncPack,
+    leaf: &str,
+    url: &str,
+) -> CliResult<Vec<ViewManifest>> {
+    let mut by_name = HashMap::new();
+    for r in &pack.refs {
+        if let Some(m) = manifest_from_pack(pack, &r.name, url)? {
+            by_name.insert(r.name.clone(), m);
+        }
+    }
+
+    let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut cursor = Some(leaf.to_string());
+    while let Some(name) = cursor {
+        if !seen.insert(name.clone()) {
+            return Err(CliError::RemoteError {
+                message: format!("Remote view parent chain contains a cycle at '{name}'"),
+                url: Some(url.to_string()),
+            });
+        }
+        let manifest = by_name.remove(&name).ok_or_else(|| CliError::RemoteError {
+            message: format!("Remote view metadata is missing '{name}'"),
+            url: Some(url.to_string()),
+        })?;
+        cursor = manifest.parent.clone();
+        chain.push(manifest);
+    }
+    chain.reverse();
+    Ok(chain)
+}
 
 // Constants
 
@@ -396,20 +490,13 @@ impl Pull {
         let remote_view = self.get_remote_view(repo.current_view());
         let local_view = self.get_local_view(&remote_view);
 
-        // Ensure the local target view exists. When pulling a view that is
-        // not present locally (a teammate's view, or a `--to-view` naming a
-        // fresh view), create it so downloaded changes have somewhere to go
-        // instead of failing to apply with "View not found". A dry run must
-        // not mutate the repository, so it only records the view's absence.
-        let mut local_view_exists = repo
+        // Whether the local target view already exists. Creation is deferred
+        // until the remote manifest is known (below), so a pulled draft can be
+        // created with the remote's identity (scope + parent) — inheriting its
+        // parent's history — instead of a flat shared view.
+        let local_view_exists = repo
             .view_exists(&local_view)
             .map_err(CliError::Repository)?;
-        if !local_view_exists && !self.dry_run {
-            repo.create_shared_view(&local_view)
-                .map_err(CliError::Repository)?;
-            local_view_exists = true;
-            print_info(&format!("Created local view '{}'", local_view));
-        }
 
         // Print header
         println!(
@@ -429,32 +516,11 @@ impl Pull {
         })?;
         finish_success(&spinner, "Connected");
 
-        // Query remote state
-        let spinner = create_spinner("Querying remote state...");
-        let remote_state = remote.get_state(&remote_view).await.map_err(|e| {
-            finish_error(&spinner, "Failed to query state");
-            convert_remote_error(e, &remote_url)
-        })?;
-        finish_success(&spinner, "Got remote state");
-
-        // Get remote changelist
-        let spinner = create_spinner("Fetching remote changelist...");
-        let remote_from = 0; // Always get full changelist for comparison
-        let remote_entries = remote
-            .get_changelist(&remote_view, remote_from)
-            .await
-            .map_err(|e| {
-                finish_error(&spinner, "Failed to fetch changelist");
-                convert_remote_error(e, &remote_url)
-            })?;
-        finish_success(
-            &spinner,
-            &format!("Got {} remote changes", remote_entries.len()),
-        );
-
-        // Get local history for the target view. A freshly created view (or,
-        // under --dry-run, one that does not exist yet) has no local changes,
-        // so every remote change is treated as missing.
+        // Load the target view's history for display only. Object negotiation is
+        // graph-wide: `haves` is every change node already registered in the
+        // common pristine, regardless of which view metadata currently exposes
+        // it. This prevents the server from resending shared-view nodes when a
+        // draft's own local log is empty.
         let spinner = create_spinner("Loading local history...");
         let local_entries = if local_view_exists {
             repo.log(HistoryOptions::new().view(&local_view))
@@ -462,9 +528,85 @@ impl Pull {
         } else {
             Vec::new()
         };
+        let haves: Vec<String> = repo
+            .registered_change_hashes()
+            .map_err(CliError::Repository)?
+            .into_iter()
+            .map(|hash| hash.to_base32())
+            .collect();
         finish_success(
             &spinner,
-            &format!("Loaded {} local changes", local_entries.len()),
+            &format!(
+                "Loaded {} local view changes ({} graph objects present)",
+                local_entries.len(),
+                haves.len()
+            ),
+        );
+
+        // One `/code` pull: request the remote view metadata chain and any graph
+        // objects absent from the graph-wide `haves`. The response carries the
+        // requested view + ancestor snapshots and the missing `.change` objects.
+        let spinner = create_spinner("Fetching remote view...");
+        let pull_pack = remote
+            .sync_pull(&SyncWants {
+                refs: vec![remote_view.clone()],
+                haves,
+                // A dry run only needs the manifest to compute the delta; skip
+                // downloading change bodies it will not apply.
+                refs_only: self.dry_run,
+            })
+            .await
+            .map_err(|e| {
+                finish_error(&spinner, "Failed to fetch remote view");
+                convert_remote_error(e, &remote_url)
+            })?;
+        let mut remote_chain = match manifest_chain_from_pack(&pull_pack, &remote_view, &remote_url)
+        {
+            Ok(chain) if !chain.is_empty() => chain,
+            _ => {
+                finish_error(&spinner, "Remote view not found");
+                return Err(CliError::RemoteError {
+                    message: format!("Remote view '{}' does not exist", remote_view),
+                    url: Some(remote_url.clone()),
+                });
+            }
+        };
+        // `--to-view` renames only the requested leaf locally. Ancestor closure
+        // metadata retains its canonical names; the leaf's parent remains that
+        // reconciled local ancestor.
+        if let Some(leaf) = remote_chain.last_mut() {
+            leaf.name = local_view.clone();
+        }
+        let remote_manifest = remote_chain.last().expect("non-empty remote chain").clone();
+        // Adapt the manifest's change log to the existing delta/display types.
+        // Reconstruct each change's merkle state by folding from `Merkle::ZERO`
+        // (the same fold `ViewManifest` uses), so `calculate_pull_delta` — which
+        // parses `entry.merkle` and skips any that fail — sees valid states and
+        // the final one matches `remote_manifest.state`.
+        let remote_entries: Vec<ChangelistEntry> = {
+            let mut acc = Merkle::ZERO;
+            remote_manifest
+                .changes
+                .iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    acc = acc.next(h);
+                    ChangelistEntry::new(i as u64, h.to_base32(), acc.to_base32(), false)
+                })
+                .collect()
+        };
+        let remote_state = if remote_manifest.changes.is_empty() {
+            StateResponse::empty()
+        } else {
+            StateResponse::state(
+                (remote_manifest.changes.len() as u64).saturating_sub(1),
+                remote_manifest.state.to_base32(),
+                String::new(),
+            )
+        };
+        finish_success(
+            &spinner,
+            &format!("Got {} remote changes", remote_entries.len()),
         );
 
         // Display state comparison
@@ -484,23 +626,32 @@ impl Pull {
             self.display_local_only_warning(&local_only);
         }
 
-        // Calculate what to pull
-        let to_download = calculate_pull_delta(&remote_entries, &local_entries, self.all);
+        // The server already subtracted the graph-wide `haves`; every change
+        // object in the pack is a genuinely missing node in the common graph.
+        // Do not derive this from one view's log.
+        let change_objects = pack_objects_by_key(&pull_pack, ObjectFamily::Change);
+        let to_download: Vec<PullChange> = change_objects
+            .keys()
+            .enumerate()
+            .filter_map(|(i, key)| {
+                Hash::from_base32(key.as_bytes())
+                    .map(|hash| PullChange::new(hash, i as u64, Merkle::ZERO))
+            })
+            .collect();
 
         // Handle dry run
         if self.dry_run {
             return self.display_dry_run(&remote_name, &remote_url, &remote_view, &to_download);
         }
 
-        // Check for nothing to pull
-        if to_download.is_empty() {
-            print_success("Already up to date");
-            return Ok(());
+        // Save missing graph nodes first. Even when none are missing, continue:
+        // remote view metadata may still add closures around nodes already in
+        // the local graph (for example, advancing local `dev` before applying a
+        // draft's metadata).
+        if !to_download.is_empty() {
+            println!("Downloading {}:", format_count(to_download.len(), "change"));
+            print_blank();
         }
-
-        // Download changes
-        println!("Downloading {}:", format_count(to_download.len(), "change"));
-        print_blank();
 
         let progress = create_progress_bar(to_download.len() as u64, "Pulling changes");
         let mut stats = PullStats::new();
@@ -509,15 +660,12 @@ impl Pull {
             let hash_str = change.hash.to_base32();
             let msg = change.message_or_default();
 
-            // Download the change
-            let result = remote.download_change(&hash_str).await;
-
-            match result {
-                Ok(data) => {
+            match change_objects.get(&hash_str) {
+                Some(data) => {
                     let data_len = data.len() as u64;
 
                     // Save to local change store
-                    match save_downloaded_change(&repo, &change.hash, data) {
+                    match save_downloaded_change(&repo, &change.hash, Bytes::from(data.clone())) {
                         Ok(()) => {
                             stats.record_change_downloaded(data_len);
                             println!(
@@ -543,20 +691,19 @@ impl Pull {
                         }
                     }
                 }
-                Err(e) => {
+                None => {
                     stats.record_failed();
                     println!(
-                        "  {} {} ({}/{}) {} - {}",
+                        "  {} {} ({}/{}) {} - not found on remote",
                         error("✗"),
                         style_hash(&format_hash(&change.hash, false)),
                         i + 1,
                         to_download.len(),
                         msg,
-                        e
                     );
-
-                    // Stop on first failure to maintain consistency
-                    return Err(convert_remote_error(e, &remote_url));
+                    return Err(CliError::ChangeNotFound {
+                        hash: hash_str.clone(),
+                    });
                 }
             }
 
@@ -580,56 +727,36 @@ impl Pull {
         // Atomic session index without any relationship queries against
         // the server.
         let mut provenance_count = 0usize;
-        match remote.get_provenance_list().await {
-            Ok(remote_provenance) => {
-                for prov_hash_str in remote_provenance {
-                    let Some(prov_hash) = Hash::from_base32(prov_hash_str.as_bytes()) else {
-                        continue;
-                    };
-                    if repo.has_provenance_graph(&prov_hash) {
+        for (prov_hash_str, data) in pack_objects_by_key(&pull_pack, ObjectFamily::Provenance) {
+            let Some(prov_hash) = Hash::from_base32(prov_hash_str.as_bytes()) else {
+                continue;
+            };
+            if repo.has_provenance_graph(&prov_hash) {
+                continue;
+            }
+            match atomic_core::change::ProvenanceGraph::deserialize(&data) {
+                Ok((graph, computed)) => {
+                    if computed != prov_hash {
+                        print_warning(&format!(
+                            "Provenance {} failed hash verification — skipped",
+                            &prov_hash_str[..12.min(prov_hash_str.len())]
+                        ));
                         continue;
                     }
-                    match remote.download_provenance(&prov_hash_str).await {
-                        Ok(data) => {
-                            match atomic_core::change::ProvenanceGraph::deserialize(&data) {
-                                Ok((graph, computed)) => {
-                                    if computed != prov_hash {
-                                        print_warning(&format!(
-                                            "Provenance {} failed hash verification — skipped",
-                                            &prov_hash_str[..12.min(prov_hash_str.len())]
-                                        ));
-                                        continue;
-                                    }
-                                    match repo.save_provenance_graph(&graph) {
-                                        Ok(_) => provenance_count += 1,
-                                        Err(e) => print_warning(&format!(
-                                            "Failed to register provenance {}: {}",
-                                            &prov_hash_str[..12.min(prov_hash_str.len())],
-                                            e
-                                        )),
-                                    }
-                                }
-                                Err(e) => print_warning(&format!(
-                                    "Corrupt provenance {}: {}",
-                                    &prov_hash_str[..12.min(prov_hash_str.len())],
-                                    e
-                                )),
-                            }
-                        }
+                    match repo.save_provenance_graph(&graph) {
+                        Ok(_) => provenance_count += 1,
                         Err(e) => print_warning(&format!(
-                            "Failed to download provenance {}: {}",
+                            "Failed to register provenance {}: {}",
                             &prov_hash_str[..12.min(prov_hash_str.len())],
                             e
                         )),
                     }
                 }
-            }
-            Err(_) => {
-                // Server does not support the provenance inventory extension —
-                // provenance sync is skipped, not fatal.
-                print_hint(
-                    "Remote does not support provenance sync; session provenance stays local",
-                );
+                Err(e) => print_warning(&format!(
+                    "Corrupt provenance {}: {}",
+                    &prov_hash_str[..12.min(prov_hash_str.len())],
+                    e
+                )),
             }
         }
         if provenance_count > 0 {
@@ -650,50 +777,71 @@ impl Pull {
             return Ok(());
         }
 
-        // Apply downloaded changes to the local view
+        // Reconcile view metadata root-to-leaf over the now-populated common
+        // graph. Shared ancestors union their local and remote own memberships;
+        // the requested draft (if any) then naturally inherits the synchronized
+        // shared closure. These are metadata closures around graph nodes — not
+        // per-view object transfers.
         print_blank();
-        let spinner = create_spinner("Applying changes to view...");
-
-        // Apply downloaded changes to the local view in sequence order.
-        // Changes that failed to save during download are skipped gracefully
-        // by insert_change_rec (it will return a "change not found" error).
+        let spinner = create_spinner("Reconciling view metadata...");
         let mut apply_errors: Vec<String> = Vec::new();
-
-        for change in &to_download {
-            let options = InsertOptions::default().apply_deps(true).view(&local_view);
-
-            match repo.insert_change_rec(&change.hash, options) {
-                Ok(_outcome) => {
-                    stats.record_applied();
+        for manifest in &remote_chain {
+            match repo.reconcile_view_manifest(manifest) {
+                Ok(outcome) => {
+                    for _ in 0..outcome.replayed {
+                        stats.record_applied();
+                    }
                 }
-                Err(e) => {
-                    // Log but don't abort — other changes may still apply
-                    apply_errors.push(format!(
-                        "Failed to apply {}: {}",
-                        format_hash(&change.hash, false),
-                        e
-                    ));
-                }
+                Err(e) => apply_errors.push(format!(
+                    "Failed to reconcile view '{}': {}",
+                    manifest.name, e
+                )),
             }
         }
 
-        if stats.has_applied() {
+        if apply_errors.is_empty() {
             finish_success(
                 &spinner,
-                &format!(
-                    "Applied {} to {}",
-                    format_count(stats.changes_applied, "change"),
-                    local_view
-                ),
+                &format!("Reconciled {} view closures", remote_chain.len()),
             );
         } else {
-            finish_error(&spinner, "No changes were applied");
-        }
-
-        // Report any per-change apply errors
-        if !apply_errors.is_empty() {
+            finish_error(&spinner, "View metadata reconciliation failed");
             for err in &apply_errors {
                 print_warning(err);
+            }
+        }
+
+        // Validate the pull with the SetId — the order-invariant convergence
+        // identity. The remote's expected set-id is the server-computed
+        // **effective** (own ∪ ancestors) set-id from the view inventory
+        // (`GET /refs/views`), compared to the local view's set after applying.
+        // Using the server's effective value is correct for drafts (whose
+        // effective set differs from their own set) and is an independent source
+        // — it proves the pull reproduced exactly the remote set, regardless of
+        // change counts or merkle order.
+        if stats.has_applied() {
+            let remote_set = remote.list_view_refs().await.ok().and_then(|inv| {
+                inv.into_iter()
+                    .find(|v| v.name == remote_view)
+                    .and_then(|v| v.set_id)
+            });
+            match (repo.view_set_id(&local_view), remote_set) {
+                (Ok(local), Some(expected)) => {
+                    if local.to_base32() == expected {
+                        print_success(
+                            "Verified: local view set-id matches the remote (convergent)",
+                        );
+                    } else {
+                        print_warning(&format!(
+                            "Set-id mismatch after pull: local {} != remote {}. \
+                             The view may be divergent or incomplete.",
+                            local.to_base32(),
+                            expected
+                        ));
+                    }
+                }
+                (Ok(_), None) => { /* remote reported no set-id; skip verification */ }
+                (Err(e), _) => print_warning(&format!("Could not compute local set-id: {}", e)),
             }
         }
 
@@ -735,45 +883,29 @@ impl Pull {
 
         // Download tags from the remote view.
         let mut tags_downloaded: usize = 0;
-        {
-            let remote_tags = remote
-                .list_remote_tags(&remote_view)
-                .await
-                .unwrap_or_default();
-
-            for (tag_hash, tag_name) in &remote_tags {
-                // Skip tags we already have locally
-                if let Ok(Some(_)) = repo.get_tag_from_view(tag_name, &local_view) {
-                    continue;
-                }
-
-                match remote.download_tag(tag_hash).await {
-                    Ok(tag_bytes) => match atomic_repository::deserialize_tag(&tag_bytes) {
-                        Ok(tag) => {
-                            let tag_len = tag_bytes.len() as u64;
-                            if let Err(e) = repo.save_synced_tag(&tag) {
-                                print_warning(&format!("Failed to save tag '{}': {}", tag_name, e));
-                            } else {
-                                tags_downloaded += 1;
-                                stats.record_tag_downloaded(tag_len);
-                                println!(
-                                    "  {} tag '{}' ({})",
-                                    success("\u{2713}"),
-                                    tag_name,
-                                    tag.kind,
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            print_warning(&format!(
-                                "Failed to deserialize tag '{}': {}",
-                                tag_name, e
-                            ));
-                        }
-                    },
-                    Err(e) => {
-                        log::debug!("Tag download failed for '{}': {}", tag_name, e);
+        for (_tag_hash, tag_bytes) in pack_objects_by_key(&pull_pack, ObjectFamily::Tag) {
+            match atomic_repository::deserialize_tag(&tag_bytes) {
+                Ok(tag) => {
+                    // Skip tags we already have locally.
+                    if let Ok(Some(_)) = repo.get_tag_from_view(&tag.name, &local_view) {
+                        continue;
                     }
+                    let tag_len = tag_bytes.len() as u64;
+                    if let Err(e) = repo.save_synced_tag(&tag) {
+                        print_warning(&format!("Failed to save tag '{}': {}", tag.name, e));
+                    } else {
+                        tags_downloaded += 1;
+                        stats.record_tag_downloaded(tag_len);
+                        println!(
+                            "  {} tag '{}' ({})",
+                            success("\u{2713}"),
+                            tag.name,
+                            tag.kind,
+                        );
+                    }
+                }
+                Err(e) => {
+                    print_warning(&format!("Failed to deserialize tag: {}", e));
                 }
             }
         }

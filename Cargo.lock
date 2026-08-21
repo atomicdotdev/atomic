@@ -180,6 +180,7 @@ dependencies = [
  "atomic-config",
  "atomic-core",
  "atomic-identity",
+ "atomic-objects",
  "atomic-remote",
  "atomic-repository",
  "atomic-semantic",
@@ -272,6 +273,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomic-objects"
+version = "0.16.2"
+dependencies = [
+ "blake3",
+ "data-encoding",
+ "postcard",
+ "serde",
+ "serde_json",
+ "zstd",
+]
+
+[[package]]
 name = "atomic-polyfill"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -286,6 +299,7 @@ version = "0.16.2"
 dependencies = [
  "anyhow",
  "atomic-core",
+ "atomic-objects",
  "bytes",
  "chrono",
  "env_logger",
