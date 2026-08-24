@@ -155,8 +155,11 @@ impl List {
             let config = attach_identity(config, &remote_url, self.identity.as_deref()).await;
             let remote = HttpRemote::with_config(&remote_url, config)
                 .map_err(|e| CliError::remote_error(e.to_string(), Some(remote_url.clone())))?;
+            // Bare object+ref model: the inventory is composed server-side from
+            // the `.view` objects (GET /refs/views), independent of any
+            // reconciled read-model.
             remote
-                .list_views()
+                .list_view_refs()
                 .await
                 .map_err(|e| CliError::remote_error(e.to_string(), Some(remote_url.clone())))
         })?;

@@ -151,7 +151,7 @@
 // Submodules
 
 mod command;
-mod helpers;
+pub(crate) mod helpers;
 pub mod types;
 
 // Re-exports

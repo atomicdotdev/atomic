@@ -170,6 +170,22 @@ impl Repository {
         self.change_store.has_change(hash)
     }
 
+    /// Return every normal change registered in the repository's common graph.
+    ///
+    /// This is the authoritative object inventory for sync negotiation: changes
+    /// are repository-global graph nodes, not owned by a particular view. A
+    /// client advertises these hashes as `haves` so the server never resends a
+    /// `.change` merely because it is absent from one view's own metadata.
+    pub fn registered_change_hashes(&self) -> Result<Vec<Hash>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.list_registered_changes()
+            .map(|items| items.into_iter().map(|(_, hash)| hash).collect())
+            .map_err(|e| RepositoryError::Database(e.to_string()))
+    }
+
     /// Backfill the pristine normal-change dependency index from stored changes.
     ///
     /// This is intended for legacy repositories that predate the `CHANGE_DEPS`
