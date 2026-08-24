@@ -22,9 +22,9 @@
 //! (`VaultEntry`/`VaultManifest`) will land here later as additional families
 //! riding the identical transport.
 //!
-//! The [`sync`] module defines the **single `/code` transport** wire format —
-//! the header-negotiated, postcard+zstd [`sync::SyncPack`]/[`sync::SyncWants`]
-//! exchange that carries every object family and ref move for push/pull/clone.
+//! The synchronization types define the **single `/code` transport** wire format —
+//! the header-negotiated, postcard+zstd [`SyncPack`]/[`SyncWants`] exchange that
+//! carries every object family and ref move for push/pull/clone.
 
 mod sync;
 mod view_snapshot;

@@ -2454,14 +2454,27 @@ mod tests {
         )
         .unwrap();
 
-        // Precondition: vault tables don't exist yet
+        // Precondition: vault tables don't exist yet. Capture exact graph-
+        // materialized bytes: bootstrap is disk→redb and must not rewrite them.
         assert!(!repo2.has_vault().unwrap());
+        let arch_before = std::fs::read(vault2.join("memory/architecture.md")).unwrap();
+        let rust_before = std::fs::read(vault2.join("skills/rust.md")).unwrap();
 
         // ── Bootstrap ──────────────────────────────────────────────
         repo2.bootstrap_vault_from_working_copy().unwrap();
 
         // ── Assertions ─────────────────────────────────────────────
         assert!(repo2.has_vault().unwrap());
+        assert_eq!(
+            std::fs::read(vault2.join("memory/architecture.md")).unwrap(),
+            arch_before,
+            "bootstrap must not rewrite tracked vault files"
+        );
+        assert_eq!(
+            std::fs::read(vault2.join("skills/rust.md")).unwrap(),
+            rust_before,
+            "bootstrap must not rewrite tracked vault files"
+        );
 
         // Both entries should now be in repo2's redb
         let arch = repo2

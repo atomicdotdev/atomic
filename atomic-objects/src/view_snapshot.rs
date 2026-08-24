@@ -61,8 +61,8 @@ pub struct ViewSnapshot {
     /// decision D6), preserving Atomic's inheritance semantics.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub parent_view: Option<String>,
-    /// Predecessor snapshot key(s) (hex Blake3). Usually 1; empty for genesis;
-    /// >1 only for a view merge. Makes the view's history a content-addressed
+    /// Predecessor snapshot key(s) (hex Blake3). Usually one; empty for genesis;
+    /// multiple only for a view merge. Makes the view's history a content-addressed
     /// DAG — fast-forward vs divergence is decided by walking `prev`, not by
     /// log-shape heuristics.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]

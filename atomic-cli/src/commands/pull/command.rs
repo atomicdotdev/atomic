@@ -917,13 +917,23 @@ impl Pull {
             ));
         }
 
-        // Bootstrap vault if .vault/ files were pulled but redb tables don't exist.
-        // This happens when another user initialized the vault and pushed changes
-        // that were then pulled by a collaborator who hasn't run `vault init`.
-        if stats.has_applied() {
-            let vault_on_disk = repo.vault_dir().exists();
-            let vault_in_db = repo.has_vault().unwrap_or(false);
-            if vault_on_disk && !vault_in_db {
+        // The graph-materialized working copy is authoritative after pull.
+        // Deflate `.vault/` disk content into redb; never inflate redb back over
+        // these tracked files, which would regenerate system frontmatter and make
+        // a clean pull immediately appear modified.
+        if stats.has_applied() && repo.vault_dir().exists() {
+            if repo.has_vault().unwrap_or(false) {
+                match repo.vault_record_working_copy() {
+                    Ok(paths) => log::info!(
+                        "Synchronized {} pulled vault entries into redb",
+                        paths.len()
+                    ),
+                    Err(e) => print_warning(&format!(
+                        "Failed to synchronize pulled vault content: {}",
+                        e
+                    )),
+                }
+            } else {
                 print_info(
                     "Vault files detected \u{2014} initializing vault from pulled content...",
                 );
@@ -944,13 +954,6 @@ impl Pull {
             match repo.kg_enrich_from_vcs() {
                 Ok(kg_stats) => log::info!("KG enriched after pull: {}", kg_stats),
                 Err(e) => log::warn!("KG enrichment after pull failed: {}", e),
-            }
-
-            // Materialize any new vault entries pulled (only if vault exists)
-            if repo.has_vault().unwrap_or(false) {
-                if let Err(e) = repo.vault_materialize_all() {
-                    log::warn!("Vault materialization after pull failed: {}", e);
-                }
             }
         }
 

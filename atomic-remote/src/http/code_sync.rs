@@ -4,9 +4,9 @@
 //! `atomic push`/`pull`/`clone` move objects and refs through **one** endpoint —
 //! the remote's `base_url` (`…/projects/{slug}/code`) — using the header-
 //! negotiated binary [`SyncPack`]/[`SyncWants`] format from [`atomic_objects`].
-//! It replaces the per-object [`super::bare`] REST calls (`put_object`,
-//! `get_object`, `put_view_ref`, …) for transport; those RESTful URLs remain
-//! only as read-only WebUI surfaces.
+//! It replaces the per-object REST calls (`put_object`, `get_object`,
+//! `put_view_ref`, …) for transport; those RESTful URLs remain only as
+//! read-only WebUI surfaces.
 //!
 //! - [`HttpRemote::sync_push`] `POST`s a [`SyncPack`] (objects + ref CAS moves).
 //! - [`HttpRemote::sync_pull`] `GET`s with a [`SyncWants`] body and decodes the
@@ -35,8 +35,8 @@ impl HttpRemote {
     /// Push a [`SyncPack`] to the remote's `/code` endpoint.
     ///
     /// A `409 Conflict` (a divergent, non-fast-forward ref move) surfaces as a
-    /// [`RemoteError::Protocol`] carrying the server's message, so the caller can
-    /// tell the user to pull first.
+    /// [`RemoteError::ProtocolError`] carrying the server's message, so the caller
+    /// can tell the user to pull first.
     pub async fn sync_push(&self, pack: &SyncPack) -> RemoteResult<PushSummary> {
         let url = self.base_url.as_str().to_string();
         let body = pack
