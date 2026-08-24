@@ -7,6 +7,7 @@ members = [
     "atomic-core",
     "atomic-config",
     "atomic-identity",
+    "atomic-objects",
     "atomic-remote",
     "atomic-repository",
     "atomic-semantic",
@@ -14,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.16.2"
+version = "0.17.0"
 edition = "2021"
 authors = ["Atomic Contributors"]
 license = "Apache-2.0"
@@ -29,6 +30,7 @@ atomic-canonical = { path = "atomic-canonical" }
 atomic-core = { path = "atomic-core" }
 atomic-config = { path = "atomic-config" }
 atomic-identity = { path = "atomic-identity" }
+atomic-objects = { path = "atomic-objects" }
 atomic-remote = { path = "atomic-remote" }
 atomic-repository = { path = "atomic-repository" }
 atomic-semantic = { path = "atomic-semantic" }

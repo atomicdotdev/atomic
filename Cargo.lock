@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-agent"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "atomic-core",
@@ -158,7 +158,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-canonical"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "atomic-identity",
  "blake3",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-cli"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "atomic-agent",
@@ -180,6 +180,7 @@ dependencies = [
  "atomic-config",
  "atomic-core",
  "atomic-identity",
+ "atomic-objects",
  "atomic-remote",
  "atomic-repository",
  "atomic-semantic",
@@ -212,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-config"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -226,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-core"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
@@ -252,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-identity"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "atomic-config",
@@ -272,6 +273,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomic-objects"
+version = "0.17.0"
+dependencies = [
+ "blake3",
+ "data-encoding",
+ "postcard",
+ "serde",
+ "serde_json",
+ "zstd",
+]
+
+[[package]]
 name = "atomic-polyfill"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -282,10 +295,11 @@ dependencies = [
 
 [[package]]
 name = "atomic-remote"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "atomic-core",
+ "atomic-objects",
  "bytes",
  "chrono",
  "env_logger",
@@ -304,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-repository"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "atomic-canonical",
@@ -340,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-semantic"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -357,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-teams"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "atomic-remote",
  "chrono",

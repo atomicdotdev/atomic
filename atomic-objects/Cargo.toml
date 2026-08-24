@@ -1,0 +1,17 @@
+[package]
+name = "atomic-objects"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Canonical, content-addressed object encodings shared by the Atomic client and server (bare object+ref sync)."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+data-encoding = { workspace = true }
+postcard = { workspace = true }
+zstd = { workspace = true }

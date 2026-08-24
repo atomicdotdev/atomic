@@ -8,13 +8,15 @@
 //! a shared remote view. Each view's scope, parent, and exact change log
 //! survive the transfer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use bytes::Bytes;
 use clap::Parser;
 
-use atomic_core::types::{Base32, Hash};
+use atomic_core::types::{Base32, Hash, SetId};
+use atomic_objects::{
+    ObjectFamily, ObjectRecord, RefRecord, SyncPack, SyncWants, ViewScopeLabel, ViewSnapshot,
+};
 use atomic_remote::{HttpRemote, HttpRemoteConfig};
 use atomic_repository::{Repository, ViewManifest};
 
@@ -27,9 +29,87 @@ use crate::output::{
 
 use super::helpers::{
     build_view_chain, convert_remote_error, display_manifest_divergence, format_count,
-    load_change_data, load_change_message, parse_remote_manifest, plan_view_sync,
-    require_manifest_support, ChainError, ViewSyncConflict, ViewSyncPlan,
+    load_change_data, load_change_message, parse_remote_manifest, plan_view_sync, ChainError,
+    ViewSyncConflict, ViewSyncPlan,
 };
+
+/// The remote ref advertisement, fetched once per push via a single `/code`
+/// sync call: each remote view's current snapshot object key (the CAS `prev`)
+/// and its manifest reconstructed from that snapshot.
+struct RemoteAdvertisement {
+    /// remote view name → current view-snapshot object key.
+    ref_targets: HashMap<String, String>,
+    /// remote view name → manifest reconstructed from that snapshot.
+    manifests: HashMap<String, ViewManifest>,
+}
+
+/// Parse a ref-advertisement [`SyncPack`] (from `sync_pull` with `refs_only`)
+/// into per-view snapshot keys and manifests.
+///
+/// This replaces the legacy per-view `get_view_ref` + `get_object("views", …)`
+/// round-trips: push negotiation now reads the remote's view state from a single
+/// `/code` advertisement, uniform across local (`FsStore`) and geo (`S3Store`).
+fn parse_advertisement(adv: &SyncPack, url: &str) -> CliResult<RemoteAdvertisement> {
+    let mut snapshots: HashMap<String, ViewSnapshot> = HashMap::new();
+    for obj in &adv.objects {
+        if obj.family == ObjectFamily::View {
+            if let Some(s) = ViewSnapshot::from_bytes(&obj.bytes) {
+                snapshots.insert(obj.key.clone(), s);
+            }
+        }
+    }
+    let mut ref_targets = HashMap::new();
+    let mut manifests = HashMap::new();
+    for r in &adv.refs {
+        ref_targets.insert(r.name.clone(), r.new_target.clone());
+        match snapshots.get(&r.new_target) {
+            Some(s) => {
+                let manifest = parse_remote_manifest(&r.name, &s.to_manifest_text(&r.name), url)?;
+                manifests.insert(r.name.clone(), manifest);
+            }
+            None => {
+                // Ref points at a snapshot the advertisement did not carry;
+                // treat the view as absent (a re-push heals it).
+            }
+        }
+    }
+    Ok(RemoteAdvertisement {
+        ref_targets,
+        manifests,
+    })
+}
+
+/// Mint the content-addressed `ViewSnapshot` for a view from its local manifest
+/// and the remote's current snapshot key (`prev`, for the CAS-on-`prev` chain).
+///
+/// The `own_set_id` fold matches the server's `from_manifest` bridge exactly, so
+/// client and server mint byte-identical objects with identical content keys.
+fn mint_view_snapshot(manifest: &ViewManifest, prev: Option<String>) -> ViewSnapshot {
+    let own_changes: Vec<String> = manifest.changes.iter().map(|h| h.to_base32()).collect();
+    let mut acc = SetId::ZERO;
+    for h in &manifest.changes {
+        acc = acc.add(h);
+    }
+    let own_set_id = acc.to_base32();
+    let merkle_state = if manifest.changes.is_empty() {
+        None
+    } else {
+        Some(manifest.state.to_base32())
+    };
+    let scope = if manifest.scope.is_draft() {
+        ViewScopeLabel::Draft
+    } else {
+        ViewScopeLabel::Shared
+    };
+    ViewSnapshot::new(
+        scope,
+        manifest.parent.clone(),
+        prev.into_iter().collect(),
+        own_changes,
+        own_set_id,
+        merkle_state,
+    )
+}
 
 // Constants
 
@@ -455,6 +535,31 @@ impl Push {
         })?;
         finish_success(&spinner, "Connected");
 
+        // Fetch remote view metadata only. Push does not import remote graph
+        // nodes or mutate local view metadata: doing so would change the current
+        // view's effective closure without materializing its working copy. The
+        // server performs the local∪remote set union when publishing refs.
+        let remote_names: Vec<String> = chain
+            .iter()
+            .map(|name| {
+                if name == &local_view {
+                    remote_view.clone()
+                } else {
+                    name.clone()
+                }
+            })
+            .collect();
+        let spinner = create_spinner("Fetching remote view metadata...");
+        let adv_pack = remote
+            .sync_pull(&SyncWants::advertise(remote_names.clone()))
+            .await
+            .map_err(|e| {
+                finish_error(&spinner, "Failed to fetch remote metadata");
+                convert_remote_error(e, &remote_url)
+            })?;
+        let adv = parse_advertisement(&adv_pack, &remote_url)?;
+        finish_success(&spinner, "Fetched remote view metadata");
+
         // Plan phase: for each view in the chain, export the local manifest,
         // fetch the remote's, and compute the fast-forward suffix. Hashes
         // known to be on the remote (remote prefixes, or stored for an
@@ -478,35 +583,17 @@ impl Push {
                 manifest.name = remote_view_name.clone();
             }
 
-            // Fetch the remote's manifest. A server without manifest support
-            // is a hard error: there is no flatten fallback.
-            let spinner = create_spinner(&format!(
-                "Fetching remote manifest for {}...",
-                style_view(&remote_view_name)
-            ));
-            let remote_text = require_manifest_support(
-                remote.get_view_manifest(&remote_view_name).await,
-                &remote_url,
-            )
-            .inspect_err(|_| finish_error(&spinner, "Failed to fetch manifest"))?;
-            let remote_manifest = match remote_text {
-                Some(text) => Some(parse_remote_manifest(
-                    &remote_view_name,
-                    &text,
-                    &remote_url,
-                )?),
-                None => None,
-            };
-            finish_success(
-                &spinner,
-                &format!(
-                    "Remote {} {}",
-                    style_view(&remote_view_name),
-                    match &remote_manifest {
-                        Some(m) => format!("has {}", format_count(m.changes.len(), "change")),
-                        None => "does not exist yet".to_string(),
-                    }
-                ),
+            // The remote's manifest for this view comes from the single ref
+            // advertisement fetched up front (no per-view round-trip).
+            let remote_manifest = adv.manifests.get(&remote_view_name).cloned();
+            println!(
+                "  {} Remote {} {}",
+                success("✓"),
+                style_view(&remote_view_name),
+                match &remote_manifest {
+                    Some(m) => format!("has {}", format_count(m.changes.len(), "change")),
+                    None => "does not exist yet".to_string(),
+                }
             );
 
             // Everything the remote view already logs is known-present.
@@ -564,6 +651,9 @@ impl Push {
         let mut total_stored = 0usize;
         let mut views_declared = 0usize;
         let mut stored_hashes: Vec<Hash> = Vec::new();
+        // One SyncPack for the whole push: objects (changes, view snapshots,
+        // attestations, provenance, tags) + ref CAS moves, sent via `/code`.
+        let mut pack = SyncPack::empty();
 
         for sync in &syncs {
             if sync.plan.is_noop() {
@@ -604,30 +694,19 @@ impl Push {
                     let msg = load_change_message(&repo, hash)
                         .unwrap_or_else(|| "(no message)".to_string());
 
-                    match remote.store_change(&hash.to_base32(), data).await {
-                        Ok(()) => {
-                            println!(
-                                "  {} {} ({}/{}) {}",
-                                success("✓"),
-                                style_hash(&format_hash(hash, false)),
-                                i + 1,
-                                sync.to_store.len(),
-                                msg,
-                            );
-                        }
-                        Err(e) => {
-                            finish_error(&progress, "Store failed");
-                            println!(
-                                "  {} {} ({}/{}) {}",
-                                crate::output::error("✗"),
-                                style_hash(&format_hash(hash, false)),
-                                i + 1,
-                                sync.to_store.len(),
-                                msg,
-                            );
-                            return Err(convert_remote_error(e, &remote_url));
-                        }
-                    }
+                    pack.objects.push(ObjectRecord::new(
+                        ObjectFamily::Change,
+                        hash.to_base32(),
+                        data.to_vec(),
+                    ));
+                    println!(
+                        "  {} {} ({}/{}) {}",
+                        success("✓"),
+                        style_hash(&format_hash(hash, false)),
+                        i + 1,
+                        sync.to_store.len(),
+                        msg,
+                    );
                     progress.inc(1);
                 }
 
@@ -640,42 +719,40 @@ impl Push {
                 stored_hashes.extend(sync.to_store.iter().copied());
             }
 
-            // Declare the view's identity and log. The server creates the
-            // view (with the declared scope/parent) if absent, fast-forwards
-            // its log, and verifies the merkle state.
-            let spinner = create_spinner(&format!(
-                "Declaring view {}...",
-                style_view(&sync.remote_name)
+            // Mint the content-addressed snapshot and queue its object plus a
+            // ref CAS move (`prev` = the remote's current tip from the
+            // advertisement). The store and ancestry-gated CAS happen
+            // server-side in the single `/code` push below.
+            let prev = adv.ref_targets.get(&sync.remote_name).cloned();
+            let snapshot = mint_view_snapshot(&sync.manifest, prev.clone());
+            let snap_key = snapshot.content_key();
+            pack.objects.push(ObjectRecord::new(
+                ObjectFamily::View,
+                snap_key.clone(),
+                snapshot.to_canonical_bytes(),
             ));
-            match remote
-                .put_view_manifest(&sync.remote_name, sync.manifest.to_text())
-                .await
-            {
-                Ok(()) => {
-                    views_declared += 1;
-                    finish_success(
-                        &spinner,
-                        &format!(
-                            "Declared {} [{}] ({} in log)",
-                            style_view(&sync.remote_name),
-                            sync.manifest.scope,
-                            format_count(sync.manifest.changes.len(), "change"),
-                        ),
-                    );
-                }
-                Err(e) => {
-                    finish_error(&spinner, "Declare failed");
-                    return Err(convert_remote_error(e, &remote_url));
-                }
-            }
+            pack.refs.push(RefRecord {
+                name: sync.remote_name.clone(),
+                expect_old: prev,
+                new_target: snap_key,
+            });
+            views_declared += 1;
+            println!(
+                "  {} Declared {} [{}] ({} in log)",
+                success("✓"),
+                style_view(&sync.remote_name),
+                sync.manifest.scope,
+                format_count(sync.manifest.changes.len(), "change"),
+            );
         }
 
-        // All changes in the leaf view's log are on the remote after a
-        // successful sync (chain views are subsets by the prefix rule).
+        // Sidecars may travel only when every covered change is in the closure
+        // being published (the union of this view chain's own memberships), not
+        // merely somewhere in the local common graph.
         let all_synced: HashSet<Hash> = syncs
-            .last()
-            .map(|s| s.manifest.changes.iter().copied().collect())
-            .unwrap_or_default();
+            .iter()
+            .flat_map(|sync| sync.manifest.changes.iter().copied())
+            .collect();
 
         // Upload attestations that cover the pushed changes.
         // Attestations are graph-level audit nodes — they travel with
@@ -713,52 +790,33 @@ impl Push {
             }
 
             for (attest_hash, attestation) in &unique_attestations {
-                // Load and upload the raw attestation bytes
+                // Load the raw attestation bytes and queue them.
                 let attest_data = match attestation.serialize() {
-                    Ok(data) => Bytes::from(data),
+                    Ok(data) => data,
                     Err(_) => continue,
                 };
 
-                match remote
-                    .upload_attestation(&attest_hash.to_base32(), attest_data)
-                    .await
-                {
-                    Ok(()) => {
-                        attest_count += 1;
-                        println!(
-                            "  {} {} attestation ({}, {} covered)",
-                            success("✓"),
-                            style_hash(&format_hash(attest_hash, false)),
-                            attestation.cost_display(),
-                            attestation.change_count(),
-                        );
-                    }
-                    Err(e) => {
-                        print_warning(&format!(
-                            "Failed to upload attestation {}: {}",
-                            &attest_hash.to_base32()[..12],
-                            e
-                        ));
-                    }
-                }
+                pack.objects.push(ObjectRecord::new(
+                    ObjectFamily::Attest,
+                    attest_hash.to_base32(),
+                    attest_data,
+                ));
+                attest_count += 1;
+                println!(
+                    "  {} {} attestation ({}, {} covered)",
+                    success("✓"),
+                    style_hash(&format_hash(attest_hash, false)),
+                    attestation.cost_display(),
+                    attestation.change_count(),
+                );
             }
         }
 
-        // Upload provenance graphs that explain the pushed changes.
-        // Provenance graphs are causal decision DAGs — they travel with
-        // their dependencies but aren't part of any view's changelog.
-        //
-        // Same model as .change files: query the server's flat inventory,
-        // upload only what it does not already hold.
+        // Upload provenance graphs that explain the pushed changes, via the
+        // RESTful provenance object family: `HEAD /provenance/{key}` to skip
+        // what the server already holds, `PUT /provenance/{key}` to store.
         let mut provenance_count = 0;
         {
-            let remote_provenance: HashSet<String> = remote
-                .get_provenance_list()
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-
             // Collect unique provenance graphs — same dedup logic as attestations.
             let mut seen_prov: HashSet<Hash> = HashSet::new();
             let mut unique_graphs: Vec<(Hash, atomic_core::change::ProvenanceGraph)> = Vec::new();
@@ -786,39 +844,28 @@ impl Push {
                     continue;
                 }
 
-                // Skip provenance the server already holds (presence delta).
-                if remote_provenance.contains(&prov_hash.to_base32()) {
-                    continue;
-                }
+                let prov_key = prov_hash.to_base32();
 
-                // Load and upload the raw provenance bytes
+                // Load the raw provenance bytes and queue them. The server
+                // dedupes idempotently, so there is no per-object presence probe.
                 let prov_data = match graph.serialize() {
-                    Ok(data) => Bytes::from(data),
+                    Ok(data) => data,
                     Err(_) => continue,
                 };
 
-                match remote
-                    .upload_provenance(&prov_hash.to_base32(), prov_data)
-                    .await
-                {
-                    Ok(()) => {
-                        provenance_count += 1;
-                        println!(
-                            "  {} {} provenance ({} nodes, {} changes)",
-                            success("✓"),
-                            style_hash(&format_hash(prov_hash, false)),
-                            graph.node_count(),
-                            graph.change_count(),
-                        );
-                    }
-                    Err(e) => {
-                        print_warning(&format!(
-                            "Failed to upload provenance graph {}: {}",
-                            &prov_hash.to_base32()[..12],
-                            e
-                        ));
-                    }
-                }
+                pack.objects.push(ObjectRecord::new(
+                    ObjectFamily::Provenance,
+                    prov_key,
+                    prov_data,
+                ));
+                provenance_count += 1;
+                println!(
+                    "  {} {} provenance ({} nodes, {} changes)",
+                    success("✓"),
+                    style_hash(&format_hash(prov_hash, false)),
+                    graph.node_count(),
+                    graph.change_count(),
+                );
             }
         }
 
@@ -834,32 +881,81 @@ impl Push {
                 let tag_hash_str = tag_hash.to_base32();
 
                 let tag_bytes = match atomic_repository::serialize_tag(tag) {
-                    Ok(bytes) => Bytes::from(bytes),
+                    Ok(bytes) => bytes,
                     Err(e) => {
                         print_warning(&format!("Failed to serialize tag '{}': {}", tag.name, e));
                         continue;
                     }
                 };
 
-                match remote
-                    .upload_tag(&tag_hash_str, &remote_view, tag_bytes)
-                    .await
+                pack.objects.push(ObjectRecord::new(
+                    ObjectFamily::Tag,
+                    tag_hash_str.clone(),
+                    tag_bytes,
+                ));
+                tag_count += 1;
+                println!(
+                    "  {} {} tag '{}' ({})",
+                    success("\u{2713}"),
+                    style_hash(&tag_hash_str[..12]),
+                    tag.name,
+                    tag.kind,
+                );
+            }
+        }
+
+        // Send everything in one `/code` push: objects stored + refs CAS-moved.
+        if !pack.is_empty() {
+            let spinner = create_spinner("Pushing to remote...");
+            remote.sync_push(&pack).await.map_err(|e| {
+                finish_error(&spinner, "Push failed");
+                convert_remote_error(e, &remote_url)
+            })?;
+
+            // Re-read final metadata only. A concurrent writer may have caused
+            // the server to publish a larger union, which is valid. Push verifies
+            // that every locally proposed patch is present remotely; it does not
+            // import remote-only nodes or mutate the local closures.
+            let final_pack = remote
+                .sync_pull(&SyncWants::advertise(remote_names.clone()))
+                .await
+                .map_err(|e| {
+                    finish_error(&spinner, "Push landed, but remote verification failed");
+                    convert_remote_error(e, &remote_url)
+                })?;
+            let final_adv = parse_advertisement(&final_pack, &remote_url)?;
+            for sync in &syncs {
+                let final_manifest =
+                    final_adv.manifests.get(&sync.remote_name).ok_or_else(|| {
+                        CliError::RemoteError {
+                            message: format!(
+                                "Remote did not advertise pushed view '{}'",
+                                sync.remote_name
+                            ),
+                            url: Some(remote_url.clone()),
+                        }
+                    })?;
+                let final_set: HashSet<Hash> = final_manifest.changes.iter().copied().collect();
+                if let Some(missing) = sync
+                    .manifest
+                    .changes
+                    .iter()
+                    .find(|hash| !final_set.contains(hash))
                 {
-                    Ok(()) => {
-                        tag_count += 1;
-                        println!(
-                            "  {} {} tag '{}' ({})",
-                            success("\u{2713}"),
-                            style_hash(&tag_hash_str[..12]),
-                            tag.name,
-                            tag.kind,
-                        );
-                    }
-                    Err(e) => {
-                        print_warning(&format!("Failed to upload tag '{}': {}", tag.name, e));
-                    }
+                    finish_error(&spinner, "Push landed, but remote union is incomplete");
+                    return Err(CliError::Conflict {
+                        description: format!(
+                            "Remote view '{}' does not contain proposed patch {}",
+                            sync.remote_name,
+                            missing.to_base32()
+                        ),
+                    });
                 }
             }
+            finish_success(
+                &spinner,
+                "Push complete; remote union contains proposed patches",
+            );
         }
 
         // Summary

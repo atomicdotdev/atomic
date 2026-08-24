@@ -30,6 +30,8 @@
 //! }
 //! ```
 
+mod bare;
+pub mod code_sync;
 mod download;
 mod queries;
 mod upload;

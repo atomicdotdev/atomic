@@ -774,6 +774,94 @@ impl Repository {
         Ok(manifest)
     }
 
+    /// Reconcile a view manifest by **set union** over the common causal graph.
+    ///
+    /// Normal synchronization is monotonic: independently-added patches in a
+    /// shared view commute, so neither ordered log replaces the other. This
+    /// method preserves the local own membership and adds every incoming own
+    /// change not already present. For drafts, inherited membership remains
+    /// derived from the already-reconciled parent metadata; only the draft's
+    /// own changes are unioned here.
+    ///
+    /// The caller applies ancestor manifests root-to-leaf. Every referenced
+    /// `.change` must already be stored; `insert_change` registers/applies a
+    /// graph node only when absent and otherwise performs the metadata write.
+    /// Identity (scope + parent) is immutable and must match.
+    pub fn reconcile_view_manifest(
+        &mut self,
+        manifest: &ViewManifest,
+    ) -> Result<ManifestApplyOutcome, RepositoryError> {
+        manifest.verify()?;
+
+        for hash in &manifest.changes {
+            if !self.has_change(hash) {
+                return Err(RepositoryError::ManifestMissingChanges {
+                    view: manifest.name.clone(),
+                    count: 1,
+                    first: hash.to_base32(),
+                });
+            }
+        }
+
+        if self.view_exists(&manifest.name)? {
+            let info = self.get_view_info(&manifest.name)?;
+            if info.scope != manifest.scope {
+                return Err(RepositoryError::ManifestIdentityMismatch {
+                    view: manifest.name.clone(),
+                    reason: format!(
+                        "local scope is {:?}, manifest declares {:?}",
+                        info.scope, manifest.scope
+                    ),
+                });
+            }
+            if info.parent_name != manifest.parent {
+                return Err(RepositoryError::ManifestIdentityMismatch {
+                    view: manifest.name.clone(),
+                    reason: format!(
+                        "local parent is {:?}, manifest declares {:?}",
+                        info.parent_name, manifest.parent
+                    ),
+                });
+            }
+        } else {
+            self.create_view_with_identity(
+                &manifest.name,
+                manifest.scope,
+                manifest.parent.as_deref(),
+            )
+            .map_err(|e| match e {
+                RepositoryError::ViewNotFound { name } => RepositoryError::ManifestParentMissing {
+                    view: manifest.name.clone(),
+                    parent: name,
+                },
+                other => other,
+            })?;
+        }
+
+        let local = self.view_manifest(&manifest.name)?;
+        let mut present: HashSet<Hash> = local.changes.iter().copied().collect();
+        let already_present = manifest
+            .changes
+            .iter()
+            .filter(|hash| present.contains(hash))
+            .count();
+        let mut replayed = 0usize;
+        for hash in &manifest.changes {
+            if present.insert(*hash) {
+                self.insert_change(hash, InsertOptions::default().view(&manifest.name))?;
+                replayed += 1;
+            }
+        }
+
+        let info = self.get_view_info(&manifest.name)?;
+        Ok(ManifestApplyOutcome {
+            view: manifest.name.clone(),
+            already_present,
+            replayed,
+            state: info.state,
+        })
+    }
+
     /// Declaratively apply a [`ViewManifest`]: create the view with its
     /// declared identity if absent, then fast-forward its change log to
     /// match the manifest.

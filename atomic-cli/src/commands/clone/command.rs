@@ -34,15 +34,17 @@
 //! resolution. If the clone fails partway through, the `CleanupGuard`
 //! ensures the partially created directory is removed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
+use bytes::Bytes;
 use clap::Parser;
 use git2::Repository as GitRepository;
 
 use atomic_core::pristine::ViewScope;
-use atomic_core::types::{Base32, Hash};
+use atomic_core::types::{Base32, Hash, SetId};
+use atomic_objects::{ObjectFamily, SyncPack, SyncWants, ViewSnapshot};
 use atomic_remote::{HttpRemote, HttpRemoteConfig, RemoteError};
 use atomic_repository::{ManifestApplyOutcome, Repository, ViewManifest};
 
@@ -343,16 +345,107 @@ impl Clone {
     /// Fetch and validate one view's manifest from the remote.
     ///
     /// Returns `Ok(None)` if the remote does not have the view.
-    async fn fetch_view_manifest(
+    /// Reconstruct one view's manifest from a pulled [`SyncPack`]: find its ref
+    /// target, then its view-snapshot object, and render the manifest text.
+    /// Returns `Ok(None)` when the pack carries no ref/snapshot for `view`.
+    ///
+    /// This replaces the per-object `get_view_ref` + `get_object("views", …)`
+    /// round-trips: clone reads every view's state from the single `/code` pull.
+    fn view_manifest_from_pack(
         &self,
-        remote: &HttpRemote,
+        pack: &SyncPack,
         view: &str,
     ) -> CliResult<Option<ViewManifest>> {
-        match remote.get_view_manifest(view).await {
-            Ok(Some(text)) => parse_remote_manifest(view, &text, &self.url).map(Some),
-            Ok(None) => Ok(None),
-            Err(e) => Err(self.manifest_fetch_error(e)),
+        let target = match pack.refs.iter().find(|r| r.name == view) {
+            Some(r) => r.new_target.clone(),
+            None => return Ok(None),
+        };
+        let snapshot = pack
+            .objects
+            .iter()
+            .find(|o| o.family == ObjectFamily::View && o.key == target)
+            .and_then(|o| ViewSnapshot::from_bytes(&o.bytes));
+        let snapshot = match snapshot {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let manifest = parse_remote_manifest(view, &snapshot.to_manifest_text(view), &self.url)?;
+        // O(1) producer-integrity cross-check: the snapshot's declared
+        // `own_set_id` must equal the order-invariant fold of its own change
+        // list (content addressing guarantees the bytes, not a self-consistent
+        // producer).
+        let mut fold = SetId::ZERO;
+        for h in &manifest.changes {
+            fold = fold.add(h);
         }
+        if fold.to_base32() != snapshot.own_set_id {
+            print_warning(&format!(
+                "Remote view '{view}' snapshot set-id disagrees with its change list; \
+                 the remote object may be inconsistent."
+            ));
+        }
+        Ok(Some(manifest))
+    }
+
+    /// Verify convergence with the order-invariant `SetId`: each applied view's
+    /// local **effective** set-id must equal the remote's, taken from the server
+    /// view inventory (`GET /refs/views`), which the server folds over each
+    /// view's effective (own ∪ ancestors) change set. Comparing against the
+    /// server-computed value — an independent source — catches a dropped or
+    /// corrupt change that counts/merkle-order alone would miss, and is correct
+    /// for drafts (whose effective set differs from their own set).
+    async fn verify_convergence(
+        &self,
+        repo: &Repository,
+        remote: &HttpRemote,
+        views: &HashSet<String>,
+    ) {
+        let inventory = match remote.list_view_refs().await {
+            Ok(inv) => inv,
+            // Inventory unavailable — skip verification rather than fail the clone.
+            Err(_) => return,
+        };
+        let remote_set: HashMap<String, String> = inventory
+            .into_iter()
+            .filter_map(|v| v.set_id.map(|s| (v.name, s)))
+            .collect();
+
+        let mut verified = 0usize;
+        let mut mismatched = 0usize;
+        for view in views {
+            let Some(expected) = remote_set.get(view) else {
+                continue; // remote reported no set-id for this view
+            };
+            match repo.view_set_id(view) {
+                Ok(local) if &local.to_base32() == expected => verified += 1,
+                Ok(local) => {
+                    mismatched += 1;
+                    print_warning(&format!(
+                        "Set-id mismatch for view '{}': local {} != remote {}. \
+                         The clone may be incomplete or divergent.",
+                        view,
+                        local.to_base32(),
+                        expected
+                    ));
+                }
+                Err(e) => print_warning(&format!(
+                    "Could not compute local set-id for view '{}': {}",
+                    view, e
+                )),
+            }
+        }
+        if mismatched == 0 && verified > 0 {
+            print_success("Verified: cloned view set-ids match the remote (convergent)");
+        }
+    }
+
+    /// Index a pack's change objects into `base32 hash → bytes` for local save.
+    fn change_objects_from_pack(pack: &SyncPack) -> HashMap<String, Vec<u8>> {
+        pack.objects
+            .iter()
+            .filter(|o| o.family == ObjectFamily::Change)
+            .map(|o| (o.key.clone(), o.bytes.clone()))
+            .collect()
     }
 
     /// Fetch the requested view's manifest and walk its parent chain up to
@@ -362,11 +455,8 @@ impl Clone {
     /// remote. A declared parent that is missing remotely, or a parent chain
     /// that loops, means the remote's view metadata is corrupted and is a
     /// hard error.
-    async fn fetch_manifest_chain(
-        &self,
-        remote: &HttpRemote,
-    ) -> CliResult<Option<Vec<ViewManifest>>> {
-        let Some(leaf) = self.fetch_view_manifest(remote, &self.view).await? else {
+    fn fetch_manifest_chain(&self, pack: &SyncPack) -> CliResult<Option<Vec<ViewManifest>>> {
+        let Some(leaf) = self.view_manifest_from_pack(pack, &self.view)? else {
             return Ok(None);
         };
 
@@ -390,8 +480,7 @@ impl Clone {
                 .map(|m| m.name.clone())
                 .unwrap_or_else(|| self.view.clone());
             let manifest = self
-                .fetch_view_manifest(remote, &parent)
-                .await?
+                .view_manifest_from_pack(pack, &parent)?
                 .ok_or_else(|| CliError::RemoteError {
                     message: format!(
                         "View '{}' declares parent '{}', but the remote has no such view",
@@ -412,10 +501,10 @@ impl Clone {
     ///
     /// Stops on the first download failure to maintain consistency (the
     /// manifest apply would fail on the missing change anyway).
-    async fn download_missing_changes(
+    fn download_missing_changes(
         &self,
         repo: &Repository,
-        remote: &HttpRemote,
+        change_objects: &HashMap<String, Vec<u8>>,
         missing: &[Hash],
         stats: &mut CloneStats,
         progress: &mut CloneProgress,
@@ -434,12 +523,12 @@ impl Clone {
             let hash_str = hash.to_base32();
             let hash_display = &hash_str[..12.min(hash_str.len())];
 
-            match remote.download_change(&hash_str).await {
-                Ok(data) => {
+            match change_objects.get(&hash_str) {
+                Some(data) => {
                     let data_len = data.len() as u64;
 
                     // Save to local change store
-                    match save_downloaded_change(repo, hash, data) {
+                    match save_downloaded_change(repo, hash, Bytes::from(data.clone())) {
                         Ok(()) => {
                             stats.record_change_downloaded(data_len);
                             progress.record_downloaded();
@@ -464,19 +553,18 @@ impl Clone {
                         }
                     }
                 }
-                Err(e) => {
+                None => {
                     stats.record_failed();
                     println!(
-                        "  {} {}... ({}/{}) download failed: {}",
+                        "  {} {}... ({}/{}) not found on remote",
                         error("✗"),
                         hash_display,
                         i + 1,
                         missing.len(),
-                        e
                     );
-
-                    // Stop on first failure to maintain consistency
-                    return Err(convert_remote_error(e, &self.url));
+                    return Err(CliError::ChangeNotFound {
+                        hash: hash_str.clone(),
+                    });
                 }
             }
 
@@ -599,27 +687,18 @@ impl Clone {
     /// Manifests are ordered parents-before-children; changes are
     /// content-addressed and deduplicated against everything already
     /// downloaded. Returns the number of additional views cloned.
-    async fn clone_additional_views(
+    fn clone_additional_views(
         &self,
         repo: &mut Repository,
-        remote: &HttpRemote,
+        pack: &SyncPack,
+        change_objects: &HashMap<String, Vec<u8>>,
         stats: &mut CloneStats,
         applied: &mut HashSet<String>,
     ) -> CliResult<usize> {
-        // The user explicitly asked for every view, so a missing inventory
-        // is a hard error, not a silent single-view clone.
-        let remote_views = remote
-            .list_views()
-            .await
-            .map_err(|e| CliError::RemoteError {
-                message: format!(
-                    "--all-views requires the view inventory (?views), but the request failed: {}",
-                    e
-                ),
-                url: Some(self.url.clone()),
-            })?;
-
-        let names: Vec<String> = remote_views.into_iter().map(|v| v.name).collect();
+        // With `--all-views` the primary pull requested every view, so the pack
+        // already carries all view refs + snapshots. Derive the inventory from
+        // it — no separate `GET /refs/views` round-trip.
+        let names: Vec<String> = pack.refs.iter().map(|r| r.name.clone()).collect();
         let others = match classify_inventory(&names, applied) {
             InventoryOutcome::Views(others) => others,
             InventoryOutcome::NothingNew => return Ok(0),
@@ -644,7 +723,7 @@ impl Clone {
         // Fetch manifests for every remaining view.
         let mut manifests: Vec<ViewManifest> = Vec::with_capacity(others.len());
         for name in &others {
-            match self.fetch_view_manifest(remote, name).await {
+            match self.view_manifest_from_pack(pack, name) {
                 Ok(Some(m)) => manifests.push(m),
                 Ok(None) => {
                     print_warning(&format!(
@@ -682,8 +761,7 @@ impl Clone {
             .collect();
         let mut progress = CloneProgress::new(missing.len());
         progress.phase = ClonePhase::Downloading;
-        self.download_missing_changes(repo, remote, &missing, stats, &mut progress)
-            .await?;
+        self.download_missing_changes(repo, change_objects, &missing, stats, &mut progress)?;
 
         let mut cloned = 0usize;
         for manifest in &ordered {
@@ -714,12 +792,15 @@ impl Clone {
     /// not hinted. Best-effort: silent if the server has no inventory
     /// endpoint or nothing else to clone.
     async fn hint_other_views(&self, remote: &HttpRemote, applied: &HashSet<String>) {
-        let Ok(remote_views) = remote.list_views().await else {
+        // A cheap ref advertisement (refs only, no change bodies) lists every
+        // view on the remote.
+        let Ok(adv) = remote.sync_pull(&SyncWants::advertise(vec![])).await else {
             return;
         };
-        let others: Vec<String> = remote_views
+        let others: Vec<String> = adv
+            .refs
             .into_iter()
-            .map(|v| v.name)
+            .map(|r| r.name)
             .filter(|name| name != &self.view && !applied.contains(name))
             .collect();
         if others.is_empty() {
@@ -789,15 +870,37 @@ impl Clone {
         })?;
         finish_success(&spinner, "Connected");
 
-        // Fetch the requested view's manifest chain (view → ... → root).
-        // The manifests carry each view's identity, so clone reconstructs
-        // scope and parent exactly. An old server without manifest support
-        // is a hard error — there is no identity-losing fallback.
-        let spinner = create_spinner("Fetching view manifests...");
-        let manifests = match self.fetch_manifest_chain(&remote).await {
+        // One `/code` pull for the whole clone: request the view (every view
+        // with `--all-views`) and take the response — view snapshots + change
+        // bodies. A fresh clone holds nothing, so it declares no `haves`.
+        let spinner = create_spinner("Fetching from remote...");
+        let wants = if self.all_views {
+            SyncWants::all(Vec::new())
+        } else {
+            SyncWants {
+                refs: vec![self.view.clone()],
+                haves: Vec::new(),
+                refs_only: false,
+            }
+        };
+        let pack = match remote.sync_pull(&wants).await {
+            Ok(p) => p,
+            Err(e) => {
+                finish_error(&spinner, "Failed to fetch from remote");
+                return Err(convert_remote_error(e, &self.url));
+            }
+        };
+        let change_objects = Self::change_objects_from_pack(&pack);
+        finish_success(&spinner, "Fetched from remote");
+
+        // Reconstruct the requested view's manifest chain (view → ... → root)
+        // from the pulled snapshots. The manifests carry each view's identity,
+        // so clone reconstructs scope and parent exactly.
+        let spinner = create_spinner("Reading view manifests...");
+        let manifests = match self.fetch_manifest_chain(&pack) {
             Ok(m) => m,
             Err(e) => {
-                finish_error(&spinner, "Failed to fetch view manifests");
+                finish_error(&spinner, "Failed to read view manifests");
                 return Err(e);
             }
         };
@@ -873,9 +976,8 @@ impl Clone {
         let mut progress = CloneProgress::new(missing.len());
         progress.phase = ClonePhase::Downloading;
 
-        // Download the missing changes
-        self.download_missing_changes(&repo, &remote, &missing, &mut stats, &mut progress)
-            .await?;
+        // Save the missing changes from the pulled pack.
+        self.download_missing_changes(&repo, &change_objects, &missing, &mut stats, &mut progress)?;
 
         // Apply changes (unless download-only)
         if self.download_only {
@@ -1008,10 +1110,13 @@ impl Clone {
         // recoverable and preserved — cloned views keep their identity.
         if !self.download_only && apply_errors.is_empty() {
             if self.all_views {
-                match self
-                    .clone_additional_views(&mut repo, &remote, &mut stats, &mut applied_views)
-                    .await
-                {
+                match self.clone_additional_views(
+                    &mut repo,
+                    &pack,
+                    &change_objects,
+                    &mut stats,
+                    &mut applied_views,
+                ) {
                     Ok(0) => {}
                     Ok(n) => print_success(&format!(
                         "Cloned {} additional {}",
@@ -1025,6 +1130,14 @@ impl Clone {
             } else {
                 self.hint_other_views(&remote, &applied_views).await;
             }
+        }
+
+        // Validate convergence with the order-invariant SetId across every
+        // applied view (chain + any `--all-views` extras), against the
+        // server-computed effective set-ids.
+        if !self.download_only && apply_errors.is_empty() {
+            self.verify_convergence(&repo, &remote, &applied_views)
+                .await;
         }
 
         // Drop the temporary parking view, if scaffold reconciliation
