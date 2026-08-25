@@ -722,10 +722,9 @@ impl Pull {
 
         // Apply changes (unless download-only)
         if self.download_only {
-            // Sidecars (provenance, attestations) still land in the store —
-            // the pack carried them and dropping them would require a later
-            // pull to recover. DEPS wiring to the covered changes happens
-            // when those changes are applied (`atomic insert`).
+            // Sidecars (provenance, attestations) still land in the store.
+            // Saving them registers covered change hashes and wires DEPS even
+            // before those downloaded changes are inserted into a view.
             {
                 let sidecar_stats = crate::commands::sidecars::import_sidecars(&repo, &pull_pack);
                 if !sidecar_stats.is_empty() {

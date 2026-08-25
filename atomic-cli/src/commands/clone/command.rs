@@ -1004,10 +1004,9 @@ impl Clone {
             repo.align_to_view(&self.view)
                 .map_err(CliError::Repository)?;
 
-            // Sidecars (provenance, attestations) still land in the store —
-            // the pack carried them and dropping them would require a later
-            // pull to recover. DEPS wiring to the covered changes happens
-            // when those changes are applied (`atomic insert`).
+            // Sidecars (provenance, attestations) still land in the store.
+            // Saving them registers covered change hashes and wires DEPS even
+            // before those downloaded changes are inserted into a view.
             self.import_and_report_sidecars(&repo, &pack);
 
             // Configure remote as "origin" even for download-only mode

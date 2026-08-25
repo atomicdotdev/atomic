@@ -54,9 +54,7 @@ pub fn import_sidecars(repo: &Repository, pack: &SyncPack) -> SidecarStats {
         let Some(hash) = Hash::from_base32(key.as_bytes()) else {
             continue;
         };
-        if repo.has_provenance_graph(&hash) {
-            continue;
-        }
+        let already_present = repo.has_provenance_graph(&hash);
         match atomic_core::change::ProvenanceGraph::deserialize(&data) {
             Ok((graph, computed)) => {
                 if computed != hash {
@@ -66,8 +64,12 @@ pub fn import_sidecars(repo: &Repository, pack: &SyncPack) -> SidecarStats {
                     ));
                     continue;
                 }
+                // Always replay repository registration, even when the object
+                // file exists. This repairs metadata after an interrupted save
+                // and is safe because node/dependency writes are idempotent.
                 match repo.save_provenance_graph(&graph) {
-                    Ok(_) => stats.provenance += 1,
+                    Ok(_) if !already_present => stats.provenance += 1,
+                    Ok(_) => {}
                     Err(e) => print_warning(&format!(
                         "Failed to register provenance {}: {}",
                         short(&key),
@@ -83,9 +85,7 @@ pub fn import_sidecars(repo: &Repository, pack: &SyncPack) -> SidecarStats {
         let Some(hash) = Hash::from_base32(key.as_bytes()) else {
             continue;
         };
-        if repo.has_attestation(&hash) {
-            continue;
-        }
+        let already_present = repo.has_attestation(&hash);
         match atomic_core::change::Attestation::deserialize(&data) {
             Ok((attestation, computed)) => {
                 if computed != hash {
@@ -95,8 +95,11 @@ pub fn import_sidecars(repo: &Repository, pack: &SyncPack) -> SidecarStats {
                     ));
                     continue;
                 }
+                // Re-register existing files as well, repairing pristine
+                // metadata left incomplete by an earlier interrupted import.
                 match repo.save_attestation(&attestation) {
-                    Ok(_) => stats.attestations += 1,
+                    Ok(_) if !already_present => stats.attestations += 1,
+                    Ok(_) => {}
                     Err(e) => print_warning(&format!(
                         "Failed to register attestation {}: {}",
                         short(&key),
@@ -309,12 +312,10 @@ mod tests {
     }
 
     #[test]
-    fn import_before_registration_leaves_files_but_no_rev_deps() {
-        // Documents the ordering contract: a graph imported while its change
-        // is NOT yet registered still lands on disk (nothing is lost), but
-        // `find_provenance_for_change` — the REV_DEPS lookup `atomic change`
-        // uses — cannot see it. That is why clone/pull import sidecars
-        // AFTER applying view manifests.
+    fn import_before_insertion_registers_rev_deps() {
+        // Download-only imports happen before the covered change is inserted
+        // into a view. The sidecar save must still register the change hash and
+        // wire REV_DEPS so provenance queries work immediately and after insert.
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
 
@@ -333,9 +334,9 @@ mod tests {
         assert_eq!(stats.provenance, 1, "the graph file is saved");
 
         let via_rev_deps = repo.find_provenance_for_change(&change).unwrap();
-        assert!(via_rev_deps.is_empty(), "REV_DEPS cannot see it yet");
+        assert_eq!(via_rev_deps.len(), 1, "REV_DEPS sees downloaded sidecars");
 
         let via_scan = repo.find_provenance_for_change_scan(&change).unwrap();
-        assert_eq!(via_scan.len(), 1, "the disk-scan fallback does");
+        assert_eq!(via_scan.len(), 1, "the disk-scan fallback agrees");
     }
 }

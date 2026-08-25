@@ -341,8 +341,9 @@ impl Register {
 ///   `[servers.{name}]` profile carrying the URL, org, and identity binding.
 ///   It becomes the active profile (`default_server`) only when nothing is
 ///   active yet AND the legacy `[server]` block is unconfigured.
-/// - `profile_name = None` (default-identity registration): update the legacy
-///   `[server]` block in place.
+/// - `profile_name = None` (default-identity registration): update the active
+///   named profile when it already points at this URL; otherwise update the
+///   legacy `[server]` block. This guarantees the new binding is effective.
 ///
 /// In **both** cases the registering identity's name is written to the
 /// profile's `identity` field. Without that binding, push/pull fall back to
@@ -377,14 +378,39 @@ fn apply_registration(
         }
         Some(name.to_string())
     } else {
-        config.server.url = Some(server_url.to_string());
-        config.server.default_org = Some(slug.to_string());
-        config.server.single_tenant = single_tenant;
-        // Bind the registering identity so remote commands authenticate as
-        // it (see the doc comment above).
-        config.server.identity = Some(identity_name.to_string());
+        // If the active named profile already represents this server, update
+        // it directly. Writing only the legacy block would be ineffective:
+        // authentication intentionally lets the active profile win equal-host
+        // matches.
+        let matching_active = config.default_server.as_deref().and_then(|name| {
+            config
+                .servers
+                .get(name)
+                .filter(|server| server_urls_match(server.url.as_deref(), server_url))
+                .map(|_| name.to_string())
+        });
+
+        if let Some(name) = matching_active {
+            if let Some(server) = config.servers.get_mut(&name) {
+                server.url = Some(server_url.to_string());
+                server.default_org = Some(slug.to_string());
+                server.single_tenant = single_tenant;
+                server.identity = Some(identity_name.to_string());
+            }
+        } else {
+            config.server.url = Some(server_url.to_string());
+            config.server.default_org = Some(slug.to_string());
+            config.server.single_tenant = single_tenant;
+            config.server.identity = Some(identity_name.to_string());
+        }
         None
     }
+}
+
+fn server_urls_match(configured: Option<&str>, registered: &str) -> bool {
+    configured
+        .map(|url| url.trim_end_matches('/') == registered.trim_end_matches('/'))
+        .unwrap_or(false)
 }
 
 /// Derive a short profile name from a server URL.
@@ -561,6 +587,38 @@ mod tests {
             "the registering identity must be bound so push authenticates as it"
         );
         assert!(config.servers.is_empty());
+    }
+
+    #[test]
+    fn default_path_updates_matching_active_profile() {
+        let mut config = GlobalConfig {
+            default_server: Some("prod".to_string()),
+            ..GlobalConfig::default()
+        };
+        config.servers.insert(
+            "prod".to_string(),
+            atomic_config::ServerConfig {
+                url: Some("http://localhost:8444/".to_string()),
+                identity: Some("old".to_string()),
+                ..atomic_config::ServerConfig::default()
+            },
+        );
+
+        let created = apply_registration(
+            &mut config,
+            "http://localhost:8444",
+            "personal",
+            true,
+            "new",
+            None,
+        );
+
+        assert!(created.is_none());
+        let active = &config.servers["prod"];
+        assert_eq!(active.identity.as_deref(), Some("new"));
+        assert_eq!(active.default_org.as_deref(), Some("personal"));
+        assert!(active.single_tenant);
+        assert!(!config.server.is_configured());
     }
 
     #[test]
