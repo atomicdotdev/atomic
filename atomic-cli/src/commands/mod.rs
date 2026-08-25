@@ -107,6 +107,7 @@ pub mod pull;
 pub mod push;
 pub mod remote;
 pub mod server;
+pub mod sidecars;
 
 // Phase 4: Identity Management
 pub mod identity;

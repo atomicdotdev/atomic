@@ -13,8 +13,10 @@
 //! 2. URL userinfo — `http://bob@alice.localhost:8080/...` → identity "bob"
 //! 3. Configured server binding — a `[servers.*]`/`[server]` profile whose host
 //!    is the longest suffix of the remote host supplies its `identity`. Identity
-//!    follows the server you registered with, so any tenant under it resolves
-//!    without `--identity`.
+//!    follows the server you registered with (the binding `atomic identity
+//!    register` writes), so any tenant under it resolves without `--identity`.
+//!    When two profiles' hosts match equally well, the **active** profile
+//!    (per `default_server`, else the legacy `[server]` block) wins.
 //! 4. Subdomain — `http://alice.localhost:8080/...` → identity "alice" (legacy
 //!    last resort).
 //! 5. Default identity — if none of the above resolves to an identity that
@@ -31,6 +33,16 @@ use url::Url;
 
 use crate::error::{CliError, CliResult};
 
+/// One `[server]`/`[servers.*]` profile that declares an identity: its host,
+/// its bound identity, and whether it is the active profile (the one
+/// `default_server` selects, or the legacy block when no name is set).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerBinding {
+    host: String,
+    identity: String,
+    active: bool,
+}
+
 /// Resolve the identity name to authenticate as.
 ///
 /// Priority:
@@ -40,7 +52,8 @@ use crate::error::{CliError, CliResult};
 ///    suffix of the remote host (`[servers.prod] url=... identity=...`). This is
 ///    the binding that makes pushes to *any* tenant under a server you've
 ///    registered with ("just works" without `--identity`): identity follows the
-///    server, not the tenant subdomain.
+///    server, not the tenant subdomain. Equal-length matches are won by the
+///    active profile.
 /// 4. The remote host's leading subdomain label (`http://bob.host/...`) — the
 ///    legacy heuristic, kept only as a last resort.
 ///
@@ -53,16 +66,18 @@ fn resolve_identity_name_with_override(
     if let Some(name) = identity_override {
         return Some(name.to_string());
     }
-    resolve_identity_from_url(remote_url, &configured_server_identities())
+    resolve_identity_from_url(remote_url, &configured_server_identity_bindings())
 }
 
-/// Collect `(server_host, identity)` pairs from the global config — both the
-/// default `[server]` block and every named `[servers.*]` profile — that
-/// declare an identity. Servers without an identity binding are skipped.
+/// Collect the server profiles from the global config — both the default
+/// `[server]` block and every named `[servers.*]` profile — that declare an
+/// identity, marking which one is **active** (the profile `default_server`
+/// names, or the legacy block when unset). Servers without an identity binding
+/// are skipped.
 ///
 /// Returns an empty list when no config exists or it can't be read, so
 /// resolution degrades cleanly to URL-based inference.
-fn configured_server_identities() -> Vec<(String, String)> {
+fn configured_server_identity_bindings() -> Vec<ServerBinding> {
     let config = match atomic_config::GlobalConfig::load() {
         Ok(c) => c,
         Err(e) => {
@@ -71,31 +86,59 @@ fn configured_server_identities() -> Vec<(String, String)> {
         }
     };
 
-    let mut pairs = Vec::new();
-    let mut consider = |server: &atomic_config::ServerConfig| {
-        if let (Some(url), Some(identity)) = (server.url.as_ref(), server.identity.as_ref()) {
-            if let Some(host) = Url::parse(url)
-                .ok()
-                .and_then(|u| u.host_str().map(String::from))
-            {
-                pairs.push((host, identity.clone()));
-            }
+    let host_of = |server: &atomic_config::ServerConfig| {
+        server
+            .url
+            .as_deref()
+            .and_then(|u| Url::parse(u).ok())
+            .and_then(|u| u.host_str().map(String::from))
+    };
+
+    let mut bindings = Vec::new();
+    let mut consider = |server: &atomic_config::ServerConfig, active: bool| {
+        if let (Some(host), Some(identity)) = (host_of(server), server.identity.as_ref()) {
+            bindings.push(ServerBinding {
+                host,
+                identity: identity.clone(),
+                active,
+            });
         }
     };
 
-    consider(&config.server);
-    for server in config.servers.values() {
-        consider(server);
+    // The active profile is resolved exactly as management commands resolve
+    // it (`GlobalConfig::resolve_server`): `default_server` → named profile,
+    // else the legacy block. A dangling `default_server` name degrades to
+    // no active marker rather than failing auth resolution.
+    let active_named = config
+        .default_server
+        .as_deref()
+        .and_then(|name| config.servers.get(name));
+    match active_named {
+        Some(profile) => {
+            consider(profile, true);
+            for (name, server) in &config.servers {
+                if Some(name.as_str()) != config.default_server.as_deref() {
+                    consider(server, false);
+                }
+            }
+            consider(&config.server, false);
+        }
+        None => {
+            for server in config.servers.values() {
+                consider(server, false);
+            }
+            consider(&config.server, true);
+        }
     }
-    pairs
+    bindings
 }
 
 /// Pure identity resolution from a URL plus the configured server bindings.
 ///
-/// userinfo → server-host match (longest suffix) → first-label subdomain.
-/// Split from the config-loading wrapper so it can be unit-tested without a
-/// config file on disk.
-fn resolve_identity_from_url(remote_url: &str, servers: &[(String, String)]) -> Option<String> {
+/// userinfo → server-host match (longest suffix, active wins ties) → first-label
+/// subdomain. Split from the config-loading wrapper so it can be unit-tested
+/// without a config file on disk.
+fn resolve_identity_from_url(remote_url: &str, servers: &[ServerBinding]) -> Option<String> {
     let url = Url::parse(remote_url).ok()?;
 
     // 1. Explicit in the URL: http://bob@host/...
@@ -117,17 +160,21 @@ fn resolve_identity_from_url(remote_url: &str, servers: &[(String, String)]) -> 
 }
 
 /// Pick the identity bound to the configured server whose host is the longest
-/// dot-boundary suffix of `remote_host`.
+/// dot-boundary suffix of `remote_host`. When several profiles' hosts match
+/// with the same length (e.g. the legacy `[server]` block and a named profile
+/// pointing at the same server), the **active** profile wins — the one
+/// `default_server` selects, else the legacy block.
 ///
-/// Longest-suffix wins so a more specific server (`staging.atomic.storage`)
-/// beats a broader one (`atomic.storage`) for hosts under both — e.g.
-/// `x.staging.atomic.storage` resolves to the staging identity, not prod.
-fn match_server_identity(remote_host: &str, servers: &[(String, String)]) -> Option<String> {
+/// Longest-suffix still wins over active: a more specific server
+/// (`staging.atomic.storage`) beats a broader active one (`atomic.storage`)
+/// for hosts under both — e.g. `x.staging.atomic.storage` resolves to the
+/// staging identity, not prod.
+fn match_server_identity(remote_host: &str, servers: &[ServerBinding]) -> Option<String> {
     servers
         .iter()
-        .filter(|(server_host, _)| host_is_under(remote_host, server_host))
-        .max_by_key(|(server_host, _)| server_host.len())
-        .map(|(_, identity)| identity.clone())
+        .filter(|b| host_is_under(remote_host, &b.host))
+        .max_by_key(|b| (b.host.len(), b.active))
+        .map(|b| b.identity.clone())
 }
 
 /// Whether `remote_host` is the server host itself or a subdomain of it,
@@ -809,13 +856,18 @@ mod tests {
 
     // -- configured server-host identity binding --
 
-    fn servers() -> Vec<(String, String)> {
+    fn binding(host: &str, identity: &str) -> ServerBinding {
+        ServerBinding {
+            host: host.to_string(),
+            identity: identity.to_string(),
+            active: false,
+        }
+    }
+
+    fn servers() -> Vec<ServerBinding> {
         vec![
-            ("atomic.storage".to_string(), "Aaron".to_string()),
-            (
-                "staging.atomic.storage".to_string(),
-                "aaron-staging".to_string(),
-            ),
+            binding("atomic.storage", "Aaron"),
+            binding("staging.atomic.storage", "aaron-staging"),
         ]
     }
 
@@ -859,6 +911,80 @@ mod tests {
                 "host {host} should bind to the staging identity"
             );
         }
+    }
+
+    #[test]
+    fn active_profile_wins_an_equal_host_tie() {
+        // The legacy [server] block and a named profile point at the SAME
+        // server. The active profile's identity must win — previously the
+        // named profile always won on a tie, ignoring `default_server`.
+        let mut active_legacy = servers();
+        active_legacy.push(ServerBinding {
+            host: "localhost".to_string(),
+            identity: "legacy-identity".to_string(),
+            active: true,
+        });
+        active_legacy.push(binding("localhost", "named-identity"));
+
+        let url = "http://localhost:8444/workspaces/w/projects/p/code";
+        assert_eq!(
+            resolve_identity_from_url(url, &active_legacy).as_deref(),
+            Some("legacy-identity"),
+            "the active binding must win an equal-host tie"
+        );
+
+        // Flip which binding is active → the answer flips.
+        let mut active_named = servers();
+        active_named.push(binding("localhost", "legacy-identity"));
+        active_named.push(ServerBinding {
+            host: "localhost".to_string(),
+            identity: "named-identity".to_string(),
+            active: true,
+        });
+        assert_eq!(
+            resolve_identity_from_url(url, &active_named).as_deref(),
+            Some("named-identity")
+        );
+    }
+
+    #[test]
+    fn longest_suffix_beats_active_shorter_host() {
+        // A more specific (longer-host) profile outranks a broader active
+        // one: pushing to staging uses staging's identity, not the active
+        // prod profile's.
+        let mut b = servers();
+        b[0].active = true; // atomic.storage / "Aaron" is active
+        let url = "https://x.staging.atomic.storage/workspaces/w/projects/p/code";
+        assert_eq!(
+            resolve_identity_from_url(url, &b).as_deref(),
+            Some("aaron-staging"),
+            "host specificity outranks the active marker"
+        );
+    }
+
+    #[test]
+    fn active_binding_supplies_identity_for_bare_local_host() {
+        // `atomic identity register http://localhost:8444` (no --identity)
+        // now binds the registering identity to the legacy [server] block,
+        // which is active when no default_server names a profile. A push to
+        // that host must resolve to it instead of falling through to the
+        // subdomain heuristic or the store default.
+        let bindings = vec![ServerBinding {
+            host: "localhost".to_string(),
+            identity: "leefaus".to_string(),
+            active: true,
+        }];
+        let url = "http://localhost:8444/workspaces/w/projects/p/code";
+        assert_eq!(
+            resolve_identity_from_url(url, &bindings).as_deref(),
+            Some("leefaus")
+        );
+        // Tenant subdomains of the same server inherit the binding too.
+        let url = "http://aaron.localhost:8444/workspaces/w/projects/p/code";
+        assert_eq!(
+            resolve_identity_from_url(url, &bindings).as_deref(),
+            Some("leefaus")
+        );
     }
 
     #[test]

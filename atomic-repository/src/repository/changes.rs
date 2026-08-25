@@ -290,12 +290,16 @@ impl Repository {
             .register_attestation(&hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Register dependencies: attestation → covered changes
+        // Register dependencies: attestation → covered changes. A downloaded
+        // change may not have been inserted into a view yet (`--download-only`),
+        // but it still needs an internal ID so this relationship is durable.
+        // Insertion reuses the same content-addressed registration later.
         for change_hash in &attestation.changes_covered {
-            if let Ok(Some(change_id)) = txn.get_internal(change_hash) {
-                txn.put_dep(attest_id, change_id)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            }
+            let change_id = txn
+                .register_change(change_hash)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            txn.put_dep(attest_id, change_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
         }
 
         // If chained, register dependency on previous attestation too
@@ -1075,12 +1079,16 @@ impl Repository {
             .register_provenance(&hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Register dependencies: provenance → explained changes
+        // Register dependencies: provenance → explained changes. Sidecars can
+        // arrive with `--download-only`, before their changes are inserted into
+        // a view. Registering the content hash now gives the relationship a
+        // stable internal ID; insertion reuses that registration later.
         for change_hash in &graph.changes_explained {
-            if let Ok(Some(change_id)) = txn.get_internal(change_hash) {
-                txn.put_dep(prov_id, change_id)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            }
+            let change_id = txn
+                .register_change(change_hash)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            txn.put_dep(prov_id, change_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
         }
 
         // If chained, register dependency on previous provenance graph too
