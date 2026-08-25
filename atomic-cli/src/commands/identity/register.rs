@@ -215,47 +215,38 @@ impl Register {
                 CliError::Internal(anyhow::anyhow!("Failed to load global config: {e}"))
             })?;
 
-            // When --identity is specified, register as a named server profile
-            // so the URL+identity combo is remembered automatically.
-            if self.identity.is_some() {
-                let profile_name = self
-                    .server_name
+            // A named profile is created only for `--identity` registrations;
+            // the default path records the server in the legacy [server]
+            // block. Either way the identity that registered is bound in the
+            // config, so push/pull authenticate as it even when the store's
+            // global default identity is something else entirely.
+            let profile_name = if self.identity.is_some() {
+                self.server_name
                     .clone()
                     .or_else(|| derive_profile_name(&clean_server_url))
-                    .unwrap_or_else(|| slug.to_string());
+                    .or_else(|| Some(slug.to_string()))
+            } else {
+                None
+            };
 
-                let profile = atomic_config::ServerConfig {
-                    url: Some(clean_server_url.clone()),
-                    default_org: Some(slug.to_string()),
-                    default_workspaces: std::collections::BTreeMap::new(),
-                    identity: Some(identity.name.clone()),
-                    single_tenant,
-                };
+            let created_profile = apply_registration(
+                &mut config,
+                &clean_server_url,
+                slug,
+                single_tenant,
+                &identity.name,
+                profile_name.as_deref(),
+            );
 
-                config.servers.insert(profile_name.clone(), profile);
-
-                // If there's no active named server yet, make this one active.
-                if config.default_server.is_none() && config.server.is_configured() {
-                    // Legacy [server] is already set — don't override it silently.
-                    // Just register the profile; user can activate with `atomic server set`.
-                    println!(
-                        "  Profile:   '{}' added (activate with: atomic server set {})",
-                        profile_name, profile_name
-                    );
-                } else if config.default_server.is_none() {
-                    config.default_server = Some(profile_name.clone());
-                    println!("  Profile:   '{}' (now active)", profile_name);
+            if let Some(name) = &created_profile {
+                if config.default_server.as_deref() == Some(name.as_str()) {
+                    println!("  Profile:   '{}' (now active)", name);
                 } else {
                     println!(
                         "  Profile:   '{}' added (activate with: atomic server set {})",
-                        profile_name, profile_name
+                        name, name
                     );
                 }
-            } else {
-                // Default path: update the legacy [server] block.
-                config.server.url = Some(clean_server_url.clone());
-                config.server.default_org = Some(slug.to_string());
-                config.server.single_tenant = single_tenant;
             }
 
             config.save().map_err(|e| {
@@ -340,6 +331,86 @@ impl Register {
 
         Ok(())
     }
+}
+
+/// Record a completed registration in the global config.
+///
+/// Two shapes, matching the pre-existing behavior:
+///
+/// - `profile_name = Some(_)` (an `--identity` registration): insert a named
+///   `[servers.{name}]` profile carrying the URL, org, and identity binding.
+///   It becomes the active profile (`default_server`) only when nothing is
+///   active yet AND the legacy `[server]` block is unconfigured.
+/// - `profile_name = None` (default-identity registration): update the active
+///   named profile when it already points at this URL; otherwise update the
+///   legacy `[server]` block. This guarantees the new binding is effective.
+///
+/// In **both** cases the registering identity's name is written to the
+/// profile's `identity` field. Without that binding, push/pull fall back to
+/// the identity store's global default — which is frequently a different,
+/// unrelated identity on machines with several test identities, and the
+/// server then rejects the push (401/404) even though the right identity
+/// registered fine.
+///
+/// Returns the created profile name, if any.
+fn apply_registration(
+    config: &mut GlobalConfig,
+    server_url: &str,
+    slug: &str,
+    single_tenant: bool,
+    identity_name: &str,
+    profile_name: Option<&str>,
+) -> Option<String> {
+    if let Some(name) = profile_name {
+        let profile = atomic_config::ServerConfig {
+            url: Some(server_url.to_string()),
+            default_org: Some(slug.to_string()),
+            default_workspaces: std::collections::BTreeMap::new(),
+            identity: Some(identity_name.to_string()),
+            single_tenant,
+        };
+        config.servers.insert(name.to_string(), profile);
+
+        // Make it the active profile only when nothing else is active and
+        // the legacy [server] block wouldn't be silently overridden.
+        if config.default_server.is_none() && !config.server.is_configured() {
+            config.default_server = Some(name.to_string());
+        }
+        Some(name.to_string())
+    } else {
+        // If the active named profile already represents this server, update
+        // it directly. Writing only the legacy block would be ineffective:
+        // authentication intentionally lets the active profile win equal-host
+        // matches.
+        let matching_active = config.default_server.as_deref().and_then(|name| {
+            config
+                .servers
+                .get(name)
+                .filter(|server| server_urls_match(server.url.as_deref(), server_url))
+                .map(|_| name.to_string())
+        });
+
+        if let Some(name) = matching_active {
+            if let Some(server) = config.servers.get_mut(&name) {
+                server.url = Some(server_url.to_string());
+                server.default_org = Some(slug.to_string());
+                server.single_tenant = single_tenant;
+                server.identity = Some(identity_name.to_string());
+            }
+        } else {
+            config.server.url = Some(server_url.to_string());
+            config.server.default_org = Some(slug.to_string());
+            config.server.single_tenant = single_tenant;
+            config.server.identity = Some(identity_name.to_string());
+        }
+        None
+    }
+}
+
+fn server_urls_match(configured: Option<&str>, registered: &str) -> bool {
+    configured
+        .map(|url| url.trim_end_matches('/') == registered.trim_end_matches('/'))
+        .unwrap_or(false)
 }
 
 /// Derive a short profile name from a server URL.
@@ -483,6 +554,167 @@ mod tests {
         assert_eq!(
             derive_profile_name("http://localhost:8080"),
             Some("localhost".to_string())
+        );
+    }
+
+    // -- apply_registration (config persistence) --
+
+    use atomic_config::GlobalConfig;
+
+    #[test]
+    fn default_path_binds_identity_in_legacy_server_block() {
+        // The reported bug: registering with the default identity wrote the
+        // URL/org to [server] but never the identity, so push fell back to
+        // the store's global default — the wrong identity on machines with
+        // several of them.
+        let mut config = GlobalConfig::default();
+        let created = apply_registration(
+            &mut config,
+            "http://localhost:8444",
+            "personal",
+            true,
+            "leefaus",
+            None,
+        );
+
+        assert!(created.is_none(), "default path creates no named profile");
+        assert_eq!(config.server.url.as_deref(), Some("http://localhost:8444"));
+        assert_eq!(config.server.default_org.as_deref(), Some("personal"));
+        assert!(config.server.single_tenant);
+        assert_eq!(
+            config.server.identity.as_deref(),
+            Some("leefaus"),
+            "the registering identity must be bound so push authenticates as it"
+        );
+        assert!(config.servers.is_empty());
+    }
+
+    #[test]
+    fn default_path_updates_matching_active_profile() {
+        let mut config = GlobalConfig {
+            default_server: Some("prod".to_string()),
+            ..GlobalConfig::default()
+        };
+        config.servers.insert(
+            "prod".to_string(),
+            atomic_config::ServerConfig {
+                url: Some("http://localhost:8444/".to_string()),
+                identity: Some("old".to_string()),
+                ..atomic_config::ServerConfig::default()
+            },
+        );
+
+        let created = apply_registration(
+            &mut config,
+            "http://localhost:8444",
+            "personal",
+            true,
+            "new",
+            None,
+        );
+
+        assert!(created.is_none());
+        let active = &config.servers["prod"];
+        assert_eq!(active.identity.as_deref(), Some("new"));
+        assert_eq!(active.default_org.as_deref(), Some("personal"));
+        assert!(active.single_tenant);
+        assert!(!config.server.is_configured());
+    }
+
+    #[test]
+    fn default_path_rebinding_updates_the_identity() {
+        // Re-registering the same server with a different identity must
+        // replace the binding — the latest registration wins.
+        let mut config = GlobalConfig::default();
+        apply_registration(
+            &mut config,
+            "http://localhost:8444",
+            "personal",
+            false,
+            "old",
+            None,
+        );
+        apply_registration(
+            &mut config,
+            "http://localhost:8444",
+            "personal",
+            false,
+            "new",
+            None,
+        );
+        assert_eq!(config.server.identity.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn explicit_path_creates_named_profile_with_identity() {
+        let mut config = GlobalConfig::default();
+        let created = apply_registration(
+            &mut config,
+            "https://atomic.storage",
+            "atomic",
+            false,
+            "Aaron",
+            Some("prod"),
+        );
+
+        assert_eq!(created.as_deref(), Some("prod"));
+        let profile = &config.servers["prod"];
+        assert_eq!(profile.url.as_deref(), Some("https://atomic.storage"));
+        assert_eq!(profile.default_org.as_deref(), Some("atomic"));
+        assert_eq!(profile.identity.as_deref(), Some("Aaron"));
+        // No prior active server and legacy block unconfigured → now active.
+        assert_eq!(config.default_server.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn explicit_path_does_not_override_a_configured_legacy_block() {
+        // Legacy [server] already configured → the profile is added but NOT
+        // silently activated.
+        let mut config = GlobalConfig::default();
+        config.server.url = Some("http://localhost:8444".to_string());
+        config.server.default_org = Some("personal".to_string());
+
+        let created = apply_registration(
+            &mut config,
+            "https://atomic.storage",
+            "atomic",
+            false,
+            "Aaron",
+            Some("prod"),
+        );
+
+        assert_eq!(created.as_deref(), Some("prod"));
+        assert!(
+            config.default_server.is_none(),
+            "must not silently override the configured legacy block"
+        );
+        assert!(config.servers.contains_key("prod"));
+    }
+
+    #[test]
+    fn explicit_path_respects_an_existing_default_server() {
+        let mut config = GlobalConfig {
+            default_server: Some("existing".to_string()),
+            ..GlobalConfig::default()
+        };
+        config.servers.insert(
+            "existing".to_string(),
+            atomic_config::ServerConfig::default(),
+        );
+
+        apply_registration(
+            &mut config,
+            "https://staging.atomic.storage",
+            "staging",
+            false,
+            "aaron-staging",
+            Some("staging"),
+        );
+
+        assert_eq!(
+            config.default_server.as_deref(),
+            Some("existing"),
+            "an already-active profile stays active"
         );
     }
 }
