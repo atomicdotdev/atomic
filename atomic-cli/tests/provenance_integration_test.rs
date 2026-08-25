@@ -13,9 +13,9 @@
 //!   5. compute-on-demand: no new files appear and the provenance-graph count is
 //!      unchanged after trace/show.
 //!
-//! The REV_DEPS fallback is exercised too: a graph whose explained change was
-//! never made internal is invisible to REV_DEPS, and the disk-scan fallback
-//! still finds it.
+//! The REV_DEPS fallback is exercised too: a graph fixture written directly to
+//! the content-addressed store without pristine registration is invisible to
+//! REV_DEPS, and the disk-scan fallback still finds it.
 //!
 //! Windows is excluded: the tests isolate the identity store by pointing `HOME`
 //! at a temp dir, but on Windows `dirs::home_dir()` resolves via the system API
@@ -24,6 +24,7 @@
 #![cfg(not(windows))]
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -286,13 +287,12 @@ fn provenance_trace_uses_scan_fallback_when_rev_deps_missing() {
     let home_dir = home_tmp.path();
 
     create_default_identity(home_dir);
-    // Init a real repo (needed so `provenance` finds a repository root), but do
-    // NOT record the change the graph explains — so it is never internal and
-    // REV_DEPS is empty for it.
+    // Init a real repo so `provenance` finds a repository root. The graph below
+    // is written directly to the content store to model legacy/interrupted data
+    // that exists on disk without pristine registration.
     assert!(atomic(repo_dir, home_dir, &["init"]).status.success());
 
-    // A change hash that was never recorded => not internal => invisible to
-    // REV_DEPS. The graph is still saved to the change store on disk.
+    // A change hash that was never recorded remains invisible to REV_DEPS.
     let phantom_change = Hash::of(b"never-recorded-change");
     {
         let repo = Repository::open(repo_dir).expect("open repo");
@@ -301,14 +301,18 @@ fn provenance_trace_uses_scan_fallback_when_rev_deps_missing() {
             .add_node(goal_node())
             .add_change_explained(phantom_change)
             .build();
-        repo.save_provenance_graph(&graph).expect("save graph");
+        let bytes = graph.serialize().expect("serialize graph");
+        let graph_hash = Hash::of(&bytes);
+        let graph_path = repo.change_store().provenance_path(&graph_hash);
+        fs::create_dir_all(graph_path.parent().expect("graph parent")).expect("create graph dir");
+        fs::write(&graph_path, bytes).expect("write unregistered graph fixture");
 
         // Confirm the premise: REV_DEPS finds nothing, the scan finds it.
         assert!(
             repo.find_provenance_for_change(&phantom_change)
                 .expect("rev_deps lookup")
                 .is_empty(),
-            "REV_DEPS must be empty for a non-internal change"
+            "REV_DEPS must be empty for an unregistered graph"
         );
         assert_eq!(
             repo.find_provenance_for_change_scan(&phantom_change)
