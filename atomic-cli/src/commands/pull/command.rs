@@ -397,8 +397,9 @@ impl Pull {
 
     /// Build the HTTP remote configuration.
     ///
-    /// `identity_hint` — explicit identity name to use (from `--identity` or
-    /// `RemoteEntry.identity`). When `None`, falls back to URL-based inference.
+    /// `identity_hint` — an explicit identity name to use (from `--identity`).
+    /// When `None`, identity is inferred from the remote URL and the global
+    /// config's server bindings.
     async fn build_remote_config(
         &self,
         remote_url: &str,
@@ -719,56 +720,18 @@ impl Pull {
             ),
         );
 
-        // Sync provenance graphs using the same model as .change files:
-        // the server advertises a flat inventory, we pull the hashes we do
-        // not have. Saving each graph registers its dependencies (best
-        // effort), indexes the session ledger, and publishes the session
-        // manifest locally — the receiving repository rebuilds the full
-        // Atomic session index without any relationship queries against
-        // the server.
-        let mut provenance_count = 0usize;
-        for (prov_hash_str, data) in pack_objects_by_key(&pull_pack, ObjectFamily::Provenance) {
-            let Some(prov_hash) = Hash::from_base32(prov_hash_str.as_bytes()) else {
-                continue;
-            };
-            if repo.has_provenance_graph(&prov_hash) {
-                continue;
-            }
-            match atomic_core::change::ProvenanceGraph::deserialize(&data) {
-                Ok((graph, computed)) => {
-                    if computed != prov_hash {
-                        print_warning(&format!(
-                            "Provenance {} failed hash verification — skipped",
-                            &prov_hash_str[..12.min(prov_hash_str.len())]
-                        ));
-                        continue;
-                    }
-                    match repo.save_provenance_graph(&graph) {
-                        Ok(_) => provenance_count += 1,
-                        Err(e) => print_warning(&format!(
-                            "Failed to register provenance {}: {}",
-                            &prov_hash_str[..12.min(prov_hash_str.len())],
-                            e
-                        )),
-                    }
-                }
-                Err(e) => print_warning(&format!(
-                    "Corrupt provenance {}: {}",
-                    &prov_hash_str[..12.min(prov_hash_str.len())],
-                    e
-                )),
-            }
-        }
-        if provenance_count > 0 {
-            println!(
-                "  {} {}",
-                success("✓"),
-                format_count(provenance_count, "provenance graph")
-            );
-        }
-
         // Apply changes (unless download-only)
         if self.download_only {
+            // Sidecars (provenance, attestations) still land in the store —
+            // the pack carried them and dropping them would require a later
+            // pull to recover. DEPS wiring to the covered changes happens
+            // when those changes are applied (`atomic insert`).
+            {
+                let sidecar_stats = crate::commands::sidecars::import_sidecars(&repo, &pull_pack);
+                if !sidecar_stats.is_empty() {
+                    crate::commands::sidecars::report_sidecars(sidecar_stats);
+                }
+            }
             print_blank();
             print_success(&format!(
                 "Downloaded {} (not inserted - use 'atomic insert' to insert)",
@@ -808,6 +771,24 @@ impl Pull {
             finish_error(&spinner, "View metadata reconciliation failed");
             for err in &apply_errors {
                 print_warning(err);
+            }
+        }
+
+        // Sync provenance graphs and attestations — the same sidecar model
+        // as `.change` files: the server sends what the pack carries, we
+        // save what we do not have. This runs AFTER view reconciliation so
+        // the covered changes are registered in the graph: the DEPS edges
+        // that make `atomic change <hash>` find its provenance (via
+        // REV_DEPS) are only written for already-registered changes.
+        // Saving each provenance graph also indexes the session ledger and
+        // publishes the session manifest locally — the receiving repository
+        // rebuilds the full Atomic session index without any relationship
+        // queries against the server. Shared with clone so both ingest
+        // identically.
+        {
+            let sidecar_stats = crate::commands::sidecars::import_sidecars(&repo, &pull_pack);
+            if !sidecar_stats.is_empty() {
+                crate::commands::sidecars::report_sidecars(sidecar_stats);
             }
         }
 

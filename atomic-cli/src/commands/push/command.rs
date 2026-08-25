@@ -375,8 +375,9 @@ impl Push {
 
     /// Build the HTTP remote configuration.
     ///
-    /// `identity_hint` — explicit identity name to use (from `--identity` or
-    /// `RemoteEntry.identity`). When `None`, falls back to URL-based inference.
+    /// `identity_hint` — an explicit identity name to use (from `--identity`).
+    /// When `None`, identity is inferred from the remote URL and the global
+    /// config's server bindings.
     async fn build_remote_config(
         &self,
         remote_url: &str,

@@ -448,6 +448,19 @@ impl Clone {
             .collect()
     }
 
+    /// Ingest a pack's provenance graphs and attestations, reporting counts.
+    ///
+    /// Shared with `atomic pull` (see [`crate::commands::sidecars`]) so both
+    /// paths land sidecars identically. Failures warn and continue — a bad
+    /// sidecar never blocks a clone whose changes are all valid.
+    fn import_and_report_sidecars(&self, repo: &Repository, pack: &SyncPack) {
+        let stats = crate::commands::sidecars::import_sidecars(repo, pack);
+        if !stats.is_empty() {
+            print_blank();
+            crate::commands::sidecars::report_sidecars(stats);
+        }
+    }
+
     /// Fetch the requested view's manifest and walk its parent chain up to
     /// the root, returning the manifests in root→leaf apply order.
     ///
@@ -991,6 +1004,12 @@ impl Clone {
             repo.align_to_view(&self.view)
                 .map_err(CliError::Repository)?;
 
+            // Sidecars (provenance, attestations) still land in the store —
+            // the pack carried them and dropping them would require a later
+            // pull to recover. DEPS wiring to the covered changes happens
+            // when those changes are applied (`atomic insert`).
+            self.import_and_report_sidecars(&repo, &pack);
+
             // Configure remote as "origin" even for download-only mode
             let spinner = create_spinner("Configuring remote...");
             if let Err(e) = repo.add_remote_default("origin", &self.url) {
@@ -1131,6 +1150,15 @@ impl Clone {
                 self.hint_other_views(&remote, &applied_views).await;
             }
         }
+
+        // Ingest the pack's sidecars (provenance graphs, attestations) — the
+        // same logic pull uses. This must run AFTER the view manifests are
+        // applied: the DEPS edges that make `atomic change <hash>` find its
+        // provenance (via REV_DEPS) are only written for changes already
+        // registered in the graph, and registration happens at apply time.
+        // Without this, a fresh clone shows "No provenance graph found"
+        // until a later repair pull re-imports the sidecars.
+        self.import_and_report_sidecars(&repo, &pack);
 
         // Validate convergence with the order-invariant SetId across every
         // applied view (chain + any `--all-views` extras), against the
