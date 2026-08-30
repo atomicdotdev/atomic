@@ -32,6 +32,7 @@
 use std::time::Duration;
 
 use clap::Parser;
+use serde_json::{json, Value};
 
 use atomic_remote::{HttpRemote, HttpRemoteConfig, RemoteViewInfo};
 use atomic_repository::Repository;
@@ -60,6 +61,10 @@ pub struct List {
     /// Show only view names (no metadata).
     #[arg(long, short = 's')]
     pub short: bool,
+
+    /// Emit structured view metadata, including the full Merkle state.
+    #[arg(long)]
+    pub json: bool,
 
     /// Show additional details (state hash, change count).
     ///
@@ -94,6 +99,7 @@ impl List {
     pub fn new() -> Self {
         Self {
             short: false,
+            json: false,
             verbose: false,
             remote: None,
             identity: None,
@@ -109,6 +115,26 @@ impl List {
 }
 
 impl List {
+    fn local_json_views(repo: &Repository, views: &[String], current: &str) -> CliResult<Value> {
+        let mut entries = Vec::with_capacity(views.len());
+        for name in views {
+            let info = repo.get_view_info(name).map_err(CliError::Repository)?;
+            let is_current = info.name == current;
+            entries.push(json!({
+                "name": info.name,
+                "current": is_current,
+                "state": info.state_base32(),
+                "stateShort": info.state_short(),
+                "changeCount": info.change_count,
+                "ownChangeCount": info.own_change_count,
+                "inheritedChangeCount": info.inherited_change_count,
+                "scope": info.kind_label(),
+                "parent": info.parent_name,
+            }));
+        }
+        Ok(Value::Array(entries))
+    }
+
     /// List views on a remote repository.
     ///
     /// `remote_arg` is the raw `--remote` value: empty means "use the default
@@ -138,12 +164,6 @@ impl List {
             (remote_arg.to_string(), entry.url)
         };
 
-        println!(
-            "Views on {} ({})",
-            style_view(&remote_name),
-            hint(&remote_url)
-        );
-
         let rt = tokio::runtime::Runtime::new().map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {}", e))
         })?;
@@ -163,6 +183,31 @@ impl List {
                 .await
                 .map_err(|e| CliError::remote_error(e.to_string(), Some(remote_url.clone())))
         })?;
+
+        if self.json {
+            let output: Vec<_> = views
+                .iter()
+                .map(|view| {
+                    json!({
+                        "name": view.name,
+                        "current": false,
+                        "state": view.state,
+                        "stateShort": view.state.as_deref().map(|state| &state[..12.min(state.len())]),
+                        "changeCount": view.change_count,
+                        "scope": if view.is_draft() { "draft" } else { "shared" },
+                        "parent": view.parent,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+            return Ok(());
+        }
+
+        println!(
+            "Views on {} ({})",
+            style_view(&remote_name),
+            hint(&remote_url)
+        );
 
         self.print_remote_views(&views);
         Ok(())
@@ -251,6 +296,12 @@ impl Command for List {
         // Sort views alphabetically, but keep current view considerations
         let mut sorted_views = views;
         sorted_views.sort();
+
+        if self.json {
+            let output = Self::local_json_views(&repo, &sorted_views, &current)?;
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+            return Ok(());
+        }
 
         // Calculate padding for alignment
         let max_name_len = sorted_views.iter().map(|s| s.len()).max().unwrap_or(0);
@@ -347,6 +398,7 @@ mod tests {
     fn test_default() {
         let cmd = List::default();
         assert!(!cmd.short);
+        assert!(!cmd.json);
         assert!(!cmd.verbose);
     }
 
@@ -354,12 +406,29 @@ mod tests {
     fn test_new() {
         let cmd = List::new();
         assert!(!cmd.short);
+        assert!(!cmd.json);
     }
 
     #[test]
     fn test_with_verbose() {
         let cmd = List::new().with_verbose(true);
         assert!(cmd.verbose);
+    }
+
+    #[test]
+    fn test_local_json_contains_full_state() {
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let views = repo.list_views().unwrap();
+        let output = List::local_json_views(&repo, &views, &repo.current_view()).unwrap();
+        let entry = output.as_array().unwrap().first().unwrap();
+
+        assert_eq!(entry["name"], "dev");
+        assert_eq!(entry["current"], true);
+        assert_eq!(entry["state"].as_str().unwrap().len(), 52);
+        assert_eq!(entry["stateShort"].as_str().unwrap().len(), 12);
     }
 
     // -------------------------------------------------------------------------
