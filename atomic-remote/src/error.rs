@@ -133,9 +133,9 @@ pub enum RemoteError {
 
     /// The client and server are running incompatible versions.
     ///
-    /// Surfaces when the binary sync-pack wire format cannot be decoded,
-    /// which almost always means the server is on a different release than
-    /// the client. Downgrade or upgrade one side to match the other.
+    /// Surfaces when a response indicates that the server predates the current
+    /// binary sync protocol and its body cannot be decoded by this client.
+    /// Downgrade or upgrade one side to match the other.
     #[error("{}", version_mismatch_message(client_version, server_version.as_deref()))]
     VersionMismatch {
         /// The local CLI version.
