@@ -30,6 +30,18 @@ pub fn needs_upgrade(current: &str, required: &str) -> bool {
     }
 }
 
+/// Read the raw `X-Atomic-Min-Version` header value, if present and valid UTF-8.
+///
+/// Returns `None` when the header is absent or its value cannot be decoded.
+/// Callers can use this to include the server's version in error messages.
+pub fn read_min_version_header(headers: &HeaderMap) -> Option<String> {
+    let header_name = reqwest::header::HeaderName::from_static("x-atomic-min-version");
+    headers
+        .get(&header_name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
 /// Check the `X-Atomic-Min-Version` response header and warn if the
 /// current CLI version is older than the server's minimum requirement.
 ///
