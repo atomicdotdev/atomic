@@ -100,6 +100,13 @@ pub struct Log {
     /// re-implemented with a stable fork-point snapshot.
     #[arg(long = "all", hide = true)]
     pub all: bool,
+
+    /// Show compact output (shorthand for --format short).
+    ///
+    /// Displays one line per change: abbreviated hash followed by the
+    /// first line of the commit message. Equivalent to `-f short`.
+    #[arg(long = "short", conflicts_with = "format")]
+    pub short: bool,
 }
 
 impl Log {
@@ -126,6 +133,16 @@ impl Log {
             from: None,
             full_hash: false,
             all: false,
+            short: false,
+        }
+    }
+
+    /// Resolve the effective output format, accounting for `--short`.
+    pub(crate) fn effective_format(&self) -> LogFormat {
+        if self.short {
+            LogFormat::Short
+        } else {
+            self.format
         }
     }
 
@@ -411,7 +428,7 @@ impl Log {
     fn print_entries(&self, entries: &[HistoryEntry]) {
         let hash_length = self.get_hash_length();
 
-        let output = match self.format {
+        let output = match self.effective_format() {
             LogFormat::Default => self.format_default(entries, hash_length),
             LogFormat::Short => self.format_short(entries, hash_length),
             LogFormat::Oneline => self.format_oneline(entries, hash_length),
@@ -427,7 +444,7 @@ impl Log {
     ///
     /// * `view_name` - Name of the view being queried
     fn print_empty_history(&self, view_name: &str) {
-        if self.format == LogFormat::Json {
+        if self.effective_format() == LogFormat::Json {
             println!("[]");
         } else {
             println!("No changes recorded on view '{}'.\n", style_view(view_name));
@@ -437,7 +454,7 @@ impl Log {
 
     /// Print a fork-point separator indicating where the draft diverged.
     fn print_fork_point(&self, parent_name: &str, inherited_count: u64) {
-        if self.format == LogFormat::Json {
+        if self.effective_format() == LogFormat::Json {
             // JSON output doesn't get decorative separators
             return;
         }
