@@ -102,6 +102,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use serde::Serialize;
 
 use atomic_core::types::Base32;
 use atomic_repository::status::{FileStatus, RepositoryStatus, StatusOptions};
@@ -169,6 +170,10 @@ pub struct Status {
     #[arg(short = 's', long = "short")]
     pub short: bool,
 
+    /// Emit a versioned JSON document for IDEs and other integrations.
+    #[arg(long, conflicts_with_all = ["short", "debug_ignore"])]
+    pub json: bool,
+
     /// Don't show untracked files.
     ///
     /// By default, untracked files are shown in the status output.
@@ -203,6 +208,7 @@ impl Status {
         Self {
             path: None,
             short: false,
+            json: false,
             no_untracked: false,
             debug_ignore: false,
             reindex: false,
@@ -218,6 +224,12 @@ impl Status {
     /// Builder: set short output mode.
     pub fn with_short(mut self, short: bool) -> Self {
         self.short = short;
+        self
+    }
+
+    /// Builder: set JSON output mode.
+    pub fn with_json(mut self, json: bool) -> Self {
+        self.json = json;
         self
     }
 
@@ -417,6 +429,19 @@ impl Status {
 
         Ok(())
     }
+
+    /// Print a stable, versioned status document for editor integrations.
+    fn print_json_format(
+        &self,
+        status: &RepositoryStatus,
+        repo_root: &std::path::Path,
+    ) -> CliResult<()> {
+        let output = JsonStatus::new(status, repo_root);
+        let json = serde_json::to_string_pretty(&output)
+            .map_err(|error| CliError::Internal(error.into()))?;
+        println!("{}", json);
+        Ok(())
+    }
 }
 
 impl Default for Status {
@@ -501,13 +526,18 @@ impl Command for Status {
             let start = std::time::Instant::now();
             match rw_repo.reindex_working_copy() {
                 Ok(count) => {
-                    print_info(&format!(
-                        "Reindexed {} files in {:.1}s",
-                        count,
-                        start.elapsed().as_secs_f64()
-                    ));
+                    if !self.json {
+                        print_info(&format!(
+                            "Reindexed {} files in {:.1}s",
+                            count,
+                            start.elapsed().as_secs_f64()
+                        ));
+                    }
                 }
                 Err(e) => {
+                    if self.json {
+                        return Err(CliError::Internal(e.into()));
+                    }
                     print_warning(&format!("Reindex failed: {}", e));
                 }
             }
@@ -534,11 +564,85 @@ impl Command for Status {
             .map_err(|e| CliError::Internal(e.into()))?;
 
         // Print in appropriate format
-        if self.short {
+        if self.json {
+            self.print_json_format(&status, &repo_root)
+        } else if self.short {
             self.print_short_format(&status)
         } else {
             self.print_long_format(&status)
         }
+    }
+}
+
+// JSON Output Types
+
+/// Version of the `atomic status --json` document.
+const STATUS_JSON_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonStatus {
+    schema_version: u32,
+    repository_root: String,
+    view: String,
+    state: Option<String>,
+    clean: bool,
+    needs_reindex: bool,
+    stale_index_count: usize,
+    entries: Vec<JsonStatusEntry>,
+}
+
+impl JsonStatus {
+    fn new(status: &RepositoryStatus, repo_root: &std::path::Path) -> Self {
+        let mut entries: Vec<_> = status.entries().iter().map(JsonStatusEntry::from).collect();
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+
+        Self {
+            schema_version: STATUS_JSON_SCHEMA_VERSION,
+            repository_root: repo_root.to_string_lossy().into_owned(),
+            view: status.view().to_string(),
+            state: status.state().map(|state| state.to_base32()),
+            clean: entries.is_empty(),
+            needs_reindex: status.needs_reindex(),
+            stale_index_count: status.stale_index_count(),
+            entries,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonStatusEntry {
+    path: String,
+    status: &'static str,
+    code: String,
+    details: Option<String>,
+}
+
+impl From<&atomic_repository::status::FileStatusEntry> for JsonStatusEntry {
+    fn from(entry: &atomic_repository::status::FileStatusEntry) -> Self {
+        Self {
+            path: json_path(entry.path()),
+            status: json_status_name(entry.status()),
+            code: entry.status().short_code().to_string(),
+            details: entry.details().map(str::to_string),
+        }
+    }
+}
+
+fn json_path(path: &std::path::Path) -> String {
+    path.to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+fn json_status_name(status: FileStatus) -> &'static str {
+    match status {
+        FileStatus::Clean => "clean",
+        FileStatus::Modified => "modified",
+        FileStatus::Deleted => "deleted",
+        FileStatus::Untracked => "untracked",
+        FileStatus::Added => "added",
+        FileStatus::Conflicted => "conflicted",
+        FileStatus::TypeChanged => "type_changed",
+        FileStatus::PermissionsChanged => "permissions_changed",
     }
 }
 
@@ -920,6 +1024,55 @@ mod tests {
         assert_eq!(status.added_count(), 1);
         assert_eq!(status.untracked_count(), 1);
         assert!(!status.is_clean());
+    }
+
+    #[test]
+    fn test_json_status_is_versioned_and_sorted() {
+        let mut status = RepositoryStatus::new("feature".to_string(), Some(Merkle::initial()));
+        status.add_entry(FileStatusEntry::new(
+            PathBuf::from("zeta.rs"),
+            FileStatus::Modified,
+        ));
+        status.add_entry(FileStatusEntry::new(
+            PathBuf::from("alpha.rs"),
+            FileStatus::Untracked,
+        ));
+
+        let output = JsonStatus::new(&status, std::path::Path::new("/workspace/project"));
+
+        assert_eq!(output.schema_version, 1);
+        assert_eq!(output.repository_root, "/workspace/project");
+        assert_eq!(output.view, "feature");
+        assert!(output.state.is_some());
+        assert!(!output.clean);
+        assert_eq!(output.entries[0].path, "alpha.rs");
+        assert_eq!(output.entries[0].status, "untracked");
+        assert_eq!(output.entries[1].path, "zeta.rs");
+        assert_eq!(output.entries[1].code, "M");
+    }
+
+    #[test]
+    fn test_json_status_escapes_paths() {
+        let mut status = RepositoryStatus::new("dev".to_string(), None);
+        status.add_entry(FileStatusEntry::new(
+            PathBuf::from("line\nbreak.txt"),
+            FileStatus::Untracked,
+        ));
+
+        let output = JsonStatus::new(&status, std::path::Path::new("/workspace"));
+        let json = serde_json::to_string(&output).unwrap();
+
+        assert!(json.contains("line\\nbreak.txt"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["entries"][0]["path"],
+            "line\nbreak.txt"
+        );
+    }
+
+    #[test]
+    fn test_json_and_short_are_mutually_exclusive() {
+        assert!(Status::try_parse_from(["status", "--json"]).unwrap().json);
+        assert!(Status::try_parse_from(["status", "--short", "--json"]).is_err());
     }
 
     // Print Format Tests (Output verification)

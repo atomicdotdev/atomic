@@ -32,6 +32,7 @@
 use std::time::Duration;
 
 use clap::Parser;
+use serde::Serialize;
 
 use atomic_remote::{HttpRemote, HttpRemoteConfig, RemoteViewInfo};
 use atomic_repository::Repository;
@@ -60,6 +61,10 @@ pub struct List {
     /// Show only view names (no metadata).
     #[arg(long, short = 's')]
     pub short: bool,
+
+    /// Emit a versioned JSON document for IDEs and other integrations.
+    #[arg(long, conflicts_with = "short")]
+    pub json: bool,
 
     /// Show additional details (state hash, change count).
     ///
@@ -94,6 +99,7 @@ impl List {
     pub fn new() -> Self {
         Self {
             short: false,
+            json: false,
             verbose: false,
             remote: None,
             identity: None,
@@ -104,6 +110,12 @@ impl List {
     /// Builder: set the verbose flag.
     pub fn with_verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
+        self
+    }
+
+    /// Builder: set JSON output mode.
+    pub fn with_json(mut self, json: bool) -> Self {
+        self.json = json;
         self
     }
 }
@@ -128,7 +140,7 @@ impl List {
                 .map(|(name, entry)| (name, entry.url))
                 .map_err(CliError::Repository)?
         } else if remote_arg.contains("://") {
-            (remote_arg.to_string(), remote_arg.to_string())
+            (sanitized_remote_label(remote_arg), remote_arg.to_string())
         } else {
             let entry = repo
                 .get_remote(remote_arg)
@@ -138,11 +150,13 @@ impl List {
             (remote_arg.to_string(), entry.url)
         };
 
-        println!(
-            "Views on {} ({})",
-            style_view(&remote_name),
-            hint(&remote_url)
-        );
+        if !self.json {
+            println!(
+                "Views on {} ({})",
+                style_view(&remote_name),
+                hint(&remote_url)
+            );
+        }
 
         let rt = tokio::runtime::Runtime::new().map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {}", e))
@@ -164,15 +178,30 @@ impl List {
                 .map_err(|e| CliError::remote_error(e.to_string(), Some(remote_url.clone())))
         })?;
 
-        self.print_remote_views(&views);
-        Ok(())
+        self.print_remote_views(&views, &remote_name)
     }
 
     /// Render the remote view listing.
-    fn print_remote_views(&self, views: &[RemoteViewInfo]) {
+    fn print_remote_views(&self, views: &[RemoteViewInfo], remote_name: &str) -> CliResult<()> {
+        if self.json {
+            let mut json_views: Vec<_> = views
+                .iter()
+                .map(JsonView::from_remote)
+                .collect::<CliResult<_>>()?;
+            json_views.sort_by(|left, right| left.name.cmp(&right.name));
+            return print_json(&JsonViewList {
+                schema_version: VIEW_LIST_JSON_SCHEMA_VERSION,
+                source: "remote",
+                repository_root: None,
+                remote: Some(remote_name.to_string()),
+                current_view: None,
+                views: json_views,
+            });
+        }
+
         if views.is_empty() {
             println!("{}", hint("No views found on the remote."));
-            return;
+            return Ok(());
         }
 
         let mut sorted: Vec<&RemoteViewInfo> = views.iter().collect();
@@ -182,7 +211,7 @@ impl List {
             for view in sorted {
                 println!("  {}", style_view(&view.name));
             }
-            return;
+            return Ok(());
         }
 
         let max_name_len = sorted.iter().map(|v| v.name.len()).max().unwrap_or(0);
@@ -217,6 +246,8 @@ impl List {
                 width = max_name_len
             );
         }
+
+        Ok(())
     }
 }
 
@@ -239,6 +270,23 @@ impl Command for List {
         // Get list of views
         let views = repo.list_views().map_err(CliError::Repository)?;
         let current = repo.current_view();
+
+        if self.json {
+            let mut json_views = Vec::with_capacity(views.len());
+            for view in &views {
+                let info = repo.get_view_info(view).map_err(CliError::Repository)?;
+                json_views.push(JsonView::from_local(&info, view == current));
+            }
+            json_views.sort_by(|left, right| left.name.cmp(&right.name));
+            return print_json(&JsonViewList {
+                schema_version: VIEW_LIST_JSON_SCHEMA_VERSION,
+                source: "local",
+                repository_root: Some(repo_root.to_string_lossy().into_owned()),
+                remote: None,
+                current_view: Some(current.to_string()),
+                views: json_views,
+            });
+        }
 
         if views.is_empty() {
             println!(
@@ -310,6 +358,96 @@ impl Command for List {
     }
 }
 
+// JSON Output Types
+
+/// Version of the `atomic view list --json` document.
+const VIEW_LIST_JSON_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonViewList {
+    schema_version: u32,
+    source: &'static str,
+    repository_root: Option<String>,
+    remote: Option<String>,
+    current_view: Option<String>,
+    views: Vec<JsonView>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonView {
+    name: String,
+    current: bool,
+    scope: String,
+    parent: Option<String>,
+    change_count: u64,
+    own_change_count: Option<u64>,
+    inherited_change_count: Option<u64>,
+    state: Option<String>,
+    set_id: Option<String>,
+}
+
+impl JsonView {
+    fn from_local(info: &atomic_repository::ViewInfo, current: bool) -> Self {
+        Self {
+            name: info.name.clone(),
+            current,
+            scope: info.kind_label().to_string(),
+            parent: info.parent_name.clone(),
+            change_count: info
+                .own_change_count
+                .saturating_add(info.inherited_change_count),
+            own_change_count: Some(info.own_change_count),
+            inherited_change_count: Some(info.inherited_change_count),
+            state: Some(info.state_base32()),
+            set_id: None,
+        }
+    }
+
+    fn from_remote(info: &RemoteViewInfo) -> CliResult<Self> {
+        let scope = if info.scope.eq_ignore_ascii_case("shared") {
+            "shared"
+        } else if info.scope.eq_ignore_ascii_case("draft") {
+            "draft"
+        } else {
+            return Err(CliError::Internal(anyhow::anyhow!(
+                "Remote view '{}' has unsupported scope '{}'",
+                info.name,
+                info.scope
+            )));
+        };
+
+        Ok(Self {
+            name: info.name.clone(),
+            current: false,
+            scope: scope.to_string(),
+            parent: info.parent.clone(),
+            change_count: info.change_count,
+            own_change_count: None,
+            inherited_change_count: None,
+            state: info.state.clone(),
+            set_id: info.set_id.clone(),
+        })
+    }
+}
+
+fn sanitized_remote_label(remote: &str) -> String {
+    let Ok(mut url) = url::Url::parse(remote) else {
+        return remote.to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
+fn print_json(output: &JsonViewList) -> CliResult<()> {
+    let json =
+        serde_json::to_string_pretty(output).map_err(|error| CliError::Internal(error.into()))?;
+    println!("{}", json);
+    Ok(())
+}
+
 // Tests
 
 #[cfg(test)]
@@ -347,6 +485,7 @@ mod tests {
     fn test_default() {
         let cmd = List::default();
         assert!(!cmd.short);
+        assert!(!cmd.json);
         assert!(!cmd.verbose);
     }
 
@@ -360,6 +499,80 @@ mod tests {
     fn test_with_verbose() {
         let cmd = List::new().with_verbose(true);
         assert!(cmd.verbose);
+    }
+
+    #[test]
+    fn test_json_and_short_are_mutually_exclusive() {
+        assert!(List::try_parse_from(["list", "--json"]).unwrap().json);
+        assert!(List::try_parse_from(["list", "--short", "--json"]).is_err());
+    }
+
+    #[test]
+    fn test_local_json_view_contains_editor_metadata() {
+        let info = atomic_repository::ViewInfo {
+            name: "feature".to_string(),
+            state: atomic_core::types::Merkle::initial(),
+            change_count: 3,
+            own_change_count: 1,
+            inherited_change_count: 2,
+            scope: atomic_core::pristine::ViewScope::Draft,
+            parent_name: Some("dev".to_string()),
+        };
+
+        let view = JsonView::from_local(&info, true);
+
+        assert_eq!(view.name, "feature");
+        assert!(view.current);
+        assert_eq!(view.scope, "draft");
+        assert_eq!(view.parent.as_deref(), Some("dev"));
+        assert_eq!(view.change_count, 3);
+        assert_eq!(view.own_change_count, Some(1));
+        assert_eq!(view.inherited_change_count, Some(2));
+        assert!(view.state.is_some());
+    }
+
+    #[test]
+    fn test_remote_json_view_preserves_set_id() {
+        let info = RemoteViewInfo {
+            name: "dev".to_string(),
+            scope: "shared".to_string(),
+            parent: None,
+            change_count: 4,
+            state: Some("STATE".to_string()),
+            set_id: Some("SET".to_string()),
+        };
+
+        let view = JsonView::from_remote(&info).unwrap();
+
+        assert_eq!(view.name, "dev");
+        assert!(!view.current);
+        assert_eq!(view.set_id.as_deref(), Some("SET"));
+        assert_eq!(view.own_change_count, None);
+    }
+
+    #[test]
+    fn test_remote_json_view_normalizes_and_validates_scope() {
+        let mut info = RemoteViewInfo {
+            name: "dev".to_string(),
+            scope: "DRAFT".to_string(),
+            parent: None,
+            change_count: 0,
+            state: None,
+            set_id: None,
+        };
+
+        assert_eq!(JsonView::from_remote(&info).unwrap().scope, "draft");
+        info.scope = "unknown".to_string();
+        assert!(JsonView::from_remote(&info).is_err());
+    }
+
+    #[test]
+    fn test_direct_remote_label_redacts_credentials_and_query() {
+        assert_eq!(
+            sanitized_remote_label("https://user:secret@example.com/storage?token=value#fragment"),
+            "https://example.com/storage"
+        );
+        assert_eq!(sanitized_remote_label("origin"), "origin");
     }
 
     // -------------------------------------------------------------------------
