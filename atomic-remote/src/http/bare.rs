@@ -43,9 +43,21 @@ impl HttpRemote {
                     .text()
                     .await
                     .map_err(|e| RemoteError::connection_failed(&url, e))?;
-                Ok(text.lines().filter_map(RemoteViewInfo::parse).collect())
+                text.lines()
+                    .enumerate()
+                    .filter(|(_, line)| !line.trim().is_empty())
+                    .map(|(index, line)| {
+                        RemoteViewInfo::parse_strict(line).map_err(|reason| {
+                            RemoteError::protocol(format!(
+                                "Invalid view inventory row {}: {}",
+                                index + 1,
+                                reason
+                            ))
+                        })
+                    })
+                    .collect()
             }
-            StatusCode::NOT_FOUND => Ok(Vec::new()),
+            StatusCode::NOT_FOUND => Err(RemoteError::repo_not_found(&url)),
             s => Err(RemoteError::http(
                 s.as_u16(),
                 response.text().await.unwrap_or_default(),
@@ -78,5 +90,12 @@ mod tests {
             r.resource_url("refs/views"),
             "https://h/workspaces/w/projects/p/refs/views"
         );
+    }
+
+    #[test]
+    fn strict_view_inventory_rejects_malformed_rows() {
+        assert!(RemoteViewInfo::parse_strict("dev\tshared\t-\tnot-a-count\t-").is_err());
+        assert!(RemoteViewInfo::parse_strict("dev\tunknown\t-\t0\t-").is_err());
+        assert!(RemoteViewInfo::parse_strict(r#"{"workspace":"w"}"#).is_err());
     }
 }
