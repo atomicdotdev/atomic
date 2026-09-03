@@ -35,7 +35,7 @@ use atomic_agent::hooks::{codex::CodexHook, AgentRegistry};
 use atomic_agent::integrations::Receipt;
 
 use crate::commands::{find_repository_root, Command};
-use crate::error::CliResult;
+use crate::error::{CliError, CliResult};
 use crate::output::{print_error, print_success, print_warning};
 
 // Enable Command
@@ -252,6 +252,10 @@ impl Command for Enable {
 
         // Install hooks for each selected agent
         let mut total_installed = 0;
+        // Agents whose integration package could not be installed. The run
+        // continues on built-in hooks, but that is a *partial* result and the
+        // summary below has to say so — see the note where this is reported.
+        let mut degraded: Vec<(String, String)> = Vec::new();
 
         for agent_name in &agents_to_install {
             let agent = match registry.get(agent_name) {
@@ -336,6 +340,7 @@ impl Command for Enable {
                             agent.display_name(),
                             e
                         ));
+                        degraded.push((agent.display_name().to_string(), e.to_string()));
                     }
                 }
             }
@@ -398,6 +403,28 @@ impl Command for Enable {
             println!();
             println!("Use 'atomic agent status' to check integration status.");
             println!("Use 'atomic log' to view recorded turns.");
+        }
+
+        // A package that would not install is a partial result, and until now it
+        // read as a whole one: the failure was a warning part-way up the output,
+        // the success blurb printed after it regardless, and the exit code was
+        // zero. Anything scripting this — or anyone scrolling to the end — saw
+        // success. What is actually missing is the agent's Atomic skills and its
+        // system prompt; hook recording still works, which is exactly why the
+        // gap is easy to miss and can persist for weeks.
+        if !degraded.is_empty() {
+            println!();
+            print_warning("Partial install — the integration package did not land:");
+            for (name, err) in &degraded {
+                println!("    {name}: {err}");
+            }
+            println!();
+            println!("  Turns are still recorded by the built-in hooks, but these agents");
+            println!("  are missing their Atomic skills and system prompt.");
+            println!("  Retry with 'atomic agent enable --force' once the package is reachable,");
+            println!("  or install from a local checkout with '--from <path>'.");
+
+            return Err(partial_install_error(&degraded));
         }
 
         Ok(())
@@ -728,8 +755,65 @@ impl Enable {
 
 // Tests
 
+/// The error a partial install ends with.
+///
+/// Split out so the wording and the non-zero exit can be tested without a
+/// repository, a network, or a package to break.
+fn partial_install_error(degraded: &[(String, String)]) -> CliError {
+    let names: Vec<&str> = degraded.iter().map(|(n, _)| n.as_str()).collect();
+    CliError::remote_error(
+        format!(
+            "integration package install failed for {} — built-in hooks were installed, \
+             but the agent's skills and prompt are missing",
+            names.join(", ")
+        ),
+        None,
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use super::partial_install_error;
+
+    /// A package that would not install used to read as a whole success: the
+    /// failure was a warning part-way up the output, the success blurb printed
+    /// after it anyway, and the exit code was zero.
+    #[test]
+    fn a_failed_package_is_an_error_not_a_warning() {
+        let err = partial_install_error(&[(
+            "Codex".to_string(),
+            "cannot read atomic-integration.toml".to_string(),
+        )]);
+        let msg = err.to_string();
+
+        assert!(msg.contains("Codex"), "names the agent: {msg}");
+        // The distinction that matters: recording works, the rest does not.
+        assert!(msg.contains("hooks were installed"), "{msg}");
+        assert!(msg.contains("skills"), "{msg}");
+    }
+
+    #[test]
+    fn every_failed_agent_is_named() {
+        let err = partial_install_error(&[
+            ("Codex".to_string(), "boom".to_string()),
+            ("OpenCode".to_string(), "boom".to_string()),
+        ]);
+        let msg = err.to_string();
+        assert!(msg.contains("Codex") && msg.contains("OpenCode"), "{msg}");
+    }
+
+    /// A remote/sync failure, not an internal one — `CliError::Internal` tells
+    /// the user they have found a bug and should file an issue, which is the
+    /// wrong advice for an unreachable package.
+    #[test]
+    fn a_partial_install_is_not_reported_as_a_bug() {
+        let err = partial_install_error(&[("Codex".to_string(), "boom".to_string())]);
+        assert!(
+            matches!(err, CliError::RemoteError { .. }),
+            "expected RemoteError, got {err:?}"
+        );
+    }
+
     use super::*;
 
     #[test]
