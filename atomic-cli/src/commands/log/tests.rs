@@ -1157,4 +1157,45 @@ mod tests {
         // Author name should be truncated (max 20 chars)
         assert!(!output.contains("This Is A Very Long Author Name That Should Be Truncated"));
     }
+
+    // --short flag tests
+
+    #[test]
+    fn test_short_flag_effective_format_returns_short() {
+        let log = Log {
+            short: true,
+            format: LogFormat::Default,
+            ..Log::new()
+        };
+        assert_eq!(log.effective_format(), LogFormat::Short);
+    }
+
+    #[test]
+    fn test_short_flag_false_respects_format_field() {
+        let log = Log {
+            short: false,
+            format: LogFormat::Oneline,
+            ..Log::new()
+        };
+        assert_eq!(log.effective_format(), LogFormat::Oneline);
+    }
+
+    #[test]
+    fn test_short_flag_produces_compact_output() {
+        let log = Log {
+            short: true,
+            ..Log::new()
+        };
+        let entry = create_test_entry_with_header();
+        let output = log.format_short(&[entry], 8);
+        // Should be one line per entry: hash then first line of message
+        assert!(output.contains("Test change message"));
+        assert_eq!(output.lines().count(), 1);
+    }
+
+    #[test]
+    fn test_new_default_has_short_false() {
+        let log = Log::new();
+        assert!(!log.short);
+    }
 }

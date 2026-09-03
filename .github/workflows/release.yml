@@ -68,19 +68,35 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64
+          # Linux x86_64 (glibc — requires glibc 2.28+)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: atomic-x86_64-unknown-linux-gnu.tar.gz
             build_mode: zig
             verify_glibc: true
 
-          # Linux aarch64 (cross-compiled)
+          # Linux x86_64 (musl — statically linked, works on any Linux)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: atomic-x86_64-unknown-linux-musl.tar.gz
+            build_mode: zig
+            musl: true
+            verify_glibc: false
+
+          # Linux aarch64 (glibc, cross-compiled)
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             artifact: atomic-aarch64-unknown-linux-gnu.tar.gz
             build_mode: zig
             verify_glibc: true
+
+          # Linux aarch64 (musl — statically linked, works on any Linux)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact: atomic-aarch64-unknown-linux-musl.tar.gz
+            build_mode: zig
+            musl: true
+            verify_glibc: false
 
           # macOS x86_64 (Intel)
           - os: macos-latest
@@ -119,6 +135,12 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
+      - name: Install musl tools
+        if: matrix.musl
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y musl-tools
+
       - name: Cache cargo registry and build
         uses: actions/cache@v4
         with:
@@ -139,8 +161,12 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} -p atomic-cli
 
       - name: Build Linux release binary with glibc floor
-        if: matrix.build_mode == 'zig'
+        if: matrix.build_mode == 'zig' && !matrix.musl
         run: cargo zigbuild --release --target "${{ matrix.target }}.${GLIBC_MIN}" -p atomic-cli
+
+      - name: Build statically linked Linux release binary
+        if: matrix.musl
+        run: cargo zigbuild --release --target ${{ matrix.target }} -p atomic-cli
 
       - name: Verify Linux glibc floor
         if: matrix.verify_glibc
@@ -274,13 +300,25 @@ jobs:
           sudo mv atomic /usr/local/bin/
           ```
 
-          ### Linux (x86_64)
+          ### Linux (x86_64, statically linked — works on any Linux including Ubuntu 20.04+)
+          ```bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.tag }}/atomic-x86_64-unknown-linux-musl.tar.gz | tar xz
+          sudo mv atomic /usr/local/bin/
+          ```
+
+          ### Linux (x86_64, glibc — requires glibc 2.28+)
           ```bash
           curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.tag }}/atomic-x86_64-unknown-linux-gnu.tar.gz | tar xz
           sudo mv atomic /usr/local/bin/
           ```
 
-          ### Linux (aarch64)
+          ### Linux (aarch64, statically linked — works on any Linux)
+          ```bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.tag }}/atomic-aarch64-unknown-linux-musl.tar.gz | tar xz
+          sudo mv atomic /usr/local/bin/
+          ```
+
+          ### Linux (aarch64, glibc — requires glibc 2.28+)
           ```bash
           curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.tag }}/atomic-aarch64-unknown-linux-gnu.tar.gz | tar xz
           sudo mv atomic /usr/local/bin/
