@@ -23,6 +23,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   BINARY_NAME: atomic
+  # Linux release binaries must run on all supported LTS distributions,
+  # including RHEL 9. Keep this explicit so runner upgrades cannot silently
+  # raise the minimum required glibc version.
+  GLIBC_MIN: "2.28"
+  CARGO_ZIGBUILD_VERSION: "0.23.4"
+  ZIG_VERSION: "0.16.0"
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -31,6 +37,8 @@ jobs:
   version:
     name: Extract Version
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -54,48 +62,62 @@ jobs:
     name: Build (${{ matrix.target }})
     needs: [version]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64 (glibc — requires glibc 2.17+)
+          # Linux x86_64 (glibc — requires glibc 2.28+)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: atomic-x86_64-unknown-linux-gnu.tar.gz
+            build_mode: zig
+            verify_glibc: true
 
           # Linux x86_64 (musl — statically linked, works on any Linux)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             artifact: atomic-x86_64-unknown-linux-musl.tar.gz
+            build_mode: zig
             musl: true
+            verify_glibc: false
 
           # Linux aarch64 (glibc, cross-compiled)
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             artifact: atomic-aarch64-unknown-linux-gnu.tar.gz
-            cross: true
+            build_mode: zig
+            verify_glibc: true
 
           # Linux aarch64 (musl — statically linked, works on any Linux)
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             artifact: atomic-aarch64-unknown-linux-musl.tar.gz
+            build_mode: zig
             musl: true
-            cross: true
+            verify_glibc: false
 
           # macOS x86_64 (Intel)
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact: atomic-x86_64-apple-darwin.tar.gz
+            build_mode: native
+            verify_glibc: false
 
           # macOS aarch64 (Apple Silicon)
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: atomic-aarch64-apple-darwin.tar.gz
+            build_mode: native
+            verify_glibc: false
 
           # Windows x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: atomic-x86_64-pc-windows-msvc.zip
+            build_mode: native
+            verify_glibc: false
 
     steps:
       - uses: actions/checkout@v4
@@ -107,26 +129,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install zig (for musl builds)
-        if: matrix.musl
-        uses: mlugg/setup-zig@v1
+      - name: Install Zig
+        if: matrix.build_mode == 'zig'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: '0.13.0'
+          version: ${{ env.ZIG_VERSION }}
 
-      - name: Install musl tools and cargo-zigbuild
+      - name: Install musl tools
         if: matrix.musl
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y musl-tools
-          cargo install cargo-zigbuild --quiet
-
-      - name: Install cross-compilation toolchain (aarch64-gnu)
-        if: matrix.cross && !matrix.musl
-        run: |
-          # Install only the cross-compiler toolchain. OpenSSL is built from
-          # source via OPENSSL_VENDORED so no arm64 system libraries are needed.
-          sudo apt-get update -qq
-          sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -135,29 +148,50 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-${{ matrix.build_mode }}-zig-${{ env.ZIG_VERSION }}-glibc-${{ env.GLIBC_MIN }}-cargo-zigbuild-${{ env.CARGO_ZIGBUILD_VERSION }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-release-
+            ${{ runner.os }}-${{ matrix.target }}-${{ matrix.build_mode }}-zig-${{ env.ZIG_VERSION }}-glibc-${{ env.GLIBC_MIN }}-cargo-zigbuild-${{ env.CARGO_ZIGBUILD_VERSION }}-cargo-release-
+
+      - name: Install cargo-zigbuild
+        if: matrix.build_mode == 'zig'
+        run: cargo install --locked cargo-zigbuild --version "${CARGO_ZIGBUILD_VERSION}"
 
       - name: Build release binary
-        if: ${{ !matrix.cross && !matrix.musl }}
+        if: matrix.build_mode == 'native'
         run: cargo build --release --target ${{ matrix.target }} -p atomic-cli
 
-      - name: Build release binary (musl x86_64)
-        if: matrix.musl && !matrix.cross
+      - name: Build Linux release binary with glibc floor
+        if: matrix.build_mode == 'zig' && !matrix.musl
+        run: cargo zigbuild --release --target "${{ matrix.target }}.${GLIBC_MIN}" -p atomic-cli
+
+      - name: Build statically linked Linux release binary
+        if: matrix.musl
         run: cargo zigbuild --release --target ${{ matrix.target }} -p atomic-cli
 
-      - name: Build release binary (musl aarch64)
-        if: matrix.musl && matrix.cross
-        run: cargo zigbuild --release --target ${{ matrix.target }} -p atomic-cli
+      - name: Verify Linux glibc floor
+        if: matrix.verify_glibc
+        shell: bash
+        run: |
+          BINARY="target/${{ matrix.target }}/release/${BINARY_NAME}"
+          MAX_GLIBC=$(
+            readelf -W --version-info "$BINARY" \
+              | sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p' \
+              | sort -V \
+              | tail -1
+          )
 
-      - name: Build release binary (cross aarch64-gnu)
-        if: matrix.cross && !matrix.musl
-        env:
-          # OpenSSL is compiled from source via git2's vendored-openssl feature.
-          # Only the linker needs to be set explicitly for the target triple.
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }} -p atomic-cli
+          if [[ -z "$MAX_GLIBC" ]]; then
+            echo "::error::Could not determine the minimum glibc version for $BINARY"
+            exit 1
+          fi
+
+          HIGHEST=$(printf '%s\n%s\n' "$GLIBC_MIN" "$MAX_GLIBC" | sort -V | tail -1)
+          if [[ "$HIGHEST" != "$GLIBC_MIN" ]]; then
+            echo "::error::$BINARY requires glibc $MAX_GLIBC, above the supported floor $GLIBC_MIN"
+            exit 1
+          fi
+
+          echo "$BINARY requires glibc $MAX_GLIBC (supported floor: $GLIBC_MIN)"
 
       # Package: Unix (tar.gz)
       - name: Package binary (Unix)
@@ -167,7 +201,7 @@ jobs:
           cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} staging/
           cp README.md LICENSE staging/ 2>/dev/null || true
           cd staging
-          tar czf ../${{ matrix.artifact }} *
+          tar czf ../${{ matrix.artifact }} ./*
 
       # Package: Windows (zip)
       - name: Package binary (Windows)
@@ -212,7 +246,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) | while read f; do
+          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) | while read -r f; do
             sha256sum "$f" >> ../checksums-sha256.txt
           done
           cd ..
@@ -272,7 +306,7 @@ jobs:
           sudo mv atomic /usr/local/bin/
           ```
 
-          ### Linux (x86_64, glibc — requires glibc 2.17+)
+          ### Linux (x86_64, glibc — requires glibc 2.28+)
           ```bash
           curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.tag }}/atomic-x86_64-unknown-linux-gnu.tar.gz | tar xz
           sudo mv atomic /usr/local/bin/
@@ -284,7 +318,7 @@ jobs:
           sudo mv atomic /usr/local/bin/
           ```
 
-          ### Linux (aarch64, glibc)
+          ### Linux (aarch64, glibc — requires glibc 2.28+)
           ```bash
           curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.tag }}/atomic-aarch64-unknown-linux-gnu.tar.gz | tar xz
           sudo mv atomic /usr/local/bin/
