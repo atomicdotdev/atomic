@@ -13,6 +13,7 @@ rust-version.workspace = true
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 blake3 = { workspace = true }
+bs58 = { workspace = true }
 
 # Serialization
 serde = { workspace = true }

@@ -110,6 +110,52 @@ pub async fn build_apex_client(server_override: Option<&str>) -> CliResult<Stora
     Ok(client)
 }
 
+/// Resolve the active server's apex URL without building a client.
+///
+/// Agent enrollment needs the URL before it can mint a certificate — the
+/// certificate is *bound* to the server it is valid against, so the URL is an
+/// input to signing, not just to the request that follows.
+pub fn resolve_apex_url(server_override: Option<&str>) -> CliResult<String> {
+    let config = GlobalConfig::load()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
+
+    let server = config
+        .resolve_server(server_override)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?
+        .0;
+
+    server.url.clone().ok_or_else(|| {
+        let hint = if let Some(name) = server_override {
+            format!("Server profile '{}' has no URL configured.", name)
+        } else {
+            "Server not configured. Run 'atomic identity register <server-url>' first.".to_string()
+        };
+        CliError::Internal(anyhow::anyhow!("{}", hint))
+    })
+}
+
+/// Build an apex-scoped [`StorageClient`] authenticating as a **named**
+/// identity rather than whichever one the server profile resolves to.
+///
+/// Agent enrollment is the reason this exists: the caller must be the human who
+/// signs the certificate, and that is not necessarily the identity bound to the
+/// profile — nor, once agents are in play, the default. Making the identity
+/// explicit keeps "who is enrolling" a decision at the call site instead of a
+/// side effect of configuration.
+pub async fn build_apex_client_as(
+    identity: &atomic_identity::Identity,
+    server_override: Option<&str>,
+) -> CliResult<(StorageClient, String)> {
+    let apex_url = resolve_apex_url(server_override)?;
+    let bearer_token = crate::commands::token::get_token(&apex_url, identity).await?;
+
+    let client = StorageClient::new(&apex_url, "", &bearer_token).map_err(|e| {
+        CliError::Internal(anyhow::anyhow!("Failed to create storage client: {}", e))
+    })?;
+
+    Ok((client, apex_url))
+}
+
 /// Build a [`StorageClient`] and return the resolved org slug alongside it.
 ///
 /// Useful for commands that also need to resolve org-scoped state (e.g.

@@ -12,8 +12,9 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::error::RemoteError;
 use crate::storage_types::{
-    ApiResponse, CreateProjectRequest, CreateWorkspaceRequest, IdentityInfo, ProjectInfo,
-    UpdateProjectRequest, UpdateWorkspaceRequest, WorkspaceInfo,
+    AgentIdentityInfo, ApiResponse, CreateProjectRequest, CreateWorkspaceRequest, DelegationInfo,
+    DelegationStatusInfo, EnrollAgentRequest, IdentityInfo, ProjectInfo, PushDelegationRequest,
+    RevokeDelegationRequest, UpdateProjectRequest, UpdateWorkspaceRequest, WorkspaceInfo,
 };
 
 /// How much of an undeserializable response body to quote in the error.
@@ -392,6 +393,87 @@ impl StorageClient {
         self.get(&format!(
             "/identities/resolve?name={}",
             urlencoding::encode(name)
+        ))
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent identities and delegations
+    //
+    // These are apex endpoints (no org subdomain): an agent belongs to a human,
+    // not to an org, and the same agent may be used across every org that human
+    // is a member of.
+    // -----------------------------------------------------------------------
+
+    /// Enroll an agent identity under the authenticated human identity.
+    ///
+    /// The caller must be the delegator named in the certificate — the server
+    /// verifies the proof against the public key it has on record for the
+    /// caller, so a certificate signed by anyone else is rejected no matter who
+    /// presents it.
+    pub async fn enroll_agent(
+        &self,
+        req: &EnrollAgentRequest,
+    ) -> Result<AgentIdentityInfo, RemoteError> {
+        self.post("/identities/agents", req).await
+    }
+
+    /// List the agents enrolled under the authenticated identity.
+    pub async fn list_agents(&self) -> Result<Vec<AgentIdentityInfo>, RemoteError> {
+        self.get("/identities/agents").await
+    }
+
+    /// Fetch one agent by its identity UUID.
+    pub async fn get_agent(&self, agent_id: &str) -> Result<AgentIdentityInfo, RemoteError> {
+        self.get(&format!("/identities/agents/{agent_id}")).await
+    }
+
+    /// Retire an agent: revoke its delegations and mark the key unusable.
+    ///
+    /// Past work stays attributable — the identity row is not deleted, so a
+    /// change recorded last month still resolves to a name rather than a
+    /// dangling key.
+    pub async fn retire_agent(&self, agent_id: &str) -> Result<(), RemoteError> {
+        self.delete(&format!("/identities/agents/{agent_id}")).await
+    }
+
+    /// Upload a new or renewed delegation certificate.
+    pub async fn push_delegation(
+        &self,
+        req: &PushDelegationRequest,
+    ) -> Result<DelegationInfo, RemoteError> {
+        self.post("/delegations", req).await
+    }
+
+    /// List the delegations issued by the authenticated identity.
+    pub async fn list_delegations(&self) -> Result<Vec<DelegationInfo>, RemoteError> {
+        self.get("/delegations").await
+    }
+
+    /// Revoke a delegation by presenting a signed revocation document.
+    pub async fn revoke_delegation(
+        &self,
+        delegation_id: &str,
+        req: &RevokeDelegationRequest,
+    ) -> Result<DelegationInfo, RemoteError> {
+        self.post(
+            &format!("/delegations/{}/revoke", urlencoding::encode(delegation_id)),
+            req,
+        )
+        .await
+    }
+
+    /// Check whether a delegation is still good.
+    ///
+    /// Unauthenticated on the server side, so anyone auditing a change's
+    /// `delegation_id` can check it without an account.
+    pub async fn delegation_status(
+        &self,
+        delegation_id: &str,
+    ) -> Result<DelegationStatusInfo, RemoteError> {
+        self.get(&format!(
+            "/delegations/{}/status",
+            urlencoding::encode(delegation_id)
         ))
         .await
     }

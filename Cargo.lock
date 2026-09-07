@@ -132,6 +132,7 @@ name = "atomic-agent"
 version = "0.17.1"
 dependencies = [
  "anyhow",
+ "atomic-canonical",
  "atomic-core",
  "atomic-identity",
  "atomic-repository",
@@ -258,6 +259,7 @@ dependencies = [
  "anyhow",
  "atomic-config",
  "blake3",
+ "bs58",
  "chrono",
  "data-encoding",
  "dirs",

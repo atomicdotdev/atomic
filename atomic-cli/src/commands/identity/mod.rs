@@ -38,6 +38,9 @@
 //! atomic identity whoami
 //! ```
 
+pub mod agent;
+pub mod delegate;
+pub mod delegation;
 pub mod delete;
 pub mod list;
 pub mod new;
@@ -48,6 +51,9 @@ pub mod verify;
 pub mod whoami;
 
 // Re-export command structs
+pub use agent::Agent;
+pub use delegate::Delegate;
+pub use delegation::DelegationCmd;
 pub use delete::Delete;
 pub use list::List;
 pub use new::New;
@@ -235,6 +241,37 @@ pub enum IdentityCommands {
     ///   < file.bin
     /// ```
     Verify(Verify),
+
+    /// Manage agent identities that act on your behalf.
+    ///
+    /// An agent gets a keypair of its own and a certificate you sign saying
+    /// what it may do. Its effective access is always your access intersected
+    /// with that certificate — an agent can never exceed the human who issued
+    /// it, so revoking your access revokes the agent's with it.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic identity agent create claude --can read,record,push --projects acme/*
+    /// atomic identity agent list
+    /// atomic identity agent revoke alice+claude --reason "laptop lost"
+    /// ```
+    #[command(subcommand_help_heading = "Agent identity")]
+    Agent(Agent),
+
+    /// Mint a delegation certificate (plumbing).
+    ///
+    /// `agent create` does this for you. Reach for it directly to re-scope an
+    /// existing agent, or to countersign a request from a key you do not hold:
+    ///
+    /// ```text
+    /// atomic identity delegate --request request.json --can record,push -o cert.json
+    /// ```
+    Delegate(Delegate),
+
+    /// Install, push, list, verify or revoke certificates (plumbing).
+    #[command(name = "delegation")]
+    Delegation(DelegationCmd),
 }
 
 impl Command for Identity {
@@ -249,6 +286,9 @@ impl Command for Identity {
             IdentityCommands::Register(cmd) => cmd.run(),
             IdentityCommands::Sign(cmd) => cmd.run(),
             IdentityCommands::Verify(cmd) => cmd.run(),
+            IdentityCommands::Agent(cmd) => cmd.run(),
+            IdentityCommands::Delegate(cmd) => cmd.run(),
+            IdentityCommands::Delegation(cmd) => cmd.run(),
         }
     }
 }
@@ -387,6 +427,69 @@ pub fn activate_server_for_identity(identity_name: &str) {
             ));
         }
     }
+}
+
+/// Load a named identity, or the store default when no name is given.
+///
+/// The one place that decides what "no `--identity`" means, so the agent
+/// commands cannot drift from the rest of the CLI on it.
+pub fn load_identity_or_default(
+    store: &atomic_identity::IdentityStore,
+    name: Option<&str>,
+) -> crate::error::CliResult<atomic_identity::Identity> {
+    use crate::error::CliError;
+    match name {
+        Some(name) => store
+            .load_by_name(name)
+            .map_err(|_| CliError::IdentityNotFound(name.to_string())),
+        None => store
+            .get_default()
+            .map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to load default identity: {e}"))
+            })?
+            .ok_or_else(|| {
+                CliError::Internal(anyhow::anyhow!(
+                    "No default identity set. Create one first:\n  \
+                     atomic identity new <name> --email <email> --set-default"
+                ))
+            }),
+    }
+}
+
+/// Record an agent identity on a server profile so hooks use it by default.
+///
+/// Writes `agent_identity` on the named profile, or on the active one when no
+/// name is given. The human binding (`identity`) is left alone: enrollment and
+/// revocation still authenticate as the human.
+pub fn bind_agent_identity(
+    server_override: Option<&str>,
+    agent_name: &str,
+) -> crate::error::CliResult<()> {
+    use crate::error::CliError;
+
+    let mut config = GlobalConfig::load()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load config: {e}")))?;
+
+    let profile = server_override
+        .map(str::to_string)
+        .or_else(|| config.default_server.clone());
+
+    match profile {
+        Some(name) => match config.servers.get_mut(&name) {
+            Some(server) => server.agent_identity = Some(agent_name.to_string()),
+            None => {
+                return Err(CliError::InvalidArgument {
+                    message: format!("No server profile named '{name}'"),
+                })
+            }
+        },
+        // No named profiles yet — the legacy [server] block is the active one.
+        None => config.server.agent_identity = Some(agent_name.to_string()),
+    }
+
+    config
+        .save()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to save config: {e}")))
 }
 
 /// Format an identity type for display.

@@ -45,6 +45,12 @@ use std::fmt;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IdentityId([u8; 32]);
 
+/// DID method prefix for atomic's in-tree identity method.
+///
+/// `did:atomic:<base32(blake3(public_key))>` — a fingerprint of the key, which
+/// is why [`IdentityId::to_did`] and the key itself are not interchangeable.
+pub const DID_ATOMIC_PREFIX: &str = "did:atomic:";
+
 impl IdentityId {
     /// Create an identity ID from a public key.
     pub fn from_public_key(public_key: &PublicKey) -> Self {
@@ -88,6 +94,32 @@ impl IdentityId {
     /// Get a short form of the ID for display (first 8 characters).
     pub fn short(&self) -> String {
         self.to_base32()[..8].to_string()
+    }
+
+    /// The `did:atomic` identifier for this identity.
+    ///
+    /// The id is already `blake3(public_key)`, which is exactly what the
+    /// `did:atomic` method specifies, so the DID is a rendering of the id
+    /// rather than a second derivation that could drift from it.
+    ///
+    /// Note this is a *fingerprint*: the public key cannot be recovered from
+    /// it. Where a verifier needs the key itself, carry
+    /// [`PublicKey::to_did_key`] alongside.
+    pub fn to_did(&self) -> String {
+        format!("{}{}", DID_ATOMIC_PREFIX, self.to_base32())
+    }
+
+    /// Parse a `did:atomic:` identifier back into an id.
+    pub fn from_did(did: &str) -> Result<Self, IdentityError> {
+        let raw = did.strip_prefix(DID_ATOMIC_PREFIX).ok_or_else(|| {
+            IdentityError::InvalidKey(format!("not a {DID_ATOMIC_PREFIX} identifier: {did}"))
+        })?;
+        Self::from_base32(raw)
+    }
+
+    /// Does this id correspond to `public_key`?
+    pub fn matches_public_key(&self, public_key: &PublicKey) -> bool {
+        *self == Self::from_public_key(public_key)
     }
 }
 

@@ -23,9 +23,20 @@
 //!
 //! # Identity Resolution Order
 //!
-//! 1. Look for the user's default identity in `~/.atomic/identities/`
-//! 2. If found, derive the agent author with `+tag` email
-//! 3. If not found, fall back to `{agent_display_name} <agent@localhost>`
+//! 1. A **delegated agent identity** (from [`AgentAuthorOptions::agent_identity`]
+//!    or `ATOMIC_AGENT_IDENTITY`) — the agent has a keypair of its own, so the
+//!    change is attributed to *its* public key and the human is recoverable
+//!    through the delegation certificate.
+//! 2. The user's default identity in `~/.atomic/identities/`, with a `+tag`
+//!    author — attribution by naming convention, signed with the human's key.
+//! 3. Neither: fall back to `{agent_display_name}` with no key at all.
+//!
+//! Only (1) is cryptographic. In (2) the author string says "an agent did
+//! this" and the key says "the human did this"; anyone who can read the
+//! repository can see the difference, but nothing *proves* which agent, or
+//! that the human authorized it. That is the gap a delegated identity closes,
+//! and why the author line looks the same either way: the visible format is
+//! not what changed, the key behind it is.
 //!
 //! # Example
 //!
@@ -37,6 +48,7 @@
 //!     agent_display_name: "Claude Code",
 //!     session_id: "60f5cbd2-aa23-40ee-9085-4375dd186ce7",
 //!     identity_dir: None, // use default ~/.atomic/identities/
+//!     agent_identity: None, // or Some("alice+claude") to sign with the agent's own key
 //! };
 //!
 //! let author = resolve_agent_author(&options);
@@ -66,6 +78,14 @@ pub struct AgentAuthorOptions<'a> {
     ///
     /// If `None`, uses `~/.atomic/identities/`. Set this for testing.
     pub identity_dir: Option<PathBuf>,
+
+    /// Name of a delegated agent identity to sign as.
+    ///
+    /// When set and resolvable, the change is attributed to the agent's own
+    /// key instead of the human's. `None` falls back to `ATOMIC_AGENT_IDENTITY`
+    /// and then to the plus-tag path, so an environment with no agent
+    /// configured behaves exactly as it did before agent identities existed.
+    pub agent_identity: Option<String>,
 }
 
 // Author Resolution
@@ -99,11 +119,102 @@ pub struct AgentAuthorOptions<'a> {
 /// Author { name: "Claude Code", email: None }
 /// ```
 pub fn resolve_agent_author(options: &AgentAuthorOptions<'_>) -> Author {
-    // Try to load the user's default identity
+    // A delegated identity is the only path where the key in the change
+    // header actually belongs to the agent, so it is tried first.
+    if let Some(author) = delegated_agent_author(options) {
+        return author;
+    }
+
+    // Otherwise: plus-tag the human's identity. Legible, not provable.
     match load_default_user_identity(options.identity_dir.as_deref()) {
         Some(user) => derive_agent_author(&user, options),
         None => fallback_agent_author(options),
     }
+}
+
+/// The delegation certificate currently authorizing this agent, as a URN.
+///
+/// Recorded on the change envelope so a reader months later can ask the server
+/// whether that specific certificate was still good, rather than inferring
+/// authority from an author string. Returns `None` when no agent identity is
+/// configured or none of its certificates is currently in force — the plus-tag
+/// path has no certificate to name.
+pub fn active_delegation_urn(
+    agent_identity: Option<&str>,
+    identity_dir: Option<&Path>,
+) -> Option<String> {
+    let name = agent_identity
+        .map(str::to_string)
+        .or_else(|| std::env::var(AGENT_IDENTITY_ENV).ok())
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())?;
+
+    let store = match identity_dir {
+        Some(dir) => atomic_identity::IdentityStore::open(dir),
+        None => atomic_identity::IdentityStore::open_default(),
+    }
+    .ok()?;
+
+    let identity = store.load_by_name(&name).ok()?;
+    atomic_canonical::delegation::active_for_delegate(&store, &identity)
+        .map(|d| d.delegation.id.to_urn())
+}
+
+/// Environment variable naming the delegated agent identity to sign as.
+///
+/// Mirrors the CLI's `ATOMIC_AGENT_IDENTITY`, so a runner that sets it once
+/// gets both authenticated pushes and correctly attributed changes.
+pub const AGENT_IDENTITY_ENV: &str = "ATOMIC_AGENT_IDENTITY";
+
+/// Build an author from a delegated agent identity, if one is configured and
+/// resolvable.
+///
+/// Returns `None` — rather than failing — whenever the identity is missing or
+/// unreadable. Recording a turn must not break because an agent identity was
+/// mistyped; falling back to the plus-tag author keeps the work attributed to
+/// *someone* and leaves a debug log explaining why it is not keyed.
+fn delegated_agent_author(options: &AgentAuthorOptions<'_>) -> Option<Author> {
+    let name = options
+        .agent_identity
+        .clone()
+        .or_else(|| std::env::var(AGENT_IDENTITY_ENV).ok())
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())?;
+
+    let store = match options.identity_dir.as_deref() {
+        Some(dir) => atomic_identity::IdentityStore::open(dir),
+        None => atomic_identity::IdentityStore::open_default(),
+    }
+    .ok()?;
+
+    let identity = match store.load_by_name(&name) {
+        Ok(identity) => identity,
+        Err(e) => {
+            log::debug!("Agent identity '{name}' not usable ({e}); falling back to plus-tag");
+            return None;
+        }
+    };
+
+    // A human identity here would silently sign agent work as the human with
+    // no delegation behind it — worse than the plus-tag fallback, which at
+    // least does not claim to be keyed to an agent.
+    if !identity.identity_type.is_delegated() && !identity.identity_type.is_agent() {
+        log::debug!("'{name}' is not an agent identity; falling back to plus-tag");
+        return None;
+    }
+
+    let session_short = extract_session_short(options.session_id);
+    let tag = format!(
+        "{}+{}",
+        normalize_agent_name(options.agent_name),
+        session_short
+    );
+
+    Some(Author::with_identity(
+        &tag,
+        identity.email.clone(),
+        identity.public_key_base32(),
+    ))
 }
 
 /// Derive the agent author from the user's identity.
@@ -397,6 +508,7 @@ pub fn build_agent_author(agent_name: &str, agent_display_name: &str, session_id
         agent_display_name,
         session_id,
         identity_dir: None,
+        agent_identity: None,
     };
     resolve_agent_author(&options)
 }
@@ -504,6 +616,7 @@ mod tests {
             agent_display_name: "Claude Code",
             session_id: "60f5cbd2-aa23-40ee-9085-4375dd186ce7",
             identity_dir: None,
+            agent_identity: None,
         };
 
         let author = derive_agent_author(&user, &options);
@@ -525,6 +638,7 @@ mod tests {
             agent_display_name: "Gemini CLI",
             session_id: "abcdef1234",
             identity_dir: None,
+            agent_identity: None,
         };
 
         let author = derive_agent_author(&user, &options);
@@ -546,6 +660,7 @@ mod tests {
             agent_display_name: "Claude Code",
             session_id: "2026-01-15-abc123de-f456-7890",
             identity_dir: None,
+            agent_identity: None,
         };
 
         let author = derive_agent_author(&user, &options);
@@ -564,6 +679,7 @@ mod tests {
             agent_display_name: "Claude Code",
             session_id: "sess-123",
             identity_dir: None,
+            agent_identity: None,
         };
 
         let author = fallback_agent_author(&options);
@@ -571,6 +687,139 @@ mod tests {
         assert_eq!(author.name, "Claude Code");
         assert!(author.email.is_none());
         assert!(author.identity.is_none());
+    }
+
+    // Delegated agent identity (keyed attribution)
+
+    /// The whole point of a delegated identity: the key in the change header
+    /// is the agent's, not the human's. Same visible author, different key.
+    #[test]
+    fn a_delegated_identity_signs_with_its_own_key() {
+        use atomic_identity::{Identity, IdentityStore, IdentityType, KeyPair};
+
+        let dir = TempDir::new().unwrap();
+        let store = IdentityStore::open(dir.path()).unwrap();
+
+        let human_key = KeyPair::generate();
+        let human = Identity::builder("alice")
+            .email("alice@example.com")
+            .public_key(human_key.public.clone())
+            .build()
+            .unwrap();
+        store.save_with_keypair(&human, &human_key, None).unwrap();
+
+        let agent_key = KeyPair::generate();
+        let agent = Identity::builder("alice+claude")
+            .identity_type(IdentityType::Agent)
+            .email("alice+claude@example.com")
+            .public_key(agent_key.public.clone())
+            .delegated_by(human.id)
+            .build()
+            .unwrap();
+        store.save_with_keypair(&agent, &agent_key, None).unwrap();
+
+        let author = resolve_agent_author(&AgentAuthorOptions {
+            agent_name: "claude-code",
+            agent_display_name: "Claude Code",
+            session_id: "60f5cbd2-aa23-40ee-9085-4375dd186ce7",
+            identity_dir: Some(dir.path().to_path_buf()),
+            agent_identity: Some("alice+claude".to_string()),
+        });
+
+        // The author line is unchanged — legibility was never the problem.
+        assert_eq!(author.name, "claude+60f5");
+        // The key is the agent's, which is what changed.
+        assert_eq!(
+            author.identity.as_deref(),
+            Some(agent.public_key_base32().as_str())
+        );
+        assert_ne!(
+            author.identity.as_deref(),
+            Some(human.public_key_base32().as_str())
+        );
+    }
+
+    /// A human identity passed as the agent identity must not be used: signing
+    /// agent work with the human's key and *calling* it keyed attribution is
+    /// worse than the honest plus-tag fallback.
+    #[test]
+    fn a_non_agent_identity_is_refused_and_falls_back() {
+        use atomic_identity::{Identity, IdentityStore, KeyPair};
+
+        let dir = TempDir::new().unwrap();
+        let store = IdentityStore::open(dir.path()).unwrap();
+        let key = KeyPair::generate();
+        let human = Identity::builder("alice")
+            .email("alice@example.com")
+            .public_key(key.public.clone())
+            .build()
+            .unwrap();
+        store.save_with_keypair(&human, &key, None).unwrap();
+
+        let options = AgentAuthorOptions {
+            agent_name: "claude-code",
+            agent_display_name: "Claude Code",
+            session_id: "sess1234",
+            identity_dir: Some(dir.path().to_path_buf()),
+            agent_identity: Some("alice".to_string()),
+        };
+        assert!(delegated_agent_author(&options).is_none());
+    }
+
+    /// A mistyped agent identity must not break recording.
+    #[test]
+    fn an_unknown_agent_identity_falls_back_rather_than_failing() {
+        let dir = TempDir::new().unwrap();
+        let options = AgentAuthorOptions {
+            agent_name: "claude-code",
+            agent_display_name: "Claude Code",
+            session_id: "sess1234",
+            identity_dir: Some(dir.path().to_path_buf()),
+            agent_identity: Some("nobody+here".to_string()),
+        };
+        assert!(delegated_agent_author(&options).is_none());
+
+        // And the public entry point still produces a usable author.
+        let author = resolve_agent_author(&options);
+        assert_eq!(author.name, "Claude Code");
+    }
+
+    /// No agent identity configured: unchanged behavior.
+    #[test]
+    fn no_agent_identity_means_no_keyed_path() {
+        let dir = TempDir::new().unwrap();
+        let options = AgentAuthorOptions {
+            agent_name: "claude-code",
+            agent_display_name: "Claude Code",
+            session_id: "sess1234",
+            identity_dir: Some(dir.path().to_path_buf()),
+            agent_identity: None,
+        };
+        // Guard against a stray env var in the test environment.
+        if std::env::var(AGENT_IDENTITY_ENV).is_err() {
+            assert!(delegated_agent_author(&options).is_none());
+        }
+    }
+
+    /// With no certificate installed there is nothing to name on the envelope.
+    #[test]
+    fn active_delegation_urn_is_none_without_a_certificate() {
+        use atomic_identity::{Identity, IdentityStore, IdentityType, KeyPair};
+
+        let dir = TempDir::new().unwrap();
+        let store = IdentityStore::open(dir.path()).unwrap();
+        let key = KeyPair::generate();
+        let agent = Identity::builder("alice+claude")
+            .identity_type(IdentityType::Agent)
+            .public_key(key.public.clone())
+            .build()
+            .unwrap();
+        store.save_with_keypair(&agent, &key, None).unwrap();
+
+        assert_eq!(
+            active_delegation_urn(Some("alice+claude"), Some(dir.path())),
+            None
+        );
     }
 
     // resolve_agent_author (integration)
@@ -585,6 +834,7 @@ mod tests {
             agent_display_name: "Claude Code",
             session_id: "60f5cbd2",
             identity_dir: Some(nonexistent),
+            agent_identity: None,
         };
 
         let author = resolve_agent_author(&options);
@@ -603,6 +853,7 @@ mod tests {
             agent_display_name: "Claude Code",
             session_id: "60f5cbd2",
             identity_dir: Some(dir.path().to_path_buf()),
+            agent_identity: None,
         };
 
         let author = resolve_agent_author(&options);
@@ -639,6 +890,7 @@ identity_type = "user"
             agent_display_name: "Claude Code",
             session_id: "60f5cbd2-aa23-40ee-9085-4375dd186ce7",
             identity_dir: Some(dir.path().to_path_buf()),
+            agent_identity: None,
         };
 
         let author = resolve_agent_author(&options);
@@ -670,6 +922,7 @@ identity_type = "user"
             agent_display_name: "Gemini CLI",
             session_id: "abcdef12",
             identity_dir: Some(dir.path().to_path_buf()),
+            agent_identity: None,
         };
 
         let author = resolve_agent_author(&options);
@@ -784,6 +1037,7 @@ version = 1
             agent_display_name: "Claude Code",
             session_id: "60f5cbd2-aa23-40ee-9085-4375dd186ce7",
             identity_dir: None,
+            agent_identity: None,
         };
 
         let author = derive_agent_author(&user, &options);
@@ -799,6 +1053,7 @@ version = 1
             agent_display_name: "Claude Code",
             session_id: "sess",
             identity_dir: None,
+            agent_identity: None,
         });
 
         assert_eq!(author.display_short(), "Claude Code");
@@ -825,6 +1080,7 @@ version = 1
                 agent_display_name: agent,
                 session_id: session,
                 identity_dir: None,
+                agent_identity: None,
             };
             let author = derive_agent_author(&user, &options);
             assert_eq!(

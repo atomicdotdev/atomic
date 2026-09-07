@@ -21,6 +21,10 @@ pub enum IdentityError {
     #[error("Identity already exists: {name}")]
     AlreadyExists { name: String },
 
+    /// No delegation certificate stored under this id
+    #[error("Delegation not found: {id}")]
+    DelegationNotFound { id: String },
+
     /// Signature verification failed
     #[error("Signature verification failed")]
     InvalidSignature,

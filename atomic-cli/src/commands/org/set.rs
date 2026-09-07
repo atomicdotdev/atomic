@@ -329,6 +329,7 @@ mod tests {
                 default_org: None,
                 default_workspaces: std::collections::BTreeMap::new(),
                 identity: Some("continuouslee".to_string()),
+                agent_identity: None,
                 single_tenant: false,
             },
         );
