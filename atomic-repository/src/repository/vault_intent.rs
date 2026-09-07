@@ -155,14 +155,30 @@ impl Repository {
                 .get_vault_manifest()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-            // Set the project code on first use, derived from the project dir.
+            // Set the project code on first use.
+            //
+            // `ATOMIC_PROJECT_CODE` wins when set, because the directory name
+            // is not always the project's name: an agent sandbox roots the
+            // repository at the sandbox directory, so the first intent created
+            // inside one stamped every intent in that project `SAND::…`
+            // forever (the prefix is set once and kept). Callers that know the
+            // real project — an orchestrator working from a project slug — set
+            // the variable and get a stable, meaningful code.
             if manifest.intent_prefix.is_empty() {
-                let project_name = self
-                    .root
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("vault");
-                manifest.intent_prefix = VaultManifest::derive_intent_prefix(project_name);
+                let from_env = std::env::var("ATOMIC_PROJECT_CODE")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                let project_name = match from_env {
+                    Some(code) => code,
+                    None => self
+                        .root
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("vault")
+                        .to_string(),
+                };
+                manifest.intent_prefix = VaultManifest::derive_intent_prefix(&project_name);
                 if manifest.intent_prefix.is_empty() {
                     manifest.intent_prefix = "VAULT".to_string();
                 }

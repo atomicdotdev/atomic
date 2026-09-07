@@ -40,6 +40,14 @@ fn kind_is(kind: &str, expected: &str) -> bool {
 }
 
 /// First 12 base32 chars — the short id used for `change:<short>` KG nodes.
+/// True for paths the vault owns — intent files, attestations, audit
+/// entries. Changes confined to these are lifecycle bookkeeping, not work
+/// a task is expected to have declared.
+fn is_vault_path(path: &str) -> bool {
+    let p = path.strip_prefix("./").unwrap_or(path);
+    p == ".vault" || p.starts_with(".vault/")
+}
+
 fn short12(hash_b32: &str) -> String {
     hash_b32.chars().take(12).collect()
 }
@@ -401,7 +409,7 @@ pub fn build_report(
                                 message,
                             )
                             .with_query(format!(
-                                "atomic intent new --review {bare} --reviews {bare}"
+                                "atomic intent new \"Review: <what>\" --review {bare}"
                             ))
                             .with_remedy(
                                 "have a different identity/model author and attest a review intent \
@@ -592,6 +600,21 @@ pub fn build_report(
     for full in &set.only_in_feature {
         if !reached_any_intent.get(full).copied().unwrap_or(false) {
             let paths = change_raw_paths.get(full).cloned().unwrap_or_default();
+
+            // Vault bookkeeping is self-explaining. Creating an intent,
+            // enriching it and attesting a review each record a change that
+            // touches only `.vault/` — the intent file, its attestation, an
+            // audit entry. No task's `::file-ref` names those paths, and it
+            // would be circular to demand one: the intent cannot cite the
+            // change that created it.
+            //
+            // Left blocking, every intent-driven merge was unreachable, and
+            // the only way through was to make a review's task claim
+            // `.vault/` paths it never really "worked on".
+            if !paths.is_empty() && paths.iter().all(|p| is_vault_path(p)) {
+                continue;
+            }
+
             let message = if paths.is_empty() {
                 "candidate change has no task/intent link — nothing explains why it exists"
                     .to_string()
@@ -1115,6 +1138,18 @@ mod tests {
             .save_to_store(true)
             .apply_after_record(true);
         repo.record(header, options).unwrap();
+    }
+
+    #[test]
+    fn vault_paths_are_recognised_as_lifecycle() {
+        assert!(is_vault_path(".vault/intents/01ABC/intent.md"));
+        assert!(is_vault_path(".vault/attestations/P__a__1/attested.md"));
+        assert!(is_vault_path("./.vault/audit/x.json"));
+        assert!(is_vault_path(".vault"));
+        // Real work is never exempt.
+        assert!(!is_vault_path("src/main.rs"));
+        assert!(!is_vault_path("vault/notes.md"));
+        assert!(!is_vault_path(".vaultish/x"));
     }
 
     /// A change recorded only on `feature` that reaches no intent (the KG has
