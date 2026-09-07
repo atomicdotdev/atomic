@@ -863,7 +863,6 @@ impl Repository {
 #[cfg(test)]
 mod summary_sync_tests {
     use crate::Repository;
-    use atomic_core::pristine::VaultEntryType;
     use tempfile::tempdir;
 
     /// An intent's `status:` edited on disk must reach the manifest summary,
