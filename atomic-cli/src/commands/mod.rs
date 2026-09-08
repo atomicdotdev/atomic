@@ -120,6 +120,7 @@ pub mod query;
 
 // Storage management commands (always available)
 pub mod client;
+pub mod delegation;
 pub mod project;
 pub mod token;
 pub mod workspace;

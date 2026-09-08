@@ -14,6 +14,27 @@
 //! - claims: `{ sub, iat, exp, jti }` (`sub` mirrors the `kid` public key)
 //! - signature: `Ed25519_sign(private_key, "header.claims")`
 //!
+//! # Acting on behalf of someone (agent identities)
+//!
+//! When the identity is a delegated **agent**, the token additionally carries
+//! the RFC 8693 actor claim, and the subject *inverts*:
+//!
+//! ```text
+//! kid  = the agent's public key   (the signer — an agent is the one holding a key)
+//! sub  = the human's public key   (the effective subject: whose access is being used)
+//! act  = { sub: the agent's public key }   (the actual actor)
+//! dlg  = urn:atomic:delegation:...         (which certificate authorizes this)
+//! ```
+//!
+//! So the server's binding rule is `kid == act.sub` when `act` is present, and
+//! `kid == sub` when it is not. `dlg` pins *which* certificate was used when an
+//! agent holds several, so the audit record is unambiguous rather than
+//! reconstructed by guesswork.
+//!
+//! A token is only minted once a locally valid certificate has been found, so
+//! an expired or out-of-scope delegation fails here — before the network — with
+//! a message naming the command that fixes it.
+//!
 //! # Keyed by the public key
 //!
 //! The JWT is keyed by the caller's Ed25519 **public key**, carried in the
@@ -49,11 +70,29 @@ struct JwtHeader {
 
 #[derive(Serialize)]
 struct Claims {
-    /// The caller's base32 Ed25519 public key (same value as the header `kid`).
+    /// The *effective subject*: the base32 public key whose access is being
+    /// exercised. For a human that is their own key (and equals `kid`); for an
+    /// agent it is the human's key that the agent acts on behalf of.
     sub: String,
     iat: i64,
     exp: i64,
     jti: String,
+
+    /// RFC 8693 actor claim — present only when an agent is acting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    act: Option<Actor>,
+
+    /// The delegation certificate authorizing this call, as a URN.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dlg: Option<String>,
+}
+
+/// The actual actor behind a delegated call (RFC 8693 §4.1).
+#[derive(Serialize)]
+struct Actor {
+    /// The agent's base32 Ed25519 public key — the same value as `kid`, since
+    /// the agent is the party that signs.
+    sub: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -80,9 +119,9 @@ pub async fn refresh_token(server: &str, identity: &Identity) -> CliResult<Strin
 // Minting
 // ---------------------------------------------------------------------------
 
-fn mint_token(_server: &str, identity: &Identity) -> CliResult<String> {
-    // The token is keyed by the identity's own public key — no server-assigned
-    // identifier to look up.
+fn mint_token(server: &str, identity: &Identity) -> CliResult<String> {
+    // The token is keyed by the signer's own public key — no server-assigned
+    // identifier to look up. For an agent the signer is the agent itself.
     let public_key_b32 = identity.public_key_base32();
 
     // Load the keypair (needs the secret key to sign).
@@ -95,12 +134,37 @@ fn mint_token(_server: &str, identity: &Identity) -> CliResult<String> {
         ))
     })?;
 
+    // An agent acts on behalf of the human who delegated to it, so the subject
+    // becomes the human and the agent moves into `act`. Resolving the
+    // certificate here means an unusable delegation is reported before any
+    // request is made, with the command that fixes it.
+    let (sub, act, dlg) = if identity.identity_type.is_delegated() {
+        let resolved = crate::commands::delegation::active_for(&store, identity, Some(server))?;
+        let delegator_key = atomic_canonical::delegation::delegator_public_key(
+            &resolved.delegation,
+        )
+        .map_err(|e| CliError::DelegationError {
+            message: format!("Delegation for '{}' is malformed: {e}", identity.name),
+        })?;
+        (
+            delegator_key.to_base32(),
+            Some(Actor {
+                sub: public_key_b32.clone(),
+            }),
+            Some(resolved.delegation.id.to_urn()),
+        )
+    } else {
+        (public_key_b32.clone(), None, None)
+    };
+
     let now = Utc::now();
     let claims = Claims {
-        sub: public_key_b32.clone(),
+        sub,
         iat: now.timestamp(),
         exp: (now + TOKEN_TTL).timestamp(),
         jti: Uuid::new_v4().to_string(),
+        act,
+        dlg,
     };
 
     let header = JwtHeader {
@@ -121,7 +185,14 @@ fn mint_token(_server: &str, identity: &Identity) -> CliResult<String> {
     let signature = keypair.sign(signing_input.as_bytes());
     let sig_b64 = BASE64URL_NOPAD.encode(&signature);
 
-    log::debug!("Minted self-signed EdDSA JWT for '{}'", identity.name);
+    if claims.act.is_some() {
+        log::debug!(
+            "Minted delegated EdDSA JWT: '{}' acting on behalf of the delegator",
+            identity.name
+        );
+    } else {
+        log::debug!("Minted self-signed EdDSA JWT for '{}'", identity.name);
+    }
     Ok(format!("{signing_input}.{sig_b64}"))
 }
 
@@ -140,6 +211,59 @@ mod tests {
         assert_eq!(json, r#"{"alg":"EdDSA","typ":"JWT","kid":"ABCDEF"}"#);
     }
 
+    /// A human's token must not carry `act`/`dlg` at all — not `null`. The
+    /// server distinguishes "delegated" from "not" by the claim's presence, so
+    /// emitting explicit nulls would put every human on the delegated path.
+    #[test]
+    fn a_non_delegated_token_omits_the_actor_claims() {
+        let claims = Claims {
+            sub: "ABCDEF".to_string(),
+            iat: 0,
+            exp: 1,
+            jti: "j".to_string(),
+            act: None,
+            dlg: None,
+        };
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(!json.contains("act"), "{json}");
+        assert!(!json.contains("dlg"), "{json}");
+    }
+
+    /// The delegated shape inverts `sub`: the human is the effective subject
+    /// and the agent — the signer, and therefore the `kid` — moves into `act`.
+    #[test]
+    fn a_delegated_token_puts_the_human_in_sub_and_the_agent_in_act() {
+        let human = "HUMANKEY";
+        let agent = "AGENTKEY";
+        let claims = Claims {
+            sub: human.to_string(),
+            iat: 0,
+            exp: 1,
+            jti: "j".to_string(),
+            act: Some(Actor {
+                sub: agent.to_string(),
+            }),
+            dlg: Some("urn:atomic:delegation:XYZ".to_string()),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&claims).unwrap()).unwrap();
+
+        assert_eq!(value["sub"], human);
+        assert_eq!(value["act"]["sub"], agent);
+        assert_eq!(value["dlg"], "urn:atomic:delegation:XYZ");
+
+        // The signer is the agent, so the header kid must match act.sub, not sub.
+        let header = JwtHeader {
+            alg: "EdDSA",
+            typ: "JWT",
+            kid: agent.to_string(),
+        };
+        let header_value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&header).unwrap()).unwrap();
+        assert_eq!(header_value["kid"], value["act"]["sub"]);
+        assert_ne!(header_value["kid"], value["sub"]);
+    }
+
     /// A minted token must verify against the identity's public key, prove the
     /// three-segment shape, carry the public key as `kid` (and `sub`), and not
     /// verify once tampered.
@@ -156,6 +280,8 @@ mod tests {
             iat: now.timestamp(),
             exp: (now + TOKEN_TTL).timestamp(),
             jti: Uuid::new_v4().to_string(),
+            act: None,
+            dlg: None,
         };
         let header = JwtHeader {
             alg: "EdDSA",

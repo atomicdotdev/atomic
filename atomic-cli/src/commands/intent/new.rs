@@ -139,9 +139,17 @@ fn create_intent(
 ) -> CliResult<(IntentCreateResult, String)> {
     // Resolve the effective kind + which scaffold to emit.
     let (kind, scaffold) = if let Some(target) = review_target {
+        // Emit the canonical URN even when the caller named the target
+        // bare. A bare ULID reads fine but projects an edge that nothing
+        // can match, so the review silently fails to cover its target.
+        let target = if target.trim().starts_with("urn:") {
+            target.trim().to_string()
+        } else {
+            format!("urn:atomic:intent:{}", target.trim())
+        };
         (
             "review".to_string(),
-            REVIEW_SCAFFOLD.to_string().replace("{target}", target),
+            REVIEW_SCAFFOLD.to_string().replace("{target}", &target),
         )
     } else {
         if !is_known_intent_kind(kind) {

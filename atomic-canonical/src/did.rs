@@ -18,31 +18,27 @@
 //! Data-Integrity tooling that resolves `did:key` natively. Verification
 //! accepts either method for the same key.
 
+use atomic_identity::identity::IdentityId;
 use atomic_identity::keypair::PublicKey;
 
-pub const DID_ATOMIC_PREFIX: &str = "did:atomic:";
-pub const DID_KEY_PREFIX: &str = "did:key:";
-/// Multicodec prefix for an Ed25519 public key (varint 0xed01).
-const MULTICODEC_ED25519_PUB: [u8; 2] = [0xed, 0x01];
+pub use atomic_identity::identity::DID_ATOMIC_PREFIX;
+pub use atomic_identity::keypair::DID_KEY_PREFIX;
 
 /// Build the `did:atomic:...` identifier for a public key.
+///
+/// Both DID renderings are derived in `atomic-identity` — the DID *is* the
+/// identity's identifier, so it belongs with the type that owns identity, and
+/// having one derivation means a `did:atomic` here can never disagree with an
+/// `IdentityId` there.
 pub fn did_for_public_key(public_key: &PublicKey) -> String {
-    let fingerprint = blake3::hash(public_key.as_bytes());
-    format!(
-        "{}{}",
-        DID_ATOMIC_PREFIX,
-        data_encoding::BASE32_NOPAD.encode(fingerprint.as_bytes())
-    )
+    IdentityId::from_public_key(public_key).to_did()
 }
 
 /// Build the standard `did:key` identifier for an Ed25519 public key
 /// (multicodec `ed25519-pub` + key bytes, base58btc multibase). Always
 /// starts `did:key:z6Mk` for Ed25519 keys.
 pub fn did_key_for_public_key(public_key: &PublicKey) -> String {
-    let mut bytes = Vec::with_capacity(2 + public_key.as_bytes().len());
-    bytes.extend_from_slice(&MULTICODEC_ED25519_PUB);
-    bytes.extend_from_slice(public_key.as_bytes());
-    format!("{}z{}", DID_KEY_PREFIX, bs58::encode(bytes).into_string())
+    public_key.to_did_key()
 }
 
 /// The verification method id used in a proof (`<did>#key-1`).

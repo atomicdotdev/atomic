@@ -357,6 +357,14 @@ impl IdentityStore {
     /// Secret key file name within each identity directory.
     const SECRET_KEY_FILE: &'static str = "secret.key";
 
+    /// Directory holding signed delegation certificates, relative to the root.
+    ///
+    /// Certificates live inside the store rather than beside it so a store is
+    /// one self-contained directory to back up, copy, or point a test at. The
+    /// name cannot collide with an identity directory: those are BASE32_NOPAD
+    /// (uppercase) renderings of a 32-byte id.
+    const DELEGATIONS_DIR: &'static str = "delegations";
+
     /// Open or create the default identity store.
     ///
     /// The default location is `~/.atomic/identities/` in the user's home directory.
@@ -719,6 +727,128 @@ impl IdentityStore {
         Ok(self.list()?.len())
     }
 
+    // -----------------------------------------------------------------------
+    // Delegation certificates
+    //
+    // The store deals in *documents*, not typed delegations: what is persisted
+    // is the exact signed JSON that `atomic-canonical` minted and that the
+    // server holds. Re-serializing a parsed struct would risk producing
+    // different bytes than the ones the proof covers, so the bytes are the
+    // artifact and parsing is the caller's business.
+    // -----------------------------------------------------------------------
+
+    /// Directory holding delegation certificates.
+    pub fn delegations_dir(&self) -> PathBuf {
+        self.root.join(Self::DELEGATIONS_DIR)
+    }
+
+    /// Path of a certificate, by its base32 id.
+    fn delegation_path(&self, id: &str) -> PathBuf {
+        self.delegations_dir().join(format!("{id}.json"))
+    }
+
+    /// Path of a revocation, by the delegation's base32 id.
+    fn revocation_path(&self, id: &str) -> PathBuf {
+        self.delegations_dir().join(format!("{id}.revocation.json"))
+    }
+
+    /// Store a signed delegation certificate under its id.
+    ///
+    /// `document` is written verbatim — the bytes the proof covers.
+    pub fn save_delegation(&self, id: &str, document: &str) -> Result<(), IdentityError> {
+        let dir = self.delegations_dir();
+        if !dir.exists() {
+            fs::create_dir_all(&dir)?;
+        }
+        fs::write(self.delegation_path(id), document)?;
+        Ok(())
+    }
+
+    /// Load a delegation certificate by base32 id.
+    pub fn load_delegation(&self, id: &str) -> Result<String, IdentityError> {
+        let path = self.delegation_path(id);
+        if !path.exists() {
+            return Err(IdentityError::DelegationNotFound { id: id.to_string() });
+        }
+        Ok(fs::read_to_string(path)?)
+    }
+
+    /// Is a certificate stored under this id?
+    pub fn delegation_exists(&self, id: &str) -> bool {
+        self.delegation_path(id).exists()
+    }
+
+    /// Every stored certificate, as `(base32 id, document)` pairs.
+    ///
+    /// Unreadable files are skipped rather than failing the whole listing: one
+    /// corrupt certificate should not make `atomic identity agent list`
+    /// unusable.
+    pub fn list_delegations(&self) -> Result<Vec<(String, String)>, IdentityError> {
+        let dir = self.delegations_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // Revocations sit beside certificates and share the id prefix.
+            if !name.ends_with(".json") || name.ends_with(".revocation.json") {
+                continue;
+            }
+            let id = name.trim_end_matches(".json").to_string();
+            if let Ok(document) = fs::read_to_string(entry.path()) {
+                out.push((id, document));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    /// Delete a certificate and any revocation stored alongside it.
+    pub fn delete_delegation(&self, id: &str) -> Result<(), IdentityError> {
+        let path = self.delegation_path(id);
+        if !path.exists() {
+            return Err(IdentityError::DelegationNotFound { id: id.to_string() });
+        }
+        fs::remove_file(path)?;
+        let revocation = self.revocation_path(id);
+        if revocation.exists() {
+            fs::remove_file(revocation)?;
+        }
+        Ok(())
+    }
+
+    /// Store a signed revocation for a delegation.
+    pub fn save_revocation(&self, id: &str, document: &str) -> Result<(), IdentityError> {
+        let dir = self.delegations_dir();
+        if !dir.exists() {
+            fs::create_dir_all(&dir)?;
+        }
+        fs::write(self.revocation_path(id), document)?;
+        Ok(())
+    }
+
+    /// The stored revocation for a delegation, if one exists.
+    pub fn load_revocation(&self, id: &str) -> Result<Option<String>, IdentityError> {
+        let path = self.revocation_path(id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(fs::read_to_string(path)?))
+    }
+
+    /// Is a revocation recorded locally for this delegation?
+    ///
+    /// A local revocation is authoritative for refusing to *use* a delegation,
+    /// but never for believing one is still good: the server is the authority
+    /// on revocations issued elsewhere.
+    pub fn is_revoked_locally(&self, id: &str) -> bool {
+        self.revocation_path(id).exists()
+    }
+
     /// Get the directory for an identity.
     fn identity_dir(&self, identity: &Identity) -> PathBuf {
         // Use a sanitized name + short ID for the directory name
@@ -937,5 +1067,87 @@ mod tests {
 
         store.save(&identity).unwrap();
         assert!(store.exists(&identity.id));
+    }
+}
+
+#[cfg(test)]
+mod delegation_store_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn store() -> (TempDir, IdentityStore) {
+        let dir = TempDir::new().unwrap();
+        let store = IdentityStore::open(dir.path()).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn save_and_load_round_trips_bytes_verbatim() {
+        let (_dir, store) = store();
+        // Deliberately odd whitespace: the proof covers these exact bytes, so
+        // the store must not normalize them.
+        let doc = "{\n  \"@type\" : \"AgentDelegation\"\n}";
+        store.save_delegation("ABC123", doc).unwrap();
+
+        assert!(store.delegation_exists("ABC123"));
+        assert_eq!(store.load_delegation("ABC123").unwrap(), doc);
+    }
+
+    #[test]
+    fn load_missing_delegation_is_not_found() {
+        let (_dir, store) = store();
+        match store.load_delegation("NOPE") {
+            Err(IdentityError::DelegationNotFound { id }) => assert_eq!(id, "NOPE"),
+            other => panic!("expected DelegationNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_skips_revocations_and_sorts() {
+        let (_dir, store) = store();
+        store.save_delegation("BBB", "{}").unwrap();
+        store.save_delegation("AAA", "{}").unwrap();
+        store.save_revocation("AAA", "{}").unwrap();
+
+        let listed: Vec<String> = store
+            .list_delegations()
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(listed, vec!["AAA".to_string(), "BBB".to_string()]);
+    }
+
+    #[test]
+    fn list_on_a_store_with_no_delegations_is_empty_not_an_error() {
+        let (_dir, store) = store();
+        assert!(store.list_delegations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn revocation_is_recorded_and_readable() {
+        let (_dir, store) = store();
+        store.save_delegation("AAA", "{}").unwrap();
+        assert!(!store.is_revoked_locally("AAA"));
+        assert_eq!(store.load_revocation("AAA").unwrap(), None);
+
+        store.save_revocation("AAA", r#"{"revoked":true}"#).unwrap();
+        assert!(store.is_revoked_locally("AAA"));
+        assert_eq!(
+            store.load_revocation("AAA").unwrap().as_deref(),
+            Some(r#"{"revoked":true}"#)
+        );
+    }
+
+    #[test]
+    fn delete_removes_the_revocation_too() {
+        let (_dir, store) = store();
+        store.save_delegation("AAA", "{}").unwrap();
+        store.save_revocation("AAA", "{}").unwrap();
+
+        store.delete_delegation("AAA").unwrap();
+        assert!(!store.delegation_exists("AAA"));
+        assert!(!store.is_revoked_locally("AAA"));
+        assert!(store.delete_delegation("AAA").is_err());
     }
 }

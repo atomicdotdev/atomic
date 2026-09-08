@@ -301,6 +301,20 @@ pub enum CliError {
     #[error("Identity already exists: '{0}'")]
     IdentityAlreadyExists(String),
 
+    /// A delegation is missing, expired, revoked, or does not cover the
+    /// requested operation.
+    ///
+    /// Distinct from [`Self::AuthenticationFailed`]: the caller proved who they
+    /// are, but the certificate authorizing them to act on someone's behalf
+    /// does not (or no longer) permits it. Every one of these is fixable by the
+    /// human who issued the delegation, so the message should say which command
+    /// fixes it.
+    #[error("Delegation error: {message}")]
+    DelegationError {
+        /// What is wrong, and what to run to fix it.
+        message: String,
+    },
+
     // Remote Errors
     /// Failed to connect to or communicate with the remote.
     ///
@@ -668,6 +682,7 @@ impl CliError {
             Self::RemoteError { .. }
             | Self::RemoteNotFound { .. }
             | Self::AuthenticationFailed { .. }
+            | Self::DelegationError { .. }
             | Self::GitError { .. } => 4,
 
             // IO and config errors

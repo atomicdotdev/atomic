@@ -38,6 +38,9 @@
 //! atomic identity whoami
 //! ```
 
+pub mod agent;
+pub mod delegate;
+pub mod delegation;
 pub mod delete;
 pub mod list;
 pub mod new;
@@ -48,6 +51,9 @@ pub mod verify;
 pub mod whoami;
 
 // Re-export command structs
+pub use agent::Agent;
+pub use delegate::Delegate;
+pub use delegation::DelegationCmd;
 pub use delete::Delete;
 pub use list::List;
 pub use new::New;
@@ -235,6 +241,51 @@ pub enum IdentityCommands {
     ///   < file.bin
     /// ```
     Verify(Verify),
+
+    /// Manage agent identities that act on your behalf.
+    ///
+    /// An agent gets a keypair of its own and a certificate you sign saying
+    /// what it may do. Its effective access is always your access intersected
+    /// with that certificate — an agent can never exceed the human who issued
+    /// it, so revoking your access revokes the agent's with it.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic identity agent create claude --can read,record,push --projects acme/*
+    /// atomic identity agent list
+    /// atomic identity agent revoke alice+claude --reason "laptop lost"
+    /// ```
+    #[command(subcommand_help_heading = "Agent identity")]
+    Agent(Agent),
+
+    /// Issue and manage grants — what an agent is allowed to do, and until when.
+    ///
+    /// Issuing a grant is you signing a document: no server round trip, nothing
+    /// to register. That is what makes short, narrow grants the cheap default.
+    ///
+    /// ```text
+    /// # issue — the operation you run often
+    /// atomic identity grant new alice+claude --can record,push --expires 4h
+    ///
+    /// # hand it to an agent with no file to place
+    /// export ATOMIC_DELEGATION=$(atomic identity grant new alice+claude --expires 1h --export)
+    ///
+    /// # on the agent's machine
+    /// atomic identity grant load grant.json
+    /// ```
+    #[command(name = "grant", alias = "delegation")]
+    Grant(DelegationCmd),
+
+    /// Countersign a grant request from a key you do not hold (plumbing).
+    ///
+    /// The same as `grant new`, kept under its own name for the request flow:
+    ///
+    /// ```text
+    /// atomic identity delegate --request request.json --can record,push -o grant.json
+    /// ```
+    #[command(hide = true)]
+    Delegate(Delegate),
 }
 
 impl Command for Identity {
@@ -249,6 +300,9 @@ impl Command for Identity {
             IdentityCommands::Register(cmd) => cmd.run(),
             IdentityCommands::Sign(cmd) => cmd.run(),
             IdentityCommands::Verify(cmd) => cmd.run(),
+            IdentityCommands::Agent(cmd) => cmd.run(),
+            IdentityCommands::Grant(cmd) => cmd.run(),
+            IdentityCommands::Delegate(cmd) => cmd.run(),
         }
     }
 }
@@ -387,6 +441,69 @@ pub fn activate_server_for_identity(identity_name: &str) {
             ));
         }
     }
+}
+
+/// Load a named identity, or the store default when no name is given.
+///
+/// The one place that decides what "no `--identity`" means, so the agent
+/// commands cannot drift from the rest of the CLI on it.
+pub fn load_identity_or_default(
+    store: &atomic_identity::IdentityStore,
+    name: Option<&str>,
+) -> crate::error::CliResult<atomic_identity::Identity> {
+    use crate::error::CliError;
+    match name {
+        Some(name) => store
+            .load_by_name(name)
+            .map_err(|_| CliError::IdentityNotFound(name.to_string())),
+        None => store
+            .get_default()
+            .map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to load default identity: {e}"))
+            })?
+            .ok_or_else(|| {
+                CliError::Internal(anyhow::anyhow!(
+                    "No default identity set. Create one first:\n  \
+                     atomic identity new <name> --email <email> --set-default"
+                ))
+            }),
+    }
+}
+
+/// Record an agent identity on a server profile so hooks use it by default.
+///
+/// Writes `agent_identity` on the named profile, or on the active one when no
+/// name is given. The human binding (`identity`) is left alone: enrollment and
+/// revocation still authenticate as the human.
+pub fn bind_agent_identity(
+    server_override: Option<&str>,
+    agent_name: &str,
+) -> crate::error::CliResult<()> {
+    use crate::error::CliError;
+
+    let mut config = GlobalConfig::load()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load config: {e}")))?;
+
+    let profile = server_override
+        .map(str::to_string)
+        .or_else(|| config.default_server.clone());
+
+    match profile {
+        Some(name) => match config.servers.get_mut(&name) {
+            Some(server) => server.agent_identity = Some(agent_name.to_string()),
+            None => {
+                return Err(CliError::InvalidArgument {
+                    message: format!("No server profile named '{name}'"),
+                })
+            }
+        },
+        // No named profiles yet — the legacy [server] block is the active one.
+        None => config.server.agent_identity = Some(agent_name.to_string()),
+    }
+
+    config
+        .save()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to save config: {e}")))
 }
 
 /// Format an identity type for display.

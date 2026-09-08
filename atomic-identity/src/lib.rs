@@ -101,31 +101,40 @@
 //!
 //! # Delegation
 //!
+//! An agent gets its own keypair; a certificate signed by the human binds the
+//! two and bounds what the agent may do. Effective permission is always the
+//! intersection of the human's own access and the delegation scope — an agent
+//! can never exceed the identity that issued it.
+//!
 //! ```rust
 //! use atomic_identity::{Identity, IdentityType};
-//! use atomic_identity::delegation::{Delegation, DelegationScope, DelegationPermission};
+//! use atomic_identity::delegation::{
+//!     Delegation, DelegationPermission, DelegationScope, ResourceRef,
+//! };
 //!
 //! // Create user and agent identities
 //! let user = Identity::generate("alice");
-//! let agent = Identity::builder("alice-assistant")
+//! let agent = Identity::builder("alice+claude")
 //!     .identity_type(IdentityType::Agent)
 //!     .delegated_by(user.id)
 //!     .build()?;
 //!
-//! // Create a delegation with specific permissions
+//! // Bound the agent to two permissions on one project namespace
 //! let scope = DelegationScope::builder()
 //!     .permission(DelegationPermission::Read)
 //!     .permission(DelegationPermission::Record)
-//!     .repository_pattern("alice/*")
+//!     .project("alice/*")
 //!     .build();
 //!
-//! let delegation = Delegation::new(&user, &agent, scope)?;
+//! let delegation = Delegation::new(&user, &agent, scope);
 //!
-//! // Check if an operation is allowed
 //! assert!(delegation.allows(
 //!     DelegationPermission::Read,
-//!     Some("alice/my-project"),
-//!     None
+//!     &ResourceRef::new().project("alice/my-project"),
+//! ));
+//! assert!(!delegation.allows(
+//!     DelegationPermission::Push,
+//!     &ResourceRef::new().project("alice/my-project"),
 //! ));
 //! # Ok::<(), atomic_identity::IdentityError>(())
 //! ```
@@ -166,6 +175,7 @@ pub use usage::IdentityUsage;
 // Re-export delegation types
 pub use delegation::{
     Delegation, DelegationId, DelegationPermission, DelegationScope, DelegationScopeBuilder,
+    DelegationStatus, ResourceRef,
 };
 
 // Re-export signing types
@@ -266,10 +276,11 @@ mod tests {
             .permission(DelegationPermission::Record)
             .build();
 
-        let delegation = Delegation::new(&user, &agent, scope).unwrap();
+        let delegation = Delegation::new(&user, &agent, scope);
+        let anywhere = ResourceRef::new();
 
-        assert!(delegation.allows(DelegationPermission::Read, None, None));
-        assert!(delegation.allows(DelegationPermission::Record, None, None));
-        assert!(!delegation.allows(DelegationPermission::Push, None, None));
+        assert!(delegation.allows(DelegationPermission::Read, &anywhere));
+        assert!(delegation.allows(DelegationPermission::Record, &anywhere));
+        assert!(!delegation.allows(DelegationPermission::Push, &anywhere));
     }
 }

@@ -145,8 +145,10 @@ pub use http::{HttpRemote, HttpRemoteConfig};
 // Storage management client
 pub use storage::StorageClient;
 pub use storage_types::{
-    ApiError, ApiResponse, CreateProjectRequest, CreateWorkspaceRequest, IdentityInfo, ProjectInfo,
-    ResponseMetadata, UpdateProjectRequest, UpdateWorkspaceRequest, Visibility, WorkspaceInfo,
+    AgentIdentityInfo, ApiError, ApiResponse, CreateProjectRequest, CreateWorkspaceRequest,
+    DelegationInfo, DelegationStatusInfo, EnrollAgentRequest, EpochInfo, IdentityInfo, ProjectInfo,
+    PushDelegationRequest, ResponseMetadata, RevokeDelegationRequest, UpdateProjectRequest,
+    UpdateWorkspaceRequest, Visibility, WorkspaceInfo,
 };
 
 // Protocol types

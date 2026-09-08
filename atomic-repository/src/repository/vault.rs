@@ -678,16 +678,23 @@ impl Repository {
                         &change.path,
                         entry_type,
                         change.content.clone(),
-                        frontmatter_json,
+                        frontmatter_json.clone(),
                     )?;
 
                     // `vault_store` maintains only counts/merkle for Intent
-                    // entries — it does not sync the IntentSummary status/pin. On
-                    // a lapse, mirror the demoted status/reason into the manifest
-                    // so lists and triage stay consistent (as vault_intent_update
-                    // does on its path).
-                    if let Some(new_fm_json) = lapsed_fm {
-                        self.sync_intent_summary_after_lapse(&change.path, &new_fm_json)?;
+                    // entries — it does not sync the IntentSummary status/pin,
+                    // and the manifest summary is what `intent list` and triage
+                    // read.
+                    //
+                    // This used to run only when a lapse rewrote the
+                    // frontmatter, so an ordinary edit to an intent's `status:`
+                    // landed in the entry and nowhere else: `intent show`
+                    // reported the new status while `intent list` and every
+                    // gate kept the stale one, forever. Mirror the effective
+                    // frontmatter on every intent store — the lapse case is
+                    // just the variant where `lapsed_fm` replaced it.
+                    if entry_type == VaultEntryType::Intent {
+                        self.sync_intent_summary_from_frontmatter(&change.path, &frontmatter_json)?;
                     }
 
                     updated_paths.push(change.path.clone());
@@ -790,7 +797,7 @@ impl Repository {
     /// `vault_path`, since the record path has the path, not the intent key.
     /// Best-effort and demote-consistent: it copies whatever the (already
     /// demoted) frontmatter now holds.
-    fn sync_intent_summary_after_lapse(
+    fn sync_intent_summary_from_frontmatter(
         &self,
         path: &str,
         new_frontmatter_json: &str,
@@ -814,6 +821,28 @@ impl Repository {
             if let Some(status) = fm.get("status").and_then(|v| v.as_str()) {
                 summary.status = status.to_string();
             }
+            // Same story as status: the title lives in the frontmatter, and
+            // the summary is what `intent list` and the intents API render.
+            // Unmirrored, an intent that plainly has a title listed with none.
+            if let Some(title) = fm
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                summary.title = title.to_string();
+            }
+            if let Some(priority) = fm
+                .get("priority")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+            {
+                summary.priority = priority.to_string();
+            }
+            if let Some(assignee) = fm.get("assignee").and_then(|v| v.as_str()) {
+                summary.assignee = Some(assignee.to_string());
+            }
             summary.done_substance_hash = fm
                 .get("doneSubstanceHash")
                 .and_then(|v| v.as_str())
@@ -828,6 +857,71 @@ impl Repository {
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod summary_sync_tests {
+    use crate::Repository;
+    use tempfile::tempdir;
+
+    /// An intent's `status:` edited on disk must reach the manifest summary,
+    /// not just the entry.
+    ///
+    /// `intent list`, `intent update` and every triage gate read the summary.
+    /// While only the entry was updated, `intent show` reported the new
+    /// status and `intent list` reported the old one indefinitely — so a
+    /// review marked `done` on disk stayed `backlog` to the gate that had to
+    /// see it.
+    #[test]
+    fn status_edited_on_disk_reaches_the_manifest_summary() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        let path = "intents/demo-s/intent.md";
+        let body = ":::why\nBecause.\n:::";
+        let file = dir.path().join(".vault").join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let write = |status: &str| {
+            std::fs::write(
+                &file,
+                format!("---\nid: DEMO-S\ntitle: Demo {status}\nstatus: {status}\n---\n{body}"),
+            )
+            .unwrap();
+        };
+
+        write("backlog");
+        repo.vault_record_working_copy().unwrap();
+
+        let status_of = || -> String {
+            repo.vault_intent_list(None)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == "DEMO-S")
+                .map(|s| s.status)
+                .unwrap_or_default()
+        };
+        assert_eq!(status_of(), "backlog", "baseline");
+
+        // Edit ONLY the frontmatter status on disk, then sync again.
+        write("done");
+        repo.vault_record_working_copy().unwrap();
+
+        let title_of = || -> String {
+            repo.vault_intent_list(None)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == "DEMO-S")
+                .map(|s| s.title)
+                .unwrap_or_default()
+        };
+        assert_eq!(title_of(), "Demo done", "the title must track the file too");
+        assert_eq!(
+            status_of(),
+            "done",
+            "a frontmatter status edit must reach the summary the gates read"
+        );
     }
 }
 

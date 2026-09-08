@@ -141,6 +141,9 @@ impl Verifies {
 /// A fully-computed intent row.
 struct Row {
     human_key: String,
+    /// The intent's title, carried into `--json` so machine consumers can
+    /// name an intent without a second lookup. The table stays id-only.
+    title: String,
     status: String,
     /// Classification tag, read from the manifest `IntentSummary.kind` (no lift).
     kind: String,
@@ -245,6 +248,7 @@ fn compute_row(
     };
     Row {
         human_key: info.id.clone(),
+        title: info.title.clone(),
         status: info.status.clone(),
         kind,
         attested,
@@ -318,6 +322,10 @@ impl Command for IntentList {
                 .map(|r| {
                     serde_json::json!({
                         "id": r.human_key,
+                        // Omitted entirely before, so every API consumer
+                        // reported an intent's title as null however well
+                        // the frontmatter named it.
+                        "title": r.title,
                         "status": r.status,
                         "kind": r.kind,
                         "attested": r.attested.json(),
