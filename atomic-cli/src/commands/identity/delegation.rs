@@ -45,7 +45,10 @@ pub struct DelegationCmd {
 #[derive(Debug, Subcommand)]
 pub enum DelegationCommands {
     /// Issue a grant to an agent. The operation you run often.
-    New(super::delegate::Delegate),
+    ///
+    /// Boxed because it carries every scope flag and dwarfs the other variants
+    /// — unboxed, each of them would pay for its size.
+    New(Box<super::delegate::Delegate>),
     /// Load a grant issued on another machine.
     #[command(alias = "install")]
     Load(Install),
