@@ -1,13 +1,24 @@
-//! `atomic identity delegate` — mint a certificate (plumbing).
+//! `atomic identity grant new` — issue a grant.
 //!
-//! The step `atomic identity agent create` performs on your behalf, exposed on
-//! its own for the two cases the porcelain cannot cover:
+//! **This is the operation you run often.** Issuing a grant is you signing a
+//! document: no server round trip, nothing to register, nothing to wait for.
+//! That is what makes narrow, short-lived grants the cheap default rather than
+//! a chore — a four-hour grant scoped to one project costs exactly as much as a
+//! year-long one scoped to everything, so there is no reason to reach for the
+//! latter.
 //!
-//! - **Re-scoping** an agent that already exists, without touching its key.
-//! - **Countersigning a request** (`--request`), where the agent generated its
-//!   own key somewhere you will never see it — a CI runner, a hosted agent. The
-//!   request is self-signed by that key, which proves the far end really holds
-//!   it, so you are not delegating to a key nobody has.
+//! The output is designed to be handed to an agent, by hand or by script:
+//!
+//! ```text
+//! atomic identity grant new alice+claude --can record,push --expires 4h
+//! atomic identity grant new alice+claude --expires 1h --export   # base64, for $ATOMIC_DELEGATION
+//! atomic identity grant new alice+claude --expires 1h -o grant.json
+//! ```
+//!
+//! `--request` covers the case where the agent generated its own key somewhere
+//! you will never see it — a CI runner, a hosted agent. The request is
+//! self-signed by that key, proving the far end really holds it, so you are not
+//! talked into granting to a key nobody has.
 
 use std::path::PathBuf;
 
@@ -24,10 +35,10 @@ use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success};
 
-/// Mint a delegation certificate for an agent.
+/// Issue a grant to an agent.
 #[derive(Debug, Parser)]
 pub struct Delegate {
-    /// Agent identity to delegate to. Omit when using `--request`.
+    /// Agent identity to grant to. Omit when using `--request`.
     pub agent: Option<String>,
 
     /// Countersign a self-signed `AgentDelegationRequest` from a file.
@@ -68,12 +79,30 @@ pub struct Delegate {
     #[arg(short, long)]
     pub identity: Option<String>,
 
-    /// Write the certificate here instead of storing it locally.
+    /// Write the grant here instead of storing it locally.
     ///
-    /// The right choice when countersigning a request: the certificate belongs
-    /// on the requesting machine, not this one.
+    /// The right choice when countersigning a request: the grant belongs on the
+    /// requesting machine, not this one.
     #[arg(short, long)]
     pub output: Option<PathBuf>,
+
+    /// Print the grant in its wire form — base64url, one line, nothing else.
+    ///
+    /// The automation path. Pipe it straight into the environment variable the
+    /// agent reads, with no file to place or clean up:
+    ///
+    /// ```text
+    /// export ATOMIC_DELEGATION=$(atomic identity grant new alice+claude --expires 1h --export)
+    /// ```
+    ///
+    /// Implies `--quiet`: nothing but the grant reaches stdout, so command
+    /// substitution captures exactly the value and not a banner with it.
+    #[arg(long, conflicts_with = "output")]
+    pub export: bool,
+
+    /// Suppress the human-readable summary.
+    #[arg(long)]
+    pub quiet: bool,
 }
 
 impl Command for Delegate {
@@ -134,6 +163,24 @@ impl Command for Delegate {
             CliError::Internal(anyhow::anyhow!("Failed to encode certificate: {e}"))
         })?;
 
+        // `--export` writes the wire form and nothing else, so the output is
+        // safe to capture in a shell substitution.
+        if self.export {
+            println!("{}", cert::encode_for_transport(&certificate));
+            if !self.quiet {
+                eprintln!(
+                    "Issued {} to {} ({})",
+                    terms.id.to_urn(),
+                    delegate.name,
+                    terms
+                        .expires
+                        .map(|e| format!("expires {}", e.format("%Y-%m-%d %H:%M UTC")))
+                        .unwrap_or_else(|| "no expiry".to_string())
+                );
+            }
+            return Ok(());
+        }
+
         match &self.output {
             Some(path) if path.as_os_str() == "-" => {
                 println!("{document}");
@@ -144,9 +191,7 @@ impl Command for Delegate {
                 print_success(&format!("Wrote certificate to {}", path.display()));
                 println!("  Delegation    {}", terms.id.to_urn());
                 println!();
-                print_hint(
-                    "Install it on the agent's machine:  atomic identity delegation install <file>",
-                );
+                print_hint("Install it on the agent's machine:  atomic identity grant load <file>");
             }
             None => {
                 store
@@ -170,7 +215,10 @@ impl Command for Delegate {
                     println!("  Expires       {}", expiry.format("%Y-%m-%d"));
                 }
                 println!();
-                print_hint("Enroll it with the server:  atomic identity delegation push");
+                print_hint(
+                    "Ready to use — grants are presented, not registered, so there is \
+                     nothing to tell the server.",
+                );
             }
         }
 

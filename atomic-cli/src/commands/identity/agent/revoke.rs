@@ -1,13 +1,24 @@
-//! `atomic identity agent revoke` — withdraw an agent's authorization.
+//! `atomic identity agent revoke` — withdraw an agent's authority.
 //!
-//! Revocation signs a document rather than just calling an endpoint, so the
-//! withdrawal is itself verifiable and survives being recorded offline. The
-//! local copy is written *first*: from that moment this machine refuses to mint
-//! a token for the agent, whether or not the server can be reached.
+//! Because grants are presented rather than registered, the server holds no
+//! list of what this agent has been issued — so revoking one certificate at a
+//! time cannot be the whole story. Two things happen:
+//!
+//! 1. **The epoch is bumped.** Every grant issued to this agent before now is
+//!    dead, including ones this machine has never seen. This is the part that
+//!    actually stops the agent, and the only mechanism that covers grants
+//!    issued from a laptop you no longer have.
+//! 2. **Known grants are deny-listed**, with a signed revocation each, so the
+//!    withdrawal is individually auditable and provable rather than a bare
+//!    timestamp.
 //!
 //! The identity is kept. Deleting it would orphan the attribution on every
 //! change the agent already recorded, turning a clean audit trail into a set of
 //! unresolvable keys.
+//!
+//! Unlike issuing, revoking **must** reach the server. A credential the holder
+//! possesses cannot prove its own withdrawal, so this is the one operation
+//! where a failed network call leaves real work outstanding — and it says so.
 
 use clap::Parser;
 
@@ -42,6 +53,10 @@ pub struct Revoke {
     pub server: Option<String>,
 
     /// Revoke locally without contacting a server.
+    ///
+    /// Stops *this machine* from using the agent. The server keeps honouring
+    /// every outstanding grant until told, so this is a stopgap, not a
+    /// revocation.
     #[arg(long)]
     pub local: bool,
 }
@@ -131,7 +146,7 @@ impl Revoke {
         }
 
         if !self.local {
-            self.notify_server(&revoked).await;
+            self.notify_server(&agent, &revoked).await;
         }
 
         if self.retire {
@@ -147,34 +162,89 @@ impl Revoke {
         Ok(())
     }
 
+    /// Tell the server: bump the epoch, then deny-list each known grant.
+    ///
+    /// The epoch first, because it is the part that actually stops the agent
+    /// and covers grants nobody has a copy of. Deny-listing the ones we do know
+    /// is the audit trail on top.
     async fn notify_server(
         &self,
+        agent: &atomic_identity::Identity,
         revoked: &[(String, atomic_identity::Identity, serde_json::Value)],
     ) {
-        for (urn, delegator, revocation) in revoked {
-            let client =
-                crate::commands::client::build_apex_client_as(delegator, self.server.as_deref())
-                    .await;
-            let Ok((client, url)) = client else {
-                print_warning(
-                    "Revoked locally, but no server could be reached. The server will keep \
-                     accepting this delegation until it is told.\n  \
-                     Retry with:  atomic identity delegation revoke <urn>",
-                );
-                return;
-            };
+        let Some((_, delegator, _)) = revoked.first() else {
+            return;
+        };
 
+        let Ok((client, url)) =
+            crate::commands::client::build_apex_client_as(delegator, self.server.as_deref()).await
+        else {
+            print_warning(
+                "Revoked locally, but no server could be reached. Outstanding grants stay \
+                 valid until the server is told.\n  \
+                 Retry with:  atomic identity agent revoke <name>",
+            );
+            return;
+        };
+
+        match self.bump_epoch(&client, agent).await {
+            Ok(()) => println!("  Epoch bumped  {url} — every outstanding grant is now dead"),
+            Err(e) => print_warning(&format!(
+                "Could not bump the epoch at {url}: {e}\n  \
+                 Grants this machine has never seen REMAIN VALID until it succeeds.\n  \
+                 Retry with:  atomic identity agent revoke {}",
+                agent.name
+            )),
+        }
+
+        for (urn, _, revocation) in revoked {
             let request = RevokeDelegationRequest {
                 revocation: revocation.clone(),
             };
             match client.revoke_delegation(urn, &request).await {
-                Ok(_) => println!("  Notified      {url}"),
-                Err(e) => print_warning(&format!(
-                    "Revoked locally, but {url} did not accept the revocation: {e}\n  \
-                     The server will keep honouring this delegation until it does.\n  \
-                     Retry with:  atomic identity delegation revoke {urn}"
-                )),
+                Ok(_) => println!("  Deny-listed   {urn}"),
+                Err(e) => print_warning(&format!("Could not deny-list {urn}: {e}")),
             }
         }
+    }
+
+    /// Find the agent's server-side id and bump its epoch.
+    ///
+    /// The lookup is by DID rather than name: names are not unique across
+    /// machines, and bumping the epoch on the wrong agent would silently do
+    /// nothing while reporting success.
+    async fn bump_epoch(
+        &self,
+        client: &atomic_remote::StorageClient,
+        agent: &atomic_identity::Identity,
+    ) -> CliResult<()> {
+        let did = agent.id.to_did();
+        let agents = client
+            .list_agents()
+            .await
+            .map_err(|e| CliError::RemoteError {
+                message: format!("Could not list agents: {e}"),
+                url: None,
+            })?;
+
+        let found = agents
+            .iter()
+            .find(|a| a.did == did)
+            .ok_or_else(|| CliError::RemoteError {
+                message: format!(
+                    "'{}' is not enrolled with this server, so there is no epoch to bump",
+                    agent.name
+                ),
+                url: None,
+            })?;
+
+        client
+            .set_agent_epoch(&found.id.to_string())
+            .await
+            .map(|_| ())
+            .map_err(|e| CliError::RemoteError {
+                message: e.to_string(),
+                url: None,
+            })
     }
 }

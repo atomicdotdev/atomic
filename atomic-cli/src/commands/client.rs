@@ -103,11 +103,31 @@ pub async fn build_apex_client(server_override: Option<&str>) -> CliResult<Stora
     // against the apex URL (the token is portable across the deployment).
     let bearer_token = crate::commands::token::get_token(&apex_url, &identity).await?;
 
-    let client = StorageClient::new(&apex_url, "", &bearer_token).map_err(|e| {
-        CliError::Internal(anyhow::anyhow!("Failed to create storage client: {}", e))
-    })?;
+    let delegation = delegation_for(&identity, &apex_url);
+    let client =
+        StorageClient::with_delegation(&apex_url, "", &bearer_token, delegation.as_deref())
+            .map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to create storage client: {}", e))
+            })?;
 
     Ok(client)
+}
+
+/// The encoded certificate this identity presents, if it is an agent.
+///
+/// Management calls are normally made by a human and this returns `None`. It
+/// exists so the few paths an agent legitimately drives — reading its own
+/// project list, say — carry the certificate too, rather than failing with a
+/// puzzling 401 that says the request was delegated but presented nothing.
+fn delegation_for(identity: &atomic_identity::Identity, server: &str) -> Option<String> {
+    if !identity.identity_type.is_delegated() {
+        return None;
+    }
+    let store = IdentityStore::open_default().ok()?;
+    let resolved = crate::commands::delegation::active_for(&store, identity, Some(server)).ok()?;
+    Some(atomic_canonical::delegation::encode_for_transport(
+        &resolved.document,
+    ))
 }
 
 /// Resolve the active server's apex URL without building a client.
@@ -148,10 +168,13 @@ pub async fn build_apex_client_as(
 ) -> CliResult<(StorageClient, String)> {
     let apex_url = resolve_apex_url(server_override)?;
     let bearer_token = crate::commands::token::get_token(&apex_url, identity).await?;
+    let delegation = delegation_for(identity, &apex_url);
 
-    let client = StorageClient::new(&apex_url, "", &bearer_token).map_err(|e| {
-        CliError::Internal(anyhow::anyhow!("Failed to create storage client: {}", e))
-    })?;
+    let client =
+        StorageClient::with_delegation(&apex_url, "", &bearer_token, delegation.as_deref())
+            .map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to create storage client: {}", e))
+            })?;
 
     Ok((client, apex_url))
 }

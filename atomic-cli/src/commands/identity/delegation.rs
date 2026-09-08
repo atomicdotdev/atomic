@@ -1,10 +1,25 @@
-//! `atomic identity delegation` — certificate plumbing.
+//! `atomic identity grant` — managing grants after they are issued.
 //!
-//! Install a certificate minted elsewhere, push one to a server, list what is
-//! held locally, verify one, or revoke one by id. The porcelain
-//! (`atomic identity agent`) composes these; they exist separately because the
-//! two-machine flows — a CI runner installing a countersigned certificate, an
-//! auditor verifying one out of a clone — only need one step each.
+//! Load one that was issued elsewhere, list what this machine holds, verify
+//! one, revoke one, or publish one for visibility.
+//!
+//! # Loading is the common one
+//!
+//! A grant is issued on the human's machine and used on the agent's. Three ways
+//! across, in rough order of how often you will want them:
+//!
+//! | | |
+//! |---|---|
+//! | `ATOMIC_DELEGATION=<base64>` | nothing to install; the automation path |
+//! | `atomic identity grant load <file>` | a file dropped on the agent's machine |
+//! | `atomic identity grant load -` | piped in over stdin |
+//!
+//! # Publishing is optional
+//!
+//! `publish` sends a grant to the server so it shows up in listings. It is
+//! **not** required to use one: the server verifies a presented grant against
+//! your registered key, so a grant works the moment you sign it. Publish when
+//! you want a dashboard to know, not to make something function.
 
 use std::path::PathBuf;
 
@@ -19,7 +34,7 @@ use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success, print_warning};
 
-/// Delegation certificate management.
+/// Grant management.
 #[derive(Debug, clap::Args)]
 pub struct DelegationCmd {
     #[command(subcommand)]
@@ -29,23 +44,32 @@ pub struct DelegationCmd {
 /// Available delegation subcommands.
 #[derive(Debug, Subcommand)]
 pub enum DelegationCommands {
-    /// Install a certificate minted on another machine.
-    Install(Install),
-    /// Upload a locally held certificate to a server.
-    Push(Push),
-    /// List certificates held on this machine.
+    /// Issue a grant to an agent. The operation you run often.
+    New(super::delegate::Delegate),
+    /// Load a grant issued on another machine.
+    #[command(alias = "install")]
+    Load(Install),
+    /// Publish a grant so it appears in server listings.
+    ///
+    /// Optional: a grant works without this. Grants are presented with each
+    /// request and verified against your registered key, so the server needs no
+    /// advance notice.
+    #[command(alias = "push")]
+    Publish(Push),
+    /// List grants held on this machine.
     List(List),
-    /// Verify a certificate's proof, expiry and revocation.
+    /// Verify a grant's proof, expiry and revocation.
     Verify(Verify),
-    /// Revoke a certificate by id.
+    /// Revoke a grant by id.
     Revoke(Revoke),
 }
 
 impl Command for DelegationCmd {
     fn run(&self) -> CliResult<()> {
         match &self.command {
-            DelegationCommands::Install(c) => c.run(),
-            DelegationCommands::Push(c) => c.run(),
+            DelegationCommands::New(c) => c.run(),
+            DelegationCommands::Load(c) => c.run(),
+            DelegationCommands::Publish(c) => c.run(),
             DelegationCommands::List(c) => c.run(),
             DelegationCommands::Verify(c) => c.run(),
             DelegationCommands::Revoke(c) => c.run(),
@@ -57,10 +81,10 @@ impl Command for DelegationCmd {
 // install
 // ---------------------------------------------------------------------------
 
-/// Install a certificate from a file.
+/// Load a grant from a file or stdin.
 #[derive(Debug, Parser)]
 pub struct Install {
-    /// Path to the certificate, or `-` for stdin.
+    /// Path to the grant, or `-` for stdin.
     #[arg(required = true)]
     pub path: String,
 }
@@ -107,8 +131,9 @@ impl Command for Install {
 
         println!();
         print_hint(
-            "The signature checks out, which proves the certificate was not altered. \
-             That the delegator is who you think is settled by the server's registered key.",
+            "Ready to use. The signature checks out, which proves the grant was not \
+             altered; that the delegator is who you think is settled by the server's \
+             registered key when you use it.",
         );
         Ok(())
     }
@@ -395,8 +420,8 @@ impl Verify {
         };
 
         match client.delegation_status(&delegation.id.to_urn()).await {
-            Ok(status) if status.status == "revoked" => {
-                println!("✗ Revoked                {url} reports this delegation revoked")
+            Ok(status) if status.revoked => {
+                println!("✗ Revoked                {url} reports this grant revoked")
             }
             Ok(_) => println!("✓ Not revoked            (checked {url})"),
             Err(e) => println!("- Revocation             not checked ({e})"),
@@ -408,12 +433,24 @@ impl Verify {
 // revoke
 // ---------------------------------------------------------------------------
 
-/// Revoke a certificate by id.
+/// Revoke a grant by id, or every grant you have issued.
 #[derive(Debug, Parser)]
 pub struct Revoke {
-    /// Delegation id (base32 or URN).
-    #[arg(required = true)]
-    pub id: String,
+    /// Grant id (base32 or URN). Omit when using `--all-mine`.
+    #[arg(required_unless_present = "all_mine")]
+    pub id: Option<String>,
+
+    /// Invalidate **every** grant you have ever issued, to every agent.
+    ///
+    /// The key-compromise button. If your signing key leaks, an attacker can
+    /// mint grants the server has never seen and there is no list to revoke —
+    /// this is the one action that reaches them, because it works on time
+    /// rather than on identifiers.
+    ///
+    /// Your agents stop working until you issue fresh grants. That is the
+    /// intended effect.
+    #[arg(long, conflicts_with = "id")]
+    pub all_mine: bool,
 
     /// Reason, recorded on the signed revocation.
     #[arg(long)]
@@ -442,14 +479,22 @@ impl Revoke {
             CliError::Internal(anyhow::anyhow!("Failed to open identity store: {e}"))
         })?;
 
-        let id = normalize_id(&self.id)?;
-        let raw = load_document(&store, &self.id)?;
+        if self.all_mine {
+            return self.revoke_everything(&store).await;
+        }
+
+        let raw_id = self
+            .id
+            .as_deref()
+            .expect("clap requires one of id/--all-mine");
+        let id = normalize_id(raw_id)?;
+        let raw = load_document(&store, raw_id)?;
         let value: serde_json::Value =
             serde_json::from_str(&raw).map_err(|e| CliError::InvalidArgument {
-                message: format!("stored certificate is not valid JSON: {e}"),
+                message: format!("stored grant is not valid JSON: {e}"),
             })?;
         let delegation = cert::parse(&value).map_err(|e| CliError::DelegationError {
-            message: format!("stored certificate is malformed: {e}"),
+            message: format!("stored grant is malformed: {e}"),
         })?;
 
         let delegator = store
@@ -469,30 +514,83 @@ impl Revoke {
             cert::mint_revocation(&delegator, &keypair, &delegation.id, self.reason.as_deref());
         let document = serde_json::to_string_pretty(&revocation)
             .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to encode: {e}")))?;
+
+        // Local first: from here this machine will not present the grant,
+        // whether or not the network call below succeeds.
         store
             .save_revocation(&id, &document)
             .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to record revocation: {e}")))?;
 
         print_success(&format!("Revoked {}", delegation.id.to_urn()));
 
-        if !self.local {
-            let (client, url) =
-                crate::commands::client::build_apex_client_as(&delegator, self.server.as_deref())
-                    .await?;
-            let request = RevokeDelegationRequest {
-                revocation: revocation.clone(),
-            };
-            match client
-                .revoke_delegation(&delegation.id.to_urn(), &request)
-                .await
-            {
-                Ok(_) => println!("  Notified      {url}"),
-                Err(e) => print_warning(&format!(
-                    "Revoked locally, but {url} did not accept it: {e}\n  \
-                     The server keeps honouring this delegation until it does."
-                )),
-            }
+        if self.local {
+            print_warning("Local only. The server keeps honouring this grant until it is told.");
+            return Ok(());
         }
+
+        let (client, url) =
+            crate::commands::client::build_apex_client_as(&delegator, self.server.as_deref())
+                .await?;
+        let request = RevokeDelegationRequest {
+            revocation: revocation.clone(),
+        };
+        match client
+            .revoke_delegation(&delegation.id.to_urn(), &request)
+            .await
+        {
+            Ok(_) => println!("  Deny-listed   {url}"),
+            Err(e) => print_warning(&format!(
+                "Revoked locally, but {url} did not accept it: {e}\n  \
+                 The grant stays usable against that server until it does.\n  \
+                 Retry with:  atomic identity grant revoke {}",
+                delegation.id.to_urn()
+            )),
+        }
+
+        Ok(())
+    }
+
+    /// Bump the delegator's epoch: everything they have issued, to anyone, dies.
+    ///
+    /// There is nothing to sign per-grant here and nothing to record locally,
+    /// because the whole point is to reach grants this machine has never seen.
+    /// It is purely a server-side statement about time, so unlike a targeted
+    /// revocation it is useless offline — and says so rather than pretending.
+    async fn revoke_everything(&self, store: &IdentityStore) -> CliResult<()> {
+        if self.local {
+            return Err(CliError::InvalidArgument {
+                message: "--all-mine cannot be done locally: it is a statement the server \
+                          makes about every grant you have issued, including ones this \
+                          machine has never seen."
+                    .to_string(),
+            });
+        }
+
+        let delegator = super::load_identity_or_default(store, None)?;
+        let (client, url) =
+            crate::commands::client::build_apex_client_as(&delegator, self.server.as_deref())
+                .await?;
+
+        let result = client
+            .set_delegator_epoch()
+            .await
+            .map_err(|e| CliError::RemoteError {
+                message: format!("Could not set the epoch: {e}"),
+                url: Some(url.clone()),
+            })?;
+
+        print_success(&format!(
+            "Every grant issued by '{}' is now invalid at {url}",
+            delegator.name
+        ));
+        if let Some(at) = result.delegations_valid_from {
+            println!("  Epoch         {}", at.format("%Y-%m-%d %H:%M:%S UTC"));
+        }
+        println!();
+        print_hint(
+            "Your agents will stop working until you issue fresh grants:  \
+             atomic identity grant new <agent>",
+        );
 
         Ok(())
     }

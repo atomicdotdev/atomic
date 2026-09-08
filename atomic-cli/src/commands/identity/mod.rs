@@ -259,19 +259,33 @@ pub enum IdentityCommands {
     #[command(subcommand_help_heading = "Agent identity")]
     Agent(Agent),
 
-    /// Mint a delegation certificate (plumbing).
+    /// Issue and manage grants — what an agent is allowed to do, and until when.
     ///
-    /// `agent create` does this for you. Reach for it directly to re-scope an
-    /// existing agent, or to countersign a request from a key you do not hold:
+    /// Issuing a grant is you signing a document: no server round trip, nothing
+    /// to register. That is what makes short, narrow grants the cheap default.
     ///
     /// ```text
-    /// atomic identity delegate --request request.json --can record,push -o cert.json
+    /// # issue — the operation you run often
+    /// atomic identity grant new alice+claude --can record,push --expires 4h
+    ///
+    /// # hand it to an agent with no file to place
+    /// export ATOMIC_DELEGATION=$(atomic identity grant new alice+claude --expires 1h --export)
+    ///
+    /// # on the agent's machine
+    /// atomic identity grant load grant.json
     /// ```
-    Delegate(Delegate),
+    #[command(name = "grant", alias = "delegation")]
+    Grant(DelegationCmd),
 
-    /// Install, push, list, verify or revoke certificates (plumbing).
-    #[command(name = "delegation")]
-    Delegation(DelegationCmd),
+    /// Countersign a grant request from a key you do not hold (plumbing).
+    ///
+    /// The same as `grant new`, kept under its own name for the request flow:
+    ///
+    /// ```text
+    /// atomic identity delegate --request request.json --can record,push -o grant.json
+    /// ```
+    #[command(hide = true)]
+    Delegate(Delegate),
 }
 
 impl Command for Identity {
@@ -287,8 +301,8 @@ impl Command for Identity {
             IdentityCommands::Sign(cmd) => cmd.run(),
             IdentityCommands::Verify(cmd) => cmd.run(),
             IdentityCommands::Agent(cmd) => cmd.run(),
+            IdentityCommands::Grant(cmd) => cmd.run(),
             IdentityCommands::Delegate(cmd) => cmd.run(),
-            IdentityCommands::Delegation(cmd) => cmd.run(),
         }
     }
 }

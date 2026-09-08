@@ -77,6 +77,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::error::{CanonicalError, Result};
+use crate::jcs;
 use crate::node::CONTEXT_URL;
 use crate::proof;
 
@@ -256,6 +257,74 @@ pub fn verify_self_contained(document: &Value) -> Result<Delegation> {
     let parsed = parse(document)?;
     let key = delegator_public_key(&parsed)?;
     verify(document, &key)
+}
+
+// ---------------------------------------------------------------------------
+// Transport
+// ---------------------------------------------------------------------------
+
+/// The HTTP header a request carries its delegation certificate in.
+///
+/// The certificate travels **with the request** rather than being registered
+/// in advance. It is signed by a key the server already trusts (the
+/// delegator's, from registration), so presenting it is proof enough — the
+/// same shape as JOSE's `x5c`, SPIFFE SVIDs, or a macaroon.
+///
+/// This is what keeps issuing cheap: extending an agent's time or widening its
+/// scope is you signing a new certificate and handing it over, with no server
+/// round trip. Only *withdrawal* needs to reach the server, because a
+/// credential the holder possesses cannot prove its own revocation.
+pub const DELEGATION_HEADER: &str = "Atomic-Delegation";
+
+/// Hard cap on an encoded certificate, enforced **before** parsing.
+///
+/// The verify path now handles caller-supplied JSON on every request, so the
+/// size check has to come first: rejecting a 10MB body after canonicalizing it
+/// is not a rejection. A real certificate is ~1–2KB; 16KB leaves generous room
+/// for long project lists without letting anything interesting through.
+pub const MAX_ENCODED_DELEGATION: usize = 16 * 1024;
+
+/// Encode a certificate for transport: JCS-canonical bytes, base64url, no pad.
+///
+/// Canonical rather than "whatever bytes we happened to store" so the encoding
+/// is deterministic — which is what lets a server cache a verified certificate
+/// by content hash and recognise the same one next request.
+pub fn encode_for_transport(document: &Value) -> String {
+    let canonical = jcs::canonicalize(document);
+    data_encoding::BASE64URL_NOPAD.encode(canonical.as_bytes())
+}
+
+/// Decode a certificate presented in a request header.
+///
+/// Checks the size cap first, then base64, then JSON. Does **not** verify —
+/// [`verify`] against the delegator's registered key is a separate, mandatory
+/// step, and keeping them apart means no call site can accidentally treat a
+/// well-formed certificate as a trusted one.
+pub fn decode_from_transport(encoded: &str) -> Result<Value> {
+    if encoded.len() > MAX_ENCODED_DELEGATION {
+        return Err(CanonicalError::Proof(format!(
+            "delegation is {} bytes, over the {MAX_ENCODED_DELEGATION}-byte limit",
+            encoded.len()
+        )));
+    }
+
+    let bytes = data_encoding::BASE64URL_NOPAD
+        .decode(encoded.trim().as_bytes())
+        .map_err(|e| CanonicalError::Proof(format!("delegation is not valid base64url: {e}")))?;
+
+    serde_json::from_slice(&bytes)
+        .map_err(|e| CanonicalError::Proof(format!("delegation is not valid JSON: {e}")))
+}
+
+/// A stable fingerprint of an encoded certificate, for caching a verified
+/// result without re-running the Ed25519 check on every request.
+///
+/// Keyed on the encoded bytes, so a cache hit means *this exact certificate*
+/// — a tampered one hashes differently and can never collide with a verified
+/// entry. Only ever populated after a full verification passes, so the cached
+/// value is the output of validation, never a substitute for it.
+pub fn transport_fingerprint(encoded: &str) -> String {
+    data_encoding::BASE32_NOPAD.encode(blake3::hash(encoded.as_bytes()).as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -675,6 +744,69 @@ mod tests {
         assert!(
             matches!(err, CanonicalError::Verification(ref m) if m.contains("@id")),
             "expected an @id mismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn transport_round_trips_and_stays_verifiable() {
+        let (alice, _claude, doc) = certificate();
+
+        let encoded = encode_for_transport(&doc);
+        let decoded = decode_from_transport(&encoded).unwrap();
+
+        // The whole premise: a certificate that travelled over the wire still
+        // verifies against the delegator's key.
+        assert!(verify(&decoded, &alice.identity.public_key).is_ok());
+    }
+
+    #[test]
+    fn transport_encoding_is_deterministic() {
+        // Content-hash caching on the server depends on this: the same
+        // certificate must encode identically every time, whatever key order
+        // it happened to be serialized in.
+        let (_alice, _claude, doc) = certificate();
+        let shuffled: Value = serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
+
+        assert_eq!(encode_for_transport(&doc), encode_for_transport(&shuffled));
+        assert_eq!(
+            transport_fingerprint(&encode_for_transport(&doc)),
+            transport_fingerprint(&encode_for_transport(&shuffled))
+        );
+    }
+
+    #[test]
+    fn a_tampered_certificate_survives_transport_but_fails_verification() {
+        // Decoding must not be mistaken for trust — this is why they are two
+        // functions and the size/format check never implies a valid proof.
+        let (alice, _claude, mut doc) = certificate();
+        doc["scope"]["permissions"] = json!(["full"]);
+
+        let decoded = decode_from_transport(&encode_for_transport(&doc)).unwrap();
+        assert!(verify(&decoded, &alice.identity.public_key).is_err());
+    }
+
+    #[test]
+    fn an_oversized_payload_is_refused_before_parsing() {
+        let huge = "A".repeat(MAX_ENCODED_DELEGATION + 1);
+        let err = decode_from_transport(&huge).unwrap_err();
+        assert!(err.to_string().contains("over the"), "{err}");
+    }
+
+    #[test]
+    fn malformed_transport_input_is_an_error_not_a_panic() {
+        assert!(decode_from_transport("not base64url!!").is_err());
+        // Valid base64url, not JSON.
+        assert!(decode_from_transport(&data_encoding::BASE64URL_NOPAD.encode(b"nope")).is_err());
+        assert!(decode_from_transport("").is_err());
+    }
+
+    #[test]
+    fn different_certificates_fingerprint_differently() {
+        let (_a, _b, one) = certificate();
+        let (_c, _d, two) = certificate();
+        assert_ne!(
+            transport_fingerprint(&encode_for_transport(&one)),
+            transport_fingerprint(&encode_for_transport(&two))
         );
     }
 

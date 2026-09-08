@@ -10,6 +10,31 @@ inline.
 
 ---
 
+## 0. The one decision everything else follows from
+
+**Grants are presented, not registered.**
+
+A certificate is signed by a key the server already trusts — yours, from
+registration — so it proves itself the moment you hand it over. The agent
+carries it in a header; the server verifies it on the spot. This is the shape of
+JOSE `x5c`, SPIFFE SVIDs, UCANs and macaroons, and it puts the round trip where
+it belongs:
+
+| Operation | Frequency | Server call? |
+|---|---|---|
+| Register an agent identity | **once** | yes |
+| Issue / extend / widen a grant | **often** | **no** |
+| Revoke a grant, or a whole epoch | rare | yes |
+
+The consequence worth internalising: a four-hour grant scoped to one project
+costs exactly as much to issue as a year-long grant scoped to everything. There
+is no longer a lazy path, so short and narrow becomes the default rather than
+the disciplined choice.
+
+Withdrawal is the asymmetry. A credential the holder possesses cannot prove its
+own revocation, so that is the one thing that must reach the server — and §6a
+covers what happens when it cannot.
+
 ## 1. The shape of the thing
 
 Today an agent has no identity. `atomic-agent/src/identity.rs` derives an
@@ -148,146 +173,104 @@ recorded offline is still provable when it reaches a server later.
 
 ## 3. CLI surface
 
-Porcelain for the common case, plumbing underneath it. Everything lives under
-`atomic identity`, which already owns identity lifecycle; `atomic agent`
-remains about hooks and provenance capture.
+Two verbs, and the split between them is the whole model: **`agent`** is the
+thing you register once, **`grant`** is the thing you issue often.
 
-### 3.1 The 90% case — one command
+### 3.1 Register the agent — once
 
 ```console
-$ atomic identity agent create claude \
-    --agent-type claude-code \
-    --projects acme/api,acme/web \
-    --can read,record,push \
-    --expires 30d
+$ atomic identity agent create claude --agent-type claude-code
 
-Created agent identity  aaron+claude
-  DID           did:atomic:K7QF…   (did:key:z6MkfR…)
-  Delegated by  aaron  (did:atomic:B2XZ…)
-  Can           read, record, push
-  On            acme/api, acme/web
+Created agent identity  alice+claude
+  DID           did:atomic:K7QF…
+  Key           did:key:z6MkfR…
+  Delegated by  alice  (did:atomic:B2XZ…)
   Expires       2026-10-07  (30 days)
 
 Registered with https://atomic.storage
-  Delegation    urn:atomic:delegation:9HTVQ3M8…
-  Bound         ~/.atomic/config.toml → [servers.storage] agent_identity
-
-Hooks will now record as aaron+claude. Run `atomic identity agent show
-aaron+claude` to inspect, `atomic identity agent revoke aaron+claude` to stop it.
 ```
 
-That single command does six things: generates an Ed25519 keypair, creates a
-`Delegated` identity named `<parent>+<agent>`, mints and signs the certificate
-with the parent's key, enrolls the agent key with the bound server, stores the
-certificate locally and remotely, and writes the config binding so hooks pick
-it up without flags.
+Generates a keypair, creates the identity, enrolls it with the server, and
+issues a first grant to get you working. Enrollment is the only part that needs
+the server, and it happens once per agent per machine.
 
-Name and email follow the plus-tag convention already in
-`atomic-agent/src/identity.rs`: identity `aaron+claude`, email
-`aaron+claude@atomic.dev`. Mail still routes to the human; `log` and `blame`
-still read as an agent.
+### 3.2 Issue grants — often, and cheaply
 
-### 3.2 Inspect, renew, revoke
+```console
+$ atomic identity grant new alice+claude \
+    --can record,push --projects acme/api --expires 4h
+```
+
+No server call. You signed a document; the agent can use it immediately. Because
+this is free, the right habit is a short grant scoped to the work at hand rather
+than a standing one scoped to everything.
+
+Three ways to get it to the agent, in rough order of how often you will want
+them:
+
+```console
+# 1. straight into the environment — nothing to install, nothing to clean up
+$ export ATOMIC_DELEGATION=$(atomic identity grant new alice+claude --expires 1h --export)
+
+# 2. a file, for a machine you can drop one on
+$ atomic identity grant new alice+claude --expires 8h -o grant.json
+$ atomic identity grant load grant.json          # on the agent's machine
+
+# 3. piped
+$ atomic identity grant new alice+claude --export | ssh runner 'atomic identity grant load -'
+```
+
+`--export` writes the wire form and nothing else to stdout — the summary goes to
+stderr — so command substitution captures exactly the grant.
+
+### 3.3 Withdraw
+
+```console
+$ atomic identity agent revoke alice+claude --reason "laptop lost"
+```
+
+Bumps the agent's **epoch** (every grant issued before now is dead, including
+ones nobody has a copy of) and deny-lists each grant this machine knows about,
+each with a signed revocation. The epoch is the part that actually stops the
+agent; the deny-list is the audit trail.
+
+For a compromised *signing* key, where an attacker can mint grants you will
+never see:
+
+```console
+$ atomic identity grant revoke --all-mine
+```
+
+### 3.4 Inspect and verify
 
 ```console
 $ atomic identity agent list
-NAME           AGENT         CAN                  ON             EXPIRES   STATUS
-aaron+claude   claude-code   read,record,push     acme/api,+1    in 30d    active
-aaron+ci       agent         record,push          acme/*         in 6d     active
-aaron+gemini   gemini-cli    read                 acme/api       -3d       expired
-
-$ atomic identity agent show aaron+claude
-$ atomic identity agent show aaron+claude --json          # for scripting
-$ atomic identity agent renew aaron+claude --expires 30d  # new cert, same key
-$ atomic identity agent revoke aaron+claude --reason "laptop lost"
-$ atomic identity agent retire aaron+claude               # revoke + delete key
+$ atomic identity agent show alice+claude
+$ atomic identity grant list
+$ atomic identity grant verify <urn> --offline
+$ atomic identity grant publish <urn>       # optional: for dashboards only
 ```
 
-`revoke` keeps the identity and its history (past changes stay attributable and
-verifiable); `retire` additionally deletes the local secret key and asks the
-server to retire the enrollment.
+`verify --offline` matters most: given a clone and the grant, anyone can check
+that a change's `delegation_id` was authorized, with no server. Revocation is
+the only check that needs the network.
 
-### 3.3 Verification, offline
+`publish` is genuinely optional. A grant works the moment you sign it; publishing
+only makes the server able to *show* it.
 
-```console
-$ atomic identity delegation verify urn:atomic:delegation:9HTVQ3M8…
-✓ Proof valid            signed by did:atomic:B2XZ… (aaron)
-✓ Delegate key matches   did:atomic:K7QF… (aaron+claude)
-✓ Not expired            18 days remaining
-✓ Not revoked            (checked https://atomic.storage, 2s ago)
-  Scope                  read, record, push on acme/api, acme/web
-
-$ atomic identity delegation verify --offline <file>   # proof + expiry only
-$ atomic change <hash> -a                              # attestation shows the chain
-```
-
-`--offline` is the important mode: given a clone and the parent's public key,
-anyone can verify that a change claiming `delegation_id` was made by a key the
-human actually authorized, with no server involved. Revocation is the only
-check that needs the network.
-
-### 3.4 Plumbing
-
-Each porcelain step is separately addressable:
+### 3.5 Remote enrollment — a key you never hold
 
 ```console
-atomic identity new aaron+claude --type agent --delegated-by aaron
-atomic identity delegate aaron+claude \
-    --can read,record,push --projects acme/api --expires 30d \
-    --output cert.json
-atomic identity delegation install cert.json
-atomic identity delegation push --server https://atomic.storage
-atomic identity delegation list [--agent aaron+claude] [--include-expired]
-atomic identity delegation revoke urn:atomic:delegation:… [--reason …]
-```
-
-Note `atomic identity new --delegated-by` — the builder already flips
-`IdentityType` to `Delegated` when a delegator is set
-(`atomic-identity/src/identity.rs:450`), but the CLI has no flag to reach it.
-Today `--type delegated` produces an orphan with `delegated_by: None`; that
-combination should become an error pointing at `--delegated-by`.
-
-### 3.5 Remote enrollment — when the human doesn't hold the key
-
-CI runners and hosted agents must generate their own key; the human's laptop
-never sees the secret. Two-step, with proof of possession:
-
-```console
-# on the runner — self-signed request, proves it holds the key
+# on the runner
 $ atomic identity new ci-runner --type agent --request-delegation > request.json
-
-# on the human's machine — inspect, then countersign
-$ atomic identity delegate --request request.json \
-    --can record,push --projects "acme/*" --expires 7d --output cert.json
-
+# on your machine — verifies the self-signature, then countersigns
+$ atomic identity delegate --request request.json --can record,push --expires 7d -o grant.json
 # back on the runner
-$ atomic identity delegation install cert.json
-$ atomic identity delegation push --server https://atomic.storage
+$ atomic identity grant load grant.json
 ```
 
-The request is an `AgentDelegationRequest` node self-signed by the agent key.
-`delegate --request` verifies that self-signature before countersigning, so the
-human cannot be tricked into delegating to a key nobody holds.
-
-### 3.6 Unattended key access
-
-Agent keys are unattended by definition, so a passphrase prompt is not
-available. Resolution order for the agent secret:
-
-1. `--key-file <path>`
-2. `ATOMIC_AGENT_KEY` (base64 secret key — for CI secret stores)
-3. `~/.atomic/identities/<id>/secret.key`, mode `0600`
-
-Worth knowing before relying on this: `IdentityStore::save_secret_key` writes
-`encryption = "none"` on **both** branches — password protection is a `TODO`
-(`atomic-identity/src/store.rs:458`). Every secret key on disk today is
-base64 plaintext at `0600`. The design's answer is not to pretend otherwise but
-to make agent keys *cheap to rotate*: short default expiry (30 days
-interactive, 7 days CI), one-command renew, one-command revoke, and a scope
-that bounds the blast radius to named projects and permissions. Real key
-encryption for *human* parent keys is a separate, still-needed fix.
-
----
+The request is self-signed by the runner's key, which is what stops you being
+talked into granting to a key nobody holds.
 
 ## 4. Local storage
 
@@ -371,65 +354,57 @@ so the audit row is unambiguous and the server never has to guess.
 
 ### 5.2 Endpoints
 
-**New:**
+Apex-scoped: an agent belongs to a *person*, not an org, so one agent works
+across every org that person belongs to.
 
-| Method | Path | Auth | Purpose |
+| Method | Path | Auth | Frequency |
 |---|---|---|---|
-| `POST` | `/identities/agents` | parent | Enroll an agent key + its first delegation |
-| `GET` | `/identities/agents` | parent | List my agents |
-| `DELETE` | `/identities/agents/{id}` | parent | Retire; cascades revoke |
-| `POST` | `/delegations` | parent | Issue or renew a certificate |
-| `GET` | `/delegations` | parent | List, filterable by agent/status |
-| `GET` | `/delegations/{id}` | parent | Fetch one |
-| `POST` | `/delegations/{id}/revoke` | parent | Body is the signed revocation |
-| `GET` | `/delegations/{id}/status` | none | `{active, expired, revoked, revokedAt}` for third-party verification |
+| `POST` | `/identities/agents` | the human | **once per agent** |
+| `GET` | `/identities/agents` | the human | on demand |
+| `GET` | `/identities/agents/{id}` | the human | on demand |
+| `DELETE` | `/identities/agents/{id}` | the human | retire |
+| `POST` | `/identities/agents/{id}/epoch` | the human | **withdrawal** |
+| `DELETE` | `/identities/agents/{id}/epoch` | the human | undo an epoch |
+| `POST` | `/delegations/epoch` | the human | key compromise |
+| `POST` | `/delegations/{id}/revoke` | the human | **withdrawal** |
+| `GET` | `/delegations` | the human | listings |
+| `POST` | `/delegations` | the human | *optional* publish |
+| `GET` | `/delegations/{id}/status` | **none** | third-party audit |
 
-`POST /identities/agents` verification, in order — all five must hold:
+Note what is *absent*: there is no endpoint you must call to issue, extend or
+widen a grant. `POST /delegations` exists only to publish one for visibility,
+and nothing depends on it having been called.
 
-1. The caller's JWT verifies (`kid` = parent's registered key).
-2. The certificate's `proof` verifies against the parent's **registered**
-   public key — not one supplied in the request.
-3. `cert.delegator` is the caller's DID.
-4. `cert.delegate` and `cert.delegateKey` agree, and `cert.delegate` matches
-   the `public_key` field in the body.
-5. `cert.scope.servers` includes this server's canonical URL.
+Every authenticated endpoint requires a **direct** call. An agent enrolling
+agents, issuing itself grants, or clearing its own epoch would make a leaked key
+self-perpetuating — exactly what short expiry exists to bound.
 
-That canonical URL comes from `SERVER_APEX_URL` (defaulting to
-`https://{SERVER_BASE_DOMAIN}`), injected as an axum extension — **never** from
-the request's `Host` header. A client that could choose the value it is compared
-against could enroll a certificate scoped to somewhere else entirely.
+`GET /delegations/{id}/status` is unauthenticated because someone auditing a
+change's `delegation_id` may have a clone and no account. It returns a single
+boolean — `revoked` — and deliberately nothing else: not scope, not parties, not
+expiry, and not whether the id was ever issued. An unknown id and a live one
+answer identically, so it cannot be used to enumerate anything.
 
-On success the server writes an identity row with `kind = 'agent'` and
-`parent_identity_id` set — **no tenant, no subdomain, no `/register`**.
-
-**Changed:**
-
-| What | Change | Why |
-|---|---|---|
-| `POST /register` | Reject when the identity is `agent` or `delegated`; return an error naming `atomic identity agent create` | Today *any* identity that registers mints a tenant. An agent key must never own one. |
-| JWT verifier | Accept and enforce `act` / `dlg` per §5.1 | The delegation path |
-| Resolver cache | Delegated tokens bypass the verified-token cache entirely | The cache cannot see a revocation or a suspended delegator, and both are re-checked per request. Revocation taking effect *now* is worth one indexed lookup. |
-| Authorization | Add the intersection step in §5.3 | The whole point |
-| `GET /orgs/{slug}/members` | `OrgMemberInfo` gains `kind` and `parent_identity_id`; agents render nested under their human | So "who is in this org" answers honestly. Enrichment fields (`name`, `public_key`, `status`, `email`) already exist from #149. |
-| Push audit | Record `acting_identity_id`, `on_behalf_of_identity_id`, `delegation_id` | Attribution has to survive on the server, not just in the change header |
-
-**Deliberately unchanged:** `GrantSubjectType` stays `{User, Team, Everyone}`.
-Agents are not grant subjects in v1. Adding `Agent` there would let someone
-grant an agent access its human lacks, which breaks invariant 1 and doubles the
-revocation surface. Narrowing is what the scope is for.
+**Changed:** `POST /register` refuses a key already enrolled as an agent.
+Registration mints a tenant named for the identity, so an agent getting one
+would hand a delegated key its own top-level namespace that outlives any
+withdrawal.
 
 ### 5.3 The authorization algebra
 
 For an agent request against a resource:
 
 ```
-allow  ⟺  delegation.status == active
-      ∧  now < delegation.expires
-      ∧  delegation.delegate == jwt.kid
-      ∧  delegation.delegator == jwt.sub
-      ∧  server_url ∈ delegation.scope.servers
-      ∧  parent_has(delegation.delegator, resource, action)   ← existing check
-      ∧  scope_allows(delegation.scope, resource, action)     ← new
+allow  ⟺  certificate verifies against the delegator's REGISTERED key
+      ∧  certificate.delegate == jwt.kid
+      ∧  certificate.@id == jwt.dlg          (when the token names one)
+      ∧  certificate.delegator == jwt.sub
+      ∧  server_url ∈ certificate.scope.servers
+      ∧  now < certificate.expires
+      ∧  certificate.@id ∉ deny-list
+      ∧  certificate.issued ≥ agent epoch, and ≥ delegator epoch
+      ∧  parent_has(delegator, resource, action)     ← existing check
+      ∧  scope_allows(certificate, resource, action) ← narrowing only
 ```
 
 `scope_allows` matches the **server's** notion of the resource — the workspace
@@ -441,7 +416,19 @@ A useful consequence: nothing needs to happen when a human leaves an org. Their
 grants disappear, the intersection empties, and every agent they issued goes
 inert on the next request.
 
----
+### 5.4 Cost per request
+
+One extra Ed25519 verify (~50µs) and one indexed lookup for the deny-list plus
+both epochs, combined into a single query. Delegated tokens deliberately bypass
+the resolver cache: it cannot see a revocation or a suspended delegator, and
+both are precisely what an operator revoking an agent expects to take effect
+*now* rather than when a token ages out.
+
+The new attack surface is real and worth naming: the server now canonicalizes
+and verifies caller-supplied JSON on every delegated request. It is bounded by a
+hard 16KB cap checked **before** parsing — rejecting a large payload after
+canonicalizing it is not a rejection — and the JCS path wants a fuzz target
+before this carries production traffic.
 
 ## 6. How we validate that an identity belongs to who
 
@@ -469,25 +456,65 @@ is what makes attribution in a clone meaningful rather than a claim the server
 makes on your behalf. The server verifies it once at enrollment against the key
 it already has on record, and trusts its own stored row thereafter.
 
-**4 — The authorization is still live.** Expiry is in the signed document;
-revocation is checked server-side per request. Effective permission is the
-intersection from §5.3, so authority is re-derived from the human's *current*
-grants on every call rather than frozen at issue time.
+**4 — The authorization is still live.** Three independent facts, checked
+server-side on every request: the expiry inside the signed document, the
+deny-list, and both epochs. Effective permission is then re-derived from the
+human's *current* grants rather than frozen at issue time.
 
-**5 — The work stays attributable.** Every change the agent records carries
-`attributedTo` = agent DID, `actedOnBehalfOf` = human DID, and
-`delegation_id` in the envelope; the attestation is signed by the agent's key.
-`atomic change <hash> -a` and `atomic identity delegation verify --offline`
-re-walk links 2–4 from a clone months later.
+## 6a. Withdrawal, and why it is the only thing that must reach the server
 
-### Threat table
+A grant proves itself. A withdrawal cannot — you cannot prove a negative with a
+document the holder is carrying. Every bearer-credential system has this
+asymmetry, which is why X.509 has CRLs and OCSP.
+
+So the burden inverts, which is the right way round: the frequent operation is
+free, and the rare one costs a call. Three mechanisms, in increasing blast
+radius:
+
+| | Reaches | Use when |
+|---|---|---|
+| **Expiry** | that certificate | always — the backstop that needs nothing |
+| **Deny-list** | one certificate, by id | you know which grant to kill |
+| **Epoch** | every grant issued before an instant | you don't, or there is no list |
+
+The epoch is not garnish. Because grants are never registered, **the server
+cannot enumerate what is outstanding** — so "revoke everything for this agent"
+has no list to walk. A timestamp says it instead. It is also the honest answer
+when a laptop goes missing and nobody knows what it issued.
+
+Two scopes:
+
+- **Per agent** (`identities.delegations_valid_from` on the agent). The routine
+  tool. Narrowing a scope means issuing a tighter grant *and* bumping this, so
+  the old broader one dies immediately instead of lingering until its own
+  expiry. `atomic identity agent revoke` does both.
+- **Per delegator** (the same column on the human). The key-compromise button:
+  if your signing key leaks, an attacker can mint grants nobody knows exist, and
+  this is the only action that reaches them. `atomic identity grant
+  revoke --all-mine`.
+
+An epoch can be cleared, which brings unexpired grants back. That is safe
+because each is still bounded by its own expiry, and it means bumping one in
+error is recoverable rather than permanent.
+
+### What this costs you
+
+Revocation is now the operation with a hard network dependency. `agent revoke`
+says so explicitly when it cannot reach the server, and distinguishes the two
+outcomes: grants this machine knows about are refused locally straight away,
+while grants it has never seen **remain valid** until the epoch bump lands.
+That is stated in the output rather than left for someone to discover.
+
+### Threat table### Threat table
 
 | Threat | What stops it |
 |---|---|
-| Agent secret key read off disk | Scope limits it to named projects and permissions; short expiry; one-command revoke. It cannot be widened without the human's key. |
+| Agent secret key read off disk | Scope limits it to named projects and permissions; short expiry; one-command revoke. It cannot be widened without the human's key. Because issuing is free, the grant it holds should be hours old and narrow, not a standing year-long one. |
 | Agent pushes to a project outside its scope | Server matches scope against the request path, not a client claim |
 | Forged delegation certificate | Requires the parent's private key — the proof covers the JCS bytes including delegate, scope, and expiry |
-| Stale certificate replayed after revocation | Revocation checked per request; `expires` caps the window even against a server that missed the revocation |
+| Stale certificate replayed after revocation | Deny-list and both epochs checked per request; `expires` caps the window regardless |
+| **Human's signing key compromised** | The attacker can mint grants the server has never seen and there is no list to revoke. The delegator epoch is the answer, and the only one — it works on time rather than identifiers |
+| **Oversized or malformed certificate in the header** | 16KB cap enforced before parsing; decode and verify are separate functions so a well-formed certificate is never mistaken for a trusted one |
 | Agent escalates its own permissions | No grants are ever written for agent subjects; effective = parent ∩ scope |
 | Agent mints itself a tenant | `/register` rejects agent and delegated identity types |
 | Agent work silently attributed to the human | Distinct DIDs in the change header and the server audit row; `blame` shows `claude+60f5` |
@@ -503,7 +530,7 @@ re-walk links 2–4 from a clone months later.
 | `atomic-identity` | `delegation.rs` | Add `servers`, rename `repository_patterns`→`projects`, `view_patterns`→`views`. Remove `signing_data()` — signing moves to `atomic-canonical` so there is one format. Keep the scope/permission types and `allows()`. |
 | | `store.rs` | Delegation persistence: save/load/list/delete. Agent-key resolution order (§3.6). |
 | | `identity.rs` | `software_agent` label in `IdentityMetadata`; a `parent()` accessor. |
-| `atomic-canonical` | `delegation.rs` *(new)* | `AgentDelegation`, `AgentDelegationRequest`, `DelegationRevocation`: mint, verify, JCS + `eddsa-jcs-2022` via the existing `proof` module. |
+| `atomic-canonical` | `delegation.rs` *(new)* | `AgentDelegation`, `AgentDelegationRequest`, `DelegationRevocation`: mint, verify, JCS + `eddsa-jcs-2022` via the existing `proof` module. Plus the wire encoding (`encode_for_transport`, the 16KB cap, the header name) shared by both ends. |
 | | `prov.rs` | A keyed agent's `@id` becomes a real `did:key` instead of `urn:atomic:agent:<slug>` — the module comment at line 27 already anticipates exactly this. `actedOnBehalfOf` keeps pointing at the person. |
 | `atomic-agent` | `identity.rs` | Prefer a delegated agent identity when one is bound; sign with *its* key. Keep the plus-tag author name and fall back to today's behavior when no agent identity exists. |
 | | `envelope.rs` | Populate `delegation_id` — the field and its builder exist and are never called. |
@@ -515,33 +542,40 @@ re-walk links 2–4 from a clone months later.
 | | `commands/identity/register.rs` | Refuse agent/delegated identities with a pointer to the agent flow |
 | | `commands/push/` | Pre-flight the delegation locally so scope and expiry failures are actionable before the network call — the pattern #93 established for credentials |
 | `atomic-config` | `lib.rs` | `agent_identity` on server profiles |
-| **atomic-storage** | — | §5.2 endpoints, §5.1 JWT rule, §5.3 intersection, agent-aware member listing, audit columns |
+| **atomic-storage** | — | §5.2 endpoints, §5.1 JWT rule, §5.3 algebra, deny-list + epochs, per-request certificate verification, audit rows |
 
 ---
 
 ## 7a. What implementation changed
 
-Four things moved from the design as written. Each is called out where it
-applies above; collected here so a reader comparing the two does not have to
-hunt:
+Six things moved from the design as first written. Each is called out where it
+applies; collected here so a reader comparing the two does not have to hunt.
 
-1. **`delegatorKey` added to the certificate** (§2). Without it a certificate
-   cannot be verified by a machine that holds only the agent's key, which
-   contradicted the offline-verification property the whole attribution story
-   rests on.
-2. **Certificates live inside the identity store root** (§4), not beside it, so
+1. **Grants are presented, not registered** (§0). The first cut made the server
+   the registry: a certificate had to be POSTed before an agent could use it.
+   That put the round trip on the frequent operation and made short-lived
+   narrow grants *more* work than a standing broad one — precisely backwards.
+2. **The deny-list and epochs replaced per-grant rows as the authorization
+   source** (§6a). Once grants are not registered, the server cannot enumerate
+   them, so withdrawal needed a primitive that works on time rather than
+   identifiers.
+3. **`delegatorKey` added to the certificate** (§2). Without it a certificate
+   cannot be verified by a machine holding only the agent's key — a CI runner,
+   or anyone auditing a clone — which contradicted the offline-verification
+   property the attribution story rests on. It also turned out to be what makes
+   the *server's* lookup work without a registered row.
+4. **Certificates live inside the identity store root** (§4), not beside it, so
    a store is one directory.
-3. **`DelegationScope` gained `workspaces`** alongside `projects`. The server's
-   object hierarchy is org → workspace → project, and grants attach at workspace
-   level; a scope that could not name a workspace would force enumerating every
-   project under it.
-4. **Permission mapping fails closed** (§5.3). Every server `Permission` with no
-   obvious delegated meaning — deletes, tenant administration, identity
+5. **`DelegationScope` gained `workspaces`**. The server's hierarchy is
+   org → workspace → project and grants attach at workspace level; a scope that
+   could not name one would force enumerating every project under it.
+6. **Permission mapping fails closed** (§5.3). Every server `Permission` with
+   no obvious delegated meaning — deletes, tenant administration, identity
    management — maps to `Admin`, which nothing but an explicit `--can admin`
    grants. The trap avoided is `--can push` quietly also meaning "may delete
    this project".
 
-Two things the design specified and the implementation deliberately kept:
+Two things the design specified and the implementation kept:
 
 - **Agents are not grant subjects.** `GrantSubjectType` is untouched.
 - **`sub` inverts on delegated tokens.** The human is the effective subject and

@@ -146,7 +146,7 @@ pub use http::{HttpRemote, HttpRemoteConfig};
 pub use storage::StorageClient;
 pub use storage_types::{
     AgentIdentityInfo, ApiError, ApiResponse, CreateProjectRequest, CreateWorkspaceRequest,
-    DelegationInfo, DelegationStatusInfo, EnrollAgentRequest, IdentityInfo, ProjectInfo,
+    DelegationInfo, DelegationStatusInfo, EnrollAgentRequest, EpochInfo, IdentityInfo, ProjectInfo,
     PushDelegationRequest, ResponseMetadata, RevokeDelegationRequest, UpdateProjectRequest,
     UpdateWorkspaceRequest, Visibility, WorkspaceInfo,
 };

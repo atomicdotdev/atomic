@@ -407,7 +407,18 @@ pub async fn attach_identity(
     match crate::commands::token::get_token(&server, &identity).await {
         Ok(jwt) => {
             log::debug!("Attaching Bearer JWT for identity '{}'", identity_name);
-            config.with_header("Authorization", format!("Bearer {}", jwt))
+            let config = config.with_header("Authorization", format!("Bearer {}", jwt));
+
+            // An agent also presents the certificate it acts under. The server
+            // verifies it per request against the delegator's registered key,
+            // which is what lets a grant be issued without telling the server
+            // first.
+            match delegation_header(&store, &identity, &server) {
+                Some(encoded) => {
+                    config.with_header(atomic_canonical::delegation::DELEGATION_HEADER, encoded)
+                }
+                None => config,
+            }
         }
         Err(e) => {
             // Non-fatal: a server that doesn't require auth still works for
@@ -415,6 +426,32 @@ pub async fn attach_identity(
             // clear 401 from the server.
             log::debug!("Could not obtain JWT for '{}': {}", identity_name, e);
             config
+        }
+    }
+}
+
+/// The encoded certificate an agent identity should present, if any.
+///
+/// `None` for a human — they have no certificate and need none. `None` too when
+/// an agent has no usable certificate, because the resulting 401 from the
+/// server ("carries no certificate") names the problem better than anything we
+/// could raise here, and a read against a public project may not need one at
+/// all.
+fn delegation_header(store: &IdentityStore, identity: &Identity, server: &str) -> Option<String> {
+    if !identity.identity_type.is_delegated() {
+        return None;
+    }
+
+    match crate::commands::delegation::active_for(store, identity, Some(server)) {
+        Ok(resolved) => Some(atomic_canonical::delegation::encode_for_transport(
+            &resolved.document,
+        )),
+        Err(e) => {
+            log::debug!(
+                "No usable delegation for agent '{}' against {server}: {e}",
+                identity.name
+            );
+            None
         }
     }
 }

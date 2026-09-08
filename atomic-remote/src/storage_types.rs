@@ -146,9 +146,15 @@ pub struct AgentIdentityInfo {
     pub software_agent: Option<String>,
     pub status: String,
     pub created_at: DateTime<Utc>,
-    /// The delegations issued to this agent, newest first.
+    /// Grants issued to this agent before this instant are rejected.
     #[serde(default)]
-    pub delegations: Vec<DelegationInfo>,
+    pub delegations_valid_from: Option<DateTime<Utc>>,
+    /// Grants a client chose to **publish**, newest first.
+    ///
+    /// Advisory and usually incomplete — publishing is optional, so this is a
+    /// visibility aid and never the set of valid grants.
+    #[serde(default)]
+    pub published_delegations: Vec<DelegationInfo>,
 }
 
 /// A delegation certificate as the server holds it.
@@ -159,16 +165,24 @@ pub struct DelegationInfo {
     pub id: String,
     pub delegator_identity_id: uuid::Uuid,
     pub delegate_identity_id: uuid::Uuid,
-    /// `active` | `expired` | `revoked`.
+    /// `active` | `expired` | `revoked` | `superseded`.
     pub status: String,
     pub issued_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
-    pub revoked_at: Option<DateTime<Utc>>,
-    pub revocation_reason: Option<String>,
     /// The signed certificate itself, verbatim. Returned so a client can
     /// re-verify rather than trust the parsed fields above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificate: Option<serde_json::Value>,
+}
+
+/// The result of setting or clearing an epoch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EpochInfo {
+    pub identity_id: uuid::Uuid,
+    /// `None` means the epoch was cleared — grants are governed by their own
+    /// expiry alone again.
+    pub delegations_valid_from: Option<DateTime<Utc>>,
 }
 
 /// Public status of a delegation, for third-party verification.
@@ -179,9 +193,12 @@ pub struct DelegationInfo {
 #[serde(rename_all = "camelCase")]
 pub struct DelegationStatusInfo {
     pub id: String,
-    pub status: String,
-    pub expires_at: Option<DateTime<Utc>>,
-    pub revoked_at: Option<DateTime<Utc>>,
+    /// Whether the grant is on the server's deny-list.
+    ///
+    /// Deliberately the only field: the endpoint is unauthenticated, so an
+    /// unknown id and a live one answer identically and nothing about scope,
+    /// parties or expiry leaks.
+    pub revoked: bool,
 }
 
 // ---------------------------------------------------------------------------

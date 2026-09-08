@@ -27,6 +27,18 @@ use serde_json::Value;
 
 use crate::error::{CliError, CliResult};
 
+/// Environment variable carrying an encoded grant.
+///
+/// The delivery mechanism for anywhere there is no interactive step and no
+/// config to write: CI runners, containers, a sandbox handed a fresh short-lived
+/// grant each session. Set it and the agent presents that certificate, with
+/// nothing else to install.
+///
+/// It takes precedence over the store, because a caller that set it meant it —
+/// and because the common shape is a runner given a grant minted seconds ago
+/// while the store may hold something older.
+pub const DELEGATION_ENV: &str = "ATOMIC_DELEGATION";
+
 /// A stored certificate together with everything the CLI knows about it.
 #[derive(Debug, Clone)]
 pub struct ResolvedDelegation {
@@ -90,6 +102,12 @@ pub fn active_for(
     identity: &Identity,
     server: Option<&str>,
 ) -> CliResult<ResolvedDelegation> {
+    // A grant handed over out of band wins. It is the mechanism for machines
+    // with no store to populate, and the freshest thing the caller has.
+    if let Some(resolved) = from_environment(identity)? {
+        return Ok(resolved);
+    }
+
     let all = load_for_delegate(store, identity)?;
 
     if all.is_empty() {
@@ -160,6 +178,68 @@ pub fn active_for(
     };
 
     Err(CliError::DelegationError { message })
+}
+
+/// A grant supplied through [`DELEGATION_ENV`], verified and checked to belong
+/// to this agent.
+///
+/// Returns `Err` rather than `Ok(None)` when the variable is set but unusable.
+/// Falling back to the store there would be worse than failing: the operator
+/// asked for a specific grant, and silently using a different one is how you
+/// get an agent acting under a scope nobody intended.
+fn from_environment(identity: &Identity) -> CliResult<Option<ResolvedDelegation>> {
+    let Ok(encoded) = std::env::var(DELEGATION_ENV) else {
+        return Ok(None);
+    };
+    let encoded = encoded.trim();
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+
+    let document = cert::decode_from_transport(encoded).map_err(|e| CliError::DelegationError {
+        message: format!("{DELEGATION_ENV} is not a usable grant: {e}"),
+    })?;
+
+    let delegation =
+        cert::verify_self_contained(&document).map_err(|e| CliError::DelegationError {
+            message: format!("The grant in {DELEGATION_ENV} does not verify: {e}"),
+        })?;
+
+    if delegation.delegate != identity.id.to_did() {
+        // Compare DIDs, and say so. Display names are not unique — two agents
+        // called `alice+claude` on different machines are different keys, and
+        // an error reading "issued to 'alice+claude', not 'alice+claude'" tells
+        // the reader nothing.
+        return Err(CliError::DelegationError {
+            message: format!(
+                "The grant in {DELEGATION_ENV} was issued to a different key.\n  \
+                 Grant is for  {} ({})\n  \
+                 Running as    {} ({})",
+                delegation.delegate_name,
+                delegation.delegate,
+                identity.name,
+                identity.id.to_did()
+            ),
+        });
+    }
+
+    if delegation.is_expired() {
+        return Err(CliError::DelegationError {
+            message: format!(
+                "The grant in {DELEGATION_ENV} expired {}. Ask for a fresh one.",
+                delegation
+                    .expires
+                    .map(|e| e.format("on %Y-%m-%d %H:%M UTC").to_string())
+                    .unwrap_or_else(|| "some time ago".to_string())
+            ),
+        });
+    }
+
+    Ok(Some(ResolvedDelegation {
+        delegation,
+        document,
+        status: DelegationStatus::Active,
+    }))
 }
 
 /// Pre-flight a specific operation before paying for a network round trip.
@@ -268,7 +348,84 @@ mod tests {
             .build()
     }
 
+    /// The automation path: a runner is handed a grant in the environment and
+    /// needs nothing installed.
     #[test]
+    #[serial_test::serial]
+    fn a_grant_in_the_environment_is_used() {
+        let f = fixture();
+        let terms = Delegation::new(&f.human, &f.agent, scope_for("https://atomic.storage"))
+            .expires_in(Duration::days(1));
+        let doc = cert::mint(&f.human, &f.human_key, &terms);
+
+        std::env::set_var(DELEGATION_ENV, cert::encode_for_transport(&doc));
+        let found = active_for(&f.store, &f.agent, Some("https://atomic.storage"));
+        std::env::remove_var(DELEGATION_ENV);
+
+        let found = found.unwrap();
+        assert_eq!(found.delegation.id, terms.id);
+        // Nothing was ever written to the store.
+        assert!(f.store.list_delegations().unwrap().is_empty());
+    }
+
+    /// A grant issued to someone else must not be usable just because it is in
+    /// the environment.
+    #[test]
+    #[serial_test::serial]
+    fn a_grant_for_another_agent_is_refused() {
+        let f = fixture();
+        let other = Identity::builder("alice+gemini")
+            .identity_type(IdentityType::Agent)
+            .delegated_by(f.human.id)
+            .build()
+            .unwrap();
+        let terms = Delegation::new(&f.human, &other, DelegationScope::full());
+        let doc = cert::mint(&f.human, &f.human_key, &terms);
+
+        std::env::set_var(DELEGATION_ENV, cert::encode_for_transport(&doc));
+        let result = active_for(&f.store, &f.agent, None);
+        std::env::remove_var(DELEGATION_ENV);
+
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("was issued to"), "{err}");
+    }
+
+    /// A set-but-broken variable must fail loudly rather than falling back to
+    /// the store — silently using a different grant than the one asked for is
+    /// how an agent ends up with a scope nobody intended.
+    #[test]
+    #[serial_test::serial]
+    fn a_broken_environment_grant_does_not_fall_back() {
+        let f = fixture();
+        issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
+
+        std::env::set_var(DELEGATION_ENV, "not-a-grant");
+        let result = active_for(&f.store, &f.agent, Some("https://atomic.storage"));
+        std::env::remove_var(DELEGATION_ENV);
+
+        assert!(
+            result.is_err(),
+            "should not have silently used the stored grant"
+        );
+    }
+
+    /// An empty variable is treated as unset, so `ATOMIC_DELEGATION=` in a
+    /// shell profile does not break an otherwise working setup.
+    #[test]
+    #[serial_test::serial]
+    fn an_empty_environment_variable_is_ignored() {
+        let f = fixture();
+        issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
+
+        std::env::set_var(DELEGATION_ENV, "");
+        let result = active_for(&f.store, &f.agent, Some("https://atomic.storage"));
+        std::env::remove_var(DELEGATION_ENV);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn finds_the_certificate_for_this_agent() {
         let f = fixture();
         issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
@@ -279,6 +436,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn ignores_certificates_belonging_to_another_agent() {
         let f = fixture();
         issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
@@ -293,6 +451,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn no_certificate_says_how_to_issue_one() {
         let f = fixture();
         let err = active_for(&f.store, &f.agent, None).unwrap_err();
@@ -302,6 +461,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn an_expired_certificate_says_renew_not_issue() {
         let f = fixture();
         // expires_in with a negative duration puts expiry in the past.
@@ -314,6 +474,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn a_locally_revoked_certificate_is_refused() {
         let f = fixture();
         let id = issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
@@ -324,6 +485,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn a_certificate_for_another_server_is_refused_with_the_scope_shown() {
         let f = fixture();
         issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
@@ -338,6 +500,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn a_tampered_certificate_is_skipped_not_trusted() {
         let f = fixture();
         let id = issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
@@ -354,6 +517,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn permission_check_names_the_missing_permission() {
         let f = fixture();
         issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
@@ -380,6 +544,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn permission_check_names_the_out_of_scope_project() {
         let f = fixture();
         issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
@@ -398,6 +563,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn the_freshest_certificate_wins() {
         let f = fixture();
         issue(&f, DelegationScope::read_only(), Duration::days(30));

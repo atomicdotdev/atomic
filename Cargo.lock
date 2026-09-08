@@ -300,6 +300,7 @@ name = "atomic-remote"
 version = "0.17.1"
 dependencies = [
  "anyhow",
+ "atomic-canonical",
  "atomic-core",
  "atomic-objects",
  "bytes",
