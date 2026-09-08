@@ -63,9 +63,27 @@ pub struct Delegate {
     #[arg(long)]
     pub views: Option<String>,
 
-    /// Bind the certificate to a server URL. Repeat for several.
+    /// Bind the grant to a server URL. Repeat for several.
+    ///
+    /// Defaults to the active server profile, so a grant is bound to the
+    /// deployment you are working against without having to say so. A grant
+    /// minted for staging must not authenticate against production, and an
+    /// unbound grant is valid everywhere — so binding has to be what happens
+    /// when you say nothing.
     #[arg(long = "server-url")]
     pub server_urls: Vec<String>,
+
+    /// Issue a grant valid against **any** server.
+    ///
+    /// Only for a grant you genuinely intend to be portable across
+    /// deployments. It removes the check that stops a staging grant working
+    /// against production.
+    #[arg(long, conflicts_with = "server_urls")]
+    pub any_server: bool,
+
+    /// Server profile whose URL the grant is bound to.
+    #[arg(long)]
+    pub server: Option<String>,
 
     /// Lifetime (`30d`, `12h`, `2w`).
     #[arg(long)]
@@ -229,8 +247,9 @@ impl Command for Delegate {
 impl Delegate {
     fn build_scope(&self) -> CliResult<DelegationScope> {
         let mut builder = DelegationScope::builder().permissions(parse_permissions(&self.can)?);
-        for url in &self.server_urls {
-            builder = builder.server(url.clone());
+
+        for url in self.bound_servers()? {
+            builder = builder.server(url);
         }
         for pattern in self
             .projects
@@ -260,6 +279,31 @@ impl Delegate {
             builder = builder.max_changes(max);
         }
         Ok(builder.build())
+    }
+
+    /// Which servers this grant is valid against.
+    ///
+    /// Explicit `--server-url` wins; otherwise the active profile, so the safe
+    /// thing happens by default. `--any-server` is the deliberate opt-out, and
+    /// an unresolvable profile is *not* silently treated as "any" — that would
+    /// turn a misconfiguration into a grant broader than anyone asked for.
+    fn bound_servers(&self) -> CliResult<Vec<String>> {
+        if self.any_server {
+            return Ok(Vec::new());
+        }
+        if !self.server_urls.is_empty() {
+            return Ok(self.server_urls.clone());
+        }
+
+        match crate::commands::client::resolve_apex_url(self.server.as_deref()) {
+            Ok(url) => Ok(vec![url]),
+            Err(_) => Err(CliError::InvalidArgument {
+                message: "No server configured, so this grant cannot be bound to one.\n  \
+                          Pass --server-url <url>, or --any-server if you really mean a \
+                          grant valid against every deployment."
+                    .to_string(),
+            }),
+        }
     }
 
     /// Verify a self-signed request and turn it into a delegate identity.

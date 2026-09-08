@@ -828,6 +828,19 @@ mod tests {
         assert!(!scope.allows_project("other/api"));
     }
 
+    /// An unbound scope is valid against every deployment. That is correct
+    /// behaviour for the type — but it is why the CLI binds to the active
+    /// server unless told otherwise, rather than leaving this empty.
+    #[test]
+    fn an_unbound_scope_is_valid_everywhere() {
+        let scope = DelegationScope::builder()
+            .permission(DelegationPermission::Push)
+            .build();
+        assert!(scope.servers.is_empty());
+        assert!(scope.allows_server("https://atomic.storage"));
+        assert!(scope.allows_server("https://staging.example"));
+    }
+
     #[test]
     fn test_scope_server_is_exact_not_glob() {
         let scope = DelegationScope::builder()

@@ -60,7 +60,7 @@ pub enum DelegationCommands {
     List(List),
     /// Verify a grant's proof, expiry and revocation.
     Verify(Verify),
-    /// Revoke a grant by id.
+    /// Revoke a grant by id, or every grant you have issued.
     Revoke(Revoke),
 }
 

@@ -1,10 +1,27 @@
-//! `atomic identity agent renew` — a fresh certificate for the same key.
+//! `atomic identity agent renew` — a fresh grant carrying the previous scope.
+//!
+//! A convenience over `atomic identity grant new`: it reads the agent's current
+//! scope and reissues it with a new expiry, so you do not have to retype
+//! `--can` and `--projects` to extend something that was already right.
 //!
 //! Renewal deliberately does *not* touch the keypair. Rotating the key would
 //! mean re-enrolling with every server and would break attribution for work
-//! already recorded; what actually expires is the authorization, so that is
-//! what gets replaced. The old certificate stays on disk as history and the new
-//! one supersedes it by being newer.
+//! already recorded; what expires is the authorization, so that is what gets
+//! replaced.
+//!
+//! Like every other issuance, this reaches no server. The new grant is usable
+//! the moment it is signed. `--publish` sends it up for visibility only.
+//!
+//! # Renewal does not withdraw the old grant
+//!
+//! The previous certificate stays valid until its own expiry. That is fine when
+//! extending — the old one is strictly narrower in time — but it means renewing
+//! with a *tighter* scope does not take the wider one away. To make a narrowing
+//! bite immediately, bump the epoch:
+//!
+//! ```text
+//! atomic identity agent revoke <agent>     # bumps the epoch, then reissue
+//! ```
 
 use chrono::Duration;
 use clap::Parser;
@@ -42,13 +59,16 @@ pub struct Renew {
     #[arg(long)]
     pub projects: Option<String>,
 
-    /// Server profile to push the renewed certificate to.
+    /// Server profile to publish to, with `--publish`.
     #[arg(long)]
     pub server: Option<String>,
 
-    /// Renew locally without contacting a server.
+    /// Also publish the new grant so it appears in server listings.
+    ///
+    /// Optional and off by default: a grant works the moment it is signed, and
+    /// publishing only makes the server able to *show* it.
     #[arg(long)]
-    pub local: bool,
+    pub publish: bool,
 }
 
 impl Command for Renew {
@@ -153,9 +173,10 @@ impl Renew {
             );
         }
         println!("  Key           unchanged — nothing to re-enroll");
+        println!("  Ready to use  no server call needed");
 
-        if !self.local {
-            self.push(&delegator, &certificate).await?;
+        if self.publish {
+            self.publish_grant(&delegator, &certificate).await?;
         }
 
         Ok(())
@@ -173,7 +194,12 @@ impl Renew {
         Ok(scope)
     }
 
-    async fn push(&self, delegator: &Identity, certificate: &serde_json::Value) -> CliResult<()> {
+    /// Publish for visibility. Never required for the grant to work.
+    async fn publish_grant(
+        &self,
+        delegator: &Identity,
+        certificate: &serde_json::Value,
+    ) -> CliResult<()> {
         let (client, url) =
             crate::commands::client::build_apex_client_as(delegator, self.server.as_deref())
                 .await?;
@@ -183,16 +209,17 @@ impl Renew {
         };
         match client.push_delegation(&request).await {
             Ok(_) => {
-                println!("  Pushed to     {url}");
+                println!("  Published to  {url}");
                 Ok(())
             }
             Err(e) => {
-                // The certificate is already valid and stored; a server that
-                // has not heard about it yet is a follow-up, not a failure that
-                // should discard the renewal.
+                // Publishing is cosmetic — the grant is already signed and
+                // usable — so a server that will not take it is a warning, not
+                // something that should discard the renewal.
                 print_warning(&format!(
-                    "Renewed locally, but {url} did not accept it: {e}\n  \
-                     Retry with:  atomic identity delegation push"
+                    "Renewed, but {url} would not list it: {e}\n  \
+                     The grant still works; only the listing is missing.\n  \
+                     Retry with:  atomic identity grant publish"
                 ));
                 Ok(())
             }

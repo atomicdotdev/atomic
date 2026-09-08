@@ -505,7 +505,7 @@ outcomes: grants this machine knows about are refused locally straight away,
 while grants it has never seen **remain valid** until the epoch bump lands.
 That is stated in the output rather than left for someone to discover.
 
-### Threat table### Threat table
+### Threat table
 
 | Threat | What stops it |
 |---|---|
@@ -585,44 +585,64 @@ Two things the design specified and the implementation kept:
 
 ## 8. Deferred
 
+- **A fuzz target for the JCS path.** The server now canonicalizes
+  caller-supplied JSON on every delegated request. The 16KB pre-parse cap bounds
+  it, but this is the one genuinely new attack surface and it should be fuzzed
+  before production traffic.
+- **Integration tests for the route handlers.** They need live Postgres and
+  there is no harness for authenticated end-to-end requests. This matters more
+  under the presented-grant model than it did under registration: the
+  authorization path went from a row lookup to a seven-step verification.
+- **Caching verified certificates by content hash.** `transport_fingerprint`
+  exists for it and the encoding is deterministic to make it possible, but
+  nothing caches yet. One Ed25519 verify per request is cheap; measure before
+  adding a cache with its own invalidation questions.
 - **`maxChanges`** is in the certificate and enforced client-side. Server-side
-  it needs a counter per delegation, which is a write on a hot path. Ship it as
-  a soft limit reported in `agent show`, harden later if it earns its keep.
-- **Agents as grant subjects.** Explicitly excluded (§5.2). If a use case
+  it needs a counter per grant, which is a write on a hot path. Ship it as a
+  soft limit reported in `agent show`, harden later if it earns its keep.
+- **Agents as grant subjects.** Explicitly excluded (§5.3). If a use case
   appears for an agent that should reach something its human cannot, it needs
   its own design — it is not a small extension of this one.
 - **Nested delegation** (agent delegating to a sub-agent). The certificate
   shape allows it; the intersection rule makes it safe in principle. No use case
-  yet, and the revocation semantics get considerably harder.
+  yet, and the revocation semantics get considerably harder — an epoch on an
+  intermediate would need to cascade.
 
 ---
 
 ## 9. Migration
 
-Nothing breaks. An identity with no delegation behaves exactly as today: JWT
-with no `act` claim, plus-tagged author on the human key, `delegation_id` null.
-`atomic identity agent create` is opt-in per agent per machine. Servers that
-have not shipped §5.2 reject `POST /identities/agents` with 404, which the CLI
+Nothing breaks. An identity with no grant behaves exactly as today: a JWT with
+no `act` claim, no `Atomic-Delegation` header, a plus-tagged author on the
+human's key, `delegation_id` null. A human's token is byte-identical to the
+pre-agent format, with a test pinning that, so every deployed CLI is unaffected.
+
+`atomic identity agent create` is opt-in per agent per machine. A server that
+has not shipped §5.2 rejects `POST /identities/agents` with 404, which the CLI
 reports as "this server does not support agent identities yet" — the same
-degradation pattern used for the pre-v1.4.0 tenancy-mode field in
-`register.rs`.
+degradation pattern used for the pre-v1.4.0 tenancy-mode field in `register.rs`.
+
+The two repositories must land in order: the server compiles against the
+client's `atomic-canonical`, so the client change has to reach `release` before
+the server's CI can pass. Any future change to the shared certificate contract
+will have the same red window on the server side.
 
 ---
 
 ## 10. Decisions taken, and one still open
 
-1. **Default expiry: 30 days.** `agent::DEFAULT_EXPIRY_DAYS`, applied by both
-   `agent create` and `agent renew`. It is the compromise the design leans on:
-   agent secret keys sit unencrypted at `0600`, so the defence against a leaked
-   one is that it stops working soon and costs one command to replace.
-2. **Certificate verification cadence: verify at write, trust the row at read.**
-   The proof is checked at enrollment and renewal against the registered key;
-   per-request authorization re-parses the stored certificate for its scope but
-   does not re-verify the signature. Re-verifying every request would buy
-   defence against a compromised database at the cost of an Ed25519 verify per
-   call — and an attacker who can write that table can also write the
-   `identities` row the signature would be checked against, so it buys less than
-   it looks like.
+1. **Default expiry: 30 days — but that is a ceiling, not a target.**
+   `agent::DEFAULT_EXPIRY_DAYS` applies when you say nothing. Since issuing
+   costs no server call, the intended habit is far shorter: hours, scoped to the
+   work at hand. The default exists so `agent create` produces something usable,
+   not as a recommendation.
+2. **Verification cadence: every request.** The signature is re-checked against
+   the delegator's registered key on each delegated call. An earlier revision
+   verified once at registration and trusted the stored row thereafter, which
+   stopped making sense the moment grants stopped being registered — there is no
+   row to trust. The cost is one Ed25519 verify (~50µs), and it buys the
+   property the whole model rests on: a grant is only as good as the signature
+   presented with it.
 3. **`jti` replay cache: still open.** Whether atomic-storage caches `jti` for
    the token TTL was not determined, and this work did not add one. If it does
    not, that is a pre-existing gap for humans as much as agents — a 5-minute

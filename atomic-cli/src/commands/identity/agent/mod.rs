@@ -108,17 +108,24 @@ pub enum AgentCommands {
     /// Show one agent in full: identity, certificate, scope, status.
     Show(Show),
 
-    /// Issue a fresh certificate for an existing agent key.
+    /// Reissue an agent's current scope with a new expiry.
     ///
-    /// The key does not change, so nothing has to be re-enrolled anywhere —
-    /// only the certificate's expiry and (optionally) its scope.
+    /// A convenience over `atomic identity grant new`: it carries the existing
+    /// `--can` and `--projects` forward so you need only say how long. The key
+    /// does not change, so nothing is re-enrolled, and like every issuance it
+    /// reaches no server.
     Renew(Renew),
 
-    /// Withdraw an agent's delegation.
+    /// Withdraw an agent's authority.
     ///
-    /// Signs a revocation, records it locally, and tells the server. The
-    /// identity and its past work stay — attribution for changes already
-    /// recorded must not evaporate because a key was retired.
+    /// Bumps the agent's epoch — killing every grant issued to it so far,
+    /// including ones this machine has never seen — and deny-lists the grants
+    /// it does know, each with a signed revocation.
+    ///
+    /// Unlike issuing, this must reach the server: a credential the holder
+    /// possesses cannot prove its own withdrawal. The identity and its past
+    /// work stay, so attribution for changes already recorded does not
+    /// evaporate.
     Revoke(Revoke),
 }
 
