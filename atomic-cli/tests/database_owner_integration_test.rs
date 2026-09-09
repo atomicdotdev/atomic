@@ -11,6 +11,64 @@ use atomic_repository::{ChangeStore, Repository, DEFAULT_CACHE_CAPACITY};
 use serde_json::Value;
 use tempfile::TempDir;
 
+// Bound child processes so a platform-specific IPC regression produces a
+// useful failure instead of occupying a CI runner indefinitely. Drain output
+// concurrently so a full pipe cannot prevent the child from exiting.
+fn wait_for_output(mut child: Child, operation: &str) -> Output {
+    fn drain<R: Read + Send + 'static>(stream: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut stream) = stream {
+                stream.read_to_end(&mut bytes).expect("read child output");
+            }
+            let _ = sender.send(bytes);
+        });
+        receiver
+    }
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait().expect("inspect child process") {
+            break (status, false);
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill timed-out child");
+            break (child.wait().expect("reap timed-out child"), true);
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout
+        .recv_timeout(Duration::from_secs(2))
+        .expect("child stdout stayed open");
+    let stderr = stderr
+        .recv_timeout(Duration::from_secs(2))
+        .expect("child stderr stayed open");
+    assert!(
+        !timed_out,
+        "{operation} timed out after 30s; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+fn command_output(command: &mut Command) -> Output {
+    let operation = format!("{command:?}");
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn command");
+    wait_for_output(child, &operation)
+}
+
 fn owner_command(repository: &std::path::Path, operation: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_atomic"));
     command
@@ -48,10 +106,7 @@ fn spawn_owner_with_failpoint(
 }
 
 fn run_owner(repository: &std::path::Path, operation: &str) -> Output {
-    owner_command(repository, operation)
-        .arg("--json")
-        .output()
-        .expect("run database-owner command")
+    command_output(owner_command(repository, operation).arg("--json"))
 }
 
 fn wait_for_ping(repository: &std::path::Path, child: &mut Child) -> Value {
@@ -81,16 +136,16 @@ fn wait_for_ping(repository: &std::path::Path, child: &mut Child) -> Value {
 }
 
 fn reserve(repository: &std::path::Path) -> Value {
-    let output = owner_command(repository, "reserve")
-        .arg("--session-id")
-        .arg("owner-service-test")
-        .arg("--turn")
-        .arg("7")
-        .arg("--now")
-        .arg("1700000000")
-        .arg("--json")
-        .output()
-        .expect("reserve provenance turn");
+    let output = command_output(
+        owner_command(repository, "reserve")
+            .arg("--session-id")
+            .arg("owner-service-test")
+            .arg("--turn")
+            .arg("7")
+            .arg("--now")
+            .arg("1700000000")
+            .arg("--json"),
+    );
     assert!(
         output.status.success(),
         "reservation failed: {}",
@@ -100,14 +155,14 @@ fn reserve(repository: &std::path::Path) -> Value {
 }
 
 fn run_lifecycle(repository: &std::path::Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_atomic"))
-        .arg("agent")
-        .arg("lifecycle")
-        .args(args)
-        .arg("--no-color")
-        .current_dir(repository)
-        .output()
-        .expect("run lifecycle command")
+    command_output(
+        Command::new(env!("CARGO_BIN_EXE_atomic"))
+            .arg("agent")
+            .arg("lifecycle")
+            .args(args)
+            .arg("--no-color")
+            .current_dir(repository),
+    )
 }
 
 fn run_hook(repository: &std::path::Path, verb: &str, payload: &[u8]) -> Output {
@@ -134,7 +189,7 @@ fn run_agent_hook(repository: &std::path::Path, agent: &str, verb: &str, payload
         .expect("hook stdin")
         .write_all(payload)
         .expect("write hook payload");
-    child.wait_with_output().expect("wait for hook process")
+    wait_for_output(child, &format!("{agent} {verb}"))
 }
 
 #[test]
@@ -256,18 +311,15 @@ fn concurrent_hooks_commit_lossless_envelopes_without_output_or_drops() {
         String::from_utf8_lossy(&turn_start.stderr)
     );
 
-    let reservation = owner_command(&repository, "reserve")
-        .args([
-            "--session-id",
-            "hook-concurrent",
-            "--turn",
-            "1",
-            "--now",
-            "1700000000",
-            "--json",
-        ])
-        .output()
-        .unwrap();
+    let reservation = command_output(owner_command(&repository, "reserve").args([
+        "--session-id",
+        "hook-concurrent",
+        "--turn",
+        "1",
+        "--now",
+        "1700000000",
+        "--json",
+    ]));
     assert!(reservation.status.success());
     let running_generation = serde_json::from_slice::<Value>(&reservation.stdout).unwrap()["turn"]
         ["generation"]
@@ -1085,9 +1137,7 @@ fn owner_election_commit_reconnect_and_crash_restart() {
     let first_pid = first_health["pid"].as_u64().unwrap();
     assert_eq!(first_health["protocol_version"], 1);
 
-    let duplicate = owner_command(&repository, "serve")
-        .output()
-        .expect("run duplicate owner");
+    let duplicate = command_output(&mut owner_command(&repository, "serve"));
     assert!(!duplicate.status.success());
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("another database owner"));
 
@@ -1110,12 +1160,8 @@ fn owner_election_commit_reconnect_and_crash_restart() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn second bootstrap contender");
-    let first_bootstrap = first_bootstrap
-        .wait_with_output()
-        .expect("wait for first bootstrap contender");
-    let second_bootstrap = second_bootstrap
-        .wait_with_output()
-        .expect("wait for second bootstrap contender");
+    let first_bootstrap = wait_for_output(first_bootstrap, "first bootstrap contender");
+    let second_bootstrap = wait_for_output(second_bootstrap, "second bootstrap contender");
     assert!(first_bootstrap.status.success());
     assert!(second_bootstrap.status.success());
     let restarted_health: Value = serde_json::from_slice(&first_bootstrap.stdout).unwrap();
