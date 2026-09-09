@@ -624,10 +624,20 @@ impl TurnOrchestrator {
         outcome: &TurnRecordOutcome,
         event: &TurnEvent,
     ) -> AgentResult<()> {
+        self.commit_recorded_turn_events(session_id, session.turn_count.max(1), event, outcome)?;
+        self.checkpoint_turn_provenance(session_id, session, &[outcome.hash], event)
+    }
+
+    pub(super) fn checkpoint_turn_provenance(
+        &self,
+        session_id: &str,
+        session: &AgentSession,
+        change_hashes: &[atomic_core::types::Hash],
+        event: &TurnEvent,
+    ) -> AgentResult<()> {
         use atomic_core::change::session::SessionTurn;
         use atomic_core::types::{Base32, Hash};
 
-        self.commit_recorded_turn_events(session_id, session.turn_count.max(1), event, outcome)?;
         let Some(sink) = self.journal_sink.as_ref() else {
             log::debug!(
                 "Skipping provenance finalization for {} without an owner journal sink",
@@ -651,7 +661,7 @@ impl TurnOrchestrator {
             agent_name: session.agent_name.clone(),
             agent_display_name: session.agent_display_name.clone(),
             agent_vendor: session.agent_vendor.clone(),
-            change_hashes: vec![outcome.hash],
+            change_hashes: change_hashes.to_vec(),
             previous_provenance,
             plan_id: session
                 .managed_run

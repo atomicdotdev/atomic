@@ -148,6 +148,13 @@ impl TurnOrchestrator {
 
         let mut session = self.load_or_create_session(session_id, &event)?;
 
+        let has_changes = self.has_working_copy_changes();
+        if !session.is_turn_active() && session.turn_count > 0 && !has_changes {
+            // A retried Stop after successful publication must not create a
+            // second empty checkpoint for the same completed interaction.
+            return Ok(DispatchResult::new(session_id, session.phase));
+        }
+
         // Extract model/provider from the TurnEnd event's raw_json.
         // OpenCode sends model and provider in every stop payload.
         // This is the last chance to capture the info before recording,
@@ -182,14 +189,21 @@ impl TurnOrchestrator {
         let pending_turn_number = session.turn_count.saturating_add(1);
         self.commit_turn_completion_events(&session, &event, pending_turn_number)?;
 
-        // The terminal event is durably journaled even for an empty turn. The
-        // graph/checkpoint path below remains conditional until intent 108.
-        if !self.has_working_copy_changes() {
-            log::info!(
-                "Turn end for session {} — no changes detected, skipping record",
-                session_id
-            );
-            return Ok(DispatchResult::new(session_id, phase::Phase::Idle));
+        // A read-only turn still owns a journal turn number and immutable
+        // provenance. Finalize it before advancing the session so the next
+        // prompt cannot be deduplicated against this turn's goal/response IDs.
+        if !has_changes {
+            if self.watcher.is_active() {
+                let _ = self.watcher.cancel_turn().await;
+            }
+            session.end_turn();
+            self.checkpoint_turn_provenance(session_id, &session, &[], &event)?;
+            session.clear_current_prompt();
+            let result =
+                phase::transition(session.phase, Event::TurnEnd, TransitionContext::default());
+            phase::apply_common_actions(&mut session, &result);
+            self.session_store.save(&session)?;
+            return Ok(DispatchResult::new(session_id, session.phase));
         }
 
         // Release the watcher if it was active (best-effort, ignore errors)
@@ -301,6 +315,8 @@ impl TurnOrchestrator {
                                 turn_number,
                                 session_id
                             );
+                            self.checkpoint_turn_provenance(session_id, &session, &[], &event)?;
+                            session.clear_current_prompt();
                         }
                         Err(e) => {
                             log::error!(

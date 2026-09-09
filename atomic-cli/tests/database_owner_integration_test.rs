@@ -111,10 +111,14 @@ fn run_lifecycle(repository: &std::path::Path, args: &[&str]) -> Output {
 }
 
 fn run_hook(repository: &std::path::Path, verb: &str, payload: &[u8]) -> Output {
+    run_agent_hook(repository, "claude-code", verb, payload)
+}
+
+fn run_agent_hook(repository: &std::path::Path, agent: &str, verb: &str, payload: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_atomic"))
         .arg("agent")
         .arg("hooks")
-        .arg("claude-code")
+        .arg(agent)
         .arg(verb)
         .arg("--foreground")
         .arg("--no-color")
@@ -131,6 +135,81 @@ fn run_hook(repository: &std::path::Path, verb: &str, payload: &[u8]) -> Output 
         .write_all(payload)
         .expect("write hook payload");
     child.wait_with_output().expect("wait for hook process")
+}
+
+#[test]
+fn read_only_turn_does_not_reuse_its_goal_for_the_next_turn_across_agents() {
+    for (agent, prompt_verb) in [
+        ("codex", "user-prompt-submit"),
+        ("claude-code", "user-prompt-submit"),
+        ("opencode", "user-prompt"),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let repository = temp.path().join("repo");
+        drop(Repository::init(&repository).unwrap());
+        let hook = |verb: &str, payload: Value| {
+            let output = run_agent_hook(
+                &repository,
+                agent,
+                verb,
+                &serde_json::to_vec(&payload).unwrap(),
+            );
+            assert!(
+                output.status.success(),
+                "{agent} {verb}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        hook(
+            "session-start",
+            serde_json::json!({"session_id":"read-then-write"}),
+        );
+        hook(
+            prompt_verb,
+            serde_json::json!({"session_id":"read-then-write","prompt":"Inspect without edits"}),
+        );
+        hook(
+            "stop",
+            serde_json::json!({"session_id":"read-then-write","last_assistant_message":"Inspected","response":"Inspected"}),
+        );
+        // Retry the same terminal hook before the next user prompt.
+        hook(
+            "stop",
+            serde_json::json!({"session_id":"read-then-write","last_assistant_message":"Inspected","response":"Inspected"}),
+        );
+        hook(
+            prompt_verb,
+            serde_json::json!({"session_id":"read-then-write","prompt":"Implement the second request"}),
+        );
+        std::fs::write(repository.join("second.txt"), b"second request\n").unwrap();
+        hook(
+            "stop",
+            serde_json::json!({"session_id":"read-then-write","last_assistant_message":"Implemented","response":"Implemented"}),
+        );
+        hook(
+            "stop",
+            serde_json::json!({"session_id":"read-then-write","last_assistant_message":"Implemented","response":"Implemented"}),
+        );
+        assert!(run_owner(&repository, "shutdown").status.success());
+        wait_for_shutdown(&repository);
+
+        let repo = Repository::open(&repository).unwrap();
+        let (_, turns) = repo.get_session_ledger("read-then-write").unwrap().unwrap();
+        assert_eq!(
+            turns.last().unwrap().goal.as_deref(),
+            Some("Implement the second request"),
+            "{agent}: a read-only turn must not contaminate the next turn"
+        );
+        assert_eq!(
+            turns.len(),
+            2,
+            "{agent}: read-only provenance must remain queryable"
+        );
+        assert!(turns[0].change_hashes.is_empty());
+        assert_eq!(turns[0].goal.as_deref(), Some("Inspect without edits"));
+        assert_eq!(turns[1].previous_provenance, Some(turns[0].provenance_hash));
+        assert_eq!(turns[1].change_hashes.len(), 1);
+    }
 }
 
 fn wait_for_shutdown(repository: &std::path::Path) {
@@ -176,6 +255,24 @@ fn concurrent_hooks_commit_lossless_envelopes_without_output_or_drops() {
         "turn start failed: {}",
         String::from_utf8_lossy(&turn_start.stderr)
     );
+
+    let reservation = owner_command(&repository, "reserve")
+        .args([
+            "--session-id",
+            "hook-concurrent",
+            "--turn",
+            "1",
+            "--now",
+            "1700000000",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(reservation.status.success());
+    let running_generation = serde_json::from_slice::<Value>(&reservation.stdout).unwrap()["turn"]
+        ["generation"]
+        .as_u64()
+        .unwrap();
 
     let append_started = Instant::now();
     let mut workers = Vec::new();
@@ -265,9 +362,15 @@ fn concurrent_hooks_commit_lossless_envelopes_without_output_or_drops() {
         saw_terminal |= matches!(&envelope.event, ProvenanceJournalEvent::Terminal { .. });
         assert_eq!(envelope.session_id, "hook-concurrent");
         assert_eq!(envelope.turn_number, 1);
-        assert_eq!(envelope.generation, turn.generation);
+        // Finalization fences writers by advancing the stored generation;
+        // immutable events retain the generation acknowledged during append.
+        assert_eq!(envelope.generation, running_generation);
     }
     assert!(saw_reasoning && saw_response && saw_todo && saw_terminal);
+    assert!(matches!(
+        turn.state,
+        atomic_repository::redb_change_store::ProvenanceTurnState::Completed
+    ));
 }
 
 #[test]
