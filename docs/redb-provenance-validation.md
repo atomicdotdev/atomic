@@ -34,6 +34,24 @@ to idle. Repeated Stop events after completion do not create extra checkpoints.
 The regression test covers Codex, Claude Code, and OpenCode, asserting separate
 goals, linked provenance hashes, and the absence of a change in the first turn.
 
+### Windows owners retained hook output pipes
+
+Windows CI hung in every owner integration test. Bounded subprocess diagnostics
+showed that the calling processes had already exited, but their stdout pipes
+remained open. The detached owner had inherited the caller's original standard
+handles even though its own standard streams were redirected to NUL.
+
+The owner bootstrap now clears `HANDLE_FLAG_INHERIT` on the caller's standard
+handles before spawning. Explicit standard-stream inheritance remains available
+through Rust's normal handle duplication. This follows the Windows behavior
+of [Rust's process spawning](https://github.com/rust-lang/rust/issues/161158).
+After this fix, the Windows suite no longer hung and seven owner tests passed.
+The remaining four failures exposed a test shutdown race: a failed ping and a
+fixed 100 ms sleep did not guarantee that redb had closed. Tests now wait for
+the owner election lock to be released, which follows runtime/database cleanup.
+Child commands and output collection have deadlines so future failures remain
+diagnosable.
+
 ### Existing checks needed two small corrections
 
 - The database owner lock now explicitly uses `truncate(false)`, satisfying
@@ -76,7 +94,7 @@ that it eventually published the expected session ledger.
   writers of `pristine.redb`. The owner service separately owns `changes.redb`.
 - Harness checks invoke actual hook CLI processes with fixture payloads and
   transcripts. They do not run paid model sessions or validate every host UI.
-- This run covers macOS ARM64. Linux, Windows, and the Rust 1.90 MSRV need CI
-  validation before release. The draft PR targets `dev` so the existing CI workflow can validate the
-  complete owner-journal cutover together with these fixes.
+- The local totals above cover macOS ARM64. PR CI additionally exercises
+  Linux, Windows, and the Rust 1.90 MSRV. Release readiness requires the checks
+  on the final code revision to pass; current results are tracked on the PR.
 - redb 5.0 evaluation and Git–Atomic bridge integration remain separate tasks.

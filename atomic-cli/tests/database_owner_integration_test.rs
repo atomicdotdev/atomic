@@ -8,6 +8,7 @@ use atomic_agent::{ProvenanceAccumulator, ProvenanceJournalEnvelope, ProvenanceJ
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::redb_change_store::RedbChangeStore;
 use atomic_repository::{ChangeStore, Repository, DEFAULT_CACHE_CAPACITY};
+use fs2::FileExt;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -272,14 +273,30 @@ fn read_only_turn_does_not_reuse_its_goal_for_the_next_turn_across_agents() {
 }
 
 fn wait_for_shutdown(repository: &std::path::Path) {
+    // A failed ping only proves the endpoint is unavailable. The runtime may
+    // still be draining tasks and closing redb, especially on Windows. The
+    // owner releases its election lock only after that cleanup is complete.
+    let path = Repository::canonical_dot_dir(repository)
+        .unwrap()
+        .join("changes-owner.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if !run_owner(repository, "ping").status.success() {
-            return;
+        match lock.try_lock_exclusive() {
+            Ok(()) => {
+                FileExt::unlock(&lock).unwrap();
+                return;
+            }
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {}
+            Err(error) => panic!("failed to inspect database-owner shutdown: {error}"),
         }
         assert!(
             Instant::now() < deadline,
-            "database owner did not shut down"
+            "database owner did not release its lock after shutdown"
         );
         thread::sleep(Duration::from_millis(25));
     }
@@ -389,7 +406,6 @@ fn concurrent_hooks_commit_lossless_envelopes_without_output_or_drops() {
     let shutdown = run_owner(&repository, "shutdown");
     assert!(shutdown.status.success());
     wait_for_shutdown(&repository);
-    thread::sleep(Duration::from_millis(100));
 
     let store =
         RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
@@ -625,7 +641,6 @@ fn lifecycle_stop_resume_zombie_abandon_and_lease_expiry() {
 
     assert!(run_owner(&repository, "shutdown").status.success());
     wait_for_shutdown(&repository);
-    thread::sleep(Duration::from_millis(100));
     let store =
         RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
             .unwrap();
@@ -691,7 +706,6 @@ fn owner_death_before_and_after_event_commit_retries_exactly_once() {
 
         assert!(run_owner(&repository, "shutdown").status.success());
         wait_for_shutdown(&repository);
-        thread::sleep(Duration::from_millis(100));
         let store =
             RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
                 .unwrap();
@@ -731,7 +745,6 @@ fn owner_death_after_checkpoint_prepare_and_bind_recovers_in_hook_process() {
         .success());
         assert!(run_owner(&repository, "shutdown").status.success());
         wait_for_shutdown(&repository);
-        thread::sleep(Duration::from_millis(100));
         std::fs::write(repository.join("crash.txt"), b"recover\n").unwrap();
 
         let marker = temp.path().join(format!("{failpoint}.marker"));
@@ -753,7 +766,6 @@ fn owner_death_after_checkpoint_prepare_and_bind_recovers_in_hook_process() {
 
         assert!(run_owner(&repository, "shutdown").status.success());
         wait_for_shutdown(&repository);
-        thread::sleep(Duration::from_millis(100));
         let store =
             RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
                 .unwrap();
@@ -881,7 +893,6 @@ fn legacy_graph_pending_delta_imports_once_then_json_authority_is_removed() {
 
     assert!(run_owner(&repository, "shutdown").status.success());
     wait_for_shutdown(&repository);
-    thread::sleep(Duration::from_millis(100));
     let redb = RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
         .unwrap();
     let turn = redb
@@ -972,7 +983,6 @@ fn turn_end_publishes_one_checkpoint_turn_and_advances_head() {
 
     assert!(run_owner(&repository, "shutdown").status.success());
     wait_for_shutdown(&repository);
-    thread::sleep(Duration::from_millis(100));
 
     let redb = RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
         .unwrap();
@@ -1051,7 +1061,6 @@ fn pre_cutover_session_count_gap_publishes_at_next_ledger_ordinal() {
     );
     assert!(run_owner(&repository, "shutdown").status.success());
     wait_for_shutdown(&repository);
-    thread::sleep(Duration::from_millis(100));
 
     let repo = Repository::open(&repository).unwrap();
     let (_, turns) = repo.get_session_ledger("legacy-gap").unwrap().unwrap();
@@ -1103,7 +1112,6 @@ fn crashing_second_checkpoint_keeps_first_turn_immutable() {
     .success());
     assert!(run_owner(&repository, "shutdown").status.success());
     wait_for_shutdown(&repository);
-    thread::sleep(Duration::from_millis(100));
     std::fs::write(repository.join("second.txt"), b"second\n").unwrap();
     let marker = temp.path().join("second-bind.marker");
     let mut owner = spawn_owner_with_failpoint(&repository, "after-checkpoint-bind", &marker);
@@ -1121,7 +1129,6 @@ fn crashing_second_checkpoint_keeps_first_turn_immutable() {
     assert!(!owner.wait().unwrap().success());
     assert!(run_owner(&repository, "shutdown").status.success());
     wait_for_shutdown(&repository);
-    thread::sleep(Duration::from_millis(100));
 
     let repo = Repository::open(&repository).unwrap();
     let (_, turns) = repo.get_session_ledger("immutable-turns").unwrap().unwrap();
