@@ -440,7 +440,7 @@ default = "{}"
     /// need to make any modifications. This is especially useful for:
     /// - CLI commands that only display information
     /// - Integration tools that poll repository status
-    /// - Concurrent access scenarios where write operations are happening elsewhere
+    /// - Concurrent readers of a database that has no writable process handle
     ///
     /// # Arguments
     ///
@@ -462,7 +462,7 @@ default = "{}"
     /// ```
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
         if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path.as_ref()) {
-            return Self::open_sandbox(working_root, canonical, &view);
+            return Self::open_sandbox_readonly(working_root, canonical, &view);
         }
         let root = Self::find_root(path.as_ref())?;
         let dot_dir = root.join(DOT_DIR);

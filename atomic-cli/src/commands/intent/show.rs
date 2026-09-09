@@ -27,7 +27,7 @@ pub struct IntentShow {
 impl Command for IntentShow {
     fn run(&self) -> CliResult<()> {
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo = Repository::open_readonly(&root).map_err(CliError::Repository)?;
 
         // Pure read-time projection: lift then render. No gate, no proof
         // requirement — this must work on a plain (un-attested) intent. The
