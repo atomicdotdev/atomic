@@ -41,10 +41,14 @@ fn wait_for_output(mut child: Child, operation: &str) -> Output {
     };
     let stdout = stdout
         .recv_timeout(Duration::from_secs(2))
-        .expect("child stdout stayed open");
+        .unwrap_or_else(|error| {
+            panic!("{operation}: child exited with {status}, but stdout stayed open: {error}")
+        });
     let stderr = stderr
         .recv_timeout(Duration::from_secs(2))
-        .expect("child stderr stayed open");
+        .unwrap_or_else(|error| {
+            panic!("{operation}: child exited with {status}, but stderr stayed open: {error}")
+        });
     assert!(
         !timed_out,
         "{operation} timed out after 30s; stdout: {}; stderr: {}",

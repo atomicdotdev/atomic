@@ -85,6 +85,9 @@ rayon = { workspace = true }
 # Git interop
 git2 = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 serial_test = { workspace = true }

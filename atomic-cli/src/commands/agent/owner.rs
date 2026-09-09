@@ -689,7 +689,7 @@ pub(crate) fn start_or_reconnect(repository: &Path) -> anyhow::Result<OwnerRespo
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    configure_detached(&mut command);
+    configure_detached(&mut command)?;
     let mut child = command
         .spawn()
         .context("failed to spawn repository database owner")?;
@@ -1295,14 +1295,42 @@ async fn run_server(endpoint: &str, store: Arc<RedbChangeStore>) -> anyhow::Resu
 }
 
 #[cfg(unix)]
-fn configure_detached(_command: &mut ProcessCommand) {}
+fn configure_detached(_command: &mut ProcessCommand) -> anyhow::Result<()> {
+    Ok(())
+}
 
 #[cfg(windows)]
-fn configure_detached(command: &mut ProcessCommand) {
+fn configure_detached(command: &mut ProcessCommand) -> anyhow::Result<()> {
+    use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::Foundation::{
+        SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    };
+
+    // Rust's Windows spawn inherits every inheritable handle, even when the
+    // child's configured stdio is NUL. A hook's inherited output pipes would
+    // therefore stay open in the long-lived owner after the hook exits, making
+    // callers wait forever for EOF. Clear inheritance on the original handles;
+    // explicit Stdio::inherit() still works by duplicating them during spawn.
+    for handle in [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        // SAFETY: These are borrowed standard handles. This only clears an
+        // inheritance flag; it neither closes nor transfers ownership of them.
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to prevent database owner from inheriting caller stdio");
+        }
+    }
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    Ok(())
 }
 
 #[cfg(test)]
