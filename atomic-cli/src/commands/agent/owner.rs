@@ -800,6 +800,7 @@ fn acquire_owner_lock(dot_dir: &Path) -> anyhow::Result<File> {
     let path = dot_dir.join(OWNER_LOCK_FILE);
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&path)
