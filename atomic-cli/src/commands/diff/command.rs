@@ -225,10 +225,11 @@ impl Command for Diff {
         let repo_root = find_repository_root()?;
 
         // Open the repository
-        let repo =
-            Repository::open_readonly(&repo_root).map_err(|e| CliError::InvalidRepository {
+        let repo = crate::commands::open_readonly_repository(&repo_root).map_err(|e| {
+            CliError::InvalidRepository {
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         // Parse algorithm
         let algorithm = self.parse_algorithm()?;

@@ -107,6 +107,11 @@ python tools/provenance-eval/multi_session.py \
 
 ## Scope and remaining limits
 
+September 15 follow-up: ordinary CLI read commands now also use bounded
+database acquisition. See [ordinary read lock waiting](ordinary-read-lock-wait.md)
+for scope and the new zero-read-failure workload results. The measurements above
+describe the earlier Stop-only fix and are retained as historical evidence.
+
 This coordinates cooperating Stop publishers. It does not turn redb 4.2 into
 a database that supports readers alongside a writable process. Ordinary CLI
 reads may still fail while a writer is open. Other long-lived writers can

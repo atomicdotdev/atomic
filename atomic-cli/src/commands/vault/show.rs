@@ -3,7 +3,6 @@
 use clap::Parser;
 
 use atomic_core::pristine::vault::VaultEntry;
-use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
@@ -49,7 +48,8 @@ pub struct Show {
 impl Command for Show {
     fn run(&self) -> CliResult<()> {
         let root = find_repository_root()?;
-        let repo = Repository::open_readonly(&root).map_err(CliError::Repository)?;
+        let repo =
+            crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
 
         let entry = repo
             .vault_retrieve(&self.path)

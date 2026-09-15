@@ -499,7 +499,7 @@ impl Command for Log {
     fn run(&self) -> CliResult<()> {
         // Find and open repository
         let repo_root = find_repository_root()?;
-        let repo = Repository::open_readonly(&repo_root).map_err(|e| match e {
+        let repo = crate::commands::open_readonly_repository(&repo_root).map_err(|e| match e {
             atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
                 searched_path: path.into(),
             },
