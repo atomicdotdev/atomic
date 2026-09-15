@@ -1388,13 +1388,39 @@ async fn exchange(endpoint: &str, frame: &RequestFrame) -> anyhow::Result<Respon
 
 #[cfg(windows)]
 async fn exchange(endpoint: &str, frame: &RequestFrame) -> anyhow::Result<ResponseFrame> {
-    use tokio::net::windows::named_pipe::ClientOptions;
-
-    let mut stream = ClientOptions::new()
-        .open(endpoint)
+    let mut stream = connect_owner_pipe(endpoint, Duration::from_secs(5))
+        .await
         .with_context(|| format!("database owner is not reachable at {endpoint}"))?;
     write_frame(&mut stream, frame).await?;
     read_frame(&mut stream).await
+}
+
+#[cfg(windows)]
+async fn connect_owner_pipe(
+    endpoint: &str,
+    timeout: Duration,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
+    // A live server can temporarily have no listening instance when several
+    // hooks connect at once. Retry acquisition before sending any frame; a busy
+    // pipe is not evidence that the owner died or needs another bootstrap.
+    let started = tokio::time::Instant::now();
+    loop {
+        match ClientOptions::new().open(endpoint) {
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
+                    && started.elapsed() < timeout =>
+            {
+                tokio::time::sleep(
+                    START_RETRY_DELAY.min(timeout.saturating_sub(started.elapsed())),
+                )
+                .await;
+            }
+            result => return result,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1439,23 +1465,25 @@ async fn run_server(endpoint: &str, store: Arc<RedbChangeStore>) -> anyhow::Resu
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let shutdown = Arc::new(Notify::new());
-    let mut first = true;
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(endpoint)
+        .with_context(|| format!("failed to create database owner pipe {endpoint}"))?;
     loop {
-        let mut options = ServerOptions::new();
-        if first {
-            options.first_pipe_instance(true);
-        }
-        let mut server = options
-            .create(endpoint)
-            .with_context(|| format!("failed to create database owner pipe {endpoint}"))?;
         tokio::select! {
             connected = server.connect() => {
                 connected?;
-                first = false;
+                // Keep an instance available before a fast handler can finish
+                // and close the connected pipe. Otherwise clients can observe
+                // a missing endpoint between two successful requests.
+                let next = ServerOptions::new()
+                    .create(endpoint)
+                    .with_context(|| format!("failed to create database owner pipe {endpoint}"))?;
+                let connected = std::mem::replace(&mut server, next);
                 let store = Arc::clone(&store);
                 let shutdown = Arc::clone(&shutdown);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(server, store, shutdown).await {
+                    if let Err(error) = handle_connection(connected, store, shutdown).await {
                         log::warn!("database-owner connection failed: {error}");
                     }
                 });
@@ -1508,6 +1536,80 @@ fn configure_detached(command: &mut ProcessCommand) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn busy_owner_pipe_waits_for_a_new_listening_instance() {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
+        let endpoint = format!(r"\\.\pipe\atomic-busy-test-{}", Uuid::new_v4());
+        let occupied = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&endpoint)
+            .unwrap();
+        let _held_client = ClientOptions::new().open(&endpoint).unwrap();
+        occupied.connect().await.unwrap();
+        assert_eq!(
+            ClientOptions::new()
+                .open(&endpoint)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(ERROR_PIPE_BUSY as i32)
+        );
+
+        let mut connecting = Box::pin(connect_owner_pipe(&endpoint, Duration::from_secs(2)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut connecting)
+                .await
+                .is_err()
+        );
+        let next = ServerOptions::new().create(&endpoint).unwrap();
+        let _client = tokio::time::timeout(Duration::from_secs(2), connecting)
+            .await
+            .expect("client should recover when a listener is available")
+            .unwrap();
+        next.connect().await.unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn busy_owner_pipe_wait_has_a_bounded_timeout() {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
+        let endpoint = format!(r"\\.\pipe\atomic-busy-timeout-{}", Uuid::new_v4());
+        let occupied = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&endpoint)
+            .unwrap();
+        let _held_client = ClientOptions::new().open(&endpoint).unwrap();
+        occupied.connect().await.unwrap();
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            connect_owner_pipe(&endpoint, Duration::from_millis(60)),
+        )
+        .await
+        .expect("busy pipe wait must not hang")
+        .unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        assert_eq!(error.raw_os_error(), Some(ERROR_PIPE_BUSY as i32));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn missing_owner_pipe_does_not_use_the_busy_retry_budget() {
+        let endpoint = format!(r"\\.\pipe\atomic-missing-test-{}", Uuid::new_v4());
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            connect_owner_pipe(&endpoint, Duration::from_secs(5)),
+        )
+        .await
+        .expect("a missing owner must return promptly for bootstrap")
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
 
     #[test]
     fn frozen_pages_bound_encoded_frames_and_reassemble_large_envelopes() {
