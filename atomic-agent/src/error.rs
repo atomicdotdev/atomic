@@ -167,6 +167,15 @@ pub enum AgentError {
         session_id: String,
     },
 
+    /// The repository owner rejected or failed a provenance journal operation.
+    #[error("Provenance journal operation failed for session '{session_id}': {reason}")]
+    ProvenanceJournalFailed {
+        /// The session whose journal could not be committed.
+        session_id: String,
+        /// Owner transport, fencing, or storage failure.
+        reason: String,
+    },
+
     /// Multiple concurrent sessions detected that may conflict.
     #[error(
         "Concurrent session conflict: session '{existing}' is already active in this workspace"

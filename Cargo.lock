@@ -195,6 +195,7 @@ dependencies = [
  "dialoguer",
  "dirs",
  "env_logger",
+ "fs2",
  "git2",
  "indicatif",
  "log",
@@ -209,6 +210,7 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -241,7 +243,8 @@ dependencies = [
  "quickcheck",
  "quickcheck_macros",
  "rayon",
- "redb",
+ "redb 2.6.3",
+ "redb 4.2.0",
  "serde",
  "serde_json",
  "similar",
@@ -335,7 +338,7 @@ dependencies = [
  "postcard",
  "rand 0.8.7",
  "rayon",
- "redb",
+ "redb 4.2.0",
  "reflink-copy",
  "reqwest",
  "serde",
@@ -2267,6 +2270,15 @@ name = "redb"
 version = "2.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "redb"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de6c3b63e007e90ce536ec2ae4690826136a20ec8dbbbb400daef1bb999d2e36"
 dependencies = [
  "libc",
 ]

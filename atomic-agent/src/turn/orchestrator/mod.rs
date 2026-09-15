@@ -81,13 +81,16 @@ pub(crate) fn is_lock_contended(e: &std::io::Error) -> bool {
 }
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::error::AgentResult;
-use crate::event::{HookType, TurnEvent};
+use crate::event::{HookType, ProvenanceJournalEnvelope, TurnEvent};
 use crate::record::TurnRecordOutcome;
 use crate::turn::phase::Phase;
 use crate::turn::session::{ManagedRunStamp, SessionStore};
 use crate::watcher::{self, FileWatcher, WatcherConfig};
+use atomic_core::change::session::SessionTurn;
+use atomic_core::types::Hash;
 
 // ═══════════════════════════════════════════════════════════════════════
 // ManagedRunContext
@@ -224,6 +227,154 @@ impl std::fmt::Display for DispatchResult {
 ///
 /// The orchestrator does NOT persist across hook calls — each invocation is
 /// independent. Session state is persisted to disk via `SessionStore`.
+/// Owner-assigned identity and fencing generation for a journaled turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournalTurnReservation {
+    pub provenance_id: u64,
+    pub generation: u64,
+}
+
+/// Durable acknowledgement for one idempotent journal event.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JournalAppendAck {
+    pub event_id: String,
+    pub sequence: u64,
+}
+
+/// Immutable graph-building inputs persisted with a checkpoint attempt.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JournalCheckpointSource {
+    pub agent_name: String,
+    pub agent_display_name: String,
+    pub agent_vendor: String,
+    pub change_hashes: Vec<Hash>,
+    pub previous_provenance: Option<Hash>,
+    pub plan_id: Option<String>,
+    pub ledger_turn_number: u32,
+}
+
+/// Owner-persisted checkpoint frontier used to resume finalization.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JournalCheckpointAttempt {
+    pub provenance_id: u64,
+    pub attempt_generation: u64,
+    pub frozen_event_count: u64,
+    pub source: JournalCheckpointSource,
+    pub provenance_hash: Option<Hash>,
+    pub session_turn: Option<SessionTurn>,
+    pub manifest_hash: Option<Hash>,
+}
+
+/// Why an active turn was interrupted before checkpoint publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalStopCause {
+    UserRequested,
+    LeaseExpired,
+    ProcessExited,
+    HookFailure,
+    SystemShutdown,
+    Abandoned,
+}
+
+/// Persisted lifecycle state returned by the repository owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JournalTurnLifecycle {
+    Running,
+    Stopped {
+        cause: JournalStopCause,
+        observed_at: i64,
+        last_event_seq: Option<u64>,
+        resumable: bool,
+    },
+    Checkpointing,
+    Completed,
+    Abandoned {
+        observed_at: i64,
+        last_event_seq: Option<u64>,
+    },
+}
+
+/// Current owner state for one external session turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalTurnStatus {
+    pub provenance_id: u64,
+    pub generation: u64,
+    pub lifecycle: JournalTurnLifecycle,
+}
+
+/// Committed provenance-journal boundary supplied by the CLI owner client.
+pub trait ProvenanceJournalSink: Send + Sync {
+    fn reserve_turn(
+        &self,
+        session_id: &str,
+        turn_number: u32,
+        now: i64,
+    ) -> Result<JournalTurnReservation, String>;
+
+    fn append(
+        &self,
+        reservation: JournalTurnReservation,
+        envelopes: Vec<ProvenanceJournalEnvelope>,
+        now: i64,
+    ) -> Result<Vec<JournalAppendAck>, String>;
+
+    fn prepare_checkpoint(
+        &self,
+        reservation: JournalTurnReservation,
+        source: JournalCheckpointSource,
+        now: i64,
+    ) -> Result<JournalCheckpointAttempt, String>;
+
+    fn load_frozen_envelopes(
+        &self,
+        checkpoint: &JournalCheckpointAttempt,
+    ) -> Result<Vec<Vec<u8>>, String>;
+
+    fn bind_checkpoint_hash(
+        &self,
+        checkpoint: &JournalCheckpointAttempt,
+        hash: Hash,
+        session_turn: SessionTurn,
+        now: i64,
+    ) -> Result<JournalCheckpointAttempt, String>;
+
+    fn acknowledge_checkpoint(
+        &self,
+        checkpoint: &JournalCheckpointAttempt,
+        manifest_hash: Hash,
+        completed_at: i64,
+    ) -> Result<(), String>;
+
+    fn stop_turn(
+        &self,
+        session_id: &str,
+        turn_number: u32,
+        cause: JournalStopCause,
+        resumable: bool,
+        observed_at: i64,
+    ) -> Result<Option<JournalTurnStatus>, String>;
+
+    fn resume_turn(
+        &self,
+        session_id: &str,
+        turn_number: u32,
+        now: i64,
+    ) -> Result<Option<JournalTurnStatus>, String>;
+
+    fn abandon_turn(
+        &self,
+        session_id: &str,
+        turn_number: u32,
+        observed_at: i64,
+    ) -> Result<Option<JournalTurnStatus>, String>;
+
+    fn turn_status(
+        &self,
+        session_id: &str,
+        turn_number: u32,
+    ) -> Result<Option<JournalTurnStatus>, String>;
+}
+
 pub struct TurnOrchestrator {
     /// Path to the repository root (where `.atomic/` lives).
     pub(crate) repo_root: PathBuf,
@@ -246,6 +397,10 @@ pub struct TurnOrchestrator {
     /// Managed-run context when a governing lifecycle covers this hook;
     /// `None` for direct agent usage (behavior unchanged).
     pub(crate) managed_run: Option<ManagedRunContext>,
+
+    /// Required committed journal sink for mutable provenance. Legacy JSON is
+    /// accepted only as a one-time import before the next hook event.
+    pub(crate) journal_sink: Option<Arc<dyn ProvenanceJournalSink>>,
 }
 
 impl TurnOrchestrator {
@@ -283,6 +438,7 @@ impl TurnOrchestrator {
             agent_name: "unknown".to_string(),
             agent_display_name: "Unknown Agent".to_string(),
             managed_run: None,
+            journal_sink: None,
         })
     }
 
@@ -302,6 +458,7 @@ impl TurnOrchestrator {
             agent_name: "unknown".to_string(),
             agent_display_name: "Unknown Agent".to_string(),
             managed_run: None,
+            journal_sink: None,
         }
     }
 
@@ -319,6 +476,11 @@ impl TurnOrchestrator {
     /// (see [`ManagedRunContext`]).
     pub fn set_managed_run(&mut self, context: ManagedRunContext) {
         self.managed_run = Some(context);
+    }
+
+    /// Route provenance mutations through a committed repository owner.
+    pub fn set_journal_sink(&mut self, sink: Arc<dyn ProvenanceJournalSink>) {
+        self.journal_sink = Some(sink);
     }
 
     /// The view declared by the governing managed run, if any.

@@ -48,7 +48,7 @@ pub struct SessionRecord {
 }
 
 /// Index entry connecting one session turn to its immutable Atomic objects.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTurn {
     pub session_id: String,
     pub turn_number: u32,
@@ -63,6 +63,13 @@ pub struct SessionTurn {
     /// Todo snapshot captured at the end of this turn.
     #[serde(default)]
     pub todos: Vec<SessionTodo>,
+}
+
+/// Result of atomically appending one checkpoint turn and advancing its head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCheckpointPublication {
+    pub turn: SessionTurn,
+    pub manifest_hash: Hash,
 }
 
 /// Return a deterministic, causality-aware ordering for a session's turns.

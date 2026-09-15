@@ -505,6 +505,19 @@ pub const CHANGE_CHUNKS: TableDefinition<&[u8; 36], &[u8; 32]> =
 pub const CHANGE_UNHASHED: TableDefinition<&[u8; 32], &[u8]> =
     TableDefinition::new("change_unhashed");
 
+// Pending provenance journal tables used by the redb-native change store.
+pub const PROVENANCE_STORE_META: TableDefinition<&str, u64> =
+    TableDefinition::new("provenance_store_meta");
+pub const PROVENANCE_TURN_INDEX: TableDefinition<&[u8; 40], u64> =
+    TableDefinition::new("provenance_turn_index");
+pub const PROVENANCE_TURNS: TableDefinition<u64, &[u8]> = TableDefinition::new("provenance_turns");
+pub const PROVENANCE_JOURNAL_EVENTS: TableDefinition<&[u8; 16], &[u8]> =
+    TableDefinition::new("provenance_journal_events");
+pub const PROVENANCE_EVENT_INDEX: TableDefinition<&[u8; 32], &[u8; 16]> =
+    TableDefinition::new("provenance_event_index");
+pub const PROVENANCE_FINAL_HASHES: TableDefinition<&[u8; 32], u64> =
+    TableDefinition::new("provenance_final_hashes");
+
 // Session Tables (provenance-derived session data)
 //
 // Populated from every provenance graph, regardless of the producing agent.

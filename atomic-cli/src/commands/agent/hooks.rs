@@ -51,6 +51,7 @@
 
 use std::io::{Read, Write};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use clap::Args;
@@ -240,6 +241,8 @@ impl Command for Hooks {
             // Set the agent identity so new sessions get the correct name
             // (e.g., "claude-code" / "Claude Code" instead of "unknown")
             orchestrator.set_agent(&agent_name, &agent_display);
+            orchestrator
+                .set_journal_sink(Arc::new(super::owner::OwnerJournalSink::new(&repo_root)));
 
             // Under a managed lifecycle, sessions adopt the declared view
             // and carry the run stamp (see lifecycle module docs).

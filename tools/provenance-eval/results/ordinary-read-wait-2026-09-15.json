@@ -1,0 +1,576 @@
+{
+  "date": "2026-09-15",
+  "intent": "ATOM::vince::9",
+  "intent_uid": "01M2KK12S425M8QGZ7RVS2XTES",
+  "view": "fix/redb-provenance-validation",
+  "tests": {
+    "passed": 1909,
+    "failed": 0,
+    "ignored": 0
+  },
+  "totals": {
+    "before": {
+      "runs": 18,
+      "read_ok": 5562,
+      "read_total": 6240,
+      "stop_ok": 156,
+      "stop_total": 156,
+      "verified_sessions": 78,
+      "sessions": 78,
+      "worker_failures": 0,
+      "verification_errors": 0
+    },
+    "waited": {
+      "runs": 18,
+      "read_ok": 6240,
+      "read_total": 6240,
+      "stop_ok": 156,
+      "stop_total": 156,
+      "verified_sessions": 78,
+      "sessions": 78,
+      "worker_failures": 0,
+      "verification_errors": 0
+    }
+  },
+  "scenarios": {
+    "balanced:1:before": {
+      "runs": 3,
+      "wall_s_median": 1.2210871660063276,
+      "wall_s_range": [
+        0.9334762079961365,
+        1.6965770840033656
+      ],
+      "read_ok": 96,
+      "read_total": 96,
+      "read_ms": {
+        "count": 96,
+        "p50_ms": 16.75929149496369,
+        "p95_ms": 36.18666699912865,
+        "min_ms": 10.192957997787744,
+        "max_ms": 73.45545799762476
+      },
+      "write_ms": {
+        "count": 96,
+        "p50_ms": 14.365228998940438,
+        "p95_ms": 28.008916997350752,
+        "min_ms": 9.490874988841824,
+        "max_ms": 46.11675000342075
+      },
+      "stop_ms": {
+        "count": 6,
+        "p50_ms": 53.14335450384533,
+        "p95_ms": 91.14950000366662,
+        "min_ms": 44.6812080044765,
+        "max_ms": 91.14950000366662
+      },
+      "stop_ok": 6,
+      "stop_total": 6,
+      "verified_sessions": 3,
+      "expected_sessions": 3,
+      "verification_failures": 0,
+      "worker_failures": 0,
+      "turn_ms": {
+        "count": 6,
+        "p50_ms": 610.5414164994727,
+        "p95_ms": 960.8908749942202,
+        "min_ms": 419.20641700562555,
+        "max_ms": 960.8908749942202
+      }
+    },
+    "balanced:1:waited": {
+      "runs": 3,
+      "wall_s_median": 1.5333362499950454,
+      "wall_s_range": [
+        0.9270581250020768,
+        1.576127375010401
+      ],
+      "read_ok": 96,
+      "read_total": 96,
+      "read_ms": {
+        "count": 96,
+        "p50_ms": 15.542354005447123,
+        "p95_ms": 42.15537499112543,
+        "min_ms": 10.239957991871051,
+        "max_ms": 58.501374995103106
+      },
+      "write_ms": {
+        "count": 96,
+        "p50_ms": 13.95722950110212,
+        "p95_ms": 47.365457998239435,
+        "min_ms": 9.402083000168204,
+        "max_ms": 83.48216699960176
+      },
+      "stop_ms": {
+        "count": 6,
+        "p50_ms": 50.59106249973411,
+        "p95_ms": 116.71504200785421,
+        "min_ms": 46.32841600687243,
+        "max_ms": 116.71504200785421
+      },
+      "stop_ok": 6,
+      "stop_total": 6,
+      "verified_sessions": 3,
+      "expected_sessions": 3,
+      "verification_failures": 0,
+      "worker_failures": 0,
+      "turn_ms": {
+        "count": 6,
+        "p50_ms": 578.9438959982363,
+        "p95_ms": 1002.3592499928782,
+        "min_ms": 435.4484999930719,
+        "max_ms": 1002.3592499928782
+      }
+    },
+    "balanced:4:before": {
+      "runs": 3,
+      "wall_s_median": 2.18104641600803,
+      "wall_s_range": [
+        1.672393959001056,
+        3.136076208000304
+      ],
+      "read_ok": 342,
+      "read_total": 384,
+      "read_ms": {
+        "count": 342,
+        "p50_ms": 17.95249999850057,
+        "p95_ms": 55.75362499803305,
+        "min_ms": 11.405875004129484,
+        "max_ms": 198.09304100635927
+      },
+      "write_ms": {
+        "count": 384,
+        "p50_ms": 15.846874994167592,
+        "p95_ms": 79.08466599474195,
+        "min_ms": 9.368667000671849,
+        "max_ms": 261.2225829943782
+      },
+      "stop_ms": {
+        "count": 24,
+        "p50_ms": 144.78237550065387,
+        "p95_ms": 397.0600829925388,
+        "min_ms": 55.57883399887942,
+        "max_ms": 508.92708300671075
+      },
+      "stop_ok": 24,
+      "stop_total": 24,
+      "verified_sessions": 12,
+      "expected_sessions": 12,
+      "verification_failures": 0,
+      "worker_failures": 0,
+      "turn_ms": {
+        "count": 24,
+        "p50_ms": 859.419729502406,
+        "p95_ms": 2180.303750006715,
+        "min_ms": 503.8009999989299,
+        "max_ms": 2328.8901249907212
+      }
+    },
+    "balanced:4:waited": {
+      "runs": 3,
+      "wall_s_median": 1.5332328340009553,
+      "wall_s_range": [
+        1.2668013329966925,
+        1.9392915830103448
+      ],
+      "read_ok": 384,
+      "read_total": 384,
+      "read_ms": {
+        "count": 384,
+        "p50_ms": 16.433499498816673,
+        "p95_ms": 48.54150000028312,
+        "min_ms": 10.72358300734777,
+        "max_ms": 109.96241700195242
+      },
+      "write_ms": {
+        "count": 384,
+        "p50_ms": 14.638520500739105,
+        "p95_ms": 25.0365419924492,
+        "min_ms": 9.059499992872588,
+        "max_ms": 74.28583300497849
+      },
+      "stop_ms": {
+        "count": 24,
+        "p50_ms": 107.49720799503848,
+        "p95_ms": 277.5835419888608,
+        "min_ms": 54.139583997312,
+        "max_ms": 304.4461660028901
+      },
+      "stop_ok": 24,
+      "stop_total": 24,
+      "verified_sessions": 12,
+      "expected_sessions": 12,
+      "verification_failures": 0,
+      "worker_failures": 0,
+      "turn_ms": {
+        "count": 24,
+        "p50_ms": 739.8637294973014,
+        "p95_ms": 1106.4860419865,
+        "min_ms": 495.529958003317,
+        "max_ms": 1202.4293750000652
+      }
+    },
+    "balanced:8:before": {
+      "runs": 3,
+      "wall_s_median": 2.6972537500114413,
+      "wall_s_range": [
+        2.590861083997879,
+        3.2752325420005945
+      ],
+      "read_ok": 624,
+      "read_total": 768,
+      "read_ms": {
+        "count": 624,
+        "p50_ms": 23.590062497532926,
+        "p95_ms": 48.02141699474305,
+        "min_ms": 10.435292002512142,
+        "max_ms": 114.46837500261609
+      },
+      "write_ms": {
+        "count": 768,
+        "p50_ms": 22.8598960020463,
+        "p95_ms": 39.95487499923911,
+        "min_ms": 8.992250004666857,
+        "max_ms": 102.17725000984501
+      },
+      "stop_ms": {
+        "count": 48,
+        "p50_ms": 369.44108350144234,
+        "p95_ms": 1281.7605839954922,
+        "min_ms": 47.49825000180863,
+        "max_ms": 1560.3976670099655
+      },
+      "stop_ok": 48,
+      "stop_total": 48,
+      "verified_sessions": 24,
+      "expected_sessions": 24,
+      "verification_failures": 0,
+      "worker_failures": 0,
+      "turn_ms": {
+        "count": 48,
+        "p50_ms": 1220.6341454948415,
+        "p95_ms": 2190.628333002678,
+        "min_ms": 400.2286670001922,
+        "max_ms": 2729.2283339920687
+      }
+    },
+    "balanced:8:waited": {
+      "runs": 3,
+      "wall_s_median": 2.7837842500011902,
+      "wall_s_range": [
+        2.399214707998908,
+        4.567367417010246
+      ],
+      "read_ok": 768,
+      "read_total": 768,
+      "read_ms": {
+        "count": 768,
+        "p50_ms": 19.86756249971222,
+        "p95_ms": 72.49487499939278,
+        "min_ms": 10.328707998269238,
+        "max_ms": 158.55149998969864
+      },
+      "write_ms": {
+        "count": 768,
+        "p50_ms": 21.507583507627714,
+        "p95_ms": 68.49025000701658,
+        "min_ms": 8.689750000485219,
+        "max_ms": 121.4392090041656
+      },
+      "stop_ms": {
+        "count": 48,
+        "p50_ms": 267.9633340012515,
+        "p95_ms": 1023.6904170014895,
+        "min_ms": 46.44416600058321,
+        "max_ms": 1807.1215000090888
+      },
+      "stop_ok": 48,
+      "stop_total": 48,
+      "verified_sessions": 24,
+      "expected_sessions": 24,
+      "verification_failures": 0,
+      "worker_failures": 0,
+      "turn_ms": {
+        "count": 48,
+        "p50_ms": 1173.334896004235,
+        "p95_ms": 2296.7669589997968,
+        "min_ms": 701.1867090041051,
+        "max_ms": 3524.950417006039
+      }
+    },
+    "read-heavy:1:before": {
+      "runs": 3,
+      "wall_s_median": 2.282711374995415,
+      "wall_s_range": [
+        1.549166625001817,
+        2.587889875008841
+      ],
+      "read_ok": 384,
+      "read_total": 384,
+      "read_ms": {
+        "count": 384,
+        "p50_ms": 10.456500000145752,
+        "p95_ms": 30.216415994800627,
+        "min_ms": 4.298999992897734,
+        "max_ms": 109.35695801163092
+      },
+      "write_ms": {
+        "count": 96,
+        "p50_ms": 10.840729002666194,
+        "p95_ms": 29.16245799860917,
+        "min_ms": 8.634791010990739,
+        "max_ms": 54.59595800493844
+      },
+      "stop_ms": {
+        "count": 6,
+        "p50_ms": 49.334770505083725,
+        "p95_ms": 59.13608300033957,
+        "min_ms": 46.078125000349246,
+        "max_ms": 59.13608300033957
+      },
+      "stop_ok": 6,
+      "stop_total": 6,
+      "verified_sessions": 3,
+      "expected_sessions": 3,
+      "verification_failures": 0,
+      "worker_failures": 0,
+      "turn_ms": {
+        "count": 6,
+        "p50_ms": 789.1084375005448,
+        "p95_ms": 1809.789874998387,
+        "min_ms": 749.0417499939213,
+        "max_ms": 1809.789874998387
+      }
+    },
+    "read-heavy:1:waited": {
+      "runs": 3,
+      "wall_s_median": 1.727485750001506,
+      "wall_s_range": [
+        1.4042028340045363,
+        1.793406833006884
+      ],
+      "read_ok": 384,
+      "read_total": 384,
+      "read_ms": {
+        "count": 384,
+        "p50_ms": 9.775937505764887,
+        "p95_ms": 15.466625001863576,
+        "min_ms": 4.225249998853542,
+        "max_ms": 32.35679099452682
+      },
+      "write_ms": {
+        "count": 96,
+        "p50_ms": 10.26406199525809,
+        "p95_ms": 18.37158401031047,
+        "min_ms": 8.713041999726556,
+        "max_ms": 40.0325420050649
+      },
+      "stop_ms": {
+        "count": 6,
+        "p50_ms": 50.26454200560693,
+        "p95_ms": 53.84191600023769,
+        "min_ms": 45.48241700103972,
+        "max_ms": 53.84191600023769
+      },
+      "stop_ok": 6,
+      "stop_total": 6,
+      "verified_sessions": 3,
+      "expected_sessions": 3,
+      "verification_failures": 0,
+      "worker_failures": 0,
+      "turn_ms": {
+        "count": 6,
+        "p50_ms": 789.2275834965403,
+        "p95_ms": 1006.7426249879645,
+        "min_ms": 701.5665409999201,
+        "max_ms": 1006.7426249879645
+      }
+    },
+    "read-heavy:4:before": {
+      "runs": 3,
+      "wall_s_median": 2.778132416002336,
+      "wall_s_range": [
+        2.182820832997095,
+        3.0045704579970334
+      ],
+      "read_ok": 1430,
+      "read_total": 1536,
+      "read_ms": {
+        "count": 1430,
+        "p50_ms": 12.59887449850794,
+        "p95_ms": 29.50812500785105,
+        "min_ms": 4.596665996359661,
+        "max_ms": 68.41733300825581
+      },
+      "write_ms": {
+        "count": 384,
+        "p50_ms": 13.895395495637786,
+        "p95_ms": 29.683708009542897,
+        "min_ms": 9.077250011614524,
+        "max_ms": 74.2685419972986
+      },
+      "stop_ms": {
+        "count": 24,
+        "p50_ms": 103.24647899687989,
+        "p95_ms": 370.00729200372007,
+        "min_ms": 52.088791999267414,
+        "max_ms": 461.6952910000691
+      },
+      "stop_ok": 24,
+      "stop_total": 24,
+      "verified_sessions": 12,
+      "expected_sessions": 12,
+      "verification_failures": 0,
+      "worker_failures": 0,
+      "turn_ms": {
+        "count": 24,
+        "p50_ms": 1182.6488954975503,
+        "p95_ms": 1874.0464169968618,
+        "min_ms": 964.5555419992888,
+        "max_ms": 2000.752708001528
+      }
+    },
+    "read-heavy:4:waited": {
+      "runs": 3,
+      "wall_s_median": 2.734341957999277,
+      "wall_s_range": [
+        2.244023624996771,
+        2.8755475409998326
+      ],
+      "read_ok": 1536,
+      "read_total": 1536,
+      "read_ms": {
+        "count": 1536,
+        "p50_ms": 12.456042000849266,
+        "p95_ms": 31.51800000341609,
+        "min_ms": 4.506959012360312,
+        "max_ms": 110.0478329899488
+      },
+      "write_ms": {
+        "count": 384,
+        "p50_ms": 12.914749495394062,
+        "p95_ms": 22.328000006382354,
+        "min_ms": 8.669417002238333,
+        "max_ms": 86.45391699974425
+      },
+      "stop_ms": {
+        "count": 24,
+        "p50_ms": 95.48362500936491,
+        "p95_ms": 275.0217499997234,
+        "min_ms": 43.41541699250229,
+        "max_ms": 307.4719590076711
+      },
+      "stop_ok": 24,
+      "stop_total": 24,
+      "verified_sessions": 12,
+      "expected_sessions": 12,
+      "verification_failures": 0,
+      "worker_failures": 0,
+      "turn_ms": {
+        "count": 24,
+        "p50_ms": 1219.5488959987415,
+        "p95_ms": 1652.2913749940926,
+        "min_ms": 993.0387079948559,
+        "max_ms": 1659.2367499979446
+      }
+    },
+    "read-heavy:8:before": {
+      "runs": 3,
+      "wall_s_median": 5.535983458990813,
+      "wall_s_range": [
+        4.2410807910055155,
+        6.0168094169930555
+      ],
+      "read_ok": 2686,
+      "read_total": 3072,
+      "read_ms": {
+        "count": 2686,
+        "p50_ms": 20.985083501727786,
+        "p95_ms": 51.336582997464575,
+        "min_ms": 4.873958008829504,
+        "max_ms": 148.95379199879244
+      },
+      "write_ms": {
+        "count": 768,
+        "p50_ms": 28.361749995383434,
+        "p95_ms": 69.63562499731779,
+        "min_ms": 9.451542005990632,
+        "max_ms": 147.15679199434817
+      },
+      "stop_ms": {
+        "count": 48,
+        "p50_ms": 291.9043540023267,
+        "p95_ms": 1359.9300420028158,
+        "min_ms": 47.06537499441765,
+        "max_ms": 1558.9138340001227
+      },
+      "stop_ok": 48,
+      "stop_total": 48,
+      "verified_sessions": 24,
+      "expected_sessions": 24,
+      "verification_failures": 0,
+      "worker_failures": 0,
+      "turn_ms": {
+        "count": 48,
+        "p50_ms": 2457.31579150015,
+        "p95_ms": 3672.0384579966776,
+        "min_ms": 887.492709007347,
+        "max_ms": 4016.8753750040196
+      }
+    },
+    "read-heavy:8:waited": {
+      "runs": 3,
+      "wall_s_median": 4.963592291009263,
+      "wall_s_range": [
+        4.140364207996754,
+        5.321949041986954
+      ],
+      "read_ok": 3072,
+      "read_total": 3072,
+      "read_ms": {
+        "count": 3072,
+        "p50_ms": 19.12339600676205,
+        "p95_ms": 48.30504099663813,
+        "min_ms": 4.47616699966602,
+        "max_ms": 131.86066600610502
+      },
+      "write_ms": {
+        "count": 768,
+        "p50_ms": 22.871438006404787,
+        "p95_ms": 47.1474169899011,
+        "min_ms": 10.179666001931764,
+        "max_ms": 152.7488749998156
+      },
+      "stop_ms": {
+        "count": 48,
+        "p50_ms": 173.75135450129164,
+        "p95_ms": 833.3400830015307,
+        "min_ms": 48.6453750054352,
+        "max_ms": 1321.6989579959773
+      },
+      "stop_ok": 48,
+      "stop_total": 48,
+      "verified_sessions": 24,
+      "expected_sessions": 24,
+      "verification_failures": 0,
+      "worker_failures": 0,
+      "turn_ms": {
+        "count": 48,
+        "p50_ms": 2166.4662294933805,
+        "p95_ms": 2756.4027910120785,
+        "min_ms": 1593.4133750124602,
+        "max_ms": 3413.608375005424
+      }
+    }
+  },
+  "archive_sha256": "11bcd27867bf2eb5ac91c7d0da7bd21eb858ad525979559c3bc6186c8479b5b8",
+  "binaries": {
+    "before": {
+      "path": "/Users/dev-vincent/atomic-workspace/.gstack/pr190-lee-revalidation-20260915/bin/atomic-pr190",
+      "sha256": "2cd58045ba50665eb4514b1df744e9998ea74d3a56379c2aa5368914ed6b4583"
+    },
+    "waited": {
+      "path": "/Users/dev-vincent/atomic-workspace/.gstack/ordinary-read-wait-20260915/atomic-read-wait",
+      "sha256": "6e7612d9ba34b60f792272e7bc781b4ce5d3eb918dfd8e63918ea83697de1434"
+    }
+  }
+}

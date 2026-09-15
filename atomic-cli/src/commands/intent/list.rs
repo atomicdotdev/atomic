@@ -287,7 +287,8 @@ fn build_rows(
 impl Command for IntentList {
     fn run(&self) -> CliResult<()> {
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo =
+            crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
 
         // Resolve the verifying identity ONCE (soft-fail to "no identity").
         let verifier = resolve_verifier(&self.identity)?;

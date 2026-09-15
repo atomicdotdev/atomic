@@ -3,7 +3,9 @@
 use super::*;
 use atomic_repository::Repository;
 
+use crate::error::AgentError;
 use crate::event::{HookType, TurnEvent};
+use crate::provenance::accumulator::ProvenanceAccumulator;
 use crate::turn::phase::Phase;
 use crate::turn::session::{AgentSession, SessionStore};
 use crate::watcher::fallback::FallbackWatcher;
@@ -37,6 +39,119 @@ fn turn_end_event(session_id: &str) -> TurnEvent {
 
 fn session_end_event(session_id: &str) -> TurnEvent {
     TurnEvent::new(session_id, HookType::SessionEnd)
+}
+
+struct RejectingJournalSink;
+
+impl ProvenanceJournalSink for RejectingJournalSink {
+    fn reserve_turn(
+        &self,
+        _session_id: &str,
+        _turn_number: u32,
+        _now: i64,
+    ) -> Result<JournalTurnReservation, String> {
+        Err("owner unavailable".to_string())
+    }
+
+    fn append(
+        &self,
+        _reservation: JournalTurnReservation,
+        _envelopes: Vec<crate::event::ProvenanceJournalEnvelope>,
+        _now: i64,
+    ) -> Result<Vec<JournalAppendAck>, String> {
+        unreachable!("append must not run when reservation fails")
+    }
+
+    fn prepare_checkpoint(
+        &self,
+        _reservation: JournalTurnReservation,
+        _source: JournalCheckpointSource,
+        _now: i64,
+    ) -> Result<JournalCheckpointAttempt, String> {
+        unreachable!("checkpoint must not run when reservation fails")
+    }
+
+    fn load_frozen_envelopes(
+        &self,
+        _checkpoint: &JournalCheckpointAttempt,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        unreachable!("checkpoint must not run when reservation fails")
+    }
+
+    fn bind_checkpoint_hash(
+        &self,
+        _checkpoint: &JournalCheckpointAttempt,
+        _hash: atomic_core::types::Hash,
+        _session_turn: atomic_core::change::session::SessionTurn,
+        _now: i64,
+    ) -> Result<JournalCheckpointAttempt, String> {
+        unreachable!("checkpoint must not run when reservation fails")
+    }
+
+    fn acknowledge_checkpoint(
+        &self,
+        _checkpoint: &JournalCheckpointAttempt,
+        _manifest_hash: atomic_core::types::Hash,
+        _completed_at: i64,
+    ) -> Result<(), String> {
+        unreachable!("checkpoint must not run when reservation fails")
+    }
+
+    fn stop_turn(
+        &self,
+        _session_id: &str,
+        _turn_number: u32,
+        _cause: JournalStopCause,
+        _resumable: bool,
+        _observed_at: i64,
+    ) -> Result<Option<JournalTurnStatus>, String> {
+        Err("owner unavailable".to_string())
+    }
+
+    fn resume_turn(
+        &self,
+        _session_id: &str,
+        _turn_number: u32,
+        _now: i64,
+    ) -> Result<Option<JournalTurnStatus>, String> {
+        Err("owner unavailable".to_string())
+    }
+
+    fn abandon_turn(
+        &self,
+        _session_id: &str,
+        _turn_number: u32,
+        _observed_at: i64,
+    ) -> Result<Option<JournalTurnStatus>, String> {
+        Err("owner unavailable".to_string())
+    }
+
+    fn turn_status(
+        &self,
+        _session_id: &str,
+        _turn_number: u32,
+    ) -> Result<Option<JournalTurnStatus>, String> {
+        Err("owner unavailable".to_string())
+    }
+}
+
+#[tokio::test]
+async fn journal_failure_prevents_unacknowledged_graph_fallback() {
+    let dir = TempDir::new().unwrap();
+    let mut orchestrator = make_orchestrator(&dir);
+    orchestrator.set_journal_sink(std::sync::Arc::new(RejectingJournalSink));
+
+    let result = orchestrator
+        .dispatch(turn_start_event("journal-failure", "must commit first"))
+        .await;
+    assert!(matches!(
+        result,
+        Err(AgentError::ProvenanceJournalFailed { .. })
+    ));
+    assert!(!ProvenanceAccumulator::graph_path(
+        &dir.path().join(".atomic/sessions/journal-failure")
+    )
+    .exists());
 }
 
 // DispatchResult tests
@@ -252,7 +367,7 @@ async fn test_sandbox_session_on_a_root_view_records_no_parent() {
 }
 
 #[tokio::test]
-async fn test_full_turn_in_sandbox_records_provenance_into_canonical_graph() {
+async fn test_sandbox_without_owner_sink_does_not_create_fallback_provenance() {
     // Canonical repo with a distinct view the sandbox operates on.
     let canonical = TempDir::new().unwrap();
     let repo = Repository::init(canonical.path()).unwrap();
@@ -293,20 +408,15 @@ async fn test_full_turn_in_sandbox_records_provenance_into_canonical_graph() {
     );
     let change_hash = result.change_recorded.as_ref().unwrap().hash;
 
-    // The provenance graph file must be written into the CANONICAL change
-    // store (not a throwaway `.atomic/changes` inside the sandbox). Phase 1 of
-    // the save is the lock-free durability guarantee; if it targets the
-    // sandbox's local dir, provenance is lost whenever the best-effort Phase 2
-    // (which takes the redb write lock) loses a race with a concurrent agent.
+    // A library harness without an owner sink may still record source changes,
+    // but must not resurrect either canonical or sandbox-local mutable
+    // provenance. Production hook coverage installs the owner sink.
     let canonical_changes = atomic_repository::ChangeStore::new(
         canonical.path().join(".atomic").join("changes"),
         atomic_repository::DEFAULT_CACHE_CAPACITY,
     )
     .unwrap();
-    assert!(
-        canonical_changes.count_provenance_graphs().unwrap() >= 1,
-        "provenance graph must be written to the canonical change store"
-    );
+    assert_eq!(canonical_changes.count_provenance_graphs().unwrap(), 0);
 
     // Nothing should be written into a sandbox-local change store.
     let sandbox_changes = sandbox_dir.path().join(".atomic").join("changes");
@@ -323,16 +433,12 @@ async fn test_full_turn_in_sandbox_records_provenance_into_canonical_graph() {
         );
     }
 
-    // End-to-end: the change and its provenance are both registered in the
-    // canonical graph.
+    // No fallback provenance registration occurs without the owner journal.
     let canonical_repo = Repository::open(canonical.path()).unwrap();
     let provenance = canonical_repo
         .find_provenance_for_change(&change_hash)
         .unwrap();
-    assert!(
-        !provenance.is_empty(),
-        "provenance graph for the sandbox turn must be registered in the canonical graph"
-    );
+    assert!(provenance.is_empty());
 }
 
 /// Recording a sandbox turn must not persist the session view into the

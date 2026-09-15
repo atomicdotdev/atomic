@@ -42,8 +42,6 @@ pub(crate) struct ReasoningBlock {
     pub duration_ms: Option<u64>,
 }
 
-/// A tool part recovered from the store, keyed by the same call id the
-/// plugin puts in the hook payload (`tool_call_id` on graph nodes).
 #[derive(Debug)]
 pub(crate) struct ToolPart {
     pub call_id: String,
@@ -76,8 +74,7 @@ pub(crate) struct TurnData {
     pub finish_reason: Option<String>,
     /// Number of model steps in the current turn.
     pub step_count: u32,
-    /// Tool parts for the session, so graph tool nodes recorded from thin
-    /// payloads can be enriched with their commands, files and outputs.
+    /// Tool data used to append immutable enrichment events before checkpointing.
     pub tool_parts: Vec<ToolPart>,
 }
 
@@ -336,19 +333,16 @@ fn assemble(messages: &[(String, String)], parts: &[(String, Value)]) -> TurnDat
                     line["status"] = serde_json::Value::from(status.to_string());
                 }
                 push_line(line, &mut data);
-                // Recover the full tool record so graph nodes recorded from
-                // thin payloads can be enriched with commands/files/outputs.
                 if let Some(call_id) = part.get("callID").and_then(Value::as_str) {
-                    let output = state
-                        .and_then(|s| s.get("output"))
-                        .and_then(Value::as_str)
-                        .map(|o| o.chars().take(2_000).collect());
                     data.tool_parts.push(ToolPart {
                         call_id: call_id.to_string(),
                         tool: tool.to_string(),
-                        input: state.and_then(|s| s.get("input")).cloned(),
-                        output,
-                        status: status.map(|s| s.to_string()),
+                        input: state.and_then(|value| value.get("input")).cloned(),
+                        output: state
+                            .and_then(|value| value.get("output"))
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                        status: status.map(ToOwned::to_owned),
                     });
                 }
             }

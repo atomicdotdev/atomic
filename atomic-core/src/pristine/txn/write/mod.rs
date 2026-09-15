@@ -538,6 +538,100 @@ impl<'a> WriteTxn<'a> {
         self.rewrite_session_turns(record, canonical)
     }
 
+    /// Atomically append one immutable checkpoint turn and advance its manifest head.
+    ///
+    /// Unlike import/rebuild indexing, this live publication path never rewrites
+    /// prior `SESSION_TURNS` rows. Repeating the exact turn is idempotent; any
+    /// conflicting row or non-contiguous append fails closed.
+    pub fn publish_session_checkpoint(
+        &mut self,
+        json_path: &str,
+        turn: crate::change::session::SessionTurn,
+    ) -> PristineResult<crate::change::session::SessionCheckpointPublication> {
+        use crate::change::session::{
+            SessionCheckpointPublication, SessionManifest, SessionRecord,
+        };
+
+        let mut turns = self.load_session_turns_for_write(&turn.session_id)?;
+        if let Some(existing) = turns
+            .iter()
+            .find(|existing| existing.turn_number == turn.turn_number)
+        {
+            if existing != &turn {
+                return Err(PristineError::Serialization {
+                    message: format!(
+                        "session checkpoint turn {} conflicts for {}",
+                        turn.turn_number, turn.session_id
+                    ),
+                });
+            }
+        } else {
+            if turn.turn_number as usize != turns.len()
+                || turn.previous_provenance != turns.last().map(|prior| prior.provenance_hash)
+            {
+                return Err(PristineError::Serialization {
+                    message: format!(
+                        "session checkpoint turn {} is not an append for {}",
+                        turn.turn_number, turn.session_id
+                    ),
+                });
+            }
+            let record = self
+                .load_session_record_for_write(&turn.session_id)?
+                .unwrap_or_else(|| SessionRecord {
+                    session_id: turn.session_id.clone(),
+                    json_path: json_path.to_string(),
+                    view_name: None,
+                    parent_view: None,
+                    first_provenance: None,
+                    latest_provenance: None,
+                    turn_count: 0,
+                    started_at: turn.timestamp,
+                    ended_at: None,
+                });
+            self.append_session_turn(record, turn.clone(), &turns)?;
+            self.mark_current_session_ledger_schema(&turn.session_id)?;
+            turns.push(turn.clone());
+        }
+
+        let (parent_session, fork_turn) = {
+            let heads = self.txn.open_table(SESSION_HEADS)?;
+            let manifests = self.txn.open_table(SESSION_MANIFESTS)?;
+            let lineage = match heads.get(turn.session_id.as_str())? {
+                Some(head) => match manifests.get(head.value())? {
+                    Some(bytes) => {
+                        let manifest =
+                            SessionManifest::from_bytes(bytes.value()).map_err(|error| {
+                                PristineError::Serialization {
+                                    message: format!("session manifest decode: {error}"),
+                                }
+                            })?;
+                        (manifest.parent_session, manifest.fork_turn)
+                    }
+                    None => (None, None),
+                },
+                None => (None, None),
+            };
+            lineage
+        };
+        let goal_provenance = turns
+            .iter()
+            .find_map(|entry| entry.goal.as_ref().map(|_| entry.provenance_hash));
+        let manifest = SessionManifest {
+            schema_version: 2,
+            session_id: turn.session_id.clone(),
+            goal_provenance,
+            turns,
+            parent_session,
+            fork_turn,
+        };
+        let manifest_hash = self.save_session_manifest(&manifest)?;
+        Ok(SessionCheckpointPublication {
+            turn,
+            manifest_hash,
+        })
+    }
+
     /// Index an immutable provenance graph as the next turn of its session.
     ///
     /// The session ID is the portable external identity. The turn key uses the

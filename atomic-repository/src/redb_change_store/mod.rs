@@ -1,8 +1,11 @@
 //! redb-native change storage for Atomic VCS.
 //!
 //! This module implements [`RedbChangeStore`], which stores change data directly
-//! in redb tables instead of `.change` files. This is the primary storage format
-//! for Phase 5 of the V3 change format proposal.
+//! in redb tables instead of `.change` files. Production repositories keep the
+//! store at `.atomic/changes.redb`; the repository owner service is the sole
+//! long-lived opener and ordinary [`crate::Repository`] handles expose only its
+//! canonical path. Direct [`RedbChangeStore::open`] calls are intended for the
+//! owner service, standalone stores, and tests.
 //!
 //! # Sub-modules
 //!
@@ -10,15 +13,22 @@
 //! - `queries`: Read-only query/stats/export operations on the store
 
 mod batch;
+mod provenance;
 mod queries;
 
 pub use batch::StoredSection;
+pub use provenance::{
+    FrozenProvenanceCursor, FrozenProvenanceFragment, FrozenProvenancePage,
+    ProvenanceCheckpointAttempt, ProvenanceCheckpointPhase, ProvenanceCheckpointSource,
+    ProvenanceId, ProvenanceTurnState, StopCause, StopState, StoredProvenanceEnvelope,
+    StoredProvenanceEvent, StoredProvenanceTurn, MAX_FROZEN_PAGE_FRAGMENTS,
+};
 pub use queries::{StoreStats, StoredContentChunk};
 
 use atomic_core::change::format_v3::{self, ChangeReader, FormatError, SectionType};
 use atomic_core::change::{Change, ChangeHeader};
 use atomic_core::pristine::tables;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::fmt;
 use std::io::Cursor;
 use std::path::Path;
@@ -77,6 +87,51 @@ pub enum RedbStoreError {
     /// The change data is corrupt or inconsistent.
     #[error("Corrupt change data: {0}")]
     Corrupt(String),
+
+    #[error("Unsupported provenance store schema version {0}")]
+    UnsupportedProvenanceSchema(u64),
+
+    #[error("Provenance turn {id} was not found")]
+    ProvenanceTurnNotFound { id: u64 },
+
+    #[error("Provenance id space is exhausted")]
+    ProvenanceIdExhausted,
+
+    #[error("Provenance turn {id} generation is stale: expected {expected}, actual {actual}")]
+    ProvenanceFenced { id: u64, expected: u64, actual: u64 },
+
+    #[error("Provenance turn {id} is not {expected}")]
+    InvalidProvenanceState { id: u64, expected: &'static str },
+
+    #[error("Invalid state transition for provenance turn {id}")]
+    InvalidProvenanceTransition { id: u64 },
+
+    #[error("Invalid frozen journal cursor or page budget for provenance turn {id}")]
+    InvalidProvenanceCursor { id: u64 },
+
+    #[error("Provenance event id '{event_id}' conflicts in turn {id}")]
+    ProvenanceEventConflict { id: u64, event_id: String },
+
+    #[error("Provenance event sequence is exhausted for turn {id}")]
+    ProvenanceEventSequenceExhausted { id: u64 },
+
+    #[error("Provenance generation is exhausted for turn {id}")]
+    ProvenanceGenerationExhausted { id: u64 },
+
+    #[error("Provenance turn {id} is already bound to another hash")]
+    ProvenanceFinalHashConflict { id: u64 },
+
+    #[error("Provenance checkpoint attempt for turn {id} conflicts with persisted source data")]
+    ProvenanceCheckpointConflict { id: u64 },
+
+    #[error("Provenance checkpoint attempt for turn {id} has no bound hash")]
+    ProvenanceCheckpointNotBound { id: u64 },
+
+    #[error("Provenance checkpoint publication for turn {id} conflicts with persisted state")]
+    ProvenanceCheckpointPublicationConflict { id: u64 },
+
+    #[error("Provenance hash is already bound to turn {existing_id}")]
+    ProvenanceFinalHashAlreadyBound { existing_id: u64 },
 }
 
 /// Convenience result type for redb store operations.
@@ -169,6 +224,9 @@ pub struct StoredChangeMeta {
 /// | `CONTENT_CHUNKS` | `[u8; 32]` (chunk hash) | compressed content | Deduped content chunks |
 /// | `CHANGE_CHUNKS` | `[u8; 36]` (hash + idx) | `[u8; 32]` (chunk hash) | Change → chunk manifest |
 /// | `CHANGE_UNHASHED` | `[u8; 32]` (hash) | compressed JSON | AI transcripts, etc. |
+/// | `PROVENANCE_TURNS` | `u64` | pending turn metadata | Resumable fenced turn frontier |
+/// | `PROVENANCE_JOURNAL_EVENTS` | `[u8; 16]` | immutable event | Ordered pending provenance |
+/// | `PROVENANCE_FINAL_HASHES` | `[u8; 32]` | `u64` | Final hash → reserved turn |
 pub struct RedbChangeStore {
     db: Database,
 }
@@ -181,8 +239,9 @@ impl RedbChangeStore {
     ///
     /// # Arguments
     ///
-    /// * `path` - Path to the redb database file. This can be the same
-    ///   database as the pristine (tables are namespaced) or a separate file.
+    /// * `path` - Path to the redb database file. Repository-integrated callers
+    ///   use [`crate::Repository::canonical_change_store_path`], which resolves
+    ///   to `.atomic/changes.redb` (including from agent sandboxes).
     ///
     /// # Errors
     ///
@@ -200,6 +259,7 @@ impl RedbChangeStore {
                 let _ = txn.open_table(tables::CONTENT_CHUNKS)?;
                 let _ = txn.open_table(tables::CHANGE_CHUNKS)?;
                 let _ = txn.open_table(tables::CHANGE_UNHASHED)?;
+                Self::initialize_provenance_tables(&txn)?;
             }
             txn.commit()?;
         }
@@ -434,7 +494,7 @@ impl RedbChangeStore {
 impl fmt::Debug for RedbChangeStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RedbChangeStore")
-            .field("tables", &"[CHANGE_META, CHANGE_GRAPH, CHANGE_SEMANTIC, CONTENT_CHUNKS, CHANGE_CHUNKS, CHANGE_UNHASHED]")
+            .field("tables", &"[CHANGE_META, CHANGE_GRAPH, CHANGE_SEMANTIC, CONTENT_CHUNKS, CHANGE_CHUNKS, CHANGE_UNHASHED, PROVENANCE_TURNS, PROVENANCE_JOURNAL_EVENTS]")
             .finish()
     }
 }

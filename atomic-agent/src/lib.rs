@@ -100,14 +100,20 @@ pub mod watcher;
 // Re-export primary types for convenience
 pub use envelope::SessionEnvelope;
 pub use error::{AgentError, AgentResult};
-pub use event::{HookType, TurnChanges, TurnEvent};
+pub use event::{
+    canonicalize_provenance_journal, HookType, ProvenanceJournalEnvelope, ProvenanceJournalError,
+    ProvenanceJournalEvent, ProvenanceToolPhase, TurnChanges, TurnEvent,
+};
 pub use hooks::{AgentHook, AgentRegistry};
 pub use provenance::{
-    EdgeKind, GraphEdge, GraphNode, GraphStats, NodeKind, ProvenanceAccumulator, SerializedGraph,
+    EdgeKind, GraphEdge, GraphNode, GraphStats, NodeKind, PreparedProvenanceGraph,
+    ProvenanceAccumulator, SerializedGraph,
 };
 pub use record::{record_turn, TurnRecordOptions, TurnRecordOutcome};
 pub use turn::{
-    apply_common_actions, transition, Action, AgentSession, Event, Phase, SessionStore,
+    apply_common_actions, transition, Action, AgentSession, Event, JournalAppendAck,
+    JournalCheckpointAttempt, JournalCheckpointSource, JournalStopCause, JournalTurnLifecycle,
+    JournalTurnReservation, JournalTurnStatus, Phase, ProvenanceJournalSink, SessionStore,
     TransitionContext, TransitionResult,
 };
 

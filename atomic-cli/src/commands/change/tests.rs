@@ -595,7 +595,7 @@ mod tests {
         let _guard = TestGuard::new();
 
         // Initialize empty repository
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let cmd = ChangeCmd::new();
         let result = cmd.run();
@@ -609,7 +609,7 @@ mod tests {
     fn test_change_run_invalid_sequence() {
         let _guard = TestGuard::new();
 
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let cmd = ChangeCmd::new().with_identifier("#999");
         let result = cmd.run();
@@ -623,7 +623,7 @@ mod tests {
     fn test_change_run_nonexistent_view() {
         let _guard = TestGuard::new();
 
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let cmd = ChangeCmd::new()
             .with_identifier("#0")
@@ -638,7 +638,7 @@ mod tests {
     fn test_change_run_json_format() {
         let _guard = TestGuard::new();
 
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let cmd = ChangeCmd::new().with_format(ChangeFormat::Json);
         let result = cmd.run();
@@ -652,7 +652,7 @@ mod tests {
     fn test_change_run_short_format() {
         let _guard = TestGuard::new();
 
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let cmd = ChangeCmd::new().with_format(ChangeFormat::Short);
         let result = cmd.run();
@@ -666,7 +666,7 @@ mod tests {
     fn test_change_run_with_show_deps() {
         let _guard = TestGuard::new();
 
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let cmd = ChangeCmd::new().with_show_deps(true);
         let result = cmd.run();
@@ -680,7 +680,7 @@ mod tests {
     fn test_change_run_with_show_hunks() {
         let _guard = TestGuard::new();
 
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let cmd = ChangeCmd::new().with_show_hunks(true);
         let result = cmd.run();
