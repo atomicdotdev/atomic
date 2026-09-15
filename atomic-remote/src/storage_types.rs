@@ -126,6 +126,13 @@ pub struct IdentityInfo {
     pub name: String,
     pub status: String,
     pub created_at: DateTime<Utc>,
+    /// Canonical base32-encoded Ed25519 public key (52 chars, no padding).
+    ///
+    /// Only present when the serving server supports public-key lookup
+    /// (newer servers); older servers omit the field entirely, so it is
+    /// optional for forward/backward compatibility.
+    #[serde(default, alias = "public_key")]
+    pub public_key: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

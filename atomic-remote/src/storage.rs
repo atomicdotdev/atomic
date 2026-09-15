@@ -395,6 +395,21 @@ impl StorageClient {
         ))
         .await
     }
+
+    /// Resolve an identity by its base32-encoded Ed25519 public key.
+    ///
+    /// Reverse of the name/email resolution: given the key (the same value
+    /// used as the JWT `kid`), returns the registered identity together with
+    /// its canonical public key. Base32 keys are URL-safe (A-Z2-7), so the
+    /// key can be embedded in the path without encoding. The endpoint is
+    /// unauthenticated — a caller must already possess the key to learn
+    /// anything from the lookup.
+    pub async fn resolve_identity_by_public_key(
+        &self,
+        public_key: &str,
+    ) -> Result<IdentityInfo, RemoteError> {
+        self.get(&format!("/identities/by-key/{public_key}")).await
+    }
 }
 
 #[cfg(test)]

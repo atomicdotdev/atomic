@@ -40,6 +40,7 @@
 
 pub mod delete;
 pub mod list;
+pub mod lookup_key;
 pub mod new;
 pub mod register;
 pub mod show;
@@ -50,6 +51,7 @@ pub mod whoami;
 // Re-export command structs
 pub use delete::Delete;
 pub use list::List;
+pub use lookup_key::LookupKey;
 pub use new::New;
 pub use register::Register;
 pub use show::Show;
@@ -235,6 +237,25 @@ pub enum IdentityCommands {
     ///   < file.bin
     /// ```
     Verify(Verify),
+
+    /// Resolve a public key to the identity registered for it.
+    ///
+    /// Asks the configured atomic-storage server which identity a
+    /// base32-encoded Ed25519 public key belongs to, and prints the
+    /// canonical key, username, and `did:atomic:` identifier. Handy when
+    /// you hold a signer's key (e.g. from an imported review) but the
+    /// identity isn't available locally.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Resolve a key against the configured server
+    /// atomic identity lookup-key U4NNGFTE7KZZKRML6TQDBJJMOMKDCEHZO64IKHGACVRYGZOQSH5Q
+    ///
+    /// # Use a specific server profile
+    /// atomic identity lookup-key U4NNGFTE7KZZKRML6TQDBJJMOMKDCEHZO64IKHGACVRYGZOQSH5Q --server staging
+    /// ```
+    LookupKey(LookupKey),
 }
 
 impl Command for Identity {
@@ -249,6 +270,7 @@ impl Command for Identity {
             IdentityCommands::Register(cmd) => cmd.run(),
             IdentityCommands::Sign(cmd) => cmd.run(),
             IdentityCommands::Verify(cmd) => cmd.run(),
+            IdentityCommands::LookupKey(cmd) => cmd.run(),
         }
     }
 }
