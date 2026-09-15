@@ -409,7 +409,7 @@ default = "{}"
 
         let pristine = Arc::new(
             Pristine::open_existing(dot_dir.join("pristine.redb"))
-                .map_err(|e| RepositoryError::Database(e.to_string()))?,
+                .map_err(RepositoryError::from)?,
         );
 
         let current_view =
@@ -470,7 +470,7 @@ default = "{}"
         // Open the pristine database in read-only mode
         let pristine = Arc::new(
             Pristine::open_readonly(dot_dir.join("pristine.redb"))
-                .map_err(|e| RepositoryError::Database(e.to_string()))?,
+                .map_err(RepositoryError::from)?,
         );
 
         // Read current view from config or use default
@@ -495,6 +495,42 @@ default = "{}"
             });
         }
         Ok(repository)
+    }
+
+    /// Open for a short-lived writer, waiting at most `timeout` for an
+    /// incompatible process handle to close. Other errors return immediately.
+    /// The caller must not already hold a handle to the same database.
+    pub fn open_existing_wait<P: AsRef<Path>>(
+        path: P,
+        timeout: std::time::Duration,
+    ) -> Result<Self, RepositoryError> {
+        Self::wait_for_database(timeout, || Self::open_existing(path.as_ref()))
+    }
+
+    /// Read-only counterpart of [`Self::open_existing_wait`].
+    pub fn open_readonly_wait<P: AsRef<Path>>(
+        path: P,
+        timeout: std::time::Duration,
+    ) -> Result<Self, RepositoryError> {
+        Self::wait_for_database(timeout, || Self::open_readonly(path.as_ref()))
+    }
+
+    fn wait_for_database(
+        timeout: std::time::Duration,
+        mut open: impl FnMut() -> Result<Self, RepositoryError>,
+    ) -> Result<Self, RepositoryError> {
+        let start = std::time::Instant::now();
+        loop {
+            match open() {
+                Err(RepositoryError::DatabaseBusy) if start.elapsed() < timeout => {
+                    std::thread::sleep(
+                        std::time::Duration::from_millis(10)
+                            .min(timeout.saturating_sub(start.elapsed())),
+                    );
+                }
+                result => return result,
+            }
+        }
     }
 
     /// Open an existing repository using a pre-opened `Pristine`.

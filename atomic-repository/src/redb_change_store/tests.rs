@@ -639,6 +639,223 @@ fn provenance_events_are_ordered_idempotent_and_fenced() {
 }
 
 #[test]
+fn envelope_batch_preserves_order_duplicates_and_reopen() {
+    let (dir, store) = temp_store();
+    let turn = store.reserve_provenance_turn("batch", 1, 1).unwrap();
+    let first = store
+        .append_provenance_envelope(turn.provenance_id, turn.generation, "old", b"original", 2)
+        .unwrap();
+    let batch: &[(&str, &[u8])] = &[
+        ("a", b"first a"),
+        ("old", b"retry"),
+        ("b", b"b"),
+        ("a", b"later a"),
+    ];
+    let ack = store
+        .append_provenance_envelopes(turn.provenance_id, turn.generation, batch, 3)
+        .unwrap();
+    assert_eq!(ack.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 0, 2, 1]);
+    assert_eq!(ack[1], first);
+    assert_eq!(ack[0], ack[3]);
+    assert_eq!(ack[0].envelope, b"first a");
+    drop(store);
+    let store = RedbChangeStore::open(dir.path().join("test_change_store.redb")).unwrap();
+    assert_eq!(
+        store.load_provenance_envelopes(turn.provenance_id).unwrap(),
+        vec![first, ack[0].clone(), ack[2].clone()]
+    );
+    // Stale-generation duplicates remain valid retries, even after a lifecycle fence.
+    store
+        .stop_provenance_turn(
+            turn.provenance_id,
+            turn.generation,
+            StopState {
+                cause: StopCause::ProcessExited,
+                observed_at: 4,
+                last_event_seq: Some(2),
+                resumable: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .append_provenance_envelopes(turn.provenance_id, turn.generation, batch, 5)
+            .unwrap(),
+        ack
+    );
+    assert!(store
+        .append_provenance_envelopes(
+            turn.provenance_id,
+            turn.generation,
+            &[("a", b"retry"), ("new", b"new")],
+            6
+        )
+        .is_err());
+    assert_eq!(
+        store
+            .load_provenance_envelopes(turn.provenance_id)
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(store
+        .append_provenance_envelopes(turn.provenance_id, turn.generation, &[], 7)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn envelope_batch_rolls_back_earlier_events_on_legacy_conflict() {
+    let (_dir, store) = temp_store();
+    let turn = store
+        .reserve_provenance_turn("batch-conflict", 1, 1)
+        .unwrap();
+    store
+        .append_provenance_event(
+            turn.provenance_id,
+            turn.generation,
+            "legacy",
+            provenance_event("legacy"),
+            2,
+        )
+        .unwrap();
+    let before = store
+        .get_provenance_turn_for("batch-conflict", 1)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        store.append_provenance_envelopes(
+            turn.provenance_id,
+            turn.generation,
+            &[("new", b"new"), ("legacy", b"invalid")],
+            3
+        ),
+        Err(RedbStoreError::ProvenanceEventConflict { .. })
+    ));
+    assert!(store
+        .load_provenance_envelopes(turn.provenance_id)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .get_provenance_turn_for("batch-conflict", 1)
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    let retried = store
+        .append_provenance_envelope(turn.provenance_id, turn.generation, "new", b"new", 4)
+        .unwrap();
+    assert_eq!(
+        retried.seq, 1,
+        "failed batch must leave neither index entry nor sequence gap"
+    );
+}
+
+#[test]
+fn envelope_batch_sequence_exhaustion_rolls_back_the_entire_batch() {
+    let (_dir, store) = temp_store();
+    let mut turn = store
+        .reserve_provenance_turn("batch-overflow", 1, 1)
+        .unwrap();
+    turn.next_event_seq = u64::MAX - 1;
+    let tx = store.db.begin_write().unwrap();
+    {
+        let mut table = tx.open_table(tables::PROVENANCE_TURNS).unwrap();
+        table
+            .insert(
+                turn.provenance_id.get(),
+                postcard::to_allocvec(&turn).unwrap().as_slice(),
+            )
+            .unwrap();
+    }
+    tx.commit().unwrap();
+    assert!(matches!(
+        store.append_provenance_envelopes(
+            turn.provenance_id,
+            turn.generation,
+            &[("a", b"a"), ("b", b"b")],
+            2
+        ),
+        Err(RedbStoreError::ProvenanceEventSequenceExhausted { .. })
+    ));
+    assert!(store
+        .load_provenance_envelopes(turn.provenance_id)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .get_provenance_turn_for("batch-overflow", 1)
+            .unwrap()
+            .unwrap(),
+        turn
+    );
+    assert_eq!(
+        store
+            .append_provenance_envelope(turn.provenance_id, turn.generation, "a", b"a", 3)
+            .unwrap()
+            .seq,
+        u64::MAX - 1
+    );
+}
+
+#[test]
+fn envelope_batch_and_checkpoint_have_no_partial_frontier() {
+    let (_dir, store) = temp_store();
+    for iteration in 0..16 {
+        let turn = store
+            .reserve_provenance_turn(&format!("batch-race-{iteration}"), 1, 1)
+            .unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let (append, checkpoint) = std::thread::scope(|scope| {
+            let append = scope.spawn(|| {
+                barrier.wait();
+                let names: Vec<_> = (0..16).map(|i| format!("event-{i}")).collect();
+                let batch: Vec<_> = names
+                    .iter()
+                    .map(|id| (id.as_str(), id.as_bytes()))
+                    .collect();
+                store.append_provenance_envelopes(turn.provenance_id, turn.generation, &batch, 2)
+            });
+            barrier.wait();
+            let checkpoint = store
+                .prepare_provenance_checkpoint(
+                    turn.provenance_id,
+                    turn.generation,
+                    ProvenanceCheckpointSource {
+                        agent_name: "codex".into(),
+                        agent_display_name: "Codex".into(),
+                        agent_vendor: "openai".into(),
+                        change_hashes: vec![],
+                        previous_provenance: None,
+                        plan_id: None,
+                        ledger_turn_number: 0,
+                    },
+                    3,
+                )
+                .unwrap();
+            (append.join().unwrap(), checkpoint)
+        });
+        let count = match append {
+            Ok(events) => {
+                assert_eq!(events.len(), 16);
+                16
+            }
+            Err(RedbStoreError::ProvenanceFenced { .. }) => 0,
+            other => panic!("unexpected batch/checkpoint outcome: {other:?}"),
+        };
+        assert_eq!(checkpoint.frozen_event_count, count);
+        assert_eq!(
+            store
+                .load_provenance_envelopes(turn.provenance_id)
+                .unwrap()
+                .len() as u64,
+            count
+        );
+    }
+}
+
+#[test]
 fn lossless_envelopes_share_sequence_space_and_preserve_legacy_events() {
     let (_dir, store) = temp_store();
     let turn = store.reserve_provenance_turn("session-a", 1, 1).unwrap();

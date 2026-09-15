@@ -181,6 +181,31 @@ pub struct StoredProvenanceEnvelope {
     pub envelope: Vec<u8>,
 }
 
+/// Position within a frozen journal. Offsets allow even one large envelope to
+/// cross transport pages without changing its persisted bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FrozenProvenanceCursor {
+    pub seq: u64,
+    pub offset: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenProvenanceFragment {
+    pub cursor: FrozenProvenanceCursor,
+    pub bytes: Vec<u8>,
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenProvenancePage {
+    pub fragments: Vec<FrozenProvenanceFragment>,
+    /// The exclusive freeze cutoff with offset zero denotes the end.
+    pub next: FrozenProvenanceCursor,
+}
+
+/// Bound metadata as well as payloads, including journals of empty envelopes.
+pub const MAX_FROZEN_PAGE_FRAGMENTS: usize = 256;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum StoredJournalRecord {
     Legacy(StoredProvenanceEvent),
@@ -470,67 +495,102 @@ impl RedbChangeStore {
         envelope: &[u8],
         now: i64,
     ) -> RedbStoreResult<StoredProvenanceEnvelope> {
+        let mut stored = self.append_provenance_envelopes(
+            id,
+            expected_generation,
+            &[(event_id, envelope)],
+            now,
+        )?;
+        Ok(stored.remove(0))
+    }
+
+    /// Append a batch in one durable transaction, with acknowledgments in input order.
+    ///
+    /// All new events and the sequence frontier commit together, or none do on error.
+    /// Duplicate IDs return the original stored bytes and sequence, including duplicates
+    /// earlier in this batch. As with single-event retries, existing IDs can be
+    /// acknowledged after the turn is fenced; any new event must pass the fence.
+    /// Empty and entirely duplicate batches perform no durable commit.
+    pub fn append_provenance_envelopes(
+        &self,
+        id: ProvenanceId,
+        expected_generation: u64,
+        envelopes: &[(&str, &[u8])],
+        now: i64,
+    ) -> RedbStoreResult<Vec<StoredProvenanceEnvelope>> {
+        if envelopes.is_empty() {
+            return Ok(Vec::new());
+        }
         let txn = self.db.begin_write()?;
         let mut turns = txn.open_table(tables::PROVENANCE_TURNS)?;
         let mut events = txn.open_table(tables::PROVENANCE_JOURNAL_EVENTS)?;
         let mut event_index = txn.open_table(tables::PROVENANCE_EVENT_INDEX)?;
-        let id_key = event_id_key(id, event_id);
+        let mut turn: Option<StoredProvenanceTurn> = None;
+        let mut acknowledgements = Vec::with_capacity(envelopes.len());
 
-        if let Some(existing_key) = event_index.get(&id_key)? {
-            let existing = events.get(existing_key.value())?.ok_or_else(|| {
-                RedbStoreError::Corrupt("event index points to no event".to_string())
-            })?;
-            let StoredJournalRecord::Envelope(stored) =
-                StoredJournalRecord::from_bytes(existing.value())?
-            else {
-                return Err(RedbStoreError::ProvenanceEventConflict {
-                    id: id.get(),
-                    event_id: event_id.to_string(),
-                });
-            };
-            if stored.event_id != event_id {
-                return Err(RedbStoreError::ProvenanceEventConflict {
-                    id: id.get(),
-                    event_id: event_id.to_string(),
-                });
+        for &(event_id, envelope) in envelopes {
+            let id_key = event_id_key(id, event_id);
+            if let Some(existing_key) = event_index.get(&id_key)? {
+                let existing = events.get(existing_key.value())?.ok_or_else(|| {
+                    RedbStoreError::Corrupt("event index points to no event".to_string())
+                })?;
+                let StoredJournalRecord::Envelope(stored) =
+                    StoredJournalRecord::from_bytes(existing.value())?
+                else {
+                    return Err(RedbStoreError::ProvenanceEventConflict {
+                        id: id.get(),
+                        event_id: event_id.to_string(),
+                    });
+                };
+                if stored.event_id != event_id {
+                    return Err(RedbStoreError::ProvenanceEventConflict {
+                        id: id.get(),
+                        event_id: event_id.to_string(),
+                    });
+                }
+                // Event ID is the idempotency contract; retry observation times may differ.
+                acknowledgements.push(stored);
+                continue;
             }
-            // The stable event ID is the idempotency contract. Hook payloads
-            // often omit source timestamps, so a process-level retry can carry
-            // a different observation time; return the first committed bytes.
-            return Ok(stored);
+
+            if turn.is_none() {
+                let loaded = load_turn(&turns, id)?;
+                ensure_generation(&loaded, expected_generation)?;
+                if !matches!(loaded.state, ProvenanceTurnState::Running) {
+                    return Err(RedbStoreError::InvalidProvenanceState {
+                        id: id.get(),
+                        expected: "running",
+                    });
+                }
+                turn = Some(loaded);
+            }
+            let turn = turn.as_mut().expect("new envelope loaded the turn");
+            let seq = turn.next_event_seq;
+            turn.next_event_seq = seq
+                .checked_add(1)
+                .ok_or(RedbStoreError::ProvenanceEventSequenceExhausted { id: id.get() })?;
+            let stored = StoredProvenanceEnvelope {
+                event_id: event_id.to_string(),
+                seq,
+                envelope: envelope.to_vec(),
+            };
+            let key = encode_session_event_key(id.get(), seq);
+            let event_bytes = StoredJournalRecord::Envelope(stored.clone()).to_bytes()?;
+            events.insert(&key, event_bytes.as_slice())?;
+            event_index.insert(&id_key, &key)?;
+            acknowledgements.push(stored);
         }
 
-        let mut turn = load_turn(&turns, id)?;
-        ensure_generation(&turn, expected_generation)?;
-        if !matches!(turn.state, ProvenanceTurnState::Running) {
-            return Err(RedbStoreError::InvalidProvenanceState {
-                id: id.get(),
-                expected: "running",
-            });
+        if let Some(mut turn) = turn {
+            turn.updated_at = now;
+            let turn_bytes = turn.to_bytes()?;
+            turns.insert(id.get(), turn_bytes.as_slice())?;
+            drop(event_index);
+            drop(events);
+            drop(turns);
+            txn.commit()?;
         }
-
-        let seq = turn.next_event_seq;
-        let stored = StoredProvenanceEnvelope {
-            event_id: event_id.to_string(),
-            seq,
-            envelope: envelope.to_vec(),
-        };
-        let key = encode_session_event_key(id.get(), seq);
-        let event_bytes = StoredJournalRecord::Envelope(stored.clone()).to_bytes()?;
-        events.insert(&key, event_bytes.as_slice())?;
-        event_index.insert(&id_key, &key)?;
-
-        turn.next_event_seq = seq
-            .checked_add(1)
-            .ok_or(RedbStoreError::ProvenanceEventSequenceExhausted { id: id.get() })?;
-        turn.updated_at = now;
-        let turn_bytes = turn.to_bytes()?;
-        turns.insert(id.get(), turn_bytes.as_slice())?;
-        drop(event_index);
-        drop(events);
-        drop(turns);
-        txn.commit()?;
-        Ok(stored)
+        Ok(acknowledgements)
     }
 
     /// Load serialized lossless envelope entries in committed sequence order.
@@ -679,6 +739,119 @@ impl RedbChangeStore {
             }
         }
         Ok(result)
+    }
+
+    /// Read a bounded part of the persisted checkpoint. Every page validates the
+    /// same attempt generation and cutoff in its own read transaction, so a
+    /// retry or owner restart needs no process-local cursor state.
+    pub fn load_frozen_provenance_page(
+        &self,
+        id: ProvenanceId,
+        attempt_generation: u64,
+        frozen_event_count: u64,
+        cursor: FrozenProvenanceCursor,
+        max_bytes: usize,
+    ) -> RedbStoreResult<FrozenProvenancePage> {
+        let invalid_cursor = || RedbStoreError::InvalidProvenanceCursor { id: id.get() };
+        if max_bytes == 0 || cursor.seq > frozen_event_count {
+            return Err(invalid_cursor());
+        }
+        let txn = self.db.begin_read()?;
+        let turns = txn.open_table(tables::PROVENANCE_TURNS)?;
+        let turn = turns
+            .get(id.get())?
+            .ok_or(RedbStoreError::ProvenanceTurnNotFound { id: id.get() })?;
+        let turn = StoredProvenanceTurn::from_bytes(turn.value())?;
+        let attempt = turn
+            .checkpoint_attempt
+            .ok_or(RedbStoreError::InvalidProvenanceState {
+                id: id.get(),
+                expected: "checkpoint prepared",
+            })?;
+        if attempt.attempt_generation != attempt_generation {
+            return Err(RedbStoreError::ProvenanceFenced {
+                id: id.get(),
+                expected: attempt_generation,
+                actual: attempt.attempt_generation,
+            });
+        }
+        if attempt.frozen_event_count != frozen_event_count {
+            return Err(RedbStoreError::ProvenanceCheckpointConflict { id: id.get() });
+        }
+        let end_cursor = FrozenProvenanceCursor {
+            seq: frozen_event_count,
+            offset: 0,
+        };
+        if cursor.seq == frozen_event_count {
+            if cursor.offset != 0 {
+                return Err(invalid_cursor());
+            }
+            return Ok(FrozenProvenancePage {
+                fragments: Vec::new(),
+                next: end_cursor,
+            });
+        }
+        let table = txn.open_table(tables::PROVENANCE_JOURNAL_EVENTS)?;
+        let start = encode_session_event_key(id.get(), cursor.seq);
+        let end = encode_session_event_key(id.get(), frozen_event_count - 1);
+        let mut fragments = Vec::new();
+        let mut remaining = max_bytes;
+        for entry in table.range::<&[u8; 16]>(&start..=&end)? {
+            let (_, value) = entry?;
+            let record = StoredJournalRecord::from_bytes(value.value())?;
+            let stored = match record {
+                StoredJournalRecord::Envelope(stored) => stored,
+                StoredJournalRecord::Legacy(stored) => {
+                    if stored.seq == cursor.seq && cursor.offset != 0 {
+                        return Err(invalid_cursor());
+                    }
+                    continue;
+                }
+            };
+            if fragments.is_empty() && cursor.offset != 0 && stored.seq != cursor.seq {
+                return Err(invalid_cursor());
+            }
+            let offset = if stored.seq == cursor.seq {
+                cursor.offset
+            } else {
+                0
+            };
+            if offset > stored.envelope.len() || (offset != 0 && offset == stored.envelope.len()) {
+                return Err(invalid_cursor());
+            }
+            let length = remaining.min(stored.envelope.len() - offset);
+            let complete = offset + length == stored.envelope.len();
+            let next = if complete {
+                FrozenProvenanceCursor {
+                    seq: stored.seq + 1,
+                    offset: 0,
+                }
+            } else {
+                FrozenProvenanceCursor {
+                    seq: stored.seq,
+                    offset: offset + length,
+                }
+            };
+            fragments.push(FrozenProvenanceFragment {
+                cursor: FrozenProvenanceCursor {
+                    seq: stored.seq,
+                    offset,
+                },
+                bytes: stored.envelope[offset..offset + length].to_vec(),
+                complete,
+            });
+            remaining -= length;
+            if remaining == 0 || fragments.len() == MAX_FROZEN_PAGE_FRAGMENTS {
+                return Ok(FrozenProvenancePage { fragments, next });
+            }
+        }
+        if fragments.is_empty() && cursor.offset != 0 {
+            return Err(invalid_cursor());
+        }
+        Ok(FrozenProvenancePage {
+            fragments,
+            next: end_cursor,
+        })
     }
 
     /// Bind the prepared graph hash and exact immutable session turn once.

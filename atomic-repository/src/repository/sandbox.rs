@@ -172,7 +172,7 @@ impl Repository {
         } else {
             Pristine::open_existing(path)
         };
-        let pristine = Arc::new(pristine.map_err(|e| RepositoryError::Database(e.to_string()))?);
+        let pristine = Arc::new(pristine.map_err(RepositoryError::from)?);
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 

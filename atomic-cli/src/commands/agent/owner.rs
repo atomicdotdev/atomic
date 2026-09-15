@@ -19,8 +19,9 @@ use atomic_agent::{
 use atomic_core::change::session::SessionTurn;
 use atomic_core::types::Hash;
 use atomic_repository::redb_change_store::{
-    ProvenanceCheckpointAttempt, ProvenanceCheckpointSource, ProvenanceId, ProvenanceTurnState,
-    RedbChangeStore, StopCause, StopState, StoredProvenanceTurn,
+    FrozenProvenanceCursor, FrozenProvenancePage, ProvenanceCheckpointAttempt,
+    ProvenanceCheckpointSource, ProvenanceId, ProvenanceTurnState, RedbChangeStore, StopCause,
+    StopState, StoredProvenanceTurn, MAX_FROZEN_PAGE_FRAGMENTS,
 };
 use atomic_repository::Repository;
 use clap::{Args, Subcommand};
@@ -35,6 +36,10 @@ use crate::error::CliResult;
 
 const PROTOCOL_VERSION: u16 = 1;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+// A JSON u8 takes at most four bytes including its comma. Reserve 256 bytes
+// per fragment for metadata (including 64-bit cursors), plus the next cursor.
+const FROZEN_PAGE_BYTES: usize = 1024 * 1024;
+const FROZEN_PAGE_METADATA_BYTES: usize = 256 * MAX_FROZEN_PAGE_FRAGMENTS + 256;
 const OWNER_LOCK_FILE: &str = "changes-owner.lock";
 const START_ATTEMPTS: usize = 80;
 const START_RETRY_DELAY: Duration = Duration::from_millis(25);
@@ -120,10 +125,18 @@ enum OwnerRequest {
         provenance_id: u64,
         expected_generation: u64,
         source: ProvenanceCheckpointSource,
+        #[serde(default)]
+        reuse_frozen_changes: bool,
         now: i64,
     },
     LoadFrozenEnvelopes {
         provenance_id: u64,
+    },
+    LoadFrozenEnvelopesPage {
+        provenance_id: u64,
+        attempt_generation: u64,
+        frozen_event_count: u64,
+        cursor: FrozenProvenanceCursor,
     },
     BindCheckpointHash {
         provenance_id: u64,
@@ -179,6 +192,9 @@ struct ResponseFrame {
 pub(crate) enum OwnerResponse {
     Pong {
         pid: u32,
+        // Additive v1 capability: old clients ignore it, old owners omit it.
+        #[serde(default)]
+        frozen_envelope_paging: bool,
     },
     ProvenanceTurn {
         turn: StoredProvenanceTurn,
@@ -192,6 +208,9 @@ pub(crate) enum OwnerResponse {
     },
     FrozenEnvelopes {
         envelopes: Vec<Vec<u8>>,
+    },
+    FrozenEnvelopesPage {
+        page: FrozenProvenancePage,
     },
     CheckpointAcknowledged,
     TurnLifecycle {
@@ -314,6 +333,7 @@ impl ProvenanceJournalSink for OwnerJournalSink {
                 OwnerRequest::PrepareCheckpoint {
                     provenance_id: reservation.provenance_id,
                     expected_generation: reservation.generation,
+                    reuse_frozen_changes: source.change_hashes.is_empty(),
                     source: to_store_checkpoint_source(source),
                     now,
                 },
@@ -335,14 +355,37 @@ impl ProvenanceJournalSink for OwnerJournalSink {
     ) -> Result<Vec<Vec<u8>>, String> {
         let repository = self.repository.clone();
         let provenance_id = checkpoint.provenance_id;
+        let attempt_generation = checkpoint.attempt_generation;
+        let frozen_event_count = checkpoint.frozen_event_count;
         run_outside_async_runtime(move || {
-            match request_with_reconnect(
-                &repository,
-                OwnerRequest::LoadFrozenEnvelopes { provenance_id },
-            )? {
-                OwnerResponse::FrozenEnvelopes { envelopes } => Ok(envelopes),
-                other => Err(unexpected_response("load frozen envelopes", other)),
+            require_frozen_paging(start_or_reconnect(&repository)?)?;
+            let mut cursor = FrozenProvenanceCursor::default();
+            let mut envelopes = Vec::new();
+            let mut partial = Vec::new();
+            while cursor.seq < frozen_event_count {
+                let response = request_with_reconnect(
+                    &repository,
+                    OwnerRequest::LoadFrozenEnvelopesPage {
+                        provenance_id,
+                        attempt_generation,
+                        frozen_event_count,
+                        cursor,
+                    },
+                )?;
+                match response {
+                    OwnerResponse::FrozenEnvelopesPage { page } => {
+                        append_frozen_page(
+                            &mut envelopes,
+                            &mut partial,
+                            &mut cursor,
+                            frozen_event_count,
+                            page,
+                        )?;
+                    }
+                    other => return Err(unexpected_response("load frozen envelopes page", other)),
+                }
             }
+            Ok(envelopes)
         })
         .map_err(|error| error.to_string())
     }
@@ -613,7 +656,7 @@ impl Command for DatabaseOwner {
 
 fn print_health(response: OwnerResponse, json: bool) -> CliResult<()> {
     let pid = match response {
-        OwnerResponse::Pong { pid } => pid,
+        OwnerResponse::Pong { pid, .. } => pid,
         other => return Err(unexpected_response("ping", other).into()),
     };
     let output = HealthOutput {
@@ -663,6 +706,67 @@ fn unexpected_response(operation: &str, response: OwnerResponse) -> anyhow::Erro
         }
         other => anyhow!("database owner returned an unexpected {operation} response: {other:?}"),
     }
+}
+
+fn require_frozen_paging(response: OwnerResponse) -> anyhow::Result<()> {
+    match response {
+        OwnerResponse::Pong { frozen_envelope_paging: true, .. } => Ok(()),
+        OwnerResponse::Pong { .. } => Err(anyhow!(
+            "database owner does not support frozen journal pagination; run `atomic agent database-owner shutdown --repository <path>` with the updated CLI, then retry the Stop hook"
+        )),
+        other => Err(unexpected_response("pagination capability", other)),
+    }
+}
+
+/// Reassemble only complete envelopes, advancing the cursor after a successful
+/// page. Retrying an RPC cannot append its bytes twice.
+fn append_frozen_page(
+    envelopes: &mut Vec<Vec<u8>>,
+    partial: &mut Vec<u8>,
+    cursor: &mut FrozenProvenanceCursor,
+    cutoff: u64,
+    page: FrozenProvenancePage,
+) -> anyhow::Result<()> {
+    let end = FrozenProvenanceCursor {
+        seq: cutoff,
+        offset: 0,
+    };
+    if page.next <= *cursor || page.next > end {
+        return Err(anyhow!("invalid frozen journal page continuation"));
+    }
+    let mut position = *cursor;
+    for fragment in page.fragments {
+        // Legacy journal records can leave sequence gaps, but never inside an envelope.
+        if fragment.cursor.seq >= cutoff
+            || fragment.cursor < position
+            || (fragment.cursor != position
+                && (position.offset != 0 || fragment.cursor.offset != 0))
+            || (!fragment.complete && fragment.bytes.is_empty())
+        {
+            return Err(anyhow!("invalid frozen journal fragment cursor"));
+        }
+        partial.extend_from_slice(&fragment.bytes);
+        position = if fragment.complete {
+            envelopes.push(std::mem::take(partial));
+            FrozenProvenanceCursor {
+                seq: fragment.cursor.seq + 1,
+                offset: 0,
+            }
+        } else {
+            FrozenProvenanceCursor {
+                seq: fragment.cursor.seq,
+                offset: partial.len(),
+            }
+        };
+    }
+    if page.next < position
+        || (page.next != position && (position.offset != 0 || page.next.offset != 0))
+        || (page.next == end && !partial.is_empty())
+    {
+        return Err(anyhow!("incomplete frozen journal page"));
+    }
+    *cursor = page.next;
+    Ok(())
 }
 
 fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
@@ -854,6 +958,7 @@ fn handle_request(store: &RedbChangeStore, frame: RequestFrame) -> (ResponseFram
         OwnerRequest::Ping => (
             OwnerResponse::Pong {
                 pid: std::process::id(),
+                frozen_envelope_paging: true,
             },
             false,
         ),
@@ -885,36 +990,32 @@ fn handle_request(store: &RedbChangeStore, frame: RequestFrame) -> (ResponseFram
             now,
         } => {
             owner_failpoint("before-envelope-commit");
-            let mut acknowledgements = Vec::with_capacity(envelopes.len());
-            let mut failure = None;
-            for envelope in envelopes {
-                match store.append_provenance_envelope(
-                    ProvenanceId::new(provenance_id),
-                    expected_generation,
-                    &envelope.event_id,
-                    &envelope.bytes,
-                    now,
-                ) {
-                    Ok(stored) => acknowledgements.push(JournalAppendAck {
-                        event_id: stored.event_id,
-                        sequence: stored.seq,
-                    }),
-                    Err(error) => {
-                        failure = Some(error);
-                        break;
-                    }
-                }
-            }
-            match failure {
-                Some(error) => (
+            let batch: Vec<_> = envelopes
+                .iter()
+                .map(|envelope| (envelope.event_id.as_str(), envelope.bytes.as_slice()))
+                .collect();
+            match store.append_provenance_envelopes(
+                ProvenanceId::new(provenance_id),
+                expected_generation,
+                &batch,
+                now,
+            ) {
+                Err(error) => (
                     OwnerResponse::Error {
                         code: "provenance-store".to_string(),
                         message: error.to_string(),
                     },
                     false,
                 ),
-                None => {
+                Ok(stored) => {
                     owner_failpoint("after-envelope-commit");
+                    let acknowledgements = stored
+                        .into_iter()
+                        .map(|event| JournalAppendAck {
+                            event_id: event.event_id,
+                            sequence: event.seq,
+                        })
+                        .collect();
                     (
                         OwnerResponse::ProvenanceEnvelopesCommitted { acknowledgements },
                         false,
@@ -925,14 +1026,28 @@ fn handle_request(store: &RedbChangeStore, frame: RequestFrame) -> (ResponseFram
         OwnerRequest::PrepareCheckpoint {
             provenance_id,
             expected_generation,
-            source,
+            mut source,
+            reuse_frozen_changes,
             now,
-        } => match store.prepare_provenance_checkpoint(
-            ProvenanceId::new(provenance_id),
-            expected_generation,
-            source,
-            now,
-        ) {
+        } => match (|| {
+            let id = ProvenanceId::new(provenance_id);
+            // A previous Stop may have recorded the change before its journal
+            // read failed. The retry sees a clean working copy. Recover only
+            // those frozen hashes, then retain the store's source validation;
+            // a new nonempty change set must still conflict.
+            if reuse_frozen_changes && source.change_hashes.is_empty() {
+                if let Some(turn) = store.get_provenance_turn(id)? {
+                    if turn.generation == expected_generation
+                        && matches!(turn.state, ProvenanceTurnState::Checkpointing)
+                    {
+                        if let Some(attempt) = turn.checkpoint_attempt {
+                            source.change_hashes = attempt.source.change_hashes;
+                        }
+                    }
+                }
+            }
+            store.prepare_provenance_checkpoint(id, expected_generation, source, now)
+        })() {
             Ok(attempt) => {
                 owner_failpoint("after-checkpoint-prepare");
                 (OwnerResponse::CheckpointPrepared { attempt }, false)
@@ -953,6 +1068,63 @@ fn handle_request(store: &RedbChangeStore, frame: RequestFrame) -> (ResponseFram
                     },
                     false,
                 ),
+                Err(error) => (
+                    OwnerResponse::Error {
+                        code: "provenance-checkpoint".to_string(),
+                        message: error.to_string(),
+                    },
+                    false,
+                ),
+            }
+        }
+        OwnerRequest::LoadFrozenEnvelopesPage {
+            provenance_id,
+            attempt_generation,
+            frozen_event_count,
+            cursor,
+        } => {
+            if cursor != FrozenProvenanceCursor::default() {
+                owner_failpoint("before-frozen-page-continuation");
+            }
+            // Include the actual escaped request ID in the budget. Reserving the
+            // worst-case metadata and four bytes per payload byte bounds the
+            // encoded frame, not merely the event count or raw journal size.
+            let empty = ResponseFrame {
+                version: PROTOCOL_VERSION,
+                request_id: request_id.clone(),
+                response: OwnerResponse::FrozenEnvelopesPage {
+                    page: FrozenProvenancePage {
+                        fragments: Vec::new(),
+                        next: FrozenProvenanceCursor::default(),
+                    },
+                },
+            };
+            let overhead = serde_json::to_vec(&empty)
+                .expect("serializable page frame")
+                .len();
+            let budget = (MAX_FRAME_BYTES.saturating_sub(overhead + FROZEN_PAGE_METADATA_BYTES)
+                / 4)
+            .min(FROZEN_PAGE_BYTES);
+            match store.load_frozen_provenance_page(
+                ProvenanceId::new(provenance_id),
+                attempt_generation,
+                frozen_event_count,
+                cursor,
+                budget,
+            ) {
+                Ok(_)
+                    if std::env::var("ATOMIC_OWNER_FAILPOINT").ok().as_deref()
+                        == Some("frozen-page-unavailable") =>
+                {
+                    (
+                        OwnerResponse::Error {
+                            code: "provenance-checkpoint".to_string(),
+                            message: "injected frozen page read failure".to_string(),
+                        },
+                        false,
+                    )
+                }
+                Ok(page) => (OwnerResponse::FrozenEnvelopesPage { page }, false),
                 Err(error) => (
                     OwnerResponse::Error {
                         code: "provenance-checkpoint".to_string(),
@@ -1336,6 +1508,166 @@ fn configure_detached(command: &mut ProcessCommand) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frozen_pages_bound_encoded_frames_and_reassemble_large_envelopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbChangeStore::open(dir.path().join("journal.redb")).unwrap();
+        let turn = store.reserve_provenance_turn("paged", 1, 1).unwrap();
+        // Exercise both the fragment-count limit and worst-case JSON expansion.
+        let mut expected = vec![Vec::new(); 257];
+        expected.push(vec![255; 2 * FROZEN_PAGE_BYTES + 17]);
+        for (index, bytes) in expected.iter().enumerate() {
+            store
+                .append_provenance_envelope(
+                    turn.provenance_id,
+                    turn.generation,
+                    &index.to_string(),
+                    bytes,
+                    2,
+                )
+                .unwrap();
+        }
+        let attempt = store
+            .prepare_provenance_checkpoint(
+                turn.provenance_id,
+                turn.generation,
+                ProvenanceCheckpointSource {
+                    agent_name: "codex".into(),
+                    agent_display_name: "Codex".into(),
+                    agent_vendor: "openai".into(),
+                    change_hashes: vec![],
+                    previous_provenance: None,
+                    plan_id: None,
+                    ledger_turn_number: 0,
+                },
+                3,
+            )
+            .unwrap();
+        assert!(
+            serde_json::to_vec(&OwnerResponse::FrozenEnvelopes {
+                envelopes: expected.clone()
+            })
+            .unwrap()
+            .len()
+                > MAX_FRAME_BYTES
+        );
+        for request_id in ["page".to_string(), "\\\"".repeat(1536 * 1024)] {
+            let mut cursor = FrozenProvenanceCursor::default();
+            let mut actual = Vec::new();
+            let mut partial = Vec::new();
+            let mut pages = 0;
+            while cursor.seq < attempt.frozen_event_count {
+                let request = RequestFrame {
+                    version: PROTOCOL_VERSION,
+                    request_id: request_id.clone(),
+                    request: OwnerRequest::LoadFrozenEnvelopesPage {
+                        provenance_id: turn.provenance_id.get(),
+                        attempt_generation: attempt.attempt_generation,
+                        frozen_event_count: attempt.frozen_event_count,
+                        cursor,
+                    },
+                };
+                // The escaped ID must itself fit in an inbound request.
+                assert!(serde_json::to_vec(&request).unwrap().len() < MAX_FRAME_BYTES);
+                let (frame, shutdown) = handle_request(&store, request);
+                assert!(!shutdown);
+                assert!(serde_json::to_vec(&frame).unwrap().len() <= MAX_FRAME_BYTES);
+                let OwnerResponse::FrozenEnvelopesPage { page } = frame.response else {
+                    panic!("expected page")
+                };
+                append_frozen_page(
+                    &mut actual,
+                    &mut partial,
+                    &mut cursor,
+                    attempt.frozen_event_count,
+                    page,
+                )
+                .unwrap();
+                pages += 1;
+            }
+            assert!(pages >= 4);
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn legacy_owner_requires_an_explicit_restart_for_pagination() {
+        let old: OwnerResponse = serde_json::from_str(r#"{"Pong":{"pid":42}}"#).unwrap();
+        assert!(require_frozen_paging(old)
+            .unwrap_err()
+            .to_string()
+            .contains("database-owner shutdown"));
+        assert!(require_frozen_paging(OwnerResponse::Pong {
+            pid: 42,
+            frozen_envelope_paging: true
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn checkpoint_read_retry_preserves_source_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbChangeStore::open(dir.path().join("journal.redb")).unwrap();
+        let turn = store.reserve_provenance_turn("retry", 1, 1).unwrap();
+        let original = ProvenanceCheckpointSource {
+            agent_name: "codex".into(),
+            agent_display_name: "Codex".into(),
+            agent_vendor: "openai".into(),
+            change_hashes: vec![Hash::of(b"original")],
+            previous_provenance: None,
+            plan_id: None,
+            ledger_turn_number: 0,
+        };
+        let prepared = store
+            .prepare_provenance_checkpoint(turn.provenance_id, turn.generation, original.clone(), 2)
+            .unwrap();
+        let request = |source, generation, reuse_frozen_changes| {
+            handle_request(
+                &store,
+                RequestFrame {
+                    version: PROTOCOL_VERSION,
+                    request_id: "retry".into(),
+                    request: OwnerRequest::PrepareCheckpoint {
+                        provenance_id: turn.provenance_id.get(),
+                        expected_generation: generation,
+                        source,
+                        reuse_frozen_changes,
+                        now: 3,
+                    },
+                },
+            )
+            .0
+            .response
+        };
+        let mut retry = original.clone();
+        retry.change_hashes.clear();
+        let OwnerResponse::CheckpointPrepared { attempt } =
+            request(retry.clone(), prepared.attempt_generation, true)
+        else {
+            panic!("expected recovery of prepared source")
+        };
+        assert_eq!(attempt, prepared);
+        assert!(matches!(
+            request(retry.clone(), turn.generation, true),
+            OwnerResponse::Error { .. }
+        ));
+        assert!(matches!(
+            request(retry.clone(), prepared.attempt_generation, false),
+            OwnerResponse::Error { .. }
+        ));
+        retry.agent_name = "another-agent".into();
+        assert!(matches!(
+            request(retry, prepared.attempt_generation, true),
+            OwnerResponse::Error { .. }
+        ));
+        let mut changed = original;
+        changed.change_hashes = vec![Hash::of(b"new change")];
+        assert!(matches!(
+            request(changed, prepared.attempt_generation, true),
+            OwnerResponse::Error { .. }
+        ));
+    }
 
     #[tokio::test]
     async fn framing_round_trips_request_id_and_version() {

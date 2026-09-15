@@ -139,14 +139,16 @@ pub fn record_turn(
     options: &TurnRecordOptions<'_>,
 ) -> AgentResult<TurnRecordOutcome> {
     // Step 1: Open the repository read-only for the initial status check.
-    // This avoids blocking on the redb write lock — we only need read access
-    // to decide whether there's work to do and which files are untracked.
-    let mut repo = atomic_repository::Repository::open_readonly(repo_root).map_err(|e| {
-        AgentError::RecordFailed {
-            session_id: options.session.session_id.clone(),
-            turn_number: options.turn_number,
-            reason: format!("Failed to open repository (readonly): {}", e),
-        }
+    // This can coexist with other readers. Wait for a transient incompatible
+    // writer before deciding whether work or untracked files exist.
+    let mut repo = atomic_repository::Repository::open_readonly_wait(
+        repo_root,
+        std::time::Duration::from_secs(10),
+    )
+    .map_err(|e| AgentError::RecordFailed {
+        session_id: options.session.session_id.clone(),
+        turn_number: options.turn_number,
+        reason: format!("Failed to open repository (readonly): {}", e),
     })?;
 
     // `status()` reads current_view, while `record()` writes to session.view_name.
@@ -200,12 +202,14 @@ pub fn record_turn(
     // skips the table-init `begin_write()` that `open()` does — the tables
     // already exist and that write lock is the primary cause of hook hangs
     // when another process holds a transaction.
-    let mut repo = atomic_repository::Repository::open_existing(repo_root).map_err(|e| {
-        AgentError::RecordFailed {
-            session_id: options.session.session_id.clone(),
-            turn_number: options.turn_number,
-            reason: format!("Failed to open repository for recording: {}", e),
-        }
+    let mut repo = atomic_repository::Repository::open_existing_wait(
+        repo_root,
+        std::time::Duration::from_secs(10),
+    )
+    .map_err(|e| AgentError::RecordFailed {
+        session_id: options.session.session_id.clone(),
+        turn_number: options.turn_number,
+        reason: format!("Failed to open repository for recording: {}", e),
     })?;
 
     // Keep the write handle on the same view for post-add status and record.

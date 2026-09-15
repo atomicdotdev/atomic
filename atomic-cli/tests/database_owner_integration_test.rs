@@ -723,6 +723,95 @@ fn owner_death_before_and_after_event_commit_retries_exactly_once() {
     }
 }
 
+#[cfg(unix)]
+fn batch_owner_rpc(repository: &std::path::Path, request: &Value) -> std::io::Result<Value> {
+    let dot = std::fs::canonicalize(Repository::canonical_dot_dir(repository).unwrap())?;
+    let digest = blake3::hash(dot.to_string_lossy().as_bytes())
+        .to_hex()
+        .to_string();
+    let mut stream = std::os::unix::net::UnixStream::connect(format!(
+        "/tmp/atomic-owner-{}.sock",
+        &digest[..24]
+    ))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let frame = serde_json::to_vec(
+        &serde_json::json!({"version":1,"request_id":"batch-regression","request":request}),
+    )?;
+    stream.write_all(&(frame.len() as u32).to_be_bytes())?;
+    stream.write_all(&frame)?;
+    let mut len = [0; 4];
+    stream.read_exact(&mut len)?;
+    let len = u32::from_be_bytes(len) as usize;
+    assert!(len <= 8 * 1024 * 1024);
+    let mut bytes = vec![0; len];
+    stream.read_exact(&mut bytes)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_batch_crash_retries_the_whole_durable_batch_exactly_once() {
+    for failpoint in ["before-envelope-commit", "after-envelope-commit"] {
+        let temp = TempDir::new().unwrap();
+        let repository = temp.path().join("repo");
+        drop(Repository::init(&repository).unwrap());
+        let marker = temp.path().join("batch-crash.marker");
+        let mut owner = spawn_owner_with_failpoint(&repository, failpoint, &marker);
+        wait_for_ping(&repository, &mut owner);
+        let reserved = reserve(&repository);
+        let id = reserved["turn"]["provenance_id"].as_u64().unwrap();
+        let generation = reserved["turn"]["generation"].as_u64().unwrap();
+        let envelopes: Vec<_> = (0..16)
+            .map(|i| serde_json::json!({"event_id":format!("batch-{i}"),"bytes":[i]}))
+            .collect();
+        let request = serde_json::json!({"AppendProvenanceEnvelopes":{
+            "provenance_id":id,"expected_generation":generation,"envelopes":envelopes,"now":1700000001
+        }});
+        assert!(batch_owner_rpc(&repository, &request).is_err());
+        assert!(!wait_for_output(owner, "batch failpoint owner")
+            .status
+            .success());
+        let path = Repository::canonical_change_store_path(&repository).unwrap();
+        let store = RedbChangeStore::open(&path).unwrap();
+        let events = store
+            .load_provenance_envelopes(atomic_repository::redb_change_store::ProvenanceId::new(id))
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            if failpoint == "before-envelope-commit" {
+                0
+            } else {
+                16
+            }
+        );
+        drop(store);
+
+        let mut owner = spawn_owner(&repository);
+        wait_for_ping(&repository, &mut owner);
+        let retry = batch_owner_rpc(&repository, &request).unwrap();
+        let acks = retry["response"]["ProvenanceEnvelopesCommitted"]["acknowledgements"]
+            .as_array()
+            .unwrap();
+        assert_eq!(acks.len(), 16);
+        for (i, ack) in acks.iter().enumerate() {
+            assert_eq!(ack["event_id"], format!("batch-{i}"));
+            assert_eq!(ack["sequence"], i as u64);
+        }
+        assert_eq!(batch_owner_rpc(&repository, &request).unwrap(), retry);
+        assert!(run_owner(&repository, "shutdown").status.success());
+        assert!(wait_for_output(owner, "batch retry owner").status.success());
+        let store = RedbChangeStore::open(path).unwrap();
+        let events = store
+            .load_provenance_envelopes(atomic_repository::redb_change_store::ProvenanceId::new(id))
+            .unwrap();
+        assert_eq!(events.len(), 16);
+        for (i, event) in events.iter().enumerate() {
+            assert_eq!(event.envelope, vec![i as u8]);
+        }
+    }
+}
+
 #[test]
 fn owner_death_after_checkpoint_prepare_and_bind_recovers_in_hook_process() {
     for failpoint in ["after-checkpoint-prepare", "after-checkpoint-bind"] {
@@ -1020,6 +1109,500 @@ fn turn_end_publishes_one_checkpoint_turn_and_advances_head() {
             .session_id,
         "checkpoint-e2e"
     );
+}
+
+#[test]
+fn concurrent_stops_publish_ordered_ledgers_without_external_serialization() {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repo");
+    drop(Repository::init(&repository).unwrap());
+    let begin = run_lifecycle(
+        &repository,
+        &[
+            "begin",
+            "--owner",
+            "test",
+            "--session",
+            "coordinator",
+            "--executor",
+            "claude-code",
+            "--view",
+            "dev",
+            "--json",
+        ],
+    );
+    assert!(
+        begin.status.success(),
+        "{}",
+        String::from_utf8_lossy(&begin.stderr)
+    );
+    let sessions: Vec<_> = (0..8).map(|i| format!("concurrent-stop-{i}")).collect();
+    for session in &sessions {
+        let output = run_hook(
+            &repository,
+            "session-start",
+            &serde_json::to_vec(&serde_json::json!({"session_id":session})).unwrap(),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    for round in 0..2 {
+        for session in &sessions {
+            let output = run_hook(
+                &repository,
+                "user-prompt-submit",
+                &serde_json::to_vec(
+                    &serde_json::json!({"session_id":session,"prompt":format!("round {round}")}),
+                )
+                .unwrap(),
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // First round includes an actual change. The second is read-only.
+        if round == 0 {
+            std::fs::write(repository.join("shared.txt"), "one shared change\n").unwrap();
+        }
+        // Force a transient *database* conflict in addition to simultaneous
+        // Stops. No test-side Stop lock or retry hides production failures.
+        let held_repository = Repository::open_existing(&repository).unwrap();
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(sessions.len() + 1));
+        let mut children = Vec::new();
+        for session in &sessions {
+            let root = repository.clone();
+            let session = session.clone();
+            let gate = gate.clone();
+            children.push(thread::spawn(move || {
+                gate.wait();
+                run_hook(
+                    &root,
+                    "stop",
+                    &serde_json::to_vec(&serde_json::json!({
+                        "session_id":session,"response":format!("finished {round}")
+                    }))
+                    .unwrap(),
+                )
+            }));
+        }
+        gate.wait();
+        thread::sleep(Duration::from_millis(200));
+        drop(held_repository);
+        for child in children {
+            let output = child.join().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    for session in &sessions {
+        let output = run_hook(
+            &repository,
+            "stop",
+            &serde_json::to_vec(&serde_json::json!({"session_id":session})).unwrap(),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(run_owner(&repository, "shutdown").status.success());
+    wait_for_shutdown(&repository);
+    let repo = Repository::open_existing(&repository).unwrap();
+    let mut recorded = HashSet::new();
+    for session in &sessions {
+        let (_, turns) = repo.get_session_ledger(session).unwrap().unwrap();
+        assert_eq!(turns.len(), 2, "{session}: duplicate or missing checkpoint");
+        assert_eq!(turns[1].previous_provenance, Some(turns[0].provenance_hash));
+        for (round, turn) in turns.iter().enumerate() {
+            assert_eq!(turn.turn_number, round as u32);
+            assert_eq!(
+                turn.goal.as_deref(),
+                Some(format!("round {round}").as_str())
+            );
+            let graph = repo.load_provenance_graph(&turn.provenance_hash).unwrap();
+            assert_eq!(graph.previous, turn.previous_provenance);
+            assert_eq!(graph.session_id, *session);
+            recorded.extend(turn.change_hashes.iter().copied());
+        }
+    }
+    assert_eq!(recorded.len(), 1, "one file edit must be recorded once");
+}
+
+#[test]
+fn stop_publication_timeout_preserves_the_active_turn_for_retry() {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repo");
+    drop(Repository::init(&repository).unwrap());
+    let payload = br#"{"session_id":"publication-timeout","prompt":"keep this turn"}"#;
+    assert!(run_hook(&repository, "session-start", payload)
+        .status
+        .success());
+    assert!(run_hook(&repository, "user-prompt-submit", payload)
+        .status
+        .success());
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(repository.join(".atomic/turn-publication.lock"))
+        .unwrap();
+    file.lock_exclusive().unwrap();
+    let output = run_hook(&repository, "stop", payload);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("timed out waiting"));
+    drop(file);
+    for _ in 0..2 {
+        let output = run_hook(&repository, "stop", payload);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(run_owner(&repository, "shutdown").status.success());
+    wait_for_shutdown(&repository);
+    let repo = Repository::open_existing(&repository).unwrap();
+    let (_, turns) = repo
+        .get_session_ledger("publication-timeout")
+        .unwrap()
+        .unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].goal.as_deref(), Some("keep this turn"));
+}
+
+#[test]
+fn killed_stop_releases_publication_lock_and_can_be_retried() {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repo");
+    drop(Repository::init(&repository).unwrap());
+    let payload = br#"{"session_id":"killed-stop","prompt":"recover my change"}"#;
+    assert!(run_hook(&repository, "session-start", payload)
+        .status
+        .success());
+    assert!(run_hook(&repository, "user-prompt-submit", payload)
+        .status
+        .success());
+    std::fs::write(repository.join("recover.txt"), "durable after retry\n").unwrap();
+    // Hold pristine so the real Stop has acquired publication coordination
+    // but cannot record yet. Kill that process, not a synthetic lock helper.
+    let held = Repository::open_existing(&repository).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_atomic"))
+        .args(["agent", "hooks", "claude-code", "stop", "--foreground"])
+        .current_dir(&repository)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(payload).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(repository.join(".atomic/turn-publication.lock"))
+        {
+            if let Err(error) = file.try_lock_exclusive() {
+                assert_eq!(
+                    error.raw_os_error(),
+                    fs2::lock_contended_error().raw_os_error()
+                );
+                break;
+            }
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "Stop exited before acquiring its lock"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "Stop never acquired publication lock"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(held);
+    for _ in 0..2 {
+        let output = run_hook(&repository, "stop", payload);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(run_owner(&repository, "shutdown").status.success());
+    wait_for_shutdown(&repository);
+    let repo = Repository::open_existing(&repository).unwrap();
+    let (_, turns) = repo.get_session_ledger("killed-stop").unwrap().unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].change_hashes.len(), 1);
+    assert_eq!(turns[0].goal.as_deref(), Some("recover my change"));
+}
+
+fn large_checkpoint_fixture(
+    agent: &str,
+    count: usize,
+    output_bytes: usize,
+    crash_between_pages: bool,
+) {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repo");
+    drop(Repository::init(&repository).unwrap());
+    let hook = |verb: &str, payload: Value| {
+        let output = run_agent_hook(
+            &repository,
+            agent,
+            verb,
+            &serde_json::to_vec(&payload).unwrap(),
+        );
+        assert!(
+            output.status.success(),
+            "{agent} {verb}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        assert!(
+            output.stderr.is_empty(),
+            "{agent} {verb}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    hook(
+        "session-start",
+        serde_json::json!({"session_id":"large-checkpoint"}),
+    );
+    hook(
+        if agent == "opencode" {
+            "user-prompt"
+        } else {
+            "user-prompt-submit"
+        },
+        serde_json::json!({"session_id":"large-checkpoint","prompt":"Record a large journal"}),
+    );
+    assert!(run_owner(&repository, "shutdown").status.success());
+    wait_for_shutdown(&repository);
+
+    // Seed valid, durably committed envelopes using the same store API as the
+    // owner. Avoid 1024 CLI bootstraps; the actual Stop still runs in a process.
+    let store =
+        RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
+            .unwrap();
+    let turn = store
+        .get_provenance_turn_for("large-checkpoint", 1)
+        .unwrap()
+        .unwrap();
+    let mut expected = Vec::new();
+    for index in 0..count {
+        let event_id = format!("large-{index}");
+        let output = "x".repeat(output_bytes);
+        let value = serde_json::json!({
+            "schema_version":1,"event_id":event_id,"session_id":"large-checkpoint",
+            "turn_number":1,"generation":turn.generation,"timestamp_ms":1700000000000_i64 + index as i64,
+            "event":{"type":"tool","phase":"after","tool_name":"Read","tool_call_id":event_id,
+                "input":{"path":format!("src/{index}.rs")},"output":output,"status":"completed",
+                "raw":{"tool_output":output}}
+        });
+        let bytes = serde_json::to_vec(&value).unwrap();
+        ProvenanceJournalEnvelope::from_json_bytes(&bytes).unwrap();
+        store
+            .append_provenance_envelope(turn.provenance_id, turn.generation, &event_id, &bytes, 2)
+            .unwrap();
+        expected.push(bytes);
+    }
+    if count == 1024 {
+        assert!(serde_json::to_vec(&expected).unwrap().len() > 8 * 1024 * 1024);
+    } else {
+        assert!(
+            expected[0].len() > 1024 * 1024,
+            "single envelope must span pages"
+        );
+    }
+    drop(store);
+    let marker = temp.path().join("page-retry.marker");
+    let mut crashing_owner = if crash_between_pages {
+        let mut owner =
+            spawn_owner_with_failpoint(&repository, "before-frozen-page-continuation", &marker);
+        wait_for_ping(&repository, &mut owner);
+        Some(owner)
+    } else {
+        None
+    };
+    std::fs::write(repository.join("large.txt"), b"large checkpoint\n").unwrap();
+    let stop = serde_json::json!({"session_id":"large-checkpoint","reason":"end_turn",
+        "response":"Completed","last_assistant_message":"Completed"});
+    hook("stop", stop.clone());
+    if let Some(owner) = &mut crashing_owner {
+        assert!(marker.exists(), "must crash after the first page was read");
+        assert!(!owner.wait().unwrap().success());
+    }
+    let repo = Repository::open(&repository).unwrap();
+    let (_, ledger) = repo
+        .get_session_ledger("large-checkpoint")
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.len(), 1);
+    let head = repo.get_session_head("large-checkpoint").unwrap();
+    drop(repo);
+    hook("stop", stop);
+    let repo = Repository::open(&repository).unwrap();
+    assert_eq!(
+        repo.get_session_ledger("large-checkpoint")
+            .unwrap()
+            .unwrap()
+            .1,
+        ledger
+    );
+    assert_eq!(repo.get_session_head("large-checkpoint").unwrap(), head);
+    let graph = repo
+        .load_provenance_graph(&ledger[0].provenance_hash)
+        .unwrap();
+    assert_eq!(
+        Hash::of(&graph.serialize().unwrap()),
+        ledger[0].provenance_hash
+    );
+    let tools: HashSet<_> = graph
+        .nodes
+        .iter()
+        .filter_map(|n| n.tool_call_id.as_deref())
+        .filter(|id| id.starts_with("large-"))
+        .collect();
+    assert_eq!(
+        tools.len(),
+        count,
+        "published graph must contain every tool event"
+    );
+    for index in 0..count {
+        assert!(tools.contains(format!("large-{index}").as_str()));
+    }
+    assert!(run_owner(&repository, "shutdown").status.success());
+    wait_for_shutdown(&repository);
+    let store =
+        RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
+            .unwrap();
+    let completed = store
+        .get_provenance_turn_for("large-checkpoint", 1)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        completed.state,
+        atomic_repository::redb_change_store::ProvenanceTurnState::Completed
+    ));
+    let frozen = store
+        .load_frozen_provenance_envelopes(turn.provenance_id)
+        .unwrap();
+    let actual: Vec<_> = frozen
+        .into_iter()
+        .filter(|e| e.event_id.starts_with("large-"))
+        .map(|e| e.envelope)
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "stored bytes and ordering must remain unchanged"
+    );
+}
+
+#[test]
+fn large_frozen_checkpoint_completes_across_agents() {
+    for agent in ["codex", "claude-code", "opencode"] {
+        large_checkpoint_fixture(agent, 1024, 1024, false);
+    }
+}
+
+#[test]
+fn large_envelope_checkpoint_recovers_between_pages() {
+    large_checkpoint_fixture("claude-code", 1, 600 * 1024, true);
+}
+
+#[test]
+fn failed_frozen_read_resumes_recorded_changes_on_next_stop() {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repo");
+    drop(Repository::init(&repository).unwrap());
+    assert!(run_hook(
+        &repository,
+        "session-start",
+        br#"{"session_id":"retry-frozen"}"#
+    )
+    .status
+    .success());
+    assert!(run_hook(
+        &repository,
+        "user-prompt-submit",
+        br#"{"session_id":"retry-frozen","prompt":"record before read failure"}"#
+    )
+    .status
+    .success());
+    assert!(run_owner(&repository, "shutdown").status.success());
+    wait_for_shutdown(&repository);
+    let marker = temp.path().join("unused.marker");
+    let mut owner = spawn_owner_with_failpoint(&repository, "frozen-page-unavailable", &marker);
+    wait_for_ping(&repository, &mut owner);
+    std::fs::write(repository.join("retry.txt"), b"preserve this change\n").unwrap();
+    let payload = br#"{"session_id":"retry-frozen","response":"complete"}"#;
+    let failed = run_hook(&repository, "stop", payload);
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("injected frozen page read failure"));
+    assert!(run_owner(&repository, "shutdown").status.success());
+    owner.wait().unwrap();
+    wait_for_shutdown(&repository);
+    let store =
+        RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
+            .unwrap();
+    let prepared = store
+        .get_provenance_turn_for("retry-frozen", 1)
+        .unwrap()
+        .unwrap()
+        .checkpoint_attempt
+        .unwrap();
+    assert_eq!(prepared.source.change_hashes.len(), 1);
+    assert_eq!(
+        prepared.phase,
+        atomic_repository::redb_change_store::ProvenanceCheckpointPhase::Prepared
+    );
+    drop(store);
+    let retry = run_hook(&repository, "stop", payload);
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert!(retry.stderr.is_empty());
+    assert!(run_owner(&repository, "shutdown").status.success());
+    wait_for_shutdown(&repository);
+    let store =
+        RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
+            .unwrap();
+    let completed = store
+        .get_provenance_turn_for("retry-frozen", 1)
+        .unwrap()
+        .unwrap()
+        .checkpoint_attempt
+        .unwrap();
+    assert_eq!(
+        completed.phase,
+        atomic_repository::redb_change_store::ProvenanceCheckpointPhase::Published
+    );
+    assert_eq!(completed.source, prepared.source);
+    assert_eq!(completed.frozen_event_count, prepared.frozen_event_count);
+    assert_eq!(completed.attempt_generation, prepared.attempt_generation);
+    let repo = Repository::open(&repository).unwrap();
+    let (_, ledger) = repo.get_session_ledger("retry-frozen").unwrap().unwrap();
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(ledger[0].change_hashes, prepared.source.change_hashes);
 }
 
 #[test]

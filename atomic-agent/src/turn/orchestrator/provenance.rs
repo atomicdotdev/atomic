@@ -646,17 +646,33 @@ impl TurnOrchestrator {
             return Ok(());
         };
 
-        let (previous_provenance, ledger_turn_number) =
-            atomic_repository::Repository::open_existing(&self.repo_root)
-                .ok()
-                .and_then(|repository| repository.get_session_ledger(session_id).ok().flatten())
-                .map(|(_, turns)| {
-                    (
-                        turns.last().map(|turn| turn.provenance_hash),
-                        turns.len() as u32,
-                    )
-                })
-                .unwrap_or((None, 0));
+        // A failed read must not masquerade as a new session, which would
+        // bind a checkpoint with a missing predecessor. Release this handle
+        // before replaying the journal and opening for publication.
+        let ledger = {
+            let repository = atomic_repository::Repository::open_readonly_wait(
+                &self.repo_root,
+                std::time::Duration::from_secs(10),
+            )
+            .map_err(|error| AgentError::ProvenanceJournalFailed {
+                session_id: session_id.to_string(),
+                reason: error.to_string(),
+            })?;
+            repository.get_session_ledger(session_id).map_err(|error| {
+                AgentError::ProvenanceJournalFailed {
+                    session_id: session_id.to_string(),
+                    reason: error.to_string(),
+                }
+            })?
+        };
+        let (previous_provenance, ledger_turn_number) = ledger
+            .map(|(_, turns)| {
+                (
+                    turns.last().map(|turn| turn.provenance_hash),
+                    turns.len() as u32,
+                )
+            })
+            .unwrap_or((None, 0));
         let source = super::JournalCheckpointSource {
             agent_name: session.agent_name.clone(),
             agent_display_name: session.agent_display_name.clone(),
@@ -806,13 +822,14 @@ impl TurnOrchestrator {
                 }
             };
 
-        let repository =
-            atomic_repository::Repository::open_existing(&self.repo_root).map_err(|error| {
-                AgentError::ProvenanceJournalFailed {
-                    session_id: session_id.to_string(),
-                    reason: error.to_string(),
-                }
-            })?;
+        let repository = atomic_repository::Repository::open_existing_wait(
+            &self.repo_root,
+            std::time::Duration::from_secs(10),
+        )
+        .map_err(|error| AgentError::ProvenanceJournalFailed {
+            session_id: session_id.to_string(),
+            reason: error.to_string(),
+        })?;
         let publication = repository
             .publish_provenance_checkpoint(&graph, session_turn)
             .map_err(|error| AgentError::ProvenanceJournalFailed {

@@ -2,10 +2,149 @@ use atomic_core::change::session::SessionTurn;
 use atomic_core::change::ProvenanceGraph;
 use atomic_core::types::Hash;
 use atomic_repository::redb_change_store::{
-    ProvenanceCheckpointPhase, ProvenanceCheckpointSource, ProvenanceTurnState, RedbChangeStore,
-    RedbStoreError,
+    FrozenProvenanceCursor, ProvenanceCheckpointPhase, ProvenanceCheckpointSource,
+    ProvenanceTurnState, RedbChangeStore, RedbStoreError,
 };
 use atomic_repository::{ChangeStore, Repository, DEFAULT_CACHE_CAPACITY};
+
+#[test]
+fn frozen_pages_preserve_bytes_and_retries_across_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("journal.redb");
+    let store = RedbChangeStore::open(&path).unwrap();
+    let turn = store.reserve_provenance_turn("paged", 1, 1).unwrap();
+    let expected = vec![
+        vec![],
+        vec![255; 19],
+        (0..=255).collect::<Vec<u8>>(),
+        vec![],
+    ];
+    for (index, bytes) in expected.iter().enumerate() {
+        // Interleave old-format events: pagination must preserve sequence gaps.
+        store
+            .append_provenance_event(
+                turn.provenance_id,
+                turn.generation,
+                &format!("legacy-{index}"),
+                atomic_core::change::session::SessionEvent {
+                    seq: 0,
+                    timestamp: String::new(),
+                    event_kind: "tool".into(),
+                    place: None,
+                    transition: None,
+                    token_id: String::new(),
+                    token_kind: String::new(),
+                    token_data: String::new(),
+                    record_type: None,
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .append_provenance_envelope(
+                turn.provenance_id,
+                turn.generation,
+                &format!("envelope-{index}"),
+                bytes,
+                2,
+            )
+            .unwrap();
+    }
+    let attempt = store
+        .prepare_provenance_checkpoint(
+            turn.provenance_id,
+            turn.generation,
+            ProvenanceCheckpointSource {
+                agent_name: "codex".into(),
+                agent_display_name: "Codex".into(),
+                agent_vendor: "openai".into(),
+                change_hashes: vec![],
+                previous_provenance: None,
+                plan_id: None,
+                ledger_turn_number: 0,
+            },
+            3,
+        )
+        .unwrap();
+    drop(store);
+    for budget in [1, 8, 256, 4096] {
+        let mut cursor = FrozenProvenanceCursor::default();
+        let mut actual = Vec::new();
+        let mut partial = Vec::new();
+        while cursor.seq < attempt.frozen_event_count {
+            let store = RedbChangeStore::open(&path).unwrap();
+            let load = || {
+                store
+                    .load_frozen_provenance_page(
+                        turn.provenance_id,
+                        attempt.attempt_generation,
+                        attempt.frozen_event_count,
+                        cursor,
+                        budget,
+                    )
+                    .unwrap()
+            };
+            let page = load();
+            assert_eq!(page, load(), "same cursor must return identical bytes");
+            assert!(page.next > cursor);
+            assert!(page.fragments.iter().map(|f| f.bytes.len()).sum::<usize>() <= budget);
+            for fragment in page.fragments {
+                assert_eq!(fragment.cursor.offset, partial.len());
+                partial.extend(fragment.bytes);
+                if fragment.complete {
+                    actual.push(std::mem::take(&mut partial));
+                }
+            }
+            cursor = page.next;
+        }
+        assert!(partial.is_empty());
+        assert_eq!(actual, expected);
+    }
+    let store = RedbChangeStore::open(&path).unwrap();
+    let load = |generation, cutoff, cursor, budget| {
+        store.load_frozen_provenance_page(turn.provenance_id, generation, cutoff, cursor, budget)
+    };
+    let generation = attempt.attempt_generation;
+    let cutoff = attempt.frozen_event_count;
+    assert!(matches!(
+        load(generation - 1, cutoff, FrozenProvenanceCursor::default(), 8),
+        Err(RedbStoreError::ProvenanceFenced { .. })
+    ));
+    assert!(matches!(
+        load(generation, cutoff - 1, FrozenProvenanceCursor::default(), 8),
+        Err(RedbStoreError::ProvenanceCheckpointConflict { .. })
+    ));
+    for cursor in [
+        FrozenProvenanceCursor { seq: 0, offset: 1 }, // legacy record
+        FrozenProvenanceCursor { seq: 1, offset: 1 }, // empty envelope
+        FrozenProvenanceCursor { seq: 3, offset: 19 }, // noncanonical end offset
+        FrozenProvenanceCursor {
+            seq: cutoff,
+            offset: 1,
+        },
+        FrozenProvenanceCursor {
+            seq: cutoff + 1,
+            offset: 0,
+        },
+    ] {
+        assert!(matches!(
+            load(generation, cutoff, cursor, 8),
+            Err(RedbStoreError::InvalidProvenanceCursor { .. })
+        ));
+    }
+    assert!(load(generation, cutoff, FrozenProvenanceCursor::default(), 0).is_err());
+    let end = load(
+        generation,
+        cutoff,
+        FrozenProvenanceCursor {
+            seq: cutoff,
+            offset: 0,
+        },
+        8,
+    )
+    .unwrap();
+    assert!(end.fragments.is_empty());
+}
 
 #[test]
 fn legacy_agent_turn_count_is_normalized_to_next_immutable_ledger_ordinal() {

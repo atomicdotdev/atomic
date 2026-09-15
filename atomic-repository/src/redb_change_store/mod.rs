@@ -18,9 +18,10 @@ mod queries;
 
 pub use batch::StoredSection;
 pub use provenance::{
+    FrozenProvenanceCursor, FrozenProvenanceFragment, FrozenProvenancePage,
     ProvenanceCheckpointAttempt, ProvenanceCheckpointPhase, ProvenanceCheckpointSource,
     ProvenanceId, ProvenanceTurnState, StopCause, StopState, StoredProvenanceEnvelope,
-    StoredProvenanceEvent, StoredProvenanceTurn,
+    StoredProvenanceEvent, StoredProvenanceTurn, MAX_FROZEN_PAGE_FRAGMENTS,
 };
 pub use queries::{StoreStats, StoredContentChunk};
 
@@ -104,6 +105,9 @@ pub enum RedbStoreError {
 
     #[error("Invalid state transition for provenance turn {id}")]
     InvalidProvenanceTransition { id: u64 },
+
+    #[error("Invalid frozen journal cursor or page budget for provenance turn {id}")]
+    InvalidProvenanceCursor { id: u64 },
 
     #[error("Provenance event id '{event_id}' conflicts in turn {id}")]
     ProvenanceEventConflict { id: u64, event_id: String },

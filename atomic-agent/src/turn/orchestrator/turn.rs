@@ -146,6 +146,12 @@ impl TurnOrchestrator {
             TurnEndLock::Unavailable => None,
         };
 
+        // The session lock deduplicates one session's Stops. Independent
+        // sessions (including sandboxes) still share pristine and must not
+        // race status/add/record or checkpoint publication. Acquire before
+        // reading session/status, and retain through publication and save.
+        let _publication_lock = self.wait_turn_publication_lock(session_id)?;
+
         let mut session = self.load_or_create_session(session_id, &event)?;
 
         let has_changes = self.has_working_copy_changes();
@@ -325,6 +331,13 @@ impl TurnOrchestrator {
                                 session_id,
                                 e
                             );
+                            if self.journal_sink.is_some() {
+                                // Preserve the active session and durable journal
+                                // for retry; a failed record is not a finished turn.
+                                return Err(e);
+                            }
+                            // Legacy orchestrators without a durable journal
+                            // retain their best-effort recording behavior.
                             dispatch = dispatch.with_warning(format!(
                                 "Failed to record turn {}: {}",
                                 turn_number, e
@@ -398,6 +411,50 @@ impl TurnOrchestrator {
         }
 
         Ok(DispatchResult::new(session_id, session.phase))
+    }
+
+    fn wait_turn_publication_lock(
+        &self,
+        session_id: &str,
+    ) -> AgentResult<Option<TurnEndLockGuard>> {
+        use fs2::FileExt;
+        let failure = |reason: String| AgentError::ProvenanceJournalFailed {
+            session_id: session_id.to_owned(),
+            reason,
+        };
+        let canonical = match atomic_repository::Repository::canonical_dot_dir(&self.repo_root) {
+            Ok(path) => path,
+            // Legacy session-only orchestrators can run without a repository.
+            // A journal-backed Stop must always have canonical coordination.
+            Err(
+                atomic_repository::RepositoryError::NotFound { .. }
+                | atomic_repository::RepositoryError::NotInRepository,
+            ) if self.journal_sink.is_none() => return Ok(None),
+            Err(error) => return Err(failure(error.to_string())),
+        };
+        // Never unlink a lock file: waiters must all lock the same inode.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(canonical.join("turn-publication.lock"))
+            .map_err(|error| failure(error.to_string()))?;
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(10);
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Some(TurnEndLockGuard { file })),
+                Err(error) if super::is_lock_contended(&error) => {
+                    if start.elapsed() >= timeout {
+                        return Err(failure(
+                            "timed out waiting for another Stop to publish; retry this Stop".into(),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => return Err(failure(error.to_string())),
+            }
+        }
     }
 
     fn try_turn_end_lock(&self, session_id: &str) -> TurnEndLock {
