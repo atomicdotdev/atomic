@@ -778,7 +778,7 @@ impl Repository {
         let asserting_done =
             explicit_grant || (options.content.is_some() && resulting_status == "done");
 
-        // A `needs-review` flip is the author's handoff — implementation
+        // A `needs-review` flip is the review handoff — implementation
         // complete, awaiting independent review. It is NOT a grant (no
         // substance pin is stamped), but it gets the same write-time checklist
         // guard as a done grant so an incomplete intent cannot be flagged

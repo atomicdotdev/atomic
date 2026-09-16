@@ -38,7 +38,7 @@ impl NodeType {
 }
 
 /// Intent status value set (mirrors the doc's `IntentShape` `sh:in`).
-/// `needs-review` is the author's handoff — implementation complete (every
+/// `needs-review` is the review handoff — implementation complete (every
 /// task done, every criterion met) and signed, awaiting independent review;
 /// `done` is granted by that review. `icebox` is a terminal state (an intent
 /// reviewed and set aside — not built).
