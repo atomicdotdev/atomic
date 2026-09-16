@@ -63,7 +63,7 @@ impl TurnOrchestrator {
         // session end. Record them now. Idempotent: agents that already
         // recorded each turn on `stop` leave a clean working copy here, so
         // `record_turn` returns `EmptyTurn` and this is a no-op for them.
-        {
+        if !session.explicit_record_files || had_active_turn {
             // Ensure the working copy is on the session's agent view before
             // recording. session-start aligns to it, but that can drift back to
             // the parent view by session end (observed with Cursor's CLI), which

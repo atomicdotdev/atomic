@@ -1832,3 +1832,94 @@ fn owner_election_commit_reconnect_and_crash_restart() {
     );
     wait_for_shutdown(&repository);
 }
+
+#[test]
+fn scoped_concurrent_stops_and_session_end_do_not_record_sibling_files() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("repo");
+    drop(Repository::init(&root).unwrap());
+    let hook = |sid: &str, verb: &str, extra: Value| {
+        let mut value = extra;
+        value["session_id"] = sid.into();
+        let output = run_agent_hook(
+            &root,
+            "opencode",
+            verb,
+            &serde_json::to_vec(&value).unwrap(),
+        );
+        assert!(output.status.success(), "{output:?}");
+    };
+    hook(
+        "workspace-owner",
+        "session-start",
+        serde_json::json!({"recording_scope":"explicit-files-v1"}),
+    );
+    for sid in ["child-a", "child-b"] {
+        hook(
+            sid,
+            "session-start",
+            serde_json::json!({"recording_scope":"explicit-files-v1", "workspace_session_id":"workspace-owner"}),
+        );
+        hook(
+            sid,
+            "user-prompt",
+            serde_json::json!({"prompt":"Write only the assigned file"}),
+        );
+    }
+    for name in ["child-a.txt", "child-b.txt", "human.txt"] {
+        std::fs::write(root.join(name), name).unwrap();
+    }
+    let pending:Vec<_> = ["child-a", "child-b"].into_iter().map(|sid|{
+        let root=root.clone();
+        thread::spawn(move||{
+            let path=format!("{sid}.txt");
+            let digest=atomic_agent::record::scope::fingerprint(&root,&path).unwrap();
+            run_agent_hook(&root,"opencode","stop",&serde_json::to_vec(&serde_json::json!({"session_id":sid,"record_files":{path:digest},"response":"Done"})).unwrap())
+        })
+    }).collect();
+    for handle in pending {
+        let result = handle.join().unwrap();
+        assert!(result.status.success(), "{result:?}");
+    }
+    for sid in ["child-a", "child-b"] {
+        let state: Value = serde_json::from_slice(
+            &std::fs::read(root.join(format!(".atomic/sessions/{sid}.json"))).unwrap(),
+        )
+        .unwrap();
+        let owner: Value = serde_json::from_slice(
+            &std::fs::read(root.join(".atomic/sessions/workspace-owner.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state["view_name"], owner["view_name"]);
+        assert_eq!(
+            state["files_touched"],
+            serde_json::json!([format!("{sid}.txt")])
+        );
+        assert_eq!(state["recorded_change_hashes"].as_array().unwrap().len(), 1);
+        hook(
+            sid,
+            "stop",
+            serde_json::json!({"record_files":{},"response":"duplicate idle"}),
+        );
+        hook(
+            sid,
+            "session-end",
+            serde_json::json!({"record_files":{},"reason":"deleted"}),
+        );
+        let after: Value = serde_json::from_slice(
+            &std::fs::read(root.join(format!(".atomic/sessions/{sid}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            after["recorded_change_hashes"],
+            state["recorded_change_hashes"]
+        );
+        assert_eq!(after["turn_count"], state["turn_count"]);
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("human.txt")).unwrap(),
+        "human.txt"
+    );
+    assert!(run_owner(&root, "shutdown").status.success());
+    wait_for_shutdown(&root);
+}

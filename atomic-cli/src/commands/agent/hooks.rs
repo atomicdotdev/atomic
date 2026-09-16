@@ -123,6 +123,26 @@ impl Command for Hooks {
             ))
         })?;
 
+        if self.agent_name == "opencode" && self.verb == "file-snapshot" {
+            let value: serde_json::Value =
+                serde_json::from_slice(&input).map_err(|e| CliError::Internal(anyhow!(e)))?;
+            let cwd = value
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| CliError::Internal(anyhow!("file-snapshot requires cwd")))?;
+            let extra: Vec<String> = serde_json::from_value(
+                value
+                    .get("paths")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+            )
+            .map_err(|e| CliError::Internal(anyhow!(e)))?;
+            let snapshot = atomic_agent::record::scope::snapshot(std::path::Path::new(cwd), &extra)
+                .map_err(|e| CliError::Internal(anyhow!(e)))?;
+            println!("{}", snapshot);
+            return Ok(());
+        }
+
         if self.should_handoff_codex_lifecycle() {
             return self.handoff_codex_lifecycle(&input);
         }

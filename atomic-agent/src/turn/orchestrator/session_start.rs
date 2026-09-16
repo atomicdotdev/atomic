@@ -173,6 +173,49 @@ impl TurnOrchestrator {
         // Best-effort: if the repo can't be opened or the view already
         // exists (resumed session), we log and continue — recording will
         // still work, it just won't have the parent's history.
+        if event
+            .raw_json
+            .as_ref()
+            .and_then(|v| v.get("recording_scope"))
+            .and_then(|v| v.as_str())
+            == Some("explicit-files-v1")
+        {
+            session.explicit_record_files = true;
+        }
+
+        // Several OpenCode sessions can share one actual working directory.
+        // Explicit file scopes separate authorship; a common view gives their
+        // status/add/record operations one baseline and one directory identity.
+        if let Some(owner_id) = event
+            .raw_json
+            .as_ref()
+            .and_then(|v| v.get("workspace_session_id"))
+            .and_then(|v| v.as_str())
+        {
+            if !session.explicit_record_files {
+                return Err(crate::error::AgentError::Internal(
+                    "shared workspace requires explicit file recording".into(),
+                ));
+            }
+            if owner_id != session_id {
+                let owner = self.session_store.load(owner_id)?.ok_or_else(|| {
+                    crate::error::AgentError::Internal("workspace owner session is missing".into())
+                })?;
+                if !owner.explicit_record_files {
+                    return Err(crate::error::AgentError::Internal(
+                        "workspace owner does not use explicit file recording".into(),
+                    ));
+                }
+                if self.managed_run.is_some() && session.view_name != owner.view_name {
+                    return Err(crate::error::AgentError::Internal(
+                        "workspace view conflicts with managed run".into(),
+                    ));
+                }
+                session.view_name = owner.view_name.clone();
+                session.parent_view = Some(owner.view_name);
+            }
+        }
+
         if session.parent_view.is_none() {
             match atomic_repository::Repository::open_existing_wait(
                 &self.repo_root,
