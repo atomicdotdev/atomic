@@ -7,6 +7,10 @@ use crate::turn::session::AgentSession;
 
 use super::{vendor_from_agent_name, DispatchResult, TurnOrchestrator};
 
+// Session lifecycle operations use short writable handles, just like recording.
+// Retry acquisition only; replaying the whole lifecycle could fork/switch twice.
+const SESSION_DATABASE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl TurnOrchestrator {
     /// Handle a SessionStart event.
     ///
@@ -170,7 +174,10 @@ impl TurnOrchestrator {
         // exists (resumed session), we log and continue — recording will
         // still work, it just won't have the parent's history.
         if session.parent_view.is_none() {
-            match atomic_repository::Repository::open_existing(&self.repo_root) {
+            match atomic_repository::Repository::open_existing_wait(
+                &self.repo_root,
+                SESSION_DATABASE_WAIT,
+            ) {
                 Ok(repo) if repo.is_sandbox() => {
                     // A sandbox is a materialized copy of the project; `record`
                     // writes to the *canonical* graph (shared pristine +
@@ -322,7 +329,10 @@ impl TurnOrchestrator {
         session: &crate::turn::session::AgentSession,
         ended_at: Option<i64>,
     ) {
-        match atomic_repository::Repository::open_existing(&self.repo_root) {
+        match atomic_repository::Repository::open_existing_wait(
+            &self.repo_root,
+            SESSION_DATABASE_WAIT,
+        ) {
             Ok(repo) => {
                 if let Err(e) = repo.upsert_session_lifecycle(
                     &session.session_id,
@@ -396,8 +406,10 @@ impl TurnOrchestrator {
                 // view from the user's view so that the agent's changes
                 // are isolated and the view filter only exposes the
                 // parent's files.
-                if let Ok(mut repo) = atomic_repository::Repository::open_existing(&self.repo_root)
-                {
+                if let Ok(mut repo) = atomic_repository::Repository::open_existing_wait(
+                    &self.repo_root,
+                    SESSION_DATABASE_WAIT,
+                ) {
                     let current = repo.current_view().to_string();
 
                     if repo.is_sandbox() {

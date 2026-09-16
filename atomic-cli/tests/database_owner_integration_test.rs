@@ -198,6 +198,58 @@ fn run_agent_hook(repository: &std::path::Path, agent: &str, verb: &str, payload
 }
 
 #[test]
+fn concurrent_session_starts_wait_for_writer_and_persist_views_and_lifecycle() {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repo");
+    let writer = Repository::init(&repository).unwrap();
+    let pending: Vec<_> = (0..8)
+        .map(|index| {
+            let root = repository.clone();
+            thread::spawn(move || {
+                let session = format!("start-contended-{index}");
+                let payload = serde_json::to_vec(&serde_json::json!({
+                    "session_id": session, "cwd": root,
+                }))
+                .unwrap();
+                run_agent_hook(&root, "opencode", "session-start", &payload)
+            })
+        })
+        .collect();
+    // Hold a real incompatible handle across all eight independent processes.
+    // The hook must wait internally, without a test-side retry or startup queue.
+    thread::sleep(Duration::from_millis(300));
+    let returned_early = pending.iter().any(thread::JoinHandle::is_finished);
+    drop(writer);
+    let outputs: Vec<_> = pending.into_iter().map(|p| p.join().unwrap()).collect();
+    assert!(
+        !returned_early,
+        "session start skipped a contended database"
+    );
+    let repo = Repository::open_existing(&repository).unwrap();
+    let mut views = HashSet::new();
+    for (index, output) in outputs.iter().enumerate() {
+        assert!(output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("Cannot acquire lock"), "{stderr}");
+        let sid = format!("start-contended-{index}");
+        let session: Value = serde_json::from_slice(
+            &std::fs::read(repository.join(format!(".atomic/sessions/{sid}.json"))).unwrap(),
+        )
+        .unwrap();
+        let view = session["view_name"].as_str().unwrap();
+        assert!(
+            views.insert(view.to_string()),
+            "sessions must have distinct views"
+        );
+        assert!(repo.get_view_info(view).is_ok(), "view {view} missing");
+        assert!(
+            repo.get_session_ledger(&sid).unwrap().is_some(),
+            "lifecycle missing for {sid}"
+        );
+    }
+}
+
+#[test]
 fn read_only_turn_does_not_reuse_its_goal_for_the_next_turn_across_agents() {
     for (agent, prompt_verb) in [
         ("codex", "user-prompt-submit"),
