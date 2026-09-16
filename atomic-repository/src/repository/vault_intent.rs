@@ -1901,9 +1901,7 @@ Login attempts are rate-limited.\n:::\n\n\
 
         // A handoff is not a grant: no done-substance pin is stamped.
         let manifest = repo.vault_manifest().unwrap();
-        assert!(manifest.intents[&result.id]
-            .done_substance_hash
-            .is_none());
+        assert!(manifest.intents[&result.id].done_substance_hash.is_none());
     }
 
     /// A canonical intent body whose checklist is complete (every AC met, every
