@@ -17,6 +17,12 @@
 //! In the remote case the attestation's `attributed_to` DID is required to
 //! match the returned key (fingerprint check) before any signature is
 //! verified — a swapped or malicious key fails before the crypto step.
+//!
+//! Keys resolved from the server are cached locally (24h TTL, keyed by
+//! identity name — see [`crate::commands::intent::key_cache`]), so repeat
+//! and offline verifies don't hit the network. A cached key is subject to
+//! the same fingerprint gate and falls through to a fresh fetch when it
+//! no longer matches (rotated keys).
 
 use clap::Parser;
 
@@ -27,7 +33,7 @@ use atomic_identity::IdentityStore;
 use atomic_repository::Repository;
 
 use crate::commands::client::{build_apex_client, remote_err};
-use crate::commands::intent::bridge;
+use crate::commands::intent::{bridge, key_cache};
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 
@@ -146,18 +152,44 @@ impl IntentVerify {
         Ok(())
     }
 
-    /// Fetch the identity's public key from the configured storage server and
-    /// prove it belongs to the signer recorded in the attestation.
+    /// Resolve the identity's public key: local cache first, then the server.
     ///
     /// The attestation's `attributed_to` is a `did:atomic:` (or `did:key:`)
-    /// fingerprint of the signing key. A key returned by the server that does
-    /// not fingerprint-match the sidecar cannot be the signer — reject it
-    /// before any cryptographic work.
+    /// fingerprint of the signing key. ANY key used for verification — cached
+    /// or freshly fetched — must fingerprint-match the sidecar's signer; the
+    /// cache is only a byte source, never a trust source.
+    ///
+    /// A cached key that fails the gate (or that has expired/rotated) falls
+    /// through to a fresh server fetch; only a fresh server key that itself
+    /// fails the gate is a hard error.
     async fn resolve_remote(
         &self,
         name: &str,
         node: &atomic_canonical::CanonicalNode,
     ) -> CliResult<(PublicKey, String)> {
+        // 1) Local cache first — repeat/offline verifies skip the network.
+        let mut cache = key_cache::PublicKeyCache::open();
+        if let Some(cached) = cache.get(name) {
+            if let Ok(key) = PublicKey::from_base32(&cached.public_key) {
+                match node.attributed_to.as_deref() {
+                    // Cached key gate-matches the signer → use it.
+                    Some(did) if did_matches_public_key(did, &key) => {
+                        return Ok((
+                            key,
+                            format!(
+                                "local key cache (resolved {})",
+                                cached.resolved_at.format("%Y-%m-%d %H:%M:%S UTC")
+                            ),
+                        ))
+                    }
+                    // Gate miss or no signer recorded: fall through and
+                    // re-fetch — the signer may have rotated keys.
+                    _ => {}
+                }
+            }
+        }
+
+        // 2) Fresh fetch from the configured storage server.
         let client = build_apex_client(self.server.as_deref()).await?;
 
         let info = client
@@ -194,6 +226,9 @@ impl IntentVerify {
                 });
             }
         }
+
+        // 3) Cache the fresh, gate-passing key (best-effort).
+        cache.put(name, &key.to_base32(), &info.status);
 
         let server_url = client.base_url().to_string();
         Ok((
