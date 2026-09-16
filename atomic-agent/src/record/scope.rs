@@ -85,7 +85,7 @@ pub fn snapshot(root: &Path, extra: &[String]) -> Result<serde_json::Value, Stri
     let repo = Repository::open_readonly_wait(root, std::time::Duration::from_secs(10))
         .map_err(|e| e.to_string())?;
     let status = repo
-        .status(StatusOptions::fast().with_untracked(true))
+        .status(StatusOptions::default().with_untracked(true))
         .map_err(|e| e.to_string())?;
     let dirty: Vec<String> = status
         .entries()

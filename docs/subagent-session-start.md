@@ -1,5 +1,10 @@
 # Subagent session-start contention
 
+Follow-up: the shared-directory file-ownership limitation described below is
+addressed by the separate `fix/subagent-file-ownership` branch; see
+[file ownership](subagent-file-ownership.md).
+
+
 This follow-up is based on PR #190 at
 `67b74c8881ce4afe8a758beea093bc486a1da3f7`. It keeps redb 4.2 and does not
 include Aaron's identity-delegation changes. Atomic intent: `ATOM::vince::12`
