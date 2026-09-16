@@ -366,7 +366,7 @@ atom:IntentShape
 
     sh:property [
         sh:path atom:status ;
-        sh:in ( "backlog" "todo" "in_progress" "done" ) ;
+        sh:in ( "backlog" "todo" "in_progress" "needs-review" "done" "icebox" ) ;
         sh:minCount 1 ; sh:maxCount 1 ;
         sh:message "status must be exactly one of the known states" ] ;
 
