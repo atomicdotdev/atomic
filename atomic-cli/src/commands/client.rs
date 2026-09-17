@@ -88,14 +88,10 @@ pub async fn build_apex_client(server_override: Option<&str>) -> CliResult<Stora
         .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?
         .0;
 
-    let apex_url = server.url.clone().ok_or_else(|| {
-        let hint = if let Some(name) = server_override {
-            format!("Server profile '{}' has no URL configured.", name)
-        } else {
-            "Server not configured. Run 'atomic identity register <server-url>' first.".to_string()
-        };
-        CliError::Internal(anyhow::anyhow!("{}", hint))
-    })?;
+    let apex_url = server
+        .url
+        .clone()
+        .ok_or_else(|| server_url_missing(server_override))?;
 
     let identity = resolve_identity_for_server(server)?;
 
@@ -108,6 +104,37 @@ pub async fn build_apex_client(server_override: Option<&str>) -> CliResult<Stora
     })?;
 
     Ok(client)
+}
+
+/// Resolve just the apex server URL for a server override.
+///
+/// Unlike [`build_apex_client`], this performs **no** identity resolution and
+/// **no** token minting — it is a pure local config read. Commands use it to
+/// namespace local state (e.g. the resolved-key cache) by server before any
+/// network I/O, so offline cache hits never touch the network.
+pub fn apex_server_url(server_override: Option<&str>) -> CliResult<String> {
+    let config = GlobalConfig::load()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
+
+    let server = config
+        .resolve_server(server_override)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?
+        .0;
+
+    server
+        .url
+        .clone()
+        .ok_or_else(|| server_url_missing(server_override))
+}
+
+/// Error used when no server is configured — shared by the apex helpers.
+fn server_url_missing(server_override: Option<&str>) -> CliError {
+    let hint = if let Some(name) = server_override {
+        format!("Server profile '{}' has no URL configured.", name)
+    } else {
+        "Server not configured. Run 'atomic identity register <server-url>' first.".to_string()
+    };
+    CliError::Internal(anyhow::anyhow!("{}", hint))
 }
 
 /// Build a [`StorageClient`] and return the resolved org slug alongside it.

@@ -2,9 +2,16 @@
 //!
 //! `atomic intent verify --identity <name>` resolves a signer's public key
 //! from the storage server on every invocation. This module caches the
-//! resolved key (keyed by identity name) under
-//! `~/.atomic/public-key-cache.json` (or `$ATOMIC_CONFIG_DIR`), so repeat
-//! verifies — and offline verifies — don't need the network.
+//! resolved key under `~/.atomic/public-key-cache.json` (or
+//! `$ATOMIC_CONFIG_DIR`), so repeat verifies — and offline verifies — don't
+//! need the network.
+//!
+//! # Keying
+//!
+//! Entries are namespaced by `(server URL, identity name)`: the same name on
+//! two different servers (e.g. staging vs. production) may legitimately carry
+//! different keys, and a stale entry from one server must never satisfy a
+//! lookup against another.
 //!
 //! # Security model
 //!
@@ -21,11 +28,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use atomic_config::global_config_dir;
-
-use std::path::Path;
 
 /// How long a resolved key is trusted before it must be re-fetched.
 pub const DEFAULT_CACHE_TTL: chrono::Duration = chrono::Duration::hours(24);
@@ -35,6 +40,8 @@ const CACHE_FILE: &str = "public-key-cache.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CacheEntry {
+    /// The server this key was resolved from (cache namespace).
+    server_url: String,
     /// Canonical base32-encoded Ed25519 public key.
     public_key: String,
     /// Lifecycle status as reported by the server (`active`, …).
@@ -59,7 +66,17 @@ pub struct CachedKey {
     pub resolved_at: DateTime<Utc>,
 }
 
-/// File-backed cache of name → public key resolutions.
+impl CachedKey {
+    /// A display line naming the cache as the key's source.
+    pub fn source_line(&self) -> String {
+        format!(
+            "local key cache (resolved {})",
+            self.resolved_at.format("%Y-%m-%d %H:%M:%S UTC")
+        )
+    }
+}
+
+/// File-backed cache of (server, name) → public key resolutions.
 pub struct PublicKeyCache {
     dir: PathBuf,
     path: PathBuf,
@@ -105,13 +122,16 @@ impl PublicKeyCache {
         }
     }
 
-    /// Look up a cached, unexpired, active key by identity name.
+    /// Look up a cached, unexpired, active key for (server, identity name).
     ///
-    /// Returns `None` when the name is unknown, the entry is expired, or
-    /// the identity is not `active` — in all cases the caller should fall
-    /// back to the server.
-    pub fn get(&self, name: &str) -> Option<CachedKey> {
+    /// Returns `None` when the (server, name) pair is unknown, the entry is
+    /// expired, or the identity is not `active` — in all cases the caller
+    /// should fall back to the server.
+    pub fn get(&self, server_url: &str, name: &str) -> Option<CachedKey> {
         if let Some(entry) = self.entries.get(name) {
+            if entry.server_url != server_url {
+                return None;
+            }
             if entry.status != "active" {
                 return None;
             }
@@ -130,13 +150,14 @@ impl PublicKeyCache {
     ///
     /// Write failures are logged and swallowed — the cache is
     /// best-effort and never fatal.
-    pub fn put(&mut self, name: &str, public_key: &str, status: &str) {
-        self.put_with_ttl(name, public_key, status, DEFAULT_CACHE_TTL);
+    pub fn put(&mut self, server_url: &str, name: &str, public_key: &str, status: &str) {
+        self.put_with_ttl(server_url, name, public_key, status, DEFAULT_CACHE_TTL);
     }
 
     /// Store a resolution with an explicit TTL (tests use negative TTLs).
     pub fn put_with_ttl(
         &mut self,
+        server_url: &str,
         name: &str,
         public_key: &str,
         status: &str,
@@ -144,6 +165,7 @@ impl PublicKeyCache {
     ) {
         let now = Utc::now();
         let entry = CacheEntry {
+            server_url: server_url.to_string(),
             public_key: public_key.to_string(),
             status: status.to_string(),
             resolved_at: now,
@@ -177,6 +199,9 @@ impl PublicKeyCache {
 mod tests {
     use super::*;
 
+    const SERVER: &str = "https://127.0.0.1:8080";
+    const KEY: &str = "H2AM5IDITAWB5LBSKMNOCVKOUL4ZUS5GHGEHHEGESOTUYCOC4HJA";
+
     fn scratch_dir(tag: &str) -> PathBuf {
         let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
         let dir = PathBuf::from(&tmp)
@@ -189,55 +214,58 @@ mod tests {
     #[test]
     fn empty_cache_serves_nothing() {
         let cache = PublicKeyCache::open_at(scratch_dir("empty").as_path());
-        assert!(cache.get("lee").is_none());
+        assert!(cache.get(SERVER, "lee").is_none());
     }
 
     #[test]
     fn put_then_get_round_trips() {
         let dir = scratch_dir("roundtrip");
         let mut cache = PublicKeyCache::open_at(dir.as_path());
-        cache.put(
-            "lee",
-            "H2AM5IDITAWB5LBSKMNOCVKOUL4ZUS5GHGEHHEGESOTUYCOC4HJA",
-            "active",
-        );
+        cache.put(SERVER, "lee", KEY, "active");
 
-        let hit = cache.get("lee").unwrap();
-        assert_eq!(
-            hit.public_key,
-            "H2AM5IDITAWB5LBSKMNOCVKOUL4ZUS5GHGEHHEGESOTUYCOC4HJA"
-        );
+        let hit = cache.get(SERVER, "lee").unwrap();
+        assert_eq!(hit.public_key, KEY);
+        assert!(hit.source_line().contains("local key cache"));
 
         // And a re-open from disk sees the persisted entry.
         let reopened = PublicKeyCache::open_at(dir.as_path());
         assert_eq!(
-            reopened.get("lee").map(|c| c.public_key).as_deref(),
-            Some("H2AM5IDITAWB5LBSKMNOCVKOUL4ZUS5GHGEHHEGESOTUYCOC4HJA".into())
+            reopened.get(SERVER, "lee").map(|c| c.public_key).as_deref(),
+            Some(KEY.into())
         );
+    }
+
+    #[test]
+    fn same_name_on_another_server_is_a_miss() {
+        let dir = scratch_dir("namespace");
+        let mut cache = PublicKeyCache::open_at(dir.as_path());
+        cache.put(SERVER, "lee", KEY, "active");
+        // Same identity name, different server → must not be served.
+        assert!(cache.get("https://staging.example.com", "lee").is_none());
     }
 
     #[test]
     fn unknown_name_is_a_miss() {
         let dir = scratch_dir("unknown");
         let mut cache = PublicKeyCache::open_at(dir.as_path());
-        cache.put("lee", "ABC", "active");
-        assert!(cache.get("other").is_none());
+        cache.put(SERVER, "lee", KEY, "active");
+        assert!(cache.get(SERVER, "other").is_none());
     }
 
     #[test]
     fn expired_entries_are_not_served() {
         let dir = scratch_dir("expired");
         let mut cache = PublicKeyCache::open_at(dir.as_path());
-        cache.put_with_ttl("lee", "ABC", "active", chrono::Duration::seconds(-1));
-        assert!(cache.get("lee").is_none());
+        cache.put_with_ttl(SERVER, "lee", KEY, "active", chrono::Duration::seconds(-1));
+        assert!(cache.get(SERVER, "lee").is_none());
     }
 
     #[test]
     fn suspended_entries_are_not_served() {
         let dir = scratch_dir("suspended");
         let mut cache = PublicKeyCache::open_at(dir.as_path());
-        cache.put("lee", "ABC", "suspended");
-        assert!(cache.get("lee").is_none());
+        cache.put(SERVER, "lee", KEY, "suspended");
+        assert!(cache.get(SERVER, "lee").is_none());
     }
 
     #[test]
@@ -246,6 +274,6 @@ mod tests {
         std::fs::write(&dir.join(CACHE_FILE), b"not json at all").unwrap();
 
         let cache = PublicKeyCache::open_at(dir.as_path());
-        assert!(cache.get("lee").is_none());
+        assert!(cache.get(SERVER, "lee").is_none());
     }
 }
