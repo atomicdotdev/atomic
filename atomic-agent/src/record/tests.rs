@@ -1175,3 +1175,85 @@ fn test_orphaned_session_view_duplicates_content_on_merge() {
         "session B's edit should survive the merge"
     );
 }
+
+#[test]
+fn scoped_record_keeps_sibling_and_preexisting_files_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut repo = atomic_repository::Repository::init(dir.path()).unwrap();
+    let parent = repo.current_view().to_string();
+    let mut a = AgentSession::new("child-a", "opencode", "OpenCode");
+    let mut b = AgentSession::new("child-b", "opencode", "OpenCode");
+    for s in [&mut a, &mut b] {
+        s.explicit_record_files = true;
+        s.set_parent_view(repo.current_view());
+        repo.create_view_from(&s.view_name, &parent).unwrap();
+    }
+    drop(repo);
+    for (name, text) in [
+        ("a.txt", "child a"),
+        ("b.txt", "child b"),
+        ("human.txt", "leave alone"),
+    ] {
+        std::fs::write(dir.path().join(name), text).unwrap();
+    }
+    let mut hashes = Vec::new();
+    for (s, file) in [(&a, "a.txt"), (&b, "b.txt")] {
+        let event = make_event().with_raw_json(
+            serde_json::json!({"record_files":{file:scope::fingerprint(dir.path(),file).unwrap()}}),
+        );
+        let outcome = record_turn(dir.path(), &make_options(s, &event)).unwrap();
+        assert_eq!(outcome.recorded_file_list(), &[file.to_string()]);
+        hashes.push(outcome.hash);
+    }
+    assert_ne!(hashes[0], hashes[1]);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("human.txt")).unwrap(),
+        "leave alone"
+    );
+}
+
+#[test]
+fn scoped_record_empty_missing_invalid_or_stale_manifest_never_sweeps() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = atomic_repository::Repository::init(dir.path()).unwrap();
+    let mut session = make_session();
+    session.view_name = repo.current_view().to_string();
+    session.explicit_record_files = true;
+    drop(repo);
+    std::fs::write(dir.path().join("unrelated.txt"), "human").unwrap();
+    let empty = make_event().with_raw_json(serde_json::json!({"record_files":{}}));
+    assert!(matches!(
+        record_turn(dir.path(), &make_options(&session, &empty)),
+        Err(AgentError::EmptyTurn { .. })
+    ));
+    for payload in [
+        serde_json::json!({}),
+        serde_json::json!({"record_files":null}),
+        serde_json::json!({"record_files":{"../escape":null}}),
+        serde_json::json!({"record_files":{"unrelated.txt":"wrong digest"}}),
+        serde_json::json!({"record_files":{".atomic/config.toml":null}}),
+    ] {
+        let event = make_event().with_raw_json(payload);
+        assert!(matches!(
+            record_turn(dir.path(), &make_options(&session, &event)),
+            Err(AgentError::RecordFailed { .. })
+        ));
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("unrelated.txt")).unwrap(),
+        "human"
+    );
+}
+
+#[test]
+fn scoped_snapshot_includes_requested_files_restored_to_clean_and_deletions() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(atomic_repository::Repository::init(dir.path()).unwrap());
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    let first = scope::snapshot(dir.path(), &[]).unwrap();
+    assert!(first["files"]["a.txt"].is_string());
+    std::fs::remove_file(dir.path().join("a.txt")).unwrap();
+    let after = scope::snapshot(dir.path(), &["a.txt".into()]).unwrap();
+    assert!(after["files"].as_object().unwrap().contains_key("a.txt"));
+    assert!(after["files"]["a.txt"].is_null());
+}

@@ -133,7 +133,7 @@ pub mod version;
 // Re-exports
 
 // Version checking
-pub use version::{check_min_version_header, needs_upgrade};
+pub use version::{check_min_version_header, needs_upgrade, read_min_version_header};
 
 // Error types
 pub use error::{RemoteError, RemoteResult};

@@ -36,8 +36,18 @@ impl TurnOrchestrator {
             }
         };
 
+        let had_active_turn = session.is_turn_active();
+        let journal_turn = if had_active_turn {
+            session.turn_count.saturating_add(1)
+        } else {
+            session.turn_count.max(1)
+        };
+        if had_active_turn {
+            self.commit_hook_event(&event, journal_turn)?;
+        }
+
         // If a turn is still active, cancel the watcher
-        if session.is_turn_active() {
+        if had_active_turn {
             if let Err(e) = self.watcher.cancel_turn().await {
                 log::warn!(
                     "Failed to cancel turn watcher for session {}: {}",
@@ -53,7 +63,7 @@ impl TurnOrchestrator {
         // session end. Record them now. Idempotent: agents that already
         // recorded each turn on `stop` leave a clean working copy here, so
         // `record_turn` returns `EmptyTurn` and this is a no-op for them.
-        {
+        if !session.explicit_record_files || had_active_turn {
             // Ensure the working copy is on the session's agent view before
             // recording. session-start aligns to it, but that can drift back to
             // the parent view by session end (observed with Cursor's CLI), which
@@ -97,6 +107,9 @@ impl TurnOrchestrator {
                 .or_else(|| session.first_prompt.clone());
             let turn_number = session.turn_count + 1;
             let turn_duration_ms = session.current_turn_duration_ms().unwrap_or(0);
+            if had_active_turn {
+                self.commit_turn_completion_events(&session, &event, turn_number)?;
+            }
             let record_result = {
                 let record_options = TurnRecordOptions {
                     session: &session,
@@ -114,8 +127,7 @@ impl TurnOrchestrator {
                     session.add_files_touched(&recorded_files);
                     session.recorded_change_hashes.push(outcome.hash);
                     session.clear_current_prompt();
-                    self.inject_reasoning_nodes(session_id, &event);
-                    self.save_turn_provenance(session_id, &session, &outcome, &event);
+                    self.save_turn_provenance(session_id, &session, &outcome, &event)?;
                     log::info!(
                         "SessionEnd flushed a pending turn for session {}: {}",
                         session_id,
@@ -153,6 +165,16 @@ impl TurnOrchestrator {
                     }
                 }
             }
+        }
+
+        if had_active_turn {
+            self.stop_journal_turn(
+                session_id,
+                journal_turn,
+                super::JournalStopCause::ProcessExited,
+                true,
+                event.timestamp.timestamp(),
+            )?;
         }
 
         // State machine transition

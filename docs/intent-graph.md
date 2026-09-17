@@ -109,8 +109,8 @@ are fixed regardless of implementation.
   reason (`why`) *exists*, that authorship (`attributedTo`, a DID) is present,
   and that a Data Integrity `proof` is present — it never grades the prose.
 - **Closed world.** Status and kind values come from fixed sets
-  (`backlog`/`todo`/`in_progress`/`done`/`icebox`; `unmet`/`met`; memory
-  kinds/statuses). Anything outside the set is rejected.
+  (`backlog`/`todo`/`in_progress`/`needs-review`/`done`/`icebox`; `unmet`/`met`;
+  memory kinds/statuses). Anything outside the set is rejected.
 - **`status: done` is granted, not written.** Advancing an intent to `done`
   must pass the gate first.
 - **A checked box needs proof.** `acStatus = met` without `verifiedBy` +

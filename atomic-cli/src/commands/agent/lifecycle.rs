@@ -11,17 +11,19 @@
 //! sandbox pointer) so sandbox hooks see project-root lifecycles.
 //!
 //! `expires_at` is crash protection, not a session limit: a dead
-//! orchestrator's lease expires on its own and is cleaned up lazily.
+//! orchestrator's lease expires on its own, stops governing hooks, and remains
+//! visible as stale until `lifecycle end` harvests and removes it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use atomic_agent::turn::orchestrator::ManagedRunContext;
-use atomic_agent::turn::session::{ManagedRunStamp, SessionStore};
+use atomic_agent::turn::session::{AgentSession, ManagedRunStamp, SessionStore};
+use atomic_agent::{JournalStopCause, JournalTurnLifecycle, ProvenanceJournalSink};
 use atomic_core::types::Base32;
 
 use crate::commands::Command;
@@ -44,6 +46,15 @@ enum LifecycleCommands {
 
     /// Renew a managed run's lease.
     Renew(Renew),
+
+    /// Stop a managed run while preserving a resumable pending turn.
+    Stop(Stop),
+
+    /// Resume a stopped managed run and fence prior writers.
+    Resume(Resume),
+
+    /// Explicitly abandon and seal a pending turn.
+    Abandon(Abandon),
 
     /// End a managed run and print its summary (sessions, changes, views).
     End(End),
@@ -108,6 +119,48 @@ struct Renew {
     json: bool,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum StopReason {
+    UserRequested,
+    ProcessExited,
+    HookFailure,
+    SystemShutdown,
+}
+
+#[derive(Debug, Args)]
+struct Stop {
+    #[arg(long)]
+    run_id: String,
+
+    #[arg(long, value_enum, default_value_t = StopReason::UserRequested)]
+    cause: StopReason,
+
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct Resume {
+    #[arg(long)]
+    run_id: String,
+
+    #[arg(long, default_value_t = DEFAULT_TTL_SECONDS)]
+    ttl_seconds: i64,
+
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct Abandon {
+    #[arg(long)]
+    run_id: String,
+
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Debug, Args)]
 struct End {
     /// Run id returned by lifecycle begin.
@@ -126,6 +179,24 @@ struct Status {
     json: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ManagedStopState {
+    cause: JournalStopCauseWire,
+    observed_at: i64,
+    resumable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum JournalStopCauseWire {
+    UserRequested,
+    LeaseExpired,
+    ProcessExited,
+    HookFailure,
+    SystemShutdown,
+    Abandoned,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ManagedLifecycle {
     pub run_id: String,
@@ -141,6 +212,8 @@ pub(super) struct ManagedLifecycle {
     pub created_at: i64,
     pub updated_at: i64,
     pub expires_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stop_state: Option<ManagedStopState>,
 }
 
 impl ManagedLifecycle {
@@ -158,7 +231,7 @@ impl ManagedLifecycle {
     /// must be the owner or the declared executor (any agent when no
     /// executor is declared).
     fn governs(&self, cwd: &Path, agent_name: &str) -> bool {
-        if !cwd.starts_with(&self.workdir) {
+        if self.stop_state.is_some() || !cwd.starts_with(&self.workdir) {
             return false;
         }
         if self.owner_agent == agent_name {
@@ -210,7 +283,22 @@ struct LifecycleEndResult {
 #[derive(Debug, Serialize)]
 struct LifecycleStatus {
     active: bool,
+    interrupted: bool,
     lifecycles: Vec<ManagedLifecycle>,
+    stale_lifecycles: Vec<ManagedLifecycle>,
+    turns: Vec<LifecycleTurnStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct LifecycleTurnStatus {
+    run_id: String,
+    session_id: String,
+    turn_number: u32,
+    provenance_id: u64,
+    generation: u64,
+    state: String,
+    last_event_seq: Option<u64>,
+    resumable: bool,
 }
 
 impl Command for Lifecycle {
@@ -218,6 +306,9 @@ impl Command for Lifecycle {
         match &self.command {
             LifecycleCommands::Begin(cmd) => cmd.run(),
             LifecycleCommands::Renew(cmd) => cmd.run(),
+            LifecycleCommands::Stop(cmd) => cmd.run(),
+            LifecycleCommands::Resume(cmd) => cmd.run(),
+            LifecycleCommands::Abandon(cmd) => cmd.run(),
             LifecycleCommands::End(cmd) => cmd.run(),
             LifecycleCommands::Status(cmd) => cmd.run(),
         }
@@ -237,16 +328,30 @@ impl Begin {
 
         let now = now_secs();
         let dir = lifecycle_dir(&dot_dir);
-        cleanup_expired(&dir, now);
 
         // Idempotent begin: the same owner+session renews its existing run
         // (noname retries begin on reconnect) instead of minting a new id.
-        let existing = list_active(&dir, now)
+        let existing = list_lifecycles(&dir)
             .into_iter()
             .find(|l| l.owner_agent == self.owner && l.owner_session_id == self.session);
 
         let lifecycle = match existing {
             Some(mut active) => {
+                if matches!(
+                    active.stop_state.as_ref().map(|state| state.cause),
+                    Some(JournalStopCauseWire::Abandoned)
+                ) {
+                    return Err(CliError::InvalidArgument {
+                        message: format!(
+                            "managed lifecycle '{}' was abandoned and cannot resume",
+                            active.run_id
+                        ),
+                    });
+                }
+                if active.stop_state.is_some() || active.is_expired(now) {
+                    resume_lifecycle_turns(&dot_dir, &active, now)?;
+                    active.stop_state = None;
+                }
                 active.executor_agent = self.executor.clone();
                 active.work_item_id = self.work_item.clone();
                 active.view = self.view.clone();
@@ -265,6 +370,7 @@ impl Begin {
                 created_at: now,
                 updated_at: now,
                 expires_at: now + self.ttl_seconds.max(1),
+                stop_state: None,
             },
         };
 
@@ -280,12 +386,85 @@ impl Renew {
         let now = now_secs();
 
         let mut lifecycle = load_lifecycle(&dir, &self.run_id)?
-            .filter(|l| !l.is_expired(now))
+            .filter(|l| !l.is_expired(now) && l.stop_state.is_none())
             .ok_or_else(|| CliError::InvalidArgument {
                 message: format!("no active managed lifecycle with run_id '{}'", self.run_id),
             })?;
 
         lifecycle.renew(now, self.ttl_seconds);
+        save_lifecycle(&dir, &lifecycle)?;
+        print_lifecycle(&lifecycle, self.json)
+    }
+}
+
+impl Stop {
+    fn run(&self) -> CliResult<()> {
+        let dot_dir = resolve_dot_dir()?;
+        let dir = lifecycle_dir(&dot_dir);
+        let mut lifecycle =
+            load_lifecycle(&dir, &self.run_id)?.ok_or_else(|| CliError::InvalidArgument {
+                message: format!("no managed lifecycle with run_id '{}'", self.run_id),
+            })?;
+        let now = now_secs();
+        let cause = match self.cause {
+            StopReason::UserRequested => JournalStopCauseWire::UserRequested,
+            StopReason::ProcessExited => JournalStopCauseWire::ProcessExited,
+            StopReason::HookFailure => JournalStopCauseWire::HookFailure,
+            StopReason::SystemShutdown => JournalStopCauseWire::SystemShutdown,
+        };
+        stop_lifecycle_turns(&dot_dir, &lifecycle, cause, true, now)?;
+        lifecycle.stop_state = Some(ManagedStopState {
+            cause,
+            observed_at: now,
+            resumable: true,
+        });
+        lifecycle.updated_at = now;
+        save_lifecycle(&dir, &lifecycle)?;
+        print_lifecycle(&lifecycle, self.json)
+    }
+}
+
+impl Resume {
+    fn run(&self) -> CliResult<()> {
+        let dot_dir = resolve_dot_dir()?;
+        let dir = lifecycle_dir(&dot_dir);
+        let mut lifecycle =
+            load_lifecycle(&dir, &self.run_id)?.ok_or_else(|| CliError::InvalidArgument {
+                message: format!("no managed lifecycle with run_id '{}'", self.run_id),
+            })?;
+        if matches!(
+            lifecycle.stop_state.as_ref().map(|state| state.cause),
+            Some(JournalStopCauseWire::Abandoned)
+        ) {
+            return Err(CliError::InvalidArgument {
+                message: "abandoned lifecycle cannot resume".to_string(),
+            });
+        }
+        let now = now_secs();
+        resume_lifecycle_turns(&dot_dir, &lifecycle, now)?;
+        lifecycle.stop_state = None;
+        lifecycle.renew(now, self.ttl_seconds);
+        save_lifecycle(&dir, &lifecycle)?;
+        print_lifecycle(&lifecycle, self.json)
+    }
+}
+
+impl Abandon {
+    fn run(&self) -> CliResult<()> {
+        let dot_dir = resolve_dot_dir()?;
+        let dir = lifecycle_dir(&dot_dir);
+        let mut lifecycle =
+            load_lifecycle(&dir, &self.run_id)?.ok_or_else(|| CliError::InvalidArgument {
+                message: format!("no managed lifecycle with run_id '{}'", self.run_id),
+            })?;
+        let now = now_secs();
+        abandon_lifecycle_turns(&dot_dir, &lifecycle, now)?;
+        lifecycle.stop_state = Some(ManagedStopState {
+            cause: JournalStopCauseWire::Abandoned,
+            observed_at: now,
+            resumable: false,
+        });
+        lifecycle.updated_at = now;
         save_lifecycle(&dir, &lifecycle)?;
         print_lifecycle(&lifecycle, self.json)
     }
@@ -298,6 +477,17 @@ impl End {
 
         let lifecycle = load_lifecycle(&dir, &self.run_id)?;
         let ended = lifecycle.is_some();
+        if let Some(lifecycle) = &lifecycle {
+            if lifecycle.stop_state.is_none() {
+                stop_lifecycle_turns(
+                    &dot_dir,
+                    lifecycle,
+                    JournalStopCauseWire::UserRequested,
+                    true,
+                    now_secs(),
+                )?;
+            }
+        }
         remove_lifecycle(&dir, &self.run_id)?;
 
         // Harvest the run summary from session stamps — even for an
@@ -344,26 +534,87 @@ impl Status {
     fn run(&self) -> CliResult<()> {
         let dot_dir = resolve_dot_dir()?;
         let dir = lifecycle_dir(&dot_dir);
-        let lifecycles = list_active(&dir, now_secs());
+        let now = now_secs();
+        for mut lifecycle in list_lifecycles(&dir) {
+            if lifecycle.is_expired(now) && lifecycle.stop_state.is_none() {
+                stop_lifecycle_turns(
+                    &dot_dir,
+                    &lifecycle,
+                    JournalStopCauseWire::LeaseExpired,
+                    true,
+                    now,
+                )?;
+                lifecycle.stop_state = Some(ManagedStopState {
+                    cause: JournalStopCauseWire::LeaseExpired,
+                    observed_at: now,
+                    resumable: true,
+                });
+                lifecycle.updated_at = now;
+                save_lifecycle(&dir, &lifecycle)?;
+            }
+        }
+        let (lifecycles, stale_lifecycles) = list_by_state(&dir, now);
+        let mut all_lifecycles = lifecycles.clone();
+        all_lifecycles.extend(stale_lifecycles.clone());
+        let turns = collect_lifecycle_turn_statuses(&dot_dir, &all_lifecycles)?;
 
         if self.json {
             let status = LifecycleStatus {
                 active: !lifecycles.is_empty(),
+                interrupted: !stale_lifecycles.is_empty(),
                 lifecycles,
+                stale_lifecycles,
+                turns,
             };
             println!("{}", serde_json::to_string(&status).unwrap());
-        } else if lifecycles.is_empty() {
-            println!("No active managed lifecycles.");
         } else {
-            for l in lifecycles {
+            if lifecycles.is_empty() {
+                println!("No active managed lifecycles.");
+            } else {
+                for l in lifecycles {
+                    println!(
+                        "Managed run {}: owner={} session={} view={} workdir={} expires_at={}",
+                        l.run_id,
+                        l.owner_agent,
+                        l.owner_session_id,
+                        l.view.as_deref().unwrap_or("-"),
+                        l.workdir.display(),
+                        l.expires_at,
+                    );
+                }
+            }
+            for lifecycle in stale_lifecycles {
+                let remediation = match lifecycle.stop_state.as_ref() {
+                    Some(state) if state.cause == JournalStopCauseWire::Abandoned => {
+                        "sealed; start a new run"
+                    }
+                    Some(state) if state.resumable => {
+                        "run lifecycle resume --run-id <id> to continue"
+                    }
+                    Some(_) => "non-resumable; abandon or end the run",
+                    None => "run lifecycle status again to persist lease expiry",
+                };
                 println!(
-                    "Managed run {}: owner={} session={} view={} workdir={} expires_at={}",
-                    l.run_id,
-                    l.owner_agent,
-                    l.owner_session_id,
-                    l.view.as_deref().unwrap_or("-"),
-                    l.workdir.display(),
-                    l.expires_at,
+                    "Interrupted managed run {}: owner={} session={} view={} workdir={} stop={:?} ({})",
+                    lifecycle.run_id,
+                    lifecycle.owner_agent,
+                    lifecycle.owner_session_id,
+                    lifecycle.view.as_deref().unwrap_or("-"),
+                    lifecycle.workdir.display(),
+                    lifecycle.stop_state.as_ref().map(|state| state.cause),
+                    remediation.replace("<id>", &lifecycle.run_id),
+                );
+            }
+            for turn in turns {
+                println!(
+                    "  session={} turn={} provenance={} generation={} state={} frontier={:?} resumable={}",
+                    turn.session_id,
+                    turn.turn_number,
+                    turn.provenance_id,
+                    turn.generation,
+                    turn.state,
+                    turn.last_event_seq,
+                    turn.resumable,
                 );
             }
         }
@@ -436,13 +687,13 @@ fn current_dir_canonical() -> CliResult<PathBuf> {
     Ok(canonicalize_lenient(&cwd))
 }
 
-fn list_active(dir: &Path, now: i64) -> Vec<ManagedLifecycle> {
+fn list_lifecycles(dir: &Path) -> Vec<ManagedLifecycle> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return Vec::new(),
     };
 
-    let mut active = Vec::new();
+    let mut lifecycles = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -455,32 +706,19 @@ fn list_active(dir: &Path, now: i64) -> Vec<ManagedLifecycle> {
             log::warn!("skipping unparseable lifecycle file {}", path.display());
             continue;
         };
-        if !lifecycle.is_expired(now) {
-            active.push(lifecycle);
-        }
+        lifecycles.push(lifecycle);
     }
-    active
+    lifecycles
 }
 
-fn cleanup_expired(dir: &Path, now: i64) {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let expired = fs::read_to_string(&path)
-            .ok()
-            .and_then(|data| serde_json::from_str::<ManagedLifecycle>(&data).ok())
-            .map(|l| l.is_expired(now))
-            .unwrap_or(false);
-        if expired {
-            let _ = fs::remove_file(&path);
-        }
-    }
+fn list_by_state(dir: &Path, now: i64) -> (Vec<ManagedLifecycle>, Vec<ManagedLifecycle>) {
+    list_lifecycles(dir)
+        .into_iter()
+        .partition(|lifecycle| !lifecycle.is_expired(now) && lifecycle.stop_state.is_none())
+}
+
+fn list_active(dir: &Path, now: i64) -> Vec<ManagedLifecycle> {
+    list_by_state(dir, now).0
 }
 
 fn load_lifecycle(dir: &Path, run_id: &str) -> CliResult<Option<ManagedLifecycle>> {
@@ -529,6 +767,144 @@ fn remove_lifecycle(dir: &Path, run_id: &str) -> CliResult<()> {
             e
         ))),
     }
+}
+
+fn sessions_for_run(dot_dir: &Path, run_id: &str) -> Vec<AgentSession> {
+    let Ok(store) = SessionStore::new(dot_dir.join("sessions")) else {
+        return Vec::new();
+    };
+    store
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|session| {
+            session
+                .managed_run
+                .as_ref()
+                .is_some_and(|stamp| stamp.run_id == run_id)
+        })
+        .collect()
+}
+
+fn pending_turn_number(session: &AgentSession) -> u32 {
+    if session.is_turn_active() {
+        session.turn_count.saturating_add(1)
+    } else {
+        session.turn_count.max(1)
+    }
+}
+
+fn owner_sink(dot_dir: &Path) -> CliResult<super::owner::OwnerJournalSink> {
+    let root = dot_dir.parent().ok_or_else(|| {
+        CliError::Internal(anyhow!(
+            "canonical .atomic directory has no repository parent"
+        ))
+    })?;
+    Ok(super::owner::OwnerJournalSink::new(root))
+}
+
+fn map_stop_cause(cause: JournalStopCauseWire) -> JournalStopCause {
+    match cause {
+        JournalStopCauseWire::UserRequested => JournalStopCause::UserRequested,
+        JournalStopCauseWire::LeaseExpired => JournalStopCause::LeaseExpired,
+        JournalStopCauseWire::ProcessExited => JournalStopCause::ProcessExited,
+        JournalStopCauseWire::HookFailure => JournalStopCause::HookFailure,
+        JournalStopCauseWire::SystemShutdown => JournalStopCause::SystemShutdown,
+        JournalStopCauseWire::Abandoned => JournalStopCause::Abandoned,
+    }
+}
+
+fn stop_lifecycle_turns(
+    dot_dir: &Path,
+    lifecycle: &ManagedLifecycle,
+    cause: JournalStopCauseWire,
+    resumable: bool,
+    observed_at: i64,
+) -> CliResult<()> {
+    let sink = owner_sink(dot_dir)?;
+    for session in sessions_for_run(dot_dir, &lifecycle.run_id) {
+        sink.stop_turn(
+            &session.session_id,
+            pending_turn_number(&session),
+            map_stop_cause(cause),
+            resumable,
+            observed_at,
+        )
+        .map_err(|reason| CliError::Internal(anyhow!(reason)))?;
+    }
+    Ok(())
+}
+
+fn resume_lifecycle_turns(dot_dir: &Path, lifecycle: &ManagedLifecycle, now: i64) -> CliResult<()> {
+    let sink = owner_sink(dot_dir)?;
+    for session in sessions_for_run(dot_dir, &lifecycle.run_id) {
+        sink.resume_turn(&session.session_id, pending_turn_number(&session), now)
+            .map_err(|reason| CliError::Internal(anyhow!(reason)))?;
+    }
+    Ok(())
+}
+
+fn abandon_lifecycle_turns(
+    dot_dir: &Path,
+    lifecycle: &ManagedLifecycle,
+    now: i64,
+) -> CliResult<()> {
+    let sink = owner_sink(dot_dir)?;
+    for session in sessions_for_run(dot_dir, &lifecycle.run_id) {
+        sink.abandon_turn(&session.session_id, pending_turn_number(&session), now)
+            .map_err(|reason| CliError::Internal(anyhow!(reason)))?;
+    }
+    Ok(())
+}
+
+fn collect_lifecycle_turn_statuses(
+    dot_dir: &Path,
+    lifecycles: &[ManagedLifecycle],
+) -> CliResult<Vec<LifecycleTurnStatus>> {
+    let sink = owner_sink(dot_dir)?;
+    let mut result = Vec::new();
+    for lifecycle in lifecycles {
+        for session in sessions_for_run(dot_dir, &lifecycle.run_id) {
+            let turn_number = pending_turn_number(&session);
+            let Some(status) = sink
+                .turn_status(&session.session_id, turn_number)
+                .map_err(|reason| CliError::Internal(anyhow!(reason)))?
+            else {
+                continue;
+            };
+            let (state, last_event_seq, resumable) = match status.lifecycle {
+                JournalTurnLifecycle::Running => ("running", None, true),
+                JournalTurnLifecycle::Stopped {
+                    last_event_seq,
+                    resumable,
+                    ..
+                } => ("stopped", last_event_seq, resumable),
+                JournalTurnLifecycle::Checkpointing => ("checkpointing", None, false),
+                JournalTurnLifecycle::Completed => ("completed", None, false),
+                JournalTurnLifecycle::Abandoned { last_event_seq, .. } => {
+                    ("abandoned", last_event_seq, false)
+                }
+            };
+            result.push(LifecycleTurnStatus {
+                run_id: lifecycle.run_id.clone(),
+                session_id: session.session_id,
+                turn_number,
+                provenance_id: status.provenance_id,
+                generation: status.generation,
+                state: state.to_string(),
+                last_event_seq,
+                resumable,
+            });
+        }
+    }
+    result.sort_by(|left, right| {
+        (&left.run_id, &left.session_id, left.turn_number).cmp(&(
+            &right.run_id,
+            &right.session_id,
+            right.turn_number,
+        ))
+    });
+    Ok(result)
 }
 
 /// Collect sessions stamped with `run_id` from the canonical session store.
@@ -609,6 +985,7 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             expires_at,
+            stop_state: None,
         }
     }
 
@@ -626,7 +1003,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_lifecycles_are_ignored_and_cleaned() {
+    fn expired_lifecycles_are_ignored_but_retained_for_interruption_detection() {
         let temp = TempDir::new().unwrap();
         let dir = temp.path().join(LIFECYCLE_DIR);
         let now = now_secs();
@@ -634,13 +1011,31 @@ mod tests {
         save_lifecycle(&dir, &lifecycle("run-old", "sherpa", temp.path(), now - 1)).unwrap();
         save_lifecycle(&dir, &lifecycle("run-new", "sherpa", temp.path(), now + 60)).unwrap();
 
-        let active = list_active(&dir, now);
+        let (active, stale) = list_by_state(&dir, now);
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].run_id, "run-new");
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].run_id, "run-old");
 
-        cleanup_expired(&dir, now);
-        assert!(!lifecycle_path(&dir, "run-old").exists());
+        assert!(lifecycle_path(&dir, "run-old").exists());
         assert!(lifecycle_path(&dir, "run-new").exists());
+    }
+
+    #[test]
+    fn lifecycle_status_reports_interrupted_stale_runs() {
+        let temp = TempDir::new().unwrap();
+        let status = LifecycleStatus {
+            active: false,
+            interrupted: true,
+            lifecycles: Vec::new(),
+            stale_lifecycles: vec![lifecycle("run-old", "sherpa", temp.path(), 1)],
+            turns: Vec::new(),
+        };
+
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json["active"], false);
+        assert_eq!(json["interrupted"], true);
+        assert_eq!(json["stale_lifecycles"][0]["run_id"], "run-old");
     }
 
     #[test]

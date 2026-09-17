@@ -54,6 +54,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -114,6 +115,10 @@ pub struct AgentSession {
     /// Format: `agent-{session_id}`. Created on first turn recording.
     #[serde(alias = "stack_name")]
     pub view_name: String,
+
+    /// Require an explicit file manifest; never sweep a shared working tree.
+    #[serde(default)]
+    pub explicit_record_files: bool,
 
     /// Current lifecycle phase.
     pub phase: Phase,
@@ -243,6 +248,7 @@ impl AgentSession {
         Self {
             session_id,
             view_name,
+            explicit_record_files: false,
             phase: Phase::Idle,
             turn_count: 0,
             agent_name: agent_name.into(),
@@ -442,6 +448,8 @@ impl super::phase::SessionState for AgentSession {
 
 // SessionStore
 
+static SESSION_TMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 /// Persistent storage for agent session state files.
 ///
 /// Sessions are stored as `{session_id}.json` files in the sessions directory
@@ -522,7 +530,7 @@ impl SessionStore {
         validate_session_id(&session.session_id)?;
 
         let path = self.session_path(&session.session_id);
-        let tmp_path = path.with_extension("json.tmp");
+        let tmp_path = self.temp_session_path(&session.session_id);
 
         let data =
             serde_json::to_string_pretty(session).map_err(|e| AgentError::SessionSaveFailed {
@@ -530,17 +538,25 @@ impl SessionStore {
                 reason: format!("JSON serialize error: {}", e),
             })?;
 
-        // Write to temp file
-        std::fs::write(&tmp_path, data.as_bytes()).map_err(|e| AgentError::SessionSaveFailed {
-            session_id: session.session_id.clone(),
-            reason: format!("write temp file: {}", e),
-        })?;
+        // Each writer needs its own same-directory temp file. Concurrent hook
+        // processes can save the same session, and threads within one process
+        // must not collide either.
+        if let Err(e) = std::fs::write(&tmp_path, data.as_bytes()) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(AgentError::SessionSaveFailed {
+                session_id: session.session_id.clone(),
+                reason: format!("write temp file: {}", e),
+            });
+        }
 
         // Atomic rename
-        std::fs::rename(&tmp_path, &path).map_err(|e| AgentError::SessionSaveFailed {
-            session_id: session.session_id.clone(),
-            reason: format!("rename temp file: {}", e),
-        })?;
+        if let Err(e) = std::fs::rename(&tmp_path, &path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(AgentError::SessionSaveFailed {
+                session_id: session.session_id.clone(),
+                reason: format!("rename temp file: {}", e),
+            });
+        }
 
         Ok(())
     }
@@ -624,6 +640,16 @@ impl SessionStore {
     /// Returns the path to a session's JSON file.
     fn session_path(&self, session_id: &str) -> PathBuf {
         self.sessions_dir.join(format!("{}.json", session_id))
+    }
+
+    fn temp_session_path(&self, session_id: &str) -> PathBuf {
+        let sequence = SESSION_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        self.sessions_dir.join(format!(
+            ".{}.json.{}.{}.tmp",
+            session_id,
+            std::process::id(),
+            sequence
+        ))
     }
 
     /// Returns the sessions directory path.
@@ -1115,6 +1141,43 @@ mod tests {
         let loaded = loaded.unwrap();
         assert_eq!(loaded.session_id, "sess-abc-123");
         assert_eq!(loaded.agent_name, "claude-code");
+    }
+
+    #[test]
+    fn test_store_concurrent_saves_do_not_share_temp_files() {
+        use std::sync::{Arc, Barrier};
+
+        const WRITERS: usize = 32;
+
+        let (_dir, store) = make_store();
+        let store = Arc::new(store);
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let mut writers = Vec::with_capacity(WRITERS);
+
+        for turn_count in 0..WRITERS {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            writers.push(std::thread::spawn(move || {
+                let mut session = make_session();
+                session.turn_count = turn_count as u32;
+                barrier.wait();
+                store.save(&session)
+            }));
+        }
+
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+
+        let loaded = store.load("sess-abc-123").unwrap().unwrap();
+        assert!(loaded.turn_count < WRITERS as u32);
+
+        let remaining_files: Vec<_> = std::fs::read_dir(store.sessions_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(remaining_files.len(), 1);
+        assert_eq!(remaining_files[0], "sess-abc-123.json");
     }
 
     #[test]

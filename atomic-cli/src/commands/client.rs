@@ -88,14 +88,10 @@ pub async fn build_apex_client(server_override: Option<&str>) -> CliResult<Stora
         .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?
         .0;
 
-    let apex_url = server.url.clone().ok_or_else(|| {
-        let hint = if let Some(name) = server_override {
-            format!("Server profile '{}' has no URL configured.", name)
-        } else {
-            "Server not configured. Run 'atomic identity register <server-url>' first.".to_string()
-        };
-        CliError::Internal(anyhow::anyhow!("{}", hint))
-    })?;
+    let apex_url = server
+        .url
+        .clone()
+        .ok_or_else(|| server_url_missing(server_override))?;
 
     let identity = resolve_identity_for_server(server)?;
 
@@ -130,12 +126,13 @@ fn delegation_for(identity: &atomic_identity::Identity, server: &str) -> Option<
     ))
 }
 
-/// Resolve the active server's apex URL without building a client.
+/// Resolve just the apex server URL for a server override.
 ///
-/// Agent enrollment needs the URL before it can mint a certificate — the
-/// certificate is *bound* to the server it is valid against, so the URL is an
-/// input to signing, not just to the request that follows.
-pub fn resolve_apex_url(server_override: Option<&str>) -> CliResult<String> {
+/// Unlike [`build_apex_client`], this performs **no** identity resolution and
+/// **no** token minting — it is a pure local config read. Commands use it to
+/// namespace local state (e.g. the resolved-key cache) by server before any
+/// network I/O, so offline cache hits never touch the network.
+pub fn apex_server_url(server_override: Option<&str>) -> CliResult<String> {
     let config = GlobalConfig::load()
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
 
@@ -144,14 +141,20 @@ pub fn resolve_apex_url(server_override: Option<&str>) -> CliResult<String> {
         .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?
         .0;
 
-    server.url.clone().ok_or_else(|| {
-        let hint = if let Some(name) = server_override {
-            format!("Server profile '{}' has no URL configured.", name)
-        } else {
-            "Server not configured. Run 'atomic identity register <server-url>' first.".to_string()
-        };
-        CliError::Internal(anyhow::anyhow!("{}", hint))
-    })
+    server
+        .url
+        .clone()
+        .ok_or_else(|| server_url_missing(server_override))
+}
+
+/// Error used when no server is configured — shared by the apex helpers.
+fn server_url_missing(server_override: Option<&str>) -> CliError {
+    let hint = if let Some(name) = server_override {
+        format!("Server profile '{}' has no URL configured.", name)
+    } else {
+        "Server not configured. Run 'atomic identity register <server-url>' first.".to_string()
+    };
+    CliError::Internal(anyhow::anyhow!("{}", hint))
 }
 
 /// Build an apex-scoped [`StorageClient`] authenticating as a **named**
@@ -166,7 +169,7 @@ pub async fn build_apex_client_as(
     identity: &atomic_identity::Identity,
     server_override: Option<&str>,
 ) -> CliResult<(StorageClient, String)> {
-    let apex_url = resolve_apex_url(server_override)?;
+    let apex_url = apex_server_url(server_override)?;
     let bearer_token = crate::commands::token::get_token(&apex_url, identity).await?;
     let delegation = delegation_for(identity, &apex_url);
 

@@ -515,10 +515,11 @@ impl Command for Status {
         }
 
         // Open the repository
-        let repo =
-            Repository::open_readonly(&repo_root).map_err(|e| CliError::InvalidRepository {
+        let repo = crate::commands::open_readonly_repository(&repo_root).map_err(|e| {
+            CliError::InvalidRepository {
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         // Debug ignore patterns if requested
         if self.debug_ignore {

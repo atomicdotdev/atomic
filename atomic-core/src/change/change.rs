@@ -503,12 +503,21 @@ impl Change {
         let mut unhashed: Option<serde_json::Value> = None;
 
         while let Some(section) = change_reader.next_section()? {
-            match section.section_type {
+            let section_type = section.section_type;
+            match section_type {
                 SectionType::Header => {
-                    header = Some(section.deserialize()?);
+                    header = Some(section.deserialize().map_err(|error| {
+                        ChangeError::Invalid(format!(
+                            "failed to deserialize {section_type} section: {error}"
+                        ))
+                    })?);
                 }
                 SectionType::Dependencies => {
-                    let dep_indices: Vec<u16> = section.deserialize()?;
+                    let dep_indices: Vec<u16> = section.deserialize().map_err(|error| {
+                        ChangeError::Invalid(format!(
+                            "failed to deserialize {section_type} section: {error}"
+                        ))
+                    })?;
                     for idx in dep_indices {
                         if let Some(hash_bytes) = hash_table.resolve(idx) {
                             dependencies.push(Hash::from_bytes(*hash_bytes));
@@ -516,20 +525,32 @@ impl Change {
                     }
                 }
                 SectionType::Provenance => {
-                    let prov_refs: Vec<Provenance> = section.deserialize()?;
-                    provenance = prov_refs;
+                    provenance = super::provenance::deserialize_postcard(&section.payload)
+                        .map_err(|error| {
+                            ChangeError::Invalid(format!(
+                                "failed to deserialize {section_type} section: {error}"
+                            ))
+                        })?;
                 }
                 SectionType::Graph => {
-                    let graph_payload: GraphSectionPayload =
-                        GraphSectionPayload::from_postcard_bytes(&section.payload)?;
+                    let graph_payload = GraphSectionPayload::from_postcard_bytes(&section.payload)
+                        .map_err(|error| {
+                            ChangeError::Invalid(format!(
+                                "failed to deserialize {section_type} section: {error}"
+                            ))
+                        })?;
                     let compactor = compact::Compactor::new(&hash_table);
                     for compact_op in graph_payload.ops() {
                         hunks.push(compactor.expand_graph_op(compact_op)?);
                     }
                 }
                 SectionType::Semantic => {
-                    let ops: Vec<FileOps> = postcard::from_bytes(&section.payload)
-                        .map_err(format_v3::FormatError::from)?;
+                    let ops: Vec<FileOps> =
+                        postcard::from_bytes(&section.payload).map_err(|error| {
+                            ChangeError::Invalid(format!(
+                                "failed to deserialize {section_type} section: {error}"
+                            ))
+                        })?;
                     file_ops = ops;
                 }
                 SectionType::Content => {

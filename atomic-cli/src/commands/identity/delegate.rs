@@ -295,7 +295,7 @@ impl Delegate {
             return Ok(self.server_urls.clone());
         }
 
-        match crate::commands::client::resolve_apex_url(self.server.as_deref()) {
+        match crate::commands::client::apex_server_url(self.server.as_deref()) {
             Ok(url) => Ok(vec![url]),
             Err(_) => Err(CliError::InvalidArgument {
                 message: "No server configured, so this grant cannot be bound to one.\n  \

@@ -144,7 +144,7 @@ impl Create {
         let server_url = if self.local {
             None
         } else {
-            Some(crate::commands::client::resolve_apex_url(
+            Some(crate::commands::client::apex_server_url(
                 self.server.as_deref(),
             )?)
         };

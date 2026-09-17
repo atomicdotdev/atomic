@@ -29,6 +29,8 @@ zstd.workspace = true
 
 # Database
 redb.workspace = true
+# Compatibility reader used only to upgrade legacy v2 database files to v3.
+redb_2_6.workspace = true
 
 # Time
 chrono.workspace = true

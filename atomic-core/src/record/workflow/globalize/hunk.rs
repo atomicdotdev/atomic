@@ -945,23 +945,13 @@ where
     }
 
     let elapsed_ms = step.elapsed().as_millis();
-    if elapsed_ms > 50 {
-        log::warn!(
-            "find_content_vertices_inode: inode={:?} took {}ms ({} content vertices, {} visited)",
-            inode,
-            elapsed_ms,
-            content_vertices.len(),
-            visited.len(),
-        );
-    } else {
-        log::debug!(
-            "find_content_vertices_inode: inode={:?} took {}ms ({} content vertices, {} visited)",
-            inode,
-            elapsed_ms,
-            content_vertices.len(),
-            visited.len(),
-        );
-    }
+    log::debug!(
+        "find_content_vertices_inode: inode={:?} took {}ms ({} content vertices, {} visited)",
+        inode,
+        elapsed_ms,
+        content_vertices.len(),
+        visited.len(),
+    );
 
     Ok(content_vertices)
 }

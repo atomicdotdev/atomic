@@ -5,31 +5,26 @@
 //! explored (explorations), what it changed (commitments), how it validated
 //! its work (verifications), and where it was uncertain (human gates).
 //!
-//! The graph is built incrementally by the [`accumulator::ProvenanceAccumulator`]
-//! as hook events arrive via the [`crate::turn::TurnOrchestrator`], and persisted
-//! to `.atomic/sessions/{session_id}/graph.json` between process invocations.
+//! Hook events are committed to the repository-owner redb journal. The
+//! [`accumulator::ProvenanceAccumulator`] deterministically replays a frozen
+//! turn frontier when producing an immutable content-addressed graph.
 //!
 //! # Architecture
 //!
 //! ```text
 //! TurnOrchestrator::dispatch(event)
 //!     │
-//!     ├── handle_turn_start  → accumulator.append_goal(prompt)
-//!     ├── handle_tool_use    → accumulator.append_tool_call(tool, args, output)
-//!     │                          │
-//!     │                          ├── classify::classify_tool_call → NodeKind
-//!     │                          ├── classify::summarize_tool_call → summary
-//!     │                          └── accumulator.infer_edges → causal DAG
-//!     │
-//!     ├── handle_turn_end    → accumulator.append_patch_proposal(change_hash)
-//!     └── handle_session_end → log stats, finalize graph
+//!     ├── turn/tool hooks → owner journal envelopes
+//!     ├── turn end        → freeze committed event frontier
+//!     ├── replay          → accumulator + causal DAG
+//!     └── checkpoint      → immutable graph + SESSION_TURNS/head
 //! ```
 //!
 //! # Modules
 //!
 //! - [`types`] — Node, edge, and graph type definitions
 //! - [`classify`] — Rule-based tool call classification
-//! - [`accumulator`] — In-memory DAG builder with persistence
+//! - [`accumulator`] — Deterministic journal replay and DAG builder
 //! - [`detail`] — Typed JSON payloads for Sherpa provenance nodes
 //!
 //! # Example
@@ -62,7 +57,7 @@ pub mod detail;
 pub mod types;
 
 // Re-export primary types for convenience.
-pub use accumulator::ProvenanceAccumulator;
+pub use accumulator::{PreparedProvenanceGraph, ProvenanceAccumulator};
 pub use classify::{classify_tool_call, summarize_tool_call};
 pub use consolidate::consolidate;
 pub use detail::{

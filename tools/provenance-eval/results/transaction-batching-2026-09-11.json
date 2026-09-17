@@ -1,0 +1,196 @@
+{
+  "intent": "ATOM::vince::8",
+  "view": "fix/redb-provenance-validation",
+  "archive_sha256": "94d86b4981f9334b410ba29d57990f6692c299722995d23befee2f3a69613283",
+  "build": {
+    "intent": "ATOM::vince::8",
+    "view": "fix/redb-provenance-validation",
+    "binary": "/Users/dev-vincent/atomic-workspace/.gstack/provenance-batch-2026-09-11/atomic-batched",
+    "sha256": "2cd58045ba50665eb4514b1df744e9998ea74d3a56379c2aa5368914ed6b4583",
+    "source_sha256": {
+      "Cargo.toml": "78e82fbbfe9ebd8d14f3597be6f06dfde0642156c133fce51394abf87f61bce5",
+      "Cargo.lock": "3822192eaafd8bfac469c03e57e1adec29c8b38c044207923c8ae4f0c59d8912",
+      "atomic-cli/src/commands/agent/owner.rs": "255c395b942388f22791366c4129402e71c10fd7d228a44fa003d8bca3604ff1",
+      "atomic-repository/src/redb_change_store/provenance.rs": "53732a23ee7fdd6491cd858109f32aea8667600fd371485148dfb7f0c0429796",
+      "atomic-repository/src/redb_change_store/tests.rs": "a846b873ac403f7a91aea4b01d8735a84cd6a0fa726e52f943e2dec5fea58df4",
+      "atomic-cli/tests/database_owner_integration_test.rs": "455e0fc67fefdf19feafdbe574ef95c35e4840db42688ad21d9d7c9b84cae706",
+      "tools/provenance-eval/run.py": "2ac80831ba07bb073c6dc2406ffc3e03af32641eadc26722a7d52f166b0fbb6c",
+      "tools/provenance-eval/multi_session.py": "20b5c39b42c86b2d9b7e133f52f4081e10f1eefc36f84ffc1d6e404eee7663e7"
+    },
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: aarch64-apple-darwin\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+    "build": "CARGO_TARGET_DIR=/Users/dev-vincent/atomic-workspace/atomic-redb-validation/target cargo build --release --locked --offline -p atomic-cli"
+  },
+  "workspace_tests": {
+    "passed": 8358,
+    "failed": 0,
+    "ignored": 2,
+    "command": "cargo test --workspace --lib --tests --locked --offline",
+    "doctests_included": false
+  },
+  "performance": {
+    "baseline:rpc-single": {
+      "runs": 5,
+      "turns": 5,
+      "successful_checkpoints": 5,
+      "median_events_s": 238.00033236374537,
+      "min_events_s": 205.08153593252814,
+      "max_events_s": 247.49216766564172,
+      "median_request_p50_ms": 4.047021,
+      "median_request_p95_ms": 5.09725,
+      "checkpoint": {
+        "count": 5,
+        "p50_ms": 129.107667,
+        "p95_ms": 157.44425,
+        "min_ms": 127.386375,
+        "max_ms": 157.44425
+      }
+    },
+    "batched:rpc-single": {
+      "runs": 5,
+      "turns": 5,
+      "successful_checkpoints": 5,
+      "median_events_s": 240.4041793763238,
+      "min_events_s": 214.56526588677147,
+      "max_events_s": 249.92234688142784,
+      "median_request_p50_ms": 4.0438335,
+      "median_request_p95_ms": 5.293875,
+      "checkpoint": {
+        "count": 5,
+        "p50_ms": 134.338,
+        "p95_ms": 148.348667,
+        "min_ms": 126.379458,
+        "max_ms": 148.348667
+      }
+    },
+    "baseline:rpc-batch16": {
+      "runs": 5,
+      "turns": 5,
+      "successful_checkpoints": 5,
+      "median_events_s": 245.38409135980987,
+      "min_events_s": 239.6006154246632,
+      "max_events_s": 254.44101901234782,
+      "median_request_p50_ms": 63.444021,
+      "median_request_p95_ms": 69.487083,
+      "checkpoint": {
+        "count": 5,
+        "p50_ms": 134.387833,
+        "p95_ms": 147.854625,
+        "min_ms": 130.666375,
+        "max_ms": 147.854625
+      }
+    },
+    "batched:rpc-batch16": {
+      "runs": 5,
+      "turns": 5,
+      "successful_checkpoints": 5,
+      "median_events_s": 2387.434247169799,
+      "min_events_s": 1033.409883170429,
+      "max_events_s": 2562.8661557366063,
+      "median_request_p50_ms": 5.9803125,
+      "median_request_p95_ms": 10.90925,
+      "checkpoint": {
+        "count": 5,
+        "p50_ms": 135.904416,
+        "p95_ms": 257.014458,
+        "min_ms": 127.015,
+        "max_ms": 257.014458
+      }
+    },
+    "baseline:rpc-batch16-concurrent8": {
+      "runs": 5,
+      "turns": 5,
+      "successful_checkpoints": 5,
+      "median_events_s": 247.78160068222635,
+      "min_events_s": 191.12322221807457,
+      "max_events_s": 251.2306375762524,
+      "median_request_p50_ms": 289.72283300000004,
+      "median_request_p95_ms": 515.5665,
+      "checkpoint": {
+        "count": 5,
+        "p50_ms": 132.804333,
+        "p95_ms": 141.581459,
+        "min_ms": 129.820375,
+        "max_ms": 141.581459
+      }
+    },
+    "batched:rpc-batch16-concurrent8": {
+      "runs": 5,
+      "turns": 5,
+      "successful_checkpoints": 5,
+      "median_events_s": 2665.838201907128,
+      "min_events_s": 2647.7280745206376,
+      "max_events_s": 3167.996660139521,
+      "median_request_p50_ms": 25.83725,
+      "median_request_p95_ms": 40.188583,
+      "checkpoint": {
+        "count": 5,
+        "p50_ms": 128.318917,
+        "p95_ms": 156.361958,
+        "min_ms": 125.962167,
+        "max_ms": 156.361958
+      }
+    }
+  },
+  "boundary": {
+    "baseline:frame-boundary": {
+      "runs": 1,
+      "turns": 1,
+      "successful_checkpoints": 1,
+      "median_events_s": 230.90158677807298,
+      "min_events_s": 230.90158677807298,
+      "max_events_s": 230.90158677807298,
+      "median_request_p50_ms": 67.924521,
+      "median_request_p95_ms": 87.77225,
+      "checkpoint": {
+        "count": 1,
+        "p50_ms": 229.028,
+        "p95_ms": 229.028,
+        "min_ms": 229.028,
+        "max_ms": 229.028
+      }
+    },
+    "batched:frame-boundary": {
+      "runs": 1,
+      "turns": 1,
+      "successful_checkpoints": 1,
+      "median_events_s": 1811.3016634265712,
+      "min_events_s": 1811.3016634265712,
+      "max_events_s": 1811.3016634265712,
+      "median_request_p50_ms": 7.892146,
+      "median_request_p95_ms": 13.041083,
+      "checkpoint": {
+        "count": 1,
+        "p50_ms": 226.007791,
+        "p95_ms": 226.007791,
+        "min_ms": 226.007791,
+        "max_ms": 226.007791
+      }
+    }
+  },
+  "multi_session": {
+    "stop_ok": 104,
+    "stop_total": 104,
+    "verified_sessions": 52,
+    "read_ok": 3712,
+    "read_total": 4160,
+    "verification_failures": 0,
+    "worker_failures": 0
+  },
+  "verified_counts": {
+    "performance_checkpoints": 30,
+    "boundary_checkpoints": 2,
+    "direct_tool_payloads": 5888,
+    "multi_session": {
+      "stop_ok": 104,
+      "stop_total": 104,
+      "verified_sessions": 52,
+      "read_ok": 3712,
+      "read_total": 4160,
+      "verification_failures": 0,
+      "worker_failures": 0
+    },
+    "known_read_lock_errors": 448
+  },
+  "known_limitation": "448/4160 ordinary intent reads hit Database already open; not fixed by transaction batching.",
+  "publication": "Publication verification is performed after Atomic hook recording; this file is the immutable test evidence."
+}

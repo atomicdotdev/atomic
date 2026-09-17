@@ -621,6 +621,31 @@ fn test_to_provenance_graph_basic() {
 }
 
 #[test]
+fn prepare_provenance_graph_does_not_advance_cursors_before_acknowledgement() {
+    use atomic_core::types::{Base32, Hash};
+
+    let mut acc = ProvenanceAccumulator::new("sess-prepare");
+    acc.append_goal("prepare safely", 1000);
+    let change_hash = Hash::of(b"source");
+
+    let first = acc.prepare_provenance_graph("agent", "Agent", "vendor", &[change_hash]);
+    let retry = acc.prepare_provenance_graph("agent", "Agent", "vendor", &[change_hash]);
+    let first_bytes = serde_json::to_vec(&first.graph).unwrap();
+    let retry_bytes = serde_json::to_vec(&retry.graph).unwrap();
+    assert_eq!(first_bytes, retry_bytes);
+    assert_eq!(acc.nodes_saved_count, 0);
+    assert_eq!(acc.edges_saved_count, 0);
+    assert!(acc.last_provenance_hash().is_none());
+
+    let hash = Hash::of(&first_bytes);
+    let hash_base32 = hash.to_base32();
+    acc.acknowledge_prepared_graph(&first, hash);
+    assert_eq!(acc.nodes_saved_count, acc.nodes.len());
+    assert_eq!(acc.edges_saved_count, acc.edges.len());
+    assert_eq!(acc.last_provenance_hash(), Some(hash_base32.as_str()));
+}
+
+#[test]
 fn test_to_provenance_graph_with_chaining() {
     use atomic_core::types::{Base32, Hash};
 

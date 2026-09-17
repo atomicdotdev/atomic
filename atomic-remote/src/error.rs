@@ -131,6 +131,21 @@ pub enum RemoteError {
         view: String,
     },
 
+    /// The client and server are running incompatible versions.
+    ///
+    /// Surfaces when the binary sync-pack wire format cannot be decoded,
+    /// which almost always means the server is on a different release than
+    /// the client. Downgrade or upgrade one side to match the other.
+    #[error("{}", version_mismatch_message(client_version, server_version.as_deref()))]
+    VersionMismatch {
+        /// The local CLI version.
+        client_version: String,
+        /// The server's reported minimum version, if available from the response headers.
+        server_version: Option<String>,
+        /// The underlying decode error, kept for diagnostics.
+        cause: String,
+    },
+
     /// The operation was cancelled.
     #[error("Operation cancelled")]
     Cancelled,
@@ -138,6 +153,20 @@ pub enum RemoteError {
     /// Generic error for unexpected situations.
     #[error("{0}")]
     Other(String),
+}
+
+/// Build the display message for a version mismatch error.
+fn version_mismatch_message(client_version: &str, server_version: Option<&str>) -> String {
+    let server_line = match server_version {
+        Some(v) => format!("\n  Server min-version: {v}"),
+        None => String::new(),
+    };
+    format!(
+        "Failed to decode data from remote — the client and server may be running \
+         incompatible versions.\n  \
+         Client version: {client_version}{server_line}\n  \
+         Hint: run 'atomic update' to upgrade, or ask the storage owner for their server version."
+    )
 }
 
 /// Format a list of hashes for display.
@@ -242,6 +271,23 @@ impl RemoteError {
         Self::EmptyView { view: view.into() }
     }
 
+    /// Create a version mismatch error.
+    ///
+    /// `client_version` is the running CLI version; `server_version` is the
+    /// value of the `X-Atomic-Min-Version` response header if present;
+    /// `cause` is the low-level decode error string kept for diagnostic context.
+    pub fn version_mismatch(
+        client_version: impl Into<String>,
+        server_version: Option<impl Into<String>>,
+        cause: impl Into<String>,
+    ) -> Self {
+        Self::VersionMismatch {
+            client_version: client_version.into(),
+            server_version: server_version.map(Into::into),
+            cause: cause.into(),
+        }
+    }
+
     /// Create a generic error.
     pub fn other(message: impl Into<String>) -> Self {
         Self::Other(message.into())
@@ -339,6 +385,9 @@ impl RemoteError {
                 Some("The server may be slow. Try again or increase the timeout.")
             }
             Self::EmptyView { .. } => Some("The view has no changes yet."),
+            Self::VersionMismatch { .. } => {
+                Some("Run 'atomic update' to upgrade your CLI, or contact the server owner.")
+            }
             _ => None,
         }
     }
@@ -410,6 +459,53 @@ mod tests {
     fn test_protocol_error() {
         let err = RemoteError::protocol("unexpected response format");
         assert!(err.to_string().contains("unexpected response format"));
+    }
+
+    #[test]
+    fn test_version_mismatch_message_without_server_version() {
+        let err = RemoteError::version_mismatch(
+            "0.17.0",
+            None::<String>,
+            "sync compression error: Unknown frame descriptor",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("0.17.0"), "should include client version");
+        assert!(
+            msg.contains("atomic update"),
+            "should mention upgrade command"
+        );
+        assert!(
+            msg.contains("incompatible versions"),
+            "should name the diagnosis"
+        );
+        assert!(
+            !msg.contains("Server min-version"),
+            "should not mention server version when absent"
+        );
+    }
+
+    #[test]
+    fn test_version_mismatch_message_with_server_version() {
+        let err = RemoteError::version_mismatch("0.17.0", Some("0.16.2"), "codec error");
+        let msg = err.to_string();
+        assert!(msg.contains("0.17.0"), "should include client version");
+        assert!(msg.contains("0.16.2"), "should include server version");
+        assert!(
+            msg.contains("Server min-version"),
+            "should label server version"
+        );
+    }
+
+    #[test]
+    fn test_version_mismatch_has_suggestion() {
+        let err = RemoteError::version_mismatch("0.17.0", None::<String>, "cause");
+        assert!(err.suggestion().is_some());
+    }
+
+    #[test]
+    fn test_version_mismatch_is_not_retryable() {
+        let err = RemoteError::version_mismatch("0.17.0", None::<String>, "cause");
+        assert!(!err.is_retryable());
     }
 
     #[test]

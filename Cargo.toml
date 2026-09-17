@@ -59,7 +59,8 @@ rand = "0.8"
 zstd = "0.13"
 
 # Database
-redb = "2.1"
+redb = "4.2.0"
+redb_2_6 = { package = "redb", version = "=2.6.3" }
 # Read-only access to OpenCode's session store (transcript recovery);
 # bundled so no system SQLite is required.
 rusqlite = { version = "0.32", features = ["bundled"] }
