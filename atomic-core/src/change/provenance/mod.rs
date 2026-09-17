@@ -195,6 +195,166 @@ pub struct Provenance {
     pub task_plan: Option<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+enum AIVendorV0 {
+    Anthropic,
+    OpenAI,
+    Google,
+    Meta,
+    Mistral,
+    Cohere,
+    AmazonBedrock,
+    AzureOpenAI,
+    Local,
+    Other(String),
+}
+
+impl From<AIVendorV0> for AIVendor {
+    fn from(value: AIVendorV0) -> Self {
+        match value {
+            AIVendorV0::Anthropic => Self::Anthropic,
+            AIVendorV0::OpenAI => Self::OpenAI,
+            AIVendorV0::Google => Self::Google,
+            AIVendorV0::Meta => Self::Meta,
+            AIVendorV0::Mistral => Self::Mistral,
+            AIVendorV0::Cohere => Self::Cohere,
+            AIVendorV0::AmazonBedrock => Self::AmazonBedrock,
+            AIVendorV0::AzureOpenAI => Self::AzureOpenAI,
+            AIVendorV0::Local => Self::Local,
+            AIVendorV0::Other(name) => Self::Other(name),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProvenanceBeforeXai {
+    vendor: AIVendorV0,
+    model: String,
+    model_version: Option<String>,
+    tool: AITool,
+    suggestion_type: SuggestionType,
+    prompt: PromptContent,
+    system_prompt_hash: Option<Hash>,
+    tokens: TokenUsage,
+    cost: Cost,
+    temperature: Option<u32>,
+    timestamp: Option<i64>,
+    request_id: Option<String>,
+    session_id: Option<String>,
+    metadata: Vec<(String, String)>,
+    agent_mode: Option<String>,
+    finish_reason: Option<String>,
+    step_count: Option<u32>,
+    session_slug: Option<String>,
+    reasoning_signature: Option<String>,
+    reasoning_text: Option<String>,
+    task_plan: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProvenanceV0 {
+    vendor: AIVendorV0,
+    model: String,
+    model_version: Option<String>,
+    tool: AITool,
+    suggestion_type: SuggestionType,
+    prompt: PromptContent,
+    system_prompt_hash: Option<Hash>,
+    tokens: TokenUsageV0,
+    cost: Cost,
+    temperature: Option<u32>,
+    timestamp: Option<i64>,
+    request_id: Option<String>,
+    session_id: Option<String>,
+    metadata: Vec<(String, String)>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TokenUsageV0 {
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+}
+
+impl From<ProvenanceBeforeXai> for Provenance {
+    fn from(value: ProvenanceBeforeXai) -> Self {
+        Self {
+            vendor: value.vendor.into(),
+            model: value.model,
+            model_version: value.model_version,
+            tool: value.tool,
+            suggestion_type: value.suggestion_type,
+            prompt: value.prompt,
+            system_prompt_hash: value.system_prompt_hash,
+            tokens: value.tokens,
+            cost: value.cost,
+            temperature: value.temperature,
+            timestamp: value.timestamp,
+            request_id: value.request_id,
+            session_id: value.session_id,
+            metadata: value.metadata,
+            agent_mode: value.agent_mode,
+            finish_reason: value.finish_reason,
+            step_count: value.step_count,
+            session_slug: value.session_slug,
+            reasoning_signature: value.reasoning_signature,
+            reasoning_text: value.reasoning_text,
+            task_plan: value.task_plan,
+        }
+    }
+}
+
+impl From<ProvenanceV0> for Provenance {
+    fn from(value: ProvenanceV0) -> Self {
+        Self {
+            vendor: value.vendor.into(),
+            model: value.model,
+            model_version: value.model_version,
+            tool: value.tool,
+            suggestion_type: value.suggestion_type,
+            prompt: value.prompt,
+            system_prompt_hash: value.system_prompt_hash,
+            tokens: TokenUsage {
+                input_tokens: value.tokens.input_tokens,
+                output_tokens: value.tokens.output_tokens,
+                total_tokens: value.tokens.total_tokens,
+                cache_read_tokens: value.tokens.cache_read_tokens,
+                cache_write_tokens: value.tokens.cache_write_tokens,
+                reasoning_tokens: 0,
+            },
+            cost: value.cost,
+            temperature: value.temperature,
+            timestamp: value.timestamp,
+            request_id: value.request_id,
+            session_id: value.session_id,
+            metadata: value.metadata,
+            agent_mode: None,
+            finish_reason: None,
+            step_count: None,
+            session_slug: None,
+            reasoning_signature: None,
+            reasoning_text: None,
+            task_plan: None,
+        }
+    }
+}
+
+pub(crate) fn deserialize_postcard(bytes: &[u8]) -> Result<Vec<Provenance>, postcard::Error> {
+    match postcard::from_bytes(bytes) {
+        Ok(provenance) => Ok(provenance),
+        Err(current_error) => {
+            if let Ok(legacy) = postcard::from_bytes::<Vec<ProvenanceBeforeXai>>(bytes) {
+                return Ok(legacy.into_iter().map(Provenance::from).collect());
+            }
+            postcard::from_bytes::<Vec<ProvenanceV0>>(bytes)
+                .map(|legacy| legacy.into_iter().map(Provenance::from).collect())
+                .map_err(|_| current_error)
+        }
+    }
+}
+
 impl Provenance {
     /// Create a new provenance with minimal required fields.
     pub fn new(vendor: AIVendor, model: impl Into<String>, tool: AITool) -> Self {

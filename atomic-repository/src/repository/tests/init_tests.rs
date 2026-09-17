@@ -8,6 +8,11 @@ fn test_init_creates_structure() {
     assert!(repo.dot_dir().exists());
     assert!(repo.pristine_path().exists());
     assert!(repo.changes_dir().exists());
+    assert_eq!(
+        repo.redb_change_store_path(),
+        repo.dot_dir().join(REDB_CHANGE_STORE_FILE)
+    );
+    assert!(!repo.redb_change_store_path().exists());
     assert!(repo.config_path().exists());
 }
 
@@ -30,6 +35,40 @@ fn test_open_existing() {
     let opened = Repository::open(temp_dir.path()).unwrap();
     assert_eq!(opened.root(), root);
     assert_eq!(opened.current_view(), DEFAULT_STACK);
+}
+
+#[test]
+fn test_open_legacy_repository_defers_redb_store_without_touching_changes() {
+    let (temp_dir, repo) = create_temp_repo();
+    let store_path = repo.redb_change_store_path();
+    let legacy_change = repo.changes_dir().join("legacy-change");
+    std::fs::write(&legacy_change, b"existing filesystem authority").unwrap();
+    drop(repo);
+
+    assert!(!store_path.exists());
+
+    let reopened = Repository::open(temp_dir.path()).unwrap();
+    assert_eq!(reopened.redb_change_store_path(), store_path);
+    assert!(!store_path.exists());
+    assert_eq!(
+        std::fs::read(&legacy_change).unwrap(),
+        b"existing filesystem authority"
+    );
+}
+
+#[test]
+fn test_canonical_change_store_path_follows_sandbox_pointer() {
+    let temp_dir = TempDir::new().unwrap();
+    let repo_root = temp_dir.path().join("repo");
+    let sandbox = temp_dir.path().join("agent-sandbox");
+    let repo = Repository::init(&repo_root).unwrap();
+    repo.provision_sandbox(&sandbox, repo.current_view())
+        .unwrap();
+
+    assert_eq!(
+        Repository::canonical_change_store_path(&sandbox).unwrap(),
+        repo.redb_change_store_path()
+    );
 }
 
 #[test]

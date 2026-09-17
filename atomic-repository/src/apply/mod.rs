@@ -330,15 +330,11 @@ pub fn write_change_to_graph(
                     crdt_start.elapsed()
                 );
             }
-            if crdt_ms > 50 {
-                log::warn!(
-                    "write_change_to_graph: SLOW apply_file_ops took {}ms ({} FileOps)",
-                    crdt_ms,
-                    file_ops_count
-                );
-            } else {
-                log::debug!("write_change_to_graph: apply_file_ops took {}ms", crdt_ms);
-            }
+            log::debug!(
+                "write_change_to_graph: apply_file_ops took {}ms ({} FileOps)",
+                crdt_ms,
+                file_ops_count
+            );
         } else {
             log::debug!("write_change_to_graph: no FileOps to apply");
         }

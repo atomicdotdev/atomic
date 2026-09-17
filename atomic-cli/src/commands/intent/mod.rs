@@ -35,6 +35,7 @@ use crate::error::CliResult;
 pub mod attest;
 pub mod bridge;
 pub mod delete;
+pub mod key_cache;
 pub mod link;
 pub mod list;
 pub mod new;

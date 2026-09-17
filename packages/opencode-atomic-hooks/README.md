@@ -129,7 +129,7 @@ src/
 | **handlers/chat.ts**       | Captures prompt text and model info on user messages                         | `createChatHandler()`, `extractPrompt()`                                         |
 | **handlers/tool.ts**       | Tracks tool timing, classifies file mutations, truncates output              | `createBeforeToolHandler()`, `createAfterToolHandler()`, `isEditTool()`          |
 | **handlers/shell.ts**      | Injects `ATOMIC_AGENT` and `ATOMIC_AGENT_VERSION` into shell env             | `createShellHandler()`                                                           |
-| **handlers/compaction.ts** | Reads provenance graph from disk, injects summary into compaction context    | `createCompactionHandler()`                                                      |
+| **handlers/compaction.ts** | Reads a pre-cutover graph cache when present; current provenance is owner-journaled | `createCompactionHandler()`                                               |
 
 ### Dependency Graph
 
@@ -138,7 +138,7 @@ No circular dependencies. Each module imports only from modules "below" it:
 ```
 index.ts           → cli, session, log, handlers/*
 handlers/*         → cli, session, log, constants, types
-handlers/compaction → log (reads graph.json from disk, no CLI calls)
+handlers/compaction → log (legacy graph-cache compatibility only)
 cli                → constants, types
 session            → types
 log                → constants, types
@@ -344,10 +344,11 @@ into OpenCode's compaction context. This means the LLM retains knowledge of
 what was explored, decided, committed, and verified — even after the
 conversation is compacted to fit the context window.
 
-The provenance graph itself is built and stored entirely on the Rust side.
-The plugin only reads it from `.atomic/sessions/{id}/graph.json` during
-compaction — no graph accumulation, no classification, no state management
-in TypeScript.
+Mutable provenance is committed by the Rust repository-owner service into
+`.atomic/changes.redb`; immutable finalized graphs remain content-addressed in
+`.atomic/changes/`. `graph.json` is no longer written. The compaction handler
+still tolerates a pre-cutover cache while its one-time migration is pending,
+but never creates or mutates provenance in TypeScript.
 
 ## License
 

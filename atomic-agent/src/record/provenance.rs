@@ -240,6 +240,14 @@ pub(crate) fn build_turn_envelope(
         builder = builder.prompt_hash(hash);
     }
 
+    // Name the certificate that authorized this turn. Absent when the agent
+    // has no delegated identity — the plus-tag path signs with the human's key
+    // and there is no certificate to point at, which is precisely the
+    // difference the field is there to record.
+    if let Some(urn) = crate::identity::active_delegation_urn(None, None) {
+        builder = builder.delegation_id(urn);
+    }
+
     builder.build()
 }
 

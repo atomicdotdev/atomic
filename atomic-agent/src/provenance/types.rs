@@ -202,7 +202,7 @@ impl fmt::Display for EdgeKind {
 /// Each node represents a single activity in the agent's decision chain.
 /// Nodes are created by the accumulator as events arrive and are immutable
 /// once created (the graph is append-only).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GraphNode {
     /// Unique identifier within this session graph.
     ///
@@ -561,10 +561,8 @@ fn plural_es(n: u32) -> &'static str {
 
 /// The complete serialized form of a provenance graph.
 ///
-/// This is what gets written to `.atomic/sessions/{id}/graph.json` and
-/// what the compaction hook reads from disk. It contains the full graph
-/// state including the accumulator's internal counters needed to resume
-/// appending after a process restart.
+/// Legacy mutable graph encoding retained solely for one-time pending-state
+/// import. Current hooks persist lossless envelopes in the owner redb journal.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SerializedGraph {
     /// Schema version. Always 1 for now.

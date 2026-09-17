@@ -708,15 +708,13 @@ mod tests {
         let _guard = TestGuard::new();
 
         // Initialize empty repository
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let log = Log::new();
         let result = log.run();
 
-        // Should succeed but print empty message
-        // The result could fail due to database initialization issues in tests
-        // Just verify it doesn't panic
-        let _ = result;
+        // The initializer no longer holds the writer lock during the query.
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
@@ -725,7 +723,7 @@ mod tests {
         let _guard = TestGuard::new();
 
         // Initialize repository
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let log = Log::new().with_view("nonexistent-view");
         let result = log.run();
@@ -745,13 +743,12 @@ mod tests {
         let _guard = TestGuard::new();
 
         // Initialize repository
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let log = Log::new().with_format(LogFormat::Json);
         let result = log.run();
 
-        // Result could fail due to database issues; just don't panic
-        let _ = result;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
@@ -760,13 +757,12 @@ mod tests {
         let _guard = TestGuard::new();
 
         // Initialize repository
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let log = Log::new().with_format(LogFormat::Short);
         let result = log.run();
 
-        // Result could fail due to database issues; just don't panic
-        let _ = result;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
@@ -775,13 +771,12 @@ mod tests {
         let _guard = TestGuard::new();
 
         // Initialize repository
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let log = Log::new().with_format(LogFormat::Oneline);
         let result = log.run();
 
-        // Result could fail due to database issues; just don't panic
-        let _ = result;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
@@ -790,13 +785,12 @@ mod tests {
         let _guard = TestGuard::new();
 
         // Initialize repository
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let log = Log::new().with_count(5);
         let result = log.run();
 
-        // Result could fail due to database issues; just don't panic
-        let _ = result;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
@@ -805,13 +799,12 @@ mod tests {
         let _guard = TestGuard::new();
 
         // Initialize repository
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let log = Log::new().with_reverse(true);
         let result = log.run();
 
-        // Result could fail due to database issues; just don't panic
-        let _ = result;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
@@ -821,14 +814,13 @@ mod tests {
 
         // Initialize repository and drop to release db lock
         {
-            let _repo = Repository::init(".").unwrap();
+            drop(Repository::init(".").unwrap());
         }
 
         let log = Log::new().with_from(0);
         let result = log.run();
 
-        // Result could fail due to database issues; just don't panic
-        let _ = result;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
@@ -837,13 +829,12 @@ mod tests {
         let _guard = TestGuard::new();
 
         // Initialize repository
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let log = Log::new().with_tags_only(true);
         let result = log.run();
 
-        // Result could fail due to database issues; just don't panic
-        let _ = result;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
@@ -852,13 +843,12 @@ mod tests {
         let _guard = TestGuard::new();
 
         // Initialize repository
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let log = Log::new().with_full_hash(true);
         let result = log.run();
 
-        // Result could fail due to database issues; just don't panic
-        let _ = result;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
@@ -867,7 +857,7 @@ mod tests {
         let _guard = TestGuard::new();
 
         // Initialize repository
-        let _repo = Repository::init(".").unwrap();
+        drop(Repository::init(".").unwrap());
 
         let log = Log::new()
             .with_count(10)
@@ -876,8 +866,7 @@ mod tests {
             .with_full_hash(true);
 
         let result = log.run();
-        // Result could fail due to database issues; just don't panic
-        let _ = result;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
@@ -891,7 +880,7 @@ mod tests {
             // Filesystem may be read-only or other issues in test environment
             return;
         }
-        let _repo = repo_result.unwrap();
+        drop(repo_result.unwrap());
 
         // Create and move to subdirectory
         if fs::create_dir("subdir").is_err() {
@@ -905,8 +894,7 @@ mod tests {
         let log = Log::new();
         let result = log.run();
 
-        // Result could fail due to database issues; just don't panic
-        let _ = result;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     // Edge Case Tests

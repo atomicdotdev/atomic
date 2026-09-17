@@ -5,6 +5,7 @@ use atomic_core::change::format_v3::{
 };
 use atomic_core::change::Change;
 use atomic_core::pristine::tables;
+use redb::ReadableDatabase;
 use std::fmt;
 use std::io::Cursor;
 use std::path::Path;

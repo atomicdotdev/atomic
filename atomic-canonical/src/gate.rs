@@ -280,13 +280,14 @@ pub fn validate_intent(node: &CanonicalNode) -> ValidationReport {
         }
     }
 
-    // Rollup: a `done` intent asserts the work is complete, so its headline
-    // status must be honest against its own checklist — every task `done` and
-    // every acceptance criterion `met`. A done intent with an open task or an
-    // unmet criterion is internally contradictory. Only the terminal `done`
-    // status triggers this; in-flight states (todo/in_progress) may carry open
-    // work by definition.
-    if node.status == "done" {
+    // Rollup: a `done` intent asserts the work is complete, and a
+    // `needs-review` intent asserts the implementation is complete — either
+    // headline status must be honest against its own checklist: every task
+    // `done` and every acceptance criterion `met`. An intent flagged for
+    // review (or done) with an open task or an unmet criterion is internally
+    // contradictory. Only these handoff/terminal statuses trigger this;
+    // in-flight states (todo/in_progress) and `icebox` may carry open work.
+    if node.status == "done" || node.status == "needs-review" {
         for task in &node.has_task {
             if task.task_status != "done" {
                 out.push(Violation {
@@ -294,8 +295,8 @@ pub fn validate_intent(node: &CanonicalNode) -> ValidationReport {
                     shape: "IntentShape".into(),
                     path: Some("status".into()),
                     message: format!(
-                        "intent status is 'done' but task '{}' is '{}' (every task must be done)",
-                        task.id, task.task_status
+                        "intent status is '{}' but task '{}' is '{}' (every task must be done)",
+                        node.status, task.id, task.task_status
                     ),
                 });
             }
@@ -307,8 +308,8 @@ pub fn validate_intent(node: &CanonicalNode) -> ValidationReport {
                     shape: "IntentShape".into(),
                     path: Some("status".into()),
                     message: format!(
-                        "intent status is 'done' but acceptance criterion '{}' is '{}' (every criterion must be met)",
-                        ac.id, ac.ac_status
+                        "intent status is '{}' but acceptance criterion '{}' is '{}' (every criterion must be met)",
+                        node.status, ac.id, ac.ac_status
                     ),
                 });
             }
@@ -525,6 +526,42 @@ mod tests {
             to: target.to_string(),
             edge: "reviews".to_string(),
         }
+    }
+
+    #[test]
+    fn gate_admits_needs_review_and_rolls_up_like_done() {
+        // `needs-review` is a member of the closed status set: a conforming
+        // attested intent at needs-review passes the gate.
+        let mut n = attested_base();
+        n.status = "needs-review".to_string();
+        assert!(validate_intent(&n).conforms, "needs-review must conform");
+
+        // And it carries the same checklist honesty rollup as `done`: an open
+        // task under a needs-review headline is contradictory…
+        n.has_acceptance_criterion = vec![ac("ac-1")];
+        n.has_task = vec![task("t1", &["ac-1"])];
+        let report = validate_intent(&n);
+        assert!(!report.conforms);
+        assert!(report
+            .results
+            .iter()
+            .any(|v| v.message.contains("every task must be done")));
+
+        // …and so is an unmet criterion (with the task itself done).
+        let mut m = attested_base();
+        m.status = "needs-review".to_string();
+        m.has_acceptance_criterion = vec![ac("ac-1")];
+        m.has_task = vec![{
+            let mut t = task("t1", &["ac-1"]);
+            t.task_status = "done".to_string();
+            t
+        }];
+        let report = validate_intent(&m);
+        assert!(!report.conforms);
+        assert!(report
+            .results
+            .iter()
+            .any(|v| v.message.contains("every criterion must be met")));
     }
 
     #[test]

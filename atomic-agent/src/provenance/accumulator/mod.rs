@@ -7,17 +7,10 @@
 //! converts the accumulated state to the `atomic-core` [`atomic_core::change::provenance_graph::ProvenanceGraph`] type
 //! (postcard-serialized, `Hash` change hashes) for content-addressed storage.
 //!
-//! The [`ProvenanceAccumulator`] maintains the provenance graph for a single
-//! agent session. It is loaded from disk at the start of each hook invocation,
-//! appended to as events arrive, and saved back to disk before the process
-//! exits. This design works with the "each hook is a separate process" model
-//! used by `atomic agent hooks`.
-//!
-//! # Persistence
-//!
-//! The graph is stored as JSON at `.atomic/sessions/{session_id}/graph.json`.
-//! Reads and writes are atomic (write to temp file, then rename) to prevent
-//! corruption from process crashes.
+//! The [`ProvenanceAccumulator`] is now the deterministic replay/build layer
+//! over owner-journal envelopes. Its JSON codec remains only to import pending
+//! state from repositories created before the redb authority cutover; hook
+//! dispatch never writes `graph.json`.
 //!
 //! # Edge Inference
 //!
@@ -69,8 +62,7 @@
 mod append;
 mod convert;
 mod helpers;
-
-pub(crate) use helpers::build_tool_detail;
+mod journal;
 
 #[cfg(test)]
 mod tests;
@@ -104,6 +96,13 @@ const MAX_RESPONSE_TEXT_LEN: usize = 8_000;
 ///
 /// See the [module-level documentation](self) for details on edge inference
 /// and persistence.
+/// Non-destructive provenance delta prepared for durable publication.
+pub struct PreparedProvenanceGraph {
+    pub graph: atomic_core::change::ProvenanceGraph,
+    pub(crate) nodes_end: usize,
+    pub(crate) edges_end: usize,
+}
+
 pub struct ProvenanceAccumulator {
     /// The session ID this graph belongs to.
     pub(crate) session_id: String,

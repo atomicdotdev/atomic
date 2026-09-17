@@ -418,7 +418,14 @@ mod tests {
         //     (derived from the temp dir name); the bare number and lowercase
         //     forms must all resolve to it.
         let lower = id.to_lowercase();
-        let num = id.rsplit('-').next().unwrap().to_string();
+        let num = id
+            .rsplit("::")
+            .next()
+            .unwrap()
+            .rsplit('-')
+            .next()
+            .unwrap()
+            .to_string();
         for alias in [id.as_str(), lower.as_str(), num.as_str()] {
             assert_eq!(
                 attestation_vault_path(&repo, alias).unwrap(),

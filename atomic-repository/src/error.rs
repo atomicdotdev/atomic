@@ -8,6 +8,18 @@ use crate::remote::RemoteError;
 /// Result type for repository operations
 pub type Result<T> = std::result::Result<T, RepositoryError>;
 
+impl From<atomic_core::pristine::PristineError> for RepositoryError {
+    fn from(error: atomic_core::pristine::PristineError) -> Self {
+        if matches!(&error, atomic_core::pristine::PristineError::Database(inner)
+            if matches!(inner.as_ref(), redb::DatabaseError::DatabaseAlreadyOpen))
+        {
+            Self::DatabaseBusy
+        } else {
+            Self::Database(error.to_string())
+        }
+    }
+}
+
 /// Errors that can occur during repository operations
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -176,6 +188,10 @@ pub enum RepositoryError {
     /// Database error
     #[error("Database error: {0}")]
     Database(String),
+
+    /// Another process holds an incompatible pristine database handle.
+    #[error("Database already open. Cannot acquire lock.")]
+    DatabaseBusy,
 
     /// Walkdir error (during file traversal)
     #[error("Directory traversal error: {0}")]

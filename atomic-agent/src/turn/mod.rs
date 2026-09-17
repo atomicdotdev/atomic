@@ -50,7 +50,11 @@ pub mod phase;
 pub mod session;
 
 // Re-export primary types for convenience
-pub use orchestrator::{DispatchResult, TurnOrchestrator};
+pub use orchestrator::{
+    DispatchResult, JournalAppendAck, JournalCheckpointAttempt, JournalCheckpointSource,
+    JournalStopCause, JournalTurnLifecycle, JournalTurnReservation, JournalTurnStatus,
+    ProvenanceJournalSink, TurnOrchestrator,
+};
 pub use phase::{
     apply_common_actions, transition, Action, Event, Phase, SessionState, TransitionContext,
     TransitionResult,

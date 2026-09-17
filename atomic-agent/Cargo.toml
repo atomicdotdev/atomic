@@ -12,6 +12,7 @@ rust-version.workspace = true
 # Internal crates
 atomic-core = { workspace = true }
 atomic-repository = { workspace = true }
+atomic-canonical = { workspace = true }
 atomic-identity = { workspace = true }
 
 # Watchman file watching
@@ -29,6 +30,7 @@ zstd = { workspace = true }
 
 # Hashing
 blake3 = { workspace = true }
+sha2 = "0.10"
 
 # Time
 chrono = { workspace = true }

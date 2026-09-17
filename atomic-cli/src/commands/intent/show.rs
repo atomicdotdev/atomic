@@ -3,7 +3,6 @@
 use clap::Parser;
 
 use atomic_canonical::{render, Target};
-use atomic_repository::Repository;
 
 use crate::commands::intent::bridge;
 use crate::commands::{find_repository_root, Command};
@@ -27,7 +26,8 @@ pub struct IntentShow {
 impl Command for IntentShow {
     fn run(&self) -> CliResult<()> {
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo =
+            crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
 
         // Pure read-time projection: lift then render. No gate, no proof
         // requirement — this must work on a plain (un-attested) intent. The

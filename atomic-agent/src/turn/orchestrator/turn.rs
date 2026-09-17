@@ -6,7 +6,7 @@ use std::fs::File;
 use std::path::Path;
 
 use crate::error::{AgentError, AgentResult};
-use crate::event::{HookType, TurnEvent};
+use crate::event::TurnEvent;
 use crate::record::{record_turn, TurnRecordOptions};
 use crate::turn::phase::{self, Action, Event, TransitionContext};
 
@@ -41,6 +41,11 @@ impl TurnOrchestrator {
         let session_id = &event.session_id;
 
         let mut session = self.load_or_create_session(session_id, &event)?;
+        let turn_number = session.turn_count.saturating_add(1);
+        if session.managed_run.is_none() || self.managed_run.is_some() {
+            self.resume_journal_turn(session_id, turn_number, event.timestamp.timestamp())?;
+        }
+        self.commit_hook_event(&event, turn_number)?;
 
         // Store the prompt
         if let Some(ref prompt) = event.prompt {
@@ -101,17 +106,6 @@ impl TurnOrchestrator {
             }
         }
 
-        // Provenance: append a goal node from the user's prompt.
-        // Best-effort — failures are logged but never block the session.
-        if let Some(ref prompt) = event.prompt {
-            if !prompt.is_empty() {
-                if let Some(mut acc) = self.load_accumulator(session_id) {
-                    acc.append_goal(prompt, event.timestamp.timestamp());
-                    self.save_accumulator(session_id, &acc);
-                }
-            }
-        }
-
         self.session_store.save(&session)?;
 
         Ok(dispatch)
@@ -152,23 +146,23 @@ impl TurnOrchestrator {
             TurnEndLock::Unavailable => None,
         };
 
-        // Fast gate: check if anything changed since the last record.
-        // This bypasses the entire status machinery (TREE scan, filesystem
-        // walk, etc.) and just checks the pristine database mtime.
-        // If the DB hasn't been written since the last record, nothing
-        // in the working copy could have been recorded — but files may
-        // have been edited. We check the working copy for recent mtimes
-        // by scanning only the repo root (not recursively) and common
-        // source directories.
-        if !self.has_working_copy_changes() {
-            log::info!(
-                "Turn end for session {} — no changes detected, skipping record",
-                session_id
-            );
-            return Ok(DispatchResult::new(session_id, phase::Phase::Idle));
-        }
+        // The session lock deduplicates one session's Stops. Independent
+        // sessions (including sandboxes) still share pristine and must not
+        // race status/add/record or checkpoint publication. Acquire before
+        // reading session/status, and retain through publication and save.
+        let _publication_lock = self.wait_turn_publication_lock(session_id)?;
 
         let mut session = self.load_or_create_session(session_id, &event)?;
+
+        let has_changes = session.explicit_record_files || self.has_working_copy_changes();
+        if !session.is_turn_active()
+            && session.turn_count > 0
+            && (session.explicit_record_files || !has_changes)
+        {
+            // A retried Stop after successful publication must not create a
+            // second empty checkpoint for the same completed interaction.
+            return Ok(DispatchResult::new(session_id, session.phase));
+        }
 
         // Extract model/provider from the TurnEnd event's raw_json.
         // OpenCode sends model and provider in every stop payload.
@@ -200,7 +194,26 @@ impl TurnOrchestrator {
         // OpenCode: recover transcript/reasoning/response from its local
         // store before recording — thin plugins send none of these, and
         // OpenCode writes no transcript file of its own.
-        self.enrich_opencode_turn(&mut session, &mut event);
+        self.enrich_opencode_turn(&mut session, &mut event)?;
+        let pending_turn_number = session.turn_count.saturating_add(1);
+        self.commit_turn_completion_events(&session, &event, pending_turn_number)?;
+
+        // A read-only turn still owns a journal turn number and immutable
+        // provenance. Finalize it before advancing the session so the next
+        // prompt cannot be deduplicated against this turn's goal/response IDs.
+        if !has_changes {
+            if self.watcher.is_active() {
+                let _ = self.watcher.cancel_turn().await;
+            }
+            session.end_turn();
+            self.checkpoint_turn_provenance(session_id, &session, &[], &event)?;
+            session.clear_current_prompt();
+            let result =
+                phase::transition(session.phase, Event::TurnEnd, TransitionContext::default());
+            phase::apply_common_actions(&mut session, &result);
+            self.session_store.save(&session)?;
+            return Ok(DispatchResult::new(session_id, session.phase));
+        }
 
         // Release the watcher if it was active (best-effort, ignore errors)
         if self.watcher.is_active() {
@@ -283,15 +296,17 @@ impl TurnOrchestrator {
                                 .and_then(|r| r.get("trace_file"))
                                 .and_then(|v| v.as_str())
                             {
-                                self.ingest_sherpa_trace(session_id, Path::new(trace_path));
+                                self.ingest_sherpa_trace(
+                                    session_id,
+                                    turn_number,
+                                    Path::new(trace_path),
+                                )?;
                             }
 
                             // Provenance: inject reasoning blocks as Decision nodes
                             // and the agent's closing message as an LlmResponse node,
                             // then append a patch proposal node and save the graph.
-                            self.inject_reasoning_nodes(session_id, &event);
-                            self.inject_response_node(session_id, &session, &event);
-                            self.save_turn_provenance(session_id, &session, &outcome, &event);
+                            self.save_turn_provenance(session_id, &session, &outcome, &event)?;
 
                             log::info!(
                                 "Recorded turn {} for session {}: {}",
@@ -309,6 +324,8 @@ impl TurnOrchestrator {
                                 turn_number,
                                 session_id
                             );
+                            self.checkpoint_turn_provenance(session_id, &session, &[], &event)?;
+                            session.clear_current_prompt();
                         }
                         Err(e) => {
                             log::error!(
@@ -317,6 +334,13 @@ impl TurnOrchestrator {
                                 session_id,
                                 e
                             );
+                            if self.journal_sink.is_some() {
+                                // Preserve the active session and durable journal
+                                // for retry; a failed record is not a finished turn.
+                                return Err(e);
+                            }
+                            // Legacy orchestrators without a durable journal
+                            // retain their best-effort recording behavior.
                             dispatch = dispatch.with_warning(format!(
                                 "Failed to record turn {}: {}",
                                 turn_number, e
@@ -376,6 +400,8 @@ impl TurnOrchestrator {
         let session_id = &event.session_id;
 
         let session = self.load_or_create_session(session_id, &event)?;
+        let turn_number = session.turn_count.saturating_add(1);
+        self.commit_hook_event(&event, turn_number)?;
 
         // Log tool usage
         if let Some(ref tool_name) = event.tool_name {
@@ -387,69 +413,51 @@ impl TurnOrchestrator {
             );
         }
 
-        // Provenance: append tool call nodes on PostToolUse.
-        //
-        // PreToolUse doesn't have output or duration yet, so we only
-        // record on PostToolUse where the full picture is available.
-        // The classifier uses tool name + input + output to determine
-        // the node kind (Exploration, Commitment, Verification, etc.).
-        if event.event_type == HookType::PostToolUse {
-            if let Some(mut acc) = self.load_accumulator(session_id) {
-                let tool_name = event.tool_name.as_deref().unwrap_or("unknown");
-                let tool_call_id = event.tool_use_id.as_deref();
+        Ok(DispatchResult::new(session_id, session.phase))
+    }
 
-                // Extract tool_input, tool_output, status, duration from raw_json.
-                //
-                // The enriched OpenCode plugin sends top-level fields alongside
-                // tool_input: filediff, diagnostics, title, file_path, exit_code.
-                // We merge these INTO tool_input so the accumulator's classify
-                // and detail-building functions can find them without changing
-                // their signature.
-                let raw = event.raw_json.as_ref();
-                let tool_output = raw.and_then(|r| r.get("tool_output").and_then(|v| v.as_str()));
-                let status = raw.and_then(|r| r.get("status").and_then(|v| v.as_str()));
-                let duration_ms = raw.and_then(|r| r.get("duration").and_then(|v| v.as_u64()));
-
-                // Build a merged tool_input that includes both the original
-                // tool_input fields AND the top-level enriched fields.
-                let merged_input: Option<serde_json::Value> = raw.map(|r| {
-                    let mut merged = r
-                        .get("tool_input")
-                        .and_then(|v| v.as_object().cloned())
-                        .unwrap_or_default();
-
-                    // Merge enriched top-level fields into tool_input
-                    for key in &[
-                        "filediff",
-                        "diagnostics",
-                        "title",
-                        "file_path",
-                        "exit_code",
-                        "diff",
-                    ] {
-                        if let Some(val) = r.get(*key) {
-                            merged.insert(key.to_string(), val.clone());
-                        }
+    fn wait_turn_publication_lock(
+        &self,
+        session_id: &str,
+    ) -> AgentResult<Option<TurnEndLockGuard>> {
+        use fs2::FileExt;
+        let failure = |reason: String| AgentError::ProvenanceJournalFailed {
+            session_id: session_id.to_owned(),
+            reason,
+        };
+        let canonical = match atomic_repository::Repository::canonical_dot_dir(&self.repo_root) {
+            Ok(path) => path,
+            // Legacy session-only orchestrators can run without a repository.
+            // A journal-backed Stop must always have canonical coordination.
+            Err(
+                atomic_repository::RepositoryError::NotFound { .. }
+                | atomic_repository::RepositoryError::NotInRepository,
+            ) if self.journal_sink.is_none() => return Ok(None),
+            Err(error) => return Err(failure(error.to_string())),
+        };
+        // Never unlink a lock file: waiters must all lock the same inode.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(canonical.join("turn-publication.lock"))
+            .map_err(|error| failure(error.to_string()))?;
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(10);
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Some(TurnEndLockGuard { file })),
+                Err(error) if super::is_lock_contended(&error) => {
+                    if start.elapsed() >= timeout {
+                        return Err(failure(
+                            "timed out waiting for another Stop to publish; retry this Stop".into(),
+                        ));
                     }
-
-                    serde_json::Value::Object(merged)
-                });
-
-                acc.append_tool_call(
-                    tool_name,
-                    tool_call_id,
-                    merged_input.as_ref(),
-                    tool_output,
-                    status,
-                    duration_ms,
-                    event.timestamp.timestamp(),
-                );
-
-                self.save_accumulator(session_id, &acc);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => return Err(failure(error.to_string())),
             }
         }
-
-        Ok(DispatchResult::new(session_id, session.phase))
     }
 
     fn try_turn_end_lock(&self, session_id: &str) -> TurnEndLock {

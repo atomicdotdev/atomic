@@ -1048,6 +1048,82 @@ impl Repository {
     // Provenance Graph Operations
     // =========================================================================
 
+    /// Publish a prepared turn checkpoint without rewriting prior session turns.
+    ///
+    /// The content-addressed provenance file is written first. Its registration,
+    /// dependencies, derived session tables, immutable `SESSION_TURNS` append,
+    /// manifest, and `SESSION_HEADS` advance then commit in one pristine
+    /// transaction. Repeating the exact publication is idempotent.
+    pub fn publish_provenance_checkpoint(
+        &self,
+        graph: &atomic_core::change::ProvenanceGraph,
+        mut turn: atomic_core::change::session::SessionTurn,
+    ) -> Result<atomic_core::change::session::SessionCheckpointPublication, RepositoryError> {
+        use atomic_core::pristine::MutTxnT;
+
+        let existing_turns = self
+            .get_session_ledger(&turn.session_id)?
+            .map(|(_, turns)| turns)
+            .unwrap_or_default();
+        turn.turn_number = existing_turns
+            .iter()
+            .find(|existing| existing.provenance_hash == turn.provenance_hash)
+            .map(|existing| existing.turn_number)
+            .unwrap_or(existing_turns.len() as u32);
+
+        let hash = self
+            .change_store
+            .save_provenance_graph(graph)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        if turn.provenance_hash != hash
+            || turn.session_id != graph.session_id
+            || turn.change_hashes != graph.changes_explained
+            || turn.previous_provenance != graph.previous
+        {
+            return Err(RepositoryError::Database(
+                "prepared session turn does not match provenance graph".to_string(),
+            ));
+        }
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        let provenance_id = txn
+            .register_provenance(&hash)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        for change_hash in &graph.changes_explained {
+            let change_id = txn
+                .register_change(change_hash)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            txn.put_dep(provenance_id, change_id)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        }
+        if let Some(previous) = graph.previous {
+            if let Some(previous_id) = txn
+                .get_internal(&previous)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+            {
+                txn.put_dep(provenance_id, previous_id)
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            }
+        }
+        txn.populate_session_tables(provenance_id.get(), graph)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        let json_path = self
+            .dot_dir
+            .join("sessions")
+            .join(format!("{}.json", graph.session_id))
+            .to_string_lossy()
+            .to_string();
+        let publication = txn
+            .publish_session_checkpoint(&json_path, turn)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        txn.commit()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        Ok(publication)
+    }
+
     /// Save a provenance graph to the repository.
     ///
     /// Serializes the graph to disk, registers it in the pristine database

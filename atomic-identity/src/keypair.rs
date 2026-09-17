@@ -11,6 +11,12 @@ use std::fmt;
 
 use crate::IdentityError;
 
+/// Multibase/multicodec prefix for the standard `did:key` representation of an
+/// Ed25519 public key.
+pub const DID_KEY_PREFIX: &str = "did:key:";
+/// Multicodec prefix for an Ed25519 public key (varint `0xed01`).
+const MULTICODEC_ED25519_PUB: [u8; 2] = [0xed, 0x01];
+
 /// A public key for verifying signatures.
 ///
 /// Public keys can be freely shared and are used to verify that
@@ -45,6 +51,42 @@ impl PublicKey {
     /// Encode the public key as base32
     pub fn to_base32(&self) -> String {
         data_encoding::BASE32_NOPAD.encode(self.as_bytes())
+    }
+
+    /// The standard `did:key` identifier for this Ed25519 key.
+    ///
+    /// Multicodec `ed25519-pub` (varint `0xed01`) + the 32 key bytes, base58btc
+    /// multibase — always rendered `did:key:z6Mk...` for Ed25519. Unlike
+    /// `did:atomic` (a blake3 fingerprint), the public key is *recoverable*
+    /// from this form, so a verifier holding only the DID can check a
+    /// signature. Delegation certificates carry both.
+    pub fn to_did_key(&self) -> String {
+        let mut bytes = Vec::with_capacity(2 + Self::SIZE);
+        bytes.extend_from_slice(&MULTICODEC_ED25519_PUB);
+        bytes.extend_from_slice(self.as_bytes());
+        format!("{}z{}", DID_KEY_PREFIX, bs58::encode(bytes).into_string())
+    }
+
+    /// Recover a public key from its `did:key` form.
+    pub fn from_did_key(did: &str) -> Result<Self, IdentityError> {
+        let body = did.strip_prefix(DID_KEY_PREFIX).ok_or_else(|| {
+            IdentityError::InvalidKey(format!("not a {DID_KEY_PREFIX} identifier: {did}"))
+        })?;
+        let multibase = body.strip_prefix('z').ok_or_else(|| {
+            IdentityError::InvalidKey("did:key must use base58btc multibase ('z')".to_string())
+        })?;
+        let decoded = bs58::decode(multibase)
+            .into_vec()
+            .map_err(|_| IdentityError::InvalidKey("did:key is not valid base58btc".to_string()))?;
+        let key_bytes = decoded
+            .strip_prefix(&MULTICODEC_ED25519_PUB[..])
+            .ok_or_else(|| {
+                IdentityError::InvalidKey("did:key is not an ed25519-pub key".to_string())
+            })?;
+        let key_bytes: [u8; 32] = key_bytes.try_into().map_err(|_| {
+            IdentityError::InvalidKey("did:key payload must be a 32-byte key".to_string())
+        })?;
+        Self::from_bytes(&key_bytes)
     }
 
     /// Decode a public key from base32

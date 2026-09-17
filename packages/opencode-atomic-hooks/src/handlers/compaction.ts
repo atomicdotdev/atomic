@@ -6,8 +6,8 @@
  *
  * Without this handler, all tool call history and reasoning context is lost
  * at compaction — the LLM starts fresh with a generic summary. This handler
- * reads the provenance graph built by the Rust-side `TurnOrchestrator` from
- * disk and injects a structured summary into the compacted context.
+ * reads a pre-cutover provenance cache when one is still pending migration
+ * and injects a structured summary into the compacted context.
  *
  * The result: the LLM retains structural knowledge of what was explored,
  * decided, committed, and verified — even after compaction. Multi-hour
@@ -21,8 +21,8 @@
  *       ▼
  * experimental.session.compacting hook fires
  *       │
- *       ├── Read .atomic/sessions/{sessionID}/graph.json
- *       │     (written by Rust-side TurnOrchestrator on every hook)
+ *       ├── Read legacy .atomic/sessions/{sessionID}/graph.json if present
+ *       │     (current hooks use the repository-owner redb journal)
  *       │
  *       ├── Format a token-efficient structured summary
  *       │     (goals, changes, verifications, human gates)
@@ -33,10 +33,9 @@
  *
  * ## Design
  *
- * This handler is intentionally thin — the provenance graph is built and
- * maintained entirely on the Rust side. This handler just reads the JSON
- * file from disk and formats it. No graph accumulation, no classification,
- * no state management. Consistent with the plugin's "thin pipe" design.
+ * This handler is intentionally thin and compatibility-only. It never writes
+ * provenance; current state is owned by Rust/redb. While a legacy cache still
+ * exists, the handler may format it until the next hook migrates and removes it.
  *
  * All errors are swallowed — if the graph file doesn't exist (session
  * hasn't recorded any tool calls yet) or can't be parsed, the handler
@@ -118,8 +117,8 @@ interface SerializedGraph {
  * Create a compaction handler that injects the provenance graph summary
  * into the compacted context.
  *
- * The handler reads the graph from `.atomic/sessions/{sessionID}/graph.json`,
- * formats a structured summary, and pushes it into `output.context[]`.
+ * The handler reads a legacy `.atomic/sessions/{sessionID}/graph.json` when
+ * present, formats a summary, and pushes it into `output.context[]`.
  *
  * @param deps - Injected dependencies
  * @returns An async function matching the `Hooks["experimental.session.compacting"]` signature
@@ -157,8 +156,8 @@ export function createCompactionHandler(deps: CompactionHandlerDeps) {
         summaryLength: summary.length,
       })
     } catch {
-      // Graph doesn't exist yet or can't be read — that's fine.
-      // Early in a session there may be no tool calls recorded yet.
+      // Current owner-journal sessions have no graph.json; corrupt legacy
+      // caches are also left for the Rust migration path to diagnose.
       // This is expected and not worth logging above debug level.
       log.debug("No provenance graph available for compaction", {
         sessionID: input.sessionID,

@@ -120,6 +120,7 @@ pub mod query;
 
 // Storage management commands (always available)
 pub mod client;
+pub mod delegation;
 pub mod project;
 pub mod token;
 pub mod workspace;
@@ -355,6 +356,19 @@ pub fn open_repository(path: Option<&Path>) -> CliResult<Repository> {
     };
 
     Repository::open(&repo_path).map_err(CliError::from)
+}
+
+/// Acquire a read-only repository for a CLI query, allowing short-lived writers
+/// (such as Stop checkpoint publication) to finish first. Only typed database
+/// contention is retried, for at most ten seconds; all other errors propagate
+/// immediately. Callers must not already hold a writable repository handle.
+///
+/// Keep this policy at the CLI boundary: library callers may require immediate
+/// failure or supply their own deadline to `Repository::open_readonly_wait`.
+pub(crate) fn open_readonly_repository(
+    path: impl AsRef<Path>,
+) -> Result<Repository, atomic_repository::RepositoryError> {
+    Repository::open_readonly_wait(path, std::time::Duration::from_secs(10))
 }
 
 /// Open a repository or return a user-friendly error.

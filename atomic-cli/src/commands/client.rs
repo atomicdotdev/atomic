@@ -88,14 +88,10 @@ pub async fn build_apex_client(server_override: Option<&str>) -> CliResult<Stora
         .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?
         .0;
 
-    let apex_url = server.url.clone().ok_or_else(|| {
-        let hint = if let Some(name) = server_override {
-            format!("Server profile '{}' has no URL configured.", name)
-        } else {
-            "Server not configured. Run 'atomic identity register <server-url>' first.".to_string()
-        };
-        CliError::Internal(anyhow::anyhow!("{}", hint))
-    })?;
+    let apex_url = server
+        .url
+        .clone()
+        .ok_or_else(|| server_url_missing(server_override))?;
 
     let identity = resolve_identity_for_server(server)?;
 
@@ -103,11 +99,87 @@ pub async fn build_apex_client(server_override: Option<&str>) -> CliResult<Stora
     // against the apex URL (the token is portable across the deployment).
     let bearer_token = crate::commands::token::get_token(&apex_url, &identity).await?;
 
-    let client = StorageClient::new(&apex_url, "", &bearer_token).map_err(|e| {
-        CliError::Internal(anyhow::anyhow!("Failed to create storage client: {}", e))
-    })?;
+    let delegation = delegation_for(&identity, &apex_url);
+    let client =
+        StorageClient::with_delegation(&apex_url, "", &bearer_token, delegation.as_deref())
+            .map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to create storage client: {}", e))
+            })?;
 
     Ok(client)
+}
+
+/// The encoded certificate this identity presents, if it is an agent.
+///
+/// Management calls are normally made by a human and this returns `None`. It
+/// exists so the few paths an agent legitimately drives — reading its own
+/// project list, say — carry the certificate too, rather than failing with a
+/// puzzling 401 that says the request was delegated but presented nothing.
+fn delegation_for(identity: &atomic_identity::Identity, server: &str) -> Option<String> {
+    if !identity.identity_type.is_delegated() {
+        return None;
+    }
+    let store = IdentityStore::open_default().ok()?;
+    let resolved = crate::commands::delegation::active_for(&store, identity, Some(server)).ok()?;
+    Some(atomic_canonical::delegation::encode_for_transport(
+        &resolved.document,
+    ))
+}
+
+/// Resolve just the apex server URL for a server override.
+///
+/// Unlike [`build_apex_client`], this performs **no** identity resolution and
+/// **no** token minting — it is a pure local config read. Commands use it to
+/// namespace local state (e.g. the resolved-key cache) by server before any
+/// network I/O, so offline cache hits never touch the network.
+pub fn apex_server_url(server_override: Option<&str>) -> CliResult<String> {
+    let config = GlobalConfig::load()
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load global config: {}", e)))?;
+
+    let server = config
+        .resolve_server(server_override)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?
+        .0;
+
+    server
+        .url
+        .clone()
+        .ok_or_else(|| server_url_missing(server_override))
+}
+
+/// Error used when no server is configured — shared by the apex helpers.
+fn server_url_missing(server_override: Option<&str>) -> CliError {
+    let hint = if let Some(name) = server_override {
+        format!("Server profile '{}' has no URL configured.", name)
+    } else {
+        "Server not configured. Run 'atomic identity register <server-url>' first.".to_string()
+    };
+    CliError::Internal(anyhow::anyhow!("{}", hint))
+}
+
+/// Build an apex-scoped [`StorageClient`] authenticating as a **named**
+/// identity rather than whichever one the server profile resolves to.
+///
+/// Agent enrollment is the reason this exists: the caller must be the human who
+/// signs the certificate, and that is not necessarily the identity bound to the
+/// profile — nor, once agents are in play, the default. Making the identity
+/// explicit keeps "who is enrolling" a decision at the call site instead of a
+/// side effect of configuration.
+pub async fn build_apex_client_as(
+    identity: &atomic_identity::Identity,
+    server_override: Option<&str>,
+) -> CliResult<(StorageClient, String)> {
+    let apex_url = apex_server_url(server_override)?;
+    let bearer_token = crate::commands::token::get_token(&apex_url, identity).await?;
+    let delegation = delegation_for(identity, &apex_url);
+
+    let client =
+        StorageClient::with_delegation(&apex_url, "", &bearer_token, delegation.as_deref())
+            .map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to create storage client: {}", e))
+            })?;
+
+    Ok((client, apex_url))
 }
 
 /// Build a [`StorageClient`] and return the resolved org slug alongside it.

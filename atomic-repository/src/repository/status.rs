@@ -545,27 +545,15 @@ impl Repository {
 
         let untracked_ms = untracked_start.elapsed().as_millis();
         let total_ms = overall_start.elapsed().as_millis();
-        if total_ms > 100 {
-            log::warn!(
-                "status: total={}ms (view_filter={}ms tree_scan={}ms index_load={}ms classify={}ms untracked={}ms)",
-                total_ms,
-                phase1_ms,
-                tree_ms,
-                index_ms,
-                classify_ms,
-                untracked_ms
-            );
-        } else {
-            log::debug!(
-                "status: total={}ms (view_filter={}ms tree_scan={}ms index_load={}ms classify={}ms untracked={}ms)",
-                total_ms,
-                phase1_ms,
-                tree_ms,
-                index_ms,
-                classify_ms,
-                untracked_ms
-            );
-        }
+        log::debug!(
+            "status: total={}ms (view_filter={}ms tree_scan={}ms index_load={}ms classify={}ms untracked={}ms)",
+            total_ms,
+            phase1_ms,
+            tree_ms,
+            index_ms,
+            classify_ms,
+            untracked_ms
+        );
 
         Ok(status)
     }
