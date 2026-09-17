@@ -22,28 +22,34 @@ use syntext::{Config, IndexError, SearchOptions};
 /// build artifacts, dependencies, and Atomic internals. We reuse syntext's
 /// walker (for its symlink resolution and size handling), then drop the paths
 /// Atomic excludes before handing the corpus to `build_from_file_records`.
+///
+/// Transient lock conflicts (e.g. a parallel test or a just-dropped `Index`
+/// handle still releasing its flock) are retried with backoff; only a
+/// persistent conflict surfaces as an error.
 pub fn build_content_index(repo_root: &Path) -> Result<(), ContentSearchError> {
-    let config = content_config(repo_root);
+    with_lock_retry(|| {
+        let config = content_config(repo_root);
 
-    let (files, _skips) = syntext::index::walk::enumerate_files(&config)?;
-    let ignore_rules = crate::ignore::IgnoreRules::load_for_enrichment(repo_root);
-    let records: Vec<ExternalFileRecord> = files
-        .into_iter()
-        .filter(|(_absolute, relative, _size)| {
-            !crate::ignore::is_enrichment_internal(relative)
-                && !ignore_rules.is_ignored(relative, false)
-        })
-        .map(
-            |(absolute_path, relative_path, size_bytes)| ExternalFileRecord {
-                absolute_path,
-                relative_path,
-                size_bytes,
-            },
-        )
-        .collect();
+        let (files, _skips) = syntext::index::walk::enumerate_files(&config)?;
+        let ignore_rules = crate::ignore::IgnoreRules::load_for_enrichment(repo_root);
+        let records: Vec<ExternalFileRecord> = files
+            .into_iter()
+            .filter(|(_absolute, relative, _size)| {
+                !crate::ignore::is_enrichment_internal(relative)
+                    && !ignore_rules.is_ignored(relative, false)
+            })
+            .map(
+                |(absolute_path, relative_path, size_bytes)| ExternalFileRecord {
+                    absolute_path,
+                    relative_path,
+                    size_bytes,
+                },
+            )
+            .collect();
 
-    let _index = Index::build_from_file_records(config, records)?;
-    Ok(())
+        let _index = Index::build_from_file_records(config, records)?;
+        Ok(())
+    })
 }
 
 /// Incrementally update the content index after file changes.
@@ -101,41 +107,51 @@ where
         return Ok(());
     }
 
-    let ignore_rules = crate::ignore::IgnoreRules::load_for_enrichment(repo_root);
-    let config = content_config(repo_root);
-    let index = Index::open(config)?;
+    // The open + compact below race syntext's own lock-downgrade windows and
+    // any concurrent reader/writer on the same index dir, so retry the whole
+    // update on a lock conflict rather than treating it as a hard failure.
+    // Collect the paths once: the retry closure may run multiple times.
+    let paths: Vec<std::path::PathBuf> = paths
+        .into_iter()
+        .map(|p| p.as_ref().to_path_buf())
+        .collect();
+    with_lock_retry(|| {
+        let ignore_rules = crate::ignore::IgnoreRules::load_for_enrichment(repo_root);
+        let config = content_config(repo_root);
+        let index = Index::open(config)?;
 
-    let mut any = false;
-    for path in paths {
-        let rel = path.as_ref();
-        if crate::ignore::is_enrichment_internal(rel) || ignore_rules.is_ignored(rel, false) {
-            continue;
+        let mut any = false;
+        for path in &paths {
+            let rel = path.as_path();
+            if crate::ignore::is_enrichment_internal(rel) || ignore_rules.is_ignored(rel, false) {
+                continue;
+            }
+            // syntext strips `repo_root` to derive the relative path, so hand it an
+            // absolute path. The file need not exist — a missing file is treated as
+            // a deletion and removed from the index.
+            let absolute = repo_root.join(rel);
+            index.notify_change(&absolute)?;
+            any = true;
         }
-        // syntext strips `repo_root` to derive the relative path, so hand it an
-        // absolute path. The file need not exist — a missing file is treated as
-        // a deletion and removed from the index.
-        let absolute = repo_root.join(rel);
-        index.notify_change(&absolute)?;
-        any = true;
-    }
 
-    if !any {
-        return Ok(());
-    }
-
-    // Commit the pending overlay and fold it into on-disk base segments so the
-    // change survives to the next `Index::open`. When the changed set is large
-    // relative to the index (syntext caps the overlay at 50% of base docs),
-    // `compact` reports `OverlayFull`; the sanctioned recovery is a full
-    // (filtered) rebuild.
-    match index.compact() {
-        Ok(()) => Ok(()),
-        Err(IndexError::OverlayFull { .. }) => {
-            drop(index);
-            build_content_index(repo_root)
+        if !any {
+            return Ok(());
         }
-        Err(e) => Err(e.into()),
-    }
+
+        // Commit the pending overlay and fold it into on-disk base segments so the
+        // change survives to the next `Index::open`. When the changed set is large
+        // relative to the index (syntext caps the overlay at 50% of base docs),
+        // `compact` reports `OverlayFull`; the sanctioned recovery is a full
+        // (filtered) rebuild.
+        match index.compact() {
+            Ok(()) => Ok(()),
+            Err(IndexError::OverlayFull { .. }) => {
+                drop(index);
+                build_content_index(repo_root)
+            }
+            Err(e) => Err(e.into()),
+        }
+    })
 }
 
 /// Search the content index.
@@ -424,6 +440,40 @@ pub struct ContentIndexStats {
     pub overlay_generations: usize,
     /// Number of dirty file edits buffered in the current overlay.
     pub pending_edits: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Lock-conflict retry
+// ---------------------------------------------------------------------------
+
+/// How many times to retry an operation that failed with a lock conflict,
+/// and the base delay between attempts (doubled each time).
+const LOCK_RETRY_ATTEMPTS: u32 = 8;
+const LOCK_RETRY_BASE_DELAY_MS: u64 = 25;
+
+/// Run `op`, retrying with exponential backoff when it fails with a lock
+/// conflict.
+///
+/// syntext documents lock downgrades in `build`/`compact` as brief windows
+/// where a concurrent `open` can surface `LockConflict`, with the caller
+/// expected to retry. Locks also live as long as the `Index` handle, so an
+/// immediately preceding call in this process (e.g. `build` right before an
+/// `update`) may still be holding one while its handle drops or a parallel
+/// test's handles overlap. A transient conflict must not fail the operation.
+fn with_lock_retry<T>(
+    op: impl Fn() -> Result<T, ContentSearchError>,
+) -> Result<T, ContentSearchError> {
+    let mut delay_ms = LOCK_RETRY_BASE_DELAY_MS;
+    for attempt in 0..=LOCK_RETRY_ATTEMPTS {
+        match op() {
+            Err(ContentSearchError::LockConflict) if attempt < LOCK_RETRY_ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                delay_ms *= 2;
+            }
+            other => return other,
+        }
+    }
+    unreachable!("loop returns on the final attempt")
 }
 
 // ---------------------------------------------------------------------------
