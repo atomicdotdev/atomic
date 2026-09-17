@@ -76,7 +76,7 @@ impl PublicKeyCache {
             let home = dirs::home_dir().unwrap_or(PathBuf::from("."));
             home.join(".atomic")
         });
-        Self::open_at(&dir.as_path())
+        Self::open_at(dir.as_path())
     }
 
     /// Open the cache rooted at `dir` (used by tests).
@@ -188,14 +188,14 @@ mod tests {
 
     #[test]
     fn empty_cache_serves_nothing() {
-        let cache = PublicKeyCache::open_at(&scratch_dir("empty").as_path());
+        let cache = PublicKeyCache::open_at(scratch_dir("empty").as_path());
         assert!(cache.get("lee").is_none());
     }
 
     #[test]
     fn put_then_get_round_trips() {
         let dir = scratch_dir("roundtrip");
-        let mut cache = PublicKeyCache::open_at(&dir.as_path());
+        let mut cache = PublicKeyCache::open_at(dir.as_path());
         cache.put(
             "lee",
             "H2AM5IDITAWB5LBSKMNOCVKOUL4ZUS5GHGEHHEGESOTUYCOC4HJA",
@@ -209,7 +209,7 @@ mod tests {
         );
 
         // And a re-open from disk sees the persisted entry.
-        let reopened = PublicKeyCache::open_at(&dir.as_path());
+        let reopened = PublicKeyCache::open_at(dir.as_path());
         assert_eq!(
             reopened.get("lee").map(|c| c.public_key).as_deref(),
             Some("H2AM5IDITAWB5LBSKMNOCVKOUL4ZUS5GHGEHHEGESOTUYCOC4HJA".into())
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn unknown_name_is_a_miss() {
         let dir = scratch_dir("unknown");
-        let mut cache = PublicKeyCache::open_at(&dir.as_path());
+        let mut cache = PublicKeyCache::open_at(dir.as_path());
         cache.put("lee", "ABC", "active");
         assert!(cache.get("other").is_none());
     }
@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn expired_entries_are_not_served() {
         let dir = scratch_dir("expired");
-        let mut cache = PublicKeyCache::open_at(&dir.as_path());
+        let mut cache = PublicKeyCache::open_at(dir.as_path());
         cache.put_with_ttl("lee", "ABC", "active", chrono::Duration::seconds(-1));
         assert!(cache.get("lee").is_none());
     }
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn suspended_entries_are_not_served() {
         let dir = scratch_dir("suspended");
-        let mut cache = PublicKeyCache::open_at(&dir.as_path());
+        let mut cache = PublicKeyCache::open_at(dir.as_path());
         cache.put("lee", "ABC", "suspended");
         assert!(cache.get("lee").is_none());
     }
@@ -245,7 +245,7 @@ mod tests {
         let dir = scratch_dir("corrupt");
         std::fs::write(&dir.join(CACHE_FILE), b"not json at all").unwrap();
 
-        let cache = PublicKeyCache::open_at(&dir.as_path());
+        let cache = PublicKeyCache::open_at(dir.as_path());
         assert!(cache.get("lee").is_none());
     }
 }
