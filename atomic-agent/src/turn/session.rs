@@ -116,6 +116,10 @@ pub struct AgentSession {
     #[serde(alias = "stack_name")]
     pub view_name: String,
 
+    /// Require an explicit file manifest; never sweep a shared working tree.
+    #[serde(default)]
+    pub explicit_record_files: bool,
+
     /// Current lifecycle phase.
     pub phase: Phase,
 
@@ -244,6 +248,7 @@ impl AgentSession {
         Self {
             session_id,
             view_name,
+            explicit_record_files: false,
             phase: Phase::Idle,
             turn_count: 0,
             agent_name: agent_name.into(),

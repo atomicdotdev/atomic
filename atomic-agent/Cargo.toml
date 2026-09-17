@@ -29,6 +29,7 @@ zstd = { workspace = true }
 
 # Hashing
 blake3 = { workspace = true }
+sha2 = "0.10"
 
 # Time
 chrono = { workspace = true }

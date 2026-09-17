@@ -154,8 +154,11 @@ impl TurnOrchestrator {
 
         let mut session = self.load_or_create_session(session_id, &event)?;
 
-        let has_changes = self.has_working_copy_changes();
-        if !session.is_turn_active() && session.turn_count > 0 && !has_changes {
+        let has_changes = session.explicit_record_files || self.has_working_copy_changes();
+        if !session.is_turn_active()
+            && session.turn_count > 0
+            && (session.explicit_record_files || !has_changes)
+        {
             // A retried Stop after successful publication must not create a
             // second empty checkpoint for the same completed interaction.
             return Ok(DispatchResult::new(session_id, session.phase));
