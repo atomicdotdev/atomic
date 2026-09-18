@@ -19,15 +19,15 @@ pub(super) enum DeferredTreeAction {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) struct DeferredTreeOp {
     /// Change whose visibility activates this TREE operation.
-    change: Hash,
+    pub(super) change: Hash,
     /// Stable inode position, stored with an external change hash so the
     /// journal never depends on process-local lookup state.
-    inode: Position<Hash>,
+    pub(super) inode: Position<Hash>,
     /// Path visible before this inode's first journaled operation. Only the
     /// first event for an inode uses this baseline; later events are selected
     /// solely by change visibility.
-    baseline_path: Option<String>,
-    action: DeferredTreeAction,
+    pub(super) baseline_path: Option<String>,
+    pub(super) action: DeferredTreeAction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,6 +272,7 @@ fn push_occupant_baseline<T: GraphTxnT + TreeTxnT>(
     activating_change: Hash,
     path: &str,
     exclude: Option<Position<Hash>>,
+    visible_on_target: Option<&HashSet<Hash>>,
     ops: &mut Vec<DeferredTreeOp>,
 ) -> Result<(), RepositoryError> {
     let Some(inode) = txn
@@ -284,6 +285,11 @@ fn push_occupant_baseline<T: GraphTxnT + TreeTxnT>(
         return Ok(());
     };
     if Some(position) == exclude {
+        return Ok(());
+    }
+    if visible_on_target.is_some_and(|visible| visible.contains(&position.change)) {
+        // The current occupant belongs to the target view; it is a real owner,
+        // not a foreign draft binding. Never manufacture a reverse delete.
         return Ok(());
     }
     push_unique(
@@ -307,6 +313,7 @@ pub(super) fn collect_tree_ops<T: GraphTxnT + TreeTxnT>(
     change_hash: Hash,
     change: &Change,
     deleted_paths: &[String],
+    visible_on_target: Option<&HashSet<Hash>>,
 ) -> Result<Vec<DeferredTreeOp>, RepositoryError> {
     let mut ops = Vec::new();
 
@@ -323,7 +330,14 @@ pub(super) fn collect_tree_ops<T: GraphTxnT + TreeTxnT>(
                 // and switching back can restore it without overwriting
                 // TREE/REV_TREE.
                 let added_position = Position::new(change_hash, add_inode.start);
-                push_occupant_baseline(txn, change_hash, path, Some(added_position), &mut ops)?;
+                push_occupant_baseline(
+                    txn,
+                    change_hash,
+                    path,
+                    Some(added_position),
+                    visible_on_target,
+                    &mut ops,
+                )?;
                 push_unique(
                     &mut ops,
                     DeferredTreeOp {
@@ -338,7 +352,14 @@ pub(super) fn collect_tree_ops<T: GraphTxnT + TreeTxnT>(
                 let Some(external_position) = external_position(change_hash, add.inode) else {
                     continue;
                 };
-                push_occupant_baseline(txn, change_hash, path, Some(external_position), &mut ops)?;
+                push_occupant_baseline(
+                    txn,
+                    change_hash,
+                    path,
+                    Some(external_position),
+                    visible_on_target,
+                    &mut ops,
+                )?;
                 let op = DeferredTreeOp {
                     change: change_hash,
                     inode: external_position,

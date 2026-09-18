@@ -786,7 +786,7 @@ impl Repository {
         txn.put_change_deps(change_id, final_change.dependencies())
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let tree_ops = collect_tree_ops(&txn, hash, &final_change, deleted_paths)?;
+        let tree_ops = collect_tree_ops(&txn, hash, &final_change, deleted_paths, None)?;
 
         for graph_op in final_change.hunks() {
             match graph_op {
@@ -1011,7 +1011,7 @@ impl Repository {
         txn.put_change_deps(change_id, final_change.dependencies())
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let tree_ops = collect_tree_ops(&txn, hash, &final_change, deleted_paths)?;
+        let tree_ops = collect_tree_ops(&txn, hash, &final_change, deleted_paths, None)?;
 
         let apply_start = std::time::Instant::now();
         let insert = if import_graph_first_can_apply(&final_change) {
@@ -1734,7 +1734,28 @@ impl Repository {
             already_in_graph,
             change.hunks().len()
         );
-        let tree_ops = collect_tree_ops(&txn, *hash, &change, &[])?;
+        // External hashes of the target view's effective visible set. Occupant
+        // baselines must not manufacture a reverse delete of an inode whose
+        // introducing change the target view can already see: an
+        // already-ambient change being selected in is an earlier/concurrent
+        // event, never authorization to unbind a live owner.
+        let target_view = txn
+            .get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+        let visible = collect_visible_change_ids_with_deps(&txn, &target_view)?;
+        let mut visible_hashes: HashSet<Hash> = HashSet::with_capacity(visible.len());
+        for id in &visible {
+            if let Some(hash) = txn
+                .get_external(*id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                visible_hashes.insert(hash);
+            }
+        }
+        let tree_ops = collect_tree_ops(&txn, *hash, &change, &[], Some(&visible_hashes))?;
 
         // Populate tree tables for FileAdd/DirAdd/FileDel hunks.
         // This creates the path→inode→position mappings that materialize
@@ -2154,7 +2175,7 @@ impl Repository {
         // Determine which view to use
         let view_name = options.view.as_deref().unwrap_or(&self.current_view);
         let preserve_existing_tree_paths = view_name != self.current_view;
-        let tree_ops = collect_tree_ops(&txn, *hash, change, outcome.deleted_files())?;
+        let tree_ops = collect_tree_ops(&txn, *hash, change, outcome.deleted_files(), None)?;
 
         // Before applying atoms, set up tree entries for FileAdd hunks.
         // This creates the inode→position and path→inode mappings needed

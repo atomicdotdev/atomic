@@ -891,3 +891,108 @@ fn test_cross_view_merge_post_merge_record_clean() {
         content
     );
 }
+
+/// Regression (B2): selecting an earlier change into a view must not record a
+/// reverse `Delete` of the view's current occupant when that occupant is
+/// already visible on the target.
+///
+/// Scenario:
+///   - `earlier` (draft from dev): writes f.txt = "generation one", records.
+///   - Switch to dev: the shared TREE keeps generation one's stale binding.
+///   - `target` (a sibling of `earlier`, from dev): overwrites f.txt with
+///     "generation two" and records — so generation two is the live occupant
+///     of f.txt on `target`.
+///
+/// Bug (pre-fix): collecting TREE ops for the earlier change (generation one)
+/// while it is selected into `target` manufactured a reverse `Delete` of the
+/// current occupant (generation two, visible on `target`). Replaying that
+/// journal unbound f.txt, losing the live owner.
+///
+/// Fixed: `push_occupant_baseline` skips the reverse delete when the
+/// occupant's introducing change is visible on the target.
+///
+/// This test checks the direct, replay-independent effect: the tree ops
+/// collected for the earlier change must not contain a `Delete` of any
+/// target-visible change.
+#[test]
+fn cross_view_insert_does_not_record_reverse_delete_of_visible_occupant() {
+    use super::deferred_tree::{collect_tree_ops, DeferredTreeAction};
+
+    let (temp_dir, mut repo) = create_temp_repo();
+
+    // Generation one on `earlier` (draft from dev).
+    repo.create_view_from("earlier", "dev").unwrap();
+    repo.switch_view("earlier").unwrap();
+    let file = temp_dir.path().join("f.txt");
+    std::fs::write(&file, "generation one\n").unwrap();
+    repo.add("f.txt", TrackingOptions::default()).unwrap();
+    record_all(&repo, "generation one");
+
+    // Switch to the sibling root; the shared TREE keeps gen1's stale binding.
+    repo.switch_view("dev").unwrap();
+
+    // Generation two on `target` (a sibling of `earlier`, from dev). After this
+    // record, generation two is the live occupant of f.txt on `target`.
+    repo.create_view_from("target", "dev").unwrap();
+    repo.switch_view("target").unwrap();
+    std::fs::write(&file, "generation two\n").unwrap();
+    repo.add("f.txt", TrackingOptions::default()).unwrap();
+    record_all(&repo, "generation two");
+
+    // gen1 = the latest change on `earlier`; gen2 = the latest change on
+    // `target` (the current occupant of f.txt).
+    let gen1_hash = repo
+        .get_view_changes(Some("earlier"))
+        .unwrap()
+        .into_iter()
+        .max_by_key(|(seq, _)| *seq)
+        .unwrap()
+        .1;
+    let gen2_hash = repo
+        .get_view_changes(Some("target"))
+        .unwrap()
+        .into_iter()
+        .max_by_key(|(seq, _)| *seq)
+        .unwrap()
+        .1;
+    let gen1_change = repo.load_change(&gen1_hash).unwrap();
+
+    // The set of changes visible on target (includes gen2, the live occupant).
+    let target_visible: std::collections::HashSet<Hash> = repo
+        .get_view_changes(Some("target"))
+        .unwrap()
+        .into_iter()
+        .map(|(_, h)| h)
+        .collect();
+    assert!(
+        target_visible.contains(&gen2_hash),
+        "gen2 must be visible on target"
+    );
+
+    let txn = repo.pristine.read_txn().unwrap();
+
+    // The B2 fix: when the current occupant (gen2) is visible on target,
+    // collecting tree ops for the earlier change (gen1) must NOT record a
+    // reverse Delete of any target-visible change.
+    let ops_visible =
+        collect_tree_ops(&txn, gen1_hash, &gen1_change, &[], Some(&target_visible)).unwrap();
+    assert!(
+        !ops_visible
+            .iter()
+            .any(|op| matches!(op.action, DeferredTreeAction::Delete)
+                && target_visible.contains(&op.inode.change)),
+        "B2: must not record a reverse Delete of a target-visible occupant"
+    );
+
+    // Control: without the visibility set, the occupant-baseline Delete of gen2
+    // IS recorded (the pre-fix behavior).
+    let empty: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+    let ops_unchecked = collect_tree_ops(&txn, gen1_hash, &gen1_change, &[], Some(&empty)).unwrap();
+    assert!(
+        ops_unchecked
+            .iter()
+            .any(|op| matches!(op.action, DeferredTreeAction::Delete)
+                && op.inode.change == gen2_hash),
+        "control: without visibility, the occupant Delete of gen2 is recorded"
+    );
+}
