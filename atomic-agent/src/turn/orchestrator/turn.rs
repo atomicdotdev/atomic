@@ -10,7 +10,7 @@ use crate::event::TurnEvent;
 use crate::record::{record_turn, TurnRecordOptions};
 use crate::turn::phase::{self, Action, Event, TransitionContext};
 
-use super::{DispatchResult, TurnOrchestrator};
+use super::{DispatchResult, JournalTurnLifecycle, TurnOrchestrator};
 
 const TURN_END_LOCK_FILENAME: &str = "turn-end.lock";
 
@@ -154,11 +154,65 @@ impl TurnOrchestrator {
 
         let mut session = self.load_or_create_session(session_id, &event)?;
 
+        // Tool hooks can reserve and populate the next journal turn without
+        // a TurnStart (e.g. programmatic OpenCode/subagent turns). Consult that
+        // durable state before classifying an idle session's Stop as a retry.
+        if session.phase == phase::Phase::Idle {
+            if let Some(sink) = &self.journal_sink {
+                let pending = sink
+                    .turn_status(session_id, session.turn_count.saturating_add(1))
+                    .map_err(|reason| AgentError::ProvenanceJournalFailed {
+                        session_id: session_id.to_owned(),
+                        reason,
+                    })?;
+                if let Some(pending) = pending {
+                    match pending.lifecycle {
+                        JournalTurnLifecycle::Running | JournalTurnLifecycle::Checkpointing => {
+                            session.begin_turn();
+                            let transition = phase::transition(
+                                session.phase,
+                                Event::TurnStart,
+                                TransitionContext::default(),
+                            );
+                            phase::apply_common_actions(&mut session, &transition);
+                            // Persist activation before recording or publication so
+                            // a failed checkpoint retains the normal retry path.
+                            self.session_store.save(&session)?;
+                        }
+                        lifecycle => {
+                            return Err(AgentError::ProvenanceJournalFailed {
+                                session_id: session_id.to_owned(),
+                                reason: format!(
+                                    "Stop found a pending journal turn in {lifecycle:?} while the session is idle; resume or reconcile the turn before retrying Stop"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         let has_changes = session.explicit_record_files || self.has_working_copy_changes();
         if !session.is_turn_active()
             && session.turn_count > 0
             && (session.explicit_record_files || !has_changes)
         {
+            if session.explicit_record_files {
+                let options = TurnRecordOptions {
+                    session: &session,
+                    event: &event,
+                    turn_number: session.turn_count.saturating_add(1),
+                    turn_duration_ms: 0,
+                    prompt: None,
+                };
+                if crate::record::scope::has_pending_changes(&self.repo_root, &options)? {
+                    return Err(AgentError::RecordFailed {
+                        session_id: session_id.to_owned(),
+                        turn_number: options.turn_number,
+                        reason: "Stop received unrecorded scoped files but no active turn or pending journal; send the turn-start hook (OpenCode: user-prompt) and retry Stop. Files were not recorded or discarded".into(),
+                    });
+                }
+            }
             // A retried Stop after successful publication must not create a
             // second empty checkpoint for the same completed interaction.
             return Ok(DispatchResult::new(session_id, session.phase));
@@ -257,12 +311,16 @@ impl TurnOrchestrator {
                     // Get the prompt for this turn's change message.
                     // Priority: event.prompt (from TurnEnd, rare)
                     //         > session.current_prompt (set on each TurnStart)
-                    //         > session.first_prompt (fallback for legacy/missing)
+                    //         > session.first_prompt (first turn only)
                     let prompt = event
                         .prompt
                         .clone()
                         .or_else(|| session.current_prompt.clone())
-                        .or_else(|| session.first_prompt.clone());
+                        .or_else(|| {
+                            (turn_number == 1)
+                                .then(|| session.first_prompt.clone())
+                                .flatten()
+                        });
 
                     let record_options = TurnRecordOptions {
                         session: &session,

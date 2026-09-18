@@ -1923,3 +1923,180 @@ fn scoped_concurrent_stops_and_session_end_do_not_record_sibling_files() {
     assert!(run_owner(&root, "shutdown").status.success());
     wait_for_shutdown(&root);
 }
+
+fn check_missing_turn_start(write_files: bool) {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("repo");
+    drop(Repository::init(&root).unwrap());
+    let hook = |sid: &str, verb: &str, mut value: Value| {
+        value["session_id"] = sid.into();
+        run_agent_hook(
+            &root,
+            "opencode",
+            verb,
+            &serde_json::to_vec(&value).unwrap(),
+        )
+    };
+    assert!(hook(
+        "parent",
+        "session-start",
+        serde_json::json!({"recording_scope":"explicit-files-v1"})
+    )
+    .status
+    .success());
+    let sid = "programmatic-child";
+    assert!(hook(
+        sid,
+        "session-start",
+        serde_json::json!({"recording_scope":"explicit-files-v1","workspace_session_id":"parent"})
+    )
+    .status
+    .success());
+    assert!(hook(
+        sid,
+        "user-prompt",
+        serde_json::json!({"prompt":"First turn only"})
+    )
+    .status
+    .success());
+    for turn in 0..3 {
+        // After the first turn, simulate a resumed/programmatic session that
+        // emits tools and Stop but no chat.message / user-prompt callback.
+        let event = serde_json::json!({"tool_name":"read","tool_call_id":format!("tool-{turn}"),"tool_input":{"path":"sample.txt"},"tool_output":format!("result-{turn}")});
+        assert!(hook(sid, "before-tool", event.clone()).status.success());
+        let files = if write_files {
+            std::fs::write(root.join("sample.txt"), format!("turn {turn}\n")).unwrap();
+            serde_json::json!({"sample.txt":atomic_agent::record::scope::fingerprint(&root,"sample.txt").unwrap()})
+        } else {
+            serde_json::json!({})
+        };
+        assert!(hook(sid, "after-tool", event).status.success());
+        let stop = serde_json::json!({"record_files":files,"response":format!("done-{turn}")});
+        if turn == 1 && write_files {
+            let mut stale = stop.clone();
+            stale["record_files"]["sample.txt"] = "stale digest".into();
+            let failed = hook(sid, "stop", stale);
+            assert!(!failed.status.success(), "{failed:?}");
+            // Recovery must persist activation before a failing record so the
+            // corrected Stop retries the same journal turn rather than skipping.
+            let state: Value = serde_json::from_slice(
+                &std::fs::read(root.join(format!(".atomic/sessions/{sid}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(state["phase"], "active");
+            assert_eq!(state["turn_count"], 1);
+        }
+        for _ in 0..2 {
+            let result = hook(sid, "stop", stop.clone());
+            assert!(result.status.success(), "{result:?}");
+        }
+    }
+    assert!(run_owner(&root, "shutdown").status.success());
+    wait_for_shutdown(&root);
+    let repo = Repository::open(&root).unwrap();
+    let (_, turns) = repo.get_session_ledger(sid).unwrap().unwrap();
+    assert_eq!(turns.len(), 3);
+    for (index, turn) in turns.iter().enumerate() {
+        assert_eq!(turn.change_hashes.len(), usize::from(write_files));
+        assert_eq!(
+            turn.previous_provenance,
+            index.checked_sub(1).map(|i| turns[i].provenance_hash)
+        );
+        let graph = repo.load_provenance_graph(&turn.provenance_hash).unwrap();
+        assert_eq!(graph.session_id, sid);
+        let json = serde_json::to_string(&graph).unwrap();
+        assert!(json.contains(&format!("tool-{index}")), "{json}");
+        if index > 0 {
+            assert_ne!(turn.goal.as_deref(), Some("First turn only"));
+            for hash in &turn.change_hashes {
+                assert_ne!(
+                    repo.load_change(hash).unwrap().hashed.header.message,
+                    "First turn only"
+                );
+            }
+        }
+    }
+    if write_files {
+        assert_eq!(
+            std::fs::read_to_string(root.join("sample.txt")).unwrap(),
+            "turn 2\n"
+        );
+    }
+}
+
+#[test]
+fn missing_turn_start_recovers_changes_and_provenance_without_duplicate_stops() {
+    check_missing_turn_start(true);
+}
+
+#[test]
+fn missing_turn_start_recovers_read_only_provenance() {
+    check_missing_turn_start(false);
+}
+
+#[test]
+fn scoped_stop_without_start_or_journal_fails_visibly_and_can_retry() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("repo");
+    drop(Repository::init(&root).unwrap());
+    let sid = "missing-everything";
+    let hook = |verb: &str, mut value: Value| {
+        value["session_id"] = sid.into();
+        run_agent_hook(
+            &root,
+            "opencode",
+            verb,
+            &serde_json::to_vec(&value).unwrap(),
+        )
+    };
+    assert!(hook(
+        "session-start",
+        serde_json::json!({"recording_scope":"explicit-files-v1"})
+    )
+    .status
+    .success());
+    assert!(hook(
+        "user-prompt",
+        serde_json::json!({"prompt":"first read-only turn"})
+    )
+    .status
+    .success());
+    assert!(hook("stop", serde_json::json!({"record_files":{}}))
+        .status
+        .success());
+    // No tool event either: there is no durable evidence defining a new turn.
+    std::fs::write(root.join("new.txt"), "keep this work\n").unwrap();
+    let stop = serde_json::json!({"record_files":{"new.txt":atomic_agent::record::scope::fingerprint(&root,"new.txt").unwrap()}});
+    let failed = hook("stop", stop.clone());
+    assert!(!failed.status.success(), "{failed:?}");
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("no active turn or pending journal"),
+        "{failed:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("new.txt")).unwrap(),
+        "keep this work\n"
+    );
+    assert!(hook(
+        "user-prompt",
+        serde_json::json!({"prompt":"recover pending file"})
+    )
+    .status
+    .success());
+    assert!(hook("stop", stop.clone()).status.success());
+    // Unrelated human edits must not be swept up by a duplicate scoped Stop.
+    std::fs::write(root.join("human.txt"), "leave alone\n").unwrap();
+    assert!(hook("stop", stop).status.success());
+    let invalid = hook(
+        "stop",
+        serde_json::json!({"record_files":{"../escape":null}}),
+    );
+    assert!(!invalid.status.success());
+    assert!(run_owner(&root, "shutdown").status.success());
+    wait_for_shutdown(&root);
+    let repo = Repository::open(&root).unwrap();
+    let (_, turns) = repo.get_session_ledger(sid).unwrap().unwrap();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[1].change_hashes.len(), 1);
+    assert!(repo.get_file_content("human.txt").unwrap().is_none());
+}

@@ -150,6 +150,34 @@ pub(super) fn validate(
     Ok(())
 }
 
+/// A duplicate Stop can be acknowledged only if its scoped files have no
+/// unrecorded changes. Never use unrelated working-tree edits as evidence of
+/// a new turn, and never silently accept an invalid or stale manifest.
+pub(crate) fn has_pending_changes(
+    root: &Path,
+    options: &TurnRecordOptions<'_>,
+) -> AgentResult<bool> {
+    let Some(files) = manifest(options)? else {
+        return Ok(false);
+    };
+    if files.is_empty() {
+        return Ok(false);
+    }
+    validate(root, &files, options)?;
+    let fail = |error: atomic_repository::RepositoryError| AgentError::RecordFailed {
+        session_id: options.session.session_id.clone(),
+        turn_number: options.turn_number,
+        reason: format!("cannot verify duplicate Stop's scoped files: {error}"),
+    };
+    let repo =
+        Repository::open_readonly_wait(root, std::time::Duration::from_secs(10)).map_err(fail)?;
+    let status = repo
+        .status(StatusOptions::default().with_untracked(true))
+        .map_err(fail)?;
+    let scoped = filter(status, Some(&files));
+    Ok(!scoped.is_clean() || scoped.has_untracked() || scoped.has_conflicts())
+}
+
 pub(super) fn filter(status: RepositoryStatus, files: Option<&FileManifest>) -> RepositoryStatus {
     let Some(files) = files else {
         return status;
