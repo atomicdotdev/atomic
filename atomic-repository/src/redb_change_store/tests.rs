@@ -1094,6 +1094,38 @@ fn bound_checkpoint_repairs_only_legacy_ledger_ordinal() {
 }
 
 #[test]
+fn checkpointing_provenance_turn_resumes_and_reprepares() {
+    let (_dir, store) = temp_store();
+    let running = store.reserve_provenance_turn("session-cp", 0, 1).unwrap();
+    store
+        .prepare_provenance_checkpoint(
+            running.provenance_id,
+            running.generation,
+            ProvenanceCheckpointSource {
+                agent_name: "codex".into(),
+                agent_display_name: "Codex".into(),
+                agent_vendor: "openai".into(),
+                change_hashes: vec![],
+                previous_provenance: None,
+                plan_id: None,
+                ledger_turn_number: 0,
+            },
+            2,
+        )
+        .unwrap();
+    // A resume must not fail just because a checkpoint was prepared but never
+    // bound; the next Stop re-prepares from the intact journal.
+    let prepared = store
+        .get_provenance_turn(running.provenance_id)
+        .unwrap()
+        .unwrap();
+    let resumed = store
+        .resume_provenance_turn(running.provenance_id, prepared.generation, 3)
+        .unwrap();
+    assert!(matches!(resumed.state, ProvenanceTurnState::Running));
+}
+
+#[test]
 fn stopped_provenance_turn_resumes_and_finalizes_once() {
     let (_dir, store) = temp_store();
     let running = store.reserve_provenance_turn("session-a", 0, 1).unwrap();
