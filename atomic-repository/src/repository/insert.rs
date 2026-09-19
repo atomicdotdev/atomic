@@ -5,7 +5,7 @@ use crate::apply::{
     write_change_to_graph, CrossViewInsertOptions, CrossViewInsertOutcome, InsertOptions,
     InsertOutcome, InsertStats,
 };
-use crate::repository::deferred_tree::collect_tree_ops;
+use crate::repository::deferred_tree::{apply_name_selections, collect_tree_ops};
 use atomic_core::change::Insertion;
 use atomic_core::pristine::InodeGraphOps;
 use atomic_core::types::{ChangePosition, EdgeFlags, GraphNode, SerializedGraphEdge};
@@ -851,8 +851,12 @@ impl Repository {
 
                     if let Ok(Some(inode)) = txn.position_inode(inode_pos) {
                         if let Ok(Some(old_path)) = txn.get_path(inode) {
+                            // Only unlink when OUR inode still claims the old
+                            // path — never a sibling inode's claim (a same-path
+                            // name-conflict binds multiple inodes; del_tree_binding
+                            // is inode-scoped per #206).
                             if old_path != *path {
-                                let _ = txn.del_tree(&old_path);
+                                let _ = txn.del_tree_binding(&old_path, inode);
                             }
                         }
                         let _ = txn.put_tree(path, inode);
@@ -1816,6 +1820,7 @@ impl Repository {
         // idempotently.
         let mut moved_from_disk: Vec<String> = Vec::new();
         if !preserve_existing_tree_paths {
+            apply_name_selections(&mut txn, change_id, &change)?;
             for graph_op in change.hunks() {
                 if let GraphOp::FileMove { add, path, .. } = graph_op {
                     // add.inode is Position<Option<Hash>>; resolve to Position<NodeId>.
@@ -2278,8 +2283,12 @@ impl Repository {
 
                     if let Ok(Some(inode)) = txn.position_inode(inode_pos) {
                         if let Ok(Some(old_path)) = txn.get_path(inode) {
+                            // Only unlink when OUR inode still claims the old
+                            // path — never a sibling inode's claim (a same-path
+                            // name-conflict binds multiple inodes; del_tree_binding
+                            // is inode-scoped per #206).
                             if old_path != *path {
-                                let _ = txn.del_tree(&old_path);
+                                let _ = txn.del_tree_binding(&old_path, inode);
                             }
                         }
                         let _ = txn.put_tree(path, inode);
@@ -2294,6 +2303,7 @@ impl Repository {
         // we need to explicitly remove deleted files from the tree tables.
         // View-aware: only remove if no other view still references the file.
         if !preserve_existing_tree_paths {
+            apply_name_selections(&mut txn, change_id, change)?;
             for deleted_path in outcome.deleted_files() {
                 if let Ok(Some(inode)) = txn.get_inode(deleted_path) {
                     let dominated = is_file_only_on_view(&txn, inode, view_name);
