@@ -110,6 +110,50 @@ fn build_turn_header(
         .build()
 }
 
+// Operational completion marker only: it names a target view, never paths,
+// inode ownership, inverse changes, or file-history baselines.
+pub(crate) const VIEW_PREPARATION_PENDING_FILE: &str = "agent-view-prepare.pending";
+
+// Hooks that have not opened a repository yet only pay for a database read
+// when an incomplete transition actually exists.
+pub(crate) fn ensure_view_preparation_complete_at(root: &Path) -> AgentResult<()> {
+    let Ok(dot_dir) = atomic_repository::Repository::canonical_dot_dir(root) else {
+        return Ok(());
+    };
+    if !dot_dir
+        .join(VIEW_PREPARATION_PENDING_FILE)
+        .try_exists()
+        .map_err(|e| AgentError::Internal(format!("Cannot check session view restoration: {e}")))?
+    {
+        return Ok(());
+    }
+    let repo =
+        atomic_repository::Repository::open_readonly_wait(root, std::time::Duration::from_secs(10))
+            .map_err(|e| {
+                AgentError::Internal(format!("Cannot check session view restoration: {e}"))
+            })?;
+    ensure_view_preparation_complete(&repo)
+}
+
+pub(crate) fn ensure_view_preparation_complete(
+    repo: &atomic_repository::Repository,
+) -> AgentResult<()> {
+    // The marker belongs to the canonical working copy, not sandbox files.
+    if repo.is_sandbox() {
+        return Ok(());
+    }
+    let pending = repo.dot_dir().join(VIEW_PREPARATION_PENDING_FILE);
+    if pending
+        .try_exists()
+        .map_err(|e| AgentError::Internal(format!("Cannot check session view restoration: {e}",)))?
+    {
+        return Err(AgentError::Internal(
+            "Previous session view restoration is incomplete; repair the working copy and resume its original session before starting another session or recording".into(),
+        ));
+    }
+    Ok(())
+}
+
 // A freshly forked view can reuse the same working copy only when the full
 // visible change/dependency closure is identical. Path-table occupants and
 // journal baselines cannot prove this. Sandboxes already scope their own view.
@@ -119,6 +163,7 @@ fn validate_recording_view(
 ) -> AgentResult<()> {
     use atomic_core::pristine::ViewTxnT;
     use atomic_repository::repository::collect_visible_change_ids_with_deps;
+    ensure_view_preparation_complete(repo)?;
     // A validated explicit manifest names each write/deletion deliberately;
     // it does not infer absent files from the whole working directory.
     let explicitly_scoped = options
@@ -195,6 +240,7 @@ pub fn record_turn(
     repo_root: &Path,
     options: &TurnRecordOptions<'_>,
 ) -> AgentResult<TurnRecordOutcome> {
+    ensure_view_preparation_complete_at(repo_root)?;
     let manifest = scope::manifest(options)?;
     if let Some(files) = &manifest {
         scope::validate(repo_root, files, options)?;

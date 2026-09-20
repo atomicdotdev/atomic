@@ -132,6 +132,7 @@ impl TurnOrchestrator {
     ) -> AgentResult<DispatchResult> {
         // Clone so `event` stays mutable for enrichment below while the
         // id is borrowed throughout this function.
+        crate::record::ensure_view_preparation_complete_at(&self.repo_root)?;
         let session_id_owned = event.session_id.clone();
         let session_id = session_id_owned.as_str();
         let _turn_end_lock = match self.try_turn_end_lock(session_id) {
@@ -458,6 +459,9 @@ impl TurnOrchestrator {
     ) -> AgentResult<DispatchResult> {
         let session_id = &event.session_id;
 
+        if event.event_type == crate::event::HookType::PreToolUse {
+            crate::record::ensure_view_preparation_complete_at(&self.repo_root)?;
+        }
         let session = self.load_or_create_session(session_id, &event)?;
         let turn_number = session.turn_count.saturating_add(1);
         self.commit_hook_event(&event, turn_number)?;

@@ -1529,3 +1529,157 @@ async fn resume_view_still_records_an_intentional_deletion() {
         "base\n"
     );
 }
+
+#[tokio::test]
+async fn resume_view_failed_write_blocks_retry_and_record_until_repaired() {
+    let (dir, mut orch, view, inode) = resume_view_fixture().await;
+    // Empty directories are not reported as untracked files. They can still
+    // obstruct a tracked file that must be restored from the target closure.
+    fs::create_dir(dir.path().join("session-only.txt")).unwrap();
+    let status = Repository::open_readonly(dir.path())
+        .unwrap()
+        .status(atomic_repository::status::StatusOptions::default())
+        .unwrap();
+    assert!(status.is_clean() && !status.has_untracked());
+    let error = orch
+        .dispatch(session_start_event("resume-view"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("incomplete"), "{error}");
+    assert_eq!(
+        Repository::open_readonly(dir.path())
+            .unwrap()
+            .current_view(),
+        view
+    );
+    assert!(dir.path().join("session-only.txt").is_dir());
+    drop(orch);
+
+    // A fresh process must not accept the now-matching view pointer as proof
+    // that the failed materialization completed.
+    let mut orch = make_orchestrator(&dir);
+    assert!(orch
+        .dispatch(session_start_event("resume-view"))
+        .await
+        .is_err());
+    assert!(orch
+        .dispatch(turn_start_event("resume-view", "retry"))
+        .await
+        .is_err());
+    for event in [
+        session_start_event("new-session"),
+        turn_start_event("orphan-session", "retry"),
+    ] {
+        assert!(orch.dispatch(event).await.is_err());
+        assert_eq!(
+            Repository::open_readonly(dir.path())
+                .unwrap()
+                .current_view(),
+            view
+        );
+    }
+    assert!(orch
+        .dispatch(TurnEvent::new("resume-view", HookType::PreToolUse).with_tool_name("bash"))
+        .await
+        .is_err());
+    assert!(orch.dispatch(turn_end_event("resume-view")).await.is_err());
+    fs::write(dir.path().join("base.txt"), "pending human edit\n").unwrap();
+    let session = orch.session_store.load("resume-view").unwrap().unwrap();
+    for scope in ["unscoped", "explicit", "empty"] {
+        let mut event = turn_end_event("resume-view");
+        if scope == "empty" {
+            event = event.with_raw_json(serde_json::json!({"record_files":{}}));
+        } else if scope == "explicit" {
+            event = event.with_raw_json(serde_json::json!({"record_files":{
+                "base.txt": crate::record::scope::fingerprint(dir.path(), "base.txt").unwrap()
+            }}));
+        }
+        let options = crate::record::TurnRecordOptions {
+            session: &session,
+            event: &event,
+            turn_number: 2,
+            turn_duration_ms: 0,
+            prompt: None,
+        };
+        let error = crate::record::record_turn(dir.path(), &options).unwrap_err();
+        assert!(error.to_string().contains("incomplete"), "{error}");
+    }
+    assert_eq!(
+        fs::read_to_string(dir.path().join("base.txt")).unwrap(),
+        "pending human edit\n"
+    );
+
+    // Explicit recovery resolves the obstruction and restores the recorded
+    // file; it must not silently erase another edit made during recovery.
+    fs::remove_dir(dir.path().join("session-only.txt")).unwrap();
+    fs::write(dir.path().join("session-only.txt"), "keep me\n").unwrap();
+    assert!(orch
+        .dispatch(session_start_event("resume-view"))
+        .await
+        .is_err());
+    let repo = Repository::open_existing(dir.path()).unwrap();
+    repo.record(
+        atomic_core::change::ChangeHeader::new("preserve recovery edit"),
+        atomic_repository::RecordOptions::new()
+            .with_all(true)
+            .save_to_store(true)
+            .apply_after_record(true),
+    )
+    .unwrap();
+    drop(repo);
+    orch.dispatch(session_start_event("resume-view"))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event("resume-view", "continue after recovery"))
+        .await
+        .unwrap();
+    fs::write(
+        dir.path().join("base.txt"),
+        "pending human edit\nagent continuation\n",
+    )
+    .unwrap();
+    assert!(orch
+        .dispatch(turn_end_event("resume-view"))
+        .await
+        .unwrap()
+        .was_recorded());
+    assert_eq!(resume_file_inode(&dir), inode);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("session-only.txt")).unwrap(),
+        "keep me\n"
+    );
+}
+
+#[tokio::test]
+async fn resume_view_recovers_completed_materialization_after_interrupted_cleanup() {
+    let (dir, mut orch, view, inode) = resume_view_fixture().await;
+    Repository::open_existing(dir.path())
+        .unwrap()
+        .switch_view(&view)
+        .unwrap();
+    // Simulate a process exiting after rendering but before clearing its marker.
+    let pending = dir
+        .path()
+        .join(".atomic")
+        .join(crate::record::VIEW_PREPARATION_PENDING_FILE);
+    fs::write(&pending, &view).unwrap();
+    assert!(orch
+        .dispatch(TurnEvent::new("resume-view", HookType::PreToolUse).with_tool_name("bash"))
+        .await
+        .is_err());
+    orch.dispatch(session_start_event("resume-view"))
+        .await
+        .unwrap();
+    assert!(!pending.exists());
+    assert_eq!(resume_file_inode(&dir), inode);
+    orch.dispatch(turn_start_event("resume-view", "continue"))
+        .await
+        .unwrap();
+    orch.dispatch(TurnEvent::new("resume-view", HookType::PreToolUse).with_tool_name("bash"))
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("session-only.txt")).unwrap(),
+        "keep me\n"
+    );
+}

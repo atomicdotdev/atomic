@@ -17,18 +17,12 @@ impl TurnOrchestrator {
     /// the selected view over unrecorded work, and never defer rendering to Stop.
     pub(super) fn prepare_session_view(&self, session: &AgentSession) -> AgentResult<()> {
         use atomic_repository::{status::StatusOptions, Repository};
+        use std::io::Write;
         // Lifecycle-only callers can track sessions outside an initialized VCS.
         let Ok(dot_dir) = Repository::canonical_dot_dir(&self.repo_root) else {
             return Ok(());
         };
         if !dot_dir.join("pristine.redb").is_file() {
-            return Ok(());
-        }
-        // No transition or database access is needed when the published view
-        // already matches. This also permits callers holding a read handle.
-        if std::fs::read_to_string(dot_dir.join("current_view"))
-            .is_ok_and(|view| view.trim() == session.view_name)
-        {
             return Ok(());
         }
         let fail = |reason: String| {
@@ -37,16 +31,55 @@ impl TurnOrchestrator {
                 session.view_name, session.session_id,
             ))
         };
+        let pending_path = dot_dir.join(crate::record::VIEW_PREPARATION_PENDING_FILE);
+        // A matching pointer is sufficient only when no transition is pending.
+        // A failed materialization may already have published that pointer.
+        if !pending_path.try_exists().map_err(|e| fail(e.to_string()))?
+            && std::fs::read_to_string(dot_dir.join("current_view"))
+                .is_ok_and(|view| view.trim() == session.view_name)
+        {
+            return Ok(());
+        }
         let repo = Repository::open_readonly_wait(&self.repo_root, SESSION_DATABASE_WAIT)
             .map_err(|e| fail(e.to_string()))?;
-        // A sandbox's view is scoped to its working directory. It must never
+        // Sandbox files have their own view and must not alter this marker or
         // publish a switch to the canonical user's working copy.
-        if repo.is_sandbox() || repo.current_view() == session.view_name {
+        if repo.is_sandbox() {
             return Ok(());
         }
         drop(repo);
         let mut repo = Repository::open_existing_wait(&self.repo_root, SESSION_DATABASE_WAIT)
             .map_err(|e| fail(e.to_string()))?;
+        let verify_restored = |repo: &Repository| -> AgentResult<()> {
+            let status = repo
+                .status(StatusOptions::default().with_untracked(true))
+                .map_err(|e| fail(format!("view restoration is incomplete: {e}")))?;
+            if !status.is_clean() || status.has_untracked() || status.has_conflicts() {
+                return Err(fail(
+                    "view restoration is incomplete; files do not match the selected view. Resolve filesystem obstructions, restore missing files, and preserve any other edits before retrying this session. Automatic recording is blocked".into(),
+                ));
+            }
+            Ok(())
+        };
+        let clear_pending = || -> AgentResult<()> {
+            std::fs::remove_file(&pending_path).map_err(|e| fail(e.to_string()))?;
+            sync_view_preparation_dir(&dot_dir).map_err(|e| fail(e.to_string()))
+        };
+        // Re-read after opening the writer. A prior attempt (including another
+        // process) can publish the pointer and fail before finishing the files.
+        if pending_path.try_exists().map_err(|e| fail(e.to_string()))? {
+            let target = std::fs::read_to_string(&pending_path)
+                .map_err(|e| fail(format!("view restoration is incomplete: {e}")))?;
+            if target != session.view_name || repo.current_view() != target {
+                return Err(fail(
+                    "a previous view restoration is incomplete; repair the working copy on its intended view and retry the original session".into(),
+                ));
+            }
+            // Do not blindly materialize again: an operator may have edited
+            // files while resolving the failure. Verify explicit recovery only.
+            verify_restored(&repo)?;
+            return clear_pending();
+        }
         if repo.current_view() == session.view_name {
             return Ok(());
         }
@@ -59,9 +92,25 @@ impl TurnOrchestrator {
                 repo.current_view(),
             )));
         }
-        repo.switch_view(&session.view_name)
+        // Persist intent before switch_view can publish a pointer or touch
+        // files. Keep it on every error; recovery must verify the actual files.
+        let mut pending = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pending_path)
             .map_err(|e| fail(e.to_string()))?;
-        Ok(())
+        pending
+            .write_all(session.view_name.as_bytes())
+            .map_err(|e| fail(e.to_string()))?;
+        pending.sync_all().map_err(|e| fail(e.to_string()))?;
+        drop(pending);
+        sync_view_preparation_dir(&dot_dir).map_err(|e| fail(e.to_string()))?;
+        repo.switch_view(&session.view_name)
+            .map_err(|e| fail(format!("view restoration is incomplete: {e}")))?;
+        // The current materializer may warn and skip a failed file while
+        // returning Ok. Success must be established from the resulting files.
+        verify_restored(&repo)?;
+        clear_pending()
     }
 
     /// Handle a SessionStart event.
@@ -337,6 +386,7 @@ impl TurnOrchestrator {
                     session.view_name = current;
                 }
                 Ok(mut repo) => {
+                    crate::record::ensure_view_preparation_complete(&repo)?;
                     let current = repo.current_view().to_string();
                     session.set_parent_view(&current);
 
@@ -506,6 +556,7 @@ impl TurnOrchestrator {
                     &self.repo_root,
                     SESSION_DATABASE_WAIT,
                 ) {
+                    crate::record::ensure_view_preparation_complete(&repo)?;
                     let current = repo.current_view().to_string();
 
                     if repo.is_sandbox() {
@@ -603,4 +654,14 @@ impl TurnOrchestrator {
             }
         }
     }
+}
+
+// Persist creation/removal of the operational marker where directory fsync is
+// supported. Its file contents are synced on all platforms before switching.
+fn sync_view_preparation_dir(dot_dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dot_dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dot_dir;
+    Ok(())
 }
