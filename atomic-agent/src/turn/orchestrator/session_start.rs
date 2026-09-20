@@ -12,6 +12,58 @@ use super::{vendor_from_agent_name, DispatchResult, TurnOrchestrator};
 const SESSION_DATABASE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl TurnOrchestrator {
+    /// Prepare the working copy before a resumed session can run tools.
+    /// Files absent from another closure are not user deletions. Never change
+    /// the selected view over unrecorded work, and never defer rendering to Stop.
+    pub(super) fn prepare_session_view(&self, session: &AgentSession) -> AgentResult<()> {
+        use atomic_repository::{status::StatusOptions, Repository};
+        // Lifecycle-only callers can track sessions outside an initialized VCS.
+        let Ok(dot_dir) = Repository::canonical_dot_dir(&self.repo_root) else {
+            return Ok(());
+        };
+        if !dot_dir.join("pristine.redb").is_file() {
+            return Ok(());
+        }
+        // No transition or database access is needed when the published view
+        // already matches. This also permits callers holding a read handle.
+        if std::fs::read_to_string(dot_dir.join("current_view"))
+            .is_ok_and(|view| view.trim() == session.view_name)
+        {
+            return Ok(());
+        }
+        let fail = |reason: String| {
+            crate::error::AgentError::Internal(format!(
+                "Cannot prepare view '{}' for session {}: {reason}",
+                session.view_name, session.session_id,
+            ))
+        };
+        let repo = Repository::open_readonly_wait(&self.repo_root, SESSION_DATABASE_WAIT)
+            .map_err(|e| fail(e.to_string()))?;
+        // A sandbox's view is scoped to its working directory. It must never
+        // publish a switch to the canonical user's working copy.
+        if repo.is_sandbox() || repo.current_view() == session.view_name {
+            return Ok(());
+        }
+        drop(repo);
+        let mut repo = Repository::open_existing_wait(&self.repo_root, SESSION_DATABASE_WAIT)
+            .map_err(|e| fail(e.to_string()))?;
+        if repo.current_view() == session.view_name {
+            return Ok(());
+        }
+        let status = repo
+            .status(StatusOptions::default().with_untracked(true))
+            .map_err(|e| fail(e.to_string()))?;
+        if !status.is_clean() || status.has_untracked() || status.has_conflicts() {
+            return Err(fail(format!(
+                "working directory is on view '{}' with unrecorded files; preserve or record that work on its current view before resuming. No files were switched",
+                repo.current_view(),
+            )));
+        }
+        repo.switch_view(&session.view_name)
+            .map_err(|e| fail(e.to_string()))?;
+        Ok(())
+    }
+
     /// Handle a SessionStart event.
     ///
     /// Creates a new session or re-enters an ended session. Creates the
@@ -41,6 +93,7 @@ impl TurnOrchestrator {
         // Load or create session
         let mut session = match self.session_store.load(session_id)? {
             Some(mut existing) => {
+                self.prepare_session_view(&existing)?;
                 // Re-entering an existing session (same session_id)
                 let result = phase::transition(
                     existing.phase,

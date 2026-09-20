@@ -1056,10 +1056,10 @@ fn count_occurrences(content: &str, pattern: &str) -> usize {
 /// This test drives two sessions through `record_turn()` directly: session
 /// A whose view is properly forked from `dev` beforehand (the normal path),
 /// and session B whose view is deliberately left unforked (the orphan
-/// path). Per the fix, `record_turn()` must self-heal session B by forking
-/// its view just-in-time from its intended parent (`dev`) rather than
-/// silently recording onto the wrong view. After merging both sessions'
-/// views into `dev`, every function in the file must appear exactly once.
+/// path). Recording first rejects a mismatched working-copy closure. Once
+/// the caller restores the intended parent, it may fork B's missing view.
+/// After inserting both sessions' changes into dev, every function must
+/// appear exactly once.
 #[test]
 fn test_orphaned_session_view_duplicates_content_on_merge() {
     use atomic_repository::apply::CrossViewInsertOptions;
@@ -1113,13 +1113,9 @@ fn test_orphaned_session_view_duplicates_content_on_merge() {
     record_turn(repo_root, &options_a).unwrap();
 
     // Session B: simulates a SessionStart fork that never ran (or failed) —
-    // its view does not exist yet when record_turn() is called. Per the
-    // orphan-view duplication fix, record_turn() must self-heal by forking
-    // it just-in-time from its intended parent ("dev"), NOT from whatever
-    // view happens to be current on the internally-opened Repository handle
-    // (which after session A's turn is "session-a" — forking from there
-    // would leak session A's edit into session B's history and, once both
-    // are merged into dev, resurrect it as a duplicate).
+    // its view does not exist yet when record_turn() is called. Do not
+    // repair that by recording over A's working-copy closure. Reject first,
+    // then retry after the caller restores B's intended parent ("dev").
     let mut session_b = AgentSession::new("session-b", "claude-code", "Claude Code");
     session_b.view_name = "session-b".to_string();
     session_b.set_parent_view("dev");
@@ -1135,8 +1131,24 @@ fn test_orphaned_session_view_duplicates_content_on_merge() {
         turn_duration_ms: 1000,
         prompt: Some("Bump step70".to_string()),
     };
+    let error = record_turn(repo_root, &options_b).unwrap_err();
+    assert!(error.to_string().contains("different closure"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), edited_b);
+    assert_eq!(
+        Repository::open_readonly(repo_root).unwrap().current_view(),
+        "session-a"
+    );
+
+    // Preserve the intended B edit in memory, restore A's clean content, then
+    // explicitly render B's intended parent before retrying the orphan fork.
+    std::fs::write(&file, &edited_a).unwrap();
+    Repository::open_existing(repo_root)
+        .unwrap()
+        .switch_view("dev")
+        .unwrap();
+    std::fs::write(&file, &edited_b).unwrap();
     record_turn(repo_root, &options_b)
-        .expect("record_turn should self-heal an orphaned session view rather than fail");
+        .expect("a missing view can be forked when the working copy is on its intended parent");
 
     // Merge both session views into dev.
     {

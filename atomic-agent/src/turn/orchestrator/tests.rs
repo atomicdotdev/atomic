@@ -1311,3 +1311,221 @@ async fn test_sandbox_session_files_land_in_canonical_store() {
         "sandbox session must not be stranded in a sandbox-local .atomic"
     );
 }
+
+// A view change is not an edit. Resuming must render the selected closure
+// before a tool runs, and recording must not infer deletions from another view.
+fn resume_file_inode(dir: &TempDir) -> u64 {
+    use atomic_core::pristine::TreeTxnT;
+    let repo = Repository::open_readonly(dir.path()).unwrap();
+    let txn = repo.pristine().read_txn().unwrap();
+    txn.get_inode("session-only.txt").unwrap().unwrap().get()
+}
+
+async fn resume_view_fixture() -> (TempDir, TurnOrchestrator, String, u64) {
+    let dir = TempDir::new().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+    repo.add("base.txt", atomic_repository::TrackingOptions::default())
+        .unwrap();
+    repo.record(
+        atomic_core::change::ChangeHeader::new("base"),
+        atomic_repository::RecordOptions::new()
+            .with_all(true)
+            .save_to_store(true)
+            .apply_after_record(true),
+    )
+    .unwrap();
+    drop(repo);
+    let mut orch = make_orchestrator(&dir);
+    orch.dispatch(session_start_event("resume-view"))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event("resume-view", "create file"))
+        .await
+        .unwrap();
+    fs::write(dir.path().join("session-only.txt"), "keep me\n").unwrap();
+    assert!(orch
+        .dispatch(turn_end_event("resume-view"))
+        .await
+        .unwrap()
+        .was_recorded());
+    let view = orch
+        .session_store
+        .load("resume-view")
+        .unwrap()
+        .unwrap()
+        .view_name;
+    let inode = resume_file_inode(&dir);
+    Repository::open_existing(dir.path())
+        .unwrap()
+        .switch_view("dev")
+        .unwrap();
+    assert!(!dir.path().join("session-only.txt").exists());
+    (dir, orch, view, inode)
+}
+
+#[tokio::test]
+async fn resume_view_materializes_before_session_or_turn_start() {
+    for session_start in [true, false] {
+        let (dir, mut orch, view, inode) = resume_view_fixture().await;
+        if session_start {
+            orch.dispatch(session_start_event("resume-view"))
+                .await
+                .unwrap();
+        } else {
+            orch.dispatch(turn_start_event("resume-view", "resume without startup"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            Repository::open_readonly(dir.path())
+                .unwrap()
+                .current_view(),
+            view
+        );
+        assert_eq!(resume_file_inode(&dir), inode);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("session-only.txt")).unwrap(),
+            "keep me\n"
+        );
+        if session_start {
+            orch.dispatch(turn_start_event("resume-view", "edit base"))
+                .await
+                .unwrap();
+        }
+        fs::write(dir.path().join("base.txt"), "edited\n").unwrap();
+        assert!(orch
+            .dispatch(turn_end_event("resume-view"))
+            .await
+            .unwrap()
+            .was_recorded());
+        assert_eq!(resume_file_inode(&dir), inode);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("session-only.txt")).unwrap(),
+            "keep me\n"
+        );
+        // Reopening and switching away/back must still render the original file.
+        let mut repo = Repository::open_existing(dir.path()).unwrap();
+        repo.switch_view("dev").unwrap();
+        repo.switch_view(&view).unwrap();
+        drop(repo);
+        assert_eq!(resume_file_inode(&dir), inode);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("session-only.txt")).unwrap(),
+            "keep me\n"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resume_view_preserves_dirty_or_untracked_work_and_can_retry() {
+    for untracked in [false, true] {
+        let (dir, mut orch, view, inode) = resume_view_fixture().await;
+        let path = if untracked {
+            "session-only.txt"
+        } else {
+            "base.txt"
+        };
+        fs::write(dir.path().join(path), "pending human work\n").unwrap();
+        let error = orch
+            .dispatch(session_start_event("resume-view"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unrecorded"), "{error}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join(path)).unwrap(),
+            "pending human work\n"
+        );
+        assert_eq!(
+            Repository::open_readonly(dir.path())
+                .unwrap()
+                .current_view(),
+            "dev"
+        );
+        assert!(orch
+            .dispatch(turn_start_event("resume-view", "retry still dirty"))
+            .await
+            .is_err());
+        // Resolve the test's pending work explicitly, then retry the lifecycle.
+        if untracked {
+            fs::remove_file(dir.path().join(path)).unwrap();
+        } else {
+            fs::write(dir.path().join(path), "base\n").unwrap();
+        }
+        orch.dispatch(session_start_event("resume-view"))
+            .await
+            .unwrap();
+        assert_eq!(
+            Repository::open_readonly(dir.path())
+                .unwrap()
+                .current_view(),
+            view
+        );
+        assert_eq!(resume_file_inode(&dir), inode);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("session-only.txt")).unwrap(),
+            "keep me\n"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resume_view_record_rejects_drift_instead_of_recording_deletions() {
+    let (dir, orch, _view, _) = resume_view_fixture().await;
+    let session = orch.session_store.load("resume-view").unwrap().unwrap();
+    fs::write(dir.path().join("base.txt"), "pending edit\n").unwrap();
+    let event = turn_end_event("resume-view");
+    let options = crate::record::TurnRecordOptions {
+        session: &session,
+        event: &event,
+        turn_number: 2,
+        turn_duration_ms: 0,
+        prompt: Some("edit base".into()),
+    };
+    let error = crate::record::record_turn(dir.path(), &options).unwrap_err();
+    assert!(error.to_string().contains("view"), "{error}");
+    assert_eq!(
+        Repository::open_readonly(dir.path())
+            .unwrap()
+            .current_view(),
+        "dev"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("base.txt")).unwrap(),
+        "pending edit\n"
+    );
+    assert_eq!(
+        orch.session_store
+            .load("resume-view")
+            .unwrap()
+            .unwrap()
+            .recorded_change_hashes
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn resume_view_still_records_an_intentional_deletion() {
+    let (dir, mut orch, view, _) = resume_view_fixture().await;
+    orch.dispatch(session_start_event("resume-view"))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event("resume-view", "delete session-only.txt"))
+        .await
+        .unwrap();
+    fs::remove_file(dir.path().join("session-only.txt")).unwrap();
+    assert!(orch
+        .dispatch(turn_end_event("resume-view"))
+        .await
+        .unwrap()
+        .was_recorded());
+    let mut repo = Repository::open_existing(dir.path()).unwrap();
+    repo.switch_view("dev").unwrap();
+    repo.switch_view(&view).unwrap();
+    assert!(!dir.path().join("session-only.txt").exists());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("base.txt")).unwrap(),
+        "base\n"
+    );
+}

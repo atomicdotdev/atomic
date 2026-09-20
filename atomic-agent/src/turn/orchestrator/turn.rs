@@ -41,6 +41,7 @@ impl TurnOrchestrator {
         let session_id = &event.session_id;
 
         let mut session = self.load_or_create_session(session_id, &event)?;
+        self.prepare_session_view(&session)?;
         let turn_number = session.turn_count.saturating_add(1);
         if session.managed_run.is_none() || self.managed_run.is_some() {
             self.resume_journal_turn(session_id, turn_number, event.timestamp.timestamp())?;

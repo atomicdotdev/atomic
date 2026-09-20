@@ -110,6 +110,62 @@ fn build_turn_header(
         .build()
 }
 
+// A freshly forked view can reuse the same working copy only when the full
+// visible change/dependency closure is identical. Path-table occupants and
+// journal baselines cannot prove this. Sandboxes already scope their own view.
+fn validate_recording_view(
+    repo: &atomic_repository::Repository,
+    options: &TurnRecordOptions<'_>,
+) -> AgentResult<()> {
+    use atomic_core::pristine::ViewTxnT;
+    use atomic_repository::repository::collect_visible_change_ids_with_deps;
+    // A validated explicit manifest names each write/deletion deliberately;
+    // it does not infer absent files from the whole working directory.
+    let explicitly_scoped = options
+        .event
+        .raw_json
+        .as_ref()
+        .is_some_and(|raw| raw.get("record_files").is_some());
+    if repo.is_sandbox() || explicitly_scoped || repo.current_view() == options.session.view_name {
+        return Ok(());
+    }
+    let fail = |reason: String| AgentError::RecordFailed {
+        session_id: options.session.session_id.clone(),
+        turn_number: options.turn_number,
+        reason,
+    };
+    let txn = repo
+        .pristine()
+        .read_txn()
+        .map_err(|e| fail(e.to_string()))?;
+    // A missing first-turn view may still be forked from the selected parent.
+    // It must not be reconstructed over a different closure at record time.
+    let target = txn
+        .get_view(&options.session.view_name)
+        .map_err(|e| fail(e.to_string()))?;
+    let target_name = target
+        .as_ref()
+        .map(|_| options.session.view_name.as_str())
+        .unwrap_or_else(|| options.session.parent_view().unwrap_or(repo.current_view()));
+    let current = txn
+        .get_view(repo.current_view())
+        .map_err(|e| fail(e.to_string()))?;
+    let target = txn.get_view(target_name).map_err(|e| fail(e.to_string()))?;
+    if let (Some(current), Some(target)) = (current, target) {
+        let current_ids = collect_visible_change_ids_with_deps(&txn, &current)
+            .map_err(|e| fail(e.to_string()))?;
+        let target_ids =
+            collect_visible_change_ids_with_deps(&txn, &target).map_err(|e| fail(e.to_string()))?;
+        if current_ids == target_ids {
+            return Ok(());
+        }
+    }
+    Err(fail(format!(
+        "working directory view '{}' differs from session view '{}'; refusing to record against a different closure. Files are unchanged; preserve pending work before resuming the session on its view",
+        repo.current_view(), options.session.view_name,
+    )))
+}
+
 // record_turn (the main entry point)
 
 /// Record an agent turn as an Atomic change.
@@ -161,6 +217,8 @@ pub fn record_turn(
         turn_number: options.turn_number,
         reason: format!("Failed to open repository (readonly): {}", e),
     })?;
+
+    validate_recording_view(&repo, options)?;
 
     // `status()` reads current_view, while `record()` writes to session.view_name.
     // Align the read-only handle before the first status check; this keeps the
@@ -224,6 +282,10 @@ pub fn record_turn(
         turn_number: options.turn_number,
         reason: format!("Failed to open repository for recording: {}", e),
     })?;
+
+    // Recheck after acquiring the writer: another process may have switched
+    // views since the initial read-only status check.
+    validate_recording_view(&repo, options)?;
 
     // Keep the write handle on the same view for post-add status and record.
     // First turns may target a view that record/apply will create; other failures
