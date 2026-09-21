@@ -54,6 +54,32 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-test-
 
+      - name: Windows: opt out of real-time scanning for cache and temp
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          # Best-effort. Windows Defender real-time scanning is the dominant
+          # cost for the filesystem-heavy suites (repository, teams, database
+          # owner). Exclusions are non-fatal: on managed runners the call may
+          # be denied and the run continues.
+          $paths = @(
+            "$env:GITHUB_WORKSPACE",
+            "$env:RUNNER_TEMP",
+            "$env:LOCALAPPDATA\Temp"
+          )
+          if ("$env:CARGO_HOME" -ne "") { $paths += "$env:CARGO_HOME" }
+          else { $paths += "$env:USERPROFILE\.cargo" }
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              try {
+                Add-MpPreference -ExclusionPath $p -ErrorAction Stop | Out-Null
+              } catch {
+                Write-Host "Defender exclusion denied for $p (non-fatal): $($_.Exception.Message)"
+              }
+            }
+          }
+          Write-Host "Defender exclusions requested."
+
       - name: Run tests
         run: cargo test --workspace
 
