@@ -773,7 +773,8 @@ default = "{}"
     /// Returns an error if the view does not exist or the pointer file
     /// cannot be written.
     pub fn align_to_view(&mut self, view: &str) -> Result<(), RepositoryError> {
-        self.align_deferred_tree_and_publish_view(view).map(|_| ())
+        self.align_deferred_tree_and_publish_view(view, false)
+            .map(|_| ())
     }
 
     /// Set the current view on this handle only.
