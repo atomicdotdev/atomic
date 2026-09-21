@@ -8,12 +8,15 @@
 //! ac-4 deterministic matrix (linked worktrees, concurrent writers).
 
 use super::super::projection_effects::{
-    aligned_git_index_lease, observe_checkpoint_facts, observe_git_index_lease, read_head_target,
-    ProjectionCheckpointPlan,
+    aligned_git_index_lease, observe_git_index_lease, read_head_target, ProjectionCheckpointPlan,
 };
 use super::*;
 
-use atomic_core::operation::{DigestKind, EffectReceiptKind, EffectTarget, EffectValue};
+#[cfg(feature = "adoption-test-injection")]
+use super::super::projection_effects::observe_checkpoint_facts;
+use atomic_core::operation::EffectTarget;
+#[cfg(feature = "adoption-test-injection")]
+use atomic_core::operation::{DigestKind, EffectReceiptKind, EffectValue};
 use atomic_core::pristine::OperationTxnT;
 use std::fs;
 use std::process::Command;

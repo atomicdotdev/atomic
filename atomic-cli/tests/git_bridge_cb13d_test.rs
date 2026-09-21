@@ -875,15 +875,28 @@ fn session_notice_written_and_killed_daemon_leaves_commands_unchanged() {
 
     // The killed daemon left the workspace in a command-boundary-clean
     // state: the next command outcome is unchanged versus the baseline.
-    fixture.atomic(&["git", "bridge", "reconcile"]);
-    fixture.atomic(&["git", "bridge", "verify"]);
+    // If the kill landed mid-checkpoint-write, the open-time recovery
+    // completes the interrupted operation and the boundary reconcile
+    // re-adopts the external commit on a subsequent pass — poll for the
+    // converged checkpoint instead of assuming the first pass lands it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let checkpoint = loop {
+        fixture.atomic(&["git", "bridge", "reconcile"]);
+        fixture.atomic(&["git", "bridge", "verify"]);
+        let checkpoint = fs::read_to_string(fixture.root().join(".atomic/bridge/workspace.json"))
+            .expect("checkpoint");
+        if checkpoint.contains(external_tip.to_string().as_str())
+            || std::time::Instant::now() > deadline
+        {
+            break checkpoint;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
     let after = fixture.equivalence_identity();
     assert_ne!(
         after, baseline,
         "the external commit must be reflected after the boundary reconcile"
     );
-    let checkpoint = fs::read_to_string(fixture.root().join(".atomic/bridge/workspace.json"))
-        .expect("checkpoint");
     assert!(
         checkpoint.contains(&external_tip.to_string()),
         "the checkpoint must reference the external tip after the killed daemon:\n{checkpoint}"

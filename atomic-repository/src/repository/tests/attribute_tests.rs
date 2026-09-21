@@ -245,6 +245,7 @@ fn regular_to_dangling_symlink_records_type_and_materializes_target() {
 /// Register the invisible sibling writers the review R1 probe plants: two
 /// independent changes writing one value each to the same register, visible
 /// from no view in this fixture. Returns their NodeIds.
+#[cfg(unix)]
 fn seed_invisible_siblings(
     repo: &TestRepository,
     inode: atomic_core::types::Inode,
@@ -268,6 +269,7 @@ fn seed_invisible_siblings(
 
 /// Assemble one attribute-only change on the base-only `dev` view through
 /// the production entry the import path uses.
+#[cfg(unix)]
 fn assemble_attribute_write(
     repo: &TestRepository,
     path: &str,
@@ -404,6 +406,7 @@ fn sibling_kind_writers_never_become_foreign_assembly_dependencies() {
     }
 }
 
+#[cfg(unix)]
 fn inode_of(repo: &TestRepository, path: &str) -> atomic_core::types::Inode {
     use atomic_core::pristine::TreeTxnT;
     let txn = repo.pristine.read_txn().unwrap();

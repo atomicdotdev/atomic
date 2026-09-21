@@ -886,6 +886,7 @@ impl Repository {
     }
 
     #[cfg(test)]
+    #[cfg(unix)] // consumed by unix-gated change-source tests
     fn status_with_change_source(
         &self,
         working_copy: WorkingCopyId,

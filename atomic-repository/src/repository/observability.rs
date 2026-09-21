@@ -88,11 +88,11 @@ const OPEN_NO_FOLLOW: i32 = 0o400; // O_NOFOLLOW
 const OPEN_NONBLOCK: i32 = 0o4; // O_NONBLOCK
 #[cfg(target_os = "macos")]
 const OPEN_DIRECTORY: i32 = 0o1; // O_DIRECTORY
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 const OPEN_NO_FOLLOW: i32 = 0;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 const OPEN_NONBLOCK: i32 = 0;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 const OPEN_DIRECTORY: i32 = 0;
 
 /// Validated 26-character Crockford-base32 ULID (working-copy identity).
