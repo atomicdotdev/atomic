@@ -8,7 +8,8 @@
 //! ac-4 deterministic matrix (linked worktrees, concurrent writers).
 
 use super::super::projection_effects::{
-    aligned_git_index_lease, observe_checkpoint_facts, observe_git_index_lease, read_head_target, ProjectionCheckpointPlan,
+    aligned_git_index_lease, observe_checkpoint_facts, observe_git_index_lease, read_head_target,
+    ProjectionCheckpointPlan,
 };
 use super::*;
 
@@ -1107,7 +1108,7 @@ fn head_third_value_inside_the_lock_window_is_receipted_and_preserved() {
 #[cfg(feature = "adoption-test-injection")]
 #[test]
 fn ref_landing_the_intended_value_inside_the_window_is_recovered_not_rejected() {
-    let (directory, mut repo, git) = colocated();
+    let (directory, repo, git) = colocated();
     let working_copy = repo.require_working_copy_id().unwrap();
     fs::write(directory.path().join("extra.txt"), b"target\n").unwrap();
     run_git(directory.path(), &["add", "extra.txt"]);

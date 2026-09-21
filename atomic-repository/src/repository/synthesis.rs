@@ -619,7 +619,6 @@ pub(crate) mod failpoints {
         if std::env::var_os("ATOMIC_FAIL_SYNTHESIS_SEMANTIC_CORRUPT_UNTOUCHED").is_some() {
             use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
             use atomic_core::crdt::tables::{encode_branch_id, encode_vertex_position};
-            use atomic_core::pristine::CrdtTxnT;
             use atomic_core::types::{ChangePosition, GraphNode, NodeId};
             for path in untouched_paths {
                 let Some(trunk_id) = txn.get_trunk_by_path(path)? else {
@@ -707,8 +706,7 @@ pub(crate) mod failpoints {
     ) -> Result<(), RepositoryError> {
         if std::env::var_os("ATOMIC_FAIL_SYNTHESIS_SEMANTIC_LEAF_RANGE").is_some() {
             use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
-            use atomic_core::crdt::tables::{decode_leaf_id, encode_leaf_value};
-            use atomic_core::pristine::CrdtTxnT;
+            use atomic_core::crdt::tables::encode_leaf_value;
             for path in untouched_paths {
                 let Some(trunk_id) = txn.get_trunk_by_path(path)? else {
                     continue;
@@ -741,7 +739,6 @@ pub(crate) mod failpoints {
             use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
             use atomic_core::crdt::tables::{decode_leaf_id, encode_leaf_value};
             use atomic_core::diff::TokenKind;
-            use atomic_core::pristine::CrdtTxnT;
             for path in untouched_paths {
                 let Some(trunk_id) = txn.get_trunk_by_path(path)? else {
                     continue;
@@ -808,7 +805,6 @@ pub(crate) mod failpoints {
         if std::env::var_os("ATOMIC_FAIL_SYNTHESIS_SEMANTIC_TRUNK_DELETED").is_some() {
             use atomic_core::crdt::tables::{encode_trunk_id, encode_trunk_value};
             use atomic_core::crdt::TrunkState;
-            use atomic_core::pristine::CrdtTxnT;
             for path in untouched_paths {
                 let Some(trunk_id) = txn.get_trunk_by_path(path)? else {
                     continue;
