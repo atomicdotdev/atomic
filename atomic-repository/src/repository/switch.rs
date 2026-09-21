@@ -489,7 +489,6 @@ impl Repository {
             },
         }
     }
-
     fn switch_view_journaled(
         &mut self,
         operation_lock: &super::locks::WorkingCopyOperationLockGuard,
@@ -942,6 +941,12 @@ impl Repository {
             filesystem_executor.record(pending)?;
         }
 
+        if std::env::var_os("ATOMIC_TEST_FAIL_SWITCH_AFTER_PUBLISH").is_some() {
+            return Err(RepositoryError::InvalidOperation {
+                message: "injected switch failure after view publication".to_string(),
+            });
+        }
+
         // ── Phase 4: Materialize the new view's tracked files from graph ─
         //
         // Run a complete target materialization. Scoped FILE_INDEX entries let
@@ -956,6 +961,12 @@ impl Repository {
         )?;
         filesystem_executor.complete_remaining(view)?;
         drop(filesystem_executor);
+
+        if std::env::var_os("ATOMIC_TEST_FAIL_SWITCH_AFTER_MATERIALIZE").is_some() {
+            return Err(RepositoryError::InvalidOperation {
+                message: "injected switch failure after materialization".to_string(),
+            });
+        }
 
         // ── Phase 5: Restore ignored files from the NEW view's workspace ─
         //
@@ -1001,8 +1012,7 @@ impl Repository {
         let working_copy = operation_lock.working_copy();
         let source_target = EffectTarget::WorkspacePath {
             working_copy,
-            path: path.to_string(),
-        };
+            path: path.to_string(),        };
         let shelf_target = EffectTarget::ShelfPath {
             working_copy,
             view: old_view.to_string(),

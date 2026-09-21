@@ -221,6 +221,10 @@ pub trait MutTxnT:
     /// `(removed_stale, inserted_missing)`.
     fn repair_rev_tree_bijection(&mut self) -> Result<(usize, usize), PristineError>;
 
+    /// Remove one inode's path binding without deleting a different inode that
+    /// currently occupies the same single-valued forward path entry.
+    fn del_tree_binding(&mut self, path: &str, inode: Inode) -> Result<(), PristineError>;
+
     /// Store file index entry (mtime + size + content hash) for fast status detection.
     ///
     /// Called after a file is recorded or applied. Subsequent `status()` calls

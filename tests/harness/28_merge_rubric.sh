@@ -472,6 +472,7 @@ record_change "rename orig->base-name" >/dev/null
 A11_BASE_HASH="$(tip_hash base-side-a11)"
 switch_view merge-a11 >/dev/null
 atomic insert "$A11_HASH" >/dev/null 2>&1
+<<<<<<< HEAD
 atomic insert "$A11_BASE_HASH" >/dev/null 2>&1
 
 assert_file_exists "A11: feature destination retained" feat-name.txt
@@ -526,6 +527,13 @@ else
     _fail "A11: typed conflict is stable, isolated, and insert-order independent" \
         "status/conflicts, restore, source isolation, or reverse-order merge failed"
 fi
+=======
+# Concurrent destinations are incomparable, so both names remain live and
+# materialize the same stable inode content.
+assert_file_content "A11: feature destination is preserved" feat-name.txt "shared content"
+assert_file_content "A11: base destination is preserved" base-name.txt "shared content"
+assert_file_not_exists "A11: superseded original path is absent" orig.txt
+>>>>>>> origin/dev
 
 if [[ "${KNOWN_BUGS:-0}" -gt 0 ]]; then
     echo ""

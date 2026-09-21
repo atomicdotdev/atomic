@@ -1130,6 +1130,7 @@ impl Repository {
         })
     }
 
+    /// Save and apply an already-built git-import graph change.
     fn write_import_graph_first_direct(
         &self,
         txn: &mut atomic_core::pristine::WriteTxn<'_>,

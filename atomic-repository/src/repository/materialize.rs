@@ -841,11 +841,67 @@ impl Repository {
         )?;
         let projection = self.project_tree_for_visibility(&txn, &visibility)?;
 
-        Ok(projection
+        // Base set: the path-claim-aware projection (CB-13D machinery).
+        let mut paths: HashSet<String> = projection
             .present
             .into_iter()
             .filter_map(|(path, item)| (!item.is_directory).then_some(path))
-            .collect())
+            .collect();
+
+        // CB-9A #199 recovery: the effective visible change set (own +
+        // parent chain) decides whether a REV_TREE-claimed path is still
+        // rendered by the view's filter.
+        let view_change_ids: std::collections::HashSet<atomic_core::types::NodeId> =
+            full_visibility.iter_dependency_first().copied().collect();
+
+        // REV_TREE recovery: a view is a FILTER over the global graph — every
+        // node it exposes already lives in the graph, and TREE is just a
+        // single-valued bookkeeping index over that graph. When two inodes
+        // claim the same path (cross-view creates, a materialization
+        // name-conflict), iter_tree can only expose the one binding — so a
+        // switch used to classify a path that the target view's filter DOES
+        // render as "absent from the new view" and silently DELETED it (see
+        // `switch_file_loss_tests`). Re-insert any path that the filter
+        // renders: some REV_TREE-claimed inode whose introducing change is
+        // visible on the view AND alive under that filter — the same
+        // predicate the materializer's name-conflict detection uses.
+        {
+            use atomic_core::pristine::TreeTxnT;
+            let mut by_path: std::collections::HashMap<String, Vec<Inode>> =
+                std::collections::HashMap::new();
+            if let Ok(pairs) = txn.iter_rev_tree() {
+                for (inode, path) in pairs {
+                    by_path.entry(path).or_default().push(inode);
+                }
+            }
+            for (path, inodes) in by_path {
+                if paths.contains(&path) {
+                    continue;
+                }
+                for inode in inodes {
+                    if let Ok(Some(position)) = txn.inode_position(inode) {
+                        if !view_change_ids.contains(&position.change) {
+                            continue;
+                        }
+                        // The filter exposes this path only if the claimed
+                        // inode's content chain is ALIVE under the filter;
+                        // a visible-but-superseded claimant must not keep
+                        // a path the view does not render.
+                        if crate::repository::status::is_file_alive_via_retrieval(
+                            &txn,
+                            inode,
+                            position,
+                            &full_visibility.clone(),
+                        )? {
+                            paths.insert(path);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(paths)
     }
 
     /// Materialize the working copy to match its authoritative desired view.
