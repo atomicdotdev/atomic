@@ -1992,6 +1992,12 @@ impl Repository {
                         resolved_name_conflict_inodes.extend(resolution.conflict_inodes);
                         recorded_paths.push(path);
                         stats.hunks_created += 1;
+                    } else if resolved_name {
+                        // The identity was selected in this loop's Recorded
+                        // sibling: a marker-stripped file with no other edits
+                        // is the resolution itself, not a skip (dev #203).
+                        recorded_paths.push(path);
+                        stats.files_recorded += 1;
                     } else {
                         skipped_paths.push(path);
                         stats.files_skipped += 1;

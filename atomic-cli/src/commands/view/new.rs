@@ -377,14 +377,9 @@ impl Command for New {
         // view's filter starts with the source's change-set membership,
         // anchored on --parent (or the source). The two-tier path below
         // handles plain --draft/--parent creation.
-        if self.from.is_some() {
-            if !repo
-                .view_exists(self.from.as_ref().expect("from"))
-                .map_err(CliError::Repository)?
-            {
-                return Err(CliError::ViewNotFound {
-                    name: self.from.clone().expect("from"),
-                });
+        if let Some(source) = self.from.clone() {
+            if !repo.view_exists(&source).map_err(CliError::Repository)? {
+                return Err(CliError::ViewNotFound { name: source });
             }
             let (anchor, seed) =
                 resolve_overlay_creation(self.from.as_deref(), self.parent.as_deref());
@@ -467,19 +462,16 @@ impl Command for New {
                 ));
             }
         } else {
-            // No --from: create an empty Draft workspace parented on the
-            // nearest Shared ancestor.  No changes are inherited — the
-            // user inserts them explicitly.
-            let parent_name = repo
-                .nearest_shared_ancestor(&workspace_view)
-                .map_err(CliError::Repository)?;
-            repo.create_view_with_identity(name, ViewScope::Draft, Some(&parent_name))
-                .map_err(CliError::Repository)?;
-
+            // No --from: the overlay anchors on the nearest Shared ancestor
+            // with empty membership — the user inserts changes explicitly.
+            let anchored = match repo.nearest_shared_ancestor(&workspace_view) {
+                Ok(name) => name,
+                Err(_) => workspace_view.clone(),
+            };
             print_success(&format!(
                 "Created view: {} (empty workspace, anchored on {})",
                 style_view(name),
-                style_view(&parent_name),
+                style_view(&anchored),
             ));
         }
 

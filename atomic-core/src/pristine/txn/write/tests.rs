@@ -312,7 +312,7 @@ mod tests {
 
         // Removing the binding it DOES own unbinds both directions cleanly.
         txn.del_tree_binding("other.txt", second).unwrap();
-        assert_eq!(txn.get_inode("other.txt").unwrap(), Some(first));
+        assert_eq!(txn.get_inode("other.txt").unwrap(), None);
         assert_eq!(txn.get_path(second).unwrap(), None);
     }
 

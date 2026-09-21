@@ -32,9 +32,8 @@ use crate::apply::{
     write_change_to_graph, CrossViewInsertOptions, CrossViewInsertOutcome, InsertOptions,
     InsertOutcome, InsertStats,
 };
-use crate::repository::deferred_tree::{apply_name_selections, collect_tree_ops};
 
-use atomic_core::change::Insertion;
+use atomic_core::change::{ChangeHeader, Insertion};
 use atomic_core::pristine::InodeGraphOps;
 use atomic_core::types::{ChangePosition, EdgeFlags, GraphNode, SerializedGraphEdge};
 use std::collections::{HashMap, HashSet};
@@ -1965,14 +1964,32 @@ impl Repository {
             already_in_graph,
             change.hunks().len()
         );
-        let tree_projection = self.plan_tree_projection(
-            &mut txn,
-            change_id,
-            *hash,
-            &change,
-            &[],
-            preserve_existing_tree_paths,
-        )?;
+        // Dev #206 parity: a change whose edges are ALREADY in the global
+        // graph (cross-view insert) must not re-derive deferred-tree ops from
+        // its hunks — the canonical journal already consumed that lifecycle
+        // when the change was recorded, and appending target-specific ops
+        // would grow the journal per insert (see
+        // cross_view_insert_does_not_append_deferred_tree_ops). The
+        // projection still publishes its prerequisites.
+        let tree_projection = if already_in_graph {
+            self.plan_tree_projection(
+                &mut txn,
+                change_id,
+                *hash,
+                &Change::empty(ChangeHeader::new("insert replay (no tree ops)")),
+                &[],
+                preserve_existing_tree_paths,
+            )?
+        } else {
+            self.plan_tree_projection(
+                &mut txn,
+                change_id,
+                *hash,
+                &change,
+                &[],
+                preserve_existing_tree_paths,
+            )?
+        };
         tree_projection.apply_prerequisites(&mut txn)?;
         // Apply to the graph (skips hunk application if already_in_graph)
         let t_graph = std::time::Instant::now();

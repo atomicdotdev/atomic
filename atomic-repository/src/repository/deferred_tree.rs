@@ -241,9 +241,8 @@ where
                             .iter()
                             .filter_map(|op| match &op.action {
                                 DeferredTreeAction::Set { path } => Some(path.clone()),
-                                DeferredTreeAction::Delete | DeferredTreeAction::UnlinkName { .. } => {
-                                    None
-                                }
+                                DeferredTreeAction::Delete
+                                | DeferredTreeAction::UnlinkName { .. } => None,
                             })
                             .collect();
                         if prior_paths.len() > 1 {
@@ -727,6 +726,7 @@ impl PreparedTreeProjection {
 /// Materialize explicit name selections into TREE using stable graph identity.
 /// Recording and cross-view insertion share this operation; no content is copied
 /// (dev #203: name conflicts resolve as namespace patches).
+#[allow(dead_code)] // dev #203 entry point; ours' PATH_CLAIMS projection supersedes
 pub(super) fn apply_name_selections<T: MutTxnT>(
     txn: &mut T,
     change_id: NodeId,

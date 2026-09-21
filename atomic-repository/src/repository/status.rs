@@ -1088,15 +1088,6 @@ pub(crate) fn is_file_alive_via_retrieval<T: GraphTxnT>(
     Ok(retrieved.graph.total_bytes() > 0)
 }
 
-/// Dev #203 adapter: NodeId-set visibility (collect_name_conflicts callers).
-pub(crate) fn is_file_alive_via_changes<T: GraphTxnT>(
-    txn: &T,
-    position: Position<NodeId>,
-    visible_changes: &HashSet<NodeId>,
-) -> bool {
-    try_is_file_alive_via_retrieval(txn, position, visible_changes).unwrap_or(false)
-}
-
 /// Dev #203: supersession-aware aliveness probe against an explicit NodeId
 /// change filter (no GraphVisibilityClosure construction).
 pub(crate) fn try_is_file_alive_via_retrieval<T: GraphTxnT>(

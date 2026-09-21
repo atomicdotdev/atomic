@@ -559,10 +559,10 @@ fn concurrent_change_conflicts_after_reload_and_resolution_never_replays() {
     let legs_merge = Command::new("git")
         .args(["merge", "--no-ff", "leg-b", "-m", "merge legs"])
         .current_dir(&root)
-            .env("GIT_AUTHOR_NAME", "CB-9B Tests")
-            .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
-            .env("GIT_COMMITTER_NAME", "CB-9B Tests")
-            .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
+        .env("GIT_AUTHOR_NAME", "CB-9B Tests")
+        .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
+        .env("GIT_COMMITTER_NAME", "CB-9B Tests")
+        .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
         .output()
         .expect("git merge legs");
     assert!(
@@ -771,10 +771,10 @@ fn git_env(root: &Path, env: &[(&str, &str)], args: &[&str]) {
         .args(args)
         .current_dir(root)
         .envs(env.iter().copied())
-            .env("GIT_AUTHOR_NAME", "CB-9B Tests")
-            .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
-            .env("GIT_COMMITTER_NAME", "CB-9B Tests")
-            .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
+        .env("GIT_AUTHOR_NAME", "CB-9B Tests")
+        .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
+        .env("GIT_COMMITTER_NAME", "CB-9B Tests")
+        .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
         .output()
         .expect("run git");
     assert!(
@@ -1122,10 +1122,10 @@ fn ordered_merge_fixture(a_date: &str, b_date: &str) -> OrderedMergeFixture {
     let merge_out = Command::new("git")
         .args(["merge", "--no-ff", "side-b", "-m", "merge side work"])
         .current_dir(&root)
-            .env("GIT_AUTHOR_NAME", "CB-9B Tests")
-            .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
-            .env("GIT_COMMITTER_NAME", "CB-9B Tests")
-            .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
+        .env("GIT_AUTHOR_NAME", "CB-9B Tests")
+        .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
+        .env("GIT_COMMITTER_NAME", "CB-9B Tests")
+        .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
         .output()
         .expect("git merge");
     assert!(
@@ -1343,10 +1343,10 @@ fn installed_reference_transaction_hooks_record_real_git_transitions() {
     let refused = Command::new("git")
         .args(["update-ref", "refs/heads/feature", &head])
         .current_dir(&root)
-            .env("GIT_AUTHOR_NAME", "CB-9B Tests")
-            .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
-            .env("GIT_COMMITTER_NAME", "CB-9B Tests")
-            .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
+        .env("GIT_AUTHOR_NAME", "CB-9B Tests")
+        .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
+        .env("GIT_COMMITTER_NAME", "CB-9B Tests")
+        .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
         .output()
         .expect("run git update-ref");
     assert!(
@@ -1383,10 +1383,10 @@ fn installed_reference_transaction_hooks_record_real_git_transitions() {
     let ref_check = Command::new("git")
         .args(["rev-parse", "--verify", "refs/heads/feature"])
         .current_dir(&root)
-            .env("GIT_AUTHOR_NAME", "CB-9B Tests")
-            .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
-            .env("GIT_COMMITTER_NAME", "CB-9B Tests")
-            .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
+        .env("GIT_AUTHOR_NAME", "CB-9B Tests")
+        .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
+        .env("GIT_COMMITTER_NAME", "CB-9B Tests")
+        .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
         .output()
         .expect("run git rev-parse");
     assert!(
@@ -1845,10 +1845,10 @@ fn raw_foreign_facts_survive_without_the_source_odb() {
         let out = Command::new("git")
             .args(["cat-file", "commit", &empty1])
             .current_dir(&root)
-                .env("GIT_AUTHOR_NAME", "CB-9B Tests")
-                .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
-                .env("GIT_COMMITTER_NAME", "CB-9B Tests")
-                .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
+            .env("GIT_AUTHOR_NAME", "CB-9B Tests")
+            .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
+            .env("GIT_COMMITTER_NAME", "CB-9B Tests")
+            .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
             .output()
             .expect("git cat-file");
         assert!(out.status.success());
@@ -1915,10 +1915,10 @@ fn raw_foreign_facts_survive_without_the_source_odb() {
             .env("GIT_OBJECT_DIRECTORY", root.join(".git/scratch-odb"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-                .env("GIT_AUTHOR_NAME", "CB-9B Tests")
-                .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
-                .env("GIT_COMMITTER_NAME", "CB-9B Tests")
-                .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
+            .env("GIT_AUTHOR_NAME", "CB-9B Tests")
+            .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
+            .env("GIT_COMMITTER_NAME", "CB-9B Tests")
+            .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
             .spawn()
             .expect("git hash-object");
         child
@@ -1970,10 +1970,10 @@ fn explicit_insertion_reapplies_the_resolution_in_another_view() {
     let legs_merge = Command::new("git")
         .args(["merge", "--no-ff", "leg-b", "-m", "merge legs"])
         .current_dir(&root)
-            .env("GIT_AUTHOR_NAME", "CB-9B Tests")
-            .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
-            .env("GIT_COMMITTER_NAME", "CB-9B Tests")
-            .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
+        .env("GIT_AUTHOR_NAME", "CB-9B Tests")
+        .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
+        .env("GIT_COMMITTER_NAME", "CB-9B Tests")
+        .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
         .output()
         .expect("git merge legs");
     assert!(
@@ -2244,10 +2244,10 @@ fn merge_resolution_frontier_failpoint_fails_closed() {
     let merge_out = Command::new("git")
         .args(["merge", "--no-ff", "side-b", "-m", "merge side work"])
         .current_dir(&root)
-            .env("GIT_AUTHOR_NAME", "CB-9B Tests")
-            .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
-            .env("GIT_COMMITTER_NAME", "CB-9B Tests")
-            .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
+        .env("GIT_AUTHOR_NAME", "CB-9B Tests")
+        .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
+        .env("GIT_COMMITTER_NAME", "CB-9B Tests")
+        .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
         .output()
         .expect("git merge");
     assert!(!merge_out.status.success(), "fixture merge must conflict");
@@ -2450,10 +2450,10 @@ fn merge_with_empty_tip_parent_imports_both_closures() {
     let merge_out = Command::new("git")
         .args(["merge", "--no-ff", "side-b", "-m", "merge empty tip"])
         .current_dir(&root)
-            .env("GIT_AUTHOR_NAME", "CB-9B Tests")
-            .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
-            .env("GIT_COMMITTER_NAME", "CB-9B Tests")
-            .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
+        .env("GIT_AUTHOR_NAME", "CB-9B Tests")
+        .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
+        .env("GIT_COMMITTER_NAME", "CB-9B Tests")
+        .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
         .output()
         .expect("git merge");
     assert!(
