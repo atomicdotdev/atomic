@@ -934,9 +934,9 @@ fn cutover_refuses_an_arbitrary_file_at_git() {
 }
 
 #[test]
+#[cfg(unix)]
 fn cutover_refuses_a_dangling_symlink_at_git() {
     let (temp, repo) = create_temp_repo();
-    #[cfg(unix)]
     std::os::unix::fs::symlink(temp.path().join("nowhere"), temp.path().join(".git")).unwrap();
     expect_cutover_refusal(&repo, "does not resolve to a valid Git repository");
 }
@@ -972,7 +972,6 @@ fn cutover_refuses_active_hook_surfaces() {
 /// Install an Atomic-owned advisory dispatcher with the exact marker the
 /// CLI hook installer writes (shared marker constant).
 fn install_owned_dispatcher(temp: &std::path::Path, name: &str, subcommand: &str) -> Vec<u8> {
-    use std::os::unix::fs::PermissionsExt;
     let hooks = temp.join(".git/hooks");
     std::fs::create_dir_all(&hooks).unwrap();
     let script = format!(
@@ -981,7 +980,11 @@ fn install_owned_dispatcher(temp: &std::path::Path, name: &str, subcommand: &str
     );
     let hook = hooks.join(name);
     std::fs::write(&hook, &script).unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     script.into_bytes()
 }
 

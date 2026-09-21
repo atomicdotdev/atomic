@@ -50,6 +50,7 @@
 
 use super::{Repository, RepositoryError};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -772,11 +773,18 @@ impl BridgeEventJournal {
         // directory. Only after the anchored walk succeeds is the final
         // file opened O_NOFOLLOW.
         self.open_anchored_ancestors()?;
+        #[cfg(unix)]
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .create(true)
             .append(true)
             .custom_flags(OPEN_NO_FOLLOW | OPEN_NONBLOCK)
+            .open(&self.path)?;
+        #[cfg(not(unix))]
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .create(true)
+            .append(true)
             .open(&self.path)?;
         // Confine to regular files: a FIFO or device node is refused
         // instead of blocking or writing to it.
