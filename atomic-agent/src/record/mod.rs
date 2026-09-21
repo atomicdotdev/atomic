@@ -139,16 +139,7 @@ pub fn record_turn(
     repo_root: &Path,
     options: &TurnRecordOptions<'_>,
 ) -> AgentResult<TurnRecordOutcome> {
-    let manifest = scope::manifest(options)?;
-    if let Some(files) = &manifest {
-        scope::validate(repo_root, files, options)?;
-        if files.is_empty() {
-            return Err(AgentError::EmptyTurn {
-                session_id: options.session.session_id.clone(),
-                turn_number: options.turn_number,
-            });
-        }
-    }
+    let mut manifest = scope::manifest(options)?;
     // Step 1: Open the repository read-only for the initial status check.
     // This can coexist with other readers. Wait for a transient incompatible
     // writer before deciding whether work or untracked files exist.
@@ -179,6 +170,41 @@ pub fn record_turn(
             turn_number: options.turn_number,
             reason: format!("Failed to get repository status: {}", e),
         })?;
+
+    // Restart-proof the deletion scope. The plugin's ownership claims live in
+    // its process memory; a plugin restart mid-session (e.g. after an
+    // ambiguity lockout) silently drops every claim, and deletions of files
+    // this session recorded earlier then sit unrecorded forever — no later
+    // manifest will ever mention them again. Those deletions are still
+    // attributable from the persisted session state: `files_touched` holds
+    // exactly the paths this session's own changes introduced or modified.
+    // Augment the manifest with their Deleted status entries so a lost claim
+    // cannot strand a deletion. Files the session never recorded stay
+    // unclaimed, keeping foreign edits out of scope.
+    if let Some(files) = manifest.as_mut() {
+        let touched: std::collections::HashSet<&str> = options
+            .session
+            .files_touched
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for entry in status.entries() {
+            if entry.status() != atomic_repository::status::FileStatus::Deleted {
+                continue;
+            }
+            let path = entry.path().to_string_lossy().to_string();
+            if !files.contains_key(&path) && touched.contains(path.as_str()) {
+                files.insert(path.clone(), None);
+            }
+        }
+        scope::validate(repo_root, files, options)?;
+        if files.is_empty() {
+            return Err(AgentError::EmptyTurn {
+                session_id: options.session.session_id.clone(),
+                turn_number: options.turn_number,
+            });
+        }
+    }
 
     let status = scope::filter(status, manifest.as_ref());
 

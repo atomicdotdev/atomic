@@ -42,6 +42,12 @@ impl TurnOrchestrator {
         let mut session = match self.session_store.load(session_id)? {
             Some(mut existing) => {
                 // Re-entering an existing session (same session_id)
+                // The plugin re-declares its recording mode on every
+                // session-start; a session that opted into explicit-files
+                // under an older plugin must follow a newer plugin that no
+                // longer declares the scope, or its Stop hooks refuse to
+                // record forever.
+                apply_recording_scope(session_id, &event, &mut existing)?;
                 let result = phase::transition(
                     existing.phase,
                     Event::SessionStart,
@@ -173,15 +179,15 @@ impl TurnOrchestrator {
         // Best-effort: if the repo can't be opened or the view already
         // exists (resumed session), we log and continue — recording will
         // still work, it just won't have the parent's history.
-        if event
-            .raw_json
-            .as_ref()
-            .and_then(|v| v.get("recording_scope"))
-            .and_then(|v| v.as_str())
-            == Some("explicit-files-v1")
-        {
-            session.explicit_record_files = true;
-        }
+        //
+        // The plugin declares its recording mode on every session-start, so
+        // the session follows the plugin it is actually talking to. A session
+        // that opted into explicit-files under an older plugin must
+        // re-negotiate to whole-tree recording when a newer plugin stops
+        // declaring the scope — otherwise its Stop hooks refuse to record
+        // forever ("explicit record_files manifest required") and the
+        // session's view silently stays empty.
+        apply_recording_scope(session_id, &event, &mut session)?;
 
         // Several OpenCode sessions can share one actual working directory.
         // Explicit file scopes separate authorship; a common view gives their
@@ -550,4 +556,43 @@ impl TurnOrchestrator {
             }
         }
     }
+}
+
+/// Apply the plugin's declared recording mode to the session.
+///
+/// The plugin declares its mode on every session-start, so the session
+/// follows the plugin it is actually talking to rather than the one that
+/// created it. A session that opted into explicit-files under an older
+/// plugin re-negotiates to whole-tree recording when a newer plugin stops
+/// declaring the scope; otherwise its Stop hooks refuse to record forever
+/// and the session's view silently stays empty.
+fn apply_recording_scope(
+    session_id: &str,
+    event: &TurnEvent,
+    session: &mut AgentSession,
+) -> AgentResult<()> {
+    match event
+        .raw_json
+        .as_ref()
+        .and_then(|v| v.get("recording_scope"))
+        .and_then(|v| v.as_str())
+    {
+        Some("explicit-files-v1") => session.explicit_record_files = true,
+        Some(other) => {
+            return Err(crate::error::AgentError::Internal(format!(
+                "unknown recording_scope '{other}'"
+            )))
+        }
+        None => {
+            if session.explicit_record_files {
+                log::info!(
+                    "Session {} re-negotiated to whole-tree recording: \
+                     session-start declared no recording_scope",
+                    session_id
+                );
+                session.explicit_record_files = false;
+            }
+        }
+    }
+    Ok(())
 }
