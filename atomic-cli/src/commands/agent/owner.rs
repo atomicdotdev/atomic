@@ -35,7 +35,9 @@ use crate::commands::Command;
 use crate::error::CliResult;
 
 const PROTOCOL_VERSION: u16 = 1;
-const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+// Local IPC only; a single oversized envelope (e.g. a huge recovered reasoning
+// block) must still fit one frame even after client-side chunking.
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 // A JSON u8 takes at most four bytes including its comma. Reserve 256 bytes
 // per fragment for metadata (including 64-bit cursors), plus the next cursor.
 const FROZEN_PAGE_BYTES: usize = 1024 * 1024;
@@ -301,21 +303,25 @@ impl ProvenanceJournalSink for OwnerJournalSink {
             .collect::<Result<Vec<_>, atomic_agent::ProvenanceJournalError>>()
             .map_err(|error| error.to_string())?;
         run_outside_async_runtime(move || {
-            let response = request_with_reconnect(
-                &repository,
-                OwnerRequest::AppendProvenanceEnvelopes {
-                    provenance_id: reservation.provenance_id,
-                    expected_generation: reservation.generation,
-                    envelopes,
-                    now,
-                },
-            )?;
-            match response {
-                OwnerResponse::ProvenanceEnvelopesCommitted { acknowledgements } => {
-                    Ok(acknowledgements)
+            let mut acknowledgements = Vec::new();
+            for chunk in chunk_wire_envelopes(envelopes) {
+                let response = request_with_reconnect(
+                    &repository,
+                    OwnerRequest::AppendProvenanceEnvelopes {
+                        provenance_id: reservation.provenance_id,
+                        expected_generation: reservation.generation,
+                        envelopes: chunk,
+                        now,
+                    },
+                )?;
+                match response {
+                    OwnerResponse::ProvenanceEnvelopesCommitted {
+                        acknowledgements: acks,
+                    } => acknowledgements.extend(acks),
+                    other => return Err(unexpected_response("append provenance", other)),
                 }
-                other => Err(unexpected_response("append provenance", other)),
             }
+            Ok(acknowledgements)
         })
         .map_err(|error| error.to_string())
     }
@@ -1353,6 +1359,35 @@ where
     Ok(())
 }
 
+/// A turn's envelope batch can exceed `MAX_FRAME_BYTES` on its own (a heavy
+/// agent turn recovers full tool output), so split it before framing. The
+/// estimate is conservative: `bytes` serializes as a JSON number array, which
+/// costs roughly four characters per byte.
+const APPEND_CHUNK_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
+fn wire_envelope_frame_cost(envelope: &WireEnvelope) -> usize {
+    4 * envelope.bytes.len() + 2 * envelope.event_id.len() + 128
+}
+
+fn chunk_wire_envelopes(envelopes: Vec<WireEnvelope>) -> Vec<Vec<WireEnvelope>> {
+    let mut chunks: Vec<Vec<WireEnvelope>> = Vec::new();
+    let mut current: Vec<WireEnvelope> = Vec::new();
+    let mut current_cost = 0usize;
+    for envelope in envelopes {
+        let cost = wire_envelope_frame_cost(&envelope);
+        if !current.is_empty() && current_cost + cost > APPEND_CHUNK_BUDGET_BYTES {
+            chunks.push(std::mem::take(&mut current));
+            current_cost = 0;
+        }
+        current_cost += cost;
+        current.push(envelope);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 fn endpoint_name(dot_dir: &Path) -> String {
     let canonical = std::fs::canonicalize(dot_dir).unwrap_or_else(|_| dot_dir.to_path_buf());
     let digest = blake3::hash(canonical.to_string_lossy().as_bytes())
@@ -1618,7 +1653,7 @@ mod tests {
         let turn = store.reserve_provenance_turn("paged", 1, 1).unwrap();
         // Exercise both the fragment-count limit and worst-case JSON expansion.
         let mut expected = vec![Vec::new(); 257];
-        expected.push(vec![255; 2 * FROZEN_PAGE_BYTES + 17]);
+        expected.push(vec![255; 16 * FROZEN_PAGE_BYTES + 17]);
         for (index, bytes) in expected.iter().enumerate() {
             store
                 .append_provenance_envelope(
@@ -1836,5 +1871,50 @@ mod tests {
         let digest = "0123456789abcdef01234567";
         assert_eq!(endpoint_for_digest(digest), endpoint_for_digest(digest));
         assert!(endpoint_for_digest(digest).len() < 100);
+    }
+
+    #[test]
+    fn chunking_splits_oversized_batches() {
+        let megabyte = 1024 * 1024;
+        let envelopes: Vec<_> = (0..6)
+            .map(|i| WireEnvelope {
+                event_id: format!("event-{i}"),
+                bytes: vec![0u8; 2 * megabyte],
+            })
+            .collect();
+        let chunks = chunk_wire_envelopes(envelopes);
+        assert_eq!(chunks.len(), 6);
+        for chunk in &chunks {
+            assert_eq!(chunk.len(), 1);
+        }
+    }
+
+    #[test]
+    fn chunking_packs_small_batches() {
+        let envelopes: Vec<_> = (0..1_000)
+            .map(|i| WireEnvelope {
+                event_id: format!("event-{i}"),
+                bytes: b"small envelope".to_vec(),
+            })
+            .collect();
+        let chunks = chunk_wire_envelopes(envelopes);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1_000);
+    }
+
+    #[test]
+    fn chunking_preserves_all_envelopes_in_order() {
+        let envelopes: Vec<_> = (0..2_000)
+            .map(|i| WireEnvelope {
+                event_id: format!("event-{i}"),
+                bytes: vec![b'x'; 64 * 1024],
+            })
+            .collect();
+        let chunks = chunk_wire_envelopes(envelopes);
+        let flattened: Vec<_> = chunks.into_iter().flatten().collect();
+        assert_eq!(flattened.len(), 2_000);
+        for (index, envelope) in flattened.iter().enumerate() {
+            assert_eq!(envelope.event_id, format!("event-{index}"));
+        }
     }
 }

@@ -202,6 +202,10 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT + super::CrdtTxnT {
     /// Remove a file from the tree (removes path↔inode mappings).
     fn del_tree(&mut self, path: &str) -> Result<Option<Inode>, PristineError>;
 
+    /// Remove one inode's path binding without deleting a different inode that
+    /// currently occupies the same single-valued forward path entry.
+    fn del_tree_binding(&mut self, path: &str, inode: Inode) -> Result<(), PristineError>;
+
     /// Store file index entry (mtime + size + content hash) for fast status detection.
     ///
     /// Called after a file is recorded or applied. Subsequent `status()` calls

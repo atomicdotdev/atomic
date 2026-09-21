@@ -83,27 +83,48 @@ impl Repository {
     /// - The view already exists
     /// - The database operation fails
     pub fn create_view(&mut self, name: &str) -> Result<(), RepositoryError> {
-        // Create the workspace directory for this view.
-        ensure_workspace_dir(&self.dot_dir, name)?;
+        self.create_overlay_view(name, None, None)
+    }
 
-        // Create a **Draft** view parented on the nearest Shared
-        // ancestor of the current view.  The change log starts EMPTY —
-        // no changes are inherited automatically.
-        //
-        // The parent link gives the view read-access to the shared
-        // graph content (via the overlay chain) so that `record` can
-        // compute diffs against the existing state.  But no files are
-        // *materialised* on disk until changes are explicitly inserted
-        // into this view (which copies them into the view's change log).
-        //
-        // This means:
-        //   `view new feature`              → empty workspace, no files
-        //   `insert from-view dev feature`  → inherits dev's files
-        //
-        // Using the nearest Shared ancestor (instead of the current
-        // view directly) prevents sibling Draft views from seeing
-        // each other's edges through the overlay chain.
-        let parent_name = self.nearest_shared_ancestor(&self.current_view.clone())?;
+    /// Create one view — the ONLY creation concept atomic has.
+    ///
+    /// A view is a **filter over the global graph**: every change and node a
+    /// view exposes already lives in the graph, and the view merely selects
+    /// which changes it exposes. Creation therefore has exactly two
+    /// parameters:
+    ///
+    /// - `parent_name` — the overlay-chain anchor. Draft views expose their
+    ///   own change-log PLUS the parent's effective set (recursively back to
+    ///   the nearest Shared view). `None` anchors on the nearest Shared
+    ///   ancestor of the current view.
+    /// - `seed_from` — an optional view whose **change-set membership** is
+    ///   copied into the new view's own log. This seeds the filter: the
+    ///   hunks, edges, and nodes already live in the GRAPH — nothing is
+    ///   copied out of it, and no content materializes until the filter says
+    ///   so. Without a seed the log starts empty (the documented
+    ///   create-then-`insert from-view` workflow).
+    ///
+    /// The new view is always a **Draft**. Shared is a *promoted* scope
+    /// (`view promote`), never a creation flag.
+    ///
+    /// `create_view` and `create_view_from` are thin wrappers around this
+    /// single concept.
+    pub fn create_overlay_view(
+        &mut self,
+        name: &str,
+        parent_name: Option<&str>,
+        seed_from: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        // The overlay chain is anchored on the nearest Shared ancestor of the
+        // current view unless a parent is given. Using the nearest SHARED
+        // ancestor (instead of the current view directly) prevents sibling
+        // Draft views from seeing each other's edges through the overlay.
+        let anchor = match parent_name {
+            Some(p) => p.to_string(),
+            None => self.nearest_shared_ancestor(&self.current_view.clone())?,
+        };
+
+        ensure_workspace_dir(&self.dot_dir, name)?;
 
         let mut txn = self
             .pristine
@@ -120,14 +141,58 @@ impl Repository {
             });
         }
 
-        let parent_view = txn
-            .get_view(&parent_name)
+        let anchor_view = txn
+            .get_view(&anchor)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
             .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: parent_name.clone(),
+                name: anchor.clone(),
             })?;
 
-        txn.create_view(name, ViewScope::Draft, Some(parent_view.id))
+        let mut new_view = txn
+            .create_view(name, ViewScope::Draft, Some(anchor_view.id))
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Seed the filter: copy the source view's change-set MEMBERSHIP into
+        // the new view's own log. This does NOT re-insert hunks — the edges
+        // already exist in GRAPH; the new view simply selects them.
+        if let Some(source_name) = seed_from {
+            let source_view = txn
+                .get_view(source_name)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| RepositoryError::ViewNotFound {
+                    name: source_name.to_string(),
+                })?;
+
+            // Collect membership first so the iterator is dropped before the
+            // mutable put_change writes below.
+            let membership: Vec<(NodeId, Hash)> = {
+                let iter = txn
+                    .iter_changes(&source_view, 0)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                let mut seeded: Vec<(NodeId, Hash)> = Vec::new();
+                for item in iter {
+                    let (_seq, node_id, _merkle) =
+                        item.map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    let hash = txn
+                        .get_external(node_id)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?
+                        .ok_or_else(|| {
+                            RepositoryError::Database(format!(
+                                "Change {} has no external hash",
+                                node_id.0
+                            ))
+                        })?;
+                    seeded.push((node_id, hash));
+                }
+                seeded
+            };
+            for (node_id, hash) in membership {
+                txn.put_change(&mut new_view, node_id, &hash)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            }
+        }
+
+        txn.update_view(&new_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         txn.commit()
@@ -326,83 +391,11 @@ impl Repository {
     /// repo.create_view_from("feature", "dev")?;
     /// ```
     pub fn create_view_from(&mut self, name: &str, from_view: &str) -> Result<(), RepositoryError> {
-        let mut txn = self
-            .pristine
-            .write_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Check if the new view already exists
-        if txn
-            .get_view(name)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .is_some()
-        {
-            return Err(RepositoryError::ViewAlreadyExists {
-                name: name.to_string(),
-            });
-        }
-
-        // Get the source view
-        let source_view = txn
-            .get_view(from_view)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: from_view.to_string(),
-            })?;
-
-        let source_id = source_view.id;
-
-        // Collect all changes from the source view
-        let changes: Vec<(NodeId, Hash)> = {
-            let iter = txn
-                .iter_changes(&source_view, 0)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-            let mut result = Vec::new();
-            for item in iter {
-                let (_seq, node_id, _merkle) =
-                    item.map_err(|e| RepositoryError::Database(e.to_string()))?;
-                let hash = txn
-                    .get_external(node_id)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?
-                    .ok_or_else(|| {
-                        RepositoryError::Database(format!(
-                            "Change {} has no external hash",
-                            node_id.0
-                        ))
-                    })?;
-                result.push((node_id, hash));
-            }
-            result
-        };
-
-        // Create the new view as a **Draft** view parented on the
-        // source view.  Draft views write edges to GRAPH like all
-        // views, but use a change filter for isolation. The parent
-        // link means the view chain includes the source's content.
-        // Create workspace directory for the new view.
-        ensure_workspace_dir(&self.dot_dir, name)?;
-
-        let mut new_view = txn
-            .create_view(name, ViewScope::Draft, Some(source_id))
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Copy all changes from the source to the new view's log.
-        // This does NOT re-insert hunks — the edges already exist in
-        // GRAPH. The new view sees them via the change filter.
-        for (node_id, hash) in changes {
-            txn.put_change(&mut new_view, node_id, &hash)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        }
-
-        // Update the view state
-        txn.update_view(&new_view)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        txn.commit()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        Ok(())
+        // Thin wrapper: anchor the new draft on the source AND seed its
+        // change-set membership from the source's visible set. The overlay
+        // never copies content — the edges already live in the graph; the
+        // new view just selects them (see `create_overlay_view`).
+        self.create_overlay_view(name, Some(from_view), Some(from_view))
     }
 
     /// List all views in the repository.

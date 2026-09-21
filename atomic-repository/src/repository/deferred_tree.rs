@@ -1,7 +1,7 @@
 use super::*;
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
 
 const DEFERRED_TREE_JOURNAL: &str = "deferred-tree-ops.json";
@@ -12,29 +12,40 @@ const DEFERRED_TREE_ALIGNMENT_LOCK: &str = "deferred-tree-alignment.lock";
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum DeferredTreeAction {
-    Set { path: String },
+    Set {
+        path: String,
+    },
     Delete,
+    /// Unbind `path` from the inode's desired state — a name-conflict
+    /// resolution that surrenders the name keeps the inode's identity
+    /// (and its REV_TREE claim) while ceasing to occupy the path.
+    UnlinkName {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) struct DeferredTreeOp {
     /// Change whose visibility activates this TREE operation.
-    change: Hash,
+    pub(super) change: Hash,
     /// Stable inode position, stored with an external change hash so the
     /// journal never depends on process-local lookup state.
-    inode: Position<Hash>,
+    pub(super) inode: Position<Hash>,
     /// Path visible before this inode's first journaled operation. Only the
     /// first event for an inode uses this baseline; later events are selected
     /// solely by change visibility.
-    baseline_path: Option<String>,
-    action: DeferredTreeAction,
+    pub(super) baseline_path: Option<String>,
+    pub(super) action: DeferredTreeAction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DeferredTreeJournal {
+pub(super) struct DeferredTreeJournal {
     version: u32,
     #[serde(default)]
     ops: Vec<DeferredTreeOp>,
+    /// Projection-level causal predecessors captured at first ingestion.
+    #[serde(default)]
+    predecessors: HashMap<Hash, Vec<Hash>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,85 +60,115 @@ impl Default for DeferredTreeJournal {
         Self {
             version: DEFERRED_TREE_JOURNAL_VERSION,
             ops: Vec::new(),
+            predecessors: HashMap::new(),
         }
     }
 }
 
 #[derive(Debug, Clone)]
-struct DesiredTreePath {
-    desired_path: Option<String>,
-    /// Journal order of the visible Set that currently claims this path.
-    /// A visible Set outranks an inherited baseline, and later visible Sets
-    /// resolve two view overlays that independently created the same path.
-    last_set_order: Option<usize>,
+struct DesiredTreePaths {
+    paths: BTreeSet<String>,
 }
 
-type DeferredPathClaim = (Position<Hash>, Option<usize>);
-
-fn desired_tree_paths(
+fn desired_tree_paths<F>(
     ops: &[DeferredTreeOp],
+    predecessors: &HashMap<Hash, Vec<Hash>>,
     visible_changes: &HashSet<Hash>,
-) -> HashMap<Position<Hash>, DesiredTreePath> {
-    let mut desired = HashMap::new();
+    mut depends_on: F,
+) -> HashMap<Position<Hash>, DesiredTreePaths>
+where
+    F: FnMut(Hash, Hash) -> bool,
+{
+    let mut baselines: HashMap<Position<Hash>, Option<String>> = HashMap::new();
+    let mut events: HashMap<Position<Hash>, Vec<(usize, &DeferredTreeOp)>> = HashMap::new();
 
     for (order, op) in ops.iter().enumerate() {
-        let state = desired.entry(op.inode).or_insert_with(|| DesiredTreePath {
-            desired_path: op.baseline_path.clone(),
-            last_set_order: None,
+        baselines
+            .entry(op.inode)
+            .or_insert_with(|| op.baseline_path.clone());
+        if visible_changes.contains(&op.change) {
+            events.entry(op.inode).or_default().push((order, op));
+        }
+    }
+
+    let mut desired = HashMap::new();
+    for (inode, baseline) in baselines {
+        let visible = events.remove(&inode).unwrap_or_default();
+        if visible.is_empty() {
+            desired.insert(
+                inode,
+                DesiredTreePaths {
+                    paths: baseline.into_iter().collect(),
+                },
+            );
+            continue;
+        }
+
+        let maximal = visible.iter().filter(|(order, op)| {
+            !visible.iter().any(|(other_order, other)| {
+                (other.change == op.change && other_order > order)
+                    || (other.change != op.change
+                        && (depends_on(other.change, op.change)
+                            || journal_depends_on(predecessors, other.change, op.change)))
+            })
         });
-        if !visible_changes.contains(&op.change) {
-            continue;
-        }
-
-        match &op.action {
-            DeferredTreeAction::Set { path } => {
-                state.desired_path = Some(path.clone());
-                state.last_set_order = Some(order);
-            }
-            DeferredTreeAction::Delete => {
-                state.desired_path = None;
-                state.last_set_order = None;
-            }
-        }
-    }
-
-    // TREE is a one-to-one path↔inode index, while two overlay-visible changes
-    // can independently add the same path. Match the lifecycle order Atomic
-    // established when those changes were recorded/imported: the latest
-    // visible Set owns the path. Baseline-only duplicates remain untouched so
-    // apply_deferred_tree_ops_in_txn still fails closed on corrupt TREE state.
-    let mut claims: HashMap<String, Vec<DeferredPathClaim>> = HashMap::new();
-    for (inode, state) in &desired {
-        if let Some(path) = &state.desired_path {
-            claims
-                .entry(path.clone())
-                .or_default()
-                .push((*inode, state.last_set_order));
-        }
-    }
-    for claimants in claims.into_values().filter(|claimants| claimants.len() > 1) {
-        let Some(max_order) = claimants.iter().filter_map(|(_, order)| *order).max() else {
-            continue;
-        };
-        if claimants
-            .iter()
-            .filter(|(_, order)| *order == Some(max_order))
-            .count()
-            != 1
-        {
-            continue;
-        }
-        for (inode, order) in claimants {
-            if order != Some(max_order) {
-                desired
-                    .get_mut(&inode)
-                    .expect("claimant exists")
-                    .desired_path = None;
-            }
-        }
+        let paths = maximal
+            .filter_map(|(_, op)| match &op.action {
+                DeferredTreeAction::Set { path } => Some(path.clone()),
+                DeferredTreeAction::Delete => None,
+                DeferredTreeAction::UnlinkName { .. } => None,
+            })
+            .collect();
+        desired.insert(inode, DesiredTreePaths { paths });
     }
 
     desired
+}
+
+fn journal_depends_on(
+    predecessors: &HashMap<Hash, Vec<Hash>>,
+    change: Hash,
+    ancestor: Hash,
+) -> bool {
+    let mut pending = vec![change];
+    let mut visited = HashSet::new();
+    while let Some(hash) = pending.pop() {
+        if !visited.insert(hash) {
+            continue;
+        }
+        let Some(direct) = predecessors.get(&hash) else {
+            continue;
+        };
+        if direct.contains(&ancestor) {
+            return true;
+        }
+        pending.extend(direct.iter().copied());
+    }
+    false
+}
+
+fn change_depends_on<T: GraphTxnT>(txn: &T, change: Hash, ancestor: Hash) -> bool {
+    if change == ancestor {
+        return false;
+    }
+    let mut pending = vec![change];
+    let mut visited = HashSet::new();
+    while let Some(hash) = pending.pop() {
+        if !visited.insert(hash) {
+            continue;
+        }
+        let Ok(Some(id)) = txn.get_internal(&hash) else {
+            continue;
+        };
+        let Ok(deps) = txn.get_change_deps(id) else {
+            continue;
+        };
+        if deps.contains(&ancestor) {
+            return true;
+        }
+        pending.extend(deps);
+    }
+    false
 }
 
 fn external_inode_position<T: GraphTxnT + TreeTxnT>(
@@ -160,25 +201,6 @@ fn push_unique(ops: &mut Vec<DeferredTreeOp>, op: DeferredTreeOp) {
     }
 }
 
-fn remember_op_paths(op: &DeferredTreeOp, paths: &mut HashSet<String>) {
-    if let Some(path) = &op.baseline_path {
-        paths.insert(path.clone());
-    }
-    if let DeferredTreeAction::Set { path } = &op.action {
-        paths.insert(path.clone());
-    }
-}
-
-fn op_touches_paths(op: &DeferredTreeOp, paths: &HashSet<String>) -> bool {
-    op.baseline_path
-        .as_ref()
-        .is_some_and(|path| paths.contains(path))
-        || matches!(
-            &op.action,
-            DeferredTreeAction::Set { path } if paths.contains(path)
-        )
-}
-
 fn external_position(
     change_hash: Hash,
     position: Position<Option<Hash>>,
@@ -209,37 +231,6 @@ fn current_path_for_position<T: GraphTxnT + TreeTxnT>(
     };
     txn.get_path(inode)
         .map_err(|e| RepositoryError::Database(e.to_string()))
-}
-
-fn inode_is_visible_on_another_view<T: GraphTxnT + TreeTxnT + ViewTxnT>(
-    txn: &T,
-    position: Position<Hash>,
-    current_view: &str,
-) -> Result<bool, RepositoryError> {
-    let Some(internal_change) = txn
-        .get_internal(&position.change)
-        .map_err(|e| RepositoryError::Database(e.to_string()))?
-    else {
-        return Ok(false);
-    };
-    for name in txn
-        .list_views()
-        .map_err(|e| RepositoryError::Database(e.to_string()))?
-    {
-        if name == current_view {
-            continue;
-        }
-        let Some(view) = txn
-            .get_view(&name)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-        else {
-            continue;
-        };
-        if collect_visible_change_ids(txn, &view)?.contains(&internal_change) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn push_delete_for_path<T: GraphTxnT + TreeTxnT>(
@@ -286,6 +277,7 @@ fn push_occupant_baseline<T: GraphTxnT + TreeTxnT>(
     if Some(position) == exclude {
         return Ok(());
     }
+
     push_unique(
         ops,
         DeferredTreeOp {
@@ -351,6 +343,24 @@ pub(super) fn collect_tree_ops<T: GraphTxnT + TreeTxnT>(
                 // deferred rename for views where it is visible.
                 push_unique(&mut ops, op);
             }
+            GraphOp::SolveNameConflict { name, path } => {
+                if let Some(inode) = external_position(change_hash, name.inode) {
+                    push_unique(
+                        &mut ops,
+                        DeferredTreeOp {
+                            change: change_hash,
+                            inode,
+                            baseline_path: current_path_for_position(txn, inode)?
+                                .or_else(|| Some(path.clone())),
+                            action: if name.edges.is_empty() {
+                                DeferredTreeAction::Set { path: path.clone() }
+                            } else {
+                                DeferredTreeAction::UnlinkName { path: path.clone() }
+                            },
+                        },
+                    );
+                }
+            }
             GraphOp::FileDel { del, path, .. } | GraphOp::DirDel { del, path } => {
                 if let Some(inode) = external_position(change_hash, del.inode) {
                     push_unique(
@@ -403,12 +413,48 @@ pub(super) fn collect_tree_ops<T: GraphTxnT + TreeTxnT>(
     Ok(ops)
 }
 
+/// Materialize explicit name selections into TREE using stable graph identity.
+/// Recording and cross-view insertion share this operation; no content is copied.
+pub(super) fn apply_name_selections<T: MutTxnT>(
+    txn: &mut T,
+    change_id: NodeId,
+    change: &Change,
+) -> Result<(), RepositoryError> {
+    for op in change.hunks() {
+        let GraphOp::SolveNameConflict { name, path } = op else {
+            continue;
+        };
+        if !name.edges.is_empty() {
+            continue;
+        }
+        let unresolved = || RepositoryError::InvalidOperation {
+            message: format!("cannot resolve retained identity for {path}: name conflict"),
+        };
+        let inode_change = match name.inode.change {
+            Some(hash) => txn
+                .get_internal(&hash)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(unresolved)?,
+            None => change_id,
+        };
+        let inode = txn
+            .position_inode(Position::new(inode_change, name.inode.pos))
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(unresolved)?;
+        txn.put_tree(path, inode)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    }
+    Ok(())
+}
+
 impl Repository {
     fn deferred_tree_journal_path(&self) -> PathBuf {
         self.dot_dir.join(DEFERRED_TREE_JOURNAL)
     }
 
-    fn load_deferred_tree_journal(&self) -> Result<DeferredTreeJournal, RepositoryError> {
+    pub(super) fn load_deferred_tree_journal(
+        &self,
+    ) -> Result<DeferredTreeJournal, RepositoryError> {
         let path = self.deferred_tree_journal_path();
         if !path.is_file() {
             return Ok(DeferredTreeJournal::default());
@@ -425,12 +471,11 @@ impl Repository {
 
     /// Persist deferred operations atomically. The caller holds pristine's
     /// write transaction, which serializes journal writers across processes.
-    pub(super) fn append_deferred_tree_ops<T: GraphTxnT + TreeTxnT + ViewTxnT>(
+    pub(super) fn append_deferred_tree_ops<T: GraphTxnT + ViewTxnT>(
         &self,
         txn: &T,
         ops: &[DeferredTreeOp],
         current_view: &str,
-        include_new_inodes: bool,
     ) -> Result<(), RepositoryError> {
         if ops.is_empty() {
             return Ok(());
@@ -438,35 +483,21 @@ impl Repository {
 
         let mut journal = self.load_deferred_tree_journal()?;
         let mut changed = false;
-        let mut shared_creators = HashMap::new();
-        let tracked_inodes: HashSet<Position<Hash>> =
-            journal.ops.iter().map(|op| op.inode).collect();
-        let mut tracked_paths = HashSet::new();
-        for op in &journal.ops {
-            remember_op_paths(op, &mut tracked_paths);
-        }
-        let mut batch_participates = include_new_inodes;
-        if !batch_participates {
-            for op in ops {
-                let inode_is_tracked = tracked_inodes.contains(&op.inode);
-                let path_is_tracked = op_touches_paths(op, &tracked_paths);
-                let inode_is_shared = if inode_is_tracked || path_is_tracked {
-                    false
-                } else if let Some(shared) = shared_creators.get(&op.inode.change) {
-                    *shared
-                } else {
-                    let shared = inode_is_visible_on_another_view(txn, op.inode, current_view)?;
-                    shared_creators.insert(op.inode.change, shared);
-                    shared
-                };
-                if inode_is_tracked || path_is_tracked || inode_is_shared {
-                    batch_participates = true;
-                    break;
-                }
+        let view = txn
+            .get_view(current_view)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: current_view.to_string(),
+            })?;
+        let visible_ids = collect_visible_change_ids(txn, &view)?;
+        let mut visible_hashes = HashSet::with_capacity(visible_ids.len());
+        for id in visible_ids {
+            if let Some(hash) = txn
+                .get_external(id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                visible_hashes.insert(hash);
             }
-        }
-        if !batch_participates {
-            return Ok(());
         }
 
         // A Change is Atomic's visibility unit. Once one path operation joins
@@ -474,6 +505,25 @@ impl Repository {
         // otherwise a rename encoded as tracked-delete + new-inode-add would
         // lose its destination half during replay.
         for op in ops {
+            if matches!(op.action, DeferredTreeAction::Set { .. }) {
+                let mut predecessors: Vec<Hash> = journal
+                    .ops
+                    .iter()
+                    .filter(|existing| {
+                        existing.inode == op.inode
+                            && existing.change != op.change
+                            && visible_hashes.contains(&existing.change)
+                            && matches!(existing.action, DeferredTreeAction::Set { .. })
+                    })
+                    .map(|existing| existing.change)
+                    .collect();
+                predecessors.sort();
+                predecessors.dedup();
+                if journal.predecessors.get(&op.change) != Some(&predecessors) {
+                    journal.predecessors.insert(op.change, predecessors);
+                    changed = true;
+                }
+            }
             if let Some(existing) = journal.ops.iter_mut().find(|existing| {
                 existing.change == op.change
                     && existing.inode == op.inode
@@ -564,7 +614,7 @@ impl Repository {
         Ok(lock)
     }
 
-    fn clear_deferred_tree_alignment_pending(&self) -> Result<(), RepositoryError> {
+    pub(super) fn clear_deferred_tree_alignment_pending(&self) -> Result<(), RepositoryError> {
         match std::fs::remove_file(self.deferred_tree_alignment_pending_path()) {
             Ok(()) => self.sync_dot_dir(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -576,7 +626,7 @@ impl Repository {
         self.deferred_tree_alignment_pending_path().is_file()
     }
 
-    fn apply_deferred_tree_ops_in_txn(
+    pub(super) fn apply_deferred_tree_ops_in_txn(
         &self,
         txn: &mut atomic_core::pristine::WriteTxn<'_>,
         journal: &DeferredTreeJournal,
@@ -599,8 +649,21 @@ impl Repository {
             }
         }
 
-        let desired = desired_tree_paths(&journal.ops, &visible_hashes);
-        let mut updates = Vec::new();
+        let desired = desired_tree_paths(
+            &journal.ops,
+            &journal.predecessors,
+            &visible_hashes,
+            |change, ancestor| change_depends_on(&*txn, change, ancestor),
+        );
+        let mut current_paths: HashMap<Inode, Vec<String>> = HashMap::new();
+        for entry in txn
+            .iter_tree()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            let (path, inode) = entry.map_err(|e| RepositoryError::Database(e.to_string()))?;
+            current_paths.entry(inode).or_default().push(path);
+        }
+        let mut bindings = Vec::new();
         let mut affected_paths = HashSet::new();
         for (external_position, state) in desired {
             let Some(internal_change) = txn
@@ -615,57 +678,48 @@ impl Repository {
             else {
                 continue;
             };
-            let current_path = txn
-                .get_path(inode)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            if current_path == state.desired_path {
-                continue;
-            }
-            if let Some(path) = &current_path {
-                affected_paths.insert(path.clone());
-            }
-            if let Some(path) = &state.desired_path {
-                affected_paths.insert(path.clone());
-            }
-            updates.push((inode, current_path, state.desired_path));
+            let current = current_paths.remove(&inode).unwrap_or_default();
+            affected_paths.extend(current.iter().cloned());
+            affected_paths.extend(state.paths.iter().cloned());
+            bindings.push((external_position, inode, current, state.paths));
         }
 
-        // Remove all stale sources first so rename chains and swaps are safe.
-        for (_, current_path, _) in &updates {
-            if let Some(path) = current_path {
-                txn.del_tree(path)
+        // Remove each inode's own reverse claim and only remove the forward
+        // entry when that inode is its current occupant. Deleting by path alone
+        // can unbind a different same-name inode.
+        for (_, inode, current_paths, _) in &bindings {
+            for path in current_paths {
+                txn.del_tree_binding(path, *inode)
                     .map_err(|e| RepositoryError::Database(e.to_string()))?;
             }
         }
 
-        // Never overwrite an unrelated destination: put_tree would update
-        // TREE but leave the old occupant's REV_TREE entry stale.
-        for (inode, _, desired_path) in &updates {
-            let Some(path) = desired_path else {
-                continue;
-            };
-            if let Some(occupant) = txn
-                .get_inode(path)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?
-            {
-                if occupant != *inode {
-                    return Err(RepositoryError::InvalidOperation {
-                        message: format!(
-                            "cannot replay deferred path to '{}': path is owned by another inode",
-                            path
-                        ),
-                    });
-                }
-            }
-        }
-
-        for (inode, _, desired_path) in updates {
-            if let Some(path) = desired_path {
+        // A path may have multiple visible inode claims. Reinsert all of them
+        // in stable identity order: TREE retains one deterministic lookup
+        // occupant while REV_TREE preserves every claim for conflict detection.
+        bindings.sort_by_key(|(position, _, _, _)| *position);
+        for (_, inode, _, desired_paths) in bindings {
+            for path in desired_paths {
                 txn.put_tree(&path, inode)
                     .map_err(|e| RepositoryError::Database(e.to_string()))?;
             }
         }
         Ok(affected_paths)
+    }
+
+    pub(super) fn refresh_deferred_tree_projection(
+        &self,
+        view_name: &str,
+    ) -> Result<HashSet<String>, RepositoryError> {
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let journal = self.load_deferred_tree_journal()?;
+        let affected = self.apply_deferred_tree_ops_in_txn(&mut txn, &journal, view_name)?;
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(affected)
     }
 
     /// Recover a switch interrupted between TREE alignment and publishing the
@@ -684,6 +738,11 @@ impl Repository {
             return Ok(());
         }
         let pending = self.load_deferred_tree_alignment_pending()?;
+        // Capture both view path sets before restoring the source projection;
+        // TREE is a selected-view index and target-only paths may no longer be
+        // discoverable after alignment.
+        let source_files = self.visible_file_paths(&pending.source_view)?;
+        let target_files = self.visible_file_paths(&pending.target_view)?;
         let mut txn = self
             .pristine
             .write_txn()
@@ -693,7 +752,23 @@ impl Repository {
         self.write_current_view(&pending.source_view)?;
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        self.current_view = pending.source_view;
+        self.current_view = pending.source_view.clone();
+
+        // The marker spans filesystem materialization as well as TREE/pointer
+        // publication. Remove any target-only tracked files that may have been
+        // written before interruption, then reconstruct the source view. If
+        // either step fails, retain the marker for the next writable open.
+        for path in target_files.difference(&source_files) {
+            let abs = self.root.join(path);
+            if abs.is_file() {
+                std::fs::remove_file(&abs)?;
+            }
+        }
+        self.materialize()?;
+        let source_workspace = workspace_path(&self.dot_dir, &pending.source_view);
+        if source_workspace.is_dir() {
+            self.restore_workspace_to_working_copy(&source_workspace);
+        }
         self.clear_deferred_tree_alignment_pending()?;
         Ok(())
     }
@@ -705,6 +780,7 @@ impl Repository {
     pub(super) fn align_deferred_tree_and_publish_view(
         &mut self,
         view_name: &str,
+        retain_marker_for_materialization: bool,
     ) -> Result<HashSet<String>, RepositoryError> {
         let _alignment_lock = self.lock_deferred_tree_alignment()?;
         // `current_view` can intentionally be scoped to a background target
@@ -746,10 +822,9 @@ impl Repository {
         }
 
         self.current_view = view_name.to_string();
-        // Clearing the marker is the commit point for this recoverable
-        // transition. Propagate cleanup or directory-sync failures so a switch
-        // is never reported durable while recovery may still roll it back.
-        self.clear_deferred_tree_alignment_pending()?;
+        if !retain_marker_for_materialization {
+            self.clear_deferred_tree_alignment_pending()?;
+        }
         Ok(affected_paths)
     }
 }
@@ -787,12 +862,14 @@ mod tests {
             },
         ];
 
-        let base = desired_tree_paths(&ops, &HashSet::new());
-        assert_eq!(base[&inode].desired_path.as_deref(), Some("a.txt"));
+        let base = desired_tree_paths(&ops, &HashMap::new(), &HashSet::new(), |_, _| false);
+        assert_eq!(base[&inode].paths, BTreeSet::from(["a.txt".into()]));
 
         let visible = HashSet::from([first, second]);
-        let moved = desired_tree_paths(&ops, &visible);
-        assert_eq!(moved[&inode].desired_path.as_deref(), Some("c.txt"));
+        let moved = desired_tree_paths(&ops, &HashMap::new(), &visible, |change, ancestor| {
+            change == second && ancestor == first
+        });
+        assert_eq!(moved[&inode].paths, BTreeSet::from(["c.txt".into()]));
     }
 
     #[test]
@@ -817,8 +894,13 @@ mod tests {
             },
         ];
 
-        let desired = desired_tree_paths(&ops, &HashSet::from([moved, deleted]));
-        assert_eq!(desired[&inode].desired_path, None);
+        let desired = desired_tree_paths(
+            &ops,
+            &HashMap::new(),
+            &HashSet::from([moved, deleted]),
+            |change, ancestor| change == deleted && ancestor == moved,
+        );
+        assert!(desired[&inode].paths.is_empty());
     }
 
     #[test]
@@ -847,15 +929,59 @@ mod tests {
             },
         ];
 
-        let source = desired_tree_paths(&ops, &HashSet::from([foreground]));
-        assert_eq!(source[&inode].desired_path.as_deref(), Some("source.txt"));
+        let source = desired_tree_paths(
+            &ops,
+            &HashMap::new(),
+            &HashSet::from([foreground]),
+            |_, _| false,
+        );
+        assert_eq!(source[&inode].paths, BTreeSet::from(["source.txt".into()]));
 
-        let target = desired_tree_paths(&ops, &HashSet::from([deferred]));
-        assert_eq!(target[&inode].desired_path.as_deref(), Some("target.txt"));
+        let target =
+            desired_tree_paths(&ops, &HashMap::new(), &HashSet::from([deferred]), |_, _| {
+                false
+            });
+        assert_eq!(target[&inode].paths, BTreeSet::from(["target.txt".into()]));
     }
 
     #[test]
-    fn planner_chooses_latest_visible_inode_for_same_path() {
+    fn planner_preserves_concurrent_rename_destinations_for_same_inode() {
+        let inode = Position::new(hash("creator"), ChangePosition::new(13));
+        let left = hash("rename-left");
+        let right = hash("rename-right");
+        let ops = vec![
+            DeferredTreeOp {
+                change: left,
+                inode,
+                baseline_path: Some("original.txt".into()),
+                action: DeferredTreeAction::Set {
+                    path: "left.txt".into(),
+                },
+            },
+            DeferredTreeOp {
+                change: right,
+                inode,
+                baseline_path: Some("original.txt".into()),
+                action: DeferredTreeAction::Set {
+                    path: "right.txt".into(),
+                },
+            },
+        ];
+
+        let desired = desired_tree_paths(
+            &ops,
+            &HashMap::new(),
+            &HashSet::from([left, right]),
+            |_, _| false,
+        );
+        assert_eq!(
+            desired[&inode].paths,
+            BTreeSet::from(["left.txt".into(), "right.txt".into()])
+        );
+    }
+
+    #[test]
+    fn planner_preserves_all_visible_inodes_for_same_path() {
         let target_inode = Position::new(hash("target-creator"), ChangePosition::new(3));
         let source_inode = Position::new(hash("source-creator"), ChangePosition::new(5));
         let target_add = hash("target-add");
@@ -879,18 +1005,31 @@ mod tests {
             },
         ];
 
-        let target = desired_tree_paths(&ops, &HashSet::from([target_add]));
-        assert_eq!(
-            target[&target_inode].desired_path.as_deref(),
-            Some("same.txt")
+        let target = desired_tree_paths(
+            &ops,
+            &HashMap::new(),
+            &HashSet::from([target_add]),
+            |_, _| false,
         );
-        assert_eq!(target[&source_inode].desired_path, None);
-
-        let overlay = desired_tree_paths(&ops, &HashSet::from([target_add, source_add]));
-        assert_eq!(overlay[&target_inode].desired_path, None);
         assert_eq!(
-            overlay[&source_inode].desired_path.as_deref(),
-            Some("same.txt")
+            target[&target_inode].paths,
+            BTreeSet::from(["same.txt".into()])
+        );
+        assert!(target[&source_inode].paths.is_empty());
+
+        let overlay = desired_tree_paths(
+            &ops,
+            &HashMap::new(),
+            &HashSet::from([target_add, source_add]),
+            |_, _| false,
+        );
+        assert_eq!(
+            overlay[&target_inode].paths,
+            BTreeSet::from(["same.txt".into()])
+        );
+        assert_eq!(
+            overlay[&source_inode].paths,
+            BTreeSet::from(["same.txt".into()])
         );
     }
 }

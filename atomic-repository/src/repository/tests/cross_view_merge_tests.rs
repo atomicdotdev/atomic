@@ -891,3 +891,32 @@ fn test_cross_view_merge_post_merge_record_clean() {
         content
     );
 }
+
+/// Selecting an already-ambient change expands the target closure without
+/// appending projection-derived lifecycle operations.
+#[test]
+fn cross_view_insert_does_not_append_deferred_tree_ops() {
+    let (temp_dir, mut repo) = create_temp_repo();
+
+    repo.create_view_from("earlier", "dev").unwrap();
+    repo.switch_view("earlier").unwrap();
+    let file = temp_dir.path().join("f.txt");
+    std::fs::write(&file, "generation one\n").unwrap();
+    repo.add("f.txt", TrackingOptions::default()).unwrap();
+    record_all(&repo, "generation one");
+
+    repo.switch_view("dev").unwrap();
+    repo.create_view_from("target", "dev").unwrap();
+    repo.switch_view("target").unwrap();
+    std::fs::write(&file, "generation two\n").unwrap();
+    repo.add("f.txt", TrackingOptions::default()).unwrap();
+    record_all(&repo, "generation two");
+
+    let journal = repo.dot_dir.join("deferred-tree-ops.json");
+    let before = std::fs::read(&journal).unwrap();
+    repo.insert_from_view(CrossViewInsertOptions::new("earlier", "target"))
+        .unwrap();
+    let after = std::fs::read(&journal).unwrap();
+
+    assert_eq!(after, before, "insert must consume canonical lifecycle metadata without appending target-specific operations");
+}

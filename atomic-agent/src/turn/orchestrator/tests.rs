@@ -248,6 +248,52 @@ async fn test_session_start_resumes_ended_session() {
 }
 
 #[tokio::test]
+async fn test_session_start_renegotiates_stale_explicit_files_mode() {
+    let dir = TempDir::new().unwrap();
+    let mut orch = make_orchestrator(&dir);
+
+    // A session created under the old explicit-files plugin persists the
+    // scoped-recording requirement across restarts.
+    let mut session = AgentSession::new("sess-legacy", "opencode", "OpenCode");
+    session.explicit_record_files = true;
+    orch.session_store.save(&session).unwrap();
+
+    // A newer plugin declares no recording_scope on session-start; the
+    // session must follow it instead of refusing every future Stop.
+    orch.dispatch(session_start_event("sess-legacy"))
+        .await
+        .unwrap();
+
+    let session = orch.session_store.load("sess-legacy").unwrap().unwrap();
+    assert!(!session.explicit_record_files);
+}
+
+#[tokio::test]
+async fn test_session_start_keeps_explicit_files_when_declared() {
+    let dir = TempDir::new().unwrap();
+    let mut orch = make_orchestrator(&dir);
+
+    let event = TurnEvent::new("sess-scoped", HookType::SessionStart)
+        .with_raw_json(serde_json::json!({"recording_scope": "explicit-files-v1"}));
+    orch.dispatch(event).await.unwrap();
+
+    let session = orch.session_store.load("sess-scoped").unwrap().unwrap();
+    assert!(session.explicit_record_files);
+}
+
+#[tokio::test]
+async fn test_session_start_refuses_unknown_recording_scope() {
+    let dir = TempDir::new().unwrap();
+    let mut orch = make_orchestrator(&dir);
+
+    let event = TurnEvent::new("sess-unknown", HookType::SessionStart)
+        .with_raw_json(serde_json::json!({"recording_scope": "explicit-files-v9"}));
+    assert!(orch.dispatch(event).await.is_err());
+    // The refused session must not be persisted in a half-negotiated state.
+    assert!(orch.session_store.load("sess-unknown").unwrap().is_none());
+}
+
+#[tokio::test]
 async fn test_session_start_in_sandbox_adopts_view_without_forking() {
     // Canonical repository with a distinct view the sandbox operates on.
     let canonical = TempDir::new().unwrap();

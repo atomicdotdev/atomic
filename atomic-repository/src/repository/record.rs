@@ -324,6 +324,64 @@ impl Repository {
         let shared_cached_txn =
             CachedGraphTxn::new(&shared_txn).map_err(|e| RecordError::Database(e.to_string()))?;
 
+        // TREE selects just one inode per path. Recover competing live
+        // identities exactly as materialization does before diffing that inode.
+        let selected_paths: HashSet<&str> = files_to_record
+            .iter()
+            .filter_map(|e| e.path().to_str())
+            .collect();
+        let name_conflicts = super::materialize::collect_name_conflicts(
+            &shared_txn,
+            &self.change_store,
+            &selected_paths,
+            &shared_change_filter,
+        )?;
+
+        // A namespace conflict has several legitimate identities. TREE's
+        // occupant is an index artifact, not a choice of which file to keep.
+        // Prefer an identity whose bytes match the user's resolution. Break
+        // ties (including newly edited content) by external graph identity,
+        // never repository-local allocation or cross-view index update order.
+        let mut selected_name_inodes = std::collections::HashMap::new();
+        for entry in &files_to_record {
+            if entry.status() != FileStatus::Modified {
+                continue;
+            }
+            let path = entry.path().to_string_lossy();
+            let Some(sides) = name_conflicts.get(path.as_ref()) else {
+                continue;
+            };
+            let working = std::fs::read(self.root.join(path.as_ref())).map_err(|e| {
+                RecordError::Database(format!("cannot resolve name conflict for {path}: {e}"))
+            })?;
+            let mut candidates = Vec::new();
+            for &(inode, position) in sides {
+                let options = atomic_core::output::RetrieveOptions::new()
+                    .with_change_filter(shared_change_filter.clone());
+                let (content, _) = retrieve_content_with_filter_fast_with_fork_info(
+                    &shared_cached_txn,
+                    &self.change_store,
+                    inode,
+                    position,
+                    options,
+                )
+                .map_err(|e| {
+                    RecordError::Database(format!("cannot resolve name conflict for {path}: {e}"))
+                })?;
+                let hash = shared_txn
+                    .get_external(position.change)
+                    .map_err(|e| RecordError::Database(e.to_string()))?
+                    .ok_or_else(|| {
+                        RecordError::Database(format!("{path}: missing identity hash"))
+                    })?;
+                candidates.push(((content != working, hash, position.pos), (inode, position)));
+            }
+            candidates.sort_by_key(|(key, _)| *key);
+            if let Some((_, identity)) = candidates.first() {
+                selected_name_inodes.insert(path.into_owned(), *identity);
+            }
+        }
+
         if trace_record {
             eprintln!(
                 "[record] change filter: {} visible changes",
@@ -630,7 +688,8 @@ impl Repository {
         let par_results: Vec<ModifiedResult> = modified_work
             .par_iter()
             .map(|(path, _full_path, _)| {
-                let (file_inode, file_position) = match get_inode_position(&shared_txn, path) {
+                let (file_inode, file_position) = match selected_name_inodes.get(path).copied()
+                    .map(Ok).unwrap_or_else(|| get_inode_position(&shared_txn, path)) {
                     Ok(v) => v,
                     Err(e) => return ModifiedResult::Error(path.clone(), e),
                 };
@@ -771,6 +830,70 @@ impl Repository {
 
         // Merge parallel results back into sequential state
         for result in par_results {
+            let resolved_path = match &result {
+                ModifiedResult::Recorded(path, _) | ModifiedResult::Skipped(path) => Some(path),
+                ModifiedResult::Error(path, msg) if name_conflicts.contains_key(path) => {
+                    return Err(RecordError::Database(format!(
+                        "cannot resolve recorded baseline for {path}: name conflict: {msg}"
+                    )));
+                }
+                _ => None,
+            };
+            let mut resolved_name = false;
+            if let Some(path) = resolved_path.filter(|path| {
+                // --allow-conflict-markers records literal marker bytes; it
+                // must not implicitly choose a winner for the name conflict.
+                !options.get_allow_conflict_markers()
+                    || std::fs::read(self.root.join(path))
+                        .map(|bytes| {
+                            super::materialize::first_conflict_marker_line(&bytes).is_none()
+                        })
+                        .unwrap_or(false)
+            }) {
+                if let Some(sides) = name_conflicts.get(path) {
+                    use atomic_core::crdt::tables::decode_trunk_id;
+                    use atomic_core::pristine::CrdtTxnT;
+                    let (retained, retained_position) = selected_name_inodes[path];
+                    if !sides.iter().any(|(inode, _)| *inode == retained) {
+                        return Err(RecordError::Database(format!(
+                            "cannot resolve recorded baseline for {path}: selected identity is not visible in the name conflict"
+                        )));
+                    }
+                    for &(inode, position) in sides {
+                        if inode == retained {
+                            continue;
+                        }
+                        let bindings = super::materialize::live_names_for_path(
+                            &shared_txn,
+                            &self.change_store,
+                            position,
+                            path,
+                            &shared_change_filter,
+                        )?;
+                        let mut unlinked = RecordedFile::new(path);
+                        unlinked.set_inode(inode);
+                        unlinked.set_position(position);
+                        unlinked.set_name_conflict_resolution(retained_position, bindings);
+                        // Namespace resolution preserves the semantic trunk,
+                        // branches, and tokens. It is not a file deletion.
+                        if let Some(key) = shared_txn
+                            .get_crdt_inode_trunk(inode.get())
+                            .map_err(|e| RecordError::Database(e.to_string()))?
+                        {
+                            let trunk = decode_trunk_id(&key);
+                            unlinked.set_crdt_ops(atomic_core::change::FileOps::new(
+                                trunk,
+                                path.clone(),
+                                None,
+                            ));
+                        }
+                        stats.hunks_created += 2; // identity selection + namespace unlink
+                        stats.edges_modified += 1;
+                        recorded_files.push(unlinked);
+                    }
+                    resolved_name = true;
+                }
+            }
             match result {
                 ModifiedResult::Recorded(path, recorded) => {
                     stats.files_recorded += 1;
@@ -795,8 +918,13 @@ impl Repository {
                     recorded_files.push(*recorded);
                 }
                 ModifiedResult::Skipped(path) => {
-                    skipped_paths.push(path);
-                    stats.files_skipped += 1;
+                    if resolved_name {
+                        recorded_paths.push(path);
+                        stats.files_recorded += 1;
+                    } else {
+                        skipped_paths.push(path);
+                        stats.files_skipped += 1;
+                    }
                 }
                 ModifiedResult::Error(path, msg) => {
                     errors.push((path, msg));
@@ -816,6 +944,15 @@ impl Repository {
 
         // Check if we actually recorded anything
         if recorded_files.is_empty() {
+            if !errors.is_empty() {
+                return Err(RecordError::Database(
+                    errors
+                        .iter()
+                        .map(|(path, error)| format!("cannot record {path}: {error}"))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ));
+            }
             return Err(RecordError::NothingToRecord);
         }
 

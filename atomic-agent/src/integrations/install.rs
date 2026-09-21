@@ -1097,8 +1097,7 @@ dst = "{0}/skills/atomic-vault/SKILL.md"
         let pkg = tempfile::tempdir().unwrap();
         std::fs::write(
             pkg.path().join(MANIFEST_FILE),
-            format!(
-                r#"
+            r#"
 schema = 1
 agent = "repo-file-test"
 version = "1.0.0"
@@ -1110,7 +1109,6 @@ package = "atomic-skills"
 src = "AGENTS.md"
 dst = "AGENTS.md"
 "#,
-            ),
         )
         .unwrap();
 

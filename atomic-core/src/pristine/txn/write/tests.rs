@@ -287,6 +287,25 @@ mod tests {
     }
 
     #[test]
+    fn test_del_tree_binding_preserves_other_same_path_occupant() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+        let pristine = Pristine::open(&db_path).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+
+        let first = txn.alloc_inode().unwrap();
+        let second = txn.alloc_inode().unwrap();
+        txn.put_tree("same.txt", first).unwrap();
+        txn.put_tree("same.txt", second).unwrap();
+
+        txn.del_tree_binding("same.txt", first).unwrap();
+
+        assert_eq!(txn.get_inode("same.txt").unwrap(), Some(second));
+        assert_eq!(txn.get_path(first).unwrap(), None);
+        assert_eq!(txn.get_path(second).unwrap().as_deref(), Some("same.txt"));
+    }
+
+    #[test]
     fn test_graph_operations() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("pristine");

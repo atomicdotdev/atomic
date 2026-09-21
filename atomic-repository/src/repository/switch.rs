@@ -97,7 +97,7 @@ impl Repository {
         // Apply only the small set of view-scoped TREE operations and publish
         // the new pointer while holding the same database write lock. A marker
         // makes the transition recoverable if the process exits mid-switch.
-        let deferred_paths = self.align_deferred_tree_and_publish_view(view)?;
+        let deferred_paths = self.align_deferred_tree_and_publish_view(view, true)?;
 
         // Compute files visible on the NEW view.
         let new_files = self.visible_file_paths(view)?;
@@ -223,6 +223,12 @@ impl Repository {
             .chain(ignored_paths.iter().map(|s| s.as_str()));
         cleanup_empty_ancestors(&self.root, all_removed);
 
+        if std::env::var_os("ATOMIC_TEST_FAIL_SWITCH_AFTER_PUBLISH").is_some() {
+            return Err(RepositoryError::InvalidOperation {
+                message: "injected switch failure after view publication".to_string(),
+            });
+        }
+
         // ── Phase 4: Materialize the new view's tracked files from graph ─
         //
         // Instead of materializing ALL files, compute which files differ
@@ -287,6 +293,12 @@ impl Repository {
             }
         };
 
+        if std::env::var_os("ATOMIC_TEST_FAIL_SWITCH_AFTER_MATERIALIZE").is_some() {
+            return Err(RepositoryError::InvalidOperation {
+                message: "injected switch failure after materialization".to_string(),
+            });
+        }
+
         // ── Phase 5: Restore ignored files from the NEW view's workspace ─
         //
         // Move artifacts from `.atomic/workspaces/<new_view>/` back into
@@ -296,6 +308,7 @@ impl Repository {
             self.restore_workspace_to_working_copy(&new_ws);
         }
 
+        self.clear_deferred_tree_alignment_pending()?;
         Ok(result)
     }
 
@@ -304,7 +317,7 @@ impl Repository {
     /// Walks the top-level entries in `ws_dir` and moves each into the
     /// project root via `rename()`.  Skips the `.atomic` directory if
     /// present.
-    fn restore_workspace_to_working_copy(&self, ws_dir: &Path) {
+    pub(super) fn restore_workspace_to_working_copy(&self, ws_dir: &Path) {
         let entries = match std::fs::read_dir(ws_dir) {
             Ok(e) => e,
             Err(_) => return,

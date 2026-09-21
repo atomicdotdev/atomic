@@ -668,6 +668,14 @@ pub(crate) fn is_file_alive_via_retrieval<T: GraphTxnT>(
     position: Position<NodeId>,
     visible_changes: &HashSet<NodeId>,
 ) -> bool {
+    try_is_file_alive_via_retrieval(txn, position, visible_changes).unwrap_or(false)
+}
+
+pub(crate) fn try_is_file_alive_via_retrieval<T: GraphTxnT>(
+    txn: &T,
+    position: Position<NodeId>,
+    visible_changes: &HashSet<NodeId>,
+) -> Result<bool, atomic_core::pristine::PristineError> {
     use atomic_core::output::alive::RetrieveOptions;
 
     let inode_node = position.inode_node();
@@ -676,14 +684,7 @@ pub(crate) fn is_file_alive_via_retrieval<T: GraphTxnT>(
     // Check forward edges from the inode vertex.  If any destination
     // content vertex is alive (per the full supersession logic), the
     // file has live content.
-    let edges = match txn.iter_forward(inode_node, false) {
-        Ok(edges) => edges,
-        Err(_) => return false,
-    };
-
-    if edges.is_empty() {
-        return false;
-    }
+    let edges = txn.iter_forward(inode_node, false)?;
 
     for edge in &edges {
         // Only consider edges introduced by visible changes
@@ -691,18 +692,14 @@ pub(crate) fn is_file_alive_via_retrieval<T: GraphTxnT>(
             continue;
         }
         // Build the destination vertex from the edge
-        let dest_vertex = match txn.find_block(edge.dest) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let dest_vertex = txn.find_block(edge.dest)?;
         // Use the retrieval pipeline's supersession-aware aliveness check
-        match options.is_vertex_alive(txn, dest_vertex) {
-            Ok(true) => return true,
-            _ => continue,
+        if options.is_vertex_alive(txn, dest_vertex)? {
+            return Ok(true);
         }
     }
 
-    false
+    Ok(false)
 }
 
 /// Normalize a tracked path from the TREE table to a relative PathBuf

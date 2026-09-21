@@ -1033,6 +1033,10 @@ impl RedbChangeStore {
         ensure_generation(&turn, expected_generation)?;
         match &turn.state {
             ProvenanceTurnState::Stopped(stop) if stop.resumable => {}
+            // A Checkpointing turn has a prepared-but-unbound checkpoint.
+            // Resuming supersedes the stale attempt; the next Stop re-prepares
+            // from the intact journal instead of failing the whole session.
+            ProvenanceTurnState::Checkpointing => {}
             ProvenanceTurnState::Stopped(_) | ProvenanceTurnState::Abandoned(_) => {
                 return Err(RedbStoreError::InvalidProvenanceTransition { id: id.get() })
             }
